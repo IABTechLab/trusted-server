@@ -67,7 +67,7 @@ fn sanitize_ec_id_for_cookie(ec_id: &str) -> Cow<'_, str> {
     Cow::Owned(safe_id)
 }
 
-fn ec_cookie_attributes(settings: &Settings, max_age: i32) -> String {
+pub(crate) fn ec_cookie_attributes(settings: &Settings, max_age: i32) -> String {
     format!(
         "Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age}",
         settings.publisher.cookie_domain,
@@ -190,7 +190,7 @@ pub fn forward_cookie_header(
 /// Non-ASCII characters (multi-byte UTF-8) are always rejected because their
 /// byte values exceed `0x7E`.
 #[must_use]
-pub(crate) fn synthetic_id_cookie_value_is_safe(value: &str) -> bool {
+pub(crate) fn ec_cookie_value_is_safe(value: &str) -> bool {
     // RFC 6265 §4.1.1 cookie-octet:
     //   0x21        — '!'
     //   0x23–0x2B  — '#' through '+'   (excludes 0x22 DQUOTE)
@@ -258,10 +258,12 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 ///
 /// # Panics
 ///
-/// Panics if the internal cookie string contains HTTP header-invalid bytes,
-/// which cannot occur given the validated `ec_id` and trusted `cookie_domain`.
+/// Does not panic in practice — the cookie value is validated by
+/// [`ec_cookie_value_is_safe`] (early return if invalid) before
+/// [`http::HeaderValue::from_str`] is called, so the expect is unreachable.
+/// Listed here only because clippy cannot prove it statically.
 pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
-    if !synthetic_id_cookie_value_is_safe(ec_id) {
+    if !ec_cookie_value_is_safe(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
             ec_id.len()
@@ -282,8 +284,10 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
 ///
 /// # Panics
 ///
-/// Panics if the internal cookie string contains HTTP header-invalid bytes,
-/// which cannot occur given the trusted `cookie_domain` from operator config.
+/// Does not panic in practice — the formatted value contains only ASCII
+/// printable characters (constant name, validated domain, static attributes),
+/// so [`http::HeaderValue::from_str`] always succeeds. Listed here only
+/// because clippy cannot prove it statically.
 pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -486,17 +490,14 @@ mod tests {
 
     #[test]
     fn test_is_safe_cookie_value_rejects_empty_string() {
-        assert!(
-            !synthetic_id_cookie_value_is_safe(""),
-            "should reject empty string"
-        );
+        assert!(!ec_cookie_value_is_safe(""), "should reject empty string");
     }
 
     #[test]
     fn test_is_safe_cookie_value_accepts_valid_ec_id_characters() {
         // Hex digits, dot separator, alphanumeric suffix — the full EC ID character set
         assert!(
-            synthetic_id_cookie_value_is_safe("abcdef0123456789.ABCDEFabcdef"),
+            ec_cookie_value_is_safe("abcdef0123456789.ABCDEFabcdef"),
             "should accept hex digits, dots, and alphanumeric characters"
         );
     }
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn test_is_safe_cookie_value_rejects_non_ascii() {
         assert!(
-            !synthetic_id_cookie_value_is_safe("valüe"),
+            !ec_cookie_value_is_safe("valüe"),
             "should reject non-ASCII UTF-8 characters"
         );
     }
@@ -512,31 +513,25 @@ mod tests {
     #[test]
     fn test_is_safe_cookie_value_rejects_illegal_characters() {
         assert!(
-            !synthetic_id_cookie_value_is_safe("val;ue"),
+            !ec_cookie_value_is_safe("val;ue"),
             "should reject semicolon"
         );
+        assert!(!ec_cookie_value_is_safe("val,ue"), "should reject comma");
         assert!(
-            !synthetic_id_cookie_value_is_safe("val,ue"),
-            "should reject comma"
-        );
-        assert!(
-            !synthetic_id_cookie_value_is_safe("val\"ue"),
+            !ec_cookie_value_is_safe("val\"ue"),
             "should reject double-quote"
         );
         assert!(
-            !synthetic_id_cookie_value_is_safe("val\\ue"),
+            !ec_cookie_value_is_safe("val\\ue"),
             "should reject backslash"
         );
+        assert!(!ec_cookie_value_is_safe("val ue"), "should reject space");
         assert!(
-            !synthetic_id_cookie_value_is_safe("val ue"),
-            "should reject space"
-        );
-        assert!(
-            !synthetic_id_cookie_value_is_safe("val\x00ue"),
+            !ec_cookie_value_is_safe("val\x00ue"),
             "should reject null byte"
         );
         assert!(
-            !synthetic_id_cookie_value_is_safe("val\x7fue"),
+            !ec_cookie_value_is_safe("val\x7fue"),
             "should reject DEL character"
         );
     }
@@ -564,6 +559,111 @@ mod tests {
             ),
             "expiry cookie should retain the same security attributes as the live cookie"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // forward_cookie_header tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_forward_cookie_header_strips_consent() {
+        let from = build_request(Some("euconsent-v2=BOE; session=abc123; us_privacy=1YNN"));
+        let mut to = build_request(None);
+
+        forward_cookie_header(&from, &mut to, true);
+
+        let forwarded = to
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !forwarded.contains("euconsent-v2"),
+            "should strip consent cookie"
+        );
+        assert!(
+            forwarded.contains("session=abc123"),
+            "should keep non-consent cookie"
+        );
+    }
+
+    #[test]
+    fn test_forward_cookie_header_strip_all_leaves_header_absent() {
+        let from = build_request(Some("euconsent-v2=BOE; __gpp=DBAC"));
+        let mut to = build_request(None);
+
+        forward_cookie_header(&from, &mut to, true);
+
+        assert!(
+            to.headers().get(header::COOKIE).is_none(),
+            "should omit Cookie header when all cookies are stripped"
+        );
+    }
+
+    #[test]
+    fn test_forward_cookie_header_no_strip_passes_all() {
+        let from = build_request(Some("euconsent-v2=BOE; session=abc123"));
+        let mut to = build_request(None);
+
+        forward_cookie_header(&from, &mut to, false);
+
+        let forwarded = to
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            forwarded.contains("euconsent-v2"),
+            "should forward consent cookie when not stripping"
+        );
+        assert!(
+            forwarded.contains("session=abc123"),
+            "should forward non-consent cookie"
+        );
+    }
+
+    #[test]
+    fn test_forward_cookie_header_non_utf8_forwarded_unchanged() {
+        let non_utf8 = http::HeaderValue::from_bytes(b"\xff\xfe=value")
+            .expect("should build non-UTF-8 header value");
+        let mut from = build_request(None);
+        from.headers_mut().append(header::COOKIE, non_utf8);
+        let mut to = build_request(None);
+
+        forward_cookie_header(&from, &mut to, true);
+
+        let forwarded = to.headers().get(header::COOKIE);
+        assert!(
+            forwarded.is_some(),
+            "should forward non-UTF-8 Cookie header unchanged"
+        );
+        assert_eq!(
+            forwarded.expect("should have cookie header").as_bytes(),
+            b"\xff\xfe=value",
+            "should preserve raw bytes for non-UTF-8 cookie"
+        );
+    }
+
+    #[test]
+    fn test_forward_cookie_header_multiple_cookie_headers_appended() {
+        let mut from = build_request(Some("session=abc123"));
+        from.headers_mut().append(
+            header::COOKIE,
+            "theme=dark".parse().expect("should parse header value"),
+        );
+        let mut to = build_request(None);
+
+        forward_cookie_header(&from, &mut to, false);
+
+        let all_cookies: Vec<_> = to
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(all_cookies.len(), 2, "should append all Cookie headers");
+        assert!(all_cookies.iter().any(|v| v.contains("session=abc123")));
+        assert!(all_cookies.iter().any(|v| v.contains("theme=dark")));
     }
 
     // ---------------------------------------------------------------

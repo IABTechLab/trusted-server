@@ -125,3 +125,36 @@ pub async fn handle_auction(
     // Convert to OpenRTB response format with inline creative HTML
     convert_to_openrtb_response(&result, settings, &auction_request)
 }
+
+#[cfg(test)]
+mod tests {
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{Method, Request as HttpRequest, StatusCode};
+
+    use crate::auction::build_orchestrator;
+    use crate::error::IntoHttpResponse;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn auction_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let oversized = vec![b'x'; AUCTION_MAX_BODY_BYTES + 1];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://test.com/auction")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_auction(&settings, &orchestrator, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for auction body over limit"
+        );
+    }
+}
