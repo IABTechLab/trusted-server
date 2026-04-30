@@ -45,7 +45,7 @@ impl IntegrationConfig for TestlightConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 struct TestlightRequestBody {
     #[validate(nested)]
     #[serde(default)]
@@ -75,7 +75,7 @@ struct TestlightImp {
     extra: Map<String, Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct TestlightResponseBody {
     #[serde(flatten)]
     fields: Map<String, Value>,
@@ -266,22 +266,6 @@ fn default_shim_src() -> String {
 
 fn default_enabled() -> bool {
     false
-}
-
-impl Default for TestlightRequestBody {
-    fn default() -> Self {
-        Self {
-            user: TestlightUserSection::default(),
-            imp: Vec::new(),
-            extra: Map::new(),
-        }
-    }
-}
-
-impl Default for TestlightResponseBody {
-    fn default() -> Self {
-        Self { fields: Map::new() }
-    }
 }
 
 #[cfg(test)]

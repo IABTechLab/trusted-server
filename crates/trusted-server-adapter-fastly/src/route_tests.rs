@@ -7,6 +7,7 @@ use fastly::http::StatusCode;
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::compat;
+use trusted_server_core::error::IntoHttpResponse;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -14,7 +15,6 @@ use trusted_server_core::platform::{
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
-use trusted_server_core::error::IntoHttpResponse;
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
 use trusted_server_core::settings::Settings;
 

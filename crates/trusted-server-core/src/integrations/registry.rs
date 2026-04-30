@@ -673,7 +673,8 @@ impl IntegrationRegistry {
             if let Ok(ref ec_id) = ec_id_result {
                 match HeaderValue::from_str(ec_id) {
                     Ok(header_value) => {
-                        req.headers_mut().insert(HEADER_X_TS_EC.clone(), header_value);
+                        req.headers_mut()
+                            .insert(HEADER_X_TS_EC.clone(), header_value);
                     }
                     Err(error) => {
                         log::warn!("Failed to build x-ts-ec request header value: {}", error);

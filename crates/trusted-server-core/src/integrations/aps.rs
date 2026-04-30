@@ -16,7 +16,7 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
-use crate::integrations::collect_body;
+use crate::integrations::{collect_response_bounded, UPSTREAM_RTB_MAX_RESPONSE_BYTES};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::IntegrationConfig;
 
@@ -513,6 +513,8 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to build APS request".to_string(),
             })?;
 
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout in ensure_integration_backend, which is for proxy endpoints.
         // Send request asynchronously with auction-scoped timeout
         let backend_name = BackendConfig::from_url_with_first_byte_timeout(
             &self.config.endpoint,
@@ -551,12 +553,13 @@ impl AuctionProvider for ApsAuctionProvider {
             return Ok(AuctionResponse::error("aps", response_time_ms));
         }
 
-        // Parse response body — collect_body handles both Once and Stream variants safely.
-        let body_bytes = collect_body(response.into_body(), "aps")
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to read APS response body".to_string(),
-            })?;
+        // Parse response body — collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes =
+            collect_response_bounded(response.into_body(), UPSTREAM_RTB_MAX_RESPONSE_BYTES, "aps")
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Failed to read APS response body".to_string(),
+                })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse APS response JSON".to_string(),

@@ -102,7 +102,6 @@ pub async fn handle_auction(
     let context = AuctionContext {
         settings,
         request: &http_req,
-        client_info: services.client_info(),
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,

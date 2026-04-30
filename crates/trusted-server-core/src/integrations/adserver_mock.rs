@@ -22,7 +22,7 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
-use crate::integrations::collect_body;
+use crate::integrations::{collect_response_bounded, UPSTREAM_RTB_MAX_RESPONSE_BYTES};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -334,6 +334,8 @@ impl AuctionProvider for AdServerMockProvider {
             }
         }
 
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout in ensure_integration_backend, which is for proxy endpoints.
         // Send async with auction-scoped timeout
         let backend_name = BackendConfig::from_url_with_first_byte_timeout(
             &self.config.endpoint,
@@ -371,12 +373,16 @@ impl AuctionProvider for AdServerMockProvider {
             return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
         }
 
-        // collect_body handles both Once and Stream variants safely.
-        let body_bytes = collect_body(response.into_body(), "adserver_mock")
-            .await
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to read AdServer Mock response body".to_string(),
-            })?;
+        // collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes = collect_response_bounded(
+            response.into_body(),
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            "adserver_mock",
+        )
+        .await
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to read AdServer Mock response body".to_string(),
+        })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
                 message: "Failed to parse mediation response".to_string(),

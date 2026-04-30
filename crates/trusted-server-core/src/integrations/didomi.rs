@@ -239,7 +239,7 @@ impl IntegrationProxy for DidomiIntegration {
         let backend_name = Self::backend_name_for_origin(services, base_origin)
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
-        let request_body = if matches!(parts.method, Method::POST | Method::PUT) {
+        let request_body = if parts.method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DIDOMI_INTEGRATION_ID)
                     .await
@@ -256,7 +256,7 @@ impl IntegrationProxy for DidomiIntegration {
             .change_context(Self::error("Failed to build Didomi proxy request"))?;
         self.copy_headers(
             &backend,
-            services.client_info.client_ip,
+            services.client_info().client_ip,
             &parts.headers,
             proxy_req.headers_mut(),
         );

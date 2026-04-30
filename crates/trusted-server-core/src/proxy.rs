@@ -41,7 +41,6 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_X_FORWARDED_FOR,
 ];
 
-
 #[derive(Deserialize)]
 struct ProxySignReq {
     url: String,
@@ -2154,8 +2153,12 @@ mod tests {
             .uri("https://example.com/")
             .body(EdgeBody::empty())
             .expect("should build test request");
-        req.headers_mut().insert(header::USER_AGENT, HeaderValue::from_static("test-agent/1.0"));
-        req.headers_mut().insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("test-agent/1.0"),
+        );
+        req.headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
         req.headers_mut()
             .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
 
@@ -2254,12 +2257,14 @@ mod tests {
     fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
         let mut beresp = Response::new(EdgeBody::empty());
         *beresp.status_mut() = StatusCode::OK;
-        beresp
-            .headers_mut()
-            .append(header::SET_COOKIE, HeaderValue::from_static("a=1; Path=/; Secure"));
-        beresp
-            .headers_mut()
-            .append(header::SET_COOKIE, HeaderValue::from_static("b=2; Path=/; Secure"));
+        beresp.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; Secure"),
+        );
+        beresp.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("b=2; Path=/; Secure"),
+        );
 
         let rebuilt = rebuild_response_with_body(
             beresp,
