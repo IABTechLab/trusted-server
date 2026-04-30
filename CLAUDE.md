@@ -387,8 +387,9 @@ Implementation specs live under `docs/superpowers/specs/`, split by lifecycle:
 ```yaml
 ---
 status: draft | in-progress | implemented
-implemented_in: PR#123    # optional, set on promotion
-last_reviewed: 2026-04-15  # optional, YYYY-MM-DD
+implemented_in: PR#123              # optional, set on promotion
+last_reviewed: 2026-04-15           # optional, YYYY-MM-DD
+verified_against_commit: a1b2c3d4   # optional, audit trail (skill records, does not validate)
 ---
 ```
 
