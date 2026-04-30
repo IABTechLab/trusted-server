@@ -190,7 +190,7 @@ pub fn forward_cookie_header(
 /// Non-ASCII characters (multi-byte UTF-8) are always rejected because their
 /// byte values exceed `0x7E`.
 #[must_use]
-pub(crate) fn synthetic_id_cookie_value_is_safe(value: &str) -> bool {
+pub(crate) fn ec_cookie_value_is_safe(value: &str) -> bool {
     // RFC 6265 §4.1.1 cookie-octet:
     //   0x21        — '!'
     //   0x23–0x2B  — '#' through '+'   (excludes 0x22 DQUOTE)
@@ -259,11 +259,11 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// # Panics
 ///
 /// Does not panic in practice — the cookie value is validated by
-/// [`synthetic_id_cookie_value_is_safe`] (early return if invalid) before
+/// [`ec_cookie_value_is_safe`] (early return if invalid) before
 /// [`http::HeaderValue::from_str`] is called, so the expect is unreachable.
 /// Listed here only because clippy cannot prove it statically.
 pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
-    if !synthetic_id_cookie_value_is_safe(ec_id) {
+    if !ec_cookie_value_is_safe(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
             ec_id.len()
@@ -490,17 +490,14 @@ mod tests {
 
     #[test]
     fn test_is_safe_cookie_value_rejects_empty_string() {
-        assert!(
-            !synthetic_id_cookie_value_is_safe(""),
-            "should reject empty string"
-        );
+        assert!(!ec_cookie_value_is_safe(""), "should reject empty string");
     }
 
     #[test]
     fn test_is_safe_cookie_value_accepts_valid_ec_id_characters() {
         // Hex digits, dot separator, alphanumeric suffix — the full EC ID character set
         assert!(
-            synthetic_id_cookie_value_is_safe("abcdef0123456789.ABCDEFabcdef"),
+            ec_cookie_value_is_safe("abcdef0123456789.ABCDEFabcdef"),
             "should accept hex digits, dots, and alphanumeric characters"
         );
     }
@@ -508,7 +505,7 @@ mod tests {
     #[test]
     fn test_is_safe_cookie_value_rejects_non_ascii() {
         assert!(
-            !synthetic_id_cookie_value_is_safe("valüe"),
+            !ec_cookie_value_is_safe("valüe"),
             "should reject non-ASCII UTF-8 characters"
         );
     }
@@ -516,31 +513,25 @@ mod tests {
     #[test]
     fn test_is_safe_cookie_value_rejects_illegal_characters() {
         assert!(
-            !synthetic_id_cookie_value_is_safe("val;ue"),
+            !ec_cookie_value_is_safe("val;ue"),
             "should reject semicolon"
         );
+        assert!(!ec_cookie_value_is_safe("val,ue"), "should reject comma");
         assert!(
-            !synthetic_id_cookie_value_is_safe("val,ue"),
-            "should reject comma"
-        );
-        assert!(
-            !synthetic_id_cookie_value_is_safe("val\"ue"),
+            !ec_cookie_value_is_safe("val\"ue"),
             "should reject double-quote"
         );
         assert!(
-            !synthetic_id_cookie_value_is_safe("val\\ue"),
+            !ec_cookie_value_is_safe("val\\ue"),
             "should reject backslash"
         );
+        assert!(!ec_cookie_value_is_safe("val ue"), "should reject space");
         assert!(
-            !synthetic_id_cookie_value_is_safe("val ue"),
-            "should reject space"
-        );
-        assert!(
-            !synthetic_id_cookie_value_is_safe("val\x00ue"),
+            !ec_cookie_value_is_safe("val\x00ue"),
             "should reject null byte"
         );
         assert!(
-            !synthetic_id_cookie_value_is_safe("val\x7fue"),
+            !ec_cookie_value_is_safe("val\x7fue"),
             "should reject DEL character"
         );
     }

@@ -140,18 +140,18 @@ pub fn forward_fastly_cookie_header(
 pub fn set_fastly_ec_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
-    synthetic_id: &str,
+    ec_id: &str,
 ) {
-    if !crate::cookies::synthetic_id_cookie_value_is_safe(synthetic_id) {
+    if !crate::cookies::ec_cookie_value_is_safe(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            synthetic_id.len()
+            ec_id.len()
         );
         return;
     }
     response.append_header(
         header::SET_COOKIE,
-        crate::cookies::create_ec_cookie(settings, synthetic_id),
+        crate::cookies::create_ec_cookie(settings, ec_id),
     );
 }
 
