@@ -69,15 +69,16 @@ Three accepted values for `status`:
 - `in-progress`: implementation in flight, design may still evolve.
 - `implemented`: code has shipped, spec reflects what shipped, ready to document.
 
-Two optional fields:
+Three optional fields:
 
 - `implemented_in`: PR number where the implementation landed. Used by future skill #2.
 - `last_reviewed`: date of the most recent engineering review of the spec, in `YYYY-MM-DD` format.
+- `verified_against_commit`: commit SHA the engineer asserts the spec was verified against at promotion time. Audit trail; the skill records but does not validate. Added in Section 16.3.
 
 **Skill behavior on `status`:**
 
-- `implemented`: proceed normally.
-- Any other value, or missing `status` field: skill stops and prompts `Continue without status: implemented? (y/N)`. Default is N. Empty input or anything other than literal `y` aborts. Explicit `y` proceeds with a one-line warning that the docs may drift from product. The override path is intentionally a little annoying so it does not become the default.
+- `implemented`: proceed normally (subject to the verification-rate gate added in Section 16.1).
+- Any other value, or missing `status` field: skill stops and prompts `Continue without status: implemented? Reply y to proceed.` Wait for the user's reply. Treat any reply other than a single `y` (case-insensitive) as abort. Explicit `y` proceeds with a one-line warning that the docs may drift from product. The override path is intentionally a little annoying so it does not become the default.
 
 The skill never adds frontmatter on the user's behalf. Frontmatter is added at spec-authoring time, by the brainstorming skill (for new specs) or by hand (for existing specs). Section 12 lists the one-time backfill of the 12 existing specs as a prerequisite.
 
@@ -309,4 +310,71 @@ This is a separate change from skill #1, with its own PR upstream. Listed here a
 ## 15. Implementation summary
 
 The implementation plan, written next, will sequence the prerequisites in Section 12, the slash-command and skill files described in Section 5, and the validation cases in Section 11. The skill itself is one markdown file (`.claude/skills/generate-feature-docs/SKILL.md`) plus one slash-command file (`.claude/commands/generate-feature-docs.md`). The skill content encodes the rules in Sections 6 through 10.
+
+## 16. Post-validation amendment: stricter readiness verification
+
+The first validation run (greenfield case against the JS Asset Auditor spec on 2026-04-28) exposed a workflow gap: a spec can be promoted to `implemented/` with `status: implemented` even when most of the described feature is not yet in `crates/`. The skill correctly produced a stub feature page with `<!-- TODO: planned -->` annotations, which is graceful, but the deeper signal is that promotion happened prematurely. This section documents three amendments to close that gap. They are not a re-design; they are tightening of existing rules.
+
+### 16.1 Verification-rate threshold
+
+Stage 1 already verifies each handle (config keys, endpoints, headers, error variants) against `crates/` and `trusted-server.toml`. The skill currently refuses only when zero handles verify (the "no shipped code" edge case in Section 10). Tighten this:
+
+- Compute a verification rate during stage 1: `verified_count / total_extracted_count`.
+- If the rate is **below 50%**, surface this in the outline's "Issues" subsection as a hard prompt:
+  > "Stage 1 verified `<X>` of `<N>` handles in this codebase (`<rate>%`). Below 50% suggests this spec may not be fully implemented in this branch. Options: (A) generate stubs for unverified handles, (B) abort and check status, (C) override and proceed normally."
+- The threshold of 50% is an initial value; tune based on real usage. Tracked as a known knob.
+- The skill still emits the outline normally so the user can see exactly which handles failed verification before choosing.
+
+This catches the JS Asset Auditor case directly: 1 of ~5 handles verified, roughly 20%, well below 50%.
+
+### 16.2 Branch-state heuristic
+
+In addition to handle verification, stage 1 inspects whether the current branch has actually touched code relevant to the feature:
+
+```bash
+git log --name-only <merge-base>..HEAD -- crates/ trusted-server.toml
+```
+
+Where `<merge-base>` is the merge base with `main` (or the equivalent default branch). If the result is empty (the current branch has not touched any code), surface this as an additional signal in the outline:
+
+> "Note: this branch has no commits touching `crates/` or `trusted-server.toml`. If you expect the implementation to be on this branch, you may be on the wrong branch."
+
+This is informational, not a hard stop. It pairs with 16.1 to give a more complete picture: low verification rate combined with no code on the branch is a strong indicator the engineer is on `main` rather than on the implementation branch.
+
+### 16.3 `verified_against_commit` frontmatter field
+
+Add an optional field to the spec readiness convention (Section 6):
+
+```yaml
+---
+status: implemented
+implemented_in: PR#581
+last_reviewed: 2026-04-15
+verified_against_commit: a1b2c3d4
+---
+```
+
+`verified_against_commit` records the commit SHA the engineer asserts the spec was verified against when promoted. The skill records but does not validate this field; it is an audit trail field for future review and for use by skill #2.
+
+Use case: if the skill produces a stub page (low verification rate), the user can later compare the recorded `verified_against_commit` against the current branch state to understand whether the promotion was premature or whether the implementation has been reverted since.
+
+### 16.4 Out of scope, deferred to a future enhancement
+
+Validation against the GitHub PR (calling `gh pr view <implemented_in>`) was considered and explicitly deferred. Reasons: external network calls in a hot path complicate testing, require `gh` auth, and tie the skill to GitHub. If we find we still need this signal after 16.1 and 16.2, it can be added as a `--strict` flag or a CI-only mode in a follow-up.
+
+### 16.5 Implementation impact
+
+These amendments require:
+
+1. `SKILL.md` update: add verification-rate computation and the threshold prompt to Stage 1 (Step 1.7 or a new Step 1.7a).
+2. `SKILL.md` update: add the branch-state check to Stage 1, surfaced in the outline.
+3. Section 6 update: extend the frontmatter convention with the optional `verified_against_commit` field.
+4. `CLAUDE.md` update: keep the documented frontmatter schema in sync with the extended Section 6.
+
+These amendments do NOT require:
+
+- Changes to the prerequisites in Section 12 (those have already landed).
+- Changes to the directory layout in Section 7.
+- Changes to the prose-writing rules or template in Section 9.
+- Re-running the validation cases that already passed in Section 11. The amendments are additive checks and do not affect happy-path behavior.
 
