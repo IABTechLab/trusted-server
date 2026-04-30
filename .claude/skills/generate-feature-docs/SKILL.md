@@ -29,6 +29,14 @@ Before doing anything else, parse the spec's YAML frontmatter and check the `sta
 
 You never add frontmatter on the user's behalf. If the file has no frontmatter, the user must add it before re-running.
 
+Optional frontmatter fields the skill recognizes but does not enforce:
+
+- `implemented_in`: PR number where the implementation landed.
+- `last_reviewed`: date of the most recent engineering review, in `YYYY-MM-DD` format.
+- `verified_against_commit`: commit SHA the engineer asserts the spec was verified against at promotion time. Audit trail only.
+
+If `verified_against_commit` is present, surface its value in the Stage 1 outline header (alongside the other metadata) so the user can compare it against the current branch state if drift is suspected.
+
 ## Style rules (apply to ALL output, both chat messages and written files)
 
 - No em-dashes. Use commas, colons, or semicolons.
@@ -116,6 +124,37 @@ For each handle, search the code:
 
 Mark each handle as `verified` (with `file:line`) or `NOT FOUND`.
 
+### Step 1.7a: Compute verification rate and gate on threshold
+
+After all handles have been verified in Step 1.7:
+
+1. Compute `verified_count` (handles marked `verified`) and `total_extracted_count` (all extracted handles, regardless of type).
+2. Compute `verification_rate = verified_count / total_extracted_count`.
+3. If `total_extracted_count` is zero, this is the "no shipped code" edge case (Section "Edge cases and failure modes"). Use the existing handling for that case.
+4. If `verification_rate < 0.50`, add a hard prompt to the Stage 1 "Issues" subsection:
+
+   > "Stage 1 verified `<verified_count>` of `<total_extracted_count>` handles in this codebase (`<rate>%`). Below 50% suggests this spec may not be fully implemented in this branch. Options: (A) generate stubs for unverified handles, (B) abort and check status, (C) override and proceed normally."
+
+   The user must pick A, B, or C before the skill proceeds. The threshold of 50% is initial; tune based on real usage.
+
+5. The threshold gate is in addition to per-handle Issues from Step 1.7. Both get surfaced in the same Stage 1 outline.
+
+### Step 1.7b: Branch-state heuristic
+
+In addition to handle verification, check whether the current branch has touched code relevant to the feature:
+
+```bash
+git log --name-only $(git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null)..HEAD -- crates/ trusted-server.toml
+```
+
+If the result is empty (the current branch has no commits touching `crates/` or `trusted-server.toml`), surface this as an additional informational note in the Stage 1 outline header:
+
+> "Note: this branch has no commits touching `crates/` or `trusted-server.toml`. If you expect the implementation to be on this branch, you may be on the wrong branch."
+
+This is informational, not a hard stop. Pair it with Step 1.7a's verification rate to give a fuller picture.
+
+If the merge-base lookup fails (no `main` or `master` branch found), skip this check silently and proceed.
+
 ### Step 1.8: Detect spec inconsistencies
 
 Look for:
@@ -136,6 +175,10 @@ Render a single chat message in this format. Use it verbatim, filling in the val
 **Target page:** `docs/guide/<slug>.md` (NEW or EXISTING)
 **Spec kind:** <feature | migration | readiness | unknown>
 **Sequence section:** <yes (brief description) | no>
+**Verified against commit:** <SHA from frontmatter, or "not recorded">
+
+<!-- Omit the branch-state note below when Step 1.7b finds commits on this branch. Include it verbatim when Step 1.7b finds no commits. -->
+> Note: this branch has no commits touching `crates/` or `trusted-server.toml`. If you expect the implementation to be on this branch, you may be on the wrong branch.
 
 ### Config keys
 | Key             | Status              | Location              |
