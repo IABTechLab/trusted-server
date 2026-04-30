@@ -229,12 +229,12 @@ fn default_script_patterns() -> Vec<String> {
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
-    engine: BidParamOverrideEngine,
+    engine: Arc<BidParamOverrideEngine>,
 }
 
 impl PrebidIntegration {
     fn try_new(config: PrebidIntegrationConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        let engine = BidParamOverrideEngine::try_from_config(&config)?;
+        let engine = Arc::new(BidParamOverrideEngine::try_from_config(&config)?);
         Ok(Arc::new(Self { config, engine }))
     }
 
@@ -246,7 +246,7 @@ impl PrebidIntegration {
     fn auction_provider(&self) -> PrebidAuctionProvider {
         PrebidAuctionProvider {
             config: self.config.clone(),
-            bid_param_override_engine: self.engine.clone(),
+            bid_param_override_engine: Arc::clone(&self.engine),
         }
     }
 
@@ -535,9 +535,30 @@ fn merge_bidder_param_object(
 // Generic bid-parameter override engine
 // ============================================================================
 
+fn warn_unconfigured_bidder(config: &PrebidIntegrationConfig, bidder: &str, field: &str) {
+    if !config.bidders.iter().any(|b| b == bidder) {
+        if config.client_side_bidders.iter().any(|b| b == bidder) {
+            log::warn!(
+                "prebid: {field} entry targets client-side-only bidder \
+                 '{bidder}' — server-side override will never apply"
+            );
+        } else {
+            log::warn!(
+                "prebid: {field} entry references unconfigured bidder \
+                 '{bidder}' — rule will never fire"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct BidParamOverrideEngine {
     rules: Vec<CompiledBidParamOverrideRule>,
+    // Maps bidder name to the indices (into `rules`) of rules that constrain on that bidder.
+    // Rules with no bidder constraint (zone-only or catch-all) are kept in `wildcard_indices`.
+    // Both slices are in declaration order; `apply` merges and re-sorts to restore that order.
+    bidder_index: HashMap<String, Vec<usize>>,
+    wildcard_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +584,7 @@ impl BidParamOverrideEngine {
         bidder_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
         for (bidder, set) in bidder_overrides {
+            warn_unconfigured_bidder(config, bidder, "bid_param_overrides");
             rules.push(CompiledBidParamOverrideRule::from_bidder_override(
                 bidder.as_str(),
                 set,
@@ -573,6 +595,7 @@ impl BidParamOverrideEngine {
         zone_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
         for (bidder, zone_override_sets) in zone_overrides {
+            warn_unconfigured_bidder(config, bidder, "bid_param_zone_overrides");
             let mut sorted_zone_overrides = zone_override_sets.iter().collect::<Vec<_>>();
             sorted_zone_overrides
                 .sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
@@ -589,21 +612,36 @@ impl BidParamOverrideEngine {
         for rule in &config.bid_param_override_rules {
             rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
             if let Some(bidder) = &rule.when.bidder {
-                if !config.bidders.contains(bidder) && !config.client_side_bidders.contains(bidder)
-                {
-                    log::warn!(
-                        "prebid: bid_param_override_rules entry references unconfigured bidder \
-                         '{bidder}' — rule will never fire"
-                    );
-                }
+                warn_unconfigured_bidder(config, bidder, "bid_param_override_rules");
             }
         }
 
-        Ok(Self { rules })
+        let mut bidder_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut wildcard_indices: Vec<usize> = Vec::new();
+        for (idx, rule) in rules.iter().enumerate() {
+            match &rule.bidder {
+                Some(bidder) => bidder_index.entry(bidder.clone()).or_default().push(idx),
+                None => wildcard_indices.push(idx),
+            }
+        }
+
+        Ok(Self {
+            rules,
+            bidder_index,
+            wildcard_indices,
+        })
     }
 
     fn apply(&self, facts: BidParamOverrideFacts<'_>, params: &mut Json) {
-        for rule in &self.rules {
+        let mut indices: Vec<usize> = self.wildcard_indices.clone();
+        if let Some(bidder_indices) = self.bidder_index.get(facts.bidder) {
+            indices.extend_from_slice(bidder_indices);
+        }
+        // Re-sort to restore declaration order so last-write-wins semantics are preserved.
+        indices.sort_unstable();
+
+        for &idx in &indices {
+            let rule = &self.rules[idx];
             if rule.matches(facts) {
                 if merge_bidder_param_object(params, &rule.set) {
                     log::debug!(
@@ -745,10 +783,12 @@ fn non_empty_override_object(
     is_canonical: bool,
 ) -> Result<serde_json::Map<String, Json>, Report<TrustedServerError>> {
     if value.is_empty() {
-        let suffix = if is_canonical { ".set" } else { "" };
-        return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("{source}{suffix} must not be empty"),
-        }));
+        let message = if is_canonical {
+            format!("{source}.set must not be empty")
+        } else {
+            format!("{source} entry must not be empty")
+        };
+        return Err(Report::new(TrustedServerError::Configuration { message }));
     }
 
     Ok(value.clone())
@@ -800,7 +840,7 @@ fn append_query_params(url: &str, params: &str) -> String {
 /// Prebid Server auction provider.
 pub struct PrebidAuctionProvider {
     config: PrebidIntegrationConfig,
-    bid_param_override_engine: BidParamOverrideEngine,
+    bid_param_override_engine: Arc<BidParamOverrideEngine>,
 }
 
 impl PrebidAuctionProvider {
@@ -816,7 +856,7 @@ impl PrebidAuctionProvider {
     /// Returns an error when the configured bidder-param override rules are invalid.
     pub fn try_new(config: PrebidIntegrationConfig) -> Result<Self, Report<TrustedServerError>> {
         Ok(Self {
-            bid_param_override_engine: BidParamOverrideEngine::try_from_config(&config)?,
+            bid_param_override_engine: Arc::new(BidParamOverrideEngine::try_from_config(&config)?),
             config,
         })
     }
