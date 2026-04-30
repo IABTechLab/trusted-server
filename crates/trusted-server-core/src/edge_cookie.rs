@@ -109,7 +109,11 @@ pub fn generate_ec_id(
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(ec_id) = req.headers().get(HEADER_X_TS_EC).and_then(|h| h.to_str().ok()) {
+    if let Some(ec_id) = req
+        .headers()
+        .get(HEADER_X_TS_EC)
+        .and_then(|h| h.to_str().ok())
+    {
         if ec_id_has_only_allowed_chars(ec_id) {
             log::trace!("Using existing EC ID from header: {}", ec_id);
             return Ok(Some(ec_id.to_string()));
@@ -207,7 +211,9 @@ mod tests {
         for (key, value) in headers {
             builder = builder.header(key, *value);
         }
-        builder.body(EdgeBody::empty()).expect("should build test request")
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build test request")
     }
 
     fn is_ec_id_format(value: &str) -> bool {
@@ -352,10 +358,7 @@ mod tests {
     fn test_get_ec_id_rejects_invalid_header_and_falls_back_to_cookie() {
         let req = create_test_request(&[
             (HEADER_X_TS_EC, "evil;injected"),
-            (
-                header::COOKIE,
-                &format!("{}=valid_cookie_id", COOKIE_TS_EC),
-            ),
+            (header::COOKIE, &format!("{}=valid_cookie_id", COOKIE_TS_EC)),
         ]);
 
         let ec_id = get_ec_id(&req).expect("should handle invalid header gracefully");

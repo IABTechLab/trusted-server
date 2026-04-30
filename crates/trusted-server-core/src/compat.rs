@@ -15,10 +15,13 @@ use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 use crate::platform::PlatformResponse;
 
 fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<EdgeBody> {
-    let uri: http::Uri = req
-        .get_url_str()
-        .parse()
-        .unwrap_or_else(|_| http::Uri::from_static("/"));
+    let uri: http::Uri = req.get_url_str().parse().unwrap_or_else(|_| {
+        log::warn!(
+            "Failed to parse request URL '{}'; falling back to '/'",
+            req.get_url_str()
+        );
+        http::Uri::from_static("/")
+    });
 
     let mut builder = http::Request::builder()
         .method(req.get_method().clone())
@@ -41,7 +44,9 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
 ///
 /// # Panics
 ///
-/// Panics if the Fastly request URL cannot be parsed as an `http::Uri`.
+/// Does not panic in practice — URL parse failure falls back to `"/"` (logged
+/// as a warning), and the subsequent `builder.body()` cannot fail given a valid
+/// method and URI. Listed here only because clippy cannot prove it statically.
 pub fn from_fastly_request(mut req: fastly::Request) -> http::Request<EdgeBody> {
     let body = EdgeBody::from(req.take_body_bytes());
     build_http_request(&req, body)
@@ -55,7 +60,9 @@ pub fn from_fastly_request(mut req: fastly::Request) -> http::Request<EdgeBody> 
 ///
 /// # Panics
 ///
-/// Panics if the Fastly request URL cannot be parsed as an `http::Uri`.
+/// Does not panic in practice — URL parse failure falls back to `"/"` (logged
+/// as a warning), and the subsequent `builder.body()` cannot fail given a valid
+/// method and URI. Listed here only because clippy cannot prove it statically.
 pub fn from_fastly_headers_ref(req: &fastly::Request) -> http::Request<EdgeBody> {
     build_http_request(req, EdgeBody::empty())
 }

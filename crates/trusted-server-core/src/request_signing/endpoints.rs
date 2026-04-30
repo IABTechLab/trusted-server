@@ -462,6 +462,7 @@ mod tests {
     use error_stack::Report;
     use http::{header, Method, Request as HttpRequest, StatusCode};
 
+    use crate::error::IntoHttpResponse;
     use crate::platform::{
         test_support::{build_request_signing_services, build_services_with_config, noop_services},
         PlatformConfigStore, PlatformError, StoreId, StoreName,
@@ -918,6 +919,60 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("kid must contain only")),
             "should explain the kid character restrictions"
+        );
+    }
+
+    #[test]
+    fn verify_signature_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(VERIFY_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&oversized),
+        );
+        let err = handle_verify_signature(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for verify-signature body over limit"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some(&oversized),
+        );
+        let err = handle_rotate_key(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for rotate-key body over limit"
+        );
+    }
+
+    #[test]
+    fn deactivate_key_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&oversized),
+        );
+        let err = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for deactivate-key body over limit"
         );
     }
 

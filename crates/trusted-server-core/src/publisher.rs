@@ -692,7 +692,10 @@ pub async fn handle_publisher_request(
             let mut output = Vec::new();
             process_response_streaming(body, &mut output, &params)?;
 
-            response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(output.len() as u64));
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from(output.len() as u64),
+            );
             *response.body_mut() = EdgeBody::from(output);
 
             Ok(PublisherResponse::Buffered(response))
@@ -1557,8 +1560,14 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        stream_publisher_body(EdgeBody::empty(), &mut output, &params, &settings, &registry)
-            .expect("should succeed on empty body");
+        stream_publisher_body(
+            EdgeBody::empty(),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should succeed on empty body");
 
         assert!(
             output.is_empty(),
@@ -1764,7 +1773,6 @@ mod tests {
         assert!(
             !processed.contains("origin.example.com"),
             "origin host must not leak. Got: {processed}"
-
         );
     }
 }

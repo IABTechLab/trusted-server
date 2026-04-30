@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::compat::platform_response_to_fastly;
 use crate::error::TrustedServerError;
 use crate::platform::{PlatformPendingRequest, RuntimeServices};
-use crate::compat::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
