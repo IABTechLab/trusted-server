@@ -688,7 +688,7 @@ impl IntegrationRegistry {
                         // Cookie is intentionally not set when EC ID contains RFC 6265-illegal
                         // characters (e.g. a crafted x-ts-ec header value). The response header
                         // is still emitted; only cookie persistence is skipped.
-                        compat::set_fastly_synthetic_cookie(settings, response, ec_id.as_str());
+                        compat::set_fastly_ec_cookie(settings, response, ec_id.as_str());
                     }
                     Err(ref err) => {
                         log::warn!("Failed to generate EC ID for integration response: {err:?}");
