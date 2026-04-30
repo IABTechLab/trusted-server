@@ -1379,7 +1379,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         {
             if request_signing_config.enabled {
                 let request_info = RequestInfo::from_request(context.request, context.client_info);
-                let signer = RequestSigner::from_config()?;
+                let signer = RequestSigner::from_services(context.services)?;
                 let params =
                     SigningParams::new(request.id.clone(), request_info.host, request_info.scheme);
                 let signature = signer.sign_request(&params)?;
@@ -1574,6 +1574,7 @@ pub fn register_auction_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::test_support::create_test_auction_context as shared_test_auction_context;
     use crate::auction::types::{
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
@@ -1658,13 +1659,7 @@ mod tests {
         request: &'a Request,
         client_info: &'a crate::platform::ClientInfo,
     ) -> AuctionContext<'a> {
-        AuctionContext {
-            settings,
-            request,
-            client_info,
-            timeout_ms: 1000,
-            provider_responses: None,
-        }
+        shared_test_auction_context(settings, request, client_info, 1000)
     }
 
     fn config_from_settings(
@@ -3051,6 +3046,7 @@ server_url = "https://prebid.example"
         config: PrebidIntegrationConfig,
         request: &AuctionRequest,
     ) -> OpenRtbRequest {
+        use crate::platform::test_support::noop_services;
         let provider = PrebidAuctionProvider::new(config);
         let settings = make_settings();
         let fastly_req = Request::new(Method::POST, "https://example.com/auction");
@@ -3059,12 +3055,14 @@ server_url = "https://prebid.example"
             tls_protocol: None,
             tls_cipher: None,
         };
+        let services = noop_services();
         let context = AuctionContext {
             settings: &settings,
             request: &fastly_req,
             client_info: &client_info,
             timeout_ms: 1000,
             provider_responses: None,
+            services: &services,
         };
         provider.to_openrtb(request, &context, None)
     }

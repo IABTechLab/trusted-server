@@ -148,6 +148,7 @@ impl AuctionOrchestrator {
                 client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
+                services: context.services,
             };
 
             let start_time = Instant::now();
@@ -327,6 +328,7 @@ impl AuctionOrchestrator {
                 client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
+                services: context.services,
             };
 
             log::info!(
@@ -631,8 +633,9 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
     };
 
     // All-None ClientInfo used across tests that don't need real IP/TLS data.
@@ -695,20 +698,6 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
-    }
-
-    fn create_test_context<'a>(
-        settings: &'a crate::settings::Settings,
-        req: &'a Request,
-        client_info: &'a crate::platform::ClientInfo,
-    ) -> AuctionContext<'a> {
-        AuctionContext {
-            settings,
-            request: req,
-            client_info,
-            timeout_ms: 2000,
-            provider_responses: None,
-        }
     }
 
     #[test]
@@ -798,7 +787,7 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req, &EMPTY_CLIENT_INFO);
+        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())
