@@ -213,8 +213,14 @@ async fn route_request(
             }
         }
 
-        // Temporary JA4/TLS debug endpoint for browser fingerprint inspection.
-        (Method::GET, "/_ts/debug/ja4") => Ok(build_ja4_debug_response(&req)),
+        // JA4/TLS debug endpoint — only active when debug.ja4_endpoint_enabled = true.
+        (Method::GET, "/_ts/debug/ja4") => {
+            if settings.debug.ja4_endpoint_enabled {
+                Ok(build_ja4_debug_response(&req))
+            } else {
+                Ok(Response::from_status(fastly::http::StatusCode::NOT_FOUND))
+            }
+        }
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => {

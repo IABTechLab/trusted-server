@@ -251,8 +251,72 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
 }
 
 #[test]
-fn ja4_debug_route_returns_plain_text_fallback_response() {
+fn ja4_debug_route_returns_404_when_disabled() {
     let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/_ts/debug/ja4");
+    let runtime_services = test_runtime_services(&req);
+    let response = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        req,
+    ))
+    .expect("should route ja4 debug request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "should return 404 when debug.ja4_endpoint_enabled is false"
+    );
+}
+
+fn create_debug_enabled_settings() -> Settings {
+    let base = r#"
+            [[handlers]]
+            path = "^/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [edge_cookie]
+            secret_key = "test-secret-key"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [consent]
+            consent_store = "missing-consent-store"
+
+            [integrations.prebid]
+            enabled = true
+            server_url = "https://test-prebid.com/openrtb2/auction"
+
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            timeout_ms = 2000
+
+            [debug]
+            ja4_endpoint_enabled = true
+        "#;
+    Settings::from_toml(base).expect("should parse debug-enabled test settings")
+}
+
+#[test]
+fn ja4_debug_route_returns_plain_text_fallback_response() {
+    let settings = create_debug_enabled_settings();
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
