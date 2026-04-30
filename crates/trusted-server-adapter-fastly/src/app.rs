@@ -1,9 +1,10 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
 //! Registers all routes from the legacy [`crate::route_request`] into a
-//! [`RouterService`], attaches [`FinalizeResponseMiddleware`] (outermost) and
-//! [`AuthMiddleware`] (inner), and builds the [`AppState`] once per Wasm
-//! instance.
+//! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
+//! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
+//! [`startup_error_router`] returns a bare router without middleware.
+//! Builds the [`AppState`] once per Wasm instance.
 //!
 //! # Route inventory
 //!
@@ -21,6 +22,12 @@
 //! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
 //! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy or publisher fallback |
+//! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | named paths above | publisher fallback (legacy parity for non-primary methods) |
+//!
+//! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
+//! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
+//! > This is a known intentional restriction of the EdgeZero router; the entry-point
+//! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
 //!
 //! # Startup error handling
 //!
@@ -57,8 +64,8 @@ use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
+    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +104,34 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
         registry: Arc::new(registry),
         kv_store,
     }))
+}
+
+/// Resolves per-request consent KV store services for routes that read consent data.
+///
+/// When `settings.consent.consent_store` is configured and the named KV store cannot
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
+/// matches the legacy `route_request` behavior where a misconfigured consent store
+/// makes consent-dependent routes unavailable rather than proceeding without consent.
+///
+/// # Errors
+///
+/// Returns an error when the configured consent store cannot be opened.
+pub(crate) fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +341,13 @@ impl Hooks for TrustedServerApp {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             execute_handler(s, ctx, |state, services, req| async move {
-                handle_auction(&state.settings, &state.orchestrator, &services, req).await
+                match runtime_services_for_consent_route(&state.settings, &services) {
+                    Ok(consent_services) => {
+                        handle_auction(&state.settings, &state.orchestrator, &consent_services, req)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             })
         };
 
@@ -354,7 +395,10 @@ impl Hooks for TrustedServerApp {
         let fallback_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             execute_handler(s, ctx, |state, services, req| async move {
-                dispatch_fallback(&state, &services, req).await
+                match runtime_services_for_consent_route(&state.settings, &services) {
+                    Ok(consent_services) => dispatch_fallback(&state, &consent_services, req).await,
+                    Err(e) => Err(e),
+                }
             })
         };
 
@@ -374,6 +418,30 @@ impl Hooks for TrustedServerApp {
             .get("/first-party/sign", fp_sign_get_handler)
             .post("/first-party/sign", fp_sign_post_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+
+        // matchit prefers exact path+method over a wildcard catch-all. Named paths
+        // registered above for a single method (e.g. GET /first-party/proxy) would
+        // return 405 for other methods (HEAD, OPTIONS, …) instead of falling through
+        // to the publisher fallback. Registering all publisher_fallback_methods on
+        // each named path restores the legacy all-method proxy-to-publisher guarantee.
+        let named_paths_primary_methods: &[(&str, &[Method])] = &[
+            ("/.well-known/trusted-server.json", &[Method::GET]),
+            ("/verify-signature", &[Method::POST]),
+            ("/admin/keys/rotate", &[Method::POST]),
+            ("/admin/keys/deactivate", &[Method::POST]),
+            ("/auction", &[Method::POST]),
+            ("/first-party/proxy", &[Method::GET]),
+            ("/first-party/click", &[Method::GET]),
+            ("/first-party/sign", &[Method::GET, Method::POST]),
+            ("/first-party/proxy-rebuild", &[Method::POST]),
+        ];
+        for (path, primary_methods) in named_paths_primary_methods {
+            for method in publisher_fallback_methods() {
+                if !primary_methods.contains(&method) {
+                    router = router.route(path, method, fallback_handler.clone());
+                }
+            }
+        }
 
         // matchit's `/{*rest}` does not match the bare root `/` — register
         // explicit root routes so `/` reaches the publisher fallback too.
@@ -502,14 +570,39 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_unregistered_method_returns_405_at_router_level() {
-        // Documents the known router-level behavior for unregistered HTTP methods:
-        // the RouterService returns 405 before the middleware chain runs, so
-        // FinalizeResponseMiddleware does not inject TS headers at this layer.
+    fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
+        // Regression guard: HEAD /first-party/proxy must reach the publisher
+        // fallback, not return a router-level 405. Legacy route_request proxies
+        // every (method, path) combination not matched by a specific arm through
+        // to the publisher origin.
         //
-        // The full-system guarantee (TS headers on ALL responses) is maintained
-        // by the entry-point finalize wrap in main.rs, which is idempotent for
-        // requests that did run through the middleware chain.
+        // Without a live backend the publisher proxy errors (502/503), but the
+        // important invariant is that the status is NOT 405.
+        let router = TrustedServerApp::routes();
+        let req = request_builder()
+            .method(Method::HEAD)
+            .uri("/first-party/proxy")
+            .body(Body::empty())
+            .expect("should build HEAD request");
+
+        let response = block_on(router.oneshot(req));
+
+        assert_ne!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "HEAD on a named GET path should reach the publisher fallback, not return 405"
+        );
+    }
+
+    #[test]
+    fn dispatch_unregistered_method_returns_405_at_router_level() {
+        // Documents the known router-level behavior for verbs outside the
+        // publisher_fallback_methods() list (e.g. TRACE, CONNECT): the RouterService
+        // returns 405 before the middleware chain runs, so FinalizeResponseMiddleware
+        // does not inject TS headers at this layer.
+        //
+        // The full-system guarantee (TS headers on ALL responses including these 405s)
+        // is maintained by the entry-point apply_finalize_headers call in main.rs.
         let router = TrustedServerApp::routes();
         let req = request_builder()
             .method(Method::from_bytes(b"TRACE").expect("should parse TRACE"))

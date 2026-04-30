@@ -77,16 +77,9 @@ pub struct ProxyRequestConfig<'a> {
     /// operator setup time rather than at request time.
     ///
     /// **Restricted mode** (non-empty slice): only hosts matching a listed pattern are
-    /// permitted. First-party proxy handlers pass `&settings.proxy.allowed_domains`
-    /// because they follow redirect chains that may originate from untrusted
-    /// creative-supplied URLs.
-    ///
-    /// **Behavior change from pre-PR-14**: `proxy_with_redirects` previously always
-    /// enforced `&settings.proxy.allowed_domains` regardless of the caller. After PR 14,
-    /// only [`handle_first_party_proxy`] and its siblings enforce the operator allowlist;
-    /// integration proxies use open mode. This is intentional: applying the operator
-    /// domain allowlist to integration redirects would require every operator to enumerate
-    /// every integration CDN in their config, which is impractical.
+    /// permitted. Currently only [`handle_first_party_proxy`] passes
+    /// `&settings.proxy.allowed_domains` because it follows redirect chains that may
+    /// originate from untrusted creative-supplied URLs.
     pub allowed_domains: &'a [String],
 }
 

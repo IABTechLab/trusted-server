@@ -83,7 +83,6 @@ sha2 = "0.10.9"
 subtle = "2.6"
 temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
-tokio-test = "0.4"
 toml = "1.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"

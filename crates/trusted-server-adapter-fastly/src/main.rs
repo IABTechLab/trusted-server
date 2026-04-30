@@ -38,15 +38,15 @@ mod platform;
 #[cfg(test)]
 mod route_tests;
 
-use crate::app::{build_state, TrustedServerApp};
+use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::apply_finalize_headers;
-use crate::platform::{build_runtime_services, open_kv_store, FastlyPlatformGeo};
+use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
 ///
-/// Accepted values (after whitespace trimming): `"true"` and `"1"`.
+/// Accepted values (after whitespace trimming): `"1"` or `"true"` in any ASCII case.
 /// All other values, including the empty string, are treated as disabled.
 fn parse_edgezero_flag(value: &str) -> bool {
     let v = value.trim();
@@ -104,15 +104,25 @@ fn main(mut req: FastlyRequest) -> Result<FastlyResponse, Error> {
         );
         // Apply finalize headers at the entry point so that router-level 405/404
         // responses for unregistered HTTP methods (e.g. TRACE, WebDAV verbs)
-        // carry TS/geo headers, matching the legacy path's all-methods guarantee.
-        // For requests that ran through FinalizeResponseMiddleware, this is
-        // idempotent — header::insert overwrites with the same values.
-        if let Ok(settings) = get_settings() {
-            let geo_info = FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
-                log::warn!("entry-point geo lookup failed: {e}");
-                None
-            });
-            apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+        // carry TS/geo headers. Responses that already ran through
+        // FinalizeResponseMiddleware will have their headers overwritten here,
+        // so the 401 geo-skip rule must be reproduced (same as middleware.rs).
+        match get_settings() {
+            Ok(settings) => {
+                let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED
+                {
+                    None
+                } else {
+                    FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+                        log::warn!("entry-point geo lookup failed: {e}");
+                        None
+                    })
+                };
+                apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
+            }
+            Err(e) => {
+                log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+            }
         }
         Ok(compat::to_fastly_response(response))
     } else {
@@ -302,24 +312,6 @@ pub(crate) fn resolve_publisher_response(
             Ok(response)
         }
     }
-}
-
-fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

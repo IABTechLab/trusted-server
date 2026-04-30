@@ -99,13 +99,15 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
+/// - `Err(report)` → internal error; log and convert to an HTTP response via
+///   [`crate::app::http_error`] using the error's documented status code.
 ///
 /// # Errors
 ///
-/// When [`enforce_basic_auth`] returns an error report, converts it to a 500 HTTP
-/// response so that [`FinalizeResponseMiddleware`] can still inject standard TS
-/// headers before the response reaches the client.
+/// When [`enforce_basic_auth`] returns an error report, converts it to an HTTP
+/// response via [`crate::app::http_error`] (preserving the error's status code)
+/// so that [`FinalizeResponseMiddleware`] can still inject standard TS headers
+/// before the response reaches the client.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
