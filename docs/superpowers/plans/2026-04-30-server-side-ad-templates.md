@@ -6,7 +6,7 @@
 
 **Architecture:** A new `creative-opportunities.toml` file holds per-URL slot templates. At request time, the publisher path matches the URL, fires the auction and origin fetch in parallel via `send_async()`, then injects two `<script>` globals into `<head>` — one from config at head-open and one from auction results just before `</head>` via `lol_html`'s `el.on_end_tag()` (registered inside the single existing `element!("head", ...)` handler).
 
-**Tech Stack:** Rust 2021, `lol_html` 2.7.2 (existing dep), `glob` crate (new workspace dep), `serde`/`toml` (existing), `AuctionOrchestrator::run_auction` (existing `async fn`), TypeScript for GPT shim extension.
+**Tech Stack:** Rust 2024, `lol_html` 2.7.2 (existing dep), `glob` crate (new workspace dep), `serde`/`toml` (existing), `AuctionOrchestrator::run_auction` (existing `async fn`), TypeScript for GPT shim extension.
 
 ---
 
