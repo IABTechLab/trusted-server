@@ -61,11 +61,11 @@ Bot detection also provides forward-compatibility with RSL / HTTP 402 responses
 
 Bot classification uses three signals computed at the edge before any KV I/O:
 
-| Signal | Source | How used |
-|---|---|---|
-| `known_browser` | JA4 Section 1 allowlist | Primary gate — see below |
-| `ja4_class` cipher count | `req.get_tls_ja4()` | Count > 25 → confirmed bot |
-| UA string | `User-Agent` header | Platform class derivation; empty/absent → treat as bot |
+| Signal                   | Source                  | How used                                               |
+| ------------------------ | ----------------------- | ------------------------------------------------------ |
+| `known_browser`          | JA4 Section 1 allowlist | Primary gate — see below                               |
+| `ja4_class` cipher count | `req.get_tls_ja4()`     | Count > 25 → confirmed bot                             |
+| UA string                | `User-Agent` header     | Platform class derivation; empty/absent → treat as bot |
 
 JA4 is available via `req.get_tls_ja4()` in the Fastly Compute Rust SDK.
 H2 fingerprint is available via `req.get_client_h2_fingerprint()`.
@@ -73,11 +73,11 @@ H2 fingerprint is available via `req.get_client_h2_fingerprint()`.
 **Known browser allowlist** (Section 1 of JA4 only — browser class, not
 unique device):
 
-| Browser | `ja4_class` (JA4 §1) |
-|---|---|
-| Chrome / Chromium | `t13d1516h2` |
-| Safari (Mac and iOS) | `t13d2013h2` |
-| Firefox | `t13d1717h2` |
+| Browser              | `ja4_class` (JA4 §1) |
+| -------------------- | -------------------- |
+| Chrome / Chromium    | `t13d1516h2`         |
+| Safari (Mac and iOS) | `t13d2013h2`         |
+| Firefox              | `t13d1717h2`         |
 
 Any JA4 Section 1 value not in this allowlist sets `known_browser = null`.
 Confirmed bot patterns (cipher count > 25, or curl/libcurl fingerprints) set
@@ -192,20 +192,20 @@ pub fp_signal_ttl_sec: u64,
 
 Derived from a real autoblog.com Chrome cookie jar (2026-04-02):
 
-| Partner ID | `fp_signal_cookie_names` | `fp_signal_json_path` | Notes |
-|---|---|---|---|
-| `id5` | `["id5id"]` | `"universal_uid"` | Value is JSON object |
-| `trade_desk` | `["pbjs-unifiedid"]` | `"TDID"` | Value is JSON object; check `TDID_LOOKUP == "TRUE"` |
-| `liveramp_ats` | `["idl_env"]` | — | Raw envelope string; opaque to TS |
-| `lockr` | `["lockr_tracking_id"]` | — | Raw UUID string |
-| `kargo` | `["krg_uid"]` | `"v.userId"` | Doubly-nested JSON |
-| `prebid_sharedid` | `["sharedId", "_sharedid", "_sharedID"]` | — | Multiple cookie names, same UID |
-| `lotame` | `["panoramaId"]` | — | Raw hex string |
-| `audigent` | `["_au_1d"]` | — | Raw string |
-| `yahoo_connectid` | `["connectId"]` | `"connectId"` | Value is JSON object |
-| `lotame_cc` | `["_cc_id"]` | — | Raw hex string |
-| `uid2` | `["__uid2_advertising_token"]` | `"advertising_token"` | Short-TTL token; see §1.6 |
-| `arena` | `["ArenaID", "_ig"]` | — | Arena Group first-party ID |
+| Partner ID        | `fp_signal_cookie_names`                 | `fp_signal_json_path` | Notes                                               |
+| ----------------- | ---------------------------------------- | --------------------- | --------------------------------------------------- |
+| `id5`             | `["id5id"]`                              | `"universal_uid"`     | Value is JSON object                                |
+| `trade_desk`      | `["pbjs-unifiedid"]`                     | `"TDID"`              | Value is JSON object; check `TDID_LOOKUP == "TRUE"` |
+| `liveramp_ats`    | `["idl_env"]`                            | —                     | Raw envelope string; opaque to TS                   |
+| `lockr`           | `["lockr_tracking_id"]`                  | —                     | Raw UUID string                                     |
+| `kargo`           | `["krg_uid"]`                            | `"v.userId"`          | Doubly-nested JSON                                  |
+| `prebid_sharedid` | `["sharedId", "_sharedid", "_sharedID"]` | —                     | Multiple cookie names, same UID                     |
+| `lotame`          | `["panoramaId"]`                         | —                     | Raw hex string                                      |
+| `audigent`        | `["_au_1d"]`                             | —                     | Raw string                                          |
+| `yahoo_connectid` | `["connectId"]`                          | `"connectId"`         | Value is JSON object                                |
+| `lotame_cc`       | `["_cc_id"]`                             | —                     | Raw hex string                                      |
+| `uid2`            | `["__uid2_advertising_token"]`           | `"advertising_token"` | Short-TTL token; see §1.6                           |
+| `arena`           | `["ArenaID", "_ig"]`                     | —                     | Arena Group first-party ID                          |
 
 This table ships as the default partner registry seed. Publishers register
 partners via `POST /_ts/admin/partners/register`; the first-party signal
@@ -248,12 +248,12 @@ no new concurrency logic needed.
 
 `fp_signal_json_path` uses dot-notation for nested fields:
 
-| Path | Input | Extracted |
-|---|---|---|
-| `"universal_uid"` | `{"universal_uid":"ID5*...","version":1}` | `"ID5*..."` |
-| `"v.userId"` | `{"v":{"userId":"d8f4..."}}` | `"d8f4..."` |
-| `"connectId"` | `{"connectId":"7vsQ..."}` | `"7vsQ..."` |
-| _(absent)_ | `16d913a7-d56c-...` | `"16d913a7-d56c-..."` |
+| Path              | Input                                     | Extracted             |
+| ----------------- | ----------------------------------------- | --------------------- |
+| `"universal_uid"` | `{"universal_uid":"ID5*...","version":1}` | `"ID5*..."`           |
+| `"v.userId"`      | `{"v":{"userId":"d8f4..."}}`              | `"d8f4..."`           |
+| `"connectId"`     | `{"connectId":"7vsQ..."}`                 | `"7vsQ..."`           |
+| _(absent)_        | `16d913a7-d56c-...`                       | `"16d913a7-d56c-..."` |
 
 Implementation: split on `.`, walk the JSON tree, extract string leaf. If
 parsing fails or path is missing, log at `debug` and skip — never error.
@@ -396,6 +396,7 @@ Authorization: Bearer <ts_pull_token>
 ```
 
 Response:
+
 ```json
 { "envelope": "<RampID-envelope-string>" }
 ```
@@ -462,14 +463,14 @@ signals from `KvMetadata` are read during the same operation.
 
 Decision table (evaluated in order, first match wins):
 
-| Condition | Decision |
-|---|---|
-| `known_browser` is `false` or `null` | **Never** — non-human client |
-| `cluster_size > threshold` (default 10) | **Never** — corporate/shared network |
-| `geo.asn` is a known mobile carrier ASN | **Propagate** — individual device confirmed |
+| Condition                                                               | Decision                                                                    |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `known_browser` is `false` or `null`                                    | **Never** — non-human client                                                |
+| `cluster_size > threshold` (default 10)                                 | **Never** — corporate/shared network                                        |
+| `geo.asn` is a known mobile carrier ASN                                 | **Propagate** — individual device confirmed                                 |
 | Source `platform_class` == target `platform_class`, `ja4_class` differs | **Propagate** — same machine, different browser (e.g. Chrome→Safari on Mac) |
-| Source `platform_class` != target `platform_class`, `cluster_size` <= 3 | **Propagate** — probable personal device |
-| Anything else | **Skip** — insufficient confidence |
+| Source `platform_class` != target `platform_class`, `cluster_size` <= 3 | **Propagate** — probable personal device                                    |
+| Anything else                                                           | **Skip** — insufficient confidence                                          |
 
 ### 3.3 The same-machine case
 

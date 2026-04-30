@@ -4,7 +4,7 @@ status: draft
 
 # Microsoft Monetize Integration with Server-Side Ad Templates - Codex Reviewed Spec
 
-*April 2026*
+_April 2026_
 
 ---
 
@@ -401,11 +401,11 @@ Baseline POC policy:
 
 ```javascript
 f.setAttribute(
-  "sandbox",
-  "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms"
-);
-f.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
-f.srcdoc = c[id].m;
+  'sandbox',
+  'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms'
+)
+f.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin')
+f.srcdoc = c[id].m
 ```
 
 Do not include `allow-same-origin` unless Microsoft confirms it is required and
@@ -509,30 +509,33 @@ the platform streaming API to manage transfer details.
 The generated JavaScript should be compact but explicit:
 
 ```javascript
-(function(){
-  var c = CREATIVE_JSON;
-  function render(){
-    Object.keys(c).forEach(function(id){
-      var r = c[id];
-      var el = document.getElementById(id);
-      if (!el || el.getAttribute("data-ts-ad-rendered") === "1") return;
-      var f = document.createElement("iframe");
-      f.width = String(r.w);
-      f.height = String(r.h);
-      f.style.border = "0";
-      f.scrolling = "no";
-      f.setAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms");
-      f.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
-      f.srcdoc = r.m;
-      el.setAttribute("data-ts-ad-rendered", "1");
-      el.appendChild(f);
-    });
+;(function () {
+  var c = CREATIVE_JSON
+  function render() {
+    Object.keys(c).forEach(function (id) {
+      var r = c[id]
+      var el = document.getElementById(id)
+      if (!el || el.getAttribute('data-ts-ad-rendered') === '1') return
+      var f = document.createElement('iframe')
+      f.width = String(r.w)
+      f.height = String(r.h)
+      f.style.border = '0'
+      f.scrolling = 'no'
+      f.setAttribute(
+        'sandbox',
+        'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms'
+      )
+      f.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin')
+      f.srcdoc = r.m
+      el.setAttribute('data-ts-ad-rendered', '1')
+      el.appendChild(f)
+    })
   }
-  render();
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", render, { once: true });
+  render()
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', render, { once: true })
   }
-})();
+})()
 ```
 
 For late-rendered slots, the POC may add a bounded `MutationObserver`. Keep the

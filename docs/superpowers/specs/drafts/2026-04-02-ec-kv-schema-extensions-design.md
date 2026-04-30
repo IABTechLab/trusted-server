@@ -90,6 +90,7 @@ pub struct KvDomainVisit {
 ```
 
 Added to `KvEntry`:
+
 ```rust
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub pub_properties: Option<KvPubProperties>,
@@ -137,6 +138,7 @@ pub struct KvNetwork {
 ```
 
 Added to `KvEntry`:
+
 ```rust
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub network: Option<KvNetwork>,
@@ -151,12 +153,12 @@ expensive for the hot path.
 
 ### Threshold guidance
 
-| Cluster size | Likely scenario |
-|---|---|
-| 1–3 | Individual / household |
-| 4–10 | Small shared space (family, small office) |
-| 11–50 | Medium office, hotel, coworking |
-| 50+ | Corporate VPN, university, campus |
+| Cluster size | Likely scenario                           |
+| ------------ | ----------------------------------------- |
+| 1–3          | Individual / household                    |
+| 4–10         | Small shared space (family, small office) |
+| 11–50        | Medium office, hotel, coworking           |
+| 50+          | Corporate VPN, university, campus         |
 
 **Default trust threshold:** entries with `cluster_size <= 10` are treated as
 individual users for identity resolution purposes. Configurable per publisher
@@ -186,11 +188,11 @@ send Client Hints.
 
 **`is_mobile`** — derived in priority order:
 
-| Condition | Value |
-|---|---|
-| UA contains `iPhone`, `iPad`, or `Android` | `1` — confirmed mobile |
-| UA contains `Macintosh`, `Windows`, or `Linux` | `0` — confirmed desktop |
-| Neither pattern matches | `2` — genuinely unknown (rare; typically bots or heavily hardened clients) |
+| Condition                                      | Value                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------- |
+| UA contains `iPhone`, `iPad`, or `Android`     | `1` — confirmed mobile                                                     |
+| UA contains `Macintosh`, `Windows`, or `Linux` | `0` — confirmed desktop                                                    |
+| Neither pattern matches                        | `2` — genuinely unknown (rare; typically bots or heavily hardened clients) |
 
 Note: `is_mobile: 2` in practice signals a non-standard client rather than
 Safari, since Safari always produces a recognizable UA platform string.
@@ -202,15 +204,15 @@ uniquely fingerprinting a device. The full JA4 is never stored.
 
 **`platform_class`** — coarse OS family parsed from UA:
 
-| UA segment | `platform_class` |
-|---|---|
-| `Macintosh; Intel Mac OS X` | `mac` |
-| `Windows NT` | `windows` |
-| `iPhone; CPU iPhone OS` | `ios` |
-| `iPad; CPU OS` | `ios` |
-| `Linux; Android` | `android` |
-| `Linux` (non-Android) | `linux` |
-| No match | `null` |
+| UA segment                  | `platform_class` |
+| --------------------------- | ---------------- |
+| `Macintosh; Intel Mac OS X` | `mac`            |
+| `Windows NT`                | `windows`        |
+| `iPhone; CPU iPhone OS`     | `ios`            |
+| `iPad; CPU OS`              | `ios`            |
+| `Linux; Android`            | `android`        |
+| `Linux` (non-Android)       | `linux`          |
+| No match                    | `null`           |
 
 **`h2_fp_hash`** — first 12 hex characters of SHA256 of the raw HTTP/2
 SETTINGS fingerprint string, available via `req.get_client_h2_fingerprint()`.
@@ -224,12 +226,12 @@ they match a known bot/scraper pattern. `null` when unknown.
 
 Empirically derived from Fastly Compute production responses (2026-04-03):
 
-| Browser | `ja4_class` | `h2_fp` prefix | `known_browser` |
-|---|---|---|---|
-| Chrome/Mac (v146) | `t13d1516h2` | `1:65536;2:0;4:6291456;6:262144` | `true` |
-| Safari/Mac (v26) | `t13d2013h2` | `2:0;3:100;4:2097152` | `true` |
-| Safari/iOS (v26) | `t13d2013h2` | `2:0;3:100;4:2097152` | `true` |
-| Firefox/Mac (v149) | `t13d1717h2` | `1:65536;2:0;4:131072;5:16384` | `true` |
+| Browser            | `ja4_class`  | `h2_fp` prefix                   | `known_browser` |
+| ------------------ | ------------ | -------------------------------- | --------------- |
+| Chrome/Mac (v146)  | `t13d1516h2` | `1:65536;2:0;4:6291456;6:262144` | `true`          |
+| Safari/Mac (v26)   | `t13d2013h2` | `2:0;3:100;4:2097152`            | `true`          |
+| Safari/iOS (v26)   | `t13d2013h2` | `2:0;3:100;4:2097152`            | `true`          |
+| Firefox/Mac (v149) | `t13d1717h2` | `1:65536;2:0;4:131072;5:16384`   | `true`          |
 
 Safari Mac and Safari iOS share identical TLS/H2 stacks — distinguished only
 by `platform_class` (`mac` vs `ios`) and `is_mobile` (`0` vs `1`).
@@ -266,6 +268,7 @@ pub struct KvDevice {
 ```
 
 Added to `KvEntry`:
+
 ```rust
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub device: Option<KvDevice>,
@@ -280,10 +283,10 @@ Device signals are derived on every request as pure in-memory computation —
 no KV I/O. The result gates all downstream KV and cookie operations:
 
 | `known_browser` | KV entry created | Cookie set | Partner IDs written |
-|---|---|---|---|
-| `true` | Yes | Yes | Yes |
-| `false` | **No** | **No** | **No** |
-| `null` | **No** | **No** | **No** |
+| --------------- | ---------------- | ---------- | ------------------- |
+| `true`          | Yes              | Yes        | Yes                 |
+| `false`         | **No**           | **No**     | **No**              |
+| `null`          | **No**           | **No**     | **No**              |
 
 `null` (unrecognised client) is treated the same as `false`. An advertiser
 cannot bid on a session we cannot verify as human — allowing `null` entries
@@ -339,11 +342,12 @@ Worst-case metadata size with all additions: ~90 bytes — well within the
 
 ## 7. IP address storage policy
 
-Raw IP addresses are personal data under GDPR (CJEU *Breyer v. Germany*, 2016)
+Raw IP addresses are personal data under GDPR (CJEU _Breyer v. Germany_, 2016)
 and must not be stored in KV entries. The EC hash already derives from the IP
 without persisting it.
 
 Permitted IP-derived signals (written at creation time):
+
 - `geo.country` — ISO 3166-1 alpha-2
 - `geo.region` — ISO 3166-2 subdivision
 - `geo.asn` — ASN number (network identifier, not personal data)
@@ -357,12 +361,18 @@ Three representative entries showing the Chrome seed, Safari/Mac propagation
 target, and Safari/iOS mobile entry.
 
 **Chrome/Mac (seed entry):**
+
 ```json
 {
   "v": 2,
   "created": 1775162556,
   "last_seen": 1775162556,
-  "consent": { "tcf": "CP...", "gpp": "DBA...", "ok": true, "updated": 1775162556 },
+  "consent": {
+    "tcf": "CP...",
+    "gpp": "DBA...",
+    "ok": true,
+    "updated": 1775162556
+  },
   "geo": { "country": "US", "region": "TN", "asn": 7922, "dma": 659 },
   "device": {
     "is_mobile": 0,
@@ -379,16 +389,26 @@ target, and Safari/iOS mobile entry.
   },
   "network": { "cluster_size": 2, "cluster_checked": 1775162556 },
   "ids": {
-    "id5":             { "uid": "ID5*qe8VHv...", "synced": 1775162556 },
-    "trade_desk":      { "uid": "226fb4b3-6032-405a-a5a5-4fe4d6303932", "synced": 1775162556 },
-    "liveramp_ats":    { "uid": "Ag2z1TDAfChu...", "synced": 1775162556 },
-    "lockr":           { "uid": "b545e78c-2c4f-4fd3-8a99-32c02ada962d", "synced": 1775162556 },
-    "prebid_sharedid": { "uid": "16d913a7-d56c-4e0d-8036-d0dce637707e", "synced": 1775162556 }
+    "id5": { "uid": "ID5*qe8VHv...", "synced": 1775162556 },
+    "trade_desk": {
+      "uid": "226fb4b3-6032-405a-a5a5-4fe4d6303932",
+      "synced": 1775162556
+    },
+    "liveramp_ats": { "uid": "Ag2z1TDAfChu...", "synced": 1775162556 },
+    "lockr": {
+      "uid": "b545e78c-2c4f-4fd3-8a99-32c02ada962d",
+      "synced": 1775162556
+    },
+    "prebid_sharedid": {
+      "uid": "16d913a7-d56c-4e0d-8036-d0dce637707e",
+      "synced": 1775162556
+    }
   }
 }
 ```
 
 **Safari/Mac (same machine — `platform_class: mac` + differing `ja4_class` → propagate):**
+
 ```json
 {
   "v": 2,
@@ -411,16 +431,26 @@ target, and Safari/iOS mobile entry.
   },
   "network": { "cluster_size": 2, "cluster_checked": 1775165000 },
   "ids": {
-    "id5":             { "uid": "ID5*qe8VHv...", "synced": 1775162556 },
-    "trade_desk":      { "uid": "226fb4b3-6032-405a-a5a5-4fe4d6303932", "synced": 1775162556 },
-    "liveramp_ats":    { "uid": "Ag2z1TDAfChu...", "synced": 1775162556 },
-    "lockr":           { "uid": "b545e78c-2c4f-4fd3-8a99-32c02ada962d", "synced": 1775162556 },
-    "prebid_sharedid": { "uid": "16d913a7-d56c-4e0d-8036-d0dce637707e", "synced": 1775162556 }
+    "id5": { "uid": "ID5*qe8VHv...", "synced": 1775162556 },
+    "trade_desk": {
+      "uid": "226fb4b3-6032-405a-a5a5-4fe4d6303932",
+      "synced": 1775162556
+    },
+    "liveramp_ats": { "uid": "Ag2z1TDAfChu...", "synced": 1775162556 },
+    "lockr": {
+      "uid": "b545e78c-2c4f-4fd3-8a99-32c02ada962d",
+      "synced": 1775162556
+    },
+    "prebid_sharedid": {
+      "uid": "16d913a7-d56c-4e0d-8036-d0dce637707e",
+      "synced": 1775162556
+    }
   }
 }
 ```
 
 **Safari/iOS (mobile carrier ASN 21928 — individual device signal):**
+
 ```json
 {
   "v": 2,
@@ -447,8 +477,16 @@ target, and Safari/iOS mobile entry.
 ```
 
 **Updated `KvMetadata`:**
+
 ```json
-{ "ok": true, "country": "US", "v": 2, "cluster_size": 2, "is_mobile": 0, "known_browser": true }
+{
+  "ok": true,
+  "country": "US",
+  "v": 2,
+  "cluster_size": 2,
+  "is_mobile": 0,
+  "known_browser": true
+}
 ```
 
 ---

@@ -4,7 +4,7 @@ status: draft
 
 # Generate Feature Docs Skill Design
 
-*April 2026*
+_April 2026_
 
 ## 1. Overview
 
@@ -28,7 +28,7 @@ The generated docs are aimed at publishers and integrators running Trusted Serve
 
 The following are deliberately out of scope for this skill, to keep the implementation focused and to define a clean handoff to a future skill #2 (spec-vs-reality gap analysis).
 
-1. Detecting drift between spec and code *behavior*. The skill verifies that handles exist; it does not verify that the code does what the spec says it does. That is skill #2.
+1. Detecting drift between spec and code _behavior_. The skill verifies that handles exist; it does not verify that the code does what the spec says it does. That is skill #2.
 2. Updating non-reference narrative docs. `getting-started.md`, `gdpr-compliance.md`, `architecture.md`, and similar pages are humans' responsibility.
 3. Translating, localizing, or summarizing the spec for marketing.
 4. Generating diagrams. If a Sequence section is needed, the skill emits a numbered list. Mermaid diagrams are added by humans in follow-up edits.
@@ -131,31 +131,36 @@ Read-only. Produces a structured outline shown to the user in chat.
 **Sequence section:** yes (request, token check, log, response)
 
 ### Config keys
-| Key                  | Status     | Location                |
-| -------------------- | ---------- | ----------------------- |
-| `rsl.enabled`        | verified   | `settings.rs:142`       |
-| `rsl.allowlist`      | NOT FOUND  | spec only               |
+
+| Key             | Status    | Location          |
+| --------------- | --------- | ----------------- |
+| `rsl.enabled`   | verified  | `settings.rs:142` |
+| `rsl.allowlist` | NOT FOUND | spec only         |
 
 ### Endpoints
-| Path                     | Methods | Status   | Location               |
-| ------------------------ | ------- | -------- | ---------------------- |
-| `/.well-known/rsl.json`  | GET     | verified | `rsl_handler.rs:25`    |
+
+| Path                    | Methods | Status   | Location            |
+| ----------------------- | ------- | -------- | ------------------- |
+| `/.well-known/rsl.json` | GET     | verified | `rsl_handler.rs:25` |
 
 ### Headers
-| Name           | Direction | Status   | Location               |
-| -------------- | --------- | -------- | ---------------------- |
-| `X-RSL-Token`  | request   | verified | `rsl/headers.rs:8`     |
+
+| Name          | Direction | Status   | Location           |
+| ------------- | --------- | -------- | ------------------ |
+| `X-RSL-Token` | request   | verified | `rsl/headers.rs:8` |
 
 ### Error variants
-| Variant                  | Status   | Location              |
-| ------------------------ | -------- | --------------------- |
-| `RslError::InvalidToken` | verified | `rsl/error.rs:14`     |
+
+| Variant                  | Status   | Location          |
+| ------------------------ | -------- | ----------------- |
+| `RslError::InvalidToken` | verified | `rsl/error.rs:14` |
 
 ### Issues
+
 - `rsl.allowlist` referenced in spec but not in code. Options:
-   (A) Mark inline as "planned, not yet shipped"
-   (B) Drop the row from configuration.md
-   (C) Pause and let me fix the spec or the code first
+  (A) Mark inline as "planned, not yet shipped"
+  (B) Drop the row from configuration.md
+  (C) Pause and let me fix the spec or the code first
 
 Reply `proceed`, redirect specific fields, or pick A, B, or C for each issue.
 ```
@@ -208,7 +213,7 @@ When the target page already exists:
 1. Walk the page's H2 and H3 structure.
 2. For each template section that already exists in the page: leave existing prose alone. Only add new items, for example a new row in a config table or a new bullet in a list. Never rewrite human-authored prose for stylistic reasons.
 3. For sections in the template that do not exist in the page: insert them in template order.
-4. For prose that *contradicts* the new spec or current code (e.g., a sentence mentioning a config key that no longer exists, or a behavioral claim that the spec has revised): show the existing text and the proposed replacement, and ask the user to approve, skip, or edit per item. This is the only path by which the skill rewrites existing prose.
+4. For prose that _contradicts_ the new spec or current code (e.g., a sentence mentioning a config key that no longer exists, or a behavioral claim that the spec has revised): show the existing text and the proposed replacement, and ask the user to approve, skip, or edit per item. This is the only path by which the skill rewrites existing prose.
 
 The default posture is conservative. Under-augmenting is recoverable; destroying a teammate's hand-edits is not.
 
@@ -245,19 +250,19 @@ File paths are clickable in the user's editor (the skill emits markdown links wi
 
 ## 10. Edge cases and failure modes
 
-| Case                                                  | Behavior                                                                                                                                                                            |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Spec lacks `status: implemented`                      | Prompt with `(y/N)` default N, abort unless explicit `y`.                                                                                                                           |
-| Spec covers multiple features                         | List candidates, ask user to pick: one page per feature, combined page, or subset. No default.                                                                                      |
-| Non-feature spec (migration, readiness, tech-spec)    | Prompt: "this looks like a `<kind>` spec, continue anyway?". No automatic fallback.                                                                                                  |
-| No shipped code (zero handles verify)                 | Prompt: "no shipped code found. Generate stub page with sections marked 'planned, not yet shipped', or abort?". The deeper "is the behavior correct" question is for skill #2.       |
-| Spec is internally contradictory                      | Surface in stage 1 under "Inconsistencies", ask user to resolve before proceeding.                                                                                                  |
-| Target page name cannot be determined                 | Ask the user for the target path explicitly.                                                                                                                                        |
-| Spec file not found                                   | Hard error, abort.                                                                                                                                                                  |
-| Spec file outside `docs/superpowers/specs/implemented/` | Warn once, ask "is this really an implemented spec?", then proceed if confirmed.                                                                                                    |
-| Current branch is `main` or `master`                  | Hard stop, no override. Propose `docs/<feature-slug>` branch name.                                                                                                                  |
-| Working tree has unrelated uncommitted changes        | Hard stop, no override. User must clean up first.                                                                                                                                   |
-| Re-run on a spec that has already produced docs       | Supported. Stage 1 finds the existing page. Stage 2 augments per Section 9.4. A clean re-run with no spec or code changes produces zero diff (idempotency).                        |
+| Case                                                    | Behavior                                                                                                                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Spec lacks `status: implemented`                        | Prompt with `(y/N)` default N, abort unless explicit `y`.                                                                                                                      |
+| Spec covers multiple features                           | List candidates, ask user to pick: one page per feature, combined page, or subset. No default.                                                                                 |
+| Non-feature spec (migration, readiness, tech-spec)      | Prompt: "this looks like a `<kind>` spec, continue anyway?". No automatic fallback.                                                                                            |
+| No shipped code (zero handles verify)                   | Prompt: "no shipped code found. Generate stub page with sections marked 'planned, not yet shipped', or abort?". The deeper "is the behavior correct" question is for skill #2. |
+| Spec is internally contradictory                        | Surface in stage 1 under "Inconsistencies", ask user to resolve before proceeding.                                                                                             |
+| Target page name cannot be determined                   | Ask the user for the target path explicitly.                                                                                                                                   |
+| Spec file not found                                     | Hard error, abort.                                                                                                                                                             |
+| Spec file outside `docs/superpowers/specs/implemented/` | Warn once, ask "is this really an implemented spec?", then proceed if confirmed.                                                                                               |
+| Current branch is `main` or `master`                    | Hard stop, no override. Propose `docs/<feature-slug>` branch name.                                                                                                             |
+| Working tree has unrelated uncommitted changes          | Hard stop, no override. User must clean up first.                                                                                                                              |
+| Re-run on a spec that has already produced docs         | Supported. Stage 1 finds the existing page. Stage 2 augments per Section 9.4. A clean re-run with no spec or code changes produces zero diff (idempotency).                    |
 
 ## 11. Verification and validation
 
@@ -377,4 +382,3 @@ These amendments do NOT require:
 - Changes to the directory layout in Section 7.
 - Changes to the prose-writing rules or template in Section 9.
 - Re-running the validation cases that already passed in Section 11. The amendments are additive checks and do not affect happy-path behavior.
-

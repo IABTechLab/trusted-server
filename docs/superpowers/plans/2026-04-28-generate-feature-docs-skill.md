@@ -21,6 +21,7 @@ Setup work that must complete before the skill itself is built. None of these ta
 **Why:** The docs site at iabtechlab.github.io/trusted-server is currently rendering internal engineering specs from `docs/superpowers/specs/` because the VitePress config does not exclude them. This is a pre-existing privacy issue that the skill design depends on. Must be fixed before the skill is used in normal operation.
 
 **Files:**
+
 - Modify: `docs/.vitepress/config.mts`
 
 - [ ] **Step 1: Read the existing config**
@@ -54,6 +55,7 @@ export default withMermaid(
 - [ ] **Step 3: Build the docs locally**
 
 Run:
+
 ```bash
 cd docs && npm run build
 ```
@@ -63,6 +65,7 @@ Expected: build completes without errors. Output goes to `docs/.vitepress/dist/`
 - [ ] **Step 4: Verify excluded pages are absent from the build output**
 
 Run:
+
 ```bash
 find docs/.vitepress/dist -path '*/superpowers/*' | head
 ```
@@ -83,6 +86,7 @@ git commit -m "Exclude internal specs from VitePress build"
 **Why:** The directory split (drafts/ vs implemented/) is the structural signal for the spec lifecycle. The `drafts/` directory already exists (created when the design spec was written). The `implemented/` directory does not exist yet; create it now with a `.gitkeep` so the convention is in place before any specs are promoted.
 
 **Files:**
+
 - Create: `docs/superpowers/specs/implemented/.gitkeep`
 
 - [ ] **Step 1: Create the directory and the keepfile**
@@ -114,6 +118,7 @@ git commit -m "Add implemented/ directory for promoted specs"
 **Why:** All 12 existing specs at `docs/superpowers/specs/*.md` are brainstorm output, not finalized. They must live under `drafts/` and carry `status: draft` frontmatter to match the convention. The new design spec already lives in `drafts/`; this task handles the other 12.
 
 **Files:**
+
 - Move and modify: all 12 files matching `docs/superpowers/specs/*.md`
 
 The 12 files:
@@ -218,6 +223,7 @@ git commit -m "Move existing specs to drafts/ with status: draft frontmatter"
 **Why:** The directory layout and `status:` frontmatter are conventions Claude must follow when invoked from this repo. CLAUDE.md is the right place because the harness rules give CLAUDE.md priority over default skill behavior. This is also where future contributors will look.
 
 **Files:**
+
 - Modify: `CLAUDE.md`
 
 - [ ] **Step 1: Read CLAUDE.md and locate a suitable insertion point**
@@ -238,12 +244,14 @@ Implementation specs live under `docs/superpowers/specs/`, split by lifecycle:
 
 **Required frontmatter** (every spec):
 
-\`\`\`yaml
----
+## \`\`\`yaml
+
 status: draft | in-progress | implemented
-implemented_in: PR#123    # optional, set on promotion
-last_reviewed: 2026-04-15  # optional, YYYY-MM-DD
+implemented_in: PR#123 # optional, set on promotion
+last_reviewed: 2026-04-15 # optional, YYYY-MM-DD
+
 ---
+
 \`\`\`
 
 **For agents writing new specs:** when invoked from this project, the brainstorming skill must write to `docs/superpowers/specs/drafts/`, not the parent directory. Add `status: draft` frontmatter at write time.
@@ -281,6 +289,7 @@ Build the slash command and the skill itself. After Phase 2, the skill is invoka
 **Why:** The slash command is the user-facing entry point. Following the existing convention (`check-ci.md`, `verify.md`, etc.), it is a thin file that invokes the skill with `$ARGUMENTS`.
 
 **Files:**
+
 - Create: `.claude/commands/generate-feature-docs.md`
 
 - [ ] **Step 1: Read an existing slash command to match the pattern**
@@ -327,6 +336,7 @@ git commit -m "Add /generate-feature-docs slash command"
 **Why:** SKILL.md is the heart of the skill. It is loaded into Claude's context whenever the skill is invoked. The file is built up across Tasks 6, 7, 8, and 9, one logical section per task, so each commit is reviewable in isolation. This task lays the foundation: the skill's identity, when it activates, what it operates on, and the spec-readiness convention.
 
 **Files:**
+
 - Create: `.claude/skills/generate-feature-docs/SKILL.md`
 
 - [ ] **Step 1: Create the directory**
@@ -339,10 +349,10 @@ mkdir -p .claude/skills/generate-feature-docs
 
 Write the following content to `.claude/skills/generate-feature-docs/SKILL.md`. This is the initial file; subsequent tasks extend it.
 
-````markdown
+```markdown
 ---
 name: generate-feature-docs
-description: "Use when generating, writing, or updating publisher-facing documentation from an implemented engineering spec. Activates on requests like \"generate docs for spec X\", \"write a guide page for the RSL spec\", \"update docs for the EC KV extension\". Operates on specs under docs/superpowers/specs/implemented/ with status implemented frontmatter."
+description: 'Use when generating, writing, or updating publisher-facing documentation from an implemented engineering spec. Activates on requests like "generate docs for spec X", "write a guide page for the RSL spec", "update docs for the EC KV extension". Operates on specs under docs/superpowers/specs/implemented/ with status implemented frontmatter.'
 ---
 
 # Generate Feature Docs
@@ -364,9 +374,11 @@ Before doing anything else, parse the spec's YAML frontmatter and check the `sta
 
 - `status: implemented`: proceed to the extraction pass.
 - Any other value, or missing `status`: stop. Print:
+
   > "This spec has `status: <value>` (or no status). The skill operates on `status: implemented` specs. Continue without status: implemented? Reply `y` to proceed."
 
   Wait for the user's reply. Treat any reply other than a single `y` (case-insensitive) as abort. On `y`, print this warning once before continuing:
+
   > "Proceeding without `status: implemented`. The generated docs may drift from product."
 
 You never add frontmatter on the user's behalf. If the file has no frontmatter, the user must add it before re-running.
@@ -389,7 +401,7 @@ Invoked as `/generate-feature-docs <spec-path>`. The argument is a path to a spe
 If the spec file does not exist, abort with a clear error. If the spec file lives outside `docs/superpowers/specs/implemented/`, warn once and ask the user to confirm before proceeding.
 
 <!-- Tasks 7, 8, 9 will append stage 1, stage 2, and edge cases below this comment. Remove this comment when those sections are added. -->
-````
+```
 
 - [ ] **Step 3: Verify the file**
 
@@ -413,6 +425,7 @@ git commit -m "Add SKILL.md with identity and readiness rules for generate-featu
 **Why:** Stage 1 is read-only and produces the structured outline. This is the key checkpoint where the user redirects the skill before any prose is written. Mistakes here are cheap; mistakes in stage 2 are expensive.
 
 **Files:**
+
 - Modify: `.claude/skills/generate-feature-docs/SKILL.md` (append)
 
 - [ ] **Step 1: Append the stage 1 section to SKILL.md**
@@ -420,7 +433,6 @@ git commit -m "Add SKILL.md with identity and readiness rules for generate-featu
 Append the following content to the end of the file:
 
 ````markdown
-
 ## Stage 1: Extraction pass
 
 Read-only. Produces a structured outline shown to the user in chat. Do not write any files during stage 1.
@@ -428,6 +440,7 @@ Read-only. Produces a structured outline shown to the user in chat. Do not write
 ### Step 1.1: Parse the spec
 
 Read the spec file. Extract:
+
 - The H1 title (treat as the feature name).
 - The intro paragraph (treat as the description).
 - All H2 and H3 section headings.
@@ -436,12 +449,14 @@ Read the spec file. Extract:
 ### Step 1.2: Detect spec kind
 
 Heuristic on section names:
+
 - A spec with sections like "Configuration", "Public API", or "Endpoints" is a **feature spec**. Proceed normally.
 - A spec with sections like "Migration phases" or "Rollout plan" is a **migration spec**.
 - A spec with sections like "Pre-prod checklist" or "Production readiness" is a **readiness report**.
 - Anything else with no clear kind is **unknown**.
 
 For non-feature specs and unknown specs, ask:
+
 > "This looks like a `<kind>` spec, not a feature spec. Continue anyway, or abort?"
 
 Do not proceed without explicit confirmation.
@@ -451,10 +466,12 @@ Do not proceed without explicit confirmation.
 Slug the feature name to kebab-case (e.g., "RSL AI Crawler Licensing" becomes `ai-crawler-licensing`). The target page is `docs/guide/<slug>.md`.
 
 Check if the target page already exists:
+
 - If exists: this is an augmentation case. Note the existing file's section structure (H2/H3 walk).
 - If not: this is a greenfield case.
 
 If a near-match exists (e.g., the slug differs only by a word), surface it as a candidate before proceeding:
+
 > "I will write to `docs/guide/<slug>.md`. A similar page exists at `docs/guide/<other-slug>.md`. Augment the existing page, or create a new one?"
 
 ### Step 1.4: Detect Sequence-section need
@@ -464,6 +481,7 @@ Heuristic: scan the spec for numbered request-flow steps, or language like "firs
 ### Step 1.5: Detect multi-feature specs
 
 If the spec has 2 or more top-level "Feature: X" sections, or the H1 is ambiguous (covers multiple distinct features), list candidate features and ask:
+
 > "This spec covers multiple features: <A>, <B>, <C>. Generate one page per feature, one combined page, or a subset?"
 
 No default. The user must pick.
@@ -493,6 +511,7 @@ Mark each handle as `verified` (with `file:line`) or `NOT FOUND`.
 ### Step 1.8: Detect spec inconsistencies
 
 Look for:
+
 - Same config key spelled two ways across the spec (e.g., `rsl.enabled` and `rsl_enabled`).
 - Two endpoints with the same path but different descriptions.
 - Two error variants with conflicting trigger descriptions.
@@ -512,30 +531,37 @@ Render a single chat message in this format. Use it verbatim, filling in the val
 **Sequence section:** <yes (brief description) | no>
 
 ### Config keys
-| Key             | Status              | Location              |
-| --------------- | ------------------- | --------------------- |
-| `<key>`         | verified or NOT FOUND | `<file:line>` or "spec only" |
+
+| Key     | Status                | Location                     |
+| ------- | --------------------- | ---------------------------- |
+| `<key>` | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Endpoints
-| Path            | Methods | Status              | Location              |
-| --------------- | ------- | ------------------- | --------------------- |
-| `<path>`        | <verbs> | verified or NOT FOUND | `<file:line>` or "spec only" |
+
+| Path     | Methods | Status                | Location                     |
+| -------- | ------- | --------------------- | ---------------------------- |
+| `<path>` | <verbs> | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Headers
-| Name            | Direction           | Status              | Location              |
-| --------------- | ------------------- | ------------------- | --------------------- |
-| `<name>`        | request or response | verified or NOT FOUND | `<file:line>` or "spec only" |
+
+| Name     | Direction           | Status                | Location                     |
+| -------- | ------------------- | --------------------- | ---------------------------- |
+| `<name>` | request or response | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Error variants
-| Variant         | Status              | Location              |
-| --------------- | ------------------- | --------------------- |
-| `<variant>`     | verified or NOT FOUND | `<file:line>` or "spec only" |
+
+| Variant     | Status                | Location                     |
+| ----------- | --------------------- | ---------------------------- |
+| `<variant>` | verified or NOT FOUND | `<file:line>` or "spec only" |
 
 ### Inconsistencies (if any)
+
 - <description of inconsistency>
 
 ### Issues
+
 For each handle marked `NOT FOUND` or each inconsistency, list options:
+
 - (A) Mark inline as "planned, not yet shipped"
 - (B) Drop the row from the relevant reference doc
 - (C) Pause and let me fix the spec or the code first
@@ -572,6 +598,7 @@ git commit -m "Add stage 1 extraction pass to generate-feature-docs skill"
 **Why:** Stage 2 is where prose gets written, reference docs get updated, and commits are produced. This is the largest section of the skill.
 
 **Files:**
+
 - Modify: `.claude/skills/generate-feature-docs/SKILL.md` (append)
 
 - [ ] **Step 1: Append the stage 2 section to SKILL.md**
@@ -579,7 +606,6 @@ git commit -m "Add stage 1 extraction pass to generate-feature-docs skill"
 Append the following content to the end of the file:
 
 ````markdown
-
 ## Stage 2: Generation pass
 
 Runs only after the user types `proceed`. Inputs: the spec, the approved outline from stage 1, and the existing docs. Output: files written to disk; nothing is committed until the user approves the diff.
@@ -593,6 +619,7 @@ git branch --show-current
 ```
 
 If the result is `main` or `master`:
+
 - Stop. Do not write any files.
 - Propose a branch name in the form `docs/<feature-slug>` (e.g., `docs/ai-crawler-licensing`). Ask:
   > "You are on `<branch>`. Create branch `docs/<slug>` and switch to it?"
@@ -607,6 +634,7 @@ git status --short
 ```
 
 If there are unrelated changes (anything not under `docs/guide/` or otherwise unrelated to this skill's output), stop with:
+
 > "Uncommitted changes detected outside the planned doc files. Commit, stash, or revert them before running this skill, since the doc commit must contain only doc files."
 
 This is a hard stop. No override.
@@ -629,6 +657,7 @@ A feature with no errors has no Error handling section. A feature with no consen
 ### Step 2.3: Write or augment the feature page
 
 **If greenfield (page does not exist):**
+
 - Write `docs/guide/<slug>.md` from scratch using the template above.
 - Every concrete reference (config key, file path, endpoint, header, error variant) must be one of the verified handles from stage 1, or an explicit `<!-- TODO -->` for items the user opted into during the issues prompt.
 - Empty sections drop entirely; do not write a heading with no content.
@@ -639,7 +668,8 @@ A feature with no errors has no Error handling section. A feature with no consen
 1. Walk the existing page's H2 and H3 structure.
 2. For each template section that already exists in the page: leave existing prose alone. Add new items only (e.g., a new row in a config table, a new bullet in a list). Never rewrite human-authored prose for stylistic reasons.
 3. For sections in the template that do not exist in the page: insert them in template order.
-4. For prose that *contradicts* the new spec or current code (e.g., a sentence mentioning a config key that no longer exists, or a behavioral claim that the spec has revised): show the existing text and the proposed replacement, and ask the user to approve, skip, or edit per item:
+4. For prose that _contradicts_ the new spec or current code (e.g., a sentence mentioning a config key that no longer exists, or a behavioral claim that the spec has revised): show the existing text and the proposed replacement, and ask the user to approve, skip, or edit per item:
+
    > "Existing prose says: `<excerpt>`. Spec says: `<new claim>`. Replace, skip, or edit?"
 
    This is the only path by which you rewrite existing prose.
@@ -657,9 +687,11 @@ For each of `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and `d
    - `error-reference.md`: new error variants.
 3. Append or insert each entry following the existing pattern.
 4. If an entry already exists for the same key (config key, endpoint path, header, error variant) and the spec defines it differently, prompt:
+
    > "Configuration.md already has a row for `<key>` that says `<existing>`. Spec says `<new>`. Overwrite, keep existing, or pause?"
-   
+
    Only overwrite on explicit user approval.
+
 5. Updates are otherwise additive and idempotent. Running the skill twice on the same spec produces no second diff.
 
 If the spec contributes nothing to a given reference doc, do not modify that file.
@@ -670,10 +702,11 @@ After all files are written, post a chat message in this format:
 
 ```markdown
 Generated <N> files:
-  - [docs/guide/<slug>.md](docs/guide/<slug>.md) (<NEW or +<N> lines>, <description>)
-  - [docs/guide/configuration.md](docs/guide/configuration.md) (+<N> lines, <description>)
-  - [docs/guide/api-reference.md](docs/guide/api-reference.md) (+<N> lines, <description>)
-  - [docs/guide/error-reference.md](docs/guide/error-reference.md) (+<N> lines, <description>)
+
+- [docs/guide/<slug>.md](docs/guide/<slug>.md) (<NEW or +<N> lines>, <description>)
+- [docs/guide/configuration.md](docs/guide/configuration.md) (+<N> lines, <description>)
+- [docs/guide/api-reference.md](docs/guide/api-reference.md) (+<N> lines, <description>)
+- [docs/guide/error-reference.md](docs/guide/error-reference.md) (+<N> lines, <description>)
 
 Inline TODOs: <count> (<short description per TODO>)
 
@@ -702,6 +735,7 @@ git add docs/guide/configuration.md docs/guide/api-reference.md docs/guide/error
 Only include the paths of files actually modified.
 
 Commit message format:
+
 - New page: `Add docs for <feature>`
 - Augmentation: `Update docs for <feature>`
 
@@ -721,6 +755,7 @@ COMMIT_MSG
 ```
 
 After the commit, post a final message:
+
 > "Committed as `<commit-sha>`. Run `git log -1` to inspect, or push when ready."
 
 Do not push.
@@ -748,26 +783,26 @@ git commit -m "Add stage 2 generation pass to generate-feature-docs skill"
 **Why:** Edge cases capture the "what if" scenarios from Section 10 of the spec. Without explicit guidance, Claude will default to forging ahead in cases where it should pause or abort. This task closes those holes.
 
 **Files:**
+
 - Modify: `.claude/skills/generate-feature-docs/SKILL.md` (append)
 
 - [ ] **Step 1: Append the edge cases section**
 
 Append the following content to the end of the file:
 
-````markdown
-
+```markdown
 ## Edge cases and failure modes
 
-| Case                                                   | Behavior                                                                                                                                                                          |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Spec lacks `status: implemented` frontmatter            | Prompt `Continue without status: implemented? (y/N)`. Default N. Abort unless explicit `y`.                                                                                       |
-| Spec covers multiple features                           | List candidates, ask user to pick: one page per feature, combined page, or subset. No default.                                                                                    |
+| Case                                                    | Behavior                                                                                                                                                                           |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Spec lacks `status: implemented` frontmatter            | Prompt `Continue without status: implemented? (y/N)`. Default N. Abort unless explicit `y`.                                                                                        |
+| Spec covers multiple features                           | List candidates, ask user to pick: one page per feature, combined page, or subset. No default.                                                                                     |
 | Non-feature spec (migration, readiness, tech-spec)      | Prompt: "This looks like a `<kind>` spec, continue anyway?". No automatic fallback.                                                                                                |
-| No shipped code (zero handles verify against `crates/`) | Prompt: "No shipped code found. Generate stub page with sections marked 'planned, not yet shipped', or abort?". Behavior verification is for skill #2.                            |
+| No shipped code (zero handles verify against `crates/`) | Prompt: "No shipped code found. Generate stub page with sections marked 'planned, not yet shipped', or abort?". Behavior verification is for skill #2.                             |
 | Spec is internally contradictory                        | Surface in stage 1 outline under "Inconsistencies". Ask user to resolve before proceeding.                                                                                         |
-| Target page name cannot be determined                   | Ask user for target path explicitly.                                                                                                                                              |
-| Spec file not found                                     | Hard error, abort with message naming the path that was looked up.                                                                                                                |
-| Spec file outside `docs/superpowers/specs/implemented/` | Warn once: "This file is outside `implemented/`. Is this really an implemented spec?". Proceed only on confirmation.                                                              |
+| Target page name cannot be determined                   | Ask user for target path explicitly.                                                                                                                                               |
+| Spec file not found                                     | Hard error, abort with message naming the path that was looked up.                                                                                                                 |
+| Spec file outside `docs/superpowers/specs/implemented/` | Warn once: "This file is outside `implemented/`. Is this really an implemented spec?". Proceed only on confirmation.                                                               |
 | Current branch is `main` or `master`                    | Hard stop, no override. Propose `docs/<feature-slug>` branch name. Switch via `git checkout -b` only on explicit confirmation.                                                     |
 | Working tree has unrelated uncommitted changes          | Hard stop, no override. User must clean up first.                                                                                                                                  |
 | Re-run on a spec that has already produced docs         | Supported. Stage 1 finds existing page. Stage 2 augments per the augment-in-place rules. A clean re-run with no spec or code changes produces zero diff (idempotency requirement). |
@@ -783,6 +818,7 @@ Do not produce an empty commit.
 ## Self-check before each user message
 
 Before sending any chat message or writing any file, scan your output for:
+
 - Em-dashes (`—` or `–`)
 - Emojis or decorative characters
 - Exclamation marks
@@ -793,13 +829,14 @@ If any are present, rewrite. This includes prompts, status updates, summaries, t
 ## Out of scope
 
 You do not:
-- Detect drift between spec and code *behavior*. You verify handle existence only. Behavioral verification is skill #2's job.
+
+- Detect drift between spec and code _behavior_. You verify handle existence only. Behavioral verification is skill #2's job.
 - Update narrative docs (`getting-started.md`, `gdpr-compliance.md`, `architecture.md`, etc.). Those are humans' responsibility.
 - Generate Mermaid diagrams. Sequence sections use numbered lists.
 - Touch code under `crates/`. The codebase is read-only.
 - Open PRs, push, or deploy. You commit to the current branch only.
 - Modify the spec file you are reading.
-````
+```
 
 - [ ] **Step 2: Verify the file is complete**
 
@@ -842,6 +879,7 @@ The skill is now built but has not been run. Phase 3 invokes it against real spe
 **Why:** Validation case 1 (greenfield) requires at least one spec to live in `implemented/`. The RSL AI crawler licensing spec is a good candidate because it is recent, has no corresponding guide page yet, and represents a complete feature.
 
 **Files:**
+
 - Move: `docs/superpowers/specs/drafts/2026-04-22-rsl-ai-crawler-licensing-design.md` to `docs/superpowers/specs/implemented/`
 - Modify: the same file's frontmatter
 
@@ -906,6 +944,7 @@ git commit -m "Promote RSL AI crawler licensing spec to implemented"
 **Why:** Validates the most common path: spec lands, code ships, docs do not exist, skill produces a publishable page.
 
 **Files:**
+
 - Will be created by the skill: `docs/guide/ai-crawler-licensing.md` (or similar slug; the skill resolves it)
 - Will be modified by the skill: `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and/or `docs/guide/error-reference.md`
 
@@ -936,6 +975,7 @@ The skill should run stage 1 and produce an extraction outline.
 - [ ] **Step 3: Review the extraction outline**
 
 Verify in the chat output:
+
 - The feature name is reasonable.
 - The target page slug is reasonable.
 - All extracted handles (config keys, endpoints, headers, errors) are listed.
@@ -948,6 +988,7 @@ If anything is wrong, redirect the skill or capture the issue and edit `SKILL.md
 - [ ] **Step 4: Approve and proceed to stage 2**
 
 Reply `proceed`. The skill should:
+
 - Check the current branch (already verified in Step 1).
 - Write the new feature page.
 - Apply mechanical updates to the relevant reference docs.
@@ -956,6 +997,7 @@ Reply `proceed`. The skill should:
 - [ ] **Step 5: Inspect the generated docs**
 
 For each file in the diff-review message:
+
 - Open the file. Read it as if you were a publisher integrating the feature.
 - Verify the page follows the template (Overview, How it works, optional Sequence, Configuration, API contract, Error handling, Privacy, Related docs).
 - Verify every concrete reference (config key, file path, endpoint, etc.) matches a verified handle from stage 1.
@@ -994,6 +1036,7 @@ If any check fails, do not commit. Edit SKILL.md to fix the issue, then re-run f
 **Why:** Validates that re-running the skill produces no diff when neither spec nor code has changed. This is a hard requirement: a non-idempotent skill produces noise on every run.
 
 **Files:**
+
 - None modified (this is the assertion)
 
 - [ ] **Step 1: Confirm clean working tree after Task 11**
@@ -1017,6 +1060,7 @@ Stage 1 should produce the same outline as Task 11. Reply `proceed`.
 - [ ] **Step 4: Verify the skill detects zero changes**
 
 The skill should post:
+
 > "Re-run produced no changes. The docs are already up to date for this spec."
 
 It must NOT produce an empty commit. It must NOT prompt for commit if nothing changed.
@@ -1030,6 +1074,7 @@ If the skill produces a non-empty diff on the second run, that is a bug. Inspect
 **Why:** Validates the augment-in-place behavior on an existing page. Picks a feature with an existing guide page and a spec that extends the feature.
 
 **Files:**
+
 - Will be modified by the skill: `docs/guide/edge-cookies.md` (or another existing page)
 - Will be modified by the skill: `docs/guide/configuration.md`, `docs/guide/api-reference.md`, and/or `docs/guide/error-reference.md` if applicable
 
@@ -1054,6 +1099,7 @@ Reply `proceed`.
 - [ ] **Step 5: Verify augment-in-place behavior**
 
 Open the modified existing page and compare to its prior content (use `git diff`). Confirm:
+
 - Existing prose is intact except where contradiction-detection prompted you per item.
 - New content was added in the right sections (Configuration table got new rows, etc.).
 - No human-authored content was destroyed.
@@ -1071,6 +1117,7 @@ Reply `commit` to the skill.
 **Why:** Validates that the skill correctly detects a non-feature spec and prompts before proceeding rather than silently producing nonsense.
 
 **Files:**
+
 - None expected to be modified (the skill should refuse to proceed without confirmation)
 
 - [ ] **Step 1: Promote the EdgeZero migration spec to implemented/**
@@ -1093,6 +1140,7 @@ Update its frontmatter to `status: implemented`, then commit.
 - [ ] **Step 3: Verify the skill detects spec kind and prompts**
 
 Expected behavior: stage 1 detects `spec_kind: migration` and emits:
+
 > "This looks like a `migration` spec, not a feature spec. Continue anyway, or abort?"
 
 If the skill silently proceeds, that is a bug; the spec-kind detection in SKILL.md needs strengthening.
@@ -1116,13 +1164,14 @@ Expected: empty (or whatever was there before, unchanged).
 **Why:** Validates handle verification. Tests that a spec with a config key, endpoint, header, or error variant that does not exist in code is flagged in stage 1 with a NOT FOUND status, and the skill correctly handles the user's choice (mark as TODO, drop, or pause).
 
 **Files:**
+
 - A test spec with a deliberately-broken handle
 
 - [ ] **Step 1: Create a test spec with a broken handle**
 
 Make a minimal feature spec under `docs/superpowers/specs/implemented/` named `2026-04-28-test-drift-validation.md` with the following content:
 
-```markdown
+````markdown
 ---
 status: implemented
 last_reviewed: 2026-04-28
@@ -1139,17 +1188,21 @@ A synthetic feature for validating handle drift detection. Not a real feature.
 enabled = true
 nonexistent_key = "this key does not exist in code"
 ```
+````
 
 ## API contract
 
 GET `/test-drift/nonexistent-endpoint` returns drift validation data.
+
 ```
 
 - [ ] **Step 2: Invoke the skill on the test spec**
 
 ```
+
 /generate-feature-docs docs/superpowers/specs/implemented/2026-04-28-test-drift-validation.md
-```
+
+````
 
 - [ ] **Step 3: Verify the extraction outline flags the drift**
 
@@ -1171,7 +1224,7 @@ Reply: "abort, this was just a drift test".
 ```bash
 git rm docs/superpowers/specs/implemented/2026-04-28-test-drift-validation.md
 git commit -m "Remove drift validation test spec"
-```
+````
 
 ---
 
