@@ -135,6 +135,10 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
         fastly_resp.append_header(name.as_str(), value.as_bytes());
     }
 
+    debug_assert!(
+        matches!(&body, EdgeBody::Once(_)),
+        "streaming body passed to compat::to_fastly_response will be silently truncated"
+    );
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
@@ -208,37 +212,37 @@ pub fn forward_fastly_cookie_header(
 /// Set the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
-pub fn set_fastly_synthetic_cookie(
+pub fn set_fastly_ec_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
-    synthetic_id: &str,
+    ec_id: &str,
 ) {
-    if !crate::cookies::synthetic_id_cookie_value_is_safe(synthetic_id) {
+    if !crate::cookies::ec_cookie_value_is_safe(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            synthetic_id.len()
+            ec_id.len()
         );
         return;
     }
     response.append_header(
         header::SET_COOKIE,
-        crate::cookies::create_ec_cookie(settings, synthetic_id),
+        crate::cookies::create_ec_cookie(settings, ec_id),
     );
 }
 
 /// Expire the EC ID cookie on a `fastly::Response`.
 ///
 /// # PR 15 removal target
-pub fn expire_fastly_synthetic_cookie(
+pub fn expire_fastly_ec_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
     response.append_header(
         header::SET_COOKIE,
         format!(
-            "{}=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
+            "{}=; {}",
             crate::constants::COOKIE_TS_EC,
-            settings.publisher.cookie_domain,
+            crate::cookies::ec_cookie_attributes(settings, 0),
         ),
     );
 }
@@ -605,11 +609,11 @@ mod tests {
     }
 
     #[test]
-    fn set_fastly_synthetic_cookie_sets_cookie_header() {
+    fn set_fastly_ec_cookie_sets_cookie_header() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut response = fastly::Response::new();
 
-        set_fastly_synthetic_cookie(&settings, &mut response, "abc123.XyZ789");
+        set_fastly_ec_cookie(&settings, &mut response, "abc123.XyZ789");
 
         let cookie = response
             .get_header(header::SET_COOKIE)
@@ -621,16 +625,16 @@ mod tests {
                 "ts-ec=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
                 settings.publisher.cookie_domain
             )),
-            "should set expected synthetic cookie"
+            "should set expected EC cookie"
         );
     }
 
     #[test]
-    fn expire_fastly_synthetic_cookie_sets_expiry_cookie() {
+    fn expire_fastly_ec_cookie_sets_expiry_cookie() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut response = fastly::Response::new();
 
-        expire_fastly_synthetic_cookie(&settings, &mut response);
+        expire_fastly_ec_cookie(&settings, &mut response);
 
         let cookie = response
             .get_header(header::SET_COOKIE)
