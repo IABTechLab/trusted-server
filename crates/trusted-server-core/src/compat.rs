@@ -12,13 +12,13 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
 
 fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<EdgeBody> {
-    let uri: http::Uri = req
-        .get_url_str()
-        .parse()
-        .unwrap_or_else(|_| {
-            log::warn!("Failed to parse request URL '{}'; falling back to '/'", req.get_url_str());
-            http::Uri::from_static("/")
-        });
+    let uri: http::Uri = req.get_url_str().parse().unwrap_or_else(|_| {
+        log::warn!(
+            "Failed to parse request URL '{}'; falling back to '/'",
+            req.get_url_str()
+        );
+        http::Uri::from_static("/")
+    });
 
     let mut builder = http::Request::builder()
         .method(req.get_method().clone())

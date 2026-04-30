@@ -586,8 +586,14 @@ mod tests {
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(!forwarded.contains("euconsent-v2"), "should strip consent cookie");
-        assert!(forwarded.contains("session=abc123"), "should keep non-consent cookie");
+        assert!(
+            !forwarded.contains("euconsent-v2"),
+            "should strip consent cookie"
+        );
+        assert!(
+            forwarded.contains("session=abc123"),
+            "should keep non-consent cookie"
+        );
     }
 
     #[test]
@@ -615,8 +621,14 @@ mod tests {
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(forwarded.contains("euconsent-v2"), "should forward consent cookie when not stripping");
-        assert!(forwarded.contains("session=abc123"), "should forward non-consent cookie");
+        assert!(
+            forwarded.contains("euconsent-v2"),
+            "should forward consent cookie when not stripping"
+        );
+        assert!(
+            forwarded.contains("session=abc123"),
+            "should forward non-consent cookie"
+        );
     }
 
     #[test]
@@ -630,7 +642,10 @@ mod tests {
         forward_cookie_header(&from, &mut to, true);
 
         let forwarded = to.headers().get(header::COOKIE);
-        assert!(forwarded.is_some(), "should forward non-UTF-8 Cookie header unchanged");
+        assert!(
+            forwarded.is_some(),
+            "should forward non-UTF-8 Cookie header unchanged"
+        );
         assert_eq!(
             forwarded.expect("should have cookie header").as_bytes(),
             b"\xff\xfe=value",
@@ -641,8 +656,10 @@ mod tests {
     #[test]
     fn test_forward_cookie_header_multiple_cookie_headers_appended() {
         let mut from = build_request(Some("session=abc123"));
-        from.headers_mut()
-            .append(header::COOKIE, "theme=dark".parse().expect("should parse header value"));
+        from.headers_mut().append(
+            header::COOKIE,
+            "theme=dark".parse().expect("should parse header value"),
+        );
         let mut to = build_request(None);
 
         forward_cookie_header(&from, &mut to, false);
