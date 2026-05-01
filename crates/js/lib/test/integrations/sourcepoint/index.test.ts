@@ -49,6 +49,39 @@ describe('integrations/sourcepoint', () => {
     expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBe('sp');
   });
 
+  it('mirrors __gpp and __gpp_sid from current Sourcepoint usnat localStorage shape', () => {
+    const payload = {
+      usnat: {
+        applicableSections: [7],
+        consentString: 'DBABLA~BVQqAAAAAgA.QA',
+        consentStatus: {
+          consentedToAll: true,
+        },
+      },
+    };
+    localStorage.setItem('_sp_user_consent_36922', JSON.stringify(payload));
+
+    const result = mirrorSourcepointConsent();
+
+    expect(result).toBe(true);
+    expect(getCookie('__gpp')).toBe('DBABLA~BVQqAAAAAgA.QA');
+    expect(getCookie('__gpp_sid')).toBe('7');
+  });
+
+  it('mirrors euconsent-v2 from Sourcepoint gdpr localStorage shape', () => {
+    const payload = {
+      gdpr: {
+        consentString: 'CPXxGfAPXxGfAAHABBENBCCsAP_AAH_AAAAAHftf',
+      },
+    };
+    localStorage.setItem('_sp_user_consent_36922', JSON.stringify(payload));
+
+    const result = mirrorSourcepointConsent();
+
+    expect(result).toBe(true);
+    expect(getCookie('euconsent-v2')).toBe('CPXxGfAPXxGfAAHABBENBCCsAP_AAH_AAAAAHftf');
+  });
+
   it('handles multiple applicable sections', () => {
     localStorage.setItem(
       '_sp_user_consent_99999',
