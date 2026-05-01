@@ -84,6 +84,15 @@ debug = false
 # be statically imported in the JS bundle.
 client_side_bidders = ["rubicon"]
 
+# Optional Prebid.js User ID configuration. The matching User ID modules must
+# be included at JS build time with TSJS_PREBID_USER_ID_MODULES, for example:
+# TSJS_PREBID_USER_ID_MODULES=sharedId,pubProvided,uid2 node build-all.mjs
+# [integrations.prebid.user_sync]
+# auctionDelay = 100
+# [[integrations.prebid.user_sync.userIds]]
+# name = "sharedId"
+# storage = {name = "_sharedID", type = "cookie", expires = 365}
+
 # Zone-specific bid param overrides for Kargo s2s placement IDs.
 # The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
 # and includes it in the request. The server maps zone → s2s placementId here.

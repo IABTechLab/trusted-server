@@ -18,6 +18,11 @@ import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
+// User ID submodules — self-register with prebid.js on import.
+// The set of submodules is controlled by the TSJS_PREBID_USER_ID_MODULES env var
+// at build time. See _user_id_modules.generated.ts (written by build-all.mjs).
+import './_user_id_modules.generated';
+
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
 // build time. See _adapters.generated.ts (written by build-all.mjs).
@@ -42,6 +47,8 @@ export interface PrebidNpmConfig {
   timeout?: number;
   /** Enable Prebid.js debug logging. Defaults to false. */
   debug?: boolean;
+  /** Prebid.js userSync configuration for User ID modules. */
+  userSync?: unknown;
 }
 
 /**
@@ -53,6 +60,8 @@ interface InjectedPrebidConfig {
   timeout?: number;
   debug?: boolean;
   bidders?: string[];
+  /** Prebid.js userSync configuration for User ID modules. */
+  userSync?: unknown;
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
 }
@@ -177,6 +186,10 @@ function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
 function collectAuctionEids(): AuctionEid[] | undefined {
   if (typeof pbjs.getUserIdsAsEids !== 'function') {
     return undefined;
@@ -218,6 +231,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     endpoint: config?.endpoint,
     timeout: config?.timeout ?? injected?.timeout,
     debug: config?.debug ?? injected?.debug,
+    userSync: config?.userSync ?? injected?.userSync,
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
@@ -366,11 +380,14 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   };
 
   // Apply initial configuration
-  const pbjsConfig: PbjsConfig & { bidderTimeout?: number } = {
+  const pbjsConfig: PbjsConfig & { bidderTimeout?: number; userSync?: unknown } = {
     debug: merged.debug ?? false,
   };
   if (typeof merged.timeout === 'number') {
     pbjsConfig.bidderTimeout = merged.timeout;
+  }
+  if (isRecord(merged.userSync)) {
+    pbjsConfig.userSync = merged.userSync;
   }
   pbjs.setConfig(pbjsConfig as PbjsConfig);
 
