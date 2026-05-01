@@ -3,6 +3,8 @@
 use chrono::{SecondsFormat, Utc};
 use log_fastly::Logger;
 
+const ENV_TS_LOG_LEVEL: &str = "TS_LOG_LEVEL";
+
 /// Extracts the final `::` segment from a Rust module path for use as a log label.
 ///
 /// When the input has no `::` separator, returns the full target. When the
@@ -27,14 +29,16 @@ fn target_label(target: &str) -> &str {
 /// Panics if the Fastly logger cannot be built or if the global logger has already
 /// been set.
 pub(crate) fn init_logger() {
+    let max_level = configured_log_level();
     let logger = Logger::builder()
         .default_endpoint("tslog")
         .echo_stdout(true)
-        .max_level(log::LevelFilter::Info)
+        .max_level(max_level)
         .build()
         .expect("should build Logger");
 
     fern::Dispatch::new()
+        .level(max_level)
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
@@ -47,6 +51,25 @@ pub(crate) fn init_logger() {
         .chain(Box::new(logger) as Box<dyn log::Log>)
         .apply()
         .expect("should initialize logger");
+}
+
+fn configured_log_level() -> log::LevelFilter {
+    std::env::var(ENV_TS_LOG_LEVEL)
+        .ok()
+        .and_then(|value| parse_log_level(&value))
+        .unwrap_or(log::LevelFilter::Info)
+}
+
+fn parse_log_level(value: &str) -> Option<log::LevelFilter> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(log::LevelFilter::Off),
+        "error" => Some(log::LevelFilter::Error),
+        "warn" | "warning" => Some(log::LevelFilter::Warn),
+        "info" => Some(log::LevelFilter::Info),
+        "debug" => Some(log::LevelFilter::Debug),
+        "trace" => Some(log::LevelFilter::Trace),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

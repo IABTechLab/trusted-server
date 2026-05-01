@@ -6,7 +6,7 @@
 //! eventual migration path (renaming, adding EC-specific conditions) is
 //! contained here.
 
-use crate::consent::ConsentContext;
+use crate::consent::{ConsentContext, EcConsentDecision};
 
 /// Determines whether Edge Cookie creation is permitted based on the
 /// user's consent and detected jurisdiction.
@@ -18,7 +18,13 @@ use crate::consent::ConsentContext;
 /// See [`crate::consent::allows_ec_creation`] for the full decision matrix.
 #[must_use]
 pub fn ec_consent_granted(consent_context: &ConsentContext) -> bool {
-    crate::consent::allows_ec_creation(consent_context)
+    ec_consent_decision(consent_context).allowed
+}
+
+/// Determines whether Edge Cookie creation is permitted and why.
+#[must_use]
+pub fn ec_consent_decision(consent_context: &ConsentContext) -> EcConsentDecision {
+    crate::consent::ec_creation_decision(consent_context)
 }
 
 /// Returns `true` when the request carries an explicit EC withdrawal signal.

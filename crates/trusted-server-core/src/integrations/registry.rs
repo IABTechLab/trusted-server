@@ -651,6 +651,7 @@ impl IntegrationRegistry {
     /// Response-side cookie/header mutation is centralized in EC finalize.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_proxy(
         &self,
         method: &Method,
@@ -670,9 +671,13 @@ impl IntegrationRegistry {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
-                log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={})",
+                log::info!(
+                    "EC generation decision: action=skipped_non_navigation, route=integration_proxy, \
+                     path={}, ec_present={}, ec_generated={}, consent_allowed={}",
                     path,
+                    ec_context.ec_value().is_some(),
+                    ec_context.ec_generated(),
+                    ec_context.ec_allowed(),
                 );
             }
 

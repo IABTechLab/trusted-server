@@ -103,7 +103,7 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
         let gdpr_applies =
             has_eu_tcf_signal(signals.raw_tc_string.is_some(), gpp_section_ids.as_deref());
         log::debug!("Consent proxy mode: jurisdiction={jur}, skipping decode");
-        return ConsentContext {
+        let ctx = ConsentContext {
             raw_tc_string: signals.raw_tc_string,
             raw_gpp_string: signals.raw_gpp_string,
             gpp_section_ids,
@@ -118,6 +118,8 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
             jurisdiction: jur,
             source: ConsentSource::Cookie,
         };
+        log_consent_context(&ctx);
+        return ctx;
     }
 
     let mut ctx = build_context_from_signals(&signals);
@@ -456,6 +458,120 @@ pub fn gate_eids_by_consent<T>(
 // EC consent gating
 // ---------------------------------------------------------------------------
 
+/// Reason for an Edge Cookie creation consent decision.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
+pub enum EcConsentReason {
+    /// GDPR applies and TCF Purpose 1 storage consent is granted.
+    GdprStorageConsentGranted,
+    /// GDPR applies but no decoded TCF signal is available.
+    GdprMissingTcf,
+    /// GDPR applies and TCF Purpose 1 storage consent is denied.
+    GdprStorageConsentDenied,
+    /// A US state privacy regime applies and GPC opts the user out.
+    UsGpcOptOut,
+    /// A US state privacy regime applies and TCF Purpose 1 storage consent is granted.
+    UsTcfStorageConsentGranted,
+    /// A US state privacy regime applies and TCF Purpose 1 storage consent is denied.
+    UsTcfStorageConsentDenied,
+    /// A US state privacy regime applies and GPP does not opt the user out of sale.
+    UsGppNoSaleOptOut,
+    /// A US state privacy regime applies and GPP opts the user out of sale.
+    UsGppSaleOptOut,
+    /// A US state privacy regime applies and US Privacy does not opt the user out of sale.
+    UsPrivacyNoSaleOptOut,
+    /// A US state privacy regime applies and US Privacy opts the user out of sale.
+    UsPrivacySaleOptOut,
+    /// A US state privacy regime applies but no usable consent signal is present.
+    UsMissingSignals,
+    /// The request is outside regulated jurisdictions.
+    NonRegulated,
+    /// Jurisdiction cannot be determined, so EC creation fails closed.
+    UnknownJurisdiction,
+}
+
+/// Result of evaluating whether Edge Cookie creation is permitted.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct EcConsentDecision {
+    /// Whether EC creation is permitted.
+    pub allowed: bool,
+    /// The branch responsible for the decision.
+    pub reason: EcConsentReason,
+}
+
+/// Determines whether Edge Cookie (EC) creation is permitted and why.
+#[must_use]
+pub fn ec_creation_decision(ctx: &ConsentContext) -> EcConsentDecision {
+    match &ctx.jurisdiction {
+        jurisdiction::Jurisdiction::Gdpr => match effective_tcf(ctx) {
+            Some(tcf) if tcf.has_storage_consent() => EcConsentDecision {
+                allowed: true,
+                reason: EcConsentReason::GdprStorageConsentGranted,
+            },
+            Some(_) => EcConsentDecision {
+                allowed: false,
+                reason: EcConsentReason::GdprStorageConsentDenied,
+            },
+            None => EcConsentDecision {
+                allowed: false,
+                reason: EcConsentReason::GdprMissingTcf,
+            },
+        },
+        jurisdiction::Jurisdiction::UsState(_) => {
+            if ctx.gpc {
+                return EcConsentDecision {
+                    allowed: false,
+                    reason: EcConsentReason::UsGpcOptOut,
+                };
+            }
+            if let Some(tcf) = effective_tcf(ctx) {
+                return EcConsentDecision {
+                    allowed: tcf.has_storage_consent(),
+                    reason: if tcf.has_storage_consent() {
+                        EcConsentReason::UsTcfStorageConsentGranted
+                    } else {
+                        EcConsentReason::UsTcfStorageConsentDenied
+                    },
+                };
+            }
+            if let Some(gpp) = &ctx.gpp {
+                if let Some(opted_out) = gpp.us_sale_opt_out {
+                    return EcConsentDecision {
+                        allowed: !opted_out,
+                        reason: if opted_out {
+                            EcConsentReason::UsGppSaleOptOut
+                        } else {
+                            EcConsentReason::UsGppNoSaleOptOut
+                        },
+                    };
+                }
+            }
+            if let Some(usp) = &ctx.us_privacy {
+                let opted_out = usp.opt_out_sale == PrivacyFlag::Yes;
+                return EcConsentDecision {
+                    allowed: !opted_out,
+                    reason: if opted_out {
+                        EcConsentReason::UsPrivacySaleOptOut
+                    } else {
+                        EcConsentReason::UsPrivacyNoSaleOptOut
+                    },
+                };
+            }
+            EcConsentDecision {
+                allowed: false,
+                reason: EcConsentReason::UsMissingSignals,
+            }
+        }
+        jurisdiction::Jurisdiction::NonRegulated => EcConsentDecision {
+            allowed: true,
+            reason: EcConsentReason::NonRegulated,
+        },
+        jurisdiction::Jurisdiction::Unknown => EcConsentDecision {
+            allowed: false,
+            reason: EcConsentReason::UnknownJurisdiction,
+        },
+    }
+}
+
 /// Determines whether Edge Cookie (EC) creation is permitted based on the
 /// user's consent and detected jurisdiction.
 ///
@@ -473,46 +589,7 @@ pub fn gate_eids_by_consent<T>(
 ///   blocked as a precaution.
 #[must_use]
 pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
-    match &ctx.jurisdiction {
-        jurisdiction::Jurisdiction::Gdpr => {
-            // EU/UK: explicit opt-in required (TCF Purpose 1 = store/access device).
-            match effective_tcf(ctx) {
-                Some(tcf) => tcf.has_storage_consent(),
-                None => false,
-            }
-        }
-        jurisdiction::Jurisdiction::UsState(_) => {
-            // GPC is an independent opt-out signal — it always blocks EC
-            // creation regardless of what the US Privacy string says.
-            if ctx.gpc {
-                return false;
-            }
-            // When a CMP uses TCF in the US (e.g. Didomi), respect the
-            // TCF Purpose 1 decision — this is an explicit opt-in signal.
-            // The Sourcepoint GPP design documents this precedence decision.
-            if let Some(tcf) = effective_tcf(ctx) {
-                return tcf.has_storage_consent();
-            }
-            // Check GPP US section for sale opt-out.
-            if let Some(gpp) = &ctx.gpp {
-                if let Some(opted_out) = gpp.us_sale_opt_out {
-                    return !opted_out;
-                }
-            }
-            // Check US Privacy string for explicit opt-out.
-            if let Some(usp) = &ctx.us_privacy {
-                return usp.opt_out_sale != PrivacyFlag::Yes;
-            }
-            // Spec §6.1.1: "In regulated jurisdictions (GDPR, US state),
-            // consent cookies/headers must be present for
-            // allows_ec_creation() to return true." No signals = block.
-            false
-        }
-        jurisdiction::Jurisdiction::NonRegulated => true,
-        // No geolocation data — cannot determine jurisdiction.
-        // Fail-closed: block EC creation as a precaution.
-        jurisdiction::Jurisdiction::Unknown => false,
-    }
+    ec_creation_decision(ctx).allowed
 }
 
 /// Returns `true` only when the request contains an explicit EC opt-out signal.
@@ -575,10 +652,6 @@ fn signal_status(decoded: bool, raw: bool) -> &'static str {
 
 /// Logs a structured summary of the fully-processed consent context.
 fn log_consent_context(ctx: &ConsentContext) {
-    if ctx.is_empty() {
-        return;
-    }
-
     let tcf_status = match (&ctx.tcf, ctx.expired) {
         (Some(_), _) => "present",
         (None, true) => "expired",
@@ -589,13 +662,17 @@ fn log_consent_context(ctx: &ConsentContext) {
     let gpp_status = signal_status(ctx.gpp.is_some(), ctx.raw_gpp_string.is_some());
     let usp_status = signal_status(ctx.us_privacy.is_some(), ctx.raw_us_privacy.is_some());
 
+    let ec_decision = ec_creation_decision(ctx);
     log::info!(
         "Consent context: jurisdiction={}, tcf={tcf_status}, gpp={gpp_status}, \
-         us_privacy={usp_status}, gpc={}, gdpr_applies={}, source={:?}",
+         us_privacy={usp_status}, gpc={}, gdpr_applies={}, source={:?}, \
+         ec_allowed={}, ec_reason={}",
         ctx.jurisdiction,
         ctx.gpc,
         ctx.gdpr_applies,
         ctx.source,
+        ec_decision.allowed,
+        ec_decision.reason,
     );
 }
 

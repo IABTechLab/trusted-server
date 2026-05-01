@@ -93,6 +93,21 @@ struct RequestEc {
     jar: Option<CookieJar>,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
+enum EcInputStatus {
+    Absent,
+    Valid,
+    Invalid,
+}
+
+fn ec_input_status(value: Option<&str>) -> EcInputStatus {
+    match value {
+        Some(v) if is_valid_ec_id(v) => EcInputStatus::Valid,
+        Some(_) => EcInputStatus::Invalid,
+        None => EcInputStatus::Absent,
+    }
+}
+
 /// Parses EC identity from request headers and cookies in a single pass.
 ///
 /// # Errors
@@ -212,12 +227,30 @@ impl EcContext {
         // Malformed values are discarded per §4.2: "If the header is
         // present but malformed, it is discarded and the cookie value
         // is used instead."
+        let header_status = ec_input_status(parsed.header_ec.as_deref());
+        let cookie_status = ec_input_status(parsed.cookie_ec.as_deref());
+        let active_source = if header_status == EcInputStatus::Valid {
+            "header"
+        } else if cookie_status == EcInputStatus::Valid {
+            "cookie"
+        } else {
+            "none"
+        };
+        let header_cookie_differ = matches!(
+            (parsed.header_ec.as_deref(), parsed.cookie_ec.as_deref()),
+            (Some(header), Some(cookie)) if header != cookie
+        );
         let ec_value = parsed
             .header_ec
             .filter(|v| is_valid_ec_id(v))
             .or_else(|| parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v)));
         let ec_was_present = ec_value.is_some();
 
+        log::info!(
+            "EC request state: header_ec={header_status}, cookie_ec={cookie_status}, \
+             active_source={active_source}, ec_present={ec_was_present}, \
+             header_cookie_differ={header_cookie_differ}"
+        );
         if let Some(ref id) = ec_value {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
@@ -263,14 +296,30 @@ impl EcContext {
         settings: &Settings,
         kv: Option<&KvIdentityGraph>,
     ) -> Result<(), Report<TrustedServerError>> {
-        if self.ec_value.is_some() {
+        if let Some(ec_id) = self.ec_value.as_deref() {
+            let decision = consent::ec_consent_decision(&self.consent);
+            log::info!(
+                "EC generation decision: action=existing_ec, ec_present=true, \
+                 ec_generated=false, consent_allowed={}, consent_reason={}, \
+                 jurisdiction={}, kv_available={}, ec_id={}",
+                decision.allowed,
+                decision.reason,
+                self.consent.jurisdiction,
+                kv.is_some(),
+                log_id(ec_id),
+            );
             return Ok(());
         }
 
-        if !consent::ec_consent_granted(&self.consent) {
-            log::debug!(
-                "EC generation skipped: consent not granted (jurisdiction={})",
+        let decision = consent::ec_consent_decision(&self.consent);
+        if !decision.allowed {
+            log::info!(
+                "EC generation decision: action=blocked_by_consent, ec_present=false, \
+                 ec_generated=false, consent_allowed=false, consent_reason={}, \
+                 jurisdiction={}, kv_available={}",
+                decision.reason,
                 self.consent.jurisdiction,
+                kv.is_some(),
             );
             return Ok(());
         }
@@ -306,7 +355,27 @@ impl EcContext {
                 );
                 self.ec_value = None;
                 self.ec_generated = false;
+                log::info!(
+                    "EC generation decision: action=generated_but_kv_write_failed, \
+                     ec_present=false, ec_generated=false, consent_allowed=true, \
+                     consent_reason={}, jurisdiction={}, kv_available=true",
+                    decision.reason,
+                    self.consent.jurisdiction,
+                );
+                return Ok(());
             }
+        }
+
+        if let Some(ec_id) = self.ec_value.as_deref() {
+            log::info!(
+                "EC generation decision: action=generated, ec_present=false, \
+                 ec_generated=true, consent_allowed=true, consent_reason={}, \
+                 jurisdiction={}, kv_available={}, ec_id={}",
+                decision.reason,
+                self.consent.jurisdiction,
+                kv.is_some(),
+                log_id(ec_id),
+            );
         }
 
         Ok(())
