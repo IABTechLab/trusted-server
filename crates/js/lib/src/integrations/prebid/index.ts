@@ -18,11 +18,6 @@ import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
-// Prebid User ID submodules — self-register with the core on import.
-// The set of submodules is controlled by the TSJS_PREBID_USER_IDS env var
-// at build time. See _user_ids.generated.ts (written by build-all.mjs).
-import './_user_ids.generated';
-
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
 // build time. See _adapters.generated.ts (written by build-all.mjs).

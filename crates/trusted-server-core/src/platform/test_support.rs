@@ -214,6 +214,8 @@ pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     // (status_code, body_bytes) — kept Send by avoiding Body::Stream
     responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    // Headers captured per send call, stored as (name, value) string pairs.
+    request_headers: Mutex<Vec<Vec<(String, String)>>>,
 }
 
 impl StubHttpClient {
@@ -221,6 +223,7 @@ impl StubHttpClient {
         Self {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
+            request_headers: Mutex::new(Vec::new()),
         }
     }
 
@@ -249,6 +252,22 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(request.backend_name.clone());
+
+        let headers: Vec<(String, String)> = request
+            .request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .push(headers);
 
         let (status, body_bytes) = self
             .responses
