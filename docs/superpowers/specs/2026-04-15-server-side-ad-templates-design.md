@@ -770,11 +770,11 @@ t=1052ms  AD VISIBLE
 
 ### 5.4 Key Timing Properties
 
-| Metric              | Cache hit | Cache miss | Client-side today |
-| ------------------- | --------- | ---------- | ----------------- |
-| TTFB                | ~10ms     | ~155ms     | ~150–500ms        |
-| FCP                 | ~80ms     | ~250ms     | ~500ms+           |
-| Ad visible          | ~900ms    | ~1,050ms   | ~3,250ms          |
+| Metric     | Cache hit | Cache miss | Client-side today |
+| ---------- | --------- | ---------- | ----------------- |
+| TTFB       | ~10ms     | ~155ms     | ~150–500ms        |
+| FCP        | ~80ms     | ~250ms     | ~500ms+           |
+| Ad visible | ~900ms    | ~1,050ms   | ~3,250ms          |
 
 - **The auction never blocks page rendering.** FCP is bounded by origin time
   and browser parsing only — same as a page without TS in the ad path.
