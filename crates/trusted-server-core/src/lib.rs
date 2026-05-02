@@ -50,6 +50,7 @@ pub mod integrations;
 pub mod models;
 pub mod openrtb;
 pub mod platform;
+pub mod price_bucket;
 pub mod proxy;
 pub mod publisher;
 pub mod redacted;
