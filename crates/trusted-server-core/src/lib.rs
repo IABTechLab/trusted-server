@@ -40,6 +40,7 @@ pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
+pub mod creative_opportunities;
 pub mod edge_cookie;
 pub mod error;
 pub mod geo;

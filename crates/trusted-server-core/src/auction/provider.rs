@@ -44,6 +44,24 @@ pub trait AuctionProvider: Send + Sync {
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>>;
 
+    /// Parse the response from the provider with access to the original request.
+    ///
+    /// Providers whose response identifiers differ from Trusted Server slot IDs
+    /// can override this to restore logical slot IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response cannot be parsed into a valid
+    /// [`AuctionResponse`].
+    fn parse_response_for_request(
+        &self,
+        response: fastly::Response,
+        response_time_ms: u64,
+        _request: &AuctionRequest,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        self.parse_response(response, response_time_ms)
+    }
+
     /// Check if this provider supports a specific media type.
     fn supports_media_type(&self, media_type: &super::types::MediaType) -> bool {
         // By default, support banner ads
