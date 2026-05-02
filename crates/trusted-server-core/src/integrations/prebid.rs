@@ -975,6 +975,12 @@ impl PrebidAuctionProvider {
                     .collect()
             });
 
+        let ad_id = bid_obj
+            .get("adid")
+            .or_else(|| bid_obj.get("id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         Ok(AuctionBid {
             slot_id,
             price: Some(price), // Prebid provides decoded prices
@@ -986,6 +992,7 @@ impl PrebidAuctionProvider {
             height,
             nurl,
             burl,
+            ad_id,
             metadata: std::collections::HashMap::new(),
         })
     }
@@ -2969,6 +2976,50 @@ fixed_bottom = {placementId = "_s2sBottom"}
             !auction_response.metadata.contains_key("bidstatus"),
             "should not include bidstatus when config.debug is false"
         );
+    }
+
+    #[test]
+    fn parse_openrtb_response_uses_prebid_adid_for_bid_ad_id() {
+        let provider = PrebidAuctionProvider::new(base_config());
+
+        let response_json = json!({
+            "seatbid": [{
+                "seat": "kargo",
+                "bid": [{
+                    "impid": "slot-1",
+                    "price": 2.50,
+                    "adm": "<div>ad</div>",
+                    "adid": "prebid-ad-id-abc"
+                }]
+            }]
+        });
+
+        let auction_response = provider.parse_openrtb_response(&response_json, 25);
+        let bid = auction_response.bids.first().expect("should parse bid");
+
+        assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));
+    }
+
+    #[test]
+    fn parse_openrtb_response_falls_back_to_bid_id_for_bid_ad_id() {
+        let provider = PrebidAuctionProvider::new(base_config());
+
+        let response_json = json!({
+            "seatbid": [{
+                "seat": "kargo",
+                "bid": [{
+                    "id": "openrtb-bid-id-abc",
+                    "impid": "slot-1",
+                    "price": 2.50,
+                    "adm": "<div>ad</div>"
+                }]
+            }]
+        });
+
+        let auction_response = provider.parse_openrtb_response(&response_json, 25);
+        let bid = auction_response.bids.first().expect("should parse bid");
+
+        assert_eq!(bid.ad_id.as_deref(), Some("openrtb-bid-id-abc"));
     }
 
     #[test]

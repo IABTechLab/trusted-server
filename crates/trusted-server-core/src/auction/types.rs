@@ -60,6 +60,14 @@ pub enum MediaType {
     Native,
 }
 
+impl MediaType {
+    /// Returns [`MediaType::Banner`]; used as a serde default function pointer.
+    #[must_use]
+    pub const fn banner() -> Self {
+        Self::Banner
+    }
+}
+
 /// Publisher information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublisherInfo {
@@ -152,6 +160,9 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
+    /// Provider ad ID used for `hb_adid` targeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ad_id: Option<String>,
     /// Provider-specific bid metadata
     /// For APS bids, contains encoded price in "amznbid" field
     pub metadata: HashMap<String, serde_json::Value>,
@@ -276,8 +287,34 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            ad_id: None,
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn media_type_banner_fn_returns_banner() {
+        assert_eq!(MediaType::banner(), MediaType::Banner);
+    }
+
+    #[test]
+    fn bid_has_ad_id_field_for_gam_targeting() {
+        let bid = Bid {
+            slot_id: "atf".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: "kargo".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: Some("prebid-ad-id-abc".to_string()),
+            metadata: HashMap::new(),
+        };
+
+        assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));
     }
 
     #[test]

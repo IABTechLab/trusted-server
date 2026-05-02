@@ -417,6 +417,7 @@ impl ApsAuctionProvider {
             height,
             nurl: None, // Real APS uses client-side event tracking
             burl: None,
+            ad_id: None,
             metadata,
         })
     }

@@ -256,6 +256,7 @@ impl AdServerMockProvider {
                     }),
                     nurl: None,
                     burl: None,
+                    ad_id: None,
                     metadata: HashMap::new(),
                 });
             }
@@ -507,6 +508,7 @@ mod tests {
                     adomain: Some(vec!["amazon.com".to_string()]),
                     nurl: None,
                     burl: None,
+                    ad_id: None,
                     metadata: HashMap::new(),
                 }],
                 response_time_ms: 150,
@@ -526,6 +528,7 @@ mod tests {
                     adomain: None,
                     nurl: None,
                     burl: None,
+                    ad_id: None,
                     metadata: HashMap::new(),
                 }],
                 response_time_ms: 120,
@@ -666,6 +669,7 @@ mod tests {
                 adomain: Some(vec!["amazon.com".to_string()]),
                 nurl: None,
                 burl: None,
+                ad_id: None,
                 metadata: aps_metadata,
             }],
             response_time_ms: 100,
