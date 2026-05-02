@@ -25,6 +25,7 @@ error-stack = { workspace = true }
 fastly = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
+glob = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
 http = { workspace = true }
