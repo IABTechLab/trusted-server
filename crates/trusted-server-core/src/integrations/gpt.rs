@@ -61,6 +61,11 @@ const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
 /// Integration route prefix for all GPT proxy endpoints.
 const ROUTE_PREFIX: &str = "/integrations/gpt";
 
+const GPT_SHIM_INSTALL_SNIPPET: &str =
+    "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>";
+
+const TS_AD_INIT_SNIPPET: &str = r#"<script>(function(w){if(w.__tsAdInitInstalled){return;}w.__tsAdInit=function(){if(w.__tsAdInitInstalled){return false;}w.__tsAdInitInstalled=true;var googletag=w.googletag=w.googletag||{};googletag.cmd=googletag.cmd||[];googletag.cmd.push(function(){var slots=w.__ts_ad_slots||[];var rid=w.__ts_request_id;var bidsByAdId={};var bidsPromise=(rid&&w.fetch?w.fetch('/ts-bids?rid='+encodeURIComponent(rid),{credentials:'omit'}).then(function(r){return r.json();}).catch(function(){return {};}):Promise.resolve({}));var pubads=googletag.pubads&&googletag.pubads();if(!pubads||!googletag.defineSlot){return;}if(pubads.addEventListener){pubads.addEventListener('slotRenderEnded',function(e){var adid=e&&e.slot&&e.slot.getTargeting&&e.slot.getTargeting('hb_adid')[0];var bid=adid&&bidsByAdId[adid];if(bid&&bid.burl&&w.navigator&&w.navigator.sendBeacon){w.navigator.sendBeacon(bid.burl);delete bidsByAdId[adid];}});}var gptSlots=[];slots.forEach(function(s){var slot=googletag.defineSlot(s.gam_unit_path,s.formats||[],s.div_id);if(!slot){return;}if(slot.addService){slot.addService(pubads);}Object.keys(s.targeting||{}).forEach(function(k){slot.setTargeting(k,s.targeting[k]);});gptSlots.push({def:s,slot:slot});});if(googletag.enableServices){googletag.enableServices();}gptSlots.forEach(function(pair){if(googletag.display){googletag.display(pair.def.div_id);}});bidsPromise.then(function(bids){gptSlots.forEach(function(pair){var bid=bids&&bids[pair.def.id];if(!bid){return;}['hb_pb','hb_bidder','hb_adid'].forEach(function(k){if(bid[k]!=null){pair.slot.setTargeting(k,String(bid[k]));}});if(bid.hb_adid){bidsByAdId[String(bid.hb_adid)]=bid;}});if(pubads.refresh){pubads.refresh(gptSlots.map(function(pair){return pair.slot;}));}});});return true;};w.__tsAdInit();})(window);</script>"#;
+
 /// Configuration for the Google Publisher Tags integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct GptConfig {
@@ -443,8 +448,8 @@ impl IntegrationHeadInjector for GptIntegration {
         // when it sees the pre-set flag, so this works regardless of whether
         // the inline bootstrap runs before or after the TSJS bundle.
         vec![
-            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
-                .to_string(),
+            GPT_SHIM_INSTALL_SNIPPET.to_string(),
+            TS_AD_INIT_SNIPPET.to_string(),
         ]
     }
 }
@@ -1020,11 +1025,54 @@ mod tests {
 
         let inserts = integration.head_inserts(&ctx);
 
-        assert_eq!(inserts.len(), 1, "should emit exactly one head insert");
-        assert_eq!(
-            inserts[0],
-            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
-            "should set the enable flag and call the GPT shim activation function"
+        assert!(
+            inserts
+                .iter()
+                .any(|insert| insert == GPT_SHIM_INSTALL_SNIPPET),
+            "should keep the GPT shim activation snippet"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_ts_ad_init_bootstrap_without_inline_bids() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let combined = integration.head_inserts(&ctx).join("");
+
+        assert!(
+            combined.contains("__tsAdInit"),
+            "should emit the server-side GPT bootstrap"
+        );
+        assert!(
+            combined.contains("/ts-bids"),
+            "should fetch bids from the bid endpoint"
+        );
+        assert!(
+            combined.contains("__ts_request_id"),
+            "should read the request ID global"
+        );
+        assert!(
+            combined.contains("bidsPromise"),
+            "should create a bid fetch promise"
+        );
+        assert!(
+            combined.contains("slotRenderEnded"),
+            "should listen for rendered GPT slots"
+        );
+        assert!(
+            combined.contains("sendBeacon"),
+            "should fire billing notifications via sendBeacon"
+        );
+        assert!(
+            !combined.contains("__ts_bids"),
+            "should not read or write inline bid globals"
         );
     }
 

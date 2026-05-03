@@ -17,6 +17,91 @@ type GptWindow = Window & {
   };
 };
 
+type TsAdInitWindow = Window & {
+  __ts_ad_slots?: Array<Record<string, unknown>>;
+  __ts_request_id?: string;
+  googletag?: {
+    cmd: Array<() => void>;
+    defineSlot: ReturnType<typeof vi.fn>;
+    pubads: ReturnType<typeof vi.fn>;
+    enableServices: ReturnType<typeof vi.fn>;
+    display: ReturnType<typeof vi.fn>;
+  };
+};
+
+type MockSlot = {
+  id: string;
+  targeting: Map<string, string[]>;
+  setTargeting: ReturnType<typeof vi.fn>;
+  getTargeting: ReturnType<typeof vi.fn>;
+  addService: ReturnType<typeof vi.fn>;
+};
+
+const flushPromises = async () => {
+  for (let i = 0; i < 5; i++) {
+    await Promise.resolve();
+  }
+};
+
+function jsonResponse(body: unknown) {
+  return {
+    json: () => Promise.resolve(body),
+  };
+}
+
+function createGptHarness(win: TsAdInitWindow) {
+  const operations: string[] = [];
+  const slots: MockSlot[] = [];
+  let slotRenderEnded: ((event: { slot: MockSlot }) => void) | undefined;
+
+  const pubadsService = {
+    addEventListener: vi.fn((eventName: string, callback: (event: { slot: MockSlot }) => void) => {
+      if (eventName === 'slotRenderEnded') {
+        slotRenderEnded = callback;
+      }
+    }),
+    refresh: vi.fn(() => {
+      operations.push('refresh');
+    }),
+  };
+
+  win.googletag = {
+    cmd: [],
+    defineSlot: vi.fn((_adUnitPath: string, _sizes: unknown, elementId: string) => {
+      const targeting = new Map<string, string[]>();
+      const slot: MockSlot = {
+        id: elementId,
+        targeting,
+        setTargeting: vi.fn((key: string, value: string | string[]) => {
+          const values = Array.isArray(value) ? value : [value];
+          targeting.set(key, values);
+          operations.push(`set:${elementId}:${key}:${values.join(',')}`);
+          return slot;
+        }),
+        getTargeting: vi.fn((key: string) => targeting.get(key) ?? []),
+        addService: vi.fn(() => slot),
+      };
+      slots.push(slot);
+      operations.push(`define:${elementId}`);
+      return slot;
+    }),
+    pubads: vi.fn(() => pubadsService),
+    enableServices: vi.fn(() => {
+      operations.push('enableServices');
+    }),
+    display: vi.fn((elementId: string) => {
+      operations.push(`display:${elementId}`);
+    }),
+  };
+
+  return {
+    operations,
+    pubadsService,
+    slots,
+    triggerSlotRenderEnded: (slot: MockSlot) => slotRenderEnded?.({ slot }),
+  };
+}
+
 describe('GPT shim – patchCommandQueue', () => {
   let win: GptWindow;
   let installGptShim: () => boolean;
@@ -162,6 +247,176 @@ describe('GPT shim – patchCommandQueue', () => {
 
     expect(win.googletag).toBeDefined();
     expect(Array.isArray(win.googletag!.cmd)).toBe(true);
+  });
+});
+
+describe('GPT shim – __tsAdInit bootstrap', () => {
+  let win: TsAdInitWindow;
+  let installTsAdInit: () => boolean;
+  let originalFetch: typeof globalThis.fetch;
+  let originalSendBeacon: typeof navigator.sendBeacon;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    win = window as TsAdInitWindow;
+    delete win.__ts_ad_slots;
+    delete win.__ts_request_id;
+    delete (win as TsAdInitWindow & { __tsAdInit?: () => boolean }).__tsAdInit;
+    delete (win as TsAdInitWindow & { __tsAdInitInstalled?: boolean }).__tsAdInitInstalled;
+    delete win.googletag;
+    originalFetch = globalThis.fetch;
+    originalSendBeacon = navigator.sendBeacon;
+
+    const mod = await import('../../../src/integrations/gpt/index');
+    installTsAdInit = mod.installTsAdInit;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    navigator.sendBeacon = originalSendBeacon;
+    delete win.__ts_ad_slots;
+    delete win.__ts_request_id;
+    delete (win as TsAdInitWindow & { __tsAdInit?: () => boolean }).__tsAdInit;
+    delete (win as TsAdInitWindow & { __tsAdInitInstalled?: boolean }).__tsAdInitInstalled;
+    delete win.googletag;
+  });
+
+  it('fetches request scoped bids without credentials', async () => {
+    win.__ts_ad_slots = [];
+    win.__ts_request_id = 'request id/1';
+    globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse({}))) as unknown as typeof fetch;
+    createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    expect(globalThis.fetch).toHaveBeenCalledWith('/ts-bids?rid=request%20id%2F1', {
+      credentials: 'omit',
+    });
+  });
+
+  it('applies static slot targeting before refresh', async () => {
+    win.__ts_ad_slots = [
+      {
+        id: 'atf_sidebar',
+        gam_unit_path: '/21765378893/atf_sidebar',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+        targeting: { pos: 'atf' },
+      },
+    ];
+    win.__ts_request_id = 'rid-123';
+    globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse({}))) as unknown as typeof fetch;
+    const { operations } = createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    expect(operations.indexOf('set:div-atf-sidebar:pos:atf')).toBeGreaterThanOrEqual(0);
+    expect(operations.indexOf('set:div-atf-sidebar:pos:atf')).toBeLessThan(
+      operations.indexOf('refresh')
+    );
+  });
+
+  it('applies hb targeting before refresh', async () => {
+    win.__ts_ad_slots = [
+      {
+        id: 'atf_sidebar',
+        gam_unit_path: '/21765378893/atf_sidebar',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
+    win.__ts_request_id = 'rid-123';
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(
+        jsonResponse({
+          atf_sidebar: {
+            hb_pb: '1.20',
+            hb_bidder: 'rubicon',
+            hb_adid: 'ad-123',
+          },
+        })
+      )
+    ) as unknown as typeof fetch;
+    const { operations } = createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    for (const field of ['hb_pb', 'hb_bidder', 'hb_adid']) {
+      const operation = operations.find((entry) =>
+        entry.startsWith(`set:div-atf-sidebar:${field}:`)
+      );
+      expect(operation).toBeDefined();
+      expect(operations.indexOf(operation!)).toBeLessThan(operations.indexOf('refresh'));
+    }
+  });
+
+  it('refreshes GPT slots when bid fetch fails', async () => {
+    win.__ts_ad_slots = [
+      {
+        id: 'atf_sidebar',
+        gam_unit_path: '/21765378893/atf_sidebar',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
+    win.__ts_request_id = 'rid-123';
+    globalThis.fetch = vi.fn(() =>
+      Promise.reject(new Error('network down'))
+    ) as unknown as typeof fetch;
+    const { pubadsService } = createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    expect(pubadsService.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires burl only after rendered slot targeting matches bid hb_adid', async () => {
+    win.__ts_ad_slots = [
+      {
+        id: 'atf_sidebar',
+        gam_unit_path: '/21765378893/atf_sidebar',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
+    win.__ts_request_id = 'rid-123';
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve(
+        jsonResponse({
+          atf_sidebar: {
+            hb_pb: '1.20',
+            hb_bidder: 'rubicon',
+            hb_adid: 'ad-123',
+            burl: 'https://bidder.example/bill',
+          },
+        })
+      )
+    ) as unknown as typeof fetch;
+    navigator.sendBeacon = vi.fn(() => true);
+    const { slots, triggerSlotRenderEnded } = createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    slots[0].targeting.set('hb_adid', ['other-ad']);
+    triggerSlotRenderEnded(slots[0]);
+    expect(navigator.sendBeacon).not.toHaveBeenCalled();
+
+    slots[0].targeting.set('hb_adid', ['ad-123']);
+    triggerSlotRenderEnded(slots[0]);
+    expect(navigator.sendBeacon).toHaveBeenCalledWith('https://bidder.example/bill');
   });
 });
 
