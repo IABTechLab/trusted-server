@@ -21,6 +21,7 @@ use crate::backend::BackendConfig;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
+use crate::creative_opportunities::{CreativeOpportunitiesConfig, CreativeOpportunitySlot};
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
@@ -170,6 +171,66 @@ fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
     trusted_server_js::all_module_ids()
         .into_iter()
         .find(|&id| id == stem)
+}
+
+/// Build the head script that exposes server-side ad slot metadata.
+#[must_use]
+pub(crate) fn build_head_globals_script(
+    matched_slots: &[&CreativeOpportunitySlot],
+    request_id: &str,
+    co_config: &CreativeOpportunitiesConfig,
+) -> String {
+    #[derive(serde::Serialize)]
+    struct HeadAdSlot<'a> {
+        id: &'a str,
+        gam_unit_path: String,
+        div_id: String,
+        formats: Vec<[u32; 2]>,
+        targeting: &'a std::collections::HashMap<String, String>,
+    }
+
+    let slots = matched_slots
+        .iter()
+        .map(|slot| HeadAdSlot {
+            id: &slot.id,
+            gam_unit_path: slot.resolved_gam_unit_path(co_config),
+            div_id: slot.resolved_div_id(),
+            formats: slot
+                .formats
+                .iter()
+                .map(|format| [format.width, format.height])
+                .collect(),
+            targeting: &slot.targeting,
+        })
+        .collect::<Vec<_>>();
+
+    let slots_json = serde_json::to_string(&slots).expect("should serialize ad slots");
+    let request_id_json = serde_json::to_string(request_id).expect("should serialize request ID");
+    let escaped_slots_json = html_escape_for_script(&slots_json);
+    let escaped_request_id_json = html_escape_for_script(&request_id_json);
+
+    format!(
+        "<script>window.__ts_ad_slots=JSON.parse(\"{escaped_slots_json}\");window.__ts_request_id=JSON.parse(\"{escaped_request_id_json}\");</script>"
+    )
+}
+
+/// Escape JSON so it can be embedded in a JavaScript string inside an HTML script.
+#[must_use]
+pub(crate) fn html_escape_for_script(json: &str) -> String {
+    let mut escaped = String::with_capacity(json.len());
+    for ch in json.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '<' => escaped.push_str("\\u003C"),
+            '>' => escaped.push_str("\\u003E"),
+            '&' => escaped.push_str("\\u0026"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Parameters for processing response streaming
@@ -719,10 +780,50 @@ fn apply_ec_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::types::MediaType;
+    use crate::creative_opportunities::{
+        CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
+        SlotProviders,
+    };
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::noop_services;
+    use crate::price_bucket::PriceGranularity;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn make_creative_slot(id: &str) -> CreativeOpportunitySlot {
+        CreativeOpportunitySlot {
+            id: id.to_string(),
+            gam_unit_path: Some(format!("/21765378893/{id}")),
+            div_id: Some(format!("div-{id}")),
+            page_patterns: vec!["/news/**".to_string()],
+            formats: vec![
+                CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                },
+                CreativeOpportunityFormat {
+                    width: 728,
+                    height: 90,
+                    media_type: MediaType::Banner,
+                },
+            ],
+            floor_price: Some(1.25),
+            targeting: HashMap::from([("pos".to_string(), "atf".to_string())]),
+            providers: SlotProviders::default(),
+        }
+    }
+
+    fn make_creative_config() -> CreativeOpportunitiesConfig {
+        CreativeOpportunitiesConfig {
+            gam_network_id: "21765378893".to_string(),
+            auction_timeout_ms: Some(500),
+            price_granularity: PriceGranularity::Dense,
+        }
+    }
 
     #[test]
     fn test_content_type_detection() {
@@ -749,6 +850,84 @@ mod tests {
                 "Content-Type '{content_type}' should_process: expected {expected}",
             );
         }
+    }
+
+    #[test]
+    fn build_head_globals_script_sets_slots_and_request_id_only() {
+        let slot = make_creative_slot("atf_sidebar");
+        let slots = vec![&slot];
+
+        let script = build_head_globals_script(&slots, "req-123", &make_creative_config());
+
+        assert!(
+            script.contains("window.__ts_ad_slots"),
+            "should set ad slots global"
+        );
+        assert!(
+            script.contains("window.__ts_request_id"),
+            "should set request ID global"
+        );
+        assert!(
+            script.contains("JSON.parse(\""),
+            "should parse escaped JSON from a string literal"
+        );
+        assert!(
+            script.contains("\\\"id\\\":\\\"atf_sidebar\\\""),
+            "should include slot ID in escaped JSON"
+        );
+        assert!(
+            script.contains("\\\"gam_unit_path\\\":\\\"/21765378893/atf_sidebar\\\""),
+            "should include resolved GAM unit path"
+        );
+        assert!(
+            script.contains("\\\"formats\\\":[[300,250],[728,90]]"),
+            "should include slot formats"
+        );
+        assert!(
+            script.contains("\\\"targeting\\\":{\\\"pos\\\":\\\"atf\\\"}"),
+            "should include static targeting"
+        );
+        assert!(
+            script.contains("JSON.parse(\"\\\"req-123\\\"\")"),
+            "should set request ID through JSON.parse"
+        );
+        assert!(
+            !script.contains("window.__ts_bids"),
+            "head globals must not inject bid data"
+        );
+    }
+
+    #[test]
+    fn html_escape_for_script_prevents_raw_script_breakout() {
+        let unsafe_json = serde_json::to_string(&json!({
+            "slot": "</script><script>alert(\"x\")</script>",
+            "ampersand": "a&b",
+            "line": "first\u{2028}second\u{2029}third",
+        }))
+        .expect("should serialize unsafe JSON fixture");
+
+        let escaped = html_escape_for_script(&unsafe_json);
+
+        assert!(
+            !escaped.contains("</script>"),
+            "escaped JSON string should not contain a raw script end tag"
+        );
+        assert!(
+            !escaped.contains("<script>"),
+            "escaped JSON string should not contain a raw script start tag"
+        );
+        assert!(
+            escaped.contains("\\u003C/script\\u003E"),
+            "less-than and greater-than should be escaped for HTML script safety"
+        );
+        assert!(
+            escaped.contains("\\u0026"),
+            "ampersands should be escaped for HTML safety"
+        );
+        assert!(
+            escaped.contains("\\u2028") && escaped.contains("\\u2029"),
+            "line separators should be escaped for JavaScript string safety"
+        );
     }
 
     #[test]

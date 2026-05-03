@@ -133,6 +133,8 @@ pub struct HtmlProcessorConfig {
     pub origin_host: String,
     pub request_host: String,
     pub request_scheme: String,
+    /// Precomputed head globals script. Contains ad slots and request ID only.
+    pub ad_slots_script: Option<String>,
     pub integrations: IntegrationRegistry,
 }
 
@@ -150,6 +152,7 @@ impl HtmlProcessorConfig {
             origin_host: origin_host.to_string(),
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
+            ad_slots_script: None,
             integrations: integrations.clone(),
         }
     }
@@ -230,6 +233,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let injected_tsjs = Rc::new(Cell::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
+    let ad_slots_script = Rc::new(config.ad_slots_script.clone());
 
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
@@ -238,6 +242,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let ad_slots_script = ad_slots_script.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
@@ -247,6 +252,9 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         origin_host: &patterns.origin_host,
                         document_state: &document_state,
                     };
+                    if let Some(script) = ad_slots_script.as_ref() {
+                        snippet.push_str(script);
+                    }
                     // First inject integration-specific config (e.g., window.__tsjs_prebid)
                     // so it's available when the bundle's auto-init code reads it.
                     for insert in integrations.head_inserts(&ctx) {
@@ -539,6 +547,7 @@ mod tests {
             origin_host: "origin.example.com".to_string(),
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
+            ad_slots_script: None,
             integrations: IntegrationRegistry::default(),
         }
     }
@@ -665,6 +674,95 @@ mod tests {
         assert!(
             tsjs_index < title_index,
             "should prepend all injected content before existing head content"
+        );
+    }
+
+    #[test]
+    fn ad_slots_script_is_prepended_at_head_open_before_other_head_inserts() {
+        struct TestHeadInjector;
+
+        impl IntegrationHeadInjector for TestHeadInjector {
+            fn integration_id(&self) -> &'static str {
+                "test"
+            }
+
+            fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+                vec![r#"<script>window.__testHeadInjector=true;</script>"#.to_string()]
+            }
+        }
+
+        let html = r#"<html><head><title>Test</title></head><body></body></html>"#;
+
+        let mut config = create_test_config();
+        config.ad_slots_script = Some(
+            r#"<script>window.__ts_ad_slots=JSON.parse("[]");window.__ts_request_id=JSON.parse("\"rid-123\"");</script>"#
+                .to_string(),
+        );
+        config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
+            Vec::new(),
+            Vec::new(),
+            vec![Arc::new(TestHeadInjector)],
+        );
+
+        let processor = create_html_processor(config);
+        let pipeline_config = PipelineConfig {
+            input_compression: Compression::None,
+            output_compression: Compression::None,
+            chunk_size: 8192,
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
+
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("pipeline should process HTML");
+        let processed = String::from_utf8(output).expect("output should be valid UTF-8");
+
+        let ad_slots_index = processed
+            .find("window.__ts_ad_slots")
+            .expect("should inject ad slots global");
+        let request_id_index = processed
+            .find("window.__ts_request_id")
+            .expect("should inject request ID global");
+        let head_insert_index = processed
+            .find("window.__testHeadInjector=true")
+            .expect("should inject integration head insert");
+        let tsjs_index = processed
+            .find("id=\"trustedserver-js\"")
+            .expect("should inject unified tsjs tag");
+        let title_index = processed
+            .find("<title>")
+            .expect("should keep existing head content");
+
+        assert_eq!(
+            processed.matches("window.__ts_ad_slots").count(),
+            1,
+            "should inject ad slots global once"
+        );
+        assert_eq!(
+            processed.matches("window.__ts_request_id").count(),
+            1,
+            "should inject request ID global once"
+        );
+        assert!(
+            ad_slots_index < head_insert_index,
+            "ad slots script should be first injected head content"
+        );
+        assert!(
+            request_id_index < head_insert_index,
+            "request ID should be part of the first injected head content"
+        );
+        assert!(
+            head_insert_index < tsjs_index,
+            "integration head inserts should remain before tsjs"
+        );
+        assert!(
+            tsjs_index < title_index,
+            "all injected content should be prepended at the head open tag"
+        );
+        assert!(
+            !processed.contains("window.__ts_bids"),
+            "HTML output must never include bid globals"
         );
     }
 
