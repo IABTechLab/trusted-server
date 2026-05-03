@@ -35,6 +35,7 @@ pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
 pub mod backend;
+pub mod bid_cache;
 pub mod consent;
 pub mod consent_config;
 pub mod constants;
