@@ -41,6 +41,7 @@ pub struct AuctionDeadline {
 
 impl AuctionDeadline {
     /// Builds an [`AuctionDeadline`] from explicit local and absolute times.
+    #[must_use]
     pub fn from_parts(instant: Instant, epoch_ms: u64) -> Self {
         Self { instant, epoch_ms }
     }
@@ -49,6 +50,7 @@ impl AuctionDeadline {
     ///
     /// This computes both the monotonic [`Instant`] and Unix epoch millisecond
     /// deadline once so later paths can reuse the same timeout.
+    #[must_use]
     pub fn from_timeout(timeout: Duration) -> Self {
         let now_instant = Instant::now();
         let now_epoch = SystemTime::now();
@@ -67,6 +69,7 @@ impl AuctionDeadline {
     /// Fastly stores only the epoch deadline in Core Cache. A later `/ts-bids`
     /// request uses this helper to enforce that original absolute deadline
     /// without minting a fresh timeout.
+    #[must_use]
     pub fn from_epoch_ms(epoch_ms: u64) -> Option<Self> {
         Self::from_epoch_ms_with_max_remaining(epoch_ms, DEFAULT_MAX_RECONSTRUCTED_WAIT)
     }
@@ -76,6 +79,7 @@ impl AuctionDeadline {
     ///
     /// Returns [`None`] when the persisted deadline is implausibly far in the
     /// future or cannot be represented locally.
+    #[must_use]
     pub fn from_epoch_ms_with_max_remaining(
         epoch_ms: u64,
         max_remaining: Duration,
@@ -203,6 +207,7 @@ struct StoredBidCacheEntry {
 
 impl InMemoryBidCache {
     /// Creates an in-memory bid cache with a TTL and maximum capacity.
+    #[must_use]
     pub fn new(ttl: Duration, capacity: usize) -> Self {
         Self {
             ttl,

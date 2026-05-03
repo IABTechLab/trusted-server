@@ -174,6 +174,7 @@ fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
 }
 
 /// Build the head script that exposes server-side ad slot metadata.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn build_head_globals_script(
     matched_slots: &[&CreativeOpportunitySlot],
@@ -215,6 +216,7 @@ pub(crate) fn build_head_globals_script(
 }
 
 /// Escape JSON so it can be embedded in a JavaScript string inside an HTML script.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn html_escape_for_script(json: &str) -> String {
     let mut escaped = String::with_capacity(json.len());
@@ -231,6 +233,52 @@ pub(crate) fn html_escape_for_script(json: &str) -> String {
         }
     }
     escaped
+}
+
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn build_bid_map(
+    winning_bids: &std::collections::HashMap<String, crate::auction::types::Bid>,
+    price_granularity: crate::price_bucket::PriceGranularity,
+) -> crate::bid_cache::BidMap {
+    winning_bids
+        .iter()
+        .filter_map(|(slot_id, bid)| {
+            let cpm = bid.price?;
+            Some((
+                slot_id.clone(),
+                serde_json::json!({
+                    "hb_pb": crate::price_bucket::price_bucket(cpm, price_granularity),
+                    "hb_bidder": bid.bidder.as_str(),
+                    "hb_adid": bid.ad_id.as_deref().unwrap_or(""),
+                    "burl": bid.burl.as_deref(),
+                }),
+            ))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn server_side_auction_allowed(consent_context: &crate::consent::ConsentContext) -> bool {
+    consent_context
+        .tcf
+        .as_ref()
+        .is_some_and(|tcf| tcf.has_purpose_consent(1))
+}
+
+#[allow(dead_code)]
+fn apply_server_side_ad_cache_policy(
+    response: &mut Response,
+    slots_matched: bool,
+    globals_injected: bool,
+) {
+    if !slots_matched {
+        return;
+    }
+
+    if globals_injected || slots_matched {
+        response.set_header(header::CACHE_CONTROL, "private, no-store");
+    }
 }
 
 /// Parameters for processing response streaming
@@ -778,9 +826,10 @@ fn apply_ec_headers(
 }
 
 #[cfg(test)]
-mod tests {
+mod creative_opportunities_tests {
     use super::*;
-    use crate::auction::types::MediaType;
+    use crate::auction::types::{Bid, MediaType};
+    use crate::consent::{ConsentContext, TcfConsent};
     use crate::creative_opportunities::{
         CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         SlotProviders,
@@ -822,6 +871,42 @@ mod tests {
             gam_network_id: "21765378893".to_string(),
             auction_timeout_ms: Some(500),
             price_granularity: PriceGranularity::Dense,
+        }
+    }
+
+    fn make_bid(slot_id: &str, price: Option<f64>, ad_id: Option<&str>) -> Bid {
+        Bid {
+            slot_id: slot_id.to_string(),
+            price,
+            currency: "USD".to_string(),
+            creative: Some("<div>ad</div>".to_string()),
+            adomain: Some(vec!["advertiser.example".to_string()]),
+            bidder: "rubicon".to_string(),
+            width: 300,
+            height: 250,
+            nurl: Some("https://bidder.example/win".to_string()),
+            burl: Some("https://bidder.example/bill".to_string()),
+            ad_id: ad_id.map(str::to_string),
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_tcf_with_purpose_1(consented: bool) -> TcfConsent {
+        TcfConsent {
+            version: 2,
+            cmp_id: 1,
+            cmp_version: 1,
+            consent_screen: 1,
+            consent_language: "EN".to_string(),
+            vendor_list_version: 42,
+            tcf_policy_version: 4,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents: vec![consented, true, true],
+            purpose_legitimate_interests: vec![false; 3],
+            vendor_consents: vec![],
+            vendor_legitimate_interests: vec![],
+            special_feature_opt_ins: vec![],
         }
     }
 
@@ -901,6 +986,7 @@ mod tests {
     fn html_escape_for_script_prevents_raw_script_breakout() {
         let unsafe_json = serde_json::to_string(&json!({
             "slot": "</script><script>alert(\"x\")</script>",
+            "angle": "<tag>",
             "ampersand": "a&b",
             "line": "first\u{2028}second\u{2029}third",
         }))
@@ -913,8 +999,16 @@ mod tests {
             "escaped JSON string should not contain a raw script end tag"
         );
         assert!(
-            !escaped.contains("<script>"),
-            "escaped JSON string should not contain a raw script start tag"
+            !escaped.contains('<') && !escaped.contains('>'),
+            "less-than and greater-than should be escaped for HTML script safety"
+        );
+        assert!(
+            !escaped.contains('&'),
+            "ampersands should be escaped for HTML script safety"
+        );
+        assert!(
+            !escaped.contains('\u{2028}') && !escaped.contains('\u{2029}'),
+            "line separators should be escaped for JavaScript string safety"
         );
         assert!(
             escaped.contains("\\u003C/script\\u003E"),
@@ -927,6 +1021,168 @@ mod tests {
         assert!(
             escaped.contains("\\u2028") && escaped.contains("\\u2029"),
             "line separators should be escaped for JavaScript string safety"
+        );
+    }
+
+    #[test]
+    fn build_bid_map_emits_prebid_targeting_fields() {
+        let winning_bids = HashMap::from([(
+            "atf_sidebar".to_string(),
+            make_bid("atf_sidebar", Some(1.239), Some("ad-123")),
+        )]);
+
+        let bid_map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+
+        assert_eq!(
+            bid_map.get("atf_sidebar"),
+            Some(&json!({
+                "hb_pb": "1.23",
+                "hb_bidder": "rubicon",
+                "hb_adid": "ad-123",
+                "burl": "https://bidder.example/bill",
+            })),
+            "should emit Prebid targeting fields for priced bids"
+        );
+    }
+
+    #[test]
+    fn build_bid_map_uses_empty_ad_id_when_missing() {
+        let winning_bids = HashMap::from([(
+            "atf_sidebar".to_string(),
+            make_bid("atf_sidebar", Some(1.0), None),
+        )]);
+
+        let bid_map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+
+        assert_eq!(
+            bid_map
+                .get("atf_sidebar")
+                .and_then(|bid| bid.get("hb_adid")),
+            Some(&json!("")),
+            "should use empty hb_adid when the provider did not return one"
+        );
+    }
+
+    #[test]
+    fn build_bid_map_omits_bids_without_price() {
+        let winning_bids = HashMap::from([
+            (
+                "priced".to_string(),
+                make_bid("priced", Some(2.0), Some("ad-priced")),
+            ),
+            ("aps".to_string(), make_bid("aps", None, Some("ad-aps"))),
+        ]);
+
+        let bid_map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+
+        assert!(
+            bid_map.contains_key("priced"),
+            "should keep bids with a price"
+        );
+        assert!(
+            !bid_map.contains_key("aps"),
+            "should omit bids whose price must be decoded elsewhere"
+        );
+    }
+
+    #[test]
+    fn server_side_auction_allowed_requires_tcf_purpose_1_consent() {
+        let no_tcf = ConsentContext::default();
+        let denied = ConsentContext {
+            tcf: Some(make_tcf_with_purpose_1(false)),
+            ..ConsentContext::default()
+        };
+        let allowed = ConsentContext {
+            tcf: Some(make_tcf_with_purpose_1(true)),
+            ..ConsentContext::default()
+        };
+
+        assert!(
+            !server_side_auction_allowed(&no_tcf),
+            "absent TCF should deny server-side auction"
+        );
+        assert!(
+            !server_side_auction_allowed(&denied),
+            "TCF without Purpose 1 consent should deny server-side auction"
+        );
+        assert!(
+            server_side_auction_allowed(&allowed),
+            "TCF with Purpose 1 consent should allow server-side auction"
+        );
+    }
+
+    #[test]
+    fn cache_policy_sets_no_store_when_slots_matched_and_consent_denied() {
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CACHE_CONTROL, "public, max-age=300");
+
+        apply_server_side_ad_cache_policy(&mut response, true, false);
+
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "matched slots without injected globals should not be browser cached"
+        );
+    }
+
+    #[test]
+    fn cache_policy_sets_no_store_when_globals_are_injected() {
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CACHE_CONTROL, "public, max-age=300");
+
+        apply_server_side_ad_cache_policy(&mut response, true, true);
+
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "responses with request-scoped globals should not be browser cached"
+        );
+    }
+
+    #[test]
+    fn cache_policy_preserves_surrogate_headers() {
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CACHE_CONTROL, "public, max-age=300");
+        response.set_header("Surrogate-Control", "max-age=3600");
+        response.set_header("Fastly-Surrogate-Control", "max-age=7200");
+
+        apply_server_side_ad_cache_policy(&mut response, true, true);
+
+        assert_eq!(
+            response.get_header_str("Surrogate-Control"),
+            Some("max-age=3600"),
+            "should preserve origin Surrogate-Control"
+        );
+        assert_eq!(
+            response.get_header_str("Fastly-Surrogate-Control"),
+            Some("max-age=7200"),
+            "should preserve origin Fastly-Surrogate-Control"
+        );
+    }
+
+    #[test]
+    fn cache_policy_preserves_origin_cache_headers_when_no_slots_match() {
+        let mut response = Response::from_status(StatusCode::OK);
+        response.set_header(header::CACHE_CONTROL, "public, max-age=300");
+        response.set_header("Surrogate-Control", "max-age=3600");
+        response.set_header("Fastly-Surrogate-Control", "max-age=7200");
+
+        apply_server_side_ad_cache_policy(&mut response, false, false);
+
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("public, max-age=300"),
+            "no-match responses should preserve browser cache headers"
+        );
+        assert_eq!(
+            response.get_header_str("Surrogate-Control"),
+            Some("max-age=3600"),
+            "no-match responses should preserve Surrogate-Control"
+        );
+        assert_eq!(
+            response.get_header_str("Fastly-Surrogate-Control"),
+            Some("max-age=7200"),
+            "no-match responses should preserve Fastly-Surrogate-Control"
         );
     }
 
