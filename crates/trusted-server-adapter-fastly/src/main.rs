@@ -1,10 +1,12 @@
 use error_stack::Report;
-use fastly::http::Method;
+use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
+use std::time::{Duration, Instant};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::bid_cache::{BidCache, BidMap, CacheResult, WaitResult};
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
@@ -28,8 +30,6 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
-// Used by the `/ts-bids` route in the next implementation task.
-#[allow(dead_code)]
 mod bid_cache;
 mod error;
 mod logging;
@@ -38,9 +38,13 @@ mod platform;
 #[cfg(test)]
 mod route_tests;
 
+use crate::bid_cache::FastlyBidCache;
 use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+
+const TS_BIDS_NO_STORE: &str = "private, no-store";
+const TS_BIDS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Entry point for the Fastly Compute program.
 ///
@@ -98,6 +102,7 @@ fn main() {
     let kv_store = std::sync::Arc::new(UnavailableKvStore)
         as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
     let runtime_services = build_runtime_services(&req, kv_store);
+    let bid_cache = FastlyBidCache::new();
 
     // route_request may send the response directly (streaming path) or
     // return it for us to send (buffered path).
@@ -106,6 +111,7 @@ fn main() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
+        &bid_cache,
         req,
     )) {
         response.send_to_client();
@@ -117,6 +123,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
+    bid_cache: &impl BidCache,
     mut req: Request,
 ) -> Option<Response> {
     // Strip client-spoofable forwarded headers at the edge.
@@ -157,6 +164,8 @@ async fn route_request(
 
     // Match known routes and handle them
     let result = match (method, path.as_str()) {
+        (Method::GET, "/ts-bids") => Ok(handle_ts_bids_request(&req, bid_cache)),
+
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
             handle_tsjs_dynamic(&req, integration_registry)
@@ -275,8 +284,76 @@ async fn route_request(
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
+    if path == "/ts-bids" {
+        response.set_header(header::CACHE_CONTROL, TS_BIDS_NO_STORE);
+    }
 
     Some(response)
+}
+
+fn handle_ts_bids_request(req: &Request, bid_cache: &impl BidCache) -> Response {
+    let Some(request_id) = req
+        .get_url()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "rid").then_some(value.into_owned()))
+        .filter(|value| !value.is_empty())
+    else {
+        return text_ts_bids_response(StatusCode::BAD_REQUEST, "missing rid\n");
+    };
+
+    match bid_cache.try_get(&request_id) {
+        Ok(CacheResult::Complete { bids }) => json_ts_bids_response(StatusCode::OK, &bids),
+        Ok(CacheResult::Pending { auction_deadline }) => {
+            match wait_for_ts_bids(bid_cache, &request_id, auction_deadline.instant) {
+                WaitResult::Bids(bids) => json_ts_bids_response(StatusCode::OK, &bids),
+                WaitResult::Empty => empty_ts_bids_response(),
+                WaitResult::NotFound => text_ts_bids_response(StatusCode::NOT_FOUND, "not found\n"),
+            }
+        }
+        Ok(CacheResult::NotFound) => text_ts_bids_response(StatusCode::NOT_FOUND, "not found\n"),
+        Err(error) => {
+            log::warn!("Failed to read bid cache: {error:?}");
+            empty_ts_bids_response()
+        }
+    }
+}
+
+fn wait_for_ts_bids(bid_cache: &impl BidCache, request_id: &str, deadline: Instant) -> WaitResult {
+    loop {
+        match bid_cache.try_get(request_id) {
+            Ok(CacheResult::Complete { bids }) => return WaitResult::Bids(bids),
+            Ok(CacheResult::NotFound) => return WaitResult::NotFound,
+            Ok(CacheResult::Pending { .. }) => {
+                if Instant::now() >= deadline {
+                    return WaitResult::Empty;
+                }
+                std::thread::sleep(TS_BIDS_POLL_INTERVAL);
+            }
+            Err(error) => {
+                log::warn!("Failed to poll bid cache: {error:?}");
+                return WaitResult::Empty;
+            }
+        }
+    }
+}
+
+fn empty_ts_bids_response() -> Response {
+    json_ts_bids_response(StatusCode::OK, &BidMap::new())
+}
+
+fn json_ts_bids_response(status: StatusCode, bids: &BidMap) -> Response {
+    let body = serde_json::to_string(&bids).expect("should serialize bid map");
+
+    Response::from_status(status)
+        .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, TS_BIDS_NO_STORE)
+        .with_body(body)
+}
+
+fn text_ts_bids_response(status: StatusCode, body: &str) -> Response {
+    Response::from_status(status)
+        .with_header(header::CACHE_CONTROL, TS_BIDS_NO_STORE)
+        .with_body_text_plain(body)
 }
 
 fn runtime_services_for_consent_route(

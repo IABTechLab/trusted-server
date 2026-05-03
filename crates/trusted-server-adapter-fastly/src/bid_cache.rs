@@ -26,6 +26,7 @@ impl FastlyBidCache {
     }
 
     /// Creates a Fastly bid cache with an explicit TTL.
+    #[cfg(test)]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -34,6 +35,7 @@ impl FastlyBidCache {
     }
 
     /// Creates a Fastly bid cache with explicit cache and deadline bounds.
+    #[cfg(test)]
     pub fn with_limits(ttl: Duration, max_reconstructed_wait: Duration) -> Self {
         Self {
             ttl,

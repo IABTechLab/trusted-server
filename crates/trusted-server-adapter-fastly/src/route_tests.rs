@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::StatusCode;
-use fastly::Request;
+use fastly::http::{header, StatusCode};
+use fastly::{Request, Response};
+use serde_json::json;
+use std::time::{Duration, Instant};
 use trusted_server_core::auction::build_orchestrator;
+use trusted_server_core::bid_cache::{AuctionDeadline, BidMap, InMemoryBidCache};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -16,7 +19,7 @@ use trusted_server_core::platform::{
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
 use trusted_server_core::settings::Settings;
 
-use super::route_request;
+use super::{handle_ts_bids_request, route_request};
 
 struct StubJwksConfigStore;
 
@@ -178,12 +181,168 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
         .build()
 }
 
+fn response_body(mut response: Response) -> String {
+    response.take_body_str()
+}
+
+fn test_bid_cache() -> InMemoryBidCache {
+    InMemoryBidCache::new(Duration::from_secs(1), 8)
+}
+
+fn immediate_deadline() -> AuctionDeadline {
+    AuctionDeadline::from_parts(Instant::now(), 1_700_000_000_000)
+}
+
+fn slot_bid_map() -> BidMap {
+    BidMap::from([(
+        "atf_sidebar".to_string(),
+        json!({
+            "hb_pb": "1.20",
+            "hb_bidder": "rubicon",
+            "hb_adid": "ad-123",
+            "burl": "https://bidder.example/bill"
+        }),
+    )])
+}
+
+#[test]
+fn ts_bids_missing_rid_returns_bad_request_no_store() {
+    let cache = test_bid_cache();
+    let response = handle_ts_bids_request(&Request::get("https://test.com/ts-bids"), &cache);
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject missing request ID"
+    );
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+}
+
+#[test]
+fn ts_bids_empty_rid_returns_bad_request_no_store() {
+    let cache = test_bid_cache();
+    let response = handle_ts_bids_request(&Request::get("https://test.com/ts-bids?rid="), &cache);
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject empty request ID"
+    );
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+}
+
+#[test]
+fn ts_bids_unknown_rid_returns_not_found_no_store() {
+    let cache = test_bid_cache();
+    let response = handle_ts_bids_request(
+        &Request::get("https://test.com/ts-bids?rid=missing"),
+        &cache,
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "should return 404 for unknown request IDs"
+    );
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+}
+
+#[test]
+fn ts_bids_completed_rid_returns_bid_json_no_store() {
+    let cache = test_bid_cache();
+    let bids = slot_bid_map();
+    cache.put("rid-1", bids.clone()).expect("should store bids");
+
+    let response =
+        handle_ts_bids_request(&Request::get("https://test.com/ts-bids?rid=rid-1"), &cache);
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should return completed bids"
+    );
+    assert_eq!(
+        response.get_header_str(header::CONTENT_TYPE),
+        Some("application/json; charset=utf-8"),
+        "should return JSON"
+    );
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&response_body(response)).expect("should parse JSON body");
+    assert_eq!(body, json!(bids), "should serialize bid map");
+}
+
+#[test]
+fn ts_bids_completed_empty_map_returns_empty_json_no_store() {
+    let cache = test_bid_cache();
+    cache
+        .put_empty("rid-empty")
+        .expect("should store empty bid map");
+
+    let response = handle_ts_bids_request(
+        &Request::get("https://test.com/ts-bids?rid=rid-empty"),
+        &cache,
+    );
+
+    assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+    assert_eq!(
+        response_body(response),
+        "{}",
+        "should return empty JSON object"
+    );
+}
+
+#[test]
+fn ts_bids_pending_until_original_deadline_returns_empty_json() {
+    let cache = test_bid_cache();
+    cache
+        .mark_pending("rid-pending", immediate_deadline())
+        .expect("should mark pending");
+
+    let response = handle_ts_bids_request(
+        &Request::get("https://test.com/ts-bids?rid=rid-pending"),
+        &cache,
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should return OK after pending deadline"
+    );
+    assert_eq!(
+        response_body(response),
+        "{}",
+        "should return empty JSON object"
+    );
+}
+
 #[test]
 fn configured_missing_consent_store_only_breaks_consent_routes() {
     let settings = create_test_settings();
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let bid_cache = test_bid_cache();
 
     let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_req);
@@ -192,6 +351,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &discovery_services,
+        &bid_cache,
         discovery_req,
     ))
     .expect("should route discovery request");
@@ -208,6 +368,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &admin_services,
+        &bid_cache,
         admin_req,
     ))
     .expect("should route admin request");
@@ -224,6 +385,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &auction_services,
+        &bid_cache,
         auction_req,
     ))
     .expect("should return an error response for auction requests");
@@ -240,6 +402,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &publisher_services,
+        &bid_cache,
         publisher_req,
     ))
     .expect("should return an error response for publisher fallback");
@@ -247,5 +410,68 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         publisher_resp.get_status(),
         StatusCode::SERVICE_UNAVAILABLE,
         "should scope consent store failures to the consent-dependent routes"
+    );
+}
+
+#[test]
+fn ts_bids_route_is_handled_before_publisher_fallback() {
+    let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let req = Request::get("https://test.com/ts-bids");
+    let runtime_services = test_runtime_services(&req);
+    let bid_cache = test_bid_cache();
+
+    let response = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        &bid_cache,
+        req,
+    ))
+    .expect("should route ts-bids request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should handle ts-bids before consent-dependent publisher fallback"
+    );
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should prevent browser caching"
+    );
+}
+
+#[test]
+fn ts_bids_route_keeps_no_store_after_response_header_finalization() {
+    let mut settings = create_test_settings();
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=300".to_string(),
+    );
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let req = Request::get("https://test.com/ts-bids");
+    let runtime_services = test_runtime_services(&req);
+    let bid_cache = test_bid_cache();
+
+    let response = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &runtime_services,
+        &bid_cache,
+        req,
+    ))
+    .expect("should route ts-bids request");
+
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "ts-bids no-store must win over configured response headers"
     );
 }
