@@ -1,0 +1,17 @@
+# Slot templates for server-side ad auctions.
+# Empty file = feature disabled.
+
+[[slot]]
+id = "atf_sidebar_ad"
+gam_unit_path = "/21765378893/publisher/atf-sidebar"
+div_id = "div-atf-sidebar"
+page_patterns = ["/20**"]
+formats = [{ width = 300, height = 250 }]
+floor_price = 0.50
+
+[slot.targeting]
+pos = "atf"
+zone = "atfSidebar"
+
+[slot.providers.aps]
+slot_id = "aps-slot-atf-sidebar"

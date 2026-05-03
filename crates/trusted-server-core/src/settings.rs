@@ -11,6 +11,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
+use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 
@@ -423,6 +424,8 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    #[serde(default)]
+    pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
 }
 
 #[allow(unused)]
@@ -809,6 +812,27 @@ mod tests {
         assert_eq!(settings.edge_cookie.secret_key.expose(), "test-secret-key");
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn settings_parses_creative_opportunities_section() {
+        let toml = format!(
+            r#"{}
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+price_granularity = "dense"
+"#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should parse");
+        let creative_opportunities = settings
+            .creative_opportunities
+            .expect("should have creative opportunities");
+        assert_eq!(creative_opportunities.gam_network_id, "21765378893");
+        assert_eq!(creative_opportunities.auction_timeout_ms, Some(500));
     }
 
     #[test]

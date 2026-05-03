@@ -17,6 +17,11 @@ proxy_secret = "change-me-proxy-secret"
 [edge_cookie]
 secret_key = "trusted-server"
 
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+price_granularity = "dense"
+
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
 # [response_headers]
@@ -189,5 +194,4 @@ timeout_ms = 1000
 # query parameter name. Arrays are joined with commas.
 [integrations.adserver_mock.context_query_params]
 permutive_segments = "permutive"
-
 
