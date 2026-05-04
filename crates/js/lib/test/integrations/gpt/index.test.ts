@@ -60,6 +60,9 @@ function createGptHarness(win: TsAdInitWindow) {
         slotRenderEnded = callback;
       }
     }),
+    disableInitialLoad: vi.fn(() => {
+      operations.push('disableInitialLoad');
+    }),
     refresh: vi.fn(() => {
       operations.push('refresh');
     }),
@@ -355,6 +358,33 @@ describe('GPT shim – __tsAdInit bootstrap', () => {
       expect(operation).toBeDefined();
       expect(operations.indexOf(operation!)).toBeLessThan(operations.indexOf('refresh'));
     }
+  });
+
+  it('disables initial load before display so GPT waits for refresh', async () => {
+    win.__ts_ad_slots = [
+      {
+        id: 'atf_sidebar',
+        gam_unit_path: '/21765378893/atf_sidebar',
+        div_id: 'div-atf-sidebar',
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
+    win.__ts_request_id = 'rid-123';
+    globalThis.fetch = vi.fn(() => Promise.resolve(jsonResponse({}))) as unknown as typeof fetch;
+    const { operations } = createGptHarness(win);
+
+    installTsAdInit();
+    win.googletag!.cmd[0]();
+    await flushPromises();
+
+    expect(operations.indexOf('disableInitialLoad')).toBeGreaterThanOrEqual(0);
+    expect(operations.indexOf('disableInitialLoad')).toBeLessThan(
+      operations.indexOf('display:div-atf-sidebar')
+    );
+    expect(operations.indexOf('display:div-atf-sidebar')).toBeLessThan(
+      operations.indexOf('refresh')
+    );
   });
 
   it('refreshes GPT slots when bid fetch fails', async () => {

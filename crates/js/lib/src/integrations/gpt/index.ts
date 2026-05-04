@@ -39,6 +39,7 @@ interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
+  disableInitialLoad(): void;
   addEventListener(
     eventName: 'slotRenderEnded',
     callback: (event: SlotRenderEndedEvent) => void
@@ -272,6 +273,9 @@ function runTsAdInit(win: GptWindow): void {
     definedSlots.push({ descriptor, slot });
   }
 
+  if (typeof pubads.disableInitialLoad === 'function') {
+    pubads.disableInitialLoad();
+  }
   tag.enableServices();
 
   for (const { descriptor } of definedSlots) {

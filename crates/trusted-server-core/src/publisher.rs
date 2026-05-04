@@ -790,6 +790,12 @@ impl<W: Write> Write for AuctionPollingWriter<'_, W> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum AuctionFinishMode {
+    DrainAfterStream,
+    CompleteCollected,
+}
+
 /// Server-side auction dependencies used while streaming a publisher body.
 pub struct ServerSideAuctionStreamContext<'a> {
     /// Runtime services used to poll platform HTTP requests.
@@ -831,6 +837,29 @@ pub fn stream_publisher_body<W: Write>(
     process_response_streaming(body, output, &borrowed)
 }
 
+fn process_response_streaming_with_ad_auction<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &ProcessResponseParams<'_>,
+    auction_context: &mut ServerSideAuctionStreamContext<'_>,
+    finish_mode: AuctionFinishMode,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut polling_output = AuctionPollingWriter {
+        inner: output,
+        services: auction_context.services,
+        bid_cache: auction_context.bid_cache,
+        server_side_auction: &mut *auction_context.server_side_auction,
+    };
+    let result = process_response_streaming(body, &mut polling_output, params);
+    match finish_mode {
+        AuctionFinishMode::DrainAfterStream => polling_output.finish_auction(),
+        AuctionFinishMode::CompleteCollected => polling_output
+            .server_side_auction
+            .complete_with_collected_bids(auction_context.services, auction_context.bid_cache),
+    }
+    result
+}
+
 /// Stream the publisher response body while advancing a server-side ad auction.
 ///
 /// # Errors
@@ -844,21 +873,24 @@ pub fn stream_publisher_body_with_ad_auction<W: Write>(
     integration_registry: &IntegrationRegistry,
     auction_context: &mut ServerSideAuctionStreamContext<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
-    let mut polling_output = AuctionPollingWriter {
-        inner: output,
-        services: auction_context.services,
-        bid_cache: auction_context.bid_cache,
-        server_side_auction: &mut *auction_context.server_side_auction,
-    };
-    let result = stream_publisher_body(
-        body,
-        &mut polling_output,
-        params,
+    let borrowed = ProcessResponseParams {
+        content_encoding: &params.content_encoding,
+        origin_host: &params.origin_host,
+        origin_url: &params.origin_url,
+        request_host: &params.request_host,
+        request_scheme: &params.request_scheme,
         settings,
+        content_type: &params.content_type,
         integration_registry,
-    );
-    polling_output.finish_auction();
-    result
+        ad_slots_script: params.ad_slots_script.as_deref(),
+    };
+    process_response_streaming_with_ad_auction(
+        body,
+        output,
+        &borrowed,
+        auction_context,
+        AuctionFinishMode::DrainAfterStream,
+    )
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -992,12 +1024,6 @@ pub fn handle_publisher_request(
 
             match bid_cache.mark_pending(&request_id, auction_deadline) {
                 Ok(()) => {
-                    ad_slots_script = Some(build_head_globals_script(
-                        &matched_slots,
-                        &request_id,
-                        co_config,
-                    ));
-
                     match build_server_side_auction_request(ServerSideAuctionRequestParams {
                         request_id: &request_id,
                         matched_slots: &matched_slots,
@@ -1021,6 +1047,11 @@ pub fn handle_publisher_request(
                             match orchestrator.start_server_side_auction(auction_request, &context)
                             {
                                 Ok(pending_auction) => {
+                                    ad_slots_script = Some(build_head_globals_script(
+                                        &matched_slots,
+                                        &request_id,
+                                        co_config,
+                                    ));
                                     server_side_auction = Some(ServerSideAuctionStream::new(
                                         request_id,
                                         pending_auction,
@@ -1193,9 +1224,21 @@ pub fn handle_publisher_request(
                 ad_slots_script: ad_slots_script.as_deref(),
             };
             let mut output = Vec::new();
-            process_response_streaming(body, &mut output, &params)?;
             if let Some(mut auction) = server_side_auction {
-                auction.complete_with_collected_bids(services, bid_cache);
+                let mut auction_context = ServerSideAuctionStreamContext {
+                    services,
+                    bid_cache,
+                    server_side_auction: &mut auction,
+                };
+                process_response_streaming_with_ad_auction(
+                    body,
+                    &mut output,
+                    &params,
+                    &mut auction_context,
+                    AuctionFinishMode::CompleteCollected,
+                )?;
+            } else {
+                process_response_streaming(body, &mut output, &params)?;
             }
 
             response.set_header(header::CONTENT_LENGTH, output.len().to_string());
@@ -2578,6 +2621,83 @@ mod creative_opportunities_tests {
             vec![expected_backend],
             "should fire the winning bid nurl through the platform HTTP client"
         );
+    }
+
+    #[test]
+    fn process_response_streaming_with_ad_auction_writes_bids_for_buffered_html() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let services = noop_services();
+        let params = ProcessResponseParams {
+            content_encoding: "",
+            origin_host: "origin.example.com",
+            origin_url: "https://origin.example.com",
+            request_host: "proxy.example.com",
+            request_scheme: "https",
+            settings: &settings,
+            content_type: "text/html; charset=utf-8",
+            integration_registry: &registry,
+            ad_slots_script: None,
+        };
+        let cache = InMemoryBidCache::new(std::time::Duration::from_secs(1), 4);
+        cache
+            .mark_pending(
+                "rid-buffered",
+                AuctionDeadline::from_timeout(std::time::Duration::from_millis(100)),
+            )
+            .expect("should mark bid cache pending");
+        let auction_result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "prebid",
+                vec![make_bid("atf_sidebar", Some(1.239), Some("ad-123"))],
+                8,
+            )],
+            mediator_response: None,
+            winning_bids: HashMap::from([(
+                "atf_sidebar".to_string(),
+                make_bid("atf_sidebar", Some(1.239), Some("ad-123")),
+            )]),
+            total_time_ms: 8,
+            metadata: HashMap::new(),
+        };
+        let pending_auction =
+            PendingAuction::from_completed_result_for_test(make_auction_request(), auction_result);
+        let mut server_side_auction = ServerSideAuctionStream::new(
+            "rid-buffered".to_string(),
+            pending_auction,
+            PriceGranularity::Dense,
+            false,
+            settings.proxy.certificate_check,
+        );
+        let mut auction_context = ServerSideAuctionStreamContext {
+            services: &services,
+            bid_cache: &cache,
+            server_side_auction: &mut server_side_auction,
+        };
+
+        let mut output = Vec::new();
+        process_response_streaming_with_ad_auction(
+            Body::from("<html><head></head><body>ok</body></html>"),
+            &mut output,
+            &params,
+            &mut auction_context,
+            AuctionFinishMode::CompleteCollected,
+        )
+        .expect("should process buffered HTML and poll auction");
+
+        match cache
+            .try_get("rid-buffered")
+            .expect("should read bid cache")
+        {
+            CacheResult::Complete { bids } => {
+                assert!(
+                    bids.contains_key("atf_sidebar"),
+                    "buffered processing should drain the auction into BidCache"
+                );
+            }
+            other => panic!("should complete bid cache, got {other:?}"),
+        }
     }
 
     #[test]

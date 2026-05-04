@@ -358,6 +358,12 @@ impl AuctionOrchestrator {
         request: AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<PendingAuction, Report<TrustedServerError>> {
+        if self.config.has_mediator() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: "server-side template auctions do not support mediation yet; disable the mediator for this Fastly Phase 1 path".to_string(),
+            }));
+        }
+
         let auction_started_at = Instant::now();
         let auction_deadline = auction_started_at
             .checked_add(Duration::from_millis(u64::from(context.timeout_ms)))
@@ -1169,6 +1175,35 @@ mod tests {
         assert!(
             pending_auction.is_complete(),
             "should have no pending providers after completion"
+        );
+    }
+
+    #[test]
+    fn server_side_auction_rejects_mediator_config_instead_of_bypassing_it() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: Vec::new(),
+            mediator: Some("gam".to_string()),
+            timeout_ms: 2000,
+            creative_store: "creative_store".to_string(),
+            allowed_context_keys: HashSet::new(),
+        };
+        let orchestrator = AuctionOrchestrator::new(config);
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = Request::get("https://test.com/test");
+        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
+
+        let error = match orchestrator.start_server_side_auction(request, &context) {
+            Ok(_) => {
+                panic!("mediated server-side template auctions should be explicit unsupported")
+            }
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("mediation"),
+            "should not silently run the non-mediated pending-auction path"
         );
     }
 
