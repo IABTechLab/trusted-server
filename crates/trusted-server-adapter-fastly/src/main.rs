@@ -1,6 +1,7 @@
 use error_stack::Report;
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -11,6 +12,7 @@ use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
+use trusted_server_core::creative_opportunities::CreativeOpportunitiesFile;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::sanitize_forwarded_headers;
@@ -21,7 +23,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    stream_publisher_body_with_ad_auction, PublisherResponse, ServerSideAuctionStreamContext,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -45,6 +48,11 @@ use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore}
 
 const TS_BIDS_NO_STORE: &str = "private, no-store";
 const TS_BIDS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opportunities.toml");
+
+static CREATIVE_OPPORTUNITIES: LazyLock<CreativeOpportunitiesFile> = LazyLock::new(|| {
+    toml::from_str(CREATIVE_OPPORTUNITIES_TOML).expect("should parse creative-opportunities.toml")
+});
 
 /// Entry point for the Fastly Compute program.
 ///
@@ -111,6 +119,7 @@ fn main() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
+        &CREATIVE_OPPORTUNITIES,
         &bid_cache,
         req,
     )) {
@@ -123,6 +132,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
+    creative_opportunities: &CreativeOpportunitiesFile,
     bid_cache: &impl BidCache,
     mut req: Request,
 ) -> Option<Response> {
@@ -233,23 +243,51 @@ async fn route_request(
                         settings,
                         integration_registry,
                         &publisher_services,
+                        orchestrator,
+                        creative_opportunities,
+                        bid_cache,
                         req,
                     ) {
                         Ok(PublisherResponse::Stream {
                             mut response,
                             body,
                             params,
+                            mut server_side_auction,
                         }) => {
                             // Streaming path: finalize headers, then stream body to client.
+                            let preserve_no_store = response
+                                .get_header_str(header::CACHE_CONTROL)
+                                .is_some_and(|value| value == TS_BIDS_NO_STORE);
                             finalize_response(settings, geo_info.as_ref(), &mut response);
+                            if preserve_no_store {
+                                response.set_header(header::CACHE_CONTROL, TS_BIDS_NO_STORE);
+                            }
                             let mut streaming_body = response.stream_to_client();
-                            if let Err(e) = stream_publisher_body(
-                                body,
-                                &mut streaming_body,
-                                &params,
-                                settings,
-                                integration_registry,
-                            ) {
+                            let stream_result =
+                                if let Some(auction) = server_side_auction.as_deref_mut() {
+                                    let mut auction_context = ServerSideAuctionStreamContext {
+                                        services: &publisher_services,
+                                        bid_cache,
+                                        server_side_auction: auction,
+                                    };
+                                    stream_publisher_body_with_ad_auction(
+                                        body,
+                                        &mut streaming_body,
+                                        &params,
+                                        settings,
+                                        integration_registry,
+                                        &mut auction_context,
+                                    )
+                                } else {
+                                    stream_publisher_body(
+                                        body,
+                                        &mut streaming_body,
+                                        &params,
+                                        settings,
+                                        integration_registry,
+                                    )
+                                };
+                            if let Err(e) = stream_result {
                                 // Headers already committed. Log and abort — client
                                 // sees a truncated response. Standard proxy behavior.
                                 log::error!("Streaming processing failed: {e:?}");
@@ -282,9 +320,12 @@ async fn route_request(
 
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
+    let preserve_no_store = response
+        .get_header_str(header::CACHE_CONTROL)
+        .is_some_and(|value| value == TS_BIDS_NO_STORE);
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
-    if path == "/ts-bids" {
+    if path == "/ts-bids" || preserve_no_store {
         response.set_header(header::CACHE_CONTROL, TS_BIDS_NO_STORE);
     }
 

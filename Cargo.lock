@@ -2713,6 +2713,7 @@ dependencies = [
  "log-fastly",
  "serde",
  "serde_json",
+ "toml 1.0.7+spec-1.1.0",
  "trusted-server-core",
  "urlencoding",
 ]

@@ -148,6 +148,15 @@ pub struct PlatformSelectResult {
     pub remaining: Vec<PlatformPendingRequest>,
 }
 
+/// Result of non-blocking polling for one in-flight request.
+#[derive(Debug)]
+pub enum PlatformPollResult {
+    /// The request is still pending and can be polled again later.
+    Pending(PlatformPendingRequest),
+    /// The request completed or failed.
+    Ready(Result<PlatformResponse, Report<PlatformError>>),
+}
+
 /// Outbound HTTP client abstraction.
 ///
 /// Supports both single-request sends ([`Self::send`]) and async fan-out
@@ -193,6 +202,19 @@ pub trait PlatformHttpClient: Send + Sync {
         &self,
         pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>>;
+
+    /// Poll a single in-flight request without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PlatformError::Unsupported` when the platform adapter does not
+    /// provide non-blocking polling.
+    async fn poll(
+        &self,
+        _pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
 
     /// Wait for a single in-flight request to complete.
     ///

@@ -9,6 +9,7 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::bid_cache::{AuctionDeadline, BidMap, InMemoryBidCache};
+use trusted_server_core::creative_opportunities::CreativeOpportunitiesFile;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -189,6 +190,10 @@ fn test_bid_cache() -> InMemoryBidCache {
     InMemoryBidCache::new(Duration::from_secs(1), 8)
 }
 
+fn empty_creative_opportunities() -> CreativeOpportunitiesFile {
+    CreativeOpportunitiesFile::default()
+}
+
 fn immediate_deadline() -> AuctionDeadline {
     AuctionDeadline::from_parts(Instant::now(), 1_700_000_000_000)
 }
@@ -351,6 +356,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &discovery_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         discovery_req,
     ))
@@ -368,6 +374,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &admin_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         admin_req,
     ))
@@ -385,6 +392,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &auction_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         auction_req,
     ))
@@ -402,6 +410,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &publisher_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         publisher_req,
     ))
@@ -428,6 +437,7 @@ fn ts_bids_route_is_handled_before_publisher_fallback() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         req,
     ))
@@ -464,6 +474,7 @@ fn ts_bids_route_keeps_no_store_after_response_header_finalization() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
+        &empty_creative_opportunities(),
         &bid_cache,
         req,
     ))

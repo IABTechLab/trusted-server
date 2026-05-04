@@ -9,8 +9,9 @@ use rand::rngs::OsRng;
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+    PlatformPollResult, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -354,6 +355,26 @@ impl PlatformHttpClient for StubHttpClient {
             remaining: pending_requests,
         })
     }
+
+    async fn poll(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        let stub = pending.downcast::<StubPendingResponse>().map_err(|_| {
+            Report::new(PlatformError::HttpClient)
+                .attach("unexpected inner type in StubHttpClient::poll")
+        })?;
+
+        let edge_response = edgezero_core::http::response_builder()
+            .status(stub.status)
+            .body(edgezero_core::body::Body::from(stub.body))
+            .change_context(PlatformError::HttpClient)?;
+
+        Ok(PlatformPollResult::Ready(Ok(PlatformResponse::new(
+            edge_response,
+        )
+        .with_backend_name(stub.backend_name))))
+    }
 }
 
 pub(crate) struct NoopGeo;
@@ -593,6 +614,38 @@ mod tests {
         assert!(
             matches!(err.current_context(), PlatformError::HttpClient),
             "should be HttpClient error"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_poll_returns_ready_response() {
+        let stub = StubHttpClient::new();
+        stub.push_response(202, b"poll-ready".to_vec());
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/bid")
+                .body(Body::empty())
+                .expect("should build request"),
+            "backend-poll",
+        );
+        let pending =
+            futures::executor::block_on(stub.send_async(req)).expect("should start request");
+
+        let result = futures::executor::block_on(stub.poll(pending)).expect("should poll request");
+
+        let PlatformPollResult::Ready(Ok(response)) = result else {
+            panic!("should return ready response");
+        };
+        assert_eq!(
+            response.backend_name.as_deref(),
+            Some("backend-poll"),
+            "should preserve backend correlation"
+        );
+        assert_eq!(
+            response.response.status(),
+            202,
+            "should preserve response status"
         );
     }
 

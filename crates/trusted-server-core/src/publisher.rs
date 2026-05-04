@@ -11,19 +11,28 @@
 //! `fastly::Request`/`Response`/`Body` migrations. It is not a
 //! content-rewriting concern.
 
-use std::io::Write;
+use std::collections::HashMap;
+use std::io::{self, Write};
 
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
+use crate::auction::orchestrator::{AuctionOrchestrator, PendingAuction, PendingAuctionPoll};
+use crate::auction::types::{
+    AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
+};
 use crate::backend::BackendConfig;
+use crate::bid_cache::{BidCache, BidMap};
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
-use crate::creative_opportunities::{CreativeOpportunitiesConfig, CreativeOpportunitySlot};
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::creative_opportunities::{
+    match_slots, CreativeOpportunitiesConfig, CreativeOpportunitiesFile, CreativeOpportunitySlot,
+};
+use crate::edge_cookie::{generate_ec_id, get_or_generate_ec_id};
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
@@ -281,6 +290,71 @@ fn apply_server_side_ad_cache_policy(
     }
 }
 
+pub(crate) struct ServerSideAuctionRequestParams<'a> {
+    request_id: &'a str,
+    matched_slots: &'a [&'a CreativeOpportunitySlot],
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    req: &'a Request,
+    consent_context: &'a crate::consent::ConsentContext,
+    ec_id: &'a str,
+    geo: Option<GeoInfo>,
+}
+
+fn build_server_side_auction_request(
+    params: ServerSideAuctionRequestParams<'_>,
+) -> Result<AuctionRequest, Report<TrustedServerError>> {
+    let page_url = params.req.get_url().to_string();
+    let fresh_id = generate_ec_id(params.settings, params.services).change_context(
+        TrustedServerError::Auction {
+            message: "Failed to generate fresh EC ID for server-side ad auction".to_string(),
+        },
+    )?;
+
+    Ok(AuctionRequest {
+        id: params.request_id.to_string(),
+        slots: params
+            .matched_slots
+            .iter()
+            .map(|slot| slot.to_ad_slot())
+            .collect(),
+        publisher: PublisherInfo {
+            domain: params.settings.publisher.domain.clone(),
+            page_url: Some(page_url.clone()),
+        },
+        user: UserInfo {
+            id: params.ec_id.to_string(),
+            fresh_id,
+            consent: Some(params.consent_context.clone()),
+        },
+        device: Some(DeviceInfo {
+            user_agent: params
+                .req
+                .get_header_str(header::USER_AGENT)
+                .map(str::to_string),
+            ip: params
+                .services
+                .client_info
+                .client_ip
+                .map(|ip| ip.to_string()),
+            geo: params.geo,
+        }),
+        site: Some(SiteInfo {
+            domain: params.settings.publisher.domain.clone(),
+            page: page_url,
+        }),
+        context: HashMap::new(),
+    })
+}
+
+fn clone_request_metadata_for_auction(req: &Request) -> Request {
+    let mut cloned = Request::new(req.get_method().clone(), req.get_url().clone());
+    for (name, value) in req.get_headers() {
+        cloned.append_header(name, value.clone());
+    }
+    cloned
+}
+
 /// Parameters for processing response streaming
 struct ProcessResponseParams<'a> {
     content_encoding: &'a str,
@@ -291,6 +365,7 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
+    ad_slots_script: Option<&'a str>,
 }
 
 /// Process response body through the streaming pipeline.
@@ -333,6 +408,7 @@ fn process_response_streaming<W: Write>(
             params.request_scheme,
             params.settings,
             params.integration_registry,
+            params.ad_slots_script,
         )?;
         StreamingPipeline::new(config, processor).process(body, output)?;
     } else if is_rsc_flight {
@@ -363,16 +439,18 @@ fn create_html_stream_processor(
     request_scheme: &str,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    ad_slots_script: Option<&str>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
-    let config = HtmlProcessorConfig::from_settings(
+    let mut config = HtmlProcessorConfig::from_settings(
         settings,
         integration_registry,
         origin_host,
         request_host,
         request_scheme,
     );
+    config.ad_slots_script = ad_slots_script.map(str::to_string);
 
     Ok(create_html_processor(config))
 }
@@ -399,6 +477,8 @@ pub enum PublisherResponse {
         body: Body,
         /// Parameters for `process_response_streaming`.
         params: OwnedProcessResponseParams,
+        /// Optional server-side ad auction advanced while the body streams.
+        server_side_auction: Option<Box<ServerSideAuctionStream>>,
     },
     /// Non-processable 2xx response (images, fonts, video). The adapter must
     /// reattach the body via `response.set_body(body)` before returning.
@@ -501,6 +581,137 @@ pub struct OwnedProcessResponseParams {
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
+    pub(crate) ad_slots_script: Option<String>,
+}
+
+/// Server-side ad auction state advanced during publisher response streaming.
+pub struct ServerSideAuctionStream {
+    request_id: String,
+    pending_auction: PendingAuction,
+    price_granularity: crate::price_bucket::PriceGranularity,
+    completed: bool,
+}
+
+impl ServerSideAuctionStream {
+    /// Create stream-owned server-side auction state.
+    #[must_use]
+    pub fn new(
+        request_id: String,
+        pending_auction: PendingAuction,
+        price_granularity: crate::price_bucket::PriceGranularity,
+    ) -> Self {
+        Self {
+            request_id,
+            pending_auction,
+            price_granularity,
+            completed: false,
+        }
+    }
+
+    fn poll_once(&mut self, services: &RuntimeServices, bid_cache: &dyn BidCache) {
+        if self.completed {
+            return;
+        }
+
+        match futures::executor::block_on(self.pending_auction.poll_once(services)) {
+            Ok(PendingAuctionPoll::Pending) => {}
+            Ok(PendingAuctionPoll::Complete(result)) => self.write_result(bid_cache, &result),
+            Err(error) => {
+                log::warn!("Server-side ad auction poll failed: {error:?}");
+                self.write_empty(bid_cache);
+            }
+        }
+    }
+
+    fn complete_with_collected_bids(&mut self, bid_cache: &dyn BidCache) {
+        if self.completed {
+            return;
+        }
+
+        let result = self.pending_auction.finish_due_to_deadline();
+        self.write_result(bid_cache, &result);
+    }
+
+    fn drain_after_stream(&mut self, services: &RuntimeServices, bid_cache: &dyn BidCache) {
+        while !self.completed {
+            match futures::executor::block_on(self.pending_auction.poll_once(services)) {
+                Ok(PendingAuctionPoll::Pending) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(PendingAuctionPoll::Complete(result)) => self.write_result(bid_cache, &result),
+                Err(error) => {
+                    log::warn!("Server-side ad auction drain failed: {error:?}");
+                    self.write_empty(bid_cache);
+                }
+            }
+        }
+    }
+
+    fn write_result(
+        &mut self,
+        bid_cache: &dyn BidCache,
+        result: &crate::auction::orchestrator::OrchestrationResult,
+    ) {
+        let bids = build_bid_map(&result.winning_bids, self.price_granularity);
+        self.write_bids(bid_cache, bids);
+    }
+
+    fn write_empty(&mut self, bid_cache: &dyn BidCache) {
+        self.write_bids(bid_cache, BidMap::new());
+    }
+
+    fn write_bids(&mut self, bid_cache: &dyn BidCache, bids: BidMap) {
+        if let Err(error) = bid_cache.put(&self.request_id, bids) {
+            log::warn!(
+                "Failed to write server-side ad bids for request '{}': {error:?}",
+                self.request_id
+            );
+        }
+        self.completed = true;
+    }
+}
+
+struct AuctionPollingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    services: &'a RuntimeServices,
+    bid_cache: &'a dyn BidCache,
+    server_side_auction: &'a mut ServerSideAuctionStream,
+}
+
+impl<W: Write> AuctionPollingWriter<'_, W> {
+    fn poll_auction(&mut self) {
+        self.server_side_auction
+            .poll_once(self.services, self.bid_cache);
+    }
+
+    fn finish_auction(&mut self) {
+        self.server_side_auction
+            .drain_after_stream(self.services, self.bid_cache);
+    }
+}
+
+impl<W: Write> Write for AuctionPollingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let bytes_written = self.inner.write(buf)?;
+        self.poll_auction();
+        Ok(bytes_written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.poll_auction();
+        Ok(())
+    }
+}
+
+/// Server-side auction dependencies used while streaming a publisher body.
+pub struct ServerSideAuctionStreamContext<'a> {
+    /// Runtime services used to poll platform HTTP requests.
+    pub services: &'a RuntimeServices,
+    /// Request-scoped bid cache rendezvous.
+    pub bid_cache: &'a dyn BidCache,
+    /// Auction state advanced during streaming.
+    pub server_side_auction: &'a mut ServerSideAuctionStream,
 }
 
 /// Stream the publisher response body through the processing pipeline.
@@ -529,8 +740,39 @@ pub fn stream_publisher_body<W: Write>(
         settings,
         content_type: &params.content_type,
         integration_registry,
+        ad_slots_script: params.ad_slots_script.as_deref(),
     };
     process_response_streaming(body, output, &borrowed)
+}
+
+/// Stream the publisher response body while advancing a server-side ad auction.
+///
+/// # Errors
+///
+/// Returns an error if body processing fails mid-stream.
+pub fn stream_publisher_body_with_ad_auction<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    auction_context: &mut ServerSideAuctionStreamContext<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut polling_output = AuctionPollingWriter {
+        inner: output,
+        services: auction_context.services,
+        bid_cache: auction_context.bid_cache,
+        server_side_auction: &mut *auction_context.server_side_auction,
+    };
+    let result = stream_publisher_body(
+        body,
+        &mut polling_output,
+        params,
+        settings,
+        integration_registry,
+    );
+    polling_output.finish_auction();
+    result
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -554,6 +796,9 @@ pub fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
+    orchestrator: &AuctionOrchestrator,
+    slots_file: &CreativeOpportunitiesFile,
+    bid_cache: &dyn BidCache,
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -618,6 +863,17 @@ pub fn handle_publisher_request(
     let ec_allowed = allows_ec_creation(&consent_context);
     log::debug!("Proxy ec_allowed: {}", ec_allowed);
 
+    let request_path = req.get_path().to_string();
+    let auction_context_request = clone_request_metadata_for_auction(&req);
+    let creative_opportunities = settings.creative_opportunities.as_ref();
+    let matched_slots = creative_opportunities
+        .map(|_| match_slots(&slots_file.slots, &request_path))
+        .unwrap_or_default();
+    let slots_matched = !matched_slots.is_empty();
+    let auction_timeout_ms = creative_opportunities
+        .and_then(|config| config.auction_timeout_ms)
+        .unwrap_or(settings.auction.timeout_ms);
+
     let backend_name = BackendConfig::from_url(
         &settings.publisher.origin_url,
         settings.proxy.certificate_check,
@@ -633,8 +889,94 @@ pub fn handle_publisher_request(
     restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
-    let mut response = req
-        .send(&backend_name)
+    let pending_origin =
+        req.send_async(&backend_name)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to dispatch publisher origin request".to_string(),
+            })?;
+
+    let mut ad_slots_script = None;
+    let mut server_side_auction = None;
+    if let Some(co_config) = creative_opportunities {
+        if slots_matched && server_side_auction_allowed(&consent_context) {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let auction_deadline = crate::bid_cache::AuctionDeadline::from_timeout(
+                std::time::Duration::from_millis(u64::from(auction_timeout_ms)),
+            );
+
+            match bid_cache.mark_pending(&request_id, auction_deadline) {
+                Ok(()) => {
+                    ad_slots_script = Some(build_head_globals_script(
+                        &matched_slots,
+                        &request_id,
+                        co_config,
+                    ));
+
+                    match build_server_side_auction_request(ServerSideAuctionRequestParams {
+                        request_id: &request_id,
+                        matched_slots: &matched_slots,
+                        settings,
+                        services,
+                        req: &auction_context_request,
+                        consent_context: &consent_context,
+                        ec_id: &ec_id,
+                        geo: geo.clone(),
+                    }) {
+                        Ok(auction_request) => {
+                            let context = AuctionContext {
+                                settings,
+                                request: &auction_context_request,
+                                client_info: services.client_info(),
+                                timeout_ms: auction_timeout_ms,
+                                provider_responses: None,
+                                services,
+                            };
+
+                            match orchestrator.start_server_side_auction(auction_request, &context)
+                            {
+                                Ok(pending_auction) => {
+                                    server_side_auction = Some(ServerSideAuctionStream::new(
+                                        request_id,
+                                        pending_auction,
+                                        co_config.price_granularity,
+                                    ));
+                                }
+                                Err(error) => {
+                                    log::warn!("Failed to start server-side ad auction: {error:?}");
+                                    if let Err(cache_error) =
+                                        bid_cache.put(&request_id, BidMap::new())
+                                    {
+                                        log::warn!(
+                                            "Failed to complete failed server-side ad auction request '{}': {cache_error:?}",
+                                            request_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Failed to build server-side ad auction request: {error:?}");
+                            if let Err(cache_error) = bid_cache.put(&request_id, BidMap::new()) {
+                                log::warn!(
+                                    "Failed to complete failed server-side ad auction request '{}': {cache_error:?}",
+                                    request_id
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Failed to mark server-side ad auction pending for path '{}': {error:?}",
+                        request_path
+                    );
+                }
+            }
+        }
+    }
+
+    let mut response = pending_origin
+        .wait()
         .change_context(TrustedServerError::Proxy {
             message: "Failed to proxy request to origin".to_string(),
         })?;
@@ -655,6 +997,7 @@ pub fn handle_publisher_request(
         existing_ec_cookie.as_deref(),
         &consent_context,
     );
+    apply_server_side_ad_cache_policy(&mut response, slots_matched, ad_slots_script.is_some());
 
     let content_type = response
         .get_header(header::CONTENT_TYPE)
@@ -685,6 +1028,9 @@ pub fn handle_publisher_request(
                 content_type,
                 status,
             );
+            if let Some(mut auction) = server_side_auction {
+                auction.complete_with_collected_bids(bid_cache);
+            }
             let body = response.take_body();
             Ok(PublisherResponse::PassThrough { response, body })
         }
@@ -711,6 +1057,9 @@ pub fn handle_publisher_request(
                     status,
                 );
             }
+            if let Some(mut auction) = server_side_auction {
+                auction.complete_with_collected_bids(bid_cache);
+            }
             Ok(PublisherResponse::Buffered(response))
         }
         ResponseRoute::Stream => {
@@ -732,7 +1081,9 @@ pub fn handle_publisher_request(
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
+                    ad_slots_script: ad_slots_script.clone(),
                 },
+                server_side_auction: server_side_auction.map(Box::new),
             })
         }
         ResponseRoute::BufferedProcessed => {
@@ -751,9 +1102,13 @@ pub fn handle_publisher_request(
                 settings,
                 content_type: &content_type,
                 integration_registry,
+                ad_slots_script: ad_slots_script.as_deref(),
             };
             let mut output = Vec::new();
             process_response_streaming(body, &mut output, &params)?;
+            if let Some(mut auction) = server_side_auction {
+                auction.complete_with_collected_bids(bid_cache);
+            }
 
             response.set_header(header::CONTENT_LENGTH, output.len().to_string());
             response.set_body(Body::from(output));
@@ -828,7 +1183,11 @@ fn apply_ec_headers(
 #[cfg(test)]
 mod creative_opportunities_tests {
     use super::*;
-    use crate::auction::types::{Bid, MediaType};
+    use crate::auction::orchestrator::{OrchestrationResult, PendingAuction};
+    use crate::auction::types::{
+        AuctionRequest, AuctionResponse, Bid, MediaType, PublisherInfo, UserInfo,
+    };
+    use crate::bid_cache::{AuctionDeadline, CacheResult, InMemoryBidCache};
     use crate::consent::{ConsentContext, TcfConsent};
     use crate::creative_opportunities::{
         CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
@@ -888,6 +1247,25 @@ mod creative_opportunities_tests {
             burl: Some("https://bidder.example/bill".to_string()),
             ad_id: ad_id.map(str::to_string),
             metadata: HashMap::new(),
+        }
+    }
+
+    fn make_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "auction-1".to_string(),
+            slots: Vec::new(),
+            publisher: PublisherInfo {
+                domain: "test-publisher.com".to_string(),
+                page_url: Some("https://test-publisher.com/news/story".to_string()),
+            },
+            user: UserInfo {
+                id: "ec-id".to_string(),
+                fresh_id: "fresh-id".to_string(),
+                consent: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
         }
     }
 
@@ -1801,6 +2179,7 @@ mod creative_opportunities_tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            ad_slots_script: None,
         };
 
         let mut output = Vec::new();
@@ -1842,6 +2221,7 @@ mod creative_opportunities_tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
         };
 
         let mut output = Vec::new();
@@ -1851,6 +2231,186 @@ mod creative_opportunities_tests {
         assert!(
             output.is_empty(),
             "empty origin body should produce empty streaming output. Got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_injects_ad_slots_script_at_head_open() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: Some(
+                "<script>window.__ts_ad_slots=[];window.__ts_request_id=\"rid-1\";</script>"
+                    .to_string(),
+            ),
+        };
+
+        let mut output = Vec::new();
+        stream_publisher_body(
+            Body::from("<html><head><title>Test</title></head><body></body></html>"),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should process HTML body");
+        let html = String::from_utf8(output).expect("should emit UTF-8 HTML");
+
+        assert!(
+            html.starts_with("<html><head><script>window.__ts_ad_slots=[];window.__ts_request_id=\"rid-1\";</script>"),
+            "should inject ad globals immediately after the head open tag: {html}"
+        );
+        assert!(
+            !html.contains("window.__ts_bids"),
+            "should never inject bid data"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_with_ad_auction_writes_completed_bid_map() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let services = noop_services();
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
+        };
+        let cache = InMemoryBidCache::new(std::time::Duration::from_secs(1), 4);
+        cache
+            .mark_pending(
+                "rid-stream",
+                AuctionDeadline::from_timeout(std::time::Duration::from_millis(100)),
+            )
+            .expect("should mark bid cache pending");
+        let auction_result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "prebid",
+                vec![make_bid("atf_sidebar", Some(1.239), Some("ad-123"))],
+                8,
+            )],
+            mediator_response: None,
+            winning_bids: HashMap::from([(
+                "atf_sidebar".to_string(),
+                make_bid("atf_sidebar", Some(1.239), Some("ad-123")),
+            )]),
+            total_time_ms: 8,
+            metadata: HashMap::new(),
+        };
+        let pending_auction =
+            PendingAuction::from_completed_result_for_test(make_auction_request(), auction_result);
+        let mut server_side_auction = ServerSideAuctionStream::new(
+            "rid-stream".to_string(),
+            pending_auction,
+            PriceGranularity::Dense,
+        );
+
+        let mut output = Vec::new();
+        let mut auction_context = ServerSideAuctionStreamContext {
+            services: &services,
+            bid_cache: &cache,
+            server_side_auction: &mut server_side_auction,
+        };
+        stream_publisher_body_with_ad_auction(
+            Body::from("<html><head></head><body>ok</body></html>"),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+            &mut auction_context,
+        )
+        .expect("should stream body and poll auction");
+
+        match cache.try_get("rid-stream").expect("should read bid cache") {
+            CacheResult::Complete { bids } => {
+                assert_eq!(
+                    bids.get("atf_sidebar"),
+                    Some(&json!({
+                        "hb_pb": "1.23",
+                        "hb_bidder": "rubicon",
+                        "hb_adid": "ad-123",
+                        "burl": "https://bidder.example/bill",
+                    })),
+                    "should write GPT bid targeting into cache"
+                );
+            }
+            other => panic!("should complete bid cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_server_side_auction_request_uses_matched_slots_and_request_context() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let slot = make_creative_slot("atf_sidebar");
+        let matched_slots = vec![&slot];
+        let consent_context = ConsentContext::default();
+        let mut req = Request::get("https://test-publisher.com/news/story?utm=1");
+        req.set_header(header::USER_AGENT, "Mozilla/5.0 Test");
+
+        let auction_request = build_server_side_auction_request(ServerSideAuctionRequestParams {
+            request_id: "rid-article",
+            matched_slots: &matched_slots,
+            settings: &settings,
+            services: &services,
+            req: &req,
+            consent_context: &consent_context,
+            ec_id: "ec-id-1",
+            geo: None,
+        })
+        .expect("should build auction request");
+
+        assert_eq!(
+            auction_request.id, "rid-article",
+            "should use the request ID as the auction ID"
+        );
+        assert_eq!(
+            auction_request.slots.len(),
+            1,
+            "should include matched creative slots only"
+        );
+        assert_eq!(
+            auction_request.slots[0].id, "atf_sidebar",
+            "should convert creative slot to auction slot"
+        );
+        assert_eq!(
+            auction_request.slots[0].floor_price,
+            Some(1.25),
+            "should preserve slot floor"
+        );
+        assert_eq!(
+            auction_request.publisher.page_url.as_deref(),
+            Some("https://test-publisher.com/news/story?utm=1"),
+            "should use the actual page URL"
+        );
+        assert_eq!(
+            auction_request.user.id, "ec-id-1",
+            "should use the request EC ID"
+        );
+        assert!(
+            auction_request.user.consent.is_some(),
+            "should carry consent into provider requests"
+        );
+        assert_eq!(
+            auction_request
+                .device
+                .as_ref()
+                .and_then(|device| device.user_agent.as_deref()),
+            Some("Mozilla/5.0 Test"),
+            "should forward user-agent in device context"
         );
     }
 
@@ -1874,6 +2434,7 @@ mod creative_opportunities_tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            ad_slots_script: None,
         };
 
         let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
@@ -1973,6 +2534,7 @@ mod creative_opportunities_tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -2023,6 +2585,7 @@ mod creative_opportunities_tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            ad_slots_script: None,
         };
 
         let mut output = Vec::new();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformPendingRequest, RuntimeServices};
+use crate::platform::{PlatformPendingRequest, PlatformPollResult, RuntimeServices};
 use crate::proxy::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
@@ -23,10 +23,212 @@ fn remaining_budget_ms(start: Instant, timeout_ms: u32) -> u32 {
     timeout_ms.saturating_sub(elapsed)
 }
 
+fn select_winning_bids_from_responses(
+    responses: &[AuctionResponse],
+    floor_prices: &HashMap<String, f64>,
+) -> HashMap<String, Bid> {
+    let mut winning_bids: HashMap<String, Bid> = HashMap::new();
+
+    for response in responses {
+        if response.status != BidStatus::Success {
+            continue;
+        }
+
+        for bid in &response.bids {
+            let bid_price = match bid.price {
+                Some(price) => price,
+                None => {
+                    log::debug!(
+                        "Skipping bid for slot '{}' from '{}' - price requires mediation to decode",
+                        bid.slot_id,
+                        bid.bidder
+                    );
+                    continue;
+                }
+            };
+
+            let should_replace = match winning_bids.get(&bid.slot_id) {
+                Some(current_winner) => current_winner
+                    .price
+                    .is_none_or(|current_price| bid_price > current_price),
+                None => true,
+            };
+
+            if should_replace {
+                winning_bids.insert(bid.slot_id.clone(), bid.clone());
+            }
+        }
+    }
+
+    if floor_prices.is_empty() {
+        log::info!("Selected {} winning bids", winning_bids.len());
+        return winning_bids;
+    }
+
+    let starting_count = winning_bids.len();
+    winning_bids.retain(|slot_id, bid| match floor_prices.get(slot_id) {
+        Some(floor) => match bid.price {
+            Some(price) if price >= *floor => true,
+            Some(_) => {
+                log::info!("Dropping winning bid below floor price for slot '{slot_id}'");
+                false
+            }
+            None => true,
+        },
+        None => true,
+    });
+
+    if winning_bids.len() != starting_count {
+        log::info!(
+            "Filtered winning bids by floor price: {} -> {}",
+            starting_count,
+            winning_bids.len()
+        );
+    }
+
+    log::info!("Selected {} winning bids", winning_bids.len());
+    winning_bids
+}
+
 /// Manages auction execution across multiple providers.
 pub struct AuctionOrchestrator {
     config: AuctionConfig,
     providers: HashMap<String, Arc<dyn AuctionProvider>>,
+}
+
+/// Server-side template auction that can advance without blocking page streaming.
+pub struct PendingAuction {
+    request: AuctionRequest,
+    pending: Vec<PendingProviderRequest>,
+    provider_responses: Vec<AuctionResponse>,
+    floor_prices: HashMap<String, f64>,
+    auction_started_at: Instant,
+    auction_deadline: Instant,
+}
+
+struct PendingProviderRequest {
+    provider: Arc<dyn AuctionProvider>,
+    started_at: Instant,
+    pending: PlatformPendingRequest,
+}
+
+/// Result of a non-blocking pending auction poll.
+pub enum PendingAuctionPoll {
+    /// At least one provider is still in flight.
+    Pending,
+    /// The auction completed or reached its original deadline.
+    Complete(OrchestrationResult),
+}
+
+impl PendingAuction {
+    /// Builds a completed pending auction for stream-polling tests.
+    #[cfg(test)]
+    pub(crate) fn from_completed_result_for_test(
+        request: AuctionRequest,
+        result: OrchestrationResult,
+    ) -> Self {
+        Self {
+            request,
+            pending: Vec::new(),
+            provider_responses: result.provider_responses,
+            floor_prices: HashMap::new(),
+            auction_started_at: Instant::now(),
+            auction_deadline: Instant::now(),
+        }
+    }
+
+    /// Advance provider requests once without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] when the platform poll operation fails.
+    pub async fn poll_once(
+        &mut self,
+        services: &RuntimeServices,
+    ) -> Result<PendingAuctionPoll, Report<TrustedServerError>> {
+        let mut still_pending = Vec::with_capacity(self.pending.len());
+
+        for pending_provider in self.pending.drain(..) {
+            match services
+                .http_client()
+                .poll(pending_provider.pending)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!(
+                        "HTTP poll failed for provider '{}'",
+                        pending_provider.provider.provider_name()
+                    ),
+                })? {
+                PlatformPollResult::Pending(pending) => {
+                    still_pending.push(PendingProviderRequest {
+                        pending,
+                        ..pending_provider
+                    });
+                }
+                PlatformPollResult::Ready(Ok(platform_response)) => {
+                    let response_time_ms = pending_provider.started_at.elapsed().as_millis() as u64;
+                    match platform_response_to_fastly(platform_response).and_then(|response| {
+                        pending_provider.provider.parse_response_for_request(
+                            response,
+                            response_time_ms,
+                            &self.request,
+                        )
+                    }) {
+                        Ok(response) => self.provider_responses.push(response),
+                        Err(error) => {
+                            log::warn!(
+                                "Provider '{}' failed during non-blocking auction poll: {error:?}",
+                                pending_provider.provider.provider_name()
+                            );
+                            self.provider_responses.push(AuctionResponse::error(
+                                pending_provider.provider.provider_name(),
+                                response_time_ms,
+                            ));
+                        }
+                    }
+                }
+                PlatformPollResult::Ready(Err(error)) => {
+                    log::warn!(
+                        "Provider '{}' poll completed with error: {error:?}",
+                        pending_provider.provider.provider_name()
+                    );
+                    self.provider_responses.push(AuctionResponse::error(
+                        pending_provider.provider.provider_name(),
+                        pending_provider.started_at.elapsed().as_millis() as u64,
+                    ));
+                }
+            }
+        }
+
+        self.pending = still_pending;
+
+        if self.pending.is_empty() || Instant::now() >= self.auction_deadline {
+            Ok(PendingAuctionPoll::Complete(self.finish_due_to_deadline()))
+        } else {
+            Ok(PendingAuctionPoll::Pending)
+        }
+    }
+
+    /// Finish the auction using responses collected so far.
+    #[must_use]
+    pub fn finish_due_to_deadline(&self) -> OrchestrationResult {
+        OrchestrationResult {
+            provider_responses: self.provider_responses.clone(),
+            mediator_response: None,
+            winning_bids: select_winning_bids_from_responses(
+                &self.provider_responses,
+                &self.floor_prices,
+            ),
+            total_time_ms: self.auction_started_at.elapsed().as_millis() as u64,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Return whether no provider requests remain in flight.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.pending.is_empty()
+    }
 }
 
 impl AuctionOrchestrator {
@@ -92,6 +294,92 @@ impl AuctionOrchestrator {
         Ok(OrchestrationResult {
             total_time_ms: start_time.elapsed().as_millis() as u64,
             ..result
+        })
+    }
+
+    /// Start a server-side template auction without waiting for provider responses.
+    ///
+    /// The returned [`PendingAuction`] must be advanced with
+    /// [`PendingAuction::poll_once`] while the page response streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when launching a provider request fails in a way
+    /// that should abort the auction setup. Individual provider launch failures
+    /// are logged and skipped.
+    pub fn start_server_side_auction(
+        &self,
+        request: AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> Result<PendingAuction, Report<TrustedServerError>> {
+        let auction_started_at = Instant::now();
+        let auction_deadline = auction_started_at
+            .checked_add(Duration::from_millis(u64::from(context.timeout_ms)))
+            .unwrap_or(auction_started_at);
+        let mut pending = Vec::new();
+
+        for provider_name in self.config.provider_names() {
+            let Some(provider) = self.providers.get(provider_name).cloned() else {
+                log::warn!("Provider '{}' not registered, skipping", provider_name);
+                continue;
+            };
+
+            if !provider.is_enabled() {
+                log::debug!(
+                    "Provider '{}' is disabled, skipping",
+                    provider.provider_name()
+                );
+                continue;
+            }
+
+            let remaining_ms = remaining_budget_ms(auction_started_at, context.timeout_ms);
+            let effective_timeout = remaining_ms.min(provider.timeout_ms());
+            if effective_timeout == 0 {
+                log::warn!(
+                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
+                    context.timeout_ms,
+                    provider.provider_name()
+                );
+                continue;
+            }
+
+            let provider_context = AuctionContext {
+                settings: context.settings,
+                request: context.request,
+                client_info: context.client_info,
+                timeout_ms: effective_timeout,
+                provider_responses: context.provider_responses,
+                services: context.services,
+            };
+
+            match provider.request_bids(&request, &provider_context) {
+                Ok(provider_pending) => {
+                    let mut platform_pending = PlatformPendingRequest::new(provider_pending);
+                    if let Some(backend_name) = provider.backend_name(effective_timeout) {
+                        platform_pending = platform_pending.with_backend_name(backend_name);
+                    }
+                    pending.push(PendingProviderRequest {
+                        provider,
+                        started_at: Instant::now(),
+                        pending: platform_pending,
+                    });
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Provider '{}' failed to launch request: {error:?}",
+                        provider.provider_name()
+                    );
+                }
+            }
+        }
+
+        Ok(PendingAuction {
+            floor_prices: self.floor_prices_by_slot(&request),
+            request,
+            pending,
+            provider_responses: Vec::new(),
+            auction_started_at,
+            auction_deadline,
         })
     }
 
@@ -478,42 +766,7 @@ impl AuctionOrchestrator {
         responses: &[AuctionResponse],
         floor_prices: &HashMap<String, f64>,
     ) -> HashMap<String, Bid> {
-        let mut winning_bids: HashMap<String, Bid> = HashMap::new();
-
-        for response in responses {
-            if response.status != BidStatus::Success {
-                continue;
-            }
-
-            for bid in &response.bids {
-                // Skip bids without decoded prices (e.g., APS bids)
-                // These require mediation layer to decode
-                let bid_price = match bid.price {
-                    Some(p) => p,
-                    None => {
-                        log::debug!(
-                            "Skipping bid for slot '{}' from '{}' - price requires mediation to decode",
-                            bid.slot_id,
-                            bid.bidder
-                        );
-                        continue;
-                    }
-                };
-
-                let should_replace = match winning_bids.get(&bid.slot_id) {
-                    Some(current_winner) => current_winner
-                        .price
-                        .is_none_or(|current_price| bid_price > current_price),
-                    None => true,
-                };
-
-                if should_replace {
-                    winning_bids.insert(bid.slot_id.clone(), bid.clone());
-                }
-            }
-        }
-
-        self.apply_floor_prices(winning_bids, floor_prices)
+        select_winning_bids_from_responses(responses, floor_prices)
     }
 
     fn apply_floor_prices(
@@ -637,10 +890,12 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::provider::AuctionProvider;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, AuctionResponse, Bid, MediaType, PublisherInfo, UserInfo,
     };
+    use crate::error::TrustedServerError;
 
     // All-None ClientInfo used across tests that don't need real IP/TLS data.
     // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
@@ -650,12 +905,19 @@ mod tests {
         tls_protocol: None,
         tls_cipher: None,
     };
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
+    use crate::platform::{PlatformHttpClient, PlatformHttpRequest};
     use crate::test_support::tests::crate_test_settings_str;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+    use error_stack::Report;
     use fastly::Request;
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
-    use super::AuctionOrchestrator;
+    use super::{AuctionOrchestrator, PendingAuction, PendingAuctionPoll, PendingProviderRequest};
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
@@ -702,6 +964,59 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
+    }
+
+    struct TestAuctionProvider;
+
+    impl AuctionProvider for TestAuctionProvider {
+        fn provider_name(&self) -> &'static str {
+            "test-provider"
+        }
+
+        fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &crate::auction::types::AuctionContext<'_>,
+        ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "test provider does not launch real Fastly requests".to_string(),
+            }))
+        }
+
+        fn parse_response(
+            &self,
+            mut response: fastly::Response,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            let body = response.take_body_str();
+            let price = body.parse::<f64>().unwrap_or(1.5);
+            Ok(AuctionResponse::success(
+                self.provider_name(),
+                vec![Bid {
+                    slot_id: "header-banner".to_string(),
+                    price: Some(price),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "test-bidder".to_string(),
+                    width: 728,
+                    height: 90,
+                    nurl: None,
+                    burl: None,
+                    ad_id: Some("ad-123".to_string()),
+                    metadata: HashMap::new(),
+                }],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("backend-poll".to_string())
+        }
     }
 
     #[test]
@@ -759,6 +1074,55 @@ mod tests {
         assert!(
             filtered.contains_key("slot-2"),
             "Filtered bids should include slot-2 winner"
+        );
+    }
+
+    #[test]
+    fn pending_auction_poll_once_completes_ready_provider_response() {
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response(200, b"2.25".to_vec());
+        let services = build_services_with_http_client(http_client.clone());
+        let pending = futures::executor::block_on(
+            http_client.send_async(PlatformHttpRequest::new(
+                request_builder()
+                    .method("POST")
+                    .uri("https://bidder.example/openrtb2/auction")
+                    .body(Body::empty())
+                    .expect("should build platform request"),
+                "backend-poll",
+            )),
+        )
+        .expect("should create pending request");
+        let provider = Arc::new(TestAuctionProvider);
+        let request = create_test_auction_request();
+        let floor_prices = HashMap::from([("header-banner".to_string(), 1.50)]);
+        let mut pending_auction = PendingAuction {
+            request,
+            pending: vec![PendingProviderRequest {
+                provider,
+                started_at: std::time::Instant::now(),
+                pending,
+            }],
+            provider_responses: Vec::new(),
+            floor_prices,
+            auction_started_at: std::time::Instant::now(),
+            auction_deadline: std::time::Instant::now() + std::time::Duration::from_millis(50),
+        };
+
+        let result =
+            futures::executor::block_on(pending_auction.poll_once(&services)).expect("should poll");
+
+        let PendingAuctionPoll::Complete(result) = result else {
+            panic!("should complete after ready provider response");
+        };
+        let winner = result
+            .winning_bids
+            .get("header-banner")
+            .expect("should select winning bid");
+        assert_eq!(winner.price, Some(2.25), "should parse provider response");
+        assert!(
+            pending_auction.is_complete(),
+            "should have no pending providers after completion"
         );
     }
 

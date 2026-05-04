@@ -42,8 +42,8 @@ mod types;
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSelectResult,
+    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformPollResult,
+    PlatformResponse, PlatformSelectResult,
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};

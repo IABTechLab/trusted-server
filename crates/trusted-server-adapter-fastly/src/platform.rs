@@ -12,6 +12,7 @@ use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::geo_lookup;
+use fastly::http::request::{PendingRequest, PollResult};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use trusted_server_core::backend::BackendConfig;
@@ -20,8 +21,8 @@ pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    PlatformPollResult, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
+    RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -315,6 +316,46 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 
         Ok(PlatformSelectResult { ready, remaining })
     }
+
+    async fn poll(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        let backend_name = pending.backend_name().map(str::to_string);
+        let inner = pending.downcast::<PendingRequest>().map_err(|platform_req| {
+            let backend_name = platform_req.backend_name().unwrap_or("<unknown>");
+            Report::new(PlatformError::HttpClient).attach(format!(
+                "PlatformPendingRequest inner type is not fastly::PendingRequest for backend '{backend_name}'"
+            ))
+        })?;
+
+        match inner.poll() {
+            PollResult::Pending(pending) => {
+                let mut platform_pending = PlatformPendingRequest::new(pending);
+                if let Some(backend_name) = backend_name {
+                    platform_pending = platform_pending.with_backend_name(backend_name);
+                }
+                Ok(PlatformPollResult::Pending(platform_pending))
+            }
+            PollResult::Done(Ok(fastly_resp)) => {
+                let backend_name = fastly_resp
+                    .get_backend_name()
+                    .unwrap_or_else(|| {
+                        log::warn!("poll: response has no backend name, correlation will fail");
+                        ""
+                    })
+                    .to_string();
+                Ok(PlatformPollResult::Ready(fastly_response_to_platform(
+                    fastly_resp,
+                    backend_name,
+                )))
+            }
+            PollResult::Done(Err(error)) => Ok(PlatformPollResult::Ready(Err(Report::new(
+                PlatformError::HttpClient,
+            )
+            .attach(format!("fastly poll error: {error}"))))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +611,24 @@ mod tests {
         // Wrap a non-PendingRequest type to trigger the downcast failure.
         let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
         let err = futures::executor::block_on(client.select(vec![wrong]))
+            .expect_err("should return error for wrong inner type");
+
+        assert!(
+            matches!(err.current_context(), &PlatformError::HttpClient),
+            "should be HttpClient error, got: {:?}",
+            err.current_context()
+        );
+        assert!(
+            format!("{err:?}").contains("origin-a"),
+            "should include backend name in error report: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_poll_returns_error_for_wrong_inner_type() {
+        let client = FastlyPlatformHttpClient;
+        let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
+        let err = futures::executor::block_on(client.poll(wrong))
             .expect_err("should return error for wrong inner type");
 
         assert!(

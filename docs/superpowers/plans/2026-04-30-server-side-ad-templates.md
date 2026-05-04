@@ -1030,7 +1030,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 - Modify: `crates/js/lib/src/integrations/gpt/index.ts`
 - Modify: `crates/js/lib/src/integrations/gpt/index.test.ts`
 
-- [ ] **Step 1: Write failing Rust test**
+- [x] **Step 1: Write failing Rust test**
 
   In `gpt.rs`, add a test that combines `head_inserts()` output and asserts:
   - contains `__tsAdInit`
@@ -1049,7 +1049,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: failure because `__tsAdInit` is missing.
 
-- [ ] **Step 2: Extend GPT Rust head injector**
+- [x] **Step 2: Extend GPT Rust head injector**
 
   Keep the existing GPT shim install snippet and add an inline `__tsAdInit` snippet that:
   - reads `window.__ts_ad_slots || []`
@@ -1061,7 +1061,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
   - waits for `bidsPromise` before applying `hb_*` targeting and calling `refresh()`
   - fires `burl` through `navigator.sendBeacon` only after `slotRenderEnded` confirms matching `hb_adid`
 
-- [ ] **Step 3: Write failing TypeScript tests**
+- [x] **Step 3: Write failing TypeScript tests**
 
   Add tests for:
   - `/ts-bids?rid=<request_id>` fetch with `credentials: 'omit'`
@@ -1078,11 +1078,11 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: failure because `installTsAdInit` is missing.
 
-- [ ] **Step 4: Implement `installTsAdInit`**
+- [x] **Step 4: Implement `installTsAdInit`**
 
   In `index.ts`, export `installTsAdInit()` and call it from the integration initialization path. Keep the existing GPT guard behavior.
 
-- [ ] **Step 5: Run tests and build**
+- [x] **Step 5: Run tests and build**
 
   ```bash
   cargo test -p trusted-server-core integrations::gpt
@@ -1092,7 +1092,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/integrations/gpt.rs crates/js/lib/src/integrations/gpt
@@ -1109,7 +1109,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
 This route is Fastly-only for Phase 1. Future adapters can omit this route, return unsupported, or keep server-side ad templates disabled until the EdgeZero migration provides equivalent request-rendezvous semantics.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
   Add route or helper tests for:
   - missing `rid` -> `400`
@@ -1127,7 +1127,7 @@ This route is Fastly-only for Phase 1. Future adapters can omit this route, retu
 
   Expected: failure because handler is missing.
 
-- [ ] **Step 2: Add route**
+- [x] **Step 2: Add route**
 
   Before the publisher fallback route, add:
 
@@ -1137,7 +1137,7 @@ This route is Fastly-only for Phase 1. Future adapters can omit this route, retu
 
   Adjust `route_request` parameters to receive `bid_cache: &BidCache`.
 
-- [ ] **Step 3: Implement handler**
+- [x] **Step 3: Implement handler**
 
   Handler behavior:
   - Parse `rid` from query.
@@ -1150,7 +1150,7 @@ This route is Fastly-only for Phase 1. Future adapters can omit this route, retu
   - `WaitResult::NotFound`: return `404`.
   - Always set `Cache-Control: private, no-store`.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
   ```bash
   cargo test -p trusted-server-adapter-fastly ts_bids
@@ -1158,7 +1158,7 @@ This route is Fastly-only for Phase 1. Future adapters can omit this route, retu
 
   Expected: tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add crates/trusted-server-adapter-fastly/src/main.rs
@@ -1179,7 +1179,7 @@ This route is Fastly-only for Phase 1. Future adapters can omit this route, retu
 
 Do not start this task unless Task 1 has a `Go` decision. Implement exactly the non-blocking shape selected by Task 1.
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
   Add tests proving:
   - platform HTTP client exposes a non-blocking `poll` operation for pending requests
@@ -1201,7 +1201,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   Expected: failures for missing integration.
 
-- [ ] **Step 2: Add platform pending-request polling**
+- [x] **Step 2: Add platform pending-request polling**
 
   Extend `PlatformHttpClient` with a non-blocking poll method:
 
@@ -1218,7 +1218,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   In the Fastly adapter, implement it with `fastly::http::request::PollResult` from `PendingRequest::poll()`. Non-Fastly/test implementations may return `PlatformError::Unsupported` until EdgeZero migration adds equivalent primitives.
 
-- [ ] **Step 3: Add pollable auction progression**
+- [x] **Step 3: Add pollable auction progression**
 
   Refactor auction orchestration without changing existing `/auction` behavior:
   - Keep `AuctionOrchestrator::run_auction` for existing endpoints.
@@ -1229,7 +1229,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   This is the mechanism that lets publisher streaming continue while auction work advances opportunistically between streaming chunks.
 
-- [ ] **Step 4: Load creative opportunities and bid cache in adapter**
+- [x] **Step 4: Load creative opportunities and bid cache in adapter**
 
   In `main.rs`, add:
 
@@ -1253,7 +1253,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   The Fastly bid cache itself should be a lightweight value over Core Cache APIs and may be constructed per request because the state lives in Fastly Core Cache, not the Rust object.
 
-- [ ] **Step 5: Update publisher handler signature**
+- [x] **Step 5: Update publisher handler signature**
 
   Add the dependencies required by the selected Task 1 shape:
   - `orchestrator: &AuctionOrchestrator`
@@ -1262,7 +1262,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   Keep `AuctionContext` construction aligned with current code: include `settings`, `request`, `client_info`, `timeout_ms`, `provider_responses`, and `services`.
 
-- [ ] **Step 6: Match slots and decide consent before origin body processing**
+- [x] **Step 6: Match slots and decide consent before origin body processing**
 
   Required behavior:
   - Mint `request_id` only when slots match.
@@ -1271,7 +1271,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
   - If slots match but consent is denied/absent, do not run auction and do not inject globals; set browser `Cache-Control: private, no-store`.
   - If slots match and consent allows, register pending cache entry with `A_deadline`, inject globals, and dispatch auction through the Task 1 verified non-blocking path.
 
-- [ ] **Step 7: Preserve streaming invariant**
+- [x] **Step 7: Preserve streaming invariant**
 
   The implementation must satisfy:
   - Origin request is dispatched immediately.
@@ -1280,14 +1280,14 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
   - During body streaming, auction work may only use non-blocking `poll` calls between chunk writes.
   - If the auction completes after page streaming starts, it writes bid results to `BidCache`.
 
-- [ ] **Step 8: Force chunked browser response for processed HTML**
+- [x] **Step 8: Force chunked browser response for processed HTML**
 
   For responses that enter the HTML processing path:
   - Remove `Content-Length`.
   - Set `Transfer-Encoding: chunked` if Fastly permits it explicitly.
   - Do not force chunked on binary pass-through responses.
 
-- [ ] **Step 9: Run tests**
+- [x] **Step 9: Run tests**
 
   ```bash
   cargo test -p trusted-server-core publisher
@@ -1296,7 +1296,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
   Expected: tests pass.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/platform/http.rs crates/trusted-server-adapter-fastly/src/platform.rs \
