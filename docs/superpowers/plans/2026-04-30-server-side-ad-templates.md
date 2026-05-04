@@ -95,7 +95,7 @@ Acceptable proof outcomes:
 2. A verified Fastly Core Cache rendezvous plus non-blocking `PendingRequest::poll` design exists that can advance auction pending requests between streaming chunks without delaying HTML chunks.
 3. No primitive exists. In that case, stop implementation and update the report with the blocker. Do not replace this with a design that waits for auction completion before streaming.
 
-- [ ] **Step 1: Inspect the runtime primitives**
+- [x] **Step 1: Inspect the runtime primitives**
 
   Read Fastly and local platform code for `send_async`, `PendingRequest::poll`, `PendingRequest::wait`, `select`, `stream_to_client`, Fastly Core Cache transactions/replacements, and any background execution API.
 
@@ -109,7 +109,7 @@ Acceptable proof outcomes:
 
   Expected: enough evidence to identify whether background completion or non-blocking polling is feasible.
 
-- [ ] **Step 2: Write the feasibility report**
+- [x] **Step 2: Write the feasibility report**
 
   Create `docs/superpowers/reports/2026-04-30-server-side-ad-templates-concurrency.md` with:
 
@@ -140,13 +140,13 @@ Acceptable proof outcomes:
   [Go/Blocked]
   ```
 
-- [ ] **Step 3: Verify the response-streaming and rendezvous invariant**
+- [x] **Step 3: Verify the response-streaming and rendezvous invariant**
 
   Build a small spike or route-level test that proves a matched page can emit its first HTML bytes before a deliberately delayed auction result completes, and that `/ts-bids` can observe the same request ID moving from pending to complete through the selected Fastly rendezvous.
 
   Expected: evidence shows first page bytes are emitted before the delayed auction finishes, and `/ts-bids?rid=<request_id>` sees the completed bid map without relying on process-global memory.
 
-- [ ] **Step 4: Commit the report**
+- [x] **Step 4: Commit the report**
 
   ```bash
   git add docs/superpowers/reports/2026-04-30-server-side-ad-templates-concurrency.md
@@ -162,7 +162,7 @@ Acceptable proof outcomes:
 - Modify: `Cargo.toml`
 - Modify: `crates/trusted-server-core/Cargo.toml`
 
-- [ ] **Step 1: Write a temporary failing compile check**
+- [x] **Step 1: Write a temporary failing compile check**
 
   Temporarily add this to `crates/trusted-server-core/src/lib.rs`:
 
@@ -178,7 +178,7 @@ Acceptable proof outcomes:
 
   Expected: compile error because `glob` is not declared yet.
 
-- [ ] **Step 2: Add the workspace dependency**
+- [x] **Step 2: Add the workspace dependency**
 
   In root `Cargo.toml` under `[workspace.dependencies]`, add:
 
@@ -186,7 +186,7 @@ Acceptable proof outcomes:
   glob = "0.3"
   ```
 
-- [ ] **Step 3: Add the core crate dependency**
+- [x] **Step 3: Add the core crate dependency**
 
   In `crates/trusted-server-core/Cargo.toml` under `[dependencies]`, add:
 
@@ -194,7 +194,7 @@ Acceptable proof outcomes:
   glob = { workspace = true }
   ```
 
-- [ ] **Step 4: Remove the temporary import and verify**
+- [x] **Step 4: Remove the temporary import and verify**
 
   Remove the temporary `use glob::Pattern as _;`.
 
@@ -206,7 +206,7 @@ Acceptable proof outcomes:
 
   Expected: clean compile.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add Cargo.toml crates/trusted-server-core/Cargo.toml
@@ -224,7 +224,7 @@ Acceptable proof outcomes:
 
 Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dense`, and `auto` (`auto` routes to `dense`). The April 15 design mentions `custom`, but no custom bucket schema is specified; do not implement `custom` in this task.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
   Create `crates/trusted-server-core/src/price_bucket.rs` with:
 
@@ -282,7 +282,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: compile failure because the module implementation and export are missing.
 
-- [ ] **Step 2: Implement `price_bucket.rs`**
+- [x] **Step 2: Implement `price_bucket.rs`**
 
   ```rust
   //! Prebid price granularity bucketing.
@@ -342,7 +342,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   }
   ```
 
-- [ ] **Step 3: Export the module**
+- [x] **Step 3: Export the module**
 
   In `crates/trusted-server-core/src/lib.rs`, add:
 
@@ -350,7 +350,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   pub mod price_bucket;
   ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
   ```bash
   cargo test -p trusted-server-core price_bucket
@@ -358,7 +358,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: all price bucket tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/price_bucket.rs crates/trusted-server-core/src/lib.rs
@@ -374,7 +374,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 - Modify: `crates/trusted-server-core/src/auction/types.rs`
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
   In the `#[cfg(test)]` module in `crates/trusted-server-core/src/auction/types.rs`, add:
 
@@ -413,7 +413,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: compile failure for missing `MediaType::banner` and `Bid::ad_id`.
 
-- [ ] **Step 2: Add `MediaType::banner()`**
+- [x] **Step 2: Add `MediaType::banner()`**
 
   Add:
 
@@ -426,7 +426,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   }
   ```
 
-- [ ] **Step 3: Add `Bid::ad_id`**
+- [x] **Step 3: Add `Bid::ad_id`**
 
   Add this field immediately before `metadata`:
 
@@ -437,7 +437,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Update every `Bid` literal in tests and production code with `ad_id: None` unless parsing a real provider ad ID.
 
-- [ ] **Step 4: Populate Prebid ad IDs**
+- [x] **Step 4: Populate Prebid ad IDs**
 
   In `PrebidAuctionProvider::parse_bid`, add:
 
@@ -451,7 +451,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Include `ad_id` in the returned `AuctionBid`.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
   ```bash
   cargo test -p trusted-server-core auction::types integrations::prebid
@@ -459,7 +459,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/auction/types.rs crates/trusted-server-core/src/integrations/prebid.rs
@@ -475,7 +475,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 - Create: `crates/trusted-server-core/src/creative_opportunities.rs`
 - Modify: `crates/trusted-server-core/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
   Create `crates/trusted-server-core/src/creative_opportunities.rs` with tests for:
   - `/20**` matches multi-segment article paths.
@@ -515,7 +515,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: compile failure because implementation/export is missing.
 
-- [ ] **Step 2: Implement config types and matching**
+- [x] **Step 2: Implement config types and matching**
 
   Implement:
 
@@ -578,7 +578,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Add methods for `matches_path`, `resolved_gam_unit_path`, `resolved_div_id`, `to_ad_slot`, `validate_slot_id`, and `match_slots`.
 
-- [ ] **Step 3: Export the module**
+- [x] **Step 3: Export the module**
 
   In `crates/trusted-server-core/src/lib.rs`, add:
 
@@ -586,7 +586,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   pub mod creative_opportunities;
   ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
   ```bash
   cargo test -p trusted-server-core creative_opportunities
@@ -594,7 +594,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/creative_opportunities.rs crates/trusted-server-core/src/lib.rs
@@ -613,7 +613,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 - Create: `creative-opportunities.toml`
 - Modify: `trusted-server.toml`
 
-- [ ] **Step 1: Write failing settings test**
+- [x] **Step 1: Write failing settings test**
 
   In `settings.rs` tests, add:
 
@@ -650,7 +650,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: compile failure for missing `Settings::creative_opportunities`.
 
-- [ ] **Step 2: Add settings field**
+- [x] **Step 2: Add settings field**
 
   Import `CreativeOpportunitiesConfig` and add:
 
@@ -659,7 +659,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
   ```
 
-- [ ] **Step 3: Add root config files**
+- [x] **Step 3: Add root config files**
 
   Create `creative-opportunities.toml`:
 
@@ -692,7 +692,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   price_granularity = "dense"
   ```
 
-- [ ] **Step 4: Add build-time validation**
+- [x] **Step 4: Add build-time validation**
 
   In `crates/trusted-server-core/build.rs`, add `cargo:rerun-if-changed` for `../../creative-opportunities.toml`, parse it as `toml::Value`, and validate each `[[slot]].id` with `^[A-Za-z0-9_\-]+$`.
 
@@ -702,7 +702,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   - Empty file with zero slots: valid kill-switch.
   - Invalid slot ID: startup/build error.
 
-- [ ] **Step 5: Add adapter rebuild trigger**
+- [x] **Step 5: Add adapter rebuild trigger**
 
   Create `crates/trusted-server-adapter-fastly/build.rs`:
 
@@ -712,7 +712,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
   }
   ```
 
-- [ ] **Step 6: Run verification**
+- [x] **Step 6: Run verification**
 
   ```bash
   cargo test -p trusted-server-core settings_parses_creative_opportunities_section
@@ -722,7 +722,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
   Expected: all pass/build.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/settings.rs crates/trusted-server-core/build.rs \
@@ -743,7 +743,7 @@ Phase 1 implements Prebid built-in granularities: `low`, `medium`, `high`, `dens
 
 Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID rendezvous used by the Fastly adapter; do not introduce a broader `AuctionIntent` abstraction in this plan. Production Fastly must not rely on process-global memory. Use Fastly Core Cache for pending/completed bid state, with an in-memory implementation only for unit tests and non-Fastly unsupported paths.
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
   Create tests covering:
   - unknown request ID -> `CacheResult::NotFound`
@@ -763,7 +763,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: compile failure because module is missing.
 
-- [ ] **Step 2: Implement core bid cache types and test implementation**
+- [x] **Step 2: Implement core bid cache types and test implementation**
 
   Implement:
 
@@ -818,7 +818,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   `AuctionDeadline` must be computed once when the page request starts from both `Instant::now()` and `SystemTime::now()`. In-process tests can use the `Instant`; Fastly Core Cache must persist `epoch_ms` and reconstruct an equivalent local `Instant` on `/ts-bids` so it can enforce the original deadline in a separate request. `wait_for` must not mint a new timeout.
 
-- [ ] **Step 3: Implement Fastly Core Cache `BidCache`**
+- [x] **Step 3: Implement Fastly Core Cache `BidCache`**
 
   In `crates/trusted-server-adapter-fastly/src/bid_cache.rs`, implement `FastlyBidCache`:
   - Cache key: `ts-bids:<request_id>`.
@@ -829,7 +829,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Use `fastly::cache::core` APIs, not `static` process memory, for production Fastly rendezvous.
 
-- [ ] **Step 4: Export the module**
+- [x] **Step 4: Export the module**
 
   In `crates/trusted-server-core/src/lib.rs`, add:
 
@@ -837,7 +837,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
   pub mod bid_cache;
   ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
   ```bash
   cargo test -p trusted-server-core bid_cache
@@ -846,7 +846,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/bid_cache.rs crates/trusted-server-core/src/lib.rs \
@@ -863,7 +863,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 - Modify: `crates/trusted-server-core/src/html_processor.rs`
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 
-- [ ] **Step 1: Write failing HTML processor tests**
+- [x] **Step 1: Write failing HTML processor tests**
 
   Add tests proving:
   - `ad_slots_script` is prepended at `<head>` open.
@@ -879,7 +879,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: compile failure for missing `HtmlProcessorConfig::ad_slots_script`.
 
-- [ ] **Step 2: Add config field**
+- [x] **Step 2: Add config field**
 
   Add to `HtmlProcessorConfig`:
 
@@ -890,7 +890,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Initialize it to `None` in `HtmlProcessorConfig::from_settings`.
 
-- [ ] **Step 3: Inject once at `<head>` open**
+- [x] **Step 3: Inject once at `<head>` open**
 
   In the existing `element!("head", ...)` handler:
   - Build one `snippet` string.
@@ -901,7 +901,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Do not add `on_end_tag`.
 
-- [ ] **Step 4: Add publisher script helpers**
+- [x] **Step 4: Add publisher script helpers**
 
   In `publisher.rs`, add `pub(crate)` helpers:
   - `build_head_globals_script(matched_slots, request_id, co_config) -> String`
@@ -909,7 +909,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   The script must use `JSON.parse("...escaped JSON...")` and must not interpolate raw JSON into executable JavaScript.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
   ```bash
   cargo test -p trusted-server-core html_processor
@@ -917,7 +917,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/html_processor.rs crates/trusted-server-core/src/publisher.rs
@@ -932,7 +932,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 
-- [ ] **Step 1: Write failing helper tests**
+- [x] **Step 1: Write failing helper tests**
 
   Add tests covering:
   - `build_head_globals_script` includes slots and request ID.
@@ -953,7 +953,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: failure because helpers are missing.
 
-- [ ] **Step 2: Implement bid map helper**
+- [x] **Step 2: Implement bid map helper**
 
   Implement `build_bid_map`:
 
@@ -980,7 +980,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
   }
   ```
 
-- [ ] **Step 3: Implement consent helper**
+- [x] **Step 3: Implement consent helper**
 
   Implement a small helper used only by the server-side ad-template path:
 
@@ -995,7 +995,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   This intentionally follows the April 15 design: absent TCF means no server-side auction and no ad globals for this Phase 1 path.
 
-- [ ] **Step 4: Implement browser cache policy helper**
+- [x] **Step 4: Implement browser cache policy helper**
 
   Implement a helper that receives `slots_matched: bool` and `globals_injected: bool`.
 
@@ -1005,7 +1005,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
   - If globals are injected, set `Cache-Control: private, no-store`.
   - Preserve `Surrogate-Control` and `Fastly-Surrogate-Control`.
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
   ```bash
   cargo test -p trusted-server-core publisher::creative_opportunities_tests
@@ -1013,7 +1013,7 @@ Keep the April 15 design's `BidCache` naming in Phase 1. This is the request-ID 
 
   Expected: tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/publisher.rs
@@ -1389,7 +1389,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
 - Modify only if needed by test fixes.
 
-- [ ] **Step 1: Run Rust tests**
+- [x] **Step 1: Run Rust tests**
 
   ```bash
   cargo test --workspace
@@ -1397,7 +1397,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: all tests pass.
 
-- [ ] **Step 2: Run Rust formatting check**
+- [x] **Step 2: Run Rust formatting check**
 
   ```bash
   cargo fmt --all -- --check
@@ -1405,7 +1405,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: no formatting changes needed.
 
-- [ ] **Step 3: Run Clippy**
+- [x] **Step 3: Run Clippy**
 
   ```bash
   cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -1413,7 +1413,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: no warnings.
 
-- [ ] **Step 4: Run JS tests and build**
+- [x] **Step 4: Run JS tests and build**
 
   ```bash
   cd crates/js/lib && npx vitest run
@@ -1422,7 +1422,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: tests and build pass.
 
-- [ ] **Step 5: Run manual Fastly verification**
+- [x] **Step 5: Run manual Fastly verification**
 
   Run:
 
@@ -1455,7 +1455,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
   - `/ts-bids?rid=not-real` returns `404`.
   - First HTML bytes arrive before a delayed auction completes, using the evidence path from Task 1.
 
-- [ ] **Step 6: Run browser verification**
+- [x] **Step 6: Run browser verification**
 
   With `fastly compute serve` still running, verify manually in Chrome or with Chrome MCP:
   - Open `http://127.0.0.1:7676/2024/01/test-article/`.
@@ -1465,7 +1465,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
   - Confirm the console has no GPT bootstrap errors.
   - Confirm no ad globals exist on `/about` or matched pages with denied/missing consent.
 
-- [ ] **Step 7: Commit any final test/documentation fixes**
+- [x] **Step 7: Commit any final test/documentation fixes**
 
   ```bash
   git status --short
