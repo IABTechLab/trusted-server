@@ -192,6 +192,20 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>>;
 
+    /// Start an upstream request without waiting for it to complete from a
+    /// synchronous call site.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PlatformError::Unsupported` when the platform adapter does not
+    /// provide a synchronous fire-and-forget start primitive.
+    fn send_async_now(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors
@@ -210,6 +224,20 @@ pub trait PlatformHttpClient: Send + Sync {
     /// Returns `PlatformError::Unsupported` when the platform adapter does not
     /// provide non-blocking polling.
     async fn poll(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        self.poll_now(pending)
+    }
+
+    /// Poll a single in-flight request without blocking from a synchronous call
+    /// site.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PlatformError::Unsupported` when the platform adapter does not
+    /// provide non-blocking polling.
+    fn poll_now(
         &self,
         _pending: PlatformPendingRequest,
     ) -> Result<PlatformPollResult, Report<PlatformError>> {

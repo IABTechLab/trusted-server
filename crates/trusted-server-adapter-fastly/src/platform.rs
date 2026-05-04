@@ -256,6 +256,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        self.send_async_now(request)
+    }
+
+    fn send_async_now(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
         let fastly_req = edge_request_to_fastly(request.request)?;
         let pending = fastly_req
@@ -318,6 +325,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
     }
 
     async fn poll(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        self.poll_now(pending)
+    }
+
+    fn poll_now(
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformPollResult, Report<PlatformError>> {

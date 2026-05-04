@@ -148,64 +148,110 @@ impl PendingAuction {
     ) -> Result<PendingAuctionPoll, Report<TrustedServerError>> {
         let mut still_pending = Vec::with_capacity(self.pending.len());
 
-        for pending_provider in self.pending.drain(..) {
-            match services
-                .http_client()
-                .poll(pending_provider.pending)
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: format!(
-                        "HTTP poll failed for provider '{}'",
-                        pending_provider.provider.provider_name()
-                    ),
-                })? {
-                PlatformPollResult::Pending(pending) => {
-                    still_pending.push(PendingProviderRequest {
-                        pending,
-                        ..pending_provider
-                    });
-                }
-                PlatformPollResult::Ready(Ok(platform_response)) => {
-                    let response_time_ms = pending_provider.started_at.elapsed().as_millis() as u64;
-                    match platform_response_to_fastly(platform_response).and_then(|response| {
-                        pending_provider.provider.parse_response_for_request(
-                            response,
-                            response_time_ms,
-                            &self.request,
-                        )
-                    }) {
-                        Ok(response) => self.provider_responses.push(response),
-                        Err(error) => {
-                            log::warn!(
-                                "Provider '{}' failed during non-blocking auction poll: {error:?}",
-                                pending_provider.provider.provider_name()
-                            );
-                            self.provider_responses.push(AuctionResponse::error(
-                                pending_provider.provider.provider_name(),
-                                response_time_ms,
-                            ));
-                        }
-                    }
-                }
-                PlatformPollResult::Ready(Err(error)) => {
-                    log::warn!(
-                        "Provider '{}' poll completed with error: {error:?}",
-                        pending_provider.provider.provider_name()
-                    );
-                    self.provider_responses.push(AuctionResponse::error(
-                        pending_provider.provider.provider_name(),
-                        pending_provider.started_at.elapsed().as_millis() as u64,
-                    ));
-                }
-            }
+        for pending_provider in std::mem::take(&mut self.pending) {
+            let PendingProviderRequest {
+                provider,
+                started_at,
+                pending,
+            } = pending_provider;
+            let provider_name = provider.provider_name();
+            let poll_result = services.http_client().poll(pending).await.change_context(
+                TrustedServerError::Auction {
+                    message: format!("HTTP poll failed for provider '{provider_name}'"),
+                },
+            )?;
+            self.record_poll_result(provider, started_at, poll_result, &mut still_pending);
         }
 
+        self.finish_poll_round(still_pending)
+    }
+
+    /// Advance provider requests once without blocking from a synchronous call
+    /// site.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError`] when the platform poll operation fails.
+    pub fn poll_once_now(
+        &mut self,
+        services: &RuntimeServices,
+    ) -> Result<PendingAuctionPoll, Report<TrustedServerError>> {
+        let mut still_pending = Vec::with_capacity(self.pending.len());
+
+        for pending_provider in std::mem::take(&mut self.pending) {
+            let PendingProviderRequest {
+                provider,
+                started_at,
+                pending,
+            } = pending_provider;
+            let provider_name = provider.provider_name();
+            let poll_result = services.http_client().poll_now(pending).change_context(
+                TrustedServerError::Auction {
+                    message: format!("HTTP poll failed for provider '{provider_name}'"),
+                },
+            )?;
+            self.record_poll_result(provider, started_at, poll_result, &mut still_pending);
+        }
+
+        self.finish_poll_round(still_pending)
+    }
+
+    fn finish_poll_round(
+        &mut self,
+        still_pending: Vec<PendingProviderRequest>,
+    ) -> Result<PendingAuctionPoll, Report<TrustedServerError>> {
         self.pending = still_pending;
 
         if self.pending.is_empty() || Instant::now() >= self.auction_deadline {
             Ok(PendingAuctionPoll::Complete(self.finish_due_to_deadline()))
         } else {
             Ok(PendingAuctionPoll::Pending)
+        }
+    }
+
+    fn record_poll_result(
+        &mut self,
+        provider: Arc<dyn AuctionProvider>,
+        started_at: Instant,
+        poll_result: PlatformPollResult,
+        still_pending: &mut Vec<PendingProviderRequest>,
+    ) {
+        match poll_result {
+            PlatformPollResult::Pending(pending) => {
+                still_pending.push(PendingProviderRequest {
+                    provider,
+                    started_at,
+                    pending,
+                });
+            }
+            PlatformPollResult::Ready(Ok(platform_response)) => {
+                let response_time_ms = started_at.elapsed().as_millis() as u64;
+                match platform_response_to_fastly(platform_response).and_then(|response| {
+                    provider.parse_response_for_request(response, response_time_ms, &self.request)
+                }) {
+                    Ok(response) => self.provider_responses.push(response),
+                    Err(error) => {
+                        log::warn!(
+                            "Provider '{}' failed during non-blocking auction poll: {error:?}",
+                            provider.provider_name()
+                        );
+                        self.provider_responses.push(AuctionResponse::error(
+                            provider.provider_name(),
+                            response_time_ms,
+                        ));
+                    }
+                }
+            }
+            PlatformPollResult::Ready(Err(error)) => {
+                log::warn!(
+                    "Provider '{}' poll completed with error: {error:?}",
+                    provider.provider_name()
+                );
+                self.provider_responses.push(AuctionResponse::error(
+                    provider.provider_name(),
+                    started_at.elapsed().as_millis() as u64,
+                ));
+            }
         }
     }
 

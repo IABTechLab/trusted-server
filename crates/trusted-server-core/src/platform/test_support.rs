@@ -299,6 +299,13 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        self.send_async_now(request)
+    }
+
+    fn send_async_now(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
         self.calls
             .lock()
@@ -357,6 +364,13 @@ impl PlatformHttpClient for StubHttpClient {
     }
 
     async fn poll(
+        &self,
+        pending: PlatformPendingRequest,
+    ) -> Result<PlatformPollResult, Report<PlatformError>> {
+        self.poll_now(pending)
+    }
+
+    fn poll_now(
         &self,
         pending: PlatformPendingRequest,
     ) -> Result<PlatformPollResult, Report<PlatformError>> {

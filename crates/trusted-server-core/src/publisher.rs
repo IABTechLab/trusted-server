@@ -342,11 +342,10 @@ fn fire_prebid_nurls_at_edge(
             }
         };
 
-        if let Err(error) = futures::executor::block_on(
-            services
-                .http_client()
-                .send_async(PlatformHttpRequest::new(request, backend_name)),
-        ) {
+        if let Err(error) = services
+            .http_client()
+            .send_async_now(PlatformHttpRequest::new(request, backend_name))
+        {
             log::warn!(
                 "Failed to dispatch Prebid nurl '{}' from bidder '{}': {error:?}",
                 nurl,
@@ -685,7 +684,7 @@ impl ServerSideAuctionStream {
             return;
         }
 
-        match futures::executor::block_on(self.pending_auction.poll_once(services)) {
+        match self.pending_auction.poll_once_now(services) {
             Ok(PendingAuctionPoll::Pending) => {}
             Ok(PendingAuctionPoll::Complete(result)) => {
                 self.write_result(services, bid_cache, &result);
@@ -712,7 +711,7 @@ impl ServerSideAuctionStream {
 
     fn drain_after_stream(&mut self, services: &RuntimeServices, bid_cache: &dyn BidCache) {
         while !self.completed {
-            match futures::executor::block_on(self.pending_auction.poll_once(services)) {
+            match self.pending_auction.poll_once_now(services) {
                 Ok(PendingAuctionPoll::Pending) => {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -2443,6 +2442,66 @@ mod creative_opportunities_tests {
             }
             other => panic!("should complete bid cache, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_publisher_body_with_ad_auction_runs_inside_existing_executor() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let services = noop_services();
+            let params = OwnedProcessResponseParams {
+                content_encoding: String::new(),
+                origin_host: "origin.example.com".to_string(),
+                origin_url: "https://origin.example.com".to_string(),
+                request_host: "proxy.example.com".to_string(),
+                request_scheme: "https".to_string(),
+                content_type: "text/html; charset=utf-8".to_string(),
+                ad_slots_script: None,
+            };
+            let cache = InMemoryBidCache::new(std::time::Duration::from_secs(1), 4);
+            cache
+                .mark_pending(
+                    "rid-existing-executor",
+                    AuctionDeadline::from_timeout(std::time::Duration::from_millis(100)),
+                )
+                .expect("should mark bid cache pending");
+            let auction_result = OrchestrationResult {
+                provider_responses: Vec::new(),
+                mediator_response: None,
+                winning_bids: HashMap::new(),
+                total_time_ms: 0,
+                metadata: HashMap::new(),
+            };
+            let pending_auction = PendingAuction::from_completed_result_for_test(
+                make_auction_request(),
+                auction_result,
+            );
+            let mut server_side_auction = ServerSideAuctionStream::new(
+                "rid-existing-executor".to_string(),
+                pending_auction,
+                PriceGranularity::Dense,
+                false,
+                settings.proxy.certificate_check,
+            );
+            let mut output = Vec::new();
+            let mut auction_context = ServerSideAuctionStreamContext {
+                services: &services,
+                bid_cache: &cache,
+                server_side_auction: &mut server_side_auction,
+            };
+
+            stream_publisher_body_with_ad_auction(
+                Body::from("<html><head></head><body>ok</body></html>"),
+                &mut output,
+                &params,
+                &settings,
+                &registry,
+                &mut auction_context,
+            )
+            .expect("should not nest a local executor while streaming");
+        });
     }
 
     #[test]
