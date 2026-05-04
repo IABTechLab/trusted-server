@@ -1271,9 +1271,9 @@ impl PrebidAuctionProvider {
         }
 
         if bids.is_empty() {
-            AuctionResponse::no_bid("prebid", response_time_ms)
+            AuctionResponse::no_bid(PREBID_INTEGRATION_ID, response_time_ms)
         } else {
-            AuctionResponse::success("prebid", bids, response_time_ms)
+            AuctionResponse::success(PREBID_INTEGRATION_ID, bids, response_time_ms)
         }
     }
 
@@ -1471,7 +1471,7 @@ impl PrebidAuctionProvider {
 
 impl AuctionProvider for PrebidAuctionProvider {
     fn provider_name(&self) -> &'static str {
-        "prebid"
+        PREBID_INTEGRATION_ID
     }
 
     fn request_bids(
@@ -1622,23 +1622,31 @@ impl AuctionProvider for PrebidAuctionProvider {
 pub fn register_auction_provider(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let Some(integration) = build(settings)? else {
-        log::info!("Prebid auction provider not registered: integration not found or disabled");
-        return Ok(Vec::new());
-    };
+    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
 
-    log::info!(
-        "Registering Prebid auction provider (server_url={})",
-        integration.config.server_url
-    );
-    if integration.config.debug {
-        log::warn!(
-            "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
-             bidstatus) will be included in /auction responses"
-        );
+    match settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID) {
+        Ok(Some(config)) => {
+            log::info!(
+                "Registering Prebid auction provider (server_url={})",
+                config.server_url
+            );
+            if config.debug {
+                log::warn!(
+                    "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+                     bidstatus) will be included in /auction responses"
+                );
+            }
+            providers.push(Arc::new(PrebidAuctionProvider::new(config)));
+        }
+        Ok(None) => {
+            log::info!("Prebid auction provider not registered: integration not found or disabled");
+        }
+        Err(e) => {
+            return Err(e);
+        }
     }
 
-    Ok(vec![Arc::new(integration.auction_provider())])
+    Ok(providers)
 }
 
 #[cfg(test)]
@@ -3235,28 +3243,26 @@ server_url = "https://prebid.example"
         assert_eq!(routes.len(), 0);
     }
 
-    /// Verifies body-preview truncation keeps a UTF-8 char boundary.
     #[test]
-    fn body_preview_truncation_is_utf8_safe() {
-        // 999 ASCII bytes + U+2603 SNOWMAN (3 bytes: E2 98 83) = 1002 bytes.
-        // Byte index 1000 lands on 0x98, the second byte of the snowman.
-        let mut body = "x".repeat(999);
-        body.push('\u{2603}'); // ☃
-        assert_eq!(body.len(), 1002);
+    fn prebid_body_preview_truncates_to_character_limit() {
+        let body = "x".repeat(PREBID_ERROR_BODY_PREVIEW_CHARS + 100);
 
-        let truncation_index = body.floor_char_boundary(1000);
-        assert!(
-            body.is_char_boundary(truncation_index),
-            "should truncate at a valid UTF-8 boundary"
-        );
+        let preview = prebid_body_preview(body.as_bytes());
+
         assert_eq!(
-            body[..truncation_index].len(),
-            999,
-            "should drop the partial multibyte character"
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should cap the upstream body preview"
         );
+    }
+
+    #[test]
+    fn prebid_body_preview_handles_non_utf8_lossily() {
+        let preview = prebid_body_preview(&[b'o', b'k', 0xff, b'!']);
+
         assert_eq!(
-            truncation_index, 999,
-            "should step back to the previous char boundary"
+            preview, "ok\u{fffd}!",
+            "should replace invalid UTF-8 bytes without panicking"
         );
     }
 
@@ -3358,8 +3364,10 @@ server_url = "https://prebid.example"
             "should include upstream HTTP status"
         );
         assert!(
-            auction_response.metadata.get("body_preview").is_none(),
-            "should not include upstream body preview unless debug is enabled"
+            !auction_response
+                .metadata
+                .contains_key("body_preview"),
+            "should omit upstream body preview unless Prebid debug is enabled"
         );
     }
 
