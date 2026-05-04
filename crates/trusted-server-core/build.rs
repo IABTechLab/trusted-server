@@ -169,9 +169,7 @@ fn validate_creative_opportunities_config() {
         for pattern in &typed_slot.page_patterns {
             let normalized = pattern.replace("**", "*");
             if glob::Pattern::new(pattern).is_err() && glob::Pattern::new(&normalized).is_err() {
-                panic!(
-                    "{config_path:?}: slot `{id}` has invalid page_pattern `{pattern}`"
-                );
+                panic!("{config_path:?}: slot `{id}` has invalid page_pattern `{pattern}`");
             }
         }
     }
