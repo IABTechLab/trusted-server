@@ -9,6 +9,10 @@ use trusted_server_core::bid_cache::{
 };
 
 const DEFAULT_BID_CACHE_TTL: Duration = Duration::from_secs(30);
+// Conservative upper bound for reconstructed deadlines; keeps /ts-bids from
+// long-polling up to DEFAULT_BID_CACHE_TTL (30 s) when the auction already
+// finished. Auction timeouts are typically 200–500 ms.
+const DEFAULT_MAX_RECONSTRUCTED_WAIT: Duration = Duration::from_millis(800);
 
 /// Fastly Core Cache-backed [`BidCache`] implementation.
 pub struct FastlyBidCache {
@@ -21,7 +25,7 @@ impl FastlyBidCache {
     pub fn new() -> Self {
         Self {
             ttl: DEFAULT_BID_CACHE_TTL,
-            max_reconstructed_wait: DEFAULT_BID_CACHE_TTL,
+            max_reconstructed_wait: DEFAULT_MAX_RECONSTRUCTED_WAIT,
         }
     }
 

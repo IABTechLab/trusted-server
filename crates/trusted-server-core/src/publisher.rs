@@ -186,7 +186,6 @@ fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
 }
 
 /// Build the head script that exposes server-side ad slot metadata.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn build_head_globals_script(
     matched_slots: &[&CreativeOpportunitySlot],
@@ -228,7 +227,6 @@ pub(crate) fn build_head_globals_script(
 }
 
 /// Escape JSON so it can be embedded in a JavaScript string inside an HTML script.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn html_escape_for_script(json: &str) -> String {
     let mut escaped = String::with_capacity(json.len());
@@ -247,7 +245,6 @@ pub(crate) fn html_escape_for_script(json: &str) -> String {
     escaped
 }
 
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, crate::auction::types::Bid>,
@@ -270,7 +267,6 @@ pub(crate) fn build_bid_map(
         .collect()
 }
 
-#[allow(dead_code)]
 fn server_side_auction_allowed(consent_context: &crate::consent::ConsentContext) -> bool {
     consent_context
         .tcf
@@ -278,17 +274,8 @@ fn server_side_auction_allowed(consent_context: &crate::consent::ConsentContext)
         .is_some_and(|tcf| tcf.has_purpose_consent(1))
 }
 
-#[allow(dead_code)]
-fn apply_server_side_ad_cache_policy(
-    response: &mut Response,
-    slots_matched: bool,
-    globals_injected: bool,
-) {
-    if !slots_matched {
-        return;
-    }
-
-    if globals_injected || slots_matched {
+fn apply_server_side_ad_cache_policy(response: &mut Response, slots_matched: bool) {
+    if slots_matched {
         response.set_header(header::CACHE_CONTROL, "private, no-store");
     }
 }
@@ -713,7 +700,8 @@ impl ServerSideAuctionStream {
         while !self.completed {
             match self.pending_auction.poll_once_now(services) {
                 Ok(PendingAuctionPoll::Pending) => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // poll_once_now already checks the deadline internally via finish_poll_round;
+                    // no sleep — wasm32-wasip1 has no scheduler to yield to.
                 }
                 Ok(PendingAuctionPoll::Complete(result)) => {
                     self.write_result(services, bid_cache, &result);
@@ -1116,7 +1104,7 @@ pub fn handle_publisher_request(
         existing_ec_cookie.as_deref(),
         &consent_context,
     );
-    apply_server_side_ad_cache_policy(&mut response, slots_matched, ad_slots_script.is_some());
+    apply_server_side_ad_cache_policy(&mut response, slots_matched);
 
     let content_type = response
         .get_header(header::CONTENT_TYPE)
@@ -1628,7 +1616,7 @@ mod creative_opportunities_tests {
         let mut response = Response::from_status(StatusCode::OK);
         response.set_header(header::CACHE_CONTROL, "public, max-age=300");
 
-        apply_server_side_ad_cache_policy(&mut response, true, false);
+        apply_server_side_ad_cache_policy(&mut response, true);
 
         assert_eq!(
             response.get_header_str(header::CACHE_CONTROL),
@@ -1642,7 +1630,7 @@ mod creative_opportunities_tests {
         let mut response = Response::from_status(StatusCode::OK);
         response.set_header(header::CACHE_CONTROL, "public, max-age=300");
 
-        apply_server_side_ad_cache_policy(&mut response, true, true);
+        apply_server_side_ad_cache_policy(&mut response, true);
 
         assert_eq!(
             response.get_header_str(header::CACHE_CONTROL),
@@ -1658,7 +1646,7 @@ mod creative_opportunities_tests {
         response.set_header("Surrogate-Control", "max-age=3600");
         response.set_header("Fastly-Surrogate-Control", "max-age=7200");
 
-        apply_server_side_ad_cache_policy(&mut response, true, true);
+        apply_server_side_ad_cache_policy(&mut response, true);
 
         assert_eq!(
             response.get_header_str("Surrogate-Control"),
@@ -1679,7 +1667,7 @@ mod creative_opportunities_tests {
         response.set_header("Surrogate-Control", "max-age=3600");
         response.set_header("Fastly-Surrogate-Control", "max-age=7200");
 
-        apply_server_side_ad_cache_policy(&mut response, false, false);
+        apply_server_side_ad_cache_policy(&mut response, false);
 
         assert_eq!(
             response.get_header_str(header::CACHE_CONTROL),

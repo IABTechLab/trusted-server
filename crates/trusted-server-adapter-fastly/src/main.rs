@@ -332,12 +332,14 @@ async fn route_request(
     Some(response)
 }
 
+const MAX_REQUEST_ID_BYTES: usize = 256;
+
 fn handle_ts_bids_request(req: &Request, bid_cache: &impl BidCache) -> Response {
     let Some(request_id) = req
         .get_url()
         .query_pairs()
         .find_map(|(key, value)| (key == "rid").then_some(value.into_owned()))
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_REQUEST_ID_BYTES)
     else {
         return text_ts_bids_response(StatusCode::BAD_REQUEST, "missing rid\n");
     };

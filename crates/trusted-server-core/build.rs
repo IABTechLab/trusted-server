@@ -165,5 +165,14 @@ fn validate_creative_opportunities_config() {
                 "{config_path:?}: invalid slot id `{id}`; use only ASCII letters, digits, `_`, and `-`"
             );
         }
+
+        for pattern in &typed_slot.page_patterns {
+            let normalized = pattern.replace("**", "*");
+            if glob::Pattern::new(pattern).is_err() && glob::Pattern::new(&normalized).is_err() {
+                panic!(
+                    "{config_path:?}: slot `{id}` has invalid page_pattern `{pattern}`"
+                );
+            }
+        }
     }
 }

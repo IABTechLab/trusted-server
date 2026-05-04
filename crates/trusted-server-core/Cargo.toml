@@ -55,6 +55,7 @@ edgezero-core = { workspace = true }
 config = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
+glob = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }

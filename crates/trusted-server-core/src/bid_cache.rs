@@ -2,7 +2,7 @@
 
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -195,7 +195,7 @@ pub struct InMemoryBidCache {
 #[derive(Default)]
 struct BidCacheInner {
     entries: HashMap<String, StoredBidCacheEntry>,
-    insertion_order: Vec<String>,
+    insertion_order: VecDeque<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,7 +306,7 @@ impl InMemoryBidCache {
             },
         );
         inner.insertion_order.retain(|key| key != request_id);
-        inner.insertion_order.push(request_id.to_string());
+        inner.insertion_order.push_back(request_id.to_string());
         self.enforce_capacity(&mut inner);
 
         Ok(())
@@ -329,9 +329,8 @@ impl InMemoryBidCache {
         }
 
         while inner.entries.len() > self.capacity {
-            if let Some(oldest_key) = inner.insertion_order.first().cloned() {
+            if let Some(oldest_key) = inner.insertion_order.pop_front() {
                 inner.entries.remove(&oldest_key);
-                inner.insertion_order.remove(0);
             } else {
                 break;
             }
