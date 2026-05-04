@@ -119,6 +119,10 @@ pub struct PrebidIntegrationConfig {
     /// - `both` — consent in both cookies and body (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
+    /// Whether the edge should fire Prebid win-notification URLs after
+    /// server-side template auction completion.
+    #[serde(default = "default_fire_nurl_at_edge")]
+    pub fire_nurl_at_edge: bool,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -136,6 +140,10 @@ fn default_bidders() -> Vec<String> {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_fire_nurl_at_edge() -> bool {
     true
 }
 
@@ -1265,7 +1273,18 @@ mod tests {
             client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
+            fire_nurl_at_edge: true,
         }
+    }
+
+    #[test]
+    fn prebid_fire_nurl_at_edge_defaults_to_true() {
+        let config = base_config();
+
+        assert!(
+            config.fire_nurl_at_edge,
+            "should default to edge nurl firing"
+        );
     }
 
     fn create_test_auction_request() -> AuctionRequest {

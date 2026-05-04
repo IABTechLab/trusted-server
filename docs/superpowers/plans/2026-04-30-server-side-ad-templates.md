@@ -1316,7 +1316,7 @@ Do not start this task unless Task 1 has a `Go` decision. Implement exactly the 
 
 This task implements `nurl` firing only for the Fastly Phase 1 path. Future adapters may return unsupported or disable server-side ad templates until they can provide equivalent non-blocking outbound HTTP behavior.
 
-- [ ] **Step 1: Write failing config test**
+- [x] **Step 1: Write failing config test**
 
   In Prebid tests, assert:
 
@@ -1341,7 +1341,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: failure until field/default is implemented.
 
-- [ ] **Step 2: Add config field**
+- [x] **Step 2: Add config field**
 
   Add to `PrebidIntegrationConfig`:
 
@@ -1358,7 +1358,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
   }
   ```
 
-- [ ] **Step 3: Fire winning nurls after auction completion**
+- [x] **Step 3: Fire winning nurls after auction completion**
 
   In the selected non-blocking auction completion path, after writing bid results to `BidCache`, call a helper that:
   - Reads `PrebidIntegrationConfig` via `settings.integrations.get_typed::<PrebidIntegrationConfig>("prebid")`.
@@ -1366,7 +1366,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
   - Uses the Fastly-supported async HTTP primitive from Task 1, for example `fastly::Request::get(nurl).send_async(&backend_name)`, for each winning bid with `nurl`.
   - Logs warnings but never fails the page or `/ts-bids`.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
   ```bash
   cargo test -p trusted-server-core integrations::prebid publisher
@@ -1374,7 +1374,7 @@ This task implements `nurl` firing only for the Fastly Phase 1 path. Future adap
 
   Expected: tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/integrations/prebid.rs crates/trusted-server-core/src/publisher.rs

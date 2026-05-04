@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::http::request_builder;
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
@@ -34,8 +36,9 @@ use crate::edge_cookie::{generate_ec_id, get_or_generate_ec_id};
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
+use crate::integrations::prebid::PrebidIntegrationConfig;
 use crate::integrations::IntegrationRegistry;
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -287,6 +290,69 @@ fn apply_server_side_ad_cache_policy(
 
     if globals_injected || slots_matched {
         response.set_header(header::CACHE_CONTROL, "private, no-store");
+    }
+}
+
+fn prebid_fire_nurl_at_edge(settings: &Settings) -> bool {
+    match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
+        Ok(Some(config)) => config.fire_nurl_at_edge,
+        Ok(None) => true,
+        Err(error) => {
+            log::warn!("Failed to read Prebid fire_nurl_at_edge setting: {error:?}");
+            true
+        }
+    }
+}
+
+fn fire_prebid_nurls_at_edge(
+    services: &RuntimeServices,
+    winning_bids: &HashMap<String, crate::auction::types::Bid>,
+    certificate_check: bool,
+) {
+    for bid in winning_bids.values() {
+        let Some(nurl) = bid.nurl.as_deref() else {
+            continue;
+        };
+
+        let backend_name = match BackendConfig::from_url(nurl, certificate_check) {
+            Ok(name) => name,
+            Err(error) => {
+                log::warn!(
+                    "Failed to build backend for Prebid nurl '{}' from bidder '{}': {error:?}",
+                    nurl,
+                    bid.bidder
+                );
+                continue;
+            }
+        };
+
+        let request = match request_builder()
+            .method("GET")
+            .uri(nurl)
+            .body(EdgeBody::empty())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                log::warn!(
+                    "Failed to build Prebid nurl request '{}' from bidder '{}': {error}",
+                    nurl,
+                    bid.bidder
+                );
+                continue;
+            }
+        };
+
+        if let Err(error) = futures::executor::block_on(
+            services
+                .http_client()
+                .send_async(PlatformHttpRequest::new(request, backend_name)),
+        ) {
+            log::warn!(
+                "Failed to dispatch Prebid nurl '{}' from bidder '{}': {error:?}",
+                nurl,
+                bid.bidder
+            );
+        }
     }
 }
 
@@ -589,6 +655,8 @@ pub struct ServerSideAuctionStream {
     request_id: String,
     pending_auction: PendingAuction,
     price_granularity: crate::price_bucket::PriceGranularity,
+    fire_nurl_at_edge: bool,
+    certificate_check: bool,
     completed: bool,
 }
 
@@ -599,11 +667,15 @@ impl ServerSideAuctionStream {
         request_id: String,
         pending_auction: PendingAuction,
         price_granularity: crate::price_bucket::PriceGranularity,
+        fire_nurl_at_edge: bool,
+        certificate_check: bool,
     ) -> Self {
         Self {
             request_id,
             pending_auction,
             price_granularity,
+            fire_nurl_at_edge,
+            certificate_check,
             completed: false,
         }
     }
@@ -615,7 +687,9 @@ impl ServerSideAuctionStream {
 
         match futures::executor::block_on(self.pending_auction.poll_once(services)) {
             Ok(PendingAuctionPoll::Pending) => {}
-            Ok(PendingAuctionPoll::Complete(result)) => self.write_result(bid_cache, &result),
+            Ok(PendingAuctionPoll::Complete(result)) => {
+                self.write_result(services, bid_cache, &result);
+            }
             Err(error) => {
                 log::warn!("Server-side ad auction poll failed: {error:?}");
                 self.write_empty(bid_cache);
@@ -623,13 +697,17 @@ impl ServerSideAuctionStream {
         }
     }
 
-    fn complete_with_collected_bids(&mut self, bid_cache: &dyn BidCache) {
+    fn complete_with_collected_bids(
+        &mut self,
+        services: &RuntimeServices,
+        bid_cache: &dyn BidCache,
+    ) {
         if self.completed {
             return;
         }
 
         let result = self.pending_auction.finish_due_to_deadline();
-        self.write_result(bid_cache, &result);
+        self.write_result(services, bid_cache, &result);
     }
 
     fn drain_after_stream(&mut self, services: &RuntimeServices, bid_cache: &dyn BidCache) {
@@ -638,7 +716,9 @@ impl ServerSideAuctionStream {
                 Ok(PendingAuctionPoll::Pending) => {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                Ok(PendingAuctionPoll::Complete(result)) => self.write_result(bid_cache, &result),
+                Ok(PendingAuctionPoll::Complete(result)) => {
+                    self.write_result(services, bid_cache, &result);
+                }
                 Err(error) => {
                     log::warn!("Server-side ad auction drain failed: {error:?}");
                     self.write_empty(bid_cache);
@@ -649,25 +729,32 @@ impl ServerSideAuctionStream {
 
     fn write_result(
         &mut self,
+        services: &RuntimeServices,
         bid_cache: &dyn BidCache,
         result: &crate::auction::orchestrator::OrchestrationResult,
     ) {
         let bids = build_bid_map(&result.winning_bids, self.price_granularity);
-        self.write_bids(bid_cache, bids);
+        let wrote_bids = self.write_bids(bid_cache, bids);
+        if wrote_bids && self.fire_nurl_at_edge {
+            fire_prebid_nurls_at_edge(services, &result.winning_bids, self.certificate_check);
+        }
     }
 
     fn write_empty(&mut self, bid_cache: &dyn BidCache) {
         self.write_bids(bid_cache, BidMap::new());
     }
 
-    fn write_bids(&mut self, bid_cache: &dyn BidCache, bids: BidMap) {
-        if let Err(error) = bid_cache.put(&self.request_id, bids) {
+    fn write_bids(&mut self, bid_cache: &dyn BidCache, bids: BidMap) -> bool {
+        let result = bid_cache.put(&self.request_id, bids);
+        let wrote_bids = result.is_ok();
+        if let Err(error) = result {
             log::warn!(
                 "Failed to write server-side ad bids for request '{}': {error:?}",
                 self.request_id
             );
         }
         self.completed = true;
+        wrote_bids
     }
 }
 
@@ -939,6 +1026,8 @@ pub fn handle_publisher_request(
                                         request_id,
                                         pending_auction,
                                         co_config.price_granularity,
+                                        prebid_fire_nurl_at_edge(settings),
+                                        settings.proxy.certificate_check,
                                     ));
                                 }
                                 Err(error) => {
@@ -1029,7 +1118,7 @@ pub fn handle_publisher_request(
                 status,
             );
             if let Some(mut auction) = server_side_auction {
-                auction.complete_with_collected_bids(bid_cache);
+                auction.complete_with_collected_bids(services, bid_cache);
             }
             let body = response.take_body();
             Ok(PublisherResponse::PassThrough { response, body })
@@ -1058,7 +1147,7 @@ pub fn handle_publisher_request(
                 );
             }
             if let Some(mut auction) = server_side_auction {
-                auction.complete_with_collected_bids(bid_cache);
+                auction.complete_with_collected_bids(services, bid_cache);
             }
             Ok(PublisherResponse::Buffered(response))
         }
@@ -1107,7 +1196,7 @@ pub fn handle_publisher_request(
             let mut output = Vec::new();
             process_response_streaming(body, &mut output, &params)?;
             if let Some(mut auction) = server_side_auction {
-                auction.complete_with_collected_bids(bid_cache);
+                auction.complete_with_collected_bids(services, bid_cache);
             }
 
             response.set_header(header::CONTENT_LENGTH, output.len().to_string());
@@ -1194,12 +1283,15 @@ mod creative_opportunities_tests {
         SlotProviders,
     };
     use crate::integrations::IntegrationRegistry;
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
     use crate::price_bucket::PriceGranularity;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn make_creative_slot(id: &str) -> CreativeOpportunitySlot {
         CreativeOpportunitySlot {
@@ -2316,6 +2408,8 @@ mod creative_opportunities_tests {
             "rid-stream".to_string(),
             pending_auction,
             PriceGranularity::Dense,
+            false,
+            settings.proxy.certificate_check,
         );
 
         let mut output = Vec::new();
@@ -2349,6 +2443,82 @@ mod creative_opportunities_tests {
             }
             other => panic!("should complete bid cache, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_publisher_body_with_ad_auction_fires_winning_nurl_when_enabled() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response(204, Vec::new());
+        let services = build_services_with_http_client(http_client.clone());
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
+        };
+        let cache = InMemoryBidCache::new(std::time::Duration::from_secs(1), 4);
+        cache
+            .mark_pending(
+                "rid-nurl",
+                AuctionDeadline::from_timeout(std::time::Duration::from_millis(100)),
+            )
+            .expect("should mark bid cache pending");
+        let auction_result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::success(
+                "prebid",
+                vec![make_bid("atf_sidebar", Some(1.239), Some("ad-123"))],
+                8,
+            )],
+            mediator_response: None,
+            winning_bids: HashMap::from([(
+                "atf_sidebar".to_string(),
+                make_bid("atf_sidebar", Some(1.239), Some("ad-123")),
+            )]),
+            total_time_ms: 8,
+            metadata: HashMap::new(),
+        };
+        let pending_auction =
+            PendingAuction::from_completed_result_for_test(make_auction_request(), auction_result);
+        let mut server_side_auction = ServerSideAuctionStream::new(
+            "rid-nurl".to_string(),
+            pending_auction,
+            PriceGranularity::Dense,
+            true,
+            settings.proxy.certificate_check,
+        );
+
+        let mut output = Vec::new();
+        let mut auction_context = ServerSideAuctionStreamContext {
+            services: &services,
+            bid_cache: &cache,
+            server_side_auction: &mut server_side_auction,
+        };
+        stream_publisher_body_with_ad_auction(
+            Body::from("<html><head></head><body>ok</body></html>"),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+            &mut auction_context,
+        )
+        .expect("should stream body and poll auction");
+
+        let expected_backend = BackendConfig::from_url(
+            "https://bidder.example/win",
+            settings.proxy.certificate_check,
+        )
+        .expect("should build nurl backend");
+        assert_eq!(
+            http_client.recorded_backend_names(),
+            vec![expected_backend],
+            "should fire the winning bid nurl through the platform HTTP client"
+        );
     }
 
     #[test]
