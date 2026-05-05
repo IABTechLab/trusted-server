@@ -446,16 +446,21 @@ pub fn handle_publisher_request(
             log::warn!("EC generation failed: {err:?}");
         }
     } else {
-        log::debug!(
-            "EC generation skipped: non-document request (path={})",
+        log::info!(
+            "EC generation decision: action=skipped_non_navigation, path={}, \
+             ec_present={}, ec_generated={}, consent_allowed={}",
             req.get_path(),
+            ec_context.ec_value().is_some(),
+            ec_context.ec_generated(),
+            ec_context.ec_allowed(),
         );
     }
 
     let ec_allowed = ec_context.ec_allowed();
-    log::debug!(
-        "Proxy EC ID: {:?}, ec_allowed: {ec_allowed}",
-        ec_context.ec_value(),
+    log::info!(
+        "Publisher EC state: ec_present={}, ec_generated={}, ec_allowed={ec_allowed}",
+        ec_context.ec_value().is_some(),
+        ec_context.ec_generated(),
     );
 
     let backend_name = BackendConfig::from_url(

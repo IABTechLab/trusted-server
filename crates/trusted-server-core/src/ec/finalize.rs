@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use fastly::Response;
 
-use super::consent::{ec_consent_granted, ec_consent_withdrawn};
+use super::consent::{ec_consent_decision, ec_consent_withdrawn};
 use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
@@ -47,7 +47,8 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response,
 ) {
-    let consent_allows_ec = ec_consent_granted(ec_context.consent());
+    let consent_decision = ec_consent_decision(ec_context.consent());
+    let consent_allows_ec = consent_decision.allowed;
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !consent_allows_ec {
@@ -56,6 +57,17 @@ pub fn ec_finalize_response(
         // revocation and fail-closed cases such as missing geo or undecodable
         // consent input.
         clear_ec_headers_on_response(response, Some(registry));
+        log::info!(
+            "EC finalize: action=clear_headers, consent_allowed=false, \
+             consent_reason={}, consent_withdrawn={}, cookie_present={}, \
+             ec_present={}, ec_generated={}, kv_available={}",
+            consent_decision.reason,
+            consent_withdrawn,
+            ec_context.cookie_was_present(),
+            ec_context.ec_value().is_some(),
+            ec_context.ec_generated(),
+            kv.is_some(),
+        );
 
         // Only expire the browser cookie and tombstone the identity-graph row
         // when the request carries an explicit withdrawal signal.
@@ -64,6 +76,13 @@ pub fn ec_finalize_response(
 
             // Compute once for the authoritative identity-graph tombstones.
             let ids_to_withdraw = withdrawal_ec_ids(ec_context);
+            log::info!(
+                "EC finalize: action=expire_cookie_and_tombstone, tombstone_count={}, \
+                 consent_reason={}, kv_available={}",
+                ids_to_withdraw.len(),
+                consent_decision.reason,
+                kv.is_some(),
+            );
 
             // The identity-graph tombstone is the authoritative withdrawal marker
             // for subsequent EC behavior.
@@ -72,6 +91,11 @@ pub fn ec_finalize_response(
                     if let Err(err) = graph.write_withdrawal_tombstone(ec_id) {
                         log::error!(
                             "Failed to write withdrawal tombstone for EC ID '{}': {err:?}",
+                            log_id(ec_id),
+                        );
+                    } else {
+                        log::info!(
+                            "EC finalize: action=tombstone_written, ec_id={}",
                             log_id(ec_id),
                         );
                     }
@@ -97,6 +121,14 @@ pub fn ec_finalize_response(
         // Returning users keep the active EC visible for this response, but
         // ordinary page views no longer refresh the browser cookie or KV TTL.
         set_ec_header_on_response(ec_context, response);
+        log::info!(
+            "EC finalize: action=set_returning_header, consent_allowed=true, \
+             consent_reason={}, cookie_present={}, ec_present=true, ec_generated=false, \
+             kv_available={}",
+            consent_decision.reason,
+            ec_context.cookie_was_present(),
+            kv.is_some(),
+        );
 
         return;
     }
@@ -106,7 +138,14 @@ pub fn ec_finalize_response(
     // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
         let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) else {
-            log::debug!("Skipping generated EC response write because KV graph is unavailable");
+            log::info!(
+                "EC finalize: action=skip_generated_no_kv, consent_allowed=true, \
+                 consent_reason={}, cookie_present={}, ec_present={}, ec_generated=true, \
+                 kv_available=false",
+                consent_decision.reason,
+                ec_context.cookie_was_present(),
+                ec_context.ec_value().is_some(),
+            );
             return;
         };
 
@@ -117,7 +156,25 @@ pub fn ec_finalize_response(
             ingest_sharedid_cookie(cookie, ec_id, graph, registry);
         }
         set_ec_cookie_and_header_on_response(settings, ec_context, response);
+        log::info!(
+            "EC finalize: action=set_generated_cookie_and_header, consent_allowed=true, \
+             consent_reason={}, cookie_present={}, ec_present=true, ec_generated=true, \
+             kv_available=true, ec_id={}",
+            consent_decision.reason,
+            ec_context.cookie_was_present(),
+            log_id(ec_id),
+        );
+        return;
     }
+
+    log::info!(
+        "EC finalize: action=no_ec_output, consent_allowed=true, consent_reason={}, \
+         cookie_present={}, ec_present={}, ec_generated=false, kv_available={}",
+        consent_decision.reason,
+        ec_context.cookie_was_present(),
+        ec_context.ec_value().is_some(),
+        kv.is_some(),
+    );
 }
 
 /// Sets the EC response header when an EC ID is available.
