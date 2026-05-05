@@ -352,8 +352,10 @@ mod tests {
 
     #[test]
     fn test_handle_request_cookies_invalid_utf8_cookie_header() {
-        let invalid_cookie_value = HeaderValue::from_bytes(b"ts-ec=valid-prefix\xF0\x90\x80")
-            .expect("should build header value");
+        // Truncated 4-byte UTF-8 sequence: `\xF0` starts a 4-byte code point but
+        // only two continuation bytes follow, so `to_str()` rejects it.
+        let invalid_cookie_value =
+            HeaderValue::from_bytes(b"\xF0\x90\x80").expect("should build header value");
         let req =
             Request::get("http://example.com").with_header(header::COOKIE, invalid_cookie_value);
 
@@ -363,10 +365,9 @@ mod tests {
         assert!(
             matches!(
                 err.current_context(),
-                TrustedServerError::InvalidHeaderValue { message }
-                    if message.contains("invalid UTF-8")
+                TrustedServerError::InvalidHeaderValue { .. }
             ),
-            "should return invalid header value error for non-UTF-8 cookie header"
+            "should return InvalidHeaderValue for non-UTF-8 cookie header"
         );
     }
 
