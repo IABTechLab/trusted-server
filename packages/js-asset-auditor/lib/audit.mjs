@@ -85,6 +85,21 @@ function requireFlagValue(argv, index, flag) {
   return value;
 }
 
+function normalizeFirstPartyHost(value) {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  try {
+    const parsed = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+    if (!parsed.hostname) {
+      exitWithUsage(`--first-party value is not a valid host: ${value}`);
+    }
+    return parsed.hostname;
+  } catch {
+    exitWithUsage(`--first-party value is not a valid host: ${value}`);
+  }
+}
+
 export function fail(message) {
   console.error(message);
   process.exit(1);
@@ -160,7 +175,10 @@ export function parseArgs(argv) {
       i += 1;
     } else if (arg === "--first-party") {
       const firstPartyValue = requireFlagValue(argv, i, "--first-party");
-      args.firstParty = firstPartyValue.split(",").filter(Boolean);
+      args.firstParty = firstPartyValue
+        .split(",")
+        .map(normalizeFirstPartyHost)
+        .filter(Boolean);
       i += 1;
     } else if (arg === "--no-filter") {
       args.noFilter = true;

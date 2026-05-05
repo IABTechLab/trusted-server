@@ -53,6 +53,33 @@ test("parseArgs rejects missing values instead of swallowing the next flag", () 
   assert.match(result.stderr, /Usage: audit-js-assets/);
 });
 
+test("parseArgs normalizes --first-party URL values to hostnames", () => {
+  const args = parseArgs([
+    "node",
+    "audit.mjs",
+    "example.com",
+    "--first-party",
+    "https://www.example.com/path, cdn.example.com ",
+  ]);
+
+  assert.deepEqual(args.firstParty, ["www.example.com", "cdn.example.com"]);
+});
+
+test("parseArgs rejects invalid --first-party values", () => {
+  const result = captureExit(() =>
+    parseArgs([
+      "node",
+      "audit.mjs",
+      "example.com",
+      "--first-party",
+      "not a host",
+    ]),
+  );
+
+  assert.equal(result.error.code, 1);
+  assert.match(result.stderr, /--first-party value is not a valid host/);
+});
+
 test("parseArgs keeps optional --config path semantics", () => {
   const args = parseArgs([
     "node",

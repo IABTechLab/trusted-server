@@ -319,6 +319,17 @@ export function processAssets(input, args) {
   const seenOrigins = new Set();
 
   for (const url of survivingUrls) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      continue;
+    }
+
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      continue;
+    }
+
     const { wildcarded, original, hasWildcard } = applyWildcards(url);
 
     if (seenOrigins.has(wildcarded)) continue;
@@ -336,12 +347,7 @@ export function processAssets(input, args) {
       path = `/js-assets/${prefix}/${stem}.js`;
     }
 
-    let hostname;
-    try {
-      hostname = new URL(url).hostname;
-    } catch {
-      hostname = "unknown";
-    }
+    const hostname = parsed.hostname;
 
     assets.push({
       slug,

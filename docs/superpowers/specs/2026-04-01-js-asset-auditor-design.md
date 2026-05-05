@@ -281,7 +281,7 @@ enabled = true
 container_id = "GTM-TRCJMD6"  # auto-detected
 
 [integrations.lockr]
-enabled = true
+enabled = false
 sdk_url = "https://aim.loc.kr/identity-lockr-trust-server.js"  # auto-detected
 # app_id = ""  # TODO: set your Lockr Identity app_id
 # api_endpoint = "https://identity.loc.kr"

@@ -167,7 +167,7 @@ const INTEGRATION_PATTERNS = [
     label: "Amazon Publisher Services",
     match: (url) =>
       url.hostname === "c.amazon-adsystem.com" &&
-      url.pathname.includes("/apstag"),
+      url.pathname.startsWith("/aax2/apstag"),
     extract: () => ({}),
     defaults: {
       endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid",

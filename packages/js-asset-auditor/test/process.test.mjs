@@ -6,6 +6,37 @@ import { join } from "node:path";
 
 import { parseExistingToml, processAssets } from "../lib/process.mjs";
 
+test("processAssets skips non-http script URLs", () => {
+  const result = processAssets(
+    {
+      networkUrls: [
+        "data:text/javascript,console.log(1)",
+        "blob:https://example.com/abc-123",
+        "https://cdn.vendor.test/loader.js",
+      ],
+      headUrls: [
+        "data:text/javascript,console.log(1)",
+        "blob:https://example.com/abc-123",
+        "https://cdn.vendor.test/loader.js",
+      ],
+    },
+    {
+      domain: "publisher.com",
+      target: "https://www.publisher.com",
+      output: "js-assets.toml",
+      diff: false,
+      firstParty: [],
+      noFilter: true,
+    },
+  );
+
+  assert.equal(result.summary.surfaced, 1);
+  assert.match(result.toml, /origin_url = "https:\/\/cdn\.vendor\.test\/loader\.js"/);
+  assert.doesNotMatch(result.toml, /origin_url = "null/);
+  assert.doesNotMatch(result.toml, /blob:/);
+  assert.doesNotMatch(result.toml, /https:\/\/example\.comhttps:\/\/example\.com/);
+});
+
 test("parseExistingToml includes commented diff suggestions", () => {
   const content = `[[js_assets]]
 slug = "live:asset"

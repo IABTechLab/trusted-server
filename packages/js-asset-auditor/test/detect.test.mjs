@@ -16,6 +16,16 @@ test("detectIntegrations matches GTM script path exactly", () => {
   });
 });
 
+test("detectIntegrations matches APS documented path prefix", () => {
+  const detection = detectIntegrations([
+    "https://c.amazon-adsystem.com/aax2/apstag.js",
+    "https://c.amazon-adsystem.com/foo/apstag/bar.js",
+  ]);
+
+  assert.equal(detection.integrations.length, 1);
+  assert.equal(detection.integrations[0].id, "aps");
+});
+
 test("detectIntegrations picks up prebid wrapper/load script names", () => {
   const detection = detectIntegrations([
     "https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-load.js",
