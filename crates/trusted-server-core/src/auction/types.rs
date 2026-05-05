@@ -60,6 +60,14 @@ pub enum MediaType {
     Native,
 }
 
+impl MediaType {
+    /// Returns the Banner media type.
+    #[must_use]
+    pub fn banner() -> Self {
+        Self::Banner
+    }
+}
+
 /// Publisher information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublisherInfo {
@@ -152,6 +160,8 @@ pub struct Bid {
     pub nurl: Option<String>,
     /// Billing notification URL
     pub burl: Option<String>,
+    /// Ad ID from the bidder
+    pub ad_id: Option<String>,
     /// Provider-specific bid metadata
     /// For APS bids, contains encoded price in "amznbid" field
     pub metadata: HashMap<String, serde_json::Value>,
@@ -276,6 +286,7 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            ad_id: None,
             metadata: HashMap::new(),
         }
     }
@@ -386,5 +397,29 @@ mod tests {
             json.get("metadata").is_none(),
             "should omit metadata field when empty"
         );
+    }
+
+    #[test]
+    fn media_type_banner_fn_returns_banner() {
+        assert_eq!(MediaType::banner(), MediaType::Banner);
+    }
+
+    #[test]
+    fn bid_has_ad_id_field() {
+        let bid = Bid {
+            slot_id: "s".to_string(),
+            price: Some(1.0),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: "kargo".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: Some("prebid-ad-id-abc".to_string()),
+            metadata: Default::default(),
+        };
+        assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));
     }
 }

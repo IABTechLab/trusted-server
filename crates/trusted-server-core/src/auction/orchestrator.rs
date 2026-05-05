@@ -722,6 +722,7 @@ mod tests {
                 height: 250,
                 nurl: None,
                 burl: None,
+                ad_id: None,
                 metadata: HashMap::new(),
             },
         );
@@ -738,6 +739,7 @@ mod tests {
                 height: 250,
                 nurl: None,
                 burl: None,
+                ad_id: None,
                 metadata: HashMap::new(),
             },
         );
@@ -872,6 +874,7 @@ mod tests {
                 height: 250,
                 nurl: None,
                 burl: None,
+                ad_id: None,
                 metadata: {
                     let mut m = HashMap::new();
                     m.insert(
