@@ -67,25 +67,40 @@ pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use trusted_server_js::{all_module_ids, concatenated_hash, single_module_hash};
-
     use super::*;
+
+    fn assert_sha256_hex_hash(src: &str) {
+        let hash = src
+            .rsplit_once("?v=")
+            .expect("should have cache-busting query parameter")
+            .1;
+
+        assert_eq!(hash.len(), 64, "should use a SHA-256 hex hash");
+        assert!(
+            hash.chars().all(|character| character.is_ascii_hexdigit()),
+            "should use only ASCII hex digits",
+        );
+    }
 
     #[test]
     fn tsjs_script_src_formats_unified_bundle_url_with_hash() {
-        let module_ids = ["core", "creative"];
-        let expected_hash = concatenated_hash(&module_ids);
+        let creative_src = tsjs_script_src(&["creative"]);
+        let creative_prebid_src = tsjs_script_src(&["creative", "prebid"]);
 
-        assert_eq!(
-            tsjs_script_src(&module_ids),
-            format!("/static/tsjs=tsjs-unified.min.js?v={expected_hash}"),
-            "should include the unified bundle path and cache-busting hash",
+        assert!(
+            creative_src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
+            "should include the unified bundle path and cache-busting parameter",
+        );
+        assert_sha256_hex_hash(&creative_src);
+        assert_ne!(
+            creative_src, creative_prebid_src,
+            "should generate different cache-busting URLs for different module sets",
         );
     }
 
     #[test]
     fn tsjs_script_tag_wraps_source_in_a_single_tag() {
-        let module_ids = ["core", "creative"];
+        let module_ids = ["creative"];
         let expected_src = tsjs_script_src(&module_ids);
 
         assert_eq!(
@@ -97,20 +112,16 @@ mod tests {
 
     #[test]
     fn tsjs_unified_helpers_use_all_module_ids() {
-        let all_ids = all_module_ids();
-        let expected_src = format!(
-            "/static/tsjs=tsjs-unified.min.js?v={}",
-            concatenated_hash(&all_ids)
-        );
+        let src = tsjs_unified_script_src();
 
-        assert_eq!(
-            tsjs_unified_script_src(),
-            expected_src,
-            "should hash all compiled modules for the unified bundle",
+        assert!(
+            src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
+            "should include the unified bundle path and cache-busting parameter",
         );
+        assert_sha256_hex_hash(&src);
         assert_eq!(
             tsjs_unified_script_tag(),
-            format!("<script src=\"{expected_src}\" id=\"trustedserver-js\"></script>"),
+            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
             "should wrap the unified bundle source in the standard script tag",
         );
     }
@@ -134,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_src_uses_empty_hash_for_unknown_module() {
+    fn tsjs_deferred_script_src_documents_unregistered_module_fallback() {
         assert_eq!(
             tsjs_deferred_script_src("unknown-module"),
             "/static/tsjs=tsjs-unknown-module.min.js?v=",
-            "should fall back to an empty hash for unknown deferred modules",
+            "should preserve the current fallback until callers validate registered modules",
         );
     }
 

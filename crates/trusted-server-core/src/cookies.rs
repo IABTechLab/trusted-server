@@ -355,7 +355,7 @@ mod tests {
         req.set_header(
             header::COOKIE,
             HeaderValue::from_bytes(b"session=\xFF")
-                .expect("should allow non-UTF-8 cookie header bytes"),
+                .expect("should construct HeaderValue from non-UTF-8 bytes"),
         );
 
         let error = handle_request_cookies(&req).expect_err("should reject invalid UTF-8");
