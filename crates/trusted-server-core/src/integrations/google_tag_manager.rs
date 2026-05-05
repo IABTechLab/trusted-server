@@ -1416,7 +1416,7 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
-passphrase = "test-secret-key"
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1449,7 +1449,7 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
-passphrase = "test-secret-key"
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"

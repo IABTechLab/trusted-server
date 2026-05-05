@@ -375,7 +375,12 @@ pub struct Ec {
 
 impl Ec {
     /// Known placeholder values that must not be used in production.
-    pub const PASSPHRASE_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+    pub const PASSPHRASE_PLACEHOLDERS: &[&str] = &[
+        "secret-key",
+        "secret_key",
+        "trusted-server",
+        "trusted-server-placeholder-secret",
+    ];
 
     /// Default maximum concurrent pull-sync requests.
     #[must_use]
@@ -404,12 +409,12 @@ impl Ec {
             .any(|p| p.eq_ignore_ascii_case(passphrase))
     }
 
-    /// Minimum passphrase length for HMAC key strength.
+    /// Minimum passphrase length for HMAC-SHA256 key strength.
     ///
-    /// This lower bound is only meant to reject obviously bad values; operators
-    /// are still expected to use a high-entropy random passphrase per the EC
-    /// setup and key-rotation documentation.
-    const MIN_PASSPHRASE_LENGTH: usize = 8;
+    /// The EC passphrase is long-lived keying material for visitor ID
+    /// derivation. Operators should use a high-entropy random passphrase per
+    /// the EC setup and key-rotation documentation.
+    const MIN_PASSPHRASE_LENGTH: usize = 32;
 
     /// Validates that the passphrase is not empty and meets minimum length.
     ///
@@ -1074,7 +1079,10 @@ mod tests {
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
-        assert_eq!(settings.ec.passphrase.expose(), "test-secret-key");
+        assert_eq!(
+            settings.ec.passphrase.expose(),
+            "test-secret-key-32-bytes-minimum"
+        );
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -1203,9 +1211,29 @@ mod tests {
     #[test]
     fn is_placeholder_passphrase_accepts_non_placeholder() {
         assert!(
-            !Ec::is_placeholder_passphrase("test-secret-key"),
+            !Ec::is_placeholder_passphrase("test-secret-key-32-bytes-minimum"),
             "should accept non-placeholder passphrase"
         );
+    }
+
+    #[test]
+    fn validate_passphrase_rejects_under_32_characters() {
+        let passphrase = Redacted::new("a".repeat(31));
+
+        let err = Ec::validate_passphrase(&passphrase).expect_err("should reject short passphrase");
+
+        assert_eq!(
+            err.code.as_ref(),
+            "short_passphrase",
+            "should report short passphrase validation error"
+        );
+    }
+
+    #[test]
+    fn validate_passphrase_accepts_32_characters() {
+        let passphrase = Redacted::new("a".repeat(32));
+
+        Ec::validate_passphrase(&passphrase).expect("should accept 32-character passphrase");
     }
 
     #[test]
@@ -2292,7 +2320,7 @@ mod tests {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
-            passphrase = "test-secret-key"
+            passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
             config_store_id = "test-config-store-id"

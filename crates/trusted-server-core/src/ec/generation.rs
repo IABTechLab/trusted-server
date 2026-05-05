@@ -161,7 +161,9 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// The format is `{64hex}.{6alnum}` where the first part is a 64-character
 /// **lowercase** hex string and the second part is a 6-character alphanumeric
 /// string. Only lowercase hex is accepted; callers must normalize before
-/// validation to prevent duplicate KV keys from case-variant EC IDs.
+/// validation to prevent duplicate KV keys from case-variant EC IDs. The HMAC
+/// prefix is lowercase because it comes from `hex::encode`; the random suffix
+/// allows mixed-case alphanumeric characters by construction.
 #[must_use]
 pub fn is_valid_ec_id(value: &str) -> bool {
     let mut parts = value.split('.');

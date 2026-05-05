@@ -112,7 +112,7 @@ Configure in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "your-hmac-secret"
+passphrase = "replace-with-32-plus-byte-random-secret"}]}},{
 ec_store = "ec_identity_store"
 ```
 
