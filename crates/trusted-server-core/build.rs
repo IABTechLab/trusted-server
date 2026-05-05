@@ -57,6 +57,7 @@ use std::path::Path;
 
 const TRUSTED_SERVER_INIT_CONFIG_PATH: &str = "../../trusted-server.toml";
 const TRUSTED_SERVER_OUTPUT_CONFIG_PATH: &str = "../../target/trusted-server-out.toml";
+const CREATIVE_OPPORTUNITIES_PATH: &str = "../../creative-opportunities.toml";
 
 fn main() {
     // Always rerun build.rs: integration settings are stored in a flat
@@ -84,5 +85,35 @@ fn main() {
     if current != merged_toml {
         fs::write(dest_path, merged_toml)
             .unwrap_or_else(|_| panic!("Failed to write {dest_path:?}"));
+    }
+
+    // Validate creative-opportunities.toml slot IDs at build time
+    println!("cargo:rerun-if-changed={}", CREATIVE_OPPORTUNITIES_PATH);
+
+    let co_path = Path::new(CREATIVE_OPPORTUNITIES_PATH);
+    if co_path.exists() {
+        let co_content = fs::read_to_string(co_path)
+            .expect("should read creative-opportunities.toml");
+        let co_value: toml::Value = toml::from_str(&co_content)
+            .expect("creative-opportunities.toml: invalid TOML");
+        let slot_id_re = regex::Regex::new(r"^[A-Za-z0-9_\-]+$").expect("should compile regex");
+        if let Some(slots) = co_value.get("slot").and_then(|v| v.as_array()) {
+            for slot in slots {
+                let id = slot.get("id")
+                    .and_then(|v| v.as_str())
+                    .expect("creative-opportunities.toml: slot missing 'id' field");
+                if !slot_id_re.is_match(id) {
+                    panic!(
+                        "creative-opportunities.toml: slot id '{}' is invalid; \
+                         only [A-Za-z0-9_-] allowed",
+                        id
+                    );
+                }
+            }
+            println!(
+                "cargo:warning=creative-opportunities.toml: {} slot(s) validated",
+                slots.len()
+            );
+        }
     }
 }
