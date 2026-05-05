@@ -204,6 +204,14 @@ async function buildModule(name, entryPath) {
           __dirname,
           'node_modules/prebid.js/dist/src/src/adapterManager.js'
         ),
+        // The published liveIntentIdSystem module contains a build-time
+        // require() switch that is not replaced by our Vite build. Import the
+        // standard implementation directly so browser bundles do not contain
+        // CommonJS require calls.
+        'prebid.js/modules/liveIntentIdSystem.js': path.resolve(
+          __dirname,
+          'node_modules/prebid.js/dist/src/libraries/liveIntentId/idSystem.js'
+        ),
       },
     },
     build: {
