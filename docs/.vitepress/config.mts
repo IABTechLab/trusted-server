@@ -105,6 +105,7 @@ export default withMermaid(
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'CLI', link: '/guide/cli' },
+            { text: 'Fastly Provisioning', link: '/guide/fastly-provisioning' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },
           ],

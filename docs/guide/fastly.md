@@ -87,10 +87,11 @@ FASTLY_RUNTIME_API_KEY=your-runtime-token \
 
 The CLI provisions the runtime config store, request-signing stores, and required bindings from local configuration. When request signing is enabled, `apply` will bootstrap the initial signing keypair if the signing stores are empty, and it requires an explicit runtime Fastly API token for the `api-keys/api_key` secret. Use `FASTLY_RUNTIME_API_KEY`, `--runtime-api-key`, or `--reuse-management-api-key` for that runtime credential. After provisioning, update `request_signing.config_store_id` and `request_signing.secret_store_id` in `trusted-server.toml` to match the store IDs reported by provisioning.
 
-See [Trusted Server CLI](/guide/cli#ts-provision-fastly-plan) for the full provisioning command reference.
+See [Trusted Server CLI](/guide/cli#ts-provision-fastly-plan) for the full provisioning command reference. See [Fastly Provisioning Map](/guide/fastly-provisioning) for how `trusted-server.toml` changes map to Fastly resources, items, and bindings.
 
 ## Next Steps
 
 - Return to [Getting Started](/guide/getting-started) to continue setup
 - See [Configuration](/guide/configuration) for detailed configuration options
 - See [Request Signing](/guide/request-signing) for setting up cryptographic signing
+- See [Fastly Provisioning Map](/guide/fastly-provisioning) for config-to-resource behavior

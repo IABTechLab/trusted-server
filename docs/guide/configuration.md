@@ -1090,6 +1090,7 @@ cat trusted-server.toml | npx toml-cli validate
 ## Next Steps
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
+- Review [Fastly Provisioning Map](/guide/fastly-provisioning) for config changes that create Fastly resources
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
 - Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
 - Review [Integrations](/guide/integrations-overview) for partner support

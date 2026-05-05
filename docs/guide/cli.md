@@ -396,7 +396,7 @@ JSON output uses this high-level shape:
 
 ## Fastly provisioning resources
 
-Fastly provisioning is config-driven. The CLI reads the validated local config and plans the resources that runtime code expects.
+Fastly provisioning is config-driven. The CLI reads the validated local config and plans the resources that runtime code expects. See [Fastly Provisioning Map](/guide/fastly-provisioning) for how config changes map to Fastly actions.
 
 | Resource                    | Type         | When used                                                                                            |
 | --------------------------- | ------------ | ---------------------------------------------------------------------------------------------------- |
@@ -516,5 +516,6 @@ Install Chrome or Chromium on the host machine. The audit collector checks commo
 - [Getting Started](/guide/getting-started)
 - [Configuration](/guide/configuration)
 - [Fastly Setup](/guide/fastly)
+- [Fastly Provisioning Map](/guide/fastly-provisioning)
 - [Request Signing](/guide/request-signing)
 - [Testing](/guide/testing)
