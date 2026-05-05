@@ -438,13 +438,42 @@ impl IntegrationHeadInjector for GptIntegration {
     }
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        // Set the enable flag and best-effort call the activation function
-        // registered by the GPT shim module. The bundle also auto-installs
-        // when it sees the pre-set flag, so this works regardless of whether
-        // the inline bootstrap runs before or after the TSJS bundle.
         vec![
-            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
+            "<script>window.__tsjs_gpt_enabled=true;\
+             window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                 .to_string(),
+            concat!(
+                "<script>",
+                "window.__tsAdInit=function(){",
+                  "var slots=window.__ts_ad_slots||[];",
+                  "var bids=window.__ts_bids||{};",
+                  "googletag.cmd.push(function(){",
+                    "var gptSlots=slots.map(function(slot){",
+                      "var s=googletag.defineSlot(slot.gam_unit_path,slot.formats,slot.div_id);",
+                      "if(!s)return null;",
+                      "s.addService(googletag.pubads());",
+                      "Object.entries(slot.targeting||{}).forEach(function(e){s.setTargeting(e[0],e[1]);});",
+                      "var b=bids[slot.id]||{};",
+                      "[\"hb_pb\",\"hb_bidder\",\"hb_adid\"].forEach(function(k){if(b[k])s.setTargeting(k,b[k]);});",
+                      "s.setTargeting(\"ts_initial\",\"1\");",
+                      "return{id:slot.id,gptSlot:s};",
+                    "}).filter(Boolean);",
+                    "googletag.pubads().enableSingleRequest();",
+                    "googletag.enableServices();",
+                    "googletag.pubads().addEventListener(\"slotRenderEnded\",function(ev){",
+                      "var id=ev.slot.getSlotElementId();",
+                      "var b=bids[id]||{};",
+                      "var ourBidWon=!ev.isEmpty&&b.hb_adid&&ev.slot.getTargeting(\"hb_adid\")[0]===b.hb_adid;",
+                      "if(ourBidWon){",
+                        "if(b.nurl)navigator.sendBeacon(b.nurl);",
+                        "if(b.burl)navigator.sendBeacon(b.burl);",
+                      "}",
+                    "});",
+                    "googletag.pubads().refresh();",
+                  "});",
+                "};",
+                "</script>"
+            ).to_string(),
         ]
     }
 }
@@ -1020,11 +1049,59 @@ mod tests {
 
         let inserts = integration.head_inserts(&ctx);
 
-        assert_eq!(inserts.len(), 1, "should emit exactly one head insert");
+        assert_eq!(inserts.len(), 2, "should emit exactly two head inserts");
         assert_eq!(
             inserts[0],
             "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>",
             "should set the enable flag and call the GPT shim activation function"
+        );
+    }
+
+    #[test]
+    fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+        let combined = inserts.join("");
+        assert!(combined.contains("__tsAdInit"), "should define __tsAdInit");
+        assert!(
+            combined.contains("window.__ts_bids"),
+            "should read window.__ts_bids synchronously"
+        );
+        assert!(
+            combined.contains("ts_initial"),
+            "should set ts_initial sentinel"
+        );
+        assert!(
+            combined.contains("slotRenderEnded"),
+            "should register slotRenderEnded"
+        );
+        assert!(
+            combined.contains("sendBeacon"),
+            "should fire nurl and burl via sendBeacon"
+        );
+        assert!(
+            combined.contains("nurl"),
+            "should fire nurl on confirmed render"
+        );
+        assert!(
+            !combined.contains("/ts-bids"),
+            "must NOT fetch /ts-bids — bids are inline on the page"
+        );
+        assert!(
+            !combined.contains("bidsPromise"),
+            "must NOT use bidsPromise — bids are synchronous"
+        );
+        assert!(
+            !combined.contains("__ts_request_id"),
+            "must NOT reference request_id — no longer used"
         );
     }
 
