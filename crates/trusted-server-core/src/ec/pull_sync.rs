@@ -261,6 +261,10 @@ fn pull_rate_limit_key(partner_id: &str, ec_id: &str) -> String {
 fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFlightPull>) {
     for pending in in_flight.drain(..) {
         let partner_id = pending.partner_id;
+        // The Fastly SDK version used by this crate exposes only blocking
+        // `PendingRequest::wait()` for a single pending request. Pull sync runs
+        // after `send_to_client()` and relies on the platform compute cap for
+        // the hard upper bound until a per-request timeout API is available.
         let response = match pending.pending.wait() {
             Ok(response) => response,
             Err(err) => {

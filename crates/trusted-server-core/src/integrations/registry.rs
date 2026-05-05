@@ -656,6 +656,7 @@ impl IntegrationRegistry {
     ///
     /// This method sets request-side `x-ts-ec` for integration backends.
     /// Response-side cookie/header mutation is centralized in EC finalize.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub async fn handle_proxy(
         &self,

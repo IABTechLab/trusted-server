@@ -201,18 +201,40 @@ fn classify_origin(req: &Request, settings: &Settings) -> CorsDecision {
         return CorsDecision::Denied;
     };
 
-    let host = host.to_ascii_lowercase();
     let publisher_host = settings
         .publisher
         .domain
         .trim_end_matches('.')
         .to_ascii_lowercase();
 
+    if origin_authority_contains_uppercase_host(origin) {
+        return CorsDecision::Denied;
+    }
+
+    let host = host.to_ascii_lowercase();
     if host == publisher_host || host.ends_with(&format!(".{publisher_host}")) {
         return CorsDecision::Allowed(origin.to_owned());
     }
 
     CorsDecision::Denied
+}
+
+fn origin_authority_contains_uppercase_host(origin: &str) -> bool {
+    let Some(after_scheme) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let host = host_port
+        .split_once(':')
+        .map_or(host_port, |(host, _)| host);
+
+    host.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
 fn apply_cors_headers_if_allowed(mut response: Response, allowed_origin: Option<&str>) -> Response {
@@ -294,6 +316,19 @@ mod tests {
         assert!(
             matches!(decision, CorsDecision::Denied),
             "should deny mismatched origin"
+        );
+    }
+
+    #[test]
+    fn classify_origin_rejects_mixed_case_publisher_host() {
+        let settings = create_test_settings();
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("origin", "https://Foo.test-publisher.com");
+
+        let decision = classify_origin(&req, &settings);
+        assert!(
+            matches!(decision, CorsDecision::Denied),
+            "should deny mixed-case origin hosts instead of reflecting a value browsers reject"
         );
     }
 

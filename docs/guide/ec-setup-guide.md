@@ -23,7 +23,7 @@ Set EC configuration in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "your-secure-hmac-secret"
+passphrase = "replace-with-32-plus-byte-random-secret"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
@@ -36,6 +36,7 @@ bidstream_enabled = true
 
 Required behavior assumptions:
 
+- `passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store

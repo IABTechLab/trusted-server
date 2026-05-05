@@ -34,9 +34,9 @@ const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Outcome of an [`KvIdentityGraph::upsert_partner_id_if_exists`] call.
 ///
-/// Unlike [`KvIdentityGraph::upsert_partner_id`] (which auto-creates entries),
-/// this enum encodes the per-mapping rejection reasons needed by the S2S
-/// batch sync endpoint.
+/// Like [`KvIdentityGraph::upsert_partner_id`], this method fails closed when
+/// the root entry is missing. This enum encodes the per-mapping rejection
+/// reasons needed by the S2S batch sync endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertResult {
     /// The partner ID was successfully written.
@@ -391,27 +391,16 @@ impl KvIdentityGraph {
             let (mut entry, generation) = match self.get(ec_id)? {
                 Some(pair) => pair,
                 None => {
-                    // Root entry missing — create a minimal entry.
                     log::info!(
-                        "upsert_partner_id: no entry for '{}', creating minimal entry",
+                        "upsert_partner_id: no entry for '{}', rejecting partner upsert",
                         log_id(ec_id)
                     );
-                    let minimal = KvEntry::minimal(partner_id, uid, current_timestamp());
-                    let (min_body, min_meta) = Self::serialize_entry(&minimal, &self.store_name)?;
-                    if Self::try_insert_add(&store, ec_id, &min_body, &min_meta, &self.store_name)?
-                    {
-                        return Ok(());
-                    }
-                    // Key appeared between get() and create — re-read on next iteration.
-                    log::debug!(
-                        "upsert_partner_id: minimal create raced for '{}', retrying (attempt {}/{})",
-                        log_id(ec_id),
-                        attempt + 1,
-                        MAX_CAS_RETRIES,
-                    );
-                    // Retry immediately; the bounded retry count prevents an
-                    // unbounded loop without blocking the request worker.
-                    continue;
+                    return Err(Report::new(TrustedServerError::KvStore {
+                        store_name: self.store_name.clone(),
+                        message: format!(
+                            "Cannot upsert partner '{partner_id}' for missing key '{ec_id}'"
+                        ),
+                    }));
                 }
             };
 

@@ -24,7 +24,7 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
 [ec]
-passphrase = "your-hmac-secret"
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 ### Environment Variable Overrides
@@ -37,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EC__PASSPHRASE=your-passphrase
+export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ### Generate Secure Secrets
@@ -76,7 +76,7 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
 [ec]
-passphrase = "your-hmac-secret-key"
+passphrase = "replace-with-32-plus-byte-random-secret"
 
 [request_signing]
 enabled = true
@@ -283,7 +283,7 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 
 ```toml
 [ec]
-passphrase = "your-secure-hmac-secret"
+passphrase = "replace-with-32-plus-byte-random-secret"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]

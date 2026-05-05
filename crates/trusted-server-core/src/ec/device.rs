@@ -99,11 +99,11 @@ impl DeviceSignals {
 }
 
 /// Device is a desktop (confirmed via UA platform token).
-pub const MOBILE_DESKTOP: u8 = 0;
+const MOBILE_DESKTOP: u8 = 0;
 /// Device is a mobile (confirmed via UA mobile token).
-pub const MOBILE_MOBILE: u8 = 1;
+const MOBILE_MOBILE: u8 = 1;
 /// Device type is genuinely unknown (typically bots or hardened clients).
-pub const MOBILE_UNKNOWN: u8 = 2;
+const MOBILE_UNKNOWN: u8 = 2;
 
 /// Derives mobile signal from the User-Agent string.
 ///
@@ -111,7 +111,7 @@ pub const MOBILE_UNKNOWN: u8 = 2;
 /// [`MOBILE_MOBILE`] for confirmed mobile,
 /// [`MOBILE_UNKNOWN`] for genuinely unknown (typically bots or hardened clients).
 #[must_use]
-pub fn parse_is_mobile(ua: &str) -> u8 {
+fn parse_is_mobile(ua: &str) -> u8 {
     // Mobile patterns checked first — more specific.
     if ua.contains("iPhone") || ua.contains("iPad") || ua.contains("Android") {
         return MOBILE_MOBILE;
@@ -126,7 +126,7 @@ pub fn parse_is_mobile(ua: &str) -> u8 {
 ///
 /// Returns `None` when no recognized platform pattern is found.
 #[must_use]
-pub fn parse_platform_class(ua: &str) -> Option<String> {
+fn parse_platform_class(ua: &str) -> Option<String> {
     // Order matters: check mobile-specific patterns before generic ones.
     if ua.contains("iPhone") || ua.contains("iPad") {
         return Some("ios".to_owned());
@@ -155,7 +155,7 @@ pub fn parse_platform_class(ua: &str) -> Option<String> {
 /// Returns `None` if the input is empty or has no underscore-delimited
 /// section.
 #[must_use]
-pub fn extract_ja4_section1(full_ja4: &str) -> Option<String> {
+fn extract_ja4_section1(full_ja4: &str) -> Option<String> {
     let section1 = full_ja4.split('_').next()?;
     if section1.is_empty() {
         return None;
@@ -168,7 +168,7 @@ pub fn extract_ja4_section1(full_ja4: &str) -> Option<String> {
 ///
 /// The raw string looks like `"1:65536;2:0;4:6291456;6:262144"`.
 #[must_use]
-pub fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
+fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_h2_fp.as_bytes());
     let digest = hasher.finalize();
@@ -213,7 +213,7 @@ fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
 /// Both signals must be present for a match — if either is `None`,
 /// returns `None`.
 #[must_use]
-pub fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> Option<bool> {
+fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> Option<bool> {
     let ja4 = ja4_class?;
     let h2_hash = h2_fp_hash?;
 

@@ -1798,7 +1798,7 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
-passphrase = "test-secret-key"
+passphrase = "test-secret-key-32-bytes-minimum"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section

@@ -71,6 +71,7 @@ struct SyncMapping {
     partner_uid: String,
     // Retained for API compatibility. The EC KV body no longer stores
     // per-partner timestamps, so this does not order writes.
+    #[allow(dead_code)]
     timestamp: u64,
 }
 
@@ -127,6 +128,13 @@ fn handle_batch_sync_with_writer(
 
     // 3. Parse body (with size limit to prevent OOM before validation)
     const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+    if content_length_exceeds_limit(req, MAX_BODY_SIZE) {
+        return Ok(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+        ));
+    }
+
     let body_bytes = req.take_body_bytes();
     if body_bytes.len() > MAX_BODY_SIZE {
         return Ok(error_response(
@@ -163,6 +171,12 @@ fn handle_batch_sync_with_writer(
     json_response(status, &response_body)
 }
 
+fn content_length_exceeds_limit(req: &Request, max_body_size: usize) -> bool {
+    req.get_header_str("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|content_length| content_length > max_body_size)
+}
+
 fn process_mappings(
     writer: &dyn BatchSyncWriter,
     partner_id: &str,
@@ -188,7 +202,6 @@ fn process_mappings(
             });
             continue;
         }
-        let _timestamp = mapping.timestamp;
         match writer.upsert_partner_id_if_exists(&ec_id, partner_id, &mapping.partner_uid) {
             Ok(UpsertResult::Written | UpsertResult::Unchanged) => {
                 accepted += 1;
@@ -249,6 +262,8 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::error::TrustedServerError;
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -313,6 +328,104 @@ mod tests {
             partner_uid: partner_uid.to_owned(),
             timestamp,
         }
+    }
+
+    fn make_test_partner(id: &str, api_token: &str) -> EcPartner {
+        EcPartner {
+            id: id.to_owned(),
+            name: format!("Partner {id}"),
+            source_domain: format!("{id}.example.com"),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Redacted::new(api_token.to_owned()),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }
+    }
+
+    fn authorized_batch_request(body: &str) -> Request {
+        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
+        req.set_header("authorization", "Bearer test-token");
+        req.set_body(body.to_owned());
+        req
+    }
+
+    fn test_registry() -> PartnerRegistry {
+        let partners = vec![make_test_partner("ssp_x", "test-token")];
+        PartnerRegistry::from_config(&partners).expect("should build registry")
+    }
+
+    #[test]
+    fn content_length_exceeds_limit_detects_oversized_header() {
+        let mut req = authorized_batch_request("{}");
+        req.set_header("content-length", "2097153");
+
+        assert!(
+            content_length_exceeds_limit(&req, 2 * 1024 * 1024),
+            "should reject oversized content-length before reading body"
+        );
+    }
+
+    #[test]
+    fn content_length_exceeds_limit_ignores_missing_or_malformed_header() {
+        let missing = authorized_batch_request("{}");
+        let mut malformed = authorized_batch_request("{}");
+        malformed.set_header("content-length", "not-a-number");
+
+        assert!(
+            !content_length_exceeds_limit(&missing, 2 * 1024 * 1024),
+            "missing content-length should fall back to post-read size check"
+        );
+        assert!(
+            !content_length_exceeds_limit(&malformed, 2 * 1024 * 1024),
+            "malformed content-length should fall back to post-read size check"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_rejects_oversized_content_length_before_body_parse() {
+        let writer = MockWriter::new(vec![]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let mut req = authorized_batch_request("not-json");
+        req.set_header("content-length", "2097153");
+
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, &mut req)
+            .expect("should return oversized response");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should reject from content-length before parsing body"
+        );
+    }
+
+    #[test]
+    fn handle_batch_sync_uses_post_read_limit_for_malformed_content_length() {
+        let writer = MockWriter::new(vec![]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        let oversized_body = "{".repeat((2 * 1024 * 1024) + 1);
+        let mut req = authorized_batch_request(&oversized_body);
+        req.set_header("content-length", "not-a-number");
+
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, &mut req)
+            .expect("should return oversized response");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should reject oversized body even when content-length is malformed"
+        );
     }
 
     #[test]
