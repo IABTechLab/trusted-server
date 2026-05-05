@@ -12,11 +12,14 @@
 //! content-rewriting concern.
 
 use std::io::Write;
+use std::sync::{Arc, RwLock};
 
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
+use crate::auction::orchestrator::AuctionOrchestrator;
+use crate::auction::types::{AuctionContext, AuctionRequest, Bid, PublisherInfo, SiteInfo, UserInfo};
 use crate::backend::BackendConfig;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
@@ -26,6 +29,7 @@ use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
+use crate::price_bucket::price_bucket;
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -182,6 +186,8 @@ struct ProcessResponseParams<'a> {
     settings: &'a Settings,
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
+    ad_slots_script: Option<&'a str>,
+    ad_bids_state: &'a Arc<RwLock<Option<String>>>,
 }
 
 /// Process response body through the streaming pipeline.
@@ -224,6 +230,8 @@ fn process_response_streaming<W: Write>(
             params.request_scheme,
             params.settings,
             params.integration_registry,
+            params.ad_slots_script.map(str::to_string),
+            params.ad_bids_state.clone(),
         )?;
         StreamingPipeline::new(config, processor).process(body, output)?;
     } else if is_rsc_flight {
@@ -252,18 +260,21 @@ fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
-    settings: &Settings,
+    _settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    ad_slots_script: Option<String>,
+    ad_bids_state: Arc<RwLock<Option<String>>>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
-    let config = HtmlProcessorConfig::from_settings(
-        settings,
-        integration_registry,
-        origin_host,
-        request_host,
-        request_scheme,
-    );
+    let config = HtmlProcessorConfig {
+        origin_host: origin_host.to_string(),
+        request_host: request_host.to_string(),
+        request_scheme: request_scheme.to_string(),
+        integrations: integration_registry.clone(),
+        ad_slots_script,
+        ad_bids_state,
+    };
 
     Ok(create_html_processor(config))
 }
@@ -392,6 +403,8 @@ pub struct OwnedProcessResponseParams {
     pub(crate) request_host: String,
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
+    pub(crate) ad_slots_script: Option<String>,
+    pub(crate) ad_bids_state: Arc<RwLock<Option<String>>>,
 }
 
 /// Stream the publisher response body through the processing pipeline.
@@ -420,6 +433,8 @@ pub fn stream_publisher_body<W: Write>(
         settings,
         content_type: &params.content_type,
         integration_registry,
+        ad_slots_script: params.ad_slots_script.as_deref(),
+        ad_bids_state: &params.ad_bids_state,
     };
     process_response_streaming(body, output, &borrowed)
 }
@@ -441,10 +456,12 @@ pub fn stream_publisher_body<W: Write>(
 ///
 /// Returns a [`TrustedServerError`] if the proxy request fails or the
 /// origin backend is unreachable.
-pub fn handle_publisher_request(
+pub async fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
+    orchestrator: &AuctionOrchestrator,
+    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -520,19 +537,126 @@ pub fn handle_publisher_request(
         backend_name,
         settings.publisher.origin_url
     );
+
+    let request_path = req.get_path().to_string();
+    let is_get = req.get_method() == fastly::http::Method::GET;
+
+    let is_prefetch = req.get_header_str("sec-purpose")
+        .map_or(false, |v| v.contains("prefetch"))
+        || req.get_header_str("purpose")
+        .map_or(false, |v| v.contains("prefetch"));
+
+    let user_agent = req.get_header_str("user-agent").unwrap_or("");
+    let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
+        .iter()
+        .any(|bot| user_agent.contains(bot));
+
+    let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
+        crate::creative_opportunities::match_slots(&slots_file.slots, &request_path)
+            .into_iter()
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let consent_allows_auction = consent_context
+        .tcf
+        .as_ref()
+        .map_or(false, |tcf| tcf.has_purpose_consent(1));
+
+    let should_run_auction = is_get
+        && !is_prefetch
+        && !is_bot
+        && !matched_slots.is_empty()
+        && consent_allows_auction;
+
+    let auction_timeout_ms = settings
+        .creative_opportunities
+        .as_ref()
+        .and_then(|co| co.auction_timeout_ms)
+        .unwrap_or(settings.auction.timeout_ms);
+
+    let ad_bids_state: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
-    let mut response = req
-        .send(&backend_name)
+    let pending_origin = req
+        .send_async(&backend_name)
         .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy request to origin".to_string(),
+            message: "Failed to dispatch async origin request".to_string(),
+        })?;
+
+    let auction_result = if should_run_auction {
+        let co_config = settings.creative_opportunities.as_ref()
+            .expect("should be present when should_run_auction is true");
+        let auction_request = build_auction_request(
+            &matched_slots,
+            &ec_id,
+            &consent_context,
+            &request_info,
+            co_config,
+        );
+        let placeholder_req = fastly::Request::get("https://placeholder.invalid/");
+        let auction_context = AuctionContext {
+            settings,
+            request: &placeholder_req,
+            client_info: services.client_info(),
+            timeout_ms: auction_timeout_ms,
+            provider_responses: None,
+            services,
+        };
+        match orchestrator.run_auction(&auction_request, &auction_context, services).await {
+            Ok(result) => Some(result),
+            Err(e) => {
+                log::warn!("server-side auction failed, proceeding without bids: {e:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if should_run_auction {
+        let co_config = settings.creative_opportunities.as_ref()
+            .expect("should be present");
+        let empty: std::collections::HashMap<String, Bid> =
+            std::collections::HashMap::new();
+        let winning_bids = auction_result.as_ref()
+            .map(|r| &r.winning_bids)
+            .unwrap_or(&empty);
+        let bid_map = build_bid_map(winning_bids, co_config.price_granularity);
+        let bids_script = build_bids_script(&bid_map);
+        *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
+    }
+
+    let mut response = pending_origin
+        .wait()
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to await origin response".to_string(),
         })?;
 
     log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
         log::debug!("  {}: {:?}", name, value);
+    }
+
+    let ad_slots_script = if let Some(co_config) = &settings.creative_opportunities {
+        if !matched_slots.is_empty() {
+            Some(build_ad_slots_script(&matched_slots, co_config))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if ad_slots_script.is_some() {
+        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
+        response.remove_header("surrogate-control");
+        response.remove_header("fastly-surrogate-control");
     }
 
     // Set EC ID / cookie headers BEFORE body processing.
@@ -623,6 +747,8 @@ pub fn handle_publisher_request(
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
                     content_type,
+                    ad_slots_script: ad_slots_script.clone(),
+                    ad_bids_state: ad_bids_state.clone(),
                 },
             })
         }
@@ -642,6 +768,8 @@ pub fn handle_publisher_request(
                 settings,
                 content_type: &content_type,
                 integration_registry,
+                ad_slots_script: ad_slots_script.as_deref(),
+                ad_bids_state: &ad_bids_state,
             };
             let mut output = Vec::new();
             process_response_streaming(body, &mut output, &params)?;
@@ -652,6 +780,93 @@ pub fn handle_publisher_request(
             Ok(PublisherResponse::Buffered(response))
         }
     }
+}
+
+/// Build an [`AuctionRequest`] from matched creative opportunity slots.
+pub(crate) fn build_auction_request(
+    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    ec_id: &str,
+    consent_context: &crate::consent::ConsentContext,
+    request_info: &crate::http_util::RequestInfo,
+    co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+) -> AuctionRequest {
+    let slots = matched_slots
+        .iter()
+        .map(|s| s.to_ad_slot(&co_config.gam_network_id))
+        .collect();
+    AuctionRequest {
+        id: format!("ts-{}", ec_id),
+        slots,
+        publisher: PublisherInfo {
+            domain: request_info.host.clone(),
+            page_url: None,
+        },
+        user: UserInfo {
+            id: ec_id.to_string(),
+            fresh_id: ec_id.to_string(),
+            consent: Some(consent_context.clone()),
+        },
+        device: None,
+        site: Some(SiteInfo {
+            domain: request_info.host.clone(),
+            page: String::new(),
+        }),
+        context: std::collections::HashMap::new(),
+    }
+}
+
+/// Build a price-bucketed bid map from winning bids.
+///
+/// Returns a map of slot ID → bucketed CPM string.
+pub(crate) fn build_bid_map(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    granularity: crate::price_bucket::PriceGranularity,
+) -> std::collections::HashMap<String, String> {
+    winning_bids
+        .iter()
+        .filter_map(|(slot_id, bid)| {
+            bid.price.map(|cpm| {
+                let bucket = price_bucket(cpm, granularity);
+                (slot_id.clone(), bucket)
+            })
+        })
+        .collect()
+}
+
+/// Build the `__ts_bids` inline script content from a bucketed bid map.
+pub(crate) fn build_bids_script(bid_map: &std::collections::HashMap<String, String>) -> String {
+    let entries: Vec<String> = bid_map
+        .iter()
+        .map(|(slot_id, bucket)| format!("\"{}\":\"{}\"", slot_id, bucket))
+        .collect();
+    format!("window.__ts_bids={{{}}};", entries.join(","))
+}
+
+/// Build the `__ts_ad_slots` inline script content from matched slots.
+pub(crate) fn build_ad_slots_script(
+    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+) -> String {
+    let entries: Vec<String> = matched_slots
+        .iter()
+        .map(|slot| {
+            let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
+            let div_id = slot.resolved_div_id();
+            let formats: Vec<String> = slot
+                .formats
+                .iter()
+                .map(|f| format!("[{},{}]", f.width, f.height))
+                .collect();
+            format!(
+                "{{\"id\":\"{}\",\"div\":\"{}\",\"path\":\"{}\",\"sizes\":[{}]}}",
+                slot.id,
+                div_id,
+                gam_path,
+                formats.join(",")
+            )
+        })
+        .collect();
+    format!("window.__ts_ad_slots=[{}];", entries.join(","))
 }
 
 /// Whether the content type requires processing (URL rewriting, HTML injection).
@@ -1366,6 +1581,8 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(RwLock::new(None)),
         };
 
         let mut output = Vec::new();
@@ -1407,6 +1624,8 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(RwLock::new(None)),
         };
 
         let mut output = Vec::new();
@@ -1439,6 +1658,8 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(RwLock::new(None)),
         };
 
         let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
@@ -1538,6 +1759,8 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(RwLock::new(None)),
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -1588,6 +1811,8 @@ mod tests {
             request_host: "proxy.example.com".to_string(),
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
+            ad_slots_script: None,
+            ad_bids_state: Arc::new(RwLock::new(None)),
         };
 
         let mut output = Vec::new();

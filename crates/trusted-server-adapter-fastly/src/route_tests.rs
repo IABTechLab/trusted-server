@@ -184,6 +184,8 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let slots_file =
+        trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default();
 
     let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_req);
@@ -192,6 +194,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &discovery_services,
+        &slots_file,
         discovery_req,
     ))
     .expect("should route discovery request");
@@ -208,6 +211,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &admin_services,
+        &slots_file,
         admin_req,
     ))
     .expect("should route admin request");
@@ -224,6 +228,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &auction_services,
+        &slots_file,
         auction_req,
     ))
     .expect("should return an error response for auction requests");
@@ -240,6 +245,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &orchestrator,
         &integration_registry,
         &publisher_services,
+        &slots_file,
         publisher_req,
     ))
     .expect("should return an error response for publisher fallback");
