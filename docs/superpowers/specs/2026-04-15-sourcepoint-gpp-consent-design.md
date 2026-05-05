@@ -45,13 +45,18 @@ No Rust-side `IntegrationRegistration` (same pattern as `creative`).
 4. Write first-party cookies:
    - `__gpp=<gpp string>` (path `/`, `SameSite=Lax`)
    - `__gpp_sid=<comma-separated section IDs>` (path `/`, `SameSite=Lax`)
+   - `_ts_gpp_src=sp` marker (path `/`, `SameSite=Lax`)
 5. Log what was written for debugging.
 
 Cookies are session-scoped (no `max-age` / `expires`) since the source of truth
-stays in `localStorage` and we re-mirror on each page load. This design assumes
-a single active Sourcepoint property per page; if multiple `_sp_user_consent_*`
-entries coexist, the first valid one wins. The integration runs once — no
-polling or event listeners.
+stays in `localStorage` and we re-mirror on each page load. The marker cookie
+tracks Trusted Server's Sourcepoint-owned writes so the integration only clears
+`__gpp` / `__gpp_sid` values that it previously mirrored; this avoids clobbering
+cookies written by other CMPs. This design assumes a single active Sourcepoint
+property per page; if multiple `_sp_user_consent_*` entries coexist, the first
+valid one wins. The integration runs immediately, performs bounded first-load
+retries, and re-mirrors on page focus/visibility refresh so session cookies do
+not remain stale after mid-session consent updates.
 
 ### 2. Server-side: GPP US section decoding
 
@@ -104,11 +109,20 @@ if let Some(gpp) = &ctx.gpp {
 
 Semantics:
 
-- GPP US `sale_opt_out != OptedOut` → EC allowed
-- GPP US `sale_opt_out == OptedOut` → EC blocked
-- No GPP US section → falls through to `us_privacy`
-- GPC still short-circuits at the top (unchanged)
-- TCF still takes priority for CMPs like Didomi (unchanged)
+- GPC still short-circuits at the top and blocks EC creation.
+- TCF still takes priority for CMPs like Didomi. In US-state jurisdictions, an
+  effective TCF Purpose 1 signal is treated as the authoritative EC storage
+  consent decision and is evaluated before GPP US sale opt-out.
+- GPP US `sale_opt_out != OptedOut` → EC allowed when no effective TCF signal is
+  present.
+- GPP US `sale_opt_out == OptedOut` → EC blocked when no effective TCF signal is
+  present.
+- No GPP US section → falls through to `us_privacy`.
+
+The TCF-before-GPP precedence is intentional rather than accidental: it preserves
+existing CMP behavior where TCF Purpose 1 is the explicit storage/access signal
+for the EC cookie itself. Publishers that need US-section-wins behavior should
+raise that as a separate consent-policy configuration change.
 
 ### 4. Files touched
 
@@ -120,7 +134,9 @@ Semantics:
 | `crates/trusted-server-core/src/consent/gpp.rs` | Add US section decoding, extract `sale_opt_out` |
 | `crates/trusted-server-core/src/consent/mod.rs` | Add GPP US branch in `allows_ec_creation()`, tests |
 
-No config changes, no new crate dependencies, no `IntegrationRegistry` changes.
+No config changes and no new crate dependencies. `IntegrationRegistry` includes
+`sourcepoint` in the JS-only always-shipped module list; the client-side marker
+cookie prevents the always-shipped module from clearing other CMPs' GPP cookies.
 
 ### 5. Testing
 
@@ -151,3 +167,4 @@ No config changes, no new crate dependencies, no `IntegrationRegistry` changes.
 - No richer US GPP field extraction (sharing, targeted advertising opt-outs)
 - No publisher configuration for Sourcepoint property ID (auto-discovery)
 - No Sourcepoint CMP API integration (localStorage-only approach)
+- No consent-policy knob for making GPP US sale opt-out override TCF Purpose 1

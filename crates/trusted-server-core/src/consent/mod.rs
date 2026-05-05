@@ -489,6 +489,7 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
             }
             // When a CMP uses TCF in the US (e.g. Didomi), respect the
             // TCF Purpose 1 decision — this is an explicit opt-in signal.
+            // The Sourcepoint GPP design documents this precedence decision.
             if let Some(tcf) = effective_tcf(ctx) {
                 return tcf.has_storage_consent();
             }
