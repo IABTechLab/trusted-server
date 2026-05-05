@@ -1,6 +1,7 @@
 # Server-Side Ad Templates Design
 
 _Author · 2026-04-15_
+_Revised · 2026-05-04 (body-injection rework)_
 
 ---
 
@@ -35,38 +36,54 @@ given page. There is no reason to wait for the browser.
 
 Enable Trusted Server to:
 
-1. Match an incoming page request URL against a set of pre-configured slot templates
-2. Immediately fire the full server-side auction (all providers: PBS, APS, future wrappers)
-   in parallel with the origin HTML fetch — before the browser receives a single byte
-3. Inject GPT slot definitions into `<head>` so the client can define slots without any SDK
-4. Cache auction results at the edge keyed by request ID. Serve them to the client via
-   a fast `/ts-bids` endpoint when the client fetches them. Bid delivery is decoupled
-   from page rendering — the auction never blocks FCP. The `/auction` POST endpoint is
-   retained as a fallback for pages whose URLs do not match any slot template,
-   preserving backward compatibility for publishers who have not yet adopted
-   `creative-opportunities.toml`.
-5. Eliminate Prebid.js from the client entirely
+1. Match an incoming page request URL against a set of pre-configured slot templates.
+2. Immediately fire the full server-side auction (all providers: PBS, APS, future
+   wrappers) in parallel with the origin HTML fetch — before the browser receives a
+   single byte.
+3. Inject GPT slot definitions into `<head>` so the client can define slots without any
+   SDK.
+4. Inject the auction result inline before `</body>`, so bids and HTML travel together
+   in a single response. The auction runs in parallel with origin fetch and body
+   streaming; the close-of-body tag is held only until the auction completes or
+   `A_deadline` fires, whichever is first. **FCP is unaffected** — body content above
+   `</body>` has already streamed and painted by the time the close tag is held.
+5. Eliminate Prebid.js from the page-load critical path. A stripped-down Prebid bundle
+   (_slim-Prebid_) is lazy-loaded post-`window.load` to handle scroll/refresh auctions
+   and to run userID modules that enrich the EC identity graph for the next request.
 
-**Target time to ad visible: ~1,150ms. FCP unchanged from a no-TS baseline. Net saving
-on ad-visible: ~2,100ms.**
+**Target time to ad visible: ~870ms (cache hit) / ~1,020ms (cache miss). FCP unchanged
+from a no-TS baseline.** Net saving on ad-visible: ~2,200–2,400ms vs today, compounded
+across every navigation in the user's clickstream rather than once per session.
 
 > **Note:** The latency numbers in this document are modeled estimates based on known
 > edge→PBS RTT ranges and typical origin response times. They should be validated with
-> production measurements after Phase 1 ships.
+> production measurements after Phase 1 ships. Quantitative claims in §6 are tagged with
+> the assumptions they depend on.
 
 ---
 
 ## 3. Non-Goals
 
 - Eliminating client-side GPT / Google Ad Manager — GAM remains in the rendering
-  pipeline for Phase 1. The GAM call (`securepubads.g.doubleclick.net`) moves
-  server-side in a future phase (see §9.6).
+  pipeline. The GAM call (`securepubads.g.doubleclick.net`) moving server-side is
+  aspirational, contingent on Google agreement, and is not committed for any phase
+  (see §9.6).
+- Eliminating Prebid entirely — a stripped-down Prebid bundle (_slim-Prebid_) is
+  lazy-loaded post-`window.load` to handle scroll/refresh auctions and userID
+  enrichment. **TS owns the first impression; Prebid owns subsequent refresh
+  auctions.**
 - Dynamic slot discovery (reading the DOM) — this design commits to pre-defined,
   URL-matched slot templates. Smart Slots' dynamic injection behavior is replaced by
   server knowledge.
 - Changing the `AuctionOrchestrator` internally — the orchestrator already handles
   parallel provider fan-out. This design adds a new trigger point, not new auction
   logic.
+- A separate `/ts-bids` endpoint — an earlier revision of this spec proposed a fetch
+  endpoint backed by an in-process `bid_cache`. That design was rejected because
+  in-process caches don't survive Fastly Compute's per-request Wasm isolate model:
+  isolates are not pinned across requests, and there is no documented contract for
+  cross-request shared state. Body-injection achieves the same FCP property with a
+  single response and no shared-state requirement.
 
 ---
 
@@ -100,8 +117,8 @@ gam_network_id = "21765378893"
 
 # Optional. Defaults to [auction].timeout_ms if not set.
 # Recommended: 500ms (vs client-side 1000–1500ms) due to lower edge→PBS RTT.
-# This value gates both the auction deadline and the <head>-boundary hold in
-# streaming mode — they share the same deadline (T₀ + auction_timeout_ms).
+# This value is also the upper bound on the </body>-close hold; once A_deadline
+# fires, TS injects an empty __ts_bids and emits </body> regardless.
 auction_timeout_ms = 500
 
 # Granularity table for hb_pb price bucket strings.
@@ -212,8 +229,8 @@ pub struct ApsSlotParams {
 > non-string targeting value is a startup error.
 
 > **Slot ID validation:** Slot IDs are validated at startup against a strict allowlist
-> (`[A-Za-z0-9_-]+`). IDs outside this set fail startup. This prevents XSS via
-> crafted IDs appearing in the injected `<script>` block.
+> (`[A-Za-z0-9_-]+`). IDs outside this set fail startup. This prevents XSS via crafted
+> IDs appearing in the injected `<script>` block.
 
 ### 4.2 URL Pattern Matching
 
@@ -231,7 +248,7 @@ single auction as separate impressions. Pattern matching is purely in-memory aga
 pre-parsed config — sub-millisecond. The pattern-match cost is O(slots × patterns);
 startup logs the compiled pattern count.
 
-### 4.3 Auction Trigger
+### 4.3 Auction Trigger and the Bounded Body-End Hold
 
 #### Async restructuring of the publisher path
 
@@ -242,100 +259,126 @@ parallel with the origin fetch requires:
 2. Switching the origin fetch from blocking `.send()` to `.send_async()` (returns
    `PlatformPendingRequest`)
 3. Adding `orchestrator: &AuctionOrchestrator` as a parameter
-4. Awaiting both the auction future and the pending origin request (via the platform's
-   `select` / join primitive)
+4. Awaiting both the auction future and the pending origin request
 
 This is an explicit structural change to the publisher request path. It is listed in §7
 as a required migration, not a minor modification.
 
+#### Auction-eligibility gating
+
+Auctions fire on **real first-page-load impressions only**, not on every TS-matched
+request. Before firing, TS gates on:
+
+- **Consent** — TCF Purpose 1 (storage access) is the minimum. If consent is absent or
+  denied, no auction. The page renders normally; GAM falls back to its own auction.
+- **Bot / crawler User-Agent** — well-known crawler UAs (Googlebot, Bingbot,
+  AhrefsBot, etc.) skip the auction. SSP QPS budgets are finite; burning them on
+  crawler hits is a real cost.
+- **Prefetch hints** — requests carrying `Sec-Purpose: prefetch` or `Purpose: prefetch`
+  skip the auction. Avoids spending auction inventory on speculative navigations that
+  may never paint.
+- **Method** — only `GET` requests trigger auctions. `HEAD` requests skip.
+- **Slot match** — at least one slot in `creative-opportunities.toml` must match the
+  request path. Empty match = no auction.
+
+Skipped auctions emit no `__ts_bids` and let the page proceed unmodified by the ad
+stack. Skipped requests still benefit from the EC cookie set / KV identity update
+paths that run independently of the auction.
+
 #### Consent and EC ID
 
-Before firing the auction, TS reads consent signals and the EC ID from the incoming page
-request — the same pipeline already executed in `handle_publisher_request` (EC ID at
-line 483, consent at lines 497–508). These are forwarded into `AuctionRequest` exactly
-as they are today from the client POST path.
+Before firing the auction, TS reads consent signals and the EC ID from the incoming
+page request. EC ID resolution → KV lookup → enriched EID set retrieval is part of the
+existing EC pipeline and is the load-bearing identity input to the auction (see §4.8).
 
 Consent gating:
 
 - If consent is **absent or denied** (no TCF consent string, or purpose 1 not consented):
   the auction is not fired. `__ts_bids` is omitted from the page. GPT falls back to its
   own auction. This is treated as a first-class edge case in §8.
-- **Mid-page consent revocation** is out of scope for Phase 1; bids already injected into
-  `<head>` remain. Phase 2 will address consent event propagation.
-
-EC ID behavior at the new trigger is identical to the existing path — generated or read
-from cookie, forwarded in the `AuctionRequest`.
+- **Mid-page consent revocation** is out of scope for Phase 1; bids already injected
+  remain. Phase 2 will address consent event propagation.
 
 #### Auction execution
 
-When slots are matched and consent is present, TS calls
-`AuctionOrchestrator::run_auction()` with the matched slots converted to `AdSlot`
-objects. This happens at request receipt time — in parallel with the origin fetch via
+When the gates above are satisfied, TS calls `AuctionOrchestrator::run_auction()` with
+the matched slots converted to `AdSlot` objects, decorated with `user.eids` from the
+EC graph. This happens at request receipt time, in parallel with the origin fetch via
 `send_async()`.
 
-The orchestrator's existing behaviour is unchanged:
+The orchestrator's existing behavior is unchanged:
 
 - All providers (PBS, APS) are dispatched simultaneously
 - Per-provider timeout budgets are enforced from the remaining auction deadline
   (`creative_opportunities.auction_timeout_ms`, falling back to `[auction].timeout_ms`)
 - Floor price filtering, bid unification, and winning bid selection are applied as today
 - PBS resolves bidder params from its stored requests by slot ID
-- APS bidder params are read from `[slot.providers.aps]` in `creative-opportunities.toml`
+- APS bidder params are read from `[slot.providers.aps]` in
+  `creative-opportunities.toml`
 
-#### Page rendering is never held
+#### The bounded `</body>` hold
 
-**The auction never blocks page rendering.** This is a deliberate design choice and the
-single most important property of the streaming behavior.
+Bids are injected into the page inline before `</body>`. This requires holding the
+close-of-body tag until the auction completes. The hold is **bounded by `A_deadline`**
+and **invisible to FCP** because all body content above `</body>` has already streamed
+and painted by the time the close tag is held.
 
-Holding `</head>` to inject bid results would block body parsing — browsers do not begin
-body render until `</head>` is received because head content (CSS, scripts) can affect
-rendering. A 300–500ms head hold for the auction to complete would mean the user sees a
-blank page for that entire window. This is unacceptable regardless of how good the TTFB
-metric looks.
-
-Instead, **bid delivery is decoupled from page rendering**:
-
-1. TS forces chunked encoding on every origin response (`Transfer-Encoding: chunked`),
-   regardless of origin format (WordPress, Drupal, NextJS 14, etc.). Buffered origin
-   responses are re-chunked at the edge.
-2. `__ts_ad_slots` is injected at the `<head>` open tag — known immediately from config,
-   zero wait. Browser receives this with the first head chunk.
-3. **`</head>` flushes as soon as origin emits it.** No buffering, no auction wait. Body
-   parsing and rendering begin immediately.
-4. The auction fires server-side in parallel with origin fetch. Results are cached at the
-   edge by `request_id` with a short TTL.
-5. The client tsjs bundle calls `GET /ts-bids?rid=<request_id>` to retrieve auction
-   results. Server returns results when the auction completes (cache hit if already
-   done; otherwise blocks the response until `A_deadline`).
-6. Client applies bid targeting to GPT slots, then fires `googletag.pubads().refresh()`.
-
-**Timing definitions and bounds:**
+**Timing definitions:**
 
 - `T₀` = request receipt at the edge
-- `A_deadline` = `T₀ + auction_timeout_ms` (configured in
-  `[creative_opportunities].auction_timeout_ms`)
+- `A_deadline` = `T₀ + auction_timeout_ms`
+- `origin_drain_time` = wall-clock when the origin response (or its `</body>` chunk in
+  the streaming case) reaches the edge
 
-The `/ts-bids` endpoint blocks until auction completion or `A_deadline`, whichever fires
-first. The browser's bid wait is concurrent with body rendering — by the time the bid
-fetch resolves, the user has already been viewing rendered page content for hundreds of
-milliseconds.
+**Body-close emission time:**
+
+```
+body_close_emit_time = max(origin_drain_time, min(A_deadline, auction_complete_time))
+```
+
+In English:
+
+- If the auction completes before origin drains: body close tag flushes when origin
+  emits it, with bid data injected. **No hold.** Typical cache-hit path where origin is
+  ~5ms and auction is ~500ms — the auction is the long pole, but it has already
+  finished by the time we need it because we waited for origin too.
+- If origin drains before the auction completes: body close held until either auction
+  completes or `A_deadline` fires. Hold is bounded by `A_deadline`.
+- If `A_deadline` fires first: TS injects `__ts_bids = {}` (graceful no-bid fallback)
+  and emits the close tag. GPT proceeds without bid targeting; GAM runs its own auction.
+  This is the **soft inner deadline watchdog** — auction overrun never blocks the page
+  past `A_deadline`.
+
+**Why this works without hurting FCP:** body content above `</body>` has already
+streamed and painted. Holding `</body>` delays `DOMContentLoaded` and `window.load`
+events but not FCP. Third-party scripts hooked on DCL fire later by at most the hold
+duration; this is a real cost on cache-hit pages where origin drains in <50ms but
+auction takes ~500ms. The publisher decides this trade-off via `auction_timeout_ms` —
+500ms is the recommended default and the hard upper bound on DCL slip.
 
 **FCP is unaffected by the auction.** First Contentful Paint is bounded by origin time
 and resource load time, exactly the same as a page without TS in the path.
 
-**Ad timing slips by ~30ms** versus a hypothetical head-hold injection — the
-client→edge→client RTT for the `/ts-bids` fetch. Negligible to users; significantly
-better than today's client-side auction (~1,500ms).
+> **Implementation mechanic:** lol_html's `el.on_end_tag()` registers a synchronous
+> handler against the body element. Coordinating an async auction result into a
+> synchronous handler requires shared state (e.g., `Arc<RwLock<Option<BidResult>>>`)
+> that the auction task writes when complete and the close-tag handler reads, plus an
+> outer flow-control mechanism that holds chunk emission past `</body>` until the
+> shared state is populated or `A_deadline` fires. Detailed mechanics are part of the
+> implementation plan (see §7).
 
-### 4.4 Head Injection
+### 4.4 Head and Body Injection
 
-TS injects a single `<script>` block at the `<head>` open tag containing
-`window.__ts_ad_slots` and `window.__ts_request_id`. Bid results are NOT injected into
-the page — the client fetches them via `/ts-bids` (see §4.5).
+TS injects two `<script>` blocks into the HTML response:
 
-**`window.__ts_ad_slots`** — emitted at the `<head>` opening tag, immediately from
-config. No auction needed. Available to GPT the moment the browser parses `<head>`.
-Owned by the `gpt` integration head injector (not `prebid.rs`):
+1. **`window.__ts_ad_slots`** — at `<head>` open, immediately from config. No auction
+   wait. Available to GPT the moment the browser parses `<head>`.
+2. **`window.__ts_bids`** — before `</body>`, after the bounded hold described in §4.3.
+   Carries the per-slot Prebid targeting and `nurl`/`burl` for billing.
+
+#### `__ts_ad_slots` (at `<head>` open)
+
+Owned by the `gpt` integration head injector:
 
 ```json
 [
@@ -359,39 +402,9 @@ Owned by the `gpt` integration head injector (not `prebid.rs`):
 ]
 ```
 
-**`window.__ts_request_id`** — a per-request opaque identifier (UUID v4) minted by TS
-at request receipt. Used by the client to correlate the page request with the cached
-auction result via `GET /ts-bids?rid=<request_id>`:
+#### `__ts_bids` (before `</body>`)
 
-```html
-<script>
-  window.__ts_ad_slots = [
-    {
-      id: 'atf_sidebar_ad',
-      gam_unit_path: '/21765378893/publisher/atf-sidebar',
-      div_id: 'div-atf-sidebar',
-      formats: [[300, 250]],
-      targeting: { pos: 'atf', zone: 'atfSidebar' },
-    },
-    /* ... */
-  ]
-  window.__ts_request_id = '550e8400-e29b-41d4-a716-446655440000'
-</script>
-```
-
-> **Security:** All string values are JSON-serialized via `serde_json` and HTML-escaped
-> before insertion into the `<script>` block. The wrapper uses `JSON.parse(ESCAPED)`,
-> not raw string interpolation.
-
-> **Cache contract:** The HTML response with `__ts_request_id` is per-user data and must
-> not be cached across users. TS sets `Cache-Control: private, no-store` on the response
-> before forwarding, overriding any conflicting cache headers from the publisher origin.
-> `Surrogate-Control` and `Fastly-Surrogate-Control` are also stripped.
-
-#### `/ts-bids?rid=<request_id>` endpoint
-
-A new TS endpoint at root path `/ts-bids` serves cached auction results for a given
-request ID. JSON response, keyed by slot ID:
+JSON object keyed by slot ID:
 
 ```json
 {
@@ -399,141 +412,189 @@ request ID. JSON response, keyed by slot ID:
     "hb_pb": "2.50",
     "hb_bidder": "kargo",
     "hb_adid": "abc123",
+    "nurl": "https://ssp.example/win?id=abc123",
     "burl": "https://ssp.example/billing?id=abc123"
   },
   "below-content-ad": {
     "hb_pb": "1.00",
     "hb_bidder": "appnexus",
     "hb_adid": "def456",
+    "nurl": "https://appnexus.example/win?id=def456",
     "burl": "https://appnexus.example/billing?id=def456"
   }
 }
 ```
 
 `hb_pb` is computed using the **dense** granularity table (publisher-configurable via
-`price_granularity` in `[creative_opportunities]`). The key set is `hb_pb`, `hb_bidder`,
-`hb_adid`, and `burl` — matching GAM standard Prebid targeting keys. `burl` is included
-so the client can fire it from the `slotRenderEnded` event (see §4.6).
+`price_granularity` in `[creative_opportunities]`). Per-slot keys are `hb_pb`,
+`hb_bidder`, `hb_adid`, `nurl`, `burl` — both `nurl` and `burl` ride into the page
+because both are fired client-side from `slotRenderEnded` (see §4.5).
 
-**Behavior:**
+#### Injection mechanic
 
-- If the auction has already completed for `<request_id>`, response returns immediately
-  with cached results (cache hit). Typical case for non-trivial origin times.
-- If the auction is still in flight, the request blocks until completion or `A_deadline`,
-  whichever fires first. Long-poll semantics, capped by the auction timeout.
-- If `<request_id>` is unknown (cache miss, expired TTL, or never created), returns
-  `404`. Client falls back to firing GPT without pre-set targeting.
-- If no slot received a bid above floor, returns `{}`. Client fires GPT without targeting.
-- Response carries `Cache-Control: private, no-store`.
+`__ts_ad_slots` is emitted via the existing `el.prepend()` head handler (already used
+by integrations for head-tag injection).
 
-**Storage:** auction results cached in-process (per-edge-instance) keyed by request ID
-with a 30-second TTL. Sized small (a few KB per entry) and short-lived; no Fastly KV
-write on the hot path.
+`__ts_bids` is emitted via lol_html's `el.on_end_tag()` registered against the body
+element. The handler reads from a shared auction-result state (resolved by the auction
+task, fallback to `{}` on watchdog) and calls
+`end_tag.before(<script>...</script>, ContentType::Html)`.
 
-**Security:** request IDs are 128-bit unguessable UUIDs. Even if a request ID leaks, the
-worst-case impact is reading bid metadata that's already destined for that session's
-GPT slots — no cross-user data exposure.
+> **Security:** All string values are JSON-serialized via `serde_json` and HTML-escaped
+> before insertion into the `<script>` block. The wrapper uses
+> `JSON.parse(<escaped string>)`, never raw string interpolation. `<`, `>`, `&`, U+2028,
+> U+2029 are unicode-escaped to neutralize any markup that could break out of the
+> `<script>` context.
 
-### 4.5 Win Notifications
+> **Cache contract (load-bearing invariant):** The HTML response with `__ts_bids`
+> contains per-user bid data inline. TS sets **`Cache-Control: private, max-age=0`** on
+> the browser-facing response. **`Surrogate-Control` and `Fastly-Surrogate-Control`
+> are stripped** so downstream Fastly-aware caches do not override the directive. The
+> Fastly edge cache for the **origin** response is unaffected — TS reads the cached
+> origin HTML and assembles a fresh per-request response on every hit. **The
+> assembled response must never be re-cached** by any intermediate proxy or shared
+> cache. See §4.7 for the full caching rationale, including why `no-store` was
+> rejected in favor of `max-age=0` (BFCache eligibility).
 
-Win notification responsibilities are split by where the truth lives:
+### 4.5 Win Notifications — Both `nurl` and `burl` Client-Side
 
-**`nurl` (SSP win event) — fired server-side.** When the orchestrator selects a winning
-bid, TS fires a fire-and-forget background HTTP request to `nurl` from the edge
-(edge→SSP RTT ~20–30ms, no auction-path latency cost). A per-integration switch
-(`[integrations.prebid].fire_nurl_at_edge`, default `true`) handles cases where the PBS
-deployment already fires win events internally to avoid double-firing. APS win
-notification follows its own spec.
+Win notification responsibilities are split by where the truth lives. **Both `nurl`
+and `burl` fire client-side from the GPT `slotRenderEnded` event after `hb_adid`
+match.** Server-side firing is rejected for both because it would report wins for
+auctions whose bids never actually rendered (direct deal won the GAM line item, GAM
+backfill won, user navigated away before tsjs loaded, etc.) — that's billing inflation
+and a violation of MRC counting standards.
 
-**`burl` (billing event) — fired client-side.** `burl` is embedded per slot in
-`__ts_bids` (see §4.4). The `__tsAdInit` script registers a GPT `slotRenderEnded`
-listener after defining slots. On render: if `!event.isEmpty` and
-`event.slot.getTargeting('hb_adid')[0] === bidData.hb_adid`, the client fires `burl`
-via `navigator.sendBeacon`. This confirms both that the ad rendered and that our specific
-Prebid bid (not a direct deal or backfill) won the GAM line item match.
+**Render-confirmed firing pattern (registered in `__tsAdInit`):**
+
+```javascript
+googletag.pubads().addEventListener('slotRenderEnded', function (event) {
+  var slotId = event.slot.getSlotElementId()
+  var bidData = (window.__ts_bids || {})[slotId] || {}
+  var ourBidWon =
+    !event.isEmpty &&
+    bidData.hb_adid &&
+    event.slot.getTargeting('hb_adid')[0] === bidData.hb_adid
+
+  if (ourBidWon) {
+    if (bidData.nurl) navigator.sendBeacon(bidData.nurl)
+    if (bidData.burl) navigator.sendBeacon(bidData.burl)
+  }
+})
+```
+
+The `hb_adid` match confirms two things: that the slot was filled (`!event.isEmpty`)
+**and** that **our** Prebid bid (not a direct deal or backfill) won the GAM line item
+match. Only then are SSP win/billing pixels fired.
+
+**Per-bidder suppression** (`[integrations.<bidder>].suppress_nurl`, default `false`)
+is retained as an escape hatch in case a specific PBS deployment fires `nurl`
+internally and wants to avoid double-firing. APS `burl` follows the same client-side
+path.
+
+> **Operational note:** Client-side firing introduces a small (~50–200ms) delay in
+> win-pixel arrival vs server-side firing. SSPs accept this — it's identical to
+> conventional client-side Prebid integrations today. Server-side firing would arrive
+> faster but would inflate counts on impressions that never rendered.
 
 ### 4.6 Client Residual
 
-Prebid.js is eliminated. The client-side ad bootstrap is replaced by a small inline
-script that reads `__ts_ad_slots`, fetches bids from `/ts-bids`, drives GPT directly,
-and handles billing notifications. Slot definition happens immediately; bid targeting
-and `refresh()` happen after `/ts-bids` resolves:
+Prebid.js is removed from the page-load critical path. A small inline shim
+(`__tsAdInit`) reads `window.__ts_bids` synchronously from the page, drives GPT
+directly, and registers the `slotRenderEnded` listener for win/billing pixels. **No
+fetch, no Promise, no second round-trip — bids are already on the page.**
 
 ```javascript
 window.__tsAdInit = function () {
   var slots = window.__ts_ad_slots || []
-  var rid = window.__ts_request_id
-
-  // Kick off bid fetch as early as possible. Fires in parallel with GPT setup.
-  var bidsPromise = rid
-    ? fetch('/ts-bids?rid=' + encodeURIComponent(rid), { credentials: 'omit' })
-        .then(function (r) {
-          return r.ok ? r.json() : {}
-        })
-        .catch(function () {
-          return {}
-        })
-    : Promise.resolve({})
+  var bids = window.__ts_bids || {}
 
   googletag.cmd.push(function () {
-    // Define slots immediately — no auction wait
-    var gptSlots = slots.map(function (slot) {
+    slots.forEach(function (slot) {
       var gptSlot = googletag
         .defineSlot(slot.gam_unit_path, slot.formats, slot.div_id)
         .addService(googletag.pubads())
-      Object.entries(slot.targeting).forEach(function ([k, v]) {
+
+      // Apply config-defined targeting
+      Object.entries(slot.targeting || {}).forEach(function ([k, v]) {
         gptSlot.setTargeting(k, v)
       })
-      return { id: slot.id, gptSlot: gptSlot }
+
+      // Apply auction-result targeting
+      var bidData = bids[slot.id] || {}
+      ;['hb_pb', 'hb_bidder', 'hb_adid'].forEach(function (key) {
+        if (bidData[key]) gptSlot.setTargeting(key, bidData[key])
+      })
+
+      // Slot-ownership sentinel — slim-Prebid skips initial-rendered slots and
+      // clears this key when running its own auction on refresh.
+      gptSlot.setTargeting('ts_initial', '1')
     })
 
     googletag.pubads().enableSingleRequest()
     googletag.enableServices()
 
-    // Apply bid targeting and refresh once /ts-bids resolves.
-    bidsPromise.then(function (bids) {
-      gptSlots.forEach(function ({ id, gptSlot }) {
-        var bidData = bids[id] || {}
-        ;['hb_pb', 'hb_bidder', 'hb_adid'].forEach(function (key) {
-          if (bidData[key]) gptSlot.setTargeting(key, bidData[key])
-        })
-      })
-
-      // Fire burl on confirmed render
-      googletag.pubads().addEventListener('slotRenderEnded', function (event) {
-        var slotId = event.slot.getSlotElementId()
-        var bidData = bids[slotId] || {}
-        if (
-          !event.isEmpty &&
-          bidData.burl &&
-          event.slot.getTargeting('hb_adid')[0] === bidData.hb_adid
-        ) {
-          navigator.sendBeacon(bidData.burl)
-        }
-      })
-
-      googletag.pubads().refresh()
+    // Fire win/billing pixels on confirmed render (see §4.5)
+    googletag.pubads().addEventListener('slotRenderEnded', function (event) {
+      var slotId = event.slot.getSlotElementId()
+      var bidData = bids[slotId] || {}
+      if (
+        !event.isEmpty &&
+        bidData.hb_adid &&
+        event.slot.getTargeting('hb_adid')[0] === bidData.hb_adid
+      ) {
+        if (bidData.nurl) navigator.sendBeacon(bidData.nurl)
+        if (bidData.burl) navigator.sendBeacon(bidData.burl)
+      }
     })
+
+    googletag.pubads().refresh()
   })
 }
 ```
 
-**Why slot definition happens before bid fetch resolves:** GPT slot definition is
-synchronous and cheap. Defining slots early lets GPT prepare iframes and start any
-internal work that doesn't require ad server response. `refresh()` is the call that
-actually triggers the GAM ad request — that's the one we delay until bids arrive.
+#### Phase B: lazy slim-Prebid for refresh and identity warm-up
 
-**Failure modes:**
+After `window.load`, tsjs lazy-loads a stripped-down Prebid bundle (_slim-Prebid_) in
+the background. This bundle has two responsibilities, neither on the user's critical
+path:
 
-- `/ts-bids` returns 404 (unknown rid, TTL expired) → `bidsPromise` resolves to `{}`,
-  `refresh()` fires without bid targeting, GAM falls back to its own auction. Same
-  graceful degradation as no-bid case.
-- `/ts-bids` network failure → caught, resolves to `{}`, same fallback.
-- Auction times out server-side → `/ts-bids` returns `{}`, same fallback.
+- Run **userID modules** to refresh identity provider tokens (ID5, sharedID, LiveRamp,
+  etc.). Tokens are written to first-party cookies that subsequent TS requests
+  harvest server-side and merge into the EC graph (see §4.8).
+- Register as the **auction handler for GPT scroll/refresh events**. When the
+  publisher's refresh policy fires (sticky-anchor refresh, viewability dwell, infinite
+  scroll), slim-Prebid runs a fresh client-side auction on refreshing slots and
+  applies new `hb_*` targeting before the publisher's `refresh()` trigger.
+
+Slim-Prebid is a **custom Prebid build** with bid adapters that TS handles
+server-side removed. Realistic bundle size with the major userID modules (ID5,
+sharedID, LiveRamp ATS, Lockr) and a minimal auction wrapper is ~80–120KB minified —
+meaningfully smaller than full Prebid (~250KB+) but not as small as a pure shim.
+Bundle composition is open (see §9.8).
+
+**Slot ownership signal:** `ts_initial=1` on initial-rendered slots distinguishes
+TS-served impressions from Prebid-served refresh impressions. Slim-Prebid checks for
+this key on refresh; it clears the key when re-targeting (the refresh impression is
+Prebid-served, not TS-served) and runs its own client-side auction. GAM line-item
+attribution and reporting can use this sentinel to separate the two streams.
 
 This script is part of the existing `gpt` integration bundle
-(`crates/js/lib/src/integrations/gpt/index.ts`), extending the existing GPT shim.
-Injected via the `gpt` head injector alongside `window.__ts_ad_slots`.
+(`crates/js/lib/src/integrations/gpt/index.ts`). The lazy slim-Prebid loader is a new
+sibling module loaded post-`window.load`.
+
+#### Failure modes
+
+- **`__ts_bids = {}`** (auction watchdog fired or zero bids above floor): GPT runs
+  without bid targeting; GAM falls back to its own auction. Same graceful degradation
+  path as a no-bid scenario today.
+- **`__ts_bids` missing entirely** (consent denied, bot UA, no slot match): same
+  fallback, plus the page proceeds with no TS ad stack at all.
+- **slim-Prebid fails to load:** refresh auctions don't fire; initial-render
+  impressions unaffected. Publisher's existing GPT refresh logic (if any) takes over.
+- **`__tsAdInit` not yet defined when `</body>` script executes:** the shim is loaded
+  via the `gpt` integration bundle which is part of the head injection — this is a
+  build-time invariant, not a runtime risk.
 
 ### 4.7 Caching Behavior
 
@@ -542,61 +603,155 @@ architecture is designed so that everything that can be cached, is.
 
 **What gets cached where:**
 
-| Asset                    | Cached at                        | Cacheability                                              |
-| ------------------------ | -------------------------------- | --------------------------------------------------------- |
-| Origin HTML              | Fastly edge HTTP cache           | Yes, if origin sends `Cache-Control: public, max-age=...` |
-| Origin CSS / fonts / JS  | Fastly edge + browser            | Yes (typically hashed URLs, immutable)                    |
-| `tsjs` bundle            | Fastly edge + browser            | Yes (already content-hashed via `bundle.rs`, immutable)   |
-| `__ts_ad_slots` payload  | Could be precomputed per pattern | In-memory match is sub-millisecond — not worth caching    |
-| `__ts_request_id`        | **Never**                        | Per-request UUID, minted at request receipt               |
-| Bid results (`/ts-bids`) | In-process `bid_cache`, 30s TTL  | Per-request, never shared across users                    |
+| Asset                   | Cached at                          | Cacheability                                              |
+| ----------------------- | ---------------------------------- | --------------------------------------------------------- |
+| Origin HTML             | Fastly edge HTTP cache             | Yes, if origin sends `Cache-Control: public, max-age=...` |
+| Origin CSS / fonts / JS | Fastly edge + browser              | Yes (typically hashed URLs, immutable)                    |
+| `tsjs` bundle           | Fastly edge + browser              | Yes (already content-hashed via `bundle.rs`, immutable)   |
+| `__ts_ad_slots` payload | Computed per-request               | Sub-millisecond match — not worth caching                 |
+| `__ts_bids` payload     | Live result of per-request auction | Per-user, never shared                                    |
+| Assembled HTML response | Browser disk cache + BFCache only  | `private, max-age=0` — same-user only, never shared       |
 
 **Architecture:**
 
-1. Fastly's built-in HTTP cache stores the **origin response** keyed by URL. TS
-   does not implement its own HTML caching layer — it leverages the existing
-   Fastly cache.
-2. On request: TS reads from cache (cache hit, ~5ms) or fetches from origin
-   (cache miss, ~150ms typical).
-3. TS injects `__ts_ad_slots` + `__ts_request_id` at the `<head>` open via the
-   existing `el.prepend()` head handler. This injection is per-request — origin
-   HTML in cache is unmodified.
-4. TS forces `Transfer-Encoding: chunked` and streams the assembled response
-   to the browser.
-5. The auction runs in parallel regardless of HTML cache state — bids land in
-   `bid_cache` keyed by `request_id`, served via `/ts-bids` when the client
-   fetches.
+1. Fastly's built-in HTTP cache stores the **origin response** keyed by URL, governed
+   by the origin's own `Cache-Control` headers. TS does not implement its own HTML
+   caching layer — it leverages the existing Fastly cache.
+2. On request: TS reads from cache (cache hit, ~5ms) or fetches from origin (cache
+   miss, ~150ms typical).
+3. TS injects `__ts_ad_slots` at `<head>` open and `__ts_bids` before `</body>` per
+   request. **The cached origin entry is never modified** — modifications happen on
+   the per-request assembled response only.
+4. The auction runs in parallel regardless of HTML cache state.
 
-The `bid_cache` (per-request bid results) and Fastly's HTML cache are
-**independent systems**. HTML cache hit/miss does not affect auction firing;
-auction firing does not affect HTML caching.
+**`Cache-Control` directive on the assembled response:**
 
-**`Cache-Control` handling:**
+TS sets **`Cache-Control: private, max-age=0`** on the browser-facing response. This:
 
-TS preserves the origin's `Cache-Control` header on the response sent to the
-browser, with one override: when `__ts_request_id` is injected (any matched
-page), TS sets `Cache-Control: private, no-store` on the **browser-facing**
-response to prevent intermediate caches or the browser from caching the
-per-user assembled HTML. The Fastly edge cache for the **origin** response is
-unaffected — TS reads the cached origin HTML and assembles a fresh per-request
-response on every hit.
+- **`private`** prevents intermediate-cache leaks. Per-user bid data must never be
+  served from a shared cache to a different user.
+- **`max-age=0`** forces revalidation on hard reload. A fresh request gets a fresh
+  auction.
+- **(deliberately not `no-store`)** preserves browser BFCache eligibility. Chrome and
+  Firefox treat `no-store` as a hard ineligibility signal for the back/forward cache,
+  which provides instant restore on back-button navigation. Losing BFCache is a real
+  UX downgrade for navigation-heavy sites (news, recirculation, "next article"
+  flows).
 
-`Surrogate-Control` and `Fastly-Surrogate-Control` headers from origin are
-preserved (they control Fastly's cache, not the browser's).
+**Why `no-store` was rejected:** the threats `no-store` would mitigate beyond
+`private` are (a) browser disk cache cross-OS-user leaks (rare; same exposure as any
+per-user HTML today, e.g., logged-in pages) and (b) BFCache restoration showing stale
+bid data — but BFCache restoration replays the already-rendered ad without firing a
+new GAM call, so stale bids are inert. Trading BFCache instant-restore for these two
+marginal threats is a net loss.
 
-**When caching doesn't apply:**
+**Headers stripped on the way out:**
 
-- **Logged-in users** — origin typically returns `Cache-Control: private`. Falls
-  back to cache-miss timing (full origin fetch).
-- **Personalized SSR** (per-user content, A/B test variants) — same.
-- **Dynamic NextJS routes without ISR** — origin sends `Cache-Control: no-store`
-  or short max-age. Falls back to cache-miss timing.
+- `Surrogate-Control` and `Fastly-Surrogate-Control` from origin — these would
+  override `Cache-Control` for downstream Fastly-aware caches.
+
+`Cache-Control` from origin on the **origin response stored in the Fastly edge cache**
+is preserved — that's how Fastly knows when to serve cached origin HTML to the next
+request. Only the **browser-facing assembled response** carries `private, max-age=0`.
+
+The `bid_cache` and `request_id` machinery from the prior revision is **gone** — bids
+travel inline with the HTML response, not via a separate fetch.
+
+**When caching doesn't apply (origin-side):**
+
+- **Logged-in users** — origin typically returns `Cache-Control: private`. Falls back
+  to cache-miss timing (full origin fetch).
+- **Personalized SSR** — same.
+- **Dynamic NextJS routes without ISR** — origin sends `Cache-Control: no-store` or
+  short max-age. Falls back to cache-miss timing.
 - **First request after deploy or cache purge** — cold cache, full origin fetch.
 - **Long-tail URLs** — low cache hit rate, treat as cache-miss case.
 
-For typical news / content publisher sites with anonymous visitors on stable
-content pages, expect 70–90%+ edge cache hit rate. The cache-hit timing in §5
-is the realistic common case, not the optimistic best case.
+For typical news / content publisher sites with anonymous visitors on stable content
+pages, expect 70–90%+ Fastly edge cache hit rate. The cache-hit timing in §5 is the
+realistic common case.
+
+### 4.8 Identity Model
+
+The server-side auction's CPM uplift depends materially on the identity decoration of
+`user.eids` in the bid stream. **TS does not collect identity in the auction critical
+path** — identity is _retrieved_ from the EC KV graph at request time and _enriched_
+asynchronously through three sync paths.
+
+> **Reference:** This section summarizes the identity dependency for auction purposes.
+> Full identity architecture, partner sync flows, and Phase A/B tier model live in the
+> separate _Identity Resolution_ design (forthcoming).
+
+#### EC graph as load-bearing input
+
+At request time, before firing the auction:
+
+1. TS resolves the `ts-ec` cookie or generates a new EC ID
+   (HMAC-SHA256(IP, publisher_passphrase)).
+2. KV lookup against `ec_store` retrieves the enriched EID set bound to the EC ID
+   (partner UIDs from sync paths described below).
+3. EIDs are decorated into `AuctionRequest.user.eids` and forwarded to PBS + APS.
+
+The EC graph is populated by three sync paths (all running off the auction critical
+path):
+
+- **Pixel sync (browser → TS)** — `/identify` endpoint receives partner-resolved IDs
+  via image-pixel or postMessage flows from the publisher's site.
+- **S2S batch push (partner → TS)** — partners push EID sets keyed by IP or hashed
+  email to TS via authenticated S2S endpoints.
+- **S2S pull (TS → partner)** — TS resolves EC IDs against partner databases (IP graph,
+  bid-stream history) on a scheduled batch interval.
+
+#### Phase A vs Phase B identity
+
+| Phase   | When                          | Source                                                                                                | Effect                               |
+| ------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Phase A | Auction critical path         | EC + KV + Tier 1 server-side providers (SharedID 1P cookie, UID2 server SDK, LiveRamp ATS API, Lockr) | Decorates _this_ auction             |
+| Phase B | Post-`window.load` (off path) | slim-Prebid userID modules (ID5, ATSv2 envelope, Criteo ID, etc.)                                     | Enriches EC graph for _next_ request |
+
+Phase A adds **no auction latency** — KV lookup happens in parallel with origin
+fetch and slot match, sub-millisecond once the EC ID is resolved. Phase B is
+fire-and-forget after first paint and benefits subsequent navigations.
+
+#### Bare-EC first-impression caveat
+
+A user with no prior interaction with the EC graph (truly new EC, no federated
+consortium hit, no prior partner sync) gets an auction with **bare identity** on the
+very first impression of the EC's lifetime. Subsequent impressions are enriched as
+Phase B and partner sync paths populate the graph. The duration of the bare window
+depends on partner sync cadence:
+
+- Pixel sync fires on next `/identify` call — usually within seconds of first paint.
+- S2S batch push is partner-scheduled — minutes to hours.
+- S2S pull is TS-scheduled — minutes to hours.
+
+**Measurement:** the auction emits an `auction_eid_count` metric (number of EIDs
+decorated per auction). Distribution of this metric vs revenue uplift validates the
+identity coverage / CPM relationship in production. A high-volume zero-EID tail
+signals that partner sync paths need acceleration.
+
+#### Federated-consortium passphrase
+
+EC = HMAC(IP, passphrase). Publishers sharing a passphrase share an EC graph. A user
+new to publisher A but known to publisher B (using the shared passphrase) hits a
+**populated graph** on first request to A. This shrinks the bare-EC cohort
+meaningfully for publishers participating in a consortium. Operationally, this
+requires data-sharing agreements between consortium members — a contractual surface,
+not a technical one.
+
+#### Clickstream-compounding property
+
+Every full page navigation in a user's session is an independent TS-accelerated
+server-side auction. A user reading article 1 → article 2 → article 3 gets three
+independent auctions, each decorated with the EID set the EC graph held at that
+moment. The speed win and the identity decoration **compound across the clickstream**
+rather than being a session-start one-time benefit.
+
+**SPA caveat:** pure client-side SPAs that route via `pushState` without issuing an
+HTML request do not re-trigger TS. All slots on SPA-routed views rely on slim-Prebid
+for both auction and identity. Streaming-SSR setups (Next.js App Router, etc.) that
+emit HTTP requests on route changes get the full TS-accelerated auction per route.
+See §8.
 
 ---
 
@@ -623,15 +778,13 @@ sequenceDiagram
 
     B->>E: GET ts.publisher.com/article
 
-    Note over E: t=1ms — URL → slots match<br/>Mint request_id (UUID)<br/>Check consent
+    Note over E: t=1ms — URL → slots match<br/>EC cookie → KV EID enrichment<br/>Consent + bot/prefetch gating
 
     par Auction kicks off server-side
-        E->>A: POST bid requests<br/>(PBS + APS in parallel)
+        E->>A: POST bid requests<br/>(PBS + APS in parallel)<br/>user.eids decorated from KV
         A->>S: Fan out to all SSPs
         S-->>A: Bids return
-        A-->>E: Aggregated bid responses<br/>(t=502ms)
-        Note over E: Cache bids in bid_cache<br/>(keyed by request_id, 30s TTL)
-        E->>S: Fire nurl (fire-and-forget)<br/>for winning bids
+        A-->>E: Aggregated bid responses<br/>(t≤A_deadline, ~502ms)
     and Origin HTML lookup
         E->>C: Lookup origin HTML by URL
         alt Cache HIT (typical for content pages)
@@ -643,28 +796,25 @@ sequenceDiagram
         end
     end
 
-    Note over E: Force Transfer-Encoding: chunked<br/>Inject __ts_ad_slots + __ts_request_id<br/>at <head> open<br/>Set Cache-Control: private, no-store
+    Note over E: Force Transfer-Encoding: chunked<br/>Inject __ts_ad_slots at <head> open<br/>Cache-Control: private, max-age=0
 
-    E-->>B: Stream HTML chunks (no auction wait)
+    E-->>B: Stream <head> + body chunks (no hold)
 
-    Note over B: TTFB: ~10ms (hit) / ~155ms (miss)<br/>Browser parses <head><br/>CSS, fonts, tsjs download<br/>(also from Fastly + browser cache)
+    Note over B: TTFB: ~10ms (hit) / ~155ms (miss)<br/></head> flushes immediately<br/>Body parsing begins
 
-    Note over B: </head> flushes immediately<br/>Body parsing begins<br/>🎨 FCP: ~80ms (hit) / ~250ms (miss)
+    Note over B: 🎨 FCP: ~80ms (hit) / ~250ms (miss)
 
-    Note over B: tsjs bundle executes<br/>t=130ms (hit) / t=300ms (miss)<br/>__tsAdInit() defines GPT slots<br/>(no GAM call yet)
+    Note over E: At </body>: hold close tag until<br/>auction_complete OR A_deadline<br/>(bounded by auction_timeout_ms)
 
-    B->>E: GET /ts-bids?rid=<request_id>
-
-    alt Auction already complete (typical on cache-hit pages)
-        Note over E: bid_cache hit — return immediately
-        E-->>B: Bid targeting JSON<br/>(hb_pb, hb_bidder, hb_adid, burl)
-    else Auction still running
-        Note over E: Long-poll — block until<br/>auction completes or A_deadline
-        A-->>E: Bids arrive
-        E-->>B: Bid targeting JSON<br/>(or {} on timeout)
+    alt Auction completes before A_deadline
+        Note over E: Inject __ts_bids JSON before </body><br/>Emit </body>
+    else A_deadline fires first (auction overrun)
+        Note over E: Inject __ts_bids = {} (graceful fallback)<br/>Emit </body>
     end
 
-    Note over B: Bids received (~30ms RTT)<br/>setTargeting(hb_*) per slot<br/>Register slotRenderEnded listener<br/>googletag.pubads().refresh() fires
+    E-->>B: </body> chunk arrives
+
+    Note over B: tsjs executes (DCL fires)<br/>__tsAdInit reads __ts_bids inline<br/>Defines GPT slots + applies hb_* targeting<br/>Sets ts_initial=1 sentinel<br/>Registers slotRenderEnded listener<br/>googletag.pubads().refresh() fires
 
     B->>G: GET /gampad/ads<br/>with hb_* key-values
 
@@ -677,14 +827,15 @@ sequenceDiagram
     Note over B: 🎯 Creative paints<br/>slotRenderEnded event fires<br/>__tsAdInit checks hb_adid match
 
     alt Our Prebid bid won the GAM line item match
-        B->>S: Fire burl (navigator.sendBeacon)<br/>SSP confirms billable impression
+        B->>S: navigator.sendBeacon(nurl)<br/>navigator.sendBeacon(burl)
     else Direct deal / backfill won (hb_adid mismatch or empty)
-        Note over B: No burl fired — our bid lost<br/>(correct behavior — different creative rendered)
+        Note over B: No nurl/burl fired (correct — different creative rendered)
     end
 
-    Note over B: window.load fires<br/>(page fully loaded)
+    Note over B: window.load fires
+    Note over B: Phase B: lazy slim-Prebid loads<br/>(userID modules + refresh handler)<br/>(off critical path)
 
-    Note over B,G: ✅ AD VISIBLE<br/>Cache hit: ~900ms total<br/>Cache miss: ~1,050ms total<br/>FCP: ~80ms (hit) / ~250ms (miss)<br/><br/>vs client-side today: ~3,250ms ad-visible / FCP ~500ms+
+    Note over B,G: ✅ AD VISIBLE<br/>Cache hit: ~870ms total<br/>Cache miss: ~1,020ms total<br/>FCP: ~80ms (hit) / ~250ms (miss)<br/><br/>vs client-side today: ~3,250ms ad-visible / FCP ~500ms+
 ```
 
 ### 5.2 Cache-Hit Sequence (typical for content publisher pages)
@@ -696,76 +847,83 @@ t=0ms     GET ts.publisher.com/article arrives at Fastly edge
 
 t=1ms     URL matched against creative-opportunities.toml
           Slots matched: [atf_sidebar_ad, below-content-ad, section_ad]
-          Consent check: TCF consent present → auction proceeds
-          Request ID minted: 550e8400-e29b-41d4-a716-446655440000
+          EC cookie resolved → KV lookup for EID enrichment
+          Consent: TCF Purpose 1 present → auction proceeds
+          Bot/prefetch gates: pass
 
 t=2ms     AuctionOrchestrator.run_auction() dispatched (parallel)
           PBS + APS dispatched in parallel via send_async()
+          user.eids decorated from KV graph
           Edge→PBS RTT: ~20–30ms
           Fastly cache lookup dispatched in parallel
-          __ts_ad_slots + __ts_request_id <script> assembled from config
+          __ts_ad_slots <script> assembled from config
 
 t=5ms     Cache HIT — origin HTML retrieved from Fastly edge cache
           TS forces Transfer-Encoding: chunked
-          <head> open chunk: TS injects __ts_ad_slots and __ts_request_id
-          Cache-Control: private, no-store set on response
-          Chunk forwarded to browser immediately
+          __ts_ad_slots injected at <head> open
+          Cache-Control: private, max-age=0 set on response
+          Stream begins to browser
 
-t=10ms    Browser receives first byte (TTFB ~10ms)
+t=10ms    Browser TTFB ~10ms
           CSS, fonts, framework JS, tsjs all begin downloading
-          (most also served from Fastly cache + browser cache)
+          (most also from Fastly cache + browser cache)
 
-t=60ms    </head> chunk flushes to browser (no auction wait)
+t=60ms    </head> chunk reaches browser (no hold)
           Body parsing begins immediately
-          FCP candidates start to render
 
 t=80ms    FIRST CONTENTFUL PAINT ✨ (auction never blocked rendering)
 
-t=130ms   tsjs bundle executes
-          __tsAdInit() reads __ts_ad_slots
-          fetch('/ts-bids?rid=...') dispatched (long-poll)
-          GPT slots defined synchronously (no GAM call yet)
+t=502ms   Server-side auction completes (≤500ms budget) or A_deadline fires
+          Winning bids selected; nurl/burl per slot included in __ts_bids
+          __ts_bids JSON injected before </body>
+          </body> emitted
+          (origin drained at t=5ms, so </body> was held ~497ms — DCL slip)
 
-t=502ms   Server-side auction completes (500ms budget) or A_deadline fires
-          Winning bids selected, nurl fired as background requests
-          Bids cached at edge by request_id (30s TTL)
-          /ts-bids long-poll resolves, response returned
-
-t=532ms   Browser receives /ts-bids response (~30ms RTT)
-          Bid targeting applied via gptSlot.setTargeting()
-          slotRenderEnded listener registered for burl
+t=510ms   </body> reaches browser
+          tsjs executes (DCL fires)
+          __tsAdInit reads __ts_bids inline (no fetch)
+          GPT slots defined; hb_* + ts_initial=1 targeting applied
+          slotRenderEnded listener registered
           googletag.pubads().refresh() fires
 
-t=652ms   GET /gampad/ads
+t=620ms   GET /gampad/ads (GAM RTT ~110ms)
 
-t=752ms   Creative fetch
+t=720ms   Creative fetch begins
 
-t=900ms   Creative sub-resources + paint; burl fired via slotRenderEnded
+t=870ms   Creative sub-resources + paint
+          slotRenderEnded fires; nurl + burl fired via sendBeacon
 
-          AD VISIBLE ~900ms
+          AD VISIBLE ~870ms
           FIRST CONTENTFUL PAINT ~80ms
+
+(post window.load — off critical path)
+~t=1,500ms   slim-Prebid lazy-loads
+             userID modules run, refresh 1P identity cookies
+             GPT refresh handler registered (off critical path)
 ```
 
 ### 5.3 Cache-Miss Sequence (cold cache, dynamic page, logged-in user)
 
-This is the worst case — first request to a URL after a deploy or cache purge,
-or a page that's marked uncacheable by origin (`Cache-Control: private`).
+Worst case — first request to a URL after a deploy or cache purge, or a page marked
+uncacheable by origin (`Cache-Control: private`).
 
 ```
 t=0ms     GET ts.publisher.com/article arrives at Fastly edge
-t=1ms     URL matched, request_id minted, consent checked
+t=1ms     URL matched, EC lookup, consent + gate checks
 t=2ms     Auction dispatched, origin fetch dispatched in parallel
 
 t=150ms   Origin HTML arrives at edge (cache miss — full origin RTT)
-          TS forces chunked encoding, injects __ts_ad_slots + __ts_request_id
+          TS forces chunked encoding, injects __ts_ad_slots at <head> open
           Stream begins to browser
 
-t=200ms   </head> reaches browser
+t=200ms   </head> reaches browser (no hold)
 t=250ms   FIRST CONTENTFUL PAINT
-t=300ms   tsjs executes, fetch /ts-bids
-t=502ms   Auction completes; /ts-bids resolves
-t=532ms   Bids in browser, refresh() fires
-t=1052ms  AD VISIBLE
+t=502ms   Auction completes; __ts_bids injected; </body> emitted
+          (origin drained at 150ms, auction at 502ms — </body> held ~352ms)
+t=512ms   </body> reaches browser; tsjs runs; refresh() fires
+t=622ms   GET /gampad/ads
+t=722ms   Creative fetch
+t=1,020ms AD VISIBLE
 ```
 
 ### 5.4 Key Timing Properties
@@ -774,42 +932,69 @@ t=1052ms  AD VISIBLE
 | ---------- | --------- | ---------- | ----------------- |
 | TTFB       | ~10ms     | ~155ms     | ~150–500ms        |
 | FCP        | ~80ms     | ~250ms     | ~500ms+           |
-| Ad visible | ~900ms    | ~1,050ms   | ~3,250ms          |
+| DCL        | ~510ms    | ~512ms     | ~700ms+           |
+| Ad visible | ~870ms    | ~1,020ms   | ~3,250ms          |
 
-- **The auction never blocks page rendering.** FCP is bounded by origin time
-  and browser parsing only — same as a page without TS in the ad path.
-- **Body content paints first; ads slot in after.** The page is responsive
-  and readable while ads finish loading.
-- **Cache-hit FCP under 100ms is achievable** for anonymous visitors on
-  stable content. This is the typical case for news publisher article pages.
+- **The auction never blocks FCP.** FCP is bounded by origin time and browser parsing
+  only — same as a page without TS in the ad path.
+- **Body content paints first; ads slot in after.** The page is responsive and
+  readable while ads finish loading.
+- **DCL is delayed by the auction hold** (up to `auction_timeout_ms`). Third-party
+  scripts hooked on DCL fire later by at most the hold duration. This is the explicit
+  trade-off for the speed win on ad-visible.
+- **Cache-hit FCP under 100ms is achievable** for anonymous visitors on stable content.
+  The typical case for news publisher article pages.
+- **Ad-visible converges across cache hit/miss** because the auction is the long pole
+  in both cases. Cache miss costs FCP, not ad-visible.
 
 ---
 
 ## 6. Performance Summary
 
-| Stage                      | Client-side today | TS cache hit | TS cache miss | Saving (cache hit) |
-| -------------------------- | ----------------- | ------------ | ------------- | ------------------ |
-| Origin HTML fetch          | ~150ms            | ~5ms         | ~150ms        | -145ms             |
-| Script load chain          | ~700ms            | ~40ms        | ~40ms         | -660ms             |
-| Script parse/JIT           | ~280ms            | ~10ms        | ~10ms         | -270ms             |
-| Sequential SDK hops        | ~200ms            | 0            | 0             | -200ms             |
-| Auction window             | ~1,500ms          | ~500ms       | ~500ms        | -1,000ms           |
-| `/ts-bids` round-trip      | 0                 | +30ms        | +30ms         | -                  |
-| GAM + creative             | ~570ms            | ~570ms       | ~570ms        | —                  |
-| **Ad visible (total)**     | **~3,250ms**      | **~900ms**   | **~1,050ms**  | **~2,350ms**       |
-| **First Contentful Paint** | ~500ms+           | **~80ms**    | **~250ms**    | **-420ms**         |
+| Stage                      | Client-side today | TS cache hit | TS cache miss | Saving (cache hit)  |
+| -------------------------- | ----------------- | ------------ | ------------- | ------------------- |
+| Origin HTML to browser     | ~150ms            | ~10ms TTFB   | ~155ms TTFB   | parallel w/ auction |
+| Script load chain          | ~700ms            | ~40ms        | ~40ms         | -660ms              |
+| Script parse/JIT           | ~280ms            | ~10ms        | ~10ms         | -270ms              |
+| Sequential SDK hops        | ~200ms            | 0            | 0             | -200ms              |
+| Auction window             | ~1,500ms          | ~500ms       | ~500ms        | -1,000ms            |
+| GAM + creative             | ~570ms            | ~360ms       | ~360ms        | -210ms              |
+| **Ad visible (wall)**      | **~3,250ms**      | **~870ms**   | **~1,020ms**  | **~2,380ms**        |
+| **First Contentful Paint** | ~500ms+           | **~80ms**    | **~250ms**    | **-420ms**          |
 
-The auction never blocks page rendering. FCP is bounded by origin time and browser
-parsing only — auction work happens entirely in parallel with origin fetch and body
-streaming. For typical content publisher pages with anonymous visitors (high cache
-hit rate), the cache-hit numbers are the realistic common case.
+> Components don't sum cleanly because of parallelism — auction + origin fetch run
+> concurrently, and the GAM + creative leg is post-body-close. The wall-clock totals
+> are what matter.
 
-The ~30ms `/ts-bids` round-trip cost is the only latency added vs a hypothetical
-head-injection design (which would block FCP and was rejected — see §4.3).
+**Compounding across the clickstream.** Every full page navigation in a user's session
+is an independent TS-accelerated server-side auction. The speed win and identity
+decoration compound across the clickstream rather than being a session-start one-time
+benefit. Modern engagement patterns (multi-article reads, recirculation modules,
+auto-advance "next article") mean a meaningful share of impressions are
+initial-slot impressions, not refresh impressions — exactly the surface this design
+optimizes.
 
-Auction RTT improvement: browser fires SSP requests at 80–150ms RTT; edge fires at
+**Auction RTT improvement.** Browser fires SSP requests at 80–150ms RTT; edge fires at
 20–30ms. Auction timeout can drop from 1,000–1,500ms to 500ms while still collecting
 more complete results, because edge→PBS latency is ~5–7x lower.
+
+**TS edge overhead.** TS adds processing on the request path: URL match, UUID-free
+gating, EC/KV lookup, head-script assembly, header rewrite, force-chunk. Estimated at
+≤5ms on warm Wasm isolates; to be measured in production. The §6 cache-hit numbers
+include this overhead.
+
+**Identity coverage caveat.** First-time visitors with no prior EC graph hit get a
+bare-identity auction on impression #1. CPM uplift on Tier 3 (browser-coupled) ID
+providers — ID5, ATSv2 envelope, Criteo ID, etc. — only lands on impression #2+ within
+an EC lifetime, after Phase B has populated 1P cookies for next-request harvest. The
+clickstream-compounding property means this dilution mostly resolves within the first
+few navigations of a new EC.
+
+**Confidence intervals.** The numbers above are point estimates against modeled
+assumptions (origin RTT, edge→PBS RTT, GAM RTT, creative weight). p95 ad-visible is
+likely 1.3–1.5x the median for slow networks and tail GAM/creative RTTs. Production
+measurement plan is to instrument each leg independently before claiming the headline
+saving.
 
 ---
 
@@ -817,19 +1002,18 @@ more complete results, because edge→PBS latency is ~5–7x lower.
 
 ### New
 
-- `creative-opportunities.toml` — slot template config file
+- `creative-opportunities.toml` — slot template config file at repo root
 - `crates/trusted-server-core/src/creative_opportunities.rs` — config types, TOML
-  parsing, URL glob matching, slot-to-`AdSlot` conversion, price bucketing
-- `crates/trusted-server-core/build.rs` — `include_str!()` for
-  `creative-opportunities.toml`; startup slot-ID validation
+  parsing, URL glob matching, slot-to-`AdSlot` conversion
 - `crates/trusted-server-core/src/price_bucket.rs` — Prebid price granularity tables
   (dense default; publisher-configurable); converts raw CPM `f64` to `hb_pb` string
-- `crates/trusted-server-core/src/bid_cache.rs` — in-process auction result cache keyed
-  by `request_id`, 30-second TTL, fixed-size LRU. Per-edge-instance only; no Fastly KV
-  writes on the hot path.
-- **`/ts-bids` endpoint** — new root-path GET endpoint. Long-poll: returns immediately
-  if cached, blocks until `A_deadline` if auction in flight. Returns `404` for unknown
-  request IDs. `Cache-Control: private, no-store`.
+- `crates/trusted-server-core/build.rs` updates — `include_str!()` for
+  `creative-opportunities.toml`; startup slot-ID validation
+- **slim-Prebid bundle build target** — custom Prebid build with TS-handled bid
+  adapters removed; bundled with `crates/js/lib/src/integrations/gpt/` and lazy-loaded
+  post-`window.load`. Bundle composition tracked in §9.8.
+- **Auction-eligibility gating** — bot UA list, prefetch hint detection, HEAD-method
+  short-circuit; runs before any auction work
 
 ### Modified
 
@@ -837,31 +1021,43 @@ more complete results, because edge→PBS latency is ~5–7x lower.
   - Convert `handle_publisher_request` from `fn` to `async fn`
   - Switch origin fetch from `.send()` to `.send_async()` (returns
     `PlatformPendingRequest`)
-  - Add `orchestrator: &AuctionOrchestrator` and `bid_cache: &BidCache` parameters
-  - Mint per-request UUID for `request_id`; pass into `__ts_ad_slots` injection
-  - Match slots, check consent, fire auction (writes result to `bid_cache` on
-    completion) and origin fetch concurrently. **Do not await the auction in the
-    page-handling path** — let it complete asynchronously and write to `bid_cache`.
+  - Add `orchestrator: &AuctionOrchestrator` parameter
+  - Apply auction-eligibility gates (consent, bot UA, prefetch, method, slot match)
+  - Resolve EC cookie → KV lookup for EID enrichment; decorate `user.eids` on
+    `AuctionRequest`
+  - Match slots, fire auction (returns a future), origin fetch in parallel
+  - Coordinate the `</body>` hold: shared auction-result state populated by the
+    auction task; close-tag handler reads from it; outer flow holds chunk emission
+    past `</body>` until the state is populated or `A_deadline` fires
   - Force chunked encoding on the response (strip `Content-Length`, set
     `Transfer-Encoding: chunked`)
-- **`crates/trusted-server-adapter-fastly/src/main.rs`** — update `route_request` call
-  site to `.await` the now-async publisher handler; pass orchestrator and bid_cache
-  references; add `/ts-bids` route handler
-- **`crates/trusted-server-core/src/html_processor.rs`** — inject
-  `window.__ts_ad_slots` and `window.__ts_request_id` at `<head>` open via existing
-  `el.prepend()` head handler. **No `</head>` injection — head flushes immediately.**
-  Set `Cache-Control: private, no-store` header on the response.
+- **`crates/trusted-server-adapter-fastly/src/main.rs`** — `.await` the now-async
+  publisher handler; pass orchestrator reference
+- **`crates/trusted-server-core/src/html_processor.rs`**:
+  - Inject `window.__ts_ad_slots` at `<head>` open via existing `el.prepend()` head
+    handler (no hold)
+  - Inject `window.__ts_bids` before `</body>` via lol_html's `el.on_end_tag()` on
+    the body element, reading from shared auction-result state
+  - Set `Cache-Control: private, max-age=0` on the assembled response
+  - Strip `Surrogate-Control` and `Fastly-Surrogate-Control` from the response
 - **`crates/trusted-server-core/src/integrations/gpt.rs`** — extend head injector to
-  emit `window.__ts_ad_slots` and `window.__ts_request_id` from matched slots; emit
-  `__tsAdInit` bootstrap script
+  emit `window.__ts_ad_slots` from matched slots; emit `__tsAdInit` bootstrap script
 - **`crates/js/lib/src/integrations/gpt/index.ts`** — add `__tsAdInit` function with
-  `/ts-bids` fetch + bidsPromise pattern + `slotRenderEnded` burl-firing logic
+  synchronous bid read, `slotRenderEnded` nurl + burl firing, `ts_initial` sentinel;
+  add lazy slim-Prebid loader scheduled for post-`window.load`
 - **`crates/trusted-server-core/src/integrations/prebid.rs`** — add
-  `fire_nurl_at_edge` config key; add nurl fire-and-forget call in orchestrator result
-  handling
+  `suppress_nurl` per-bidder config (default `false`); **no server-side nurl firing
+  in the page-load path** (firing is client-side from `slotRenderEnded`)
 - **`trusted-server.toml`** — add `[creative_opportunities]` section
 - **`crates/trusted-server-core/src/settings.rs`** — add `CreativeOpportunitiesConfig`
   to `Settings`
+
+### Deleted (relative to prior revision of this spec)
+
+- `crates/trusted-server-core/src/bid_cache.rs` — never created; in-process cache
+  approach was rejected
+- `/ts-bids` endpoint — never created
+- `request_id` UUID minting and `__ts_request_id` page injection — never created
 
 ### Unchanged
 
@@ -873,83 +1069,127 @@ more complete results, because edge→PBS latency is ~5–7x lower.
 
 ## 8. Edge Cases
 
-**No slots match the URL** — auction is not fired. Neither global is emitted. The page
-loads with no TS ad stack; existing client-side Prebid/GPT flow runs unmodified (for
-publishers in dual-mode rollout).
+**No slots match the URL** — auction is not fired. `__ts_bids` is omitted. The page
+renders with `__ts_ad_slots` still absent (no slots = no slot config to inject); no
+`</body>` hold. Existing client-side Prebid/GPT flow runs unmodified (for publishers
+in dual-mode rollout).
 
-**Consent absent or denied** — auction is not fired. Neither global is emitted.
-`Cache-Control: private, no-store` is still set (to prevent caching the consent-negative
-response if personalised ads were previously served). Page loads normally; GAM runs its
-own auction without Prebid targeting.
+**Consent absent or denied** — auction is not fired. `__ts_bids` is omitted; `</body>`
+flushes immediately on origin emit. `Cache-Control: private, max-age=0` is still set.
+Page loads normally; GAM runs its own auction without TS targeting.
 
-**Auction times out with partial results** — `/ts-bids` returns whatever bids arrived
-before `A_deadline`. Slots with no bid are omitted from the response. GPT fires without
-pre-set targeting for those slots; GAM falls back to its own auction for them.
+**Bot / crawler User-Agent** — auction skipped. `__ts_bids` omitted; `</body>` flushes
+immediately. SSP QPS budget preserved. Crawlers typically don't render JS, but if they
+do, GPT runs without TS targeting.
 
-**Auction times out with zero results** — `/ts-bids` returns `{}`. All slots fire GAM
-without bid targeting. No revenue impact beyond the timeout scenario itself.
+**Prefetch hint (`Sec-Purpose: prefetch` or `Purpose: prefetch`)** — auction skipped.
+Avoids burning auction inventory on speculative navigations that may never paint. If
+the user does click through, the actual click navigation is a fresh request and
+triggers a real auction.
+
+**HEAD request** — auction skipped; response carries headers only.
+
+**Auction times out with partial results (watchdog)** — `__ts_bids` includes whatever
+bids arrived before `A_deadline`. Slots with no bid are omitted. GPT fires without
+pre-set targeting for those slots; GAM falls back to its own auction.
+
+**Auction times out with zero results** — `__ts_bids = {}` injected. All slots fire
+GAM without bid targeting. No revenue impact beyond the timeout scenario itself.
 
 **Buffered origin (WordPress, Drupal, Rails, NextJS 14, static sites)** — origin
 returns full HTML in one response. TS strips `Content-Length`, sets
-`Transfer-Encoding: chunked`, and feeds the response through the streaming pipeline as
-chunks. From the browser's perspective, behavior is identical to a streaming origin.
-The auction runs in parallel with the (now-chunked) origin response; bids land in the
-edge `bid_cache` and are served via `/ts-bids` when the client fetches them.
+`Transfer-Encoding: chunked`, and feeds the response through the streaming pipeline
+as chunks. From the browser's perspective, behavior is identical to a streaming
+origin. The `</body>` hold mechanic is identical. Auction runs in parallel with
+origin response; usually completes around the same time origin drains.
 
 **Streaming origin (NextJS 16, Remix, SvelteKit with streaming)** — origin emits HTML
 chunks progressively. TS forwards them through the streaming pipeline directly. No
-buffering at the edge. `</head>` flushes the moment origin emits it. Same `/ts-bids`
-fetch pattern as buffered origins.
+buffering at the edge before `</body>`. The `</body>` hold mechanic is identical.
 
-**`/ts-bids` request with unknown `rid`** — request ID expired (>30s TTL), invalid
-format, or never created. Endpoint returns `404`. Client `bidsPromise` resolves to `{}`,
-GPT fires without pre-set targeting (graceful degradation).
+**SPA / pushState navigation** — pure client-side SPAs (CSR React/Vue, hashbang
+routing) don't issue an HTML request on route change, so TS never sees the
+navigation and no server-side auction fires for the new "page." All slots on
+SPA-routed views rely on slim-Prebid for both auction and identity. Streaming-SSR
+setups (Next.js App Router, etc.) that emit HTTP requests on route changes get the
+full TS-accelerated auction per route. The speed-win story differs by publisher
+architecture and should be confirmed during onboarding.
 
-**Slow origin** — auction has more time; results more likely to be complete by the time
-the client's `/ts-bids` fetch reaches the edge. No additional impact on FCP, which is
-already bounded by origin time.
+**Bare-EC first impression** — a new EC with no prior partner sync hits the auction
+with `user.eids = []`. Bid stream lacks Tier 3 identity; CPMs may be 10–30% lower than
+enriched impressions. Subsequent navigations populate the EC graph. Measure via the
+`auction_eid_count` distribution.
 
-**Client never fetches `/ts-bids`** — e.g., user navigates away before tsjs loads, or
-JS is disabled. The cache entry expires harmlessly after 30 seconds. `nurl` for
-winning bids has already fired server-side at bid-selection time, so SSP win counting
-is unaffected.
+**BFCache restoration** — user navigates back to a TS-served page. Browser restores
+the page from BFCache (eligible because we set `private, max-age=0`, not `no-store`).
+Already-rendered ads display from the BFCache snapshot; no new GAM call fires; no new
+auction needed. `__ts_bids` in JS heap is stale but inert. This is the desired
+behavior — instant back-button restore for the user.
+
+**Slow origin (origin drain > A_deadline)** — `</body>` waits for origin regardless
+of auction state. Auction has more wall-clock budget; results more likely complete by
+the time origin drains. No extra hold beyond origin drain.
+
+**Slim-Prebid fails to load** — refresh auctions don't fire; initial-render
+impressions are unaffected. Publisher's existing GPT refresh logic (if any) takes
+over. Phase B identity refresh doesn't happen for that session — EC graph staleness
+shifts to next session's S2S sync.
 
 **`creative-opportunities.toml` missing or malformed** — startup fails with a clear
 error. No silent degradation.
 
-**Config empty (zero slots)** — treated as "no match" for all URLs; auction never fires.
-No error. Useful as a kill-switch: deploying an empty `creative-opportunities.toml`
-disables the feature without a code change.
+**Config empty (zero slots)** — treated as "no match" for all URLs; auction never
+fires. No error. Useful as a kill-switch: deploying an empty
+`creative-opportunities.toml` disables the feature without a code change.
 
-**Slot ID not found in PBS stored requests** — PBS returns a no-bid for that slot. Slot
-is omitted from `__ts_bids`. The remaining slots proceed normally.
+**Slot ID not found in PBS stored requests** — PBS returns a no-bid for that slot.
+Slot is omitted from `__ts_bids`. The remaining slots proceed normally.
 
 ---
 
 ## 9. Open Questions
 
 1. **URL pattern coverage** — does `/20**` cover all article paths, or are there
-   non-date-prefixed article URLs? Publisher to confirm.
+   non-date-prefixed article URLs? Publisher to confirm per onboarding.
 2. **PBS stored request setup** — slot IDs in `creative-opportunities.toml` must have
-   corresponding stored requests configured in the publisher's PBS instance before this
-   goes live.
-3. **Homepage slot count** — the example shows slots 0 and 1. Are there additional slots
-   following the same pattern? Slot IDs and count to be confirmed with ad ops.
-4. **Auction timeout** — ✅ Resolved: new dedicated key
-   `[creative_opportunities].auction_timeout_ms` with fallback to `[auction].timeout_ms`.
+   corresponding stored requests configured in the publisher's PBS instance before
+   this goes live. Recommend a CI check or startup probe to PBS that lists stored
+   requests and diffs against the toml; tracked as a Phase 1 implementation item.
+3. **Homepage slot count** — the example shows slots 0 and 1. Are there additional
+   slots following the same pattern? Slot IDs and count to be confirmed with ad ops.
+4. **Auction timeout** — ✅ Resolved: dedicated key
+   `[creative_opportunities].auction_timeout_ms` with fallback to
+   `[auction].timeout_ms`. This value is also the upper bound on the `</body>` hold.
    Per-provider ceilings (`[integrations.prebid].timeout_ms`,
    `[integrations.aps].timeout_ms`) remain unchanged; the orchestrator's existing
    `min(remaining_budget, provider_timeout)` logic applies.
 5. **KV-backed config migration path** — Phase 1 ships with `include_str!()` for
-   simplicity and cost. When ad ops require live slot edits between deploys, the migration
-   path is: load from `services.kv_store()` at request time with a compiled-in fallback.
-   Design tracked as a follow-up before Phase 2.
-6. **Phase 2 server-side GAM** — The real latency ceiling is the GAM call
-   (`securepubads.g.doubleclick.net`). Phase 2 routes the GAM ad request through the edge
-   (securepubads proxy + creative bundling), eliminating the last browser→Google hop. The
-   Phase 1 architecture is designed to be shape-compatible with this: `__ts_ad_slots`
-   gives the edge the full slot inventory it needs to build a server-side GAM request.
-7. **`tsjs-gpt` bootstrap delivery** — ✅ Resolved: `__tsAdInit` is part of the existing
-   `gpt` integration bundle, not a new integration. Injection order: `window.__ts_ad_slots`
-   → existing GPT shim → `__tsAdInit` — all emitted by the `gpt` head injector in a single
-   `<script>` block, guaranteeing order before GPT.js loads.
+   simplicity and cost. When ad ops require live slot edits between deploys, the
+   migration path is: load from `services.kv_store()` at request time with a
+   compiled-in fallback. Design tracked as a follow-up.
+6. **Server-side GAM** — the real latency ceiling beyond the auction is the GAM call
+   (`securepubads.g.doubleclick.net`, ~110ms RTT). Routing GAM through the edge would
+   eliminate that hop, but it requires Google agreement which is a business
+   negotiation, not an engineering decision. **Aspirational, not committed for any
+   phase.** The current architecture is shape-compatible (`__ts_ad_slots` gives the
+   edge full slot inventory) so no rework would be required if Google agrees later.
+7. **`tsjs-gpt` bootstrap delivery** — ✅ Resolved: `__tsAdInit` is part of the
+   existing `gpt` integration bundle, not a new integration. Injection order:
+   `window.__ts_ad_slots` (head) → existing GPT shim → `__tsAdInit` (head) →
+   `window.__ts_bids` (body close). Bid script can rely on `__tsAdInit` and slot
+   config being defined.
+8. **slim-Prebid bundle composition** — which userID modules ship in the lazy bundle?
+   Default candidates: ID5, sharedID, LiveRamp ATS, Lockr. Each adds bundle weight
+   (~10–25KB each). Publisher per-deployment override should be possible. Bundle
+   target size is "as small as possible while covering the publisher's enabled
+   identity providers." Tracked as a slim-Prebid build-system item.
+9. **Privacy Sandbox interaction** — Topics API (`Sec-Browsing-Topics`) can be read at
+   the edge and decorated into the bid stream as a future enhancement. Protected
+   Audience (FLEDGE) is on-device by design and cannot move server-side; it runs in
+   parallel client-side via slim-Prebid (when supported). Out of scope for Phase 1
+   beyond this acknowledgment.
+10. **Per-bidder consent resolution** — Phase 1 gates on TCF Purpose 1 globally.
+    Real-world consent is per-vendor, per-purpose, and interacts with Google Consent
+    Mode, USP_v2, and GPP. A bidder may be allowed for some purposes but not others.
+    Phase 2 should specify per-bidder consent-resolution rules and partial-consent
+    behavior. Tracked as a follow-up before Phase 2.
