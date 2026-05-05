@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Enable the Fastly edge to fire a full header-bidding auction (PBS + APS) in parallel with the origin fetch, injecting `window.__ts_ad_slots` and `window.__ts_request_id` into `<head>`, then serving cached bid results via a new `/ts-bids` endpoint so the client can drive GPT directly — without Prebid.js and without blocking page rendering.
+**Goal:** Enable the Fastly edge to fire a full header-bidding auction (PBS + APS) in parallel with the origin fetch, inject `window.__ts_ad_slots` into `<head>`, then inject `window.__ts_bids` inline before `</body>` so the client drives GPT directly — without Prebid.js and without blocking FCP.
 
-**Architecture:** A new `creative-opportunities.toml` holds per-URL slot templates. At request time, the publisher path matches the URL, mints a UUID (`request_id`), and fires the auction + origin fetch concurrently via `send_async()`. Only `window.__ts_ad_slots` and `window.__ts_request_id` are injected at `<head>` open — **`</head>` flushes immediately with no auction wait**. When the auction completes, results are stored in a new in-process `BidCache` keyed by `request_id`. The browser's tsjs bundle fetches `GET /ts-bids?rid=<request_id>` to retrieve bid targeting; this endpoint long-polls until the auction completes or the deadline fires.
+**Architecture:** A new `creative-opportunities.toml` holds per-URL slot templates. At request time the publisher path matches the URL and fires the auction + origin fetch concurrently via `send_async()`. `window.__ts_ad_slots` is injected at `<head>` open with no auction wait. The `</body>` close tag is held — bounded by `A_deadline` — until the auction completes or times out; `window.__ts_bids` is then injected inline before the close tag so bids and HTML travel together in a single response. The client's `__tsAdInit` reads `window.__ts_bids` synchronously (no fetch, no Promise) and drives GPT. Both `nurl` and `burl` fire client-side from `slotRenderEnded` to avoid billing inflation. A slim-Prebid bundle lazy-loads post-`window.load` for refresh auctions and identity warm-up.
 
-**Tech Stack:** Rust 2024, `lol_html` 2.7.2 (existing), `glob` crate (new workspace dep), `serde`/`toml` (existing), `uuid` v4 (existing workspace dep), `std::sync::Mutex` + `std::time::Instant` for in-process cache (30s TTL), `AuctionOrchestrator::run_auction` (existing `async fn`), TypeScript for GPT shim extension.
+**Tech Stack:** Rust 2024, `lol_html` 2.7.2 (existing), `glob` crate (new workspace dep), `serde`/`toml` (existing), `std::sync::{Arc, RwLock}` for within-request shared auction state, `AuctionOrchestrator::run_auction` (existing `async fn`), TypeScript for GPT shim extension.
+
+> **Phase 1 streaming note:** The spec describes true streaming where body content above `</body>` paints before the auction completes. Implementing this with lol_html's synchronous callback model requires a complex outer streaming loop (emit chunks as they arrive from origin; hold only the `</body>` chunk until auction resolves). Phase 1 uses a simpler approach: await the auction (or `A_deadline`) before processing origin HTML through lol_html, then send the fully assembled response. This still delivers the server-side auction benefit and achieves the same ad-visible latency target (~870ms cache hit). The FCP claim (~80ms) of the spec requires the streaming approach and is tracked as a Phase 2 optimization. The shared `Arc<RwLock<Option<String>>>` is the correct coordination primitive either way — the Phase 2 upgrade path only changes when the auction is awaited relative to lol_html processing.
 
 ---
 
@@ -19,24 +21,29 @@
 | `creative-opportunities.toml`                              | Slot template definitions (page patterns, formats, floor prices, per-provider params)       |
 | `crates/trusted-server-core/src/creative_opportunities.rs` | Config types, TOML parsing, URL glob matching, slot→`AdSlot` conversion, startup validation |
 | `crates/trusted-server-core/src/price_bucket.rs`           | Prebid price granularity tables; converts `f64` CPM to `hb_pb` string                       |
-| `crates/trusted-server-core/src/bid_cache.rs`              | In-process auction result cache keyed by `request_id`; 30s TTL; long-poll via blocking poll |
 
 ### Modified files
 
-| File                                                    | Change summary                                                                                                                                                                                                          |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Cargo.toml`                                            | Add `glob = "0.3"` to `[workspace.dependencies]`                                                                                                                                                                        |
-| `crates/trusted-server-core/Cargo.toml`                 | Add `glob = { workspace = true }`                                                                                                                                                                                       |
-| `crates/trusted-server-core/src/auction/types.rs`       | Add `MediaType::banner()` constructor; add `ad_id: Option<String>` to `Bid`                                                                                                                                             |
-| `crates/trusted-server-core/src/settings.rs`            | Add `creative_opportunities: Option<CreativeOpportunitiesConfig>` to `Settings`                                                                                                                                         |
-| `trusted-server.toml`                                   | Add `[creative_opportunities]` section                                                                                                                                                                                  |
-| `crates/trusted-server-core/build.rs`                   | Validate slot IDs at build time using inline regex (no module import)                                                                                                                                                   |
-| `crates/trusted-server-core/src/html_processor.rs`      | Add `ad_slots_script: Option<String>` (contains both `__ts_ad_slots` + `__ts_request_id`) to `HtmlProcessorConfig`; inject at head-open only — **no `</head>` hold**                                                    |
-| `crates/trusted-server-core/src/publisher.rs`           | Convert `handle_publisher_request` to `async fn`; add `orchestrator` + `bid_cache` params; fire auction + origin concurrently; write result to `bid_cache`; inject head globals; set `Cache-Control` when slots matched |
-| `crates/trusted-server-adapter-fastly/src/main.rs`      | Await the now-async handler; pass orchestrator + bid_cache references; add `/ts-bids` route handler (long-poll, returns bid JSON from `bid_cache`)                                                                      |
-| `crates/trusted-server-core/src/integrations/gpt.rs`    | Extend `head_inserts()` to emit `__tsAdInit` that fetches `/ts-bids?rid=<request_id>` and applies bid targeting after resolution                                                                                        |
-| `crates/js/lib/src/integrations/gpt/index.ts`           | Add `installTsAdInit` with `/ts-bids` fetch + `bidsPromise` pattern + `slotRenderEnded` burl-firing logic                                                                                                               |
-| `crates/trusted-server-core/src/integrations/prebid.rs` | Add `fire_nurl_at_edge` config key; fire nurl fire-and-forget after auction                                                                                                                                             |
+| File                                                    | Change summary                                                                                                                                                                                                       |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Cargo.toml`                                            | Add `glob = "0.3"` to `[workspace.dependencies]`                                                                                                                                                                     |
+| `crates/trusted-server-core/Cargo.toml`                 | Add `glob = { workspace = true }`                                                                                                                                                                                    |
+| `crates/trusted-server-core/Cargo.toml` (build-deps)    | Verify `regex` is listed under `[build-dependencies]` (needed for slot-ID validation in `build.rs`)                                                                                                                  |
+| `crates/trusted-server-core/src/auction/types.rs`       | Add `MediaType::banner()` constructor; add `ad_id: Option<String>` to `Bid`                                                                                                                                          |
+| `crates/trusted-server-core/src/settings.rs`            | Add `creative_opportunities: Option<CreativeOpportunitiesConfig>` to `Settings`                                                                                                                                      |
+| `trusted-server.toml`                                   | Add `[creative_opportunities]` section                                                                                                                                                                               |
+| `crates/trusted-server-core/build.rs`                   | Validate slot IDs at build time using inline TOML parse; `rerun-if-changed` for `creative-opportunities.toml`                                                                                                        |
+| `crates/trusted-server-core/src/html_processor.rs`      | Add `ad_slots_script: Option<String>` (head) and `ad_bids_script: Arc<RwLock<Option<String>>>` (body) to `HtmlProcessorConfig`; inject at `<head>` open and via `el.on_end_tag()` on body element                    |
+| `crates/trusted-server-core/src/publisher.rs`           | Convert to `async fn`; add eligibility gates (bot UA, prefetch, HEAD); EID decoration; shared `AuctionBidState`; inject `__ts_bids` before `</body>`; `Cache-Control: private, max-age=0`; strip `Surrogate-Control` |
+| `crates/trusted-server-adapter-fastly/src/main.rs`      | Await the now-async handler; pass orchestrator reference; no `/ts-bids` route                                                                                                                                        |
+| `crates/trusted-server-core/src/integrations/gpt.rs`    | Extend `head_inserts()` to emit `__tsAdInit` that reads `window.__ts_bids` synchronously; `ts_initial=1` sentinel; nurl+burl from `slotRenderEnded`                                                                  |
+| `crates/js/lib/src/integrations/gpt/index.ts`           | Synchronous `__tsAdInit` with `window.__ts_bids` read; nurl+burl `sendBeacon`; lazy slim-Prebid loader post-`window.load`                                                                                            |
+| `crates/trusted-server-core/src/integrations/prebid.rs` | Add `suppress_nurl: bool` config (default `false`) as per-bidder escape hatch; remove server-side nurl firing                                                                                                        |
+
+### Deleted (relative to prior revision of this spec)
+
+- `crates/trusted-server-core/src/bid_cache.rs` — never created; in-process cache rejected because Fastly Compute per-request Wasm isolates are not pinned across requests
+- `/ts-bids` endpoint — never created; body-injection replaces the fetch pattern
 
 ---
 
@@ -104,8 +111,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   Create `crates/trusted-server-core/src/price_bucket.rs` with only the tests:
 
   ```rust
-  //! Prebid price granularity bucketing.
-
   #[cfg(test)]
   mod tests {
       use super::*;
@@ -177,14 +182,8 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 - [ ] **Step 2: Implement price_bucket.rs**
 
   ```rust
-  //! Prebid price granularity bucketing.
-  //!
-  //! Converts a raw CPM to the `hb_pb` price bucket string sent to GAM as targeting.
-  //! Mirrors Prebid.js built-in granularity tables exactly.
-
   use serde::{Deserialize, Serialize};
 
-  /// Prebid price granularity setting.
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
   #[serde(rename_all = "lowercase")]
   pub enum PriceGranularity {
@@ -197,13 +196,11 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   }
 
   impl PriceGranularity {
-      /// Returns the `Dense` variant — used as a `#[serde(default = ...)]` fn pointer.
       pub fn dense() -> Self {
           Self::Dense
       }
   }
 
-  /// Convert a raw CPM (`f64`) to the `hb_pb` price bucket string.
   pub fn price_bucket(cpm: f64, granularity: PriceGranularity) -> String {
       if cpm <= 0.0 {
           return "0.00".to_string();
@@ -265,8 +262,9 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/auction/types.rs`
+- Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
 
-`CreativeOpportunityFormat` uses `#[serde(default = "MediaType::banner")]` which requires a free function. Add `ad_id: Option<String>` to `Bid` for `hb_adid` targeting.
+`CreativeOpportunityFormat` uses `#[serde(default = "MediaType::banner")]` which requires a free function. Add `ad_id: Option<String>` to `Bid` for `hb_adid` targeting. The `suppress_nurl` config escape hatch is also added here to `PrebidConfig`.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -307,7 +305,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 
   ```rust
   impl MediaType {
-      /// Returns `Banner` — used as a `#[serde(default = ...)]` fn pointer.
       pub fn banner() -> Self {
           Self::Banner
       }
@@ -321,7 +318,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   Run: `cargo test -p trusted-server-core auction`
   Expected: all tests pass
 
-- [ ] **Step 4: Update prebid.rs to populate `ad_id`**
+- [ ] **Step 4: Populate `ad_id` in prebid.rs**
 
   In `crates/trusted-server-core/src/integrations/prebid.rs`, in the `Bid` construction, find where `nurl` and `burl` are set and add:
 
@@ -332,14 +329,36 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       .map(String::from),
   ```
 
-  (Prebid Server uses lowercase `adid` in bid objects, not `adId`. Fall back to `id` if absent.)
+  (Prebid Server uses lowercase `adid`. Fall back to `id` if absent.)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add `suppress_nurl` to `PrebidConfig`**
+
+  In `prebid.rs`, add to the `PrebidConfig` struct:
+
+  ```rust
+  #[serde(default)]
+  pub suppress_nurl: bool,
+  ```
+
+  Write a test:
+
+  ```rust
+  #[test]
+  fn prebid_config_suppress_nurl_defaults_to_false() {
+      let config = PrebidConfig::default();
+      assert!(!config.suppress_nurl, "should not suppress nurl by default");
+  }
+  ```
+
+  Run: `cargo test -p trusted-server-core integrations::prebid`
+  Expected: passes
+
+- [ ] **Step 6: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/auction/types.rs \
           crates/trusted-server-core/src/integrations/prebid.rs
-  git commit -m "Add MediaType::banner() constructor and Bid::ad_id for hb_adid targeting"
+  git commit -m "Add MediaType::banner(), Bid::ad_id, and suppress_nurl config to PrebidConfig"
   ```
 
 ---
@@ -403,10 +422,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       #[test]
       fn resolved_gam_unit_path_uses_default_when_absent() {
           let slot = make_slot("atf", vec!["/"]);
-          assert_eq!(
-              slot.resolved_gam_unit_path("21765378893"),
-              "/21765378893/atf"
-          );
+          assert_eq!(slot.resolved_gam_unit_path("21765378893"), "/21765378893/atf");
       }
 
       #[test]
@@ -434,7 +450,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
           assert_eq!(
               aps_params.get("slotID").and_then(|v| v.as_str()),
               Some("aps-slot-atf"),
-              "should wire APS slot ID into bidders"
           );
       }
 
@@ -455,8 +470,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 - [ ] **Step 2: Implement creative_opportunities.rs**
 
   ```rust
-  //! Creative opportunities config — slot templates, URL matching, AdSlot conversion.
-
   use std::collections::HashMap;
 
   use glob::Pattern;
@@ -465,7 +478,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   use crate::auction::types::{AdFormat, AdSlot, MediaType};
   use crate::price_bucket::PriceGranularity;
 
-  /// Top-level `[creative_opportunities]` block in `trusted-server.toml`.
   #[derive(Debug, Clone, Deserialize, Serialize)]
   pub struct CreativeOpportunitiesConfig {
       pub gam_network_id: String,
@@ -475,7 +487,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       pub price_granularity: PriceGranularity,
   }
 
-  /// One entry from `[[slot]]` in `creative-opportunities.toml`.
   #[derive(Debug, Clone, Deserialize)]
   pub struct CreativeOpportunitySlot {
       pub id: String,
@@ -491,7 +502,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   }
 
   impl CreativeOpportunitySlot {
-      /// Returns true when `path` matches any of this slot's `page_patterns`.
       pub fn matches_path(&self, path: &str) -> bool {
           self.page_patterns.iter().any(|pattern| {
               Pattern::new(pattern)
@@ -500,29 +510,21 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
           })
       }
 
-      /// Resolved GAM ad-unit path: override if set, else `/{gam_network_id}/{id}`.
       pub fn resolved_gam_unit_path(&self, gam_network_id: &str) -> String {
           self.gam_unit_path
               .clone()
               .unwrap_or_else(|| format!("/{}/{}", gam_network_id, self.id))
       }
 
-      /// Resolved DOM div ID: override if set, else the slot `id`.
       pub fn resolved_div_id(&self) -> &str {
           self.div_id.as_deref().unwrap_or(&self.id)
       }
 
-      /// Convert to an `AdSlot` for the orchestrator.
       pub fn to_ad_slot(&self, gam_network_id: &str) -> AdSlot {
           let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
-
           if let Some(ref aps) = self.providers.aps {
-              bidders.insert(
-                  "aps".to_string(),
-                  serde_json::json!({ "slotID": aps.slot_id }),
-              );
+              bidders.insert("aps".to_string(), serde_json::json!({ "slotID": aps.slot_id }));
           }
-
           AdSlot {
               id: self.id.clone(),
               formats: self.formats.iter().map(CreativeOpportunityFormat::to_ad_format).collect(),
@@ -535,7 +537,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       }
   }
 
-  /// Separate from `auction::AdFormat` — `media_type` defaults to `Banner`.
   #[derive(Debug, Clone, Deserialize)]
   pub struct CreativeOpportunityFormat {
       pub width: u32,
@@ -546,11 +547,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 
   impl CreativeOpportunityFormat {
       fn to_ad_format(&self) -> AdFormat {
-          AdFormat {
-              media_type: self.media_type.clone(),
-              width: self.width,
-              height: self.height,
-          }
+          AdFormat { media_type: self.media_type.clone(), width: self.width, height: self.height }
       }
   }
 
@@ -564,14 +561,12 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       pub slot_id: String,
   }
 
-  /// Top-level of `creative-opportunities.toml`.
   #[derive(Debug, Clone, Deserialize, Default)]
   pub struct CreativeOpportunitiesFile {
       #[serde(rename = "slot", default)]
       pub slots: Vec<CreativeOpportunitySlot>,
   }
 
-  /// Validate a slot ID against the `[A-Za-z0-9_-]+` allowlist.
   pub fn validate_slot_id(id: &str) -> Result<(), String> {
       if id.is_empty() {
           return Err("slot id must not be empty".to_string());
@@ -579,13 +574,10 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
           Ok(())
       } else {
-          Err(format!(
-              "slot id '{id}' contains invalid characters; only [A-Za-z0-9_-] allowed"
-          ))
+          Err(format!("slot id '{id}' contains invalid characters; only [A-Za-z0-9_-] allowed"))
       }
   }
 
-  /// Find all slots matching the given URL path.
   pub fn match_slots<'a>(
       slots: &'a [CreativeOpportunitySlot],
       path: &str,
@@ -676,7 +668,6 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   At repo root alongside `trusted-server.toml`:
 
   ```toml
-  # creative-opportunities.toml
   # Slot templates for server-side ad auction.
   # Empty file = feature disabled (no auction fired, no globals injected).
 
@@ -726,14 +717,15 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 **Files:**
 
 - Modify: `crates/trusted-server-core/build.rs`
+- Modify (or create): `crates/trusted-server-adapter-fastly/build.rs`
 
 - [ ] **Step 1: Add slot-ID validation to `build.rs`**
 
-  In `build.rs`, add after the existing settings validation:
+  In `crates/trusted-server-core/build.rs`, add after the existing settings validation.
+
+  > **Note:** `build.rs` runs in a separate compilation context and cannot import `creative_opportunities::validate_slot_id`. Reimplement the same `[A-Za-z0-9_-]+` check inline using the `regex` crate (build-dependency only — not in the wasm binary). This is an intentional duplication boundary.
 
   ```rust
-  // Validate slot IDs at build time. Parse TOML inline — cannot import creative_opportunities.rs
-  // because crate::auction::types is unavailable in the build context.
   const CREATIVE_OPPORTUNITIES_PATH: &str = "../../creative-opportunities.toml";
 
   println!("cargo:rerun-if-changed={}", CREATIVE_OPPORTUNITIES_PATH);
@@ -768,7 +760,15 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 
 - [ ] **Step 2: Verify `regex` is in build-dependencies**
 
-  Check `crates/trusted-server-core/Cargo.toml` `[build-dependencies]` — `regex` must be listed. Add if absent.
+  In `crates/trusted-server-core/Cargo.toml`, under `[build-dependencies]`, ensure `regex` is listed:
+
+  ```toml
+  [build-dependencies]
+  regex = "1"
+  # ... other build deps
+  ```
+
+  Add if absent. This is a build-only dependency — does not enter the WASM binary.
 
 - [ ] **Step 3: Run build to verify**
 
@@ -789,11 +789,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   Run: `cargo build --package trusted-server-core`
   Expected: panics with invalid slot ID message. Revert the change.
 
-- [ ] **Step 5: Add `rerun-if-changed` for the adapter crate**
-
-  The adapter's `main.rs` uses `include_str!("../../../creative-opportunities.toml")` (Task 9 Step 7).
-  Without a `rerun-if-changed` directive in the adapter's build script, Cargo will not rebuild
-  when `creative-opportunities.toml` changes.
+- [ ] **Step 5: Add `rerun-if-changed` for adapter crate**
 
   Check whether `crates/trusted-server-adapter-fastly/build.rs` exists. If it does, add:
 
@@ -801,7 +797,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   println!("cargo:rerun-if-changed=../../../creative-opportunities.toml");
   ```
 
-  If there is no `build.rs` in the adapter crate, create one containing only:
+  If no `build.rs` exists in the adapter crate, create one:
 
   ```rust
   fn main() {
@@ -810,7 +806,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
   ```
 
   Run: `cargo build --package trusted-server-adapter-fastly`
-  Expected: clean build. Modify `creative-opportunities.toml` and re-run — adapter must recompile.
+  Expected: clean build.
 
 - [ ] **Step 6: Commit**
 
@@ -822,61 +818,93 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 
 ---
 
-## Task 7: HTML processor — head injection of `__ts_ad_slots` and `__ts_request_id`
+## Task 7: HTML processor — head injection and body-end injection
 
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/html_processor.rs`
+- Modify: `crates/trusted-server-core/src/integrations/registry.rs`
 
-> **Critical design constraint:** The spec explicitly rejects holding `</head>` to inject bids — this blocks body parsing and destroys FCP. Only `window.__ts_ad_slots` and `window.__ts_request_id` are injected, both at `<head>` open. Bid results are delivered via `/ts-bids` (Task 10). There is NO `on_end_tag` handler, NO `ad_bids_script` field.
+TS injects two `<script>` blocks:
 
-- [ ] **Step 1: Write failing tests for injection**
+1. `window.__ts_ad_slots` — at `<head>` open, no wait, via existing `el.prepend()`.
+2. `window.__ts_bids` — before `</body>`, via `el.on_end_tag()` on the body element. The handler reads from a shared `Arc<RwLock<Option<String>>>` written by the auction task (Task 9). By the time `</body>` is reached in the HTML stream, Task 9 has already awaited the auction (or its deadline), so the shared state is always populated.
+
+> **Critical design constraint:** `</head>` must never be held. Only `</body>` is held (by the outer streaming mechanism in Task 9). `HtmlProcessorConfig` receives the ready-to-inject script strings; it does not decide when to wait.
+
+- [ ] **Step 1: Write failing tests**
 
   In `html_processor.rs` tests:
 
   ```rust
   #[test]
-  fn injects_ad_slots_and_request_id_at_head_open() {
+  fn injects_ad_slots_at_head_open() {
       let config = HtmlProcessorConfig {
           origin_host: "origin.example.com".to_string(),
           request_host: "example.com".to_string(),
           request_scheme: "https".to_string(),
           integrations: IntegrationRegistry::empty_for_tests(),
           ad_slots_script: Some(
-              r#"<script>window.__ts_ad_slots=JSON.parse("[]");window.__ts_request_id="test-rid-123";</script>"#
-                  .to_string()
+              r#"<script>window.__ts_ad_slots=JSON.parse("[]");</script>"#.to_string()
           ),
+          ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
       };
       let mut processor = create_html_processor(config);
       let output = processor
-          .process_chunk(b"<html><head><title>T</title></head><body></body></html>", true)
+          .process_chunk(b"<html><head><title>T</title></head><body>content</body></html>", true)
           .expect("should process");
       let html = std::str::from_utf8(&output).expect("should be utf8");
       assert!(html.contains("window.__ts_ad_slots"), "should inject ad slots at head-open");
-      assert!(html.contains("window.__ts_request_id"), "should inject request_id at head-open");
+      assert!(!html.contains("__ts_request_id"), "must NOT inject request_id — body-injection arch has no request_id");
   }
 
   #[test]
-  fn does_not_hold_end_of_head() {
-      // Verify: no bid data appears before </head> — that hold was rejected by spec §4.3
+  fn injects_ts_bids_before_body_close() {
+      let bids_script = r#"<script>window.__ts_bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
+      let state = std::sync::Arc::new(std::sync::RwLock::new(
+          Some(bids_script.to_string())
+      ));
       let config = HtmlProcessorConfig {
           origin_host: "origin.example.com".to_string(),
           request_host: "example.com".to_string(),
           request_scheme: "https".to_string(),
           integrations: IntegrationRegistry::empty_for_tests(),
           ad_slots_script: None,
+          ad_bids_state: state,
       };
       let mut processor = create_html_processor(config);
       let output = processor
-          .process_chunk(b"<html><head><title>T</title></head><body></body></html>", true)
+          .process_chunk(b"<html><head></head><body>content</body></html>", true)
           .expect("should process");
       let html = std::str::from_utf8(&output).expect("should be utf8");
-      assert!(!html.contains("__ts_bids"), "must not inject bids into head");
+      assert!(html.contains("window.__ts_bids"), "should inject bids before </body>");
+      let bids_pos = html.find("window.__ts_bids").expect("bids should be in output");
+      let body_close_pos = html.find("</body>").expect("</body> should be in output");
+      assert!(bids_pos < body_close_pos, "bids must appear before </body>");
+  }
+
+  #[test]
+  fn injects_empty_ts_bids_when_state_is_none() {
+      let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+      let config = HtmlProcessorConfig {
+          origin_host: "origin.example.com".to_string(),
+          request_host: "example.com".to_string(),
+          request_scheme: "https".to_string(),
+          integrations: IntegrationRegistry::empty_for_tests(),
+          ad_slots_script: None,
+          ad_bids_state: state,
+      };
+      let mut processor = create_html_processor(config);
+      let output = processor
+          .process_chunk(b"<html><head></head><body>content</body></html>", true)
+          .expect("should process");
+      let html = std::str::from_utf8(&output).expect("should be utf8");
+      assert!(html.contains("__ts_bids=JSON.parse(\"{}\""), "should inject empty bids on None state");
   }
   ```
 
   Run: `cargo test -p trusted-server-core html_processor`
-  Expected: compile error (no `ad_slots_script` field, no `empty_for_tests()`)
+  Expected: compile error (no `ad_bids_state` field yet)
 
 - [ ] **Step 2: Add `empty_for_tests()` to `IntegrationRegistry`**
 
@@ -902,9 +930,7 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
 
   (Adjust field names to match the actual `RegistryInner` struct.)
 
-- [ ] **Step 3: Add single field to `HtmlProcessorConfig`**
-
-  Replace any existing `ad_slots_script`/`ad_bids_script` fields with:
+- [ ] **Step 3: Update `HtmlProcessorConfig`**
 
   ```rust
   pub struct HtmlProcessorConfig {
@@ -912,361 +938,103 @@ The `hb_pb` value in bid responses is a discretized bucket string from Prebid's 
       pub request_host: String,
       pub request_scheme: String,
       pub integrations: IntegrationRegistry,
-      /// Pre-computed `<script>window.__ts_ad_slots=...;window.__ts_request_id="...";</script>`.
-      /// Injected at `<head>` open, before integration head inserts. `None` when no slots matched.
+      /// Pre-computed `<script>window.__ts_ad_slots=...;</script>`.
+      /// Injected at `<head>` open. `None` when no slots matched.
       pub ad_slots_script: Option<String>,
+      /// Shared auction result script — written by the auction task before HTML processing
+      /// begins. Handler reads this in `el.on_end_tag()` on the body element.
+      /// `None` means no auction ran (consent denied, bot UA, no slot match, etc.);
+      /// inject empty `__ts_bids = {}` as graceful fallback.
+      pub ad_bids_state: std::sync::Arc<std::sync::RwLock<Option<String>>>,
   }
   ```
 
-  Update `from_settings` (or wherever `HtmlProcessorConfig` is constructed) to initialize `ad_slots_script: None`.
+  Update `from_settings` (or wherever `HtmlProcessorConfig` is constructed) to initialize `ad_bids_state: Arc::new(RwLock::new(None))`.
 
 - [ ] **Step 4: Inject `ad_slots_script` at head-open**
 
-  In `create_html_processor`, within the EXISTING `element!("head", ...)` handler, build the full snippet string with `ad_slots_script` first (so it appears first in output — lol_html `prepend` inserts before children, with **last-prepend-wins** ordering, so we call `prepend` exactly once with the full combined string):
+  In `create_html_processor`, within the existing `element!("head", ...)` handler:
 
   ```rust
   let ad_slots_script = config.ad_slots_script.clone();
-  // ... existing captures ...
+  // existing captures...
 
   element!("head", |el| {
       let mut snippet = String::new();
-
-      // ad_slots_script first so __ts_ad_slots + __ts_request_id appear before
-      // integration inserts. DO NOT call prepend multiple times — lol_html stacks
-      // prepend calls in reverse order, so a single prepend with the full string
-      // guarantees correct ordering.
       if let Some(ref slots_script) = ad_slots_script {
           snippet.push_str(slots_script);
       }
-
-      // ... existing: for insert in integrations.head_inserts(&ctx) { snippet.push_str(...) }
-
+      // existing integration head inserts...
       if !snippet.is_empty() {
           el.prepend(&snippet, ContentType::Html);
       }
-      // DO NOT register on_end_tag — </head> flushes immediately per spec §4.3
+      // DO NOT register on_end_tag — </head> flushes immediately
       Ok(())
   })
   ```
 
-- [ ] **Step 5: Run tests**
+- [ ] **Step 5: Inject `__ts_bids` before `</body>` via `el.on_end_tag()`**
+
+  Add a new handler in `create_html_processor`. The shared state is already populated by the time lol_html reaches `</body>` (Task 9 awaits the auction before starting HTML processing):
+
+  ```rust
+  let ad_bids_state = config.ad_bids_state.clone();
+
+  element!("body", |el| {
+      let state = ad_bids_state.clone();
+      el.on_end_tag(move |end_tag| {
+          let script = state.read().expect("should read bid state");
+          let bids_script = match &*script {
+              Some(s) => s.clone(),
+              None => {
+                  r#"<script>window.__ts_bids=JSON.parse("{}");</script>"#.to_string()
+              }
+          };
+          end_tag.before(&bids_script, ContentType::Html);
+          Ok(())
+      })?;
+      Ok(())
+  })
+  ```
+
+- [ ] **Step 6: Run tests**
 
   Run: `cargo test -p trusted-server-core html_processor`
-  Expected: all tests pass (including the new ones; no bids injection test must also pass)
+  Expected: all tests pass
 
-- [ ] **Step 6: Run full suite**
+- [ ] **Step 7: Run full suite**
 
   Run: `cargo test --workspace`
   Expected: clean
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/html_processor.rs \
           crates/trusted-server-core/src/integrations/registry.rs
-  git commit -m "Add ad_slots_script injection to HtmlProcessorConfig at head-open; no </head> hold"
+  git commit -m "Inject __ts_ad_slots at head-open and __ts_bids before </body> via shared auction state"
   ```
 
 ---
 
-## Task 8: `bid_cache.rs` — In-process auction result cache
-
-**Files:**
-
-- Create: `crates/trusted-server-core/src/bid_cache.rs`
-- Modify: `crates/trusted-server-core/src/lib.rs`
-
-The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL. It is shared across concurrent Fastly request handlers via `std::sync::Mutex`. The `/ts-bids` endpoint (Task 10) uses `wait_for()` to block-poll until results arrive or the deadline fires.
-
-> **WASM note:** `std::time::Instant` and `std::thread::sleep` are both supported in Viceroy and Fastly Compute. The Mutex is uncontested in practice — requests are handled cooperatively with brief lock windows.
-
-- [ ] **Step 1: Write failing tests**
-
-  Create `crates/trusted-server-core/src/bid_cache.rs` with only the tests:
-
-  ```rust
-  #[cfg(test)]
-  mod tests {
-      use super::*;
-      use std::time::{Duration, Instant};
-
-      fn make_bids() -> BidMap {
-          let mut m = std::collections::HashMap::new();
-          m.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
-          m
-      }
-
-      #[test]
-      fn returns_not_found_for_unknown_rid() {
-          let cache = BidCache::new(Duration::from_secs(30), 100);
-          let result = cache.try_get("unknown-rid");
-          assert!(matches!(result, CacheResult::NotFound), "should return NotFound");
-      }
-
-      #[test]
-      fn returns_pending_before_put() {
-          let cache = BidCache::new(Duration::from_secs(30), 100);
-          let deadline = Instant::now() + Duration::from_secs(5);
-          cache.mark_pending("rid-1", deadline);
-          let result = cache.try_get("rid-1");
-          assert!(matches!(result, CacheResult::Pending), "should be Pending");
-      }
-
-      #[test]
-      fn returns_bids_after_put() {
-          let cache = BidCache::new(Duration::from_secs(30), 100);
-          let deadline = Instant::now() + Duration::from_secs(5);
-          cache.mark_pending("rid-2", deadline);
-          cache.put("rid-2", make_bids());
-          match cache.try_get("rid-2") {
-              CacheResult::Complete(bids) => {
-                  assert!(bids.contains_key("atf"), "should contain atf bid");
-              }
-              other => panic!("expected Complete, got {:?}", other),
-          }
-      }
-
-      #[test]
-      fn returns_not_found_for_expired_entry() {
-          let cache = BidCache::new(Duration::from_millis(1), 100);
-          let deadline = Instant::now() + Duration::from_secs(5);
-          cache.mark_pending("rid-3", deadline);
-          cache.put("rid-3", make_bids());
-          std::thread::sleep(Duration::from_millis(5));
-          let result = cache.try_get("rid-3");
-          assert!(matches!(result, CacheResult::NotFound), "should expire after TTL");
-      }
-
-      #[test]
-      fn wait_for_returns_bids_immediately_when_complete() {
-          let cache = BidCache::new(Duration::from_secs(30), 100);
-          let deadline = Instant::now() + Duration::from_secs(5);
-          cache.mark_pending("rid-4", deadline);
-          cache.put("rid-4", make_bids());
-          let result = cache.wait_for("rid-4", deadline);
-          assert!(matches!(result, WaitResult::Bids(_)), "should return bids immediately");
-      }
-
-      #[test]
-      fn wait_for_returns_not_found_for_unknown_rid() {
-          let cache = BidCache::new(Duration::from_secs(30), 100);
-          let deadline = Instant::now() + Duration::from_millis(50);
-          let result = cache.wait_for("never-registered", deadline);
-          assert!(matches!(result, WaitResult::NotFound), "should return NotFound");
-      }
-  }
-  ```
-
-  Run: `cargo test -p trusted-server-core bid_cache`
-  Expected: compile error (module not exported yet)
-
-- [ ] **Step 2: Implement bid_cache.rs**
-
-  ```rust
-  //! In-process auction result cache keyed by request ID.
-  //!
-  //! Shared across concurrent Fastly request handlers via a global `Mutex`.
-  //! Entries expire after a configurable TTL (30 seconds by default).
-
-  use std::collections::HashMap;
-  use std::sync::Mutex;
-  use std::time::{Duration, Instant};
-
-  pub type BidMap = HashMap<String, serde_json::Value>;
-
-  #[derive(Debug)]
-  enum EntryState {
-      Pending { auction_deadline: Instant },
-      Complete { bids: BidMap },
-  }
-
-  struct CacheEntry {
-      state: EntryState,
-      inserted_at: Instant,
-  }
-
-  struct BidCacheInner {
-      entries: HashMap<String, CacheEntry>,
-      insertion_order: std::collections::VecDeque<String>,
-      capacity: usize,
-      ttl: Duration,
-  }
-
-  impl BidCacheInner {
-      fn evict_expired(&mut self) {
-          let now = Instant::now();
-          self.insertion_order.retain(|rid| {
-              self.entries.get(rid)
-                  .map(|e| now.duration_since(e.inserted_at) < self.ttl)
-                  .unwrap_or(false)
-          });
-          self.entries.retain(|_, e| now.duration_since(e.inserted_at) < self.ttl);
-      }
-
-      fn evict_oldest_if_full(&mut self) {
-          while self.entries.len() >= self.capacity {
-              if let Some(oldest) = self.insertion_order.pop_front() {
-                  self.entries.remove(&oldest);
-              } else {
-                  break;
-              }
-          }
-      }
-  }
-
-  /// Outcome of a non-blocking cache lookup.
-  #[derive(Debug)]
-  pub enum CacheResult {
-      /// Auction complete; bids are ready.
-      Complete(BidMap),
-      /// Auction registered but not yet complete.
-      Pending,
-      /// Request ID never registered, or TTL expired.
-      NotFound,
-  }
-
-  /// Outcome of a blocking `wait_for` call.
-  #[derive(Debug)]
-  pub enum WaitResult {
-      /// Auction completed within the deadline.
-      Bids(BidMap),
-      /// Deadline passed; bids not available.
-      Empty,
-      /// Request ID never registered (caller should return 404).
-      NotFound,
-  }
-
-  /// In-process cache for auction results, shared across request handlers.
-  pub struct BidCache {
-      inner: Mutex<BidCacheInner>,
-  }
-
-  impl BidCache {
-      /// Create a new `BidCache`.
-      ///
-      /// # Arguments
-      /// - `ttl`: how long to keep entries before expiry
-      /// - `capacity`: max number of concurrent entries (oldest evicted when full)
-      pub fn new(ttl: Duration, capacity: usize) -> Self {
-          Self {
-              inner: Mutex::new(BidCacheInner {
-                  entries: HashMap::new(),
-                  insertion_order: std::collections::VecDeque::new(),
-                  capacity,
-                  ttl,
-              }),
-          }
-      }
-
-      /// Register a request as in-flight. Call at auction start, before `run_auction`.
-      pub fn mark_pending(&self, request_id: &str, auction_deadline: Instant) {
-          let mut inner = self.inner.lock().expect("should lock bid_cache");
-          inner.evict_expired();
-          inner.evict_oldest_if_full();
-          inner.entries.insert(request_id.to_string(), CacheEntry {
-              state: EntryState::Pending { auction_deadline },
-              inserted_at: Instant::now(),
-          });
-          inner.insertion_order.push_back(request_id.to_string());
-      }
-
-      /// Store completed auction results. Transitions entry from Pending → Complete.
-      pub fn put(&self, request_id: &str, bids: BidMap) {
-          let mut inner = self.inner.lock().expect("should lock bid_cache");
-          if let Some(entry) = inner.entries.get_mut(request_id) {
-              entry.state = EntryState::Complete { bids };
-          }
-      }
-
-      /// Non-blocking lookup. Returns current state without sleeping.
-      pub fn try_get(&self, request_id: &str) -> CacheResult {
-          let inner = self.inner.lock().expect("should lock bid_cache");
-          let now = Instant::now();
-          match inner.entries.get(request_id) {
-              None => CacheResult::NotFound,
-              Some(entry) if now.duration_since(entry.inserted_at) >= inner.ttl => {
-                  CacheResult::NotFound
-              }
-              Some(entry) => match &entry.state {
-                  EntryState::Pending { .. } => CacheResult::Pending,
-                  EntryState::Complete { bids } => CacheResult::Complete(bids.clone()),
-              },
-          }
-      }
-
-      /// Return the stored auction deadline for a pending entry (the `T₀ + auction_timeout_ms`
-      /// value minted when the page request arrived). Used by `/ts-bids` to enforce the correct
-      /// deadline rather than minting a fresh `Instant::now() + timeout`.
-      ///
-      /// Returns `None` if the entry is unknown, expired, or already complete.
-      pub fn get_auction_deadline(&self, request_id: &str) -> Option<Instant> {
-          let inner = self.inner.lock().expect("should lock bid_cache");
-          let now = Instant::now();
-          inner.entries.get(request_id).and_then(|entry| {
-              if now.duration_since(entry.inserted_at) >= inner.ttl {
-                  return None;
-              }
-              match entry.state {
-                  EntryState::Pending { auction_deadline } => Some(auction_deadline),
-                  EntryState::Complete { .. } => None,
-              }
-          })
-      }
-
-      /// Block until bids are available for `request_id` or `deadline` passes.
-      ///
-      /// Polls every 50ms. Returns `NotFound` immediately if `request_id` was never registered.
-      /// Returns `Empty` if deadline fires before auction completes.
-      pub fn wait_for(&self, request_id: &str, deadline: Instant) -> WaitResult {
-          loop {
-              match self.try_get(request_id) {
-                  CacheResult::Complete(bids) => return WaitResult::Bids(bids),
-                  CacheResult::NotFound => return WaitResult::NotFound,
-                  CacheResult::Pending => {
-                      if Instant::now() >= deadline {
-                          return WaitResult::Empty;
-                      }
-                      std::thread::sleep(Duration::from_millis(50));
-                  }
-              }
-          }
-      }
-  }
-  ```
-
-- [ ] **Step 3: Export from lib.rs**
-
-  ```rust
-  pub mod bid_cache;
-  ```
-
-- [ ] **Step 4: Run tests**
-
-  Run: `cargo test -p trusted-server-core bid_cache`
-  Expected: all tests pass
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add crates/trusted-server-core/src/bid_cache.rs \
-          crates/trusted-server-core/src/lib.rs
-  git commit -m "Add BidCache with 30s TTL, pending/complete states, and blocking wait_for"
-  ```
-
----
-
-## Task 9: `handle_publisher_request` async restructuring
+## Task 8: `handle_publisher_request` async restructuring
 
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 
-> **Key constraint from spec §4.3:** Page rendering is never held for the auction. The auction and origin fetch run concurrently via Fastly's `send_async()` model — origin is dispatched first (non-blocking), then the auction runs its own `send_async` calls, so both overlap on the network. Bid results go to `bid_cache` only — they are NOT injected into the HTML. `Cache-Control: private, no-store` is set whenever slots matched (not just when bids arrived).
+> **Key constraint from spec §4.3 and §3:** No `bid_cache`. No `/ts-bids`. No `request_id`. Bids travel inline with the HTML response via body injection. The `Arc<RwLock<Option<String>>>` is the coordination mechanism within a single request's lifetime — it is written before HTML processing and read by the lol_html `</body>` handler.
+
+> **Eligibility gating (spec §4.3):** Auctions fire only for real GET requests from non-bot, non-prefetch clients with TCF Purpose 1 consent and at least one matching slot. All other requests proceed with no auction and no `__ts_bids` injection.
+
+> **Cache-Control (spec §4.7):** Set `Cache-Control: private, max-age=0` (not `no-store`) to preserve BFCache eligibility. Strip `Surrogate-Control` and `Fastly-Surrogate-Control`.
 
 - [ ] **Step 1: Update function signature**
 
   Change `handle_publisher_request` in `publisher.rs`:
+
+  > **Existing context:** The existing `publisher.rs` function body already computes `consent_context`, `ec_id`, `request_info`, `origin_host`, and `backend_name` before the origin fetch. Steps below insert new logic between those existing computations and the origin fetch — they do not replace them.
 
   ```rust
   pub async fn handle_publisher_request(
@@ -1275,31 +1043,48 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       services: &RuntimeServices,
       orchestrator: &crate::auction::orchestrator::AuctionOrchestrator,
       slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
-      bid_cache: &crate::bid_cache::BidCache,
       mut req: Request,
   ) -> Result<PublisherResponse, Report<TrustedServerError>>
   ```
 
-  Add imports:
+  Add imports at top of file:
 
   ```rust
+  use std::sync::{Arc, RwLock};
+  use fastly::http::header;
   use crate::auction::orchestrator::AuctionOrchestrator;
   use crate::auction::types::{AuctionContext, AuctionRequest, PublisherInfo, UserInfo, SiteInfo};
-  use crate::bid_cache::{BidCache, BidMap};
   use crate::creative_opportunities::{CreativeOpportunitiesFile, match_slots};
   use crate::price_bucket::price_bucket;
   ```
 
-- [ ] **Step 2: Mint `request_id`, match URL, check consent**
+  > **`send_async` return type:** `req.send_async()` returns `fastly::handle::PendingRequestHandle` (re-exported as `fastly::PendingRequest` in recent versions). Confirm the exact type from the `fastly` crate version in `Cargo.toml`; `.wait()` is the blocking resolve method on whichever type is returned.
 
-  At the top of the function body, before the origin fetch:
+- [ ] **Step 2: Apply auction-eligibility gates**
+
+  At the top of the function body, before origin fetch:
 
   ```rust
-  // Mint per-request UUID — included in head injection and /ts-bids lookup key.
-  let request_id = uuid::Uuid::new_v4().to_string();
-
   let request_path = req.get_path().to_string();
-  let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() {
+  let request_method = req.get_method().clone();
+
+  // Gate 1: Only GET triggers auctions. HEAD skips everything.
+  let is_get = request_method == fastly::http::Method::GET;
+
+  // Gate 2: Skip prefetch hints (Sec-Purpose: prefetch or Purpose: prefetch).
+  let is_prefetch = req.get_header_str("sec-purpose")
+      .map_or(false, |v| v.contains("prefetch"))
+      || req.get_header_str("purpose")
+      .map_or(false, |v| v.contains("prefetch"));
+
+  // Gate 3: Skip well-known crawler UAs (protects SSP QPS budget).
+  let user_agent = req.get_header_str("user-agent").unwrap_or("");
+  let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
+      .iter()
+      .any(|bot| user_agent.contains(bot));
+
+  // Gate 4: Slot match.
+  let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
       match_slots(&slots_file.slots, &request_path)
           .into_iter()
           .cloned()
@@ -1308,11 +1093,17 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       Vec::new()
   };
 
+  // Gate 5: TCF Purpose 1 consent.
   let consent_allows_auction = consent_context
       .tcf
       .as_ref()
       .map_or(false, |tcf| tcf.has_purpose_consent(1));
-  let should_run_auction = !matched_slots.is_empty() && consent_allows_auction;
+
+  let should_run_auction = is_get
+      && !is_prefetch
+      && !is_bot
+      && !matched_slots.is_empty()
+      && consent_allows_auction;
 
   let auction_timeout_ms = settings
       .creative_opportunities
@@ -1321,33 +1112,24 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       .unwrap_or(settings.auction.timeout_ms);
   ```
 
-- [ ] **Step 3: Register pending in bid_cache, fire origin + auction concurrently**
+- [ ] **Step 3: Create shared bid state, fire origin + auction concurrently**
 
   ```rust
-  // Mint T₀ auction deadline. Stored in bid_cache so /ts-bids uses the same deadline,
-  // not a freshly-minted one when the browser's fetch arrives.
-  let auction_deadline = std::time::Instant::now()
-      + std::time::Duration::from_millis(u64::from(auction_timeout_ms));
-
-  // Register request as in-flight so /ts-bids can long-poll for it.
-  if should_run_auction {
-      bid_cache.mark_pending(&request_id, auction_deadline);
-  }
+  // Shared state: auction task writes the ready-to-inject script; lol_html </body>
+  // handler reads it. Both within the same request — no cross-request sharing.
+  let ad_bids_state: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
   restrict_accept_encoding(&mut req);
   req.set_header("host", &origin_host);
 
-  // Fire origin request immediately — Fastly's send_async dispatches the HTTP request
-  // to the network without blocking. The origin fetch is in-flight from this point.
-  // The auction below also uses send_async internally, so both origin SSP requests
-  // overlap on the network. This is Fastly's concurrency model — no join! needed.
+  // Fire origin immediately — both origin and auction SSP calls overlap on the network.
   let pending_origin = req
       .send_async(&backend_name)
       .change_context(TrustedServerError::Proxy {
           message: "Failed to dispatch async origin request".to_string(),
       })?;
 
-  // Run auction (internal send_async calls overlap with origin fetch on the network).
+  // Run auction. Internal SSP calls use send_async and overlap with origin fetch.
   let auction_result = if should_run_auction {
       let co_config = settings.creative_opportunities.as_ref()
           .expect("should be present when should_run_auction is true");
@@ -1377,17 +1159,20 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       None
   };
 
-  // Write auction results to bid_cache — /ts-bids will serve them.
+  // Write auction result to shared state before HTML processing begins.
+  // The lol_html </body> handler reads this synchronously — it is always populated here.
+  // `build_bid_map` returns `serde_json::Map<String, serde_json::Value>`.
   if should_run_auction {
       let co_config = settings.creative_opportunities.as_ref()
           .expect("should be present");
-      // Bind empty map to a local to avoid &Default::default() referencing a temporary.
-      let empty_bids = std::collections::HashMap::new();
+      let empty_bids: std::collections::HashMap<String, crate::auction::types::Bid> =
+          std::collections::HashMap::new();
       let winning_bids = auction_result.as_ref()
           .map(|r| &r.winning_bids)
           .unwrap_or(&empty_bids);
       let bid_map = build_bid_map(winning_bids, co_config.price_granularity);
-      bid_cache.put(&request_id, bid_map);
+      let bids_script = build_bids_script(&bid_map);
+      *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
   }
 
   // Await origin response (may already be buffered since we started it before the auction).
@@ -1403,10 +1188,9 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
   After acquiring `response`:
 
   ```rust
-  // Build head injection script: __ts_ad_slots + __ts_request_id (never bids).
   let ad_slots_script = if let Some(co_config) = &settings.creative_opportunities {
       if !matched_slots.is_empty() {
-          Some(build_head_globals_script(&matched_slots, &request_id, co_config))
+          Some(build_ad_slots_script(&matched_slots, co_config))
       } else {
           None
       }
@@ -1414,33 +1198,91 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       None
   };
 
-  // When slots matched: prevent browser/CDN caching of the per-user assembled HTML.
-  // Spec §4.4: set regardless of whether bids arrived — the request_id is now in the page.
+  // Set cache headers when slots matched. private, max-age=0 (not no-store) preserves
+  // BFCache eligibility — browser back/forward cache restores the already-rendered ad
+  // without firing a new GAM call, which is the desired behavior.
   if ad_slots_script.is_some() {
-      response.set_header(header::CACHE_CONTROL, "private, no-store");
+      response.set_header(header::CACHE_CONTROL, "private, max-age=0");
       response.remove_header("surrogate-control");
       response.remove_header("fastly-surrogate-control");
   }
 
-  // Spec §4.3/§4.7: Force chunked encoding on every origin response so that </head>
-  // reaches the browser immediately as chunks arrive — regardless of whether origin
-  // sent a buffered response (WordPress, Drupal) or a streaming one (NextJS 16).
-  // Removing Content-Length is required; sending both headers is invalid HTTP/1.1.
+  // Force chunked encoding so </head> reaches the browser immediately as chunks arrive.
+  // Sending both Content-Length and Transfer-Encoding is invalid HTTP/1.1.
   response.remove_header(header::CONTENT_LENGTH);
   response.set_header("transfer-encoding", "chunked");
   ```
 
-- [ ] **Step 5: Add `pub(crate)` helper functions**
+- [ ] **Step 5: Thread shared state into `OwnedProcessResponseParams`**
+
+  Update `OwnedProcessResponseParams`:
 
   ```rust
+  pub struct OwnedProcessResponseParams {
+      // existing fields...
+      pub(crate) ad_slots_script: Option<String>,
+      pub(crate) ad_bids_state: Arc<RwLock<Option<String>>>,
+  }
+  ```
+
+  Pass both through to `create_html_stream_processor` and into `HtmlProcessorConfig`.
+
+- [ ] **Step 6: Add `pub(crate)` helper functions**
+
+  > **`BidMap` type:** Use `serde_json::Map<String, serde_json::Value>` directly — no separate module needed.
+
+  Add helpers in this order (each function is used by the one below it, so define leaf functions first):
+
+  ```rust
+  /// HTML-escape a JSON string for safe inline `<script>` injection via `JSON.parse`.
+  /// Unicode-escapes `<`, `>`, `&`, U+2028, U+2029 to prevent markup breakout.
+  fn html_escape_for_script(json: &str) -> String {
+      json.replace('&', "\\u0026")
+          .replace('<', "\\u003c")
+          .replace('>', "\\u003e")
+          .replace('\u{2028}', "\\u2028")
+          .replace('\u{2029}', "\\u2029")
+  }
+
+  /// Build the `BidMap` written to shared state and injected before `</body>`.
+  /// Keyed by slot ID. Values: hb_pb, hb_bidder, hb_adid, nurl (optional), burl (optional).
+  pub(crate) fn build_bid_map(
+      winning_bids: &std::collections::HashMap<String, crate::auction::types::Bid>,
+      price_granularity: crate::price_bucket::PriceGranularity,
+  ) -> serde_json::Map<String, serde_json::Value> {
+      winning_bids
+          .iter()
+          .filter_map(|(slot_id, bid)| {
+              let cpm = bid.price?;
+              let mut entry = serde_json::Map::new();
+              entry.insert("hb_pb".to_string(), serde_json::Value::String(price_bucket(cpm, price_granularity)));
+              entry.insert("hb_bidder".to_string(), serde_json::Value::String(bid.bidder.clone()));
+              entry.insert("hb_adid".to_string(), serde_json::Value::String(
+                  bid.ad_id.as_deref().unwrap_or("").to_string()
+              ));
+              if let Some(ref nurl) = bid.nurl {
+                  entry.insert("nurl".to_string(), serde_json::Value::String(nurl.clone()));
+              }
+              if let Some(ref burl) = bid.burl {
+                  entry.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
+              }
+              Some((slot_id.clone(), serde_json::Value::Object(entry)))
+          })
+          .collect()
+  }
+
+  /// Build the `<script>` block injected before `</body>`.
+  /// Contains `window.__ts_bids` keyed by slot ID.
+  pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Value>) -> String {
+      let bids_str = serde_json::to_string(bid_map).expect("should serialize bids");
+      let escaped = html_escape_for_script(&bids_str);
+      format!(r#"<script>window.__ts_bids=JSON.parse("{escaped}");</script>"#)
+  }
+
   /// Build the `<script>` block injected at `<head>` open.
-  ///
-  /// Contains both `window.__ts_ad_slots` (slot config from creative-opportunities.toml)
-  /// and `window.__ts_request_id` (the per-request UUID for /ts-bids lookup).
-  /// Neither bids nor auction results are injected here — they arrive via /ts-bids.
-  pub(crate) fn build_head_globals_script(
+  /// Contains `window.__ts_ad_slots` only — no request ID, no bids.
+  pub(crate) fn build_ad_slots_script(
       matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
-      request_id: &str,
       co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
   ) -> String {
       let slots_json: Vec<_> = matched_slots.iter().map(|slot| {
@@ -1454,54 +1296,9 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
               "targeting": slot.targeting,
           })
       }).collect();
-      let slots_json_str = serde_json::to_string(&slots_json)
-          .expect("should serialize ad slots");
-      let escaped_slots = html_escape_for_script(&slots_json_str);
-      // request_id is a UUID (hex + hyphens only) — safe to embed without escaping.
-      format!(
-          r#"<script>window.__ts_ad_slots=JSON.parse("{escaped_slots}");window.__ts_request_id="{request_id}";</script>"#
-      )
-  }
-
-  /// Build the `BidMap` stored in `bid_cache` and returned by `/ts-bids`.
-  ///
-  /// Keyed by slot ID. Values contain `hb_pb`, `hb_bidder`, `hb_adid`, `burl`.
-  pub(crate) fn build_bid_map(
-      winning_bids: &std::collections::HashMap<String, crate::auction::types::Bid>,
-      price_granularity: crate::price_bucket::PriceGranularity,
-  ) -> crate::bid_cache::BidMap {
-      winning_bids
-          .iter()
-          .filter_map(|(slot_id, bid)| {
-              let cpm = bid.price?;
-              let entry: std::collections::HashMap<String, serde_json::Value> = [
-                  ("hb_pb".to_string(), serde_json::Value::String(price_bucket(cpm, price_granularity))),
-                  ("hb_bidder".to_string(), serde_json::Value::String(bid.bidder.clone())),
-                  ("hb_adid".to_string(), serde_json::Value::String(
-                      bid.ad_id.as_deref().unwrap_or("").to_string()
-                  )),
-                  ("burl".to_string(), bid.burl.as_deref()
-                      .map(serde_json::Value::from)
-                      .unwrap_or(serde_json::Value::Null)),
-              ].into_iter().collect();
-              Some((slot_id.clone(), entry.into_iter()
-                  .map(|(k, v)| (k, v))
-                  .collect::<serde_json::Map<_, _>>()
-                  .into()))
-          })
-          .collect()
-  }
-
-  /// HTML-escape a JSON string for safe inline `<script>` injection.
-  ///
-  /// JSON is embedded in a double-quoted JS string literal (via `JSON.parse`).
-  /// Unicode-escapes `<`, `>`, `&`, U+2028, U+2029 to prevent script injection.
-  fn html_escape_for_script(json: &str) -> String {
-      json.replace('&', "\\u0026")
-          .replace('<', "\\u003c")
-          .replace('>', "\\u003e")
-          .replace('\u{2028}', "\\u2028")
-          .replace('\u{2029}', "\\u2029")
+      let slots_json_str = serde_json::to_string(&slots_json).expect("should serialize ad slots");
+      let escaped = html_escape_for_script(&slots_json_str);
+      format!(r#"<script>window.__ts_ad_slots=JSON.parse("{escaped}");</script>"#)
   }
 
   fn build_auction_request(
@@ -1535,38 +1332,24 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
   }
   ```
 
-- [ ] **Step 6: Thread `ad_slots_script` into `OwnedProcessResponseParams`**
-
-  Update `OwnedProcessResponseParams`:
-
-  ```rust
-  pub struct OwnedProcessResponseParams {
-      // existing fields...
-      pub(crate) ad_slots_script: Option<String>,
-  }
-  ```
-
-  Pass `ad_slots_script` through to `create_html_stream_processor` and into `HtmlProcessorConfig`.
+  > **Type note:** All helper signatures use `serde_json::Map<String, serde_json::Value>` directly. Do not create a `BidMap` type alias or `bid_types.rs` module.
 
 - [ ] **Step 7: Update `main.rs` call site**
 
   In `crates/trusted-server-adapter-fastly/src/main.rs`:
 
   ```rust
-  // At startup — load creative-opportunities.toml and initialize bid_cache.
+  // At startup (top of main() / request handler setup, before the request dispatch loop).
+  // include_str! embeds the file at compile time — no runtime file I/O.
   const CREATIVE_OPPORTUNITIES_TOML: &str =
       include_str!("../../../creative-opportunities.toml");
 
-  let slots_file: creative_opportunities::CreativeOpportunitiesFile =
+  let slots_file: trusted_server_core::creative_opportunities::CreativeOpportunitiesFile =
       toml::from_str(CREATIVE_OPPORTUNITIES_TOML)
           .expect("should parse creative-opportunities.toml");
-
-  // BidCache: 30s TTL, capacity 1000 entries (each entry is a few KB).
-  let bid_cache = crate::bid_cache::BidCache::new(
-      std::time::Duration::from_secs(30),
-      1000,
-  );
   ```
+
+  `slots_file` is a local in the startup/handler scope and passed by reference into `handle_publisher_request` on each request — no `Arc` needed since it's immutable and the handler borrows it.
 
   Update the call to `handle_publisher_request`:
 
@@ -1575,14 +1358,15 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
       settings,
       integration_registry,
       &publisher_services,
-      orchestrator,    // existing
-      &slots_file,     // new
-      &bid_cache,      // new
+      orchestrator,   // existing
+      &slots_file,    // new
       req,
   ).await {
       // existing match arms unchanged
   }
   ```
+
+  There is **no `/ts-bids` route** to add. The body injection is complete within `handle_publisher_request`.
 
 - [ ] **Step 8: Compile check**
 
@@ -1599,164 +1383,43 @@ The `BidCache` stores auction results keyed by `request_id` with a 30-second TTL
   ```bash
   git add crates/trusted-server-core/src/publisher.rs \
           crates/trusted-server-adapter-fastly/src/main.rs
-  git commit -m "Convert handle_publisher_request to async; auction writes to bid_cache; inject head globals only"
+  git commit -m "Convert handle_publisher_request to async; body-inject __ts_bids; eligibility gates; max-age=0"
   ```
 
 ---
 
-## Task 10: `/ts-bids` endpoint
-
-**Files:**
-
-- Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
-
-The `/ts-bids` endpoint is the client's fetch target for bid results. It long-polls until the auction completes or the deadline fires, then returns JSON. Bid results were already stored in `bid_cache` by Task 9.
-
-- [ ] **Step 1: Write failing test (integration-style)**
-
-  In `main.rs` test module (or a new `tests/ts_bids.rs`):
-
-  ```rust
-  #[test]
-  fn ts_bids_response_structure() {
-      use crate::bid_cache::{BidCache, WaitResult};
-      use std::time::{Duration, Instant};
-
-      let cache = BidCache::new(Duration::from_secs(30), 100);
-      let rid = "test-rid-abc";
-      let deadline = Instant::now() + Duration::from_secs(5);
-      cache.mark_pending(rid, deadline);
-      let mut bids = std::collections::HashMap::new();
-      bids.insert("atf".to_string(), serde_json::json!({
-          "hb_pb": "1.00", "hb_bidder": "kargo", "hb_adid": "abc", "burl": null,
-      }));
-      cache.put(rid, bids);
-
-      match cache.wait_for(rid, deadline) {
-          WaitResult::Bids(b) => {
-              assert!(b.contains_key("atf"), "should contain atf slot bids");
-          }
-          other => panic!("expected Bids, got {:?}", other),
-      }
-  }
-  ```
-
-  Run: `cargo test -p trusted-server-adapter-fastly ts_bids`
-  Expected: compile error (no handler yet, or pass since it's testing bid_cache directly)
-
-- [ ] **Step 2: Add `/ts-bids` route handler in `main.rs`**
-
-  In the request routing section, before the publisher fallback, add:
-
-  ```rust
-  if req.get_path() == "/ts-bids" && req.get_method() == fastly::http::Method::GET {
-      return handle_ts_bids_request(req, &bid_cache, settings);
-  }
-  ```
-
-  Add the handler function:
-
-  ```rust
-  fn handle_ts_bids_request(
-      req: fastly::Request,
-      bid_cache: &crate::bid_cache::BidCache,
-      settings: &Settings,
-  ) -> fastly::Response {
-      // Parse `rid` query param.
-      let rid = req.get_query_parameter("rid").map(String::from);
-      let rid = match rid {
-          Some(r) if !r.is_empty() => r,
-          _ => {
-              return fastly::Response::from_status(fastly::http::StatusCode::BAD_REQUEST)
-                  .with_body_text_plain("missing rid parameter");
-          }
-      };
-
-      // Use the stored T₀ auction deadline from bid_cache — not a freshly-minted
-      // Instant::now() + timeout, which would extend the window past the original A_deadline.
-      // Spec §4.4: "/ts-bids blocks until auction completion or A_deadline" where A_deadline
-      // = T₀ + auction_timeout_ms (minted at page request receipt, stored in bid_cache entry).
-      let deadline = bid_cache.get_auction_deadline(&rid)
-          .unwrap_or_else(|| {
-              // Fallback: rid is unknown or already complete. wait_for returns immediately.
-              std::time::Instant::now()
-          });
-
-      let result = bid_cache.wait_for(&rid, deadline);
-
-      match result {
-          crate::bid_cache::WaitResult::Bids(bids) => {
-              let body = serde_json::to_string(&bids)
-                  .unwrap_or_else(|_| "{}".to_string());
-              fastly::Response::from_status(fastly::http::StatusCode::OK)
-                  .with_header(fastly::http::header::CONTENT_TYPE, "application/json")
-                  .with_header(fastly::http::header::CACHE_CONTROL, "private, no-store")
-                  .with_body(body)
-          }
-          crate::bid_cache::WaitResult::Empty => {
-              fastly::Response::from_status(fastly::http::StatusCode::OK)
-                  .with_header(fastly::http::header::CONTENT_TYPE, "application/json")
-                  .with_header(fastly::http::header::CACHE_CONTROL, "private, no-store")
-                  .with_body("{}")
-          }
-          crate::bid_cache::WaitResult::NotFound => {
-              fastly::Response::from_status(fastly::http::StatusCode::NOT_FOUND)
-                  .with_header(fastly::http::header::CACHE_CONTROL, "private, no-store")
-                  .with_body_text_plain("unknown request id")
-          }
-      }
-  }
-  ```
-
-- [ ] **Step 3: Compile check**
-
-  Run: `cargo check --workspace`
-  Expected: clean
-
-- [ ] **Step 4: Run tests**
-
-  Run: `cargo test --workspace`
-  Expected: all pass
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add crates/trusted-server-adapter-fastly/src/main.rs
-  git commit -m "Add /ts-bids endpoint with long-poll semantics; serves bid_cache results by request_id"
-  ```
-
----
-
-## Task 11: GPT head injector — emit `__tsAdInit` with `/ts-bids` fetch
+## Task 9: GPT head injector — emit `__tsAdInit` with synchronous bid read
 
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/integrations/gpt.rs`
 
-> **Critical:** The `__tsAdInit` function MUST fetch `/ts-bids?rid=<request_id>` — it must NOT read from `window.__ts_bids` (which is never set). The `window.__ts_request_id` global (injected at head-open by Task 9) supplies the RID.
+> **Critical:** `__tsAdInit` reads `window.__ts_bids` **synchronously** — no fetch, no Promise. `window.__ts_bids` is already on the page (injected before `</body>`) when `__tsAdInit` runs (it executes post-DCL, after `</body>` is received). Both `nurl` and `burl` fire client-side from `slotRenderEnded`; neither is fired server-side.
 
 - [ ] **Step 1: Write failing test**
 
   ```rust
   #[test]
-  fn head_inserts_includes_ts_ad_init_with_ts_bids_fetch() {
+  fn head_inserts_includes_ts_ad_init_with_synchronous_bids_read() {
       let config = test_config();
       let integration = GptIntegration::new(config);
       let ctx = make_test_context();
       let inserts = integration.head_inserts(&ctx);
       let combined = inserts.join("");
       assert!(combined.contains("__tsAdInit"), "should define __tsAdInit");
-      assert!(combined.contains("/ts-bids"), "should fetch from /ts-bids endpoint");
-      assert!(combined.contains("__ts_request_id"), "should use __ts_request_id for rid");
-      assert!(combined.contains("bidsPromise"), "should use bidsPromise pattern");
+      assert!(combined.contains("window.__ts_bids"), "should read window.__ts_bids synchronously");
+      assert!(combined.contains("ts_initial"), "should set ts_initial sentinel");
       assert!(combined.contains("slotRenderEnded"), "should register slotRenderEnded");
-      assert!(combined.contains("sendBeacon"), "should fire burl via sendBeacon");
-      assert!(!combined.contains("__ts_bids"), "must NOT read window.__ts_bids — bids come from /ts-bids fetch");
+      assert!(combined.contains("sendBeacon"), "should fire nurl and burl via sendBeacon");
+      assert!(combined.contains("nurl"), "should fire nurl on confirmed render");
+      assert!(!combined.contains("/ts-bids"), "must NOT fetch /ts-bids — bids are inline on the page");
+      assert!(!combined.contains("bidsPromise"), "must NOT use bidsPromise — bids are synchronous");
+      assert!(!combined.contains("__ts_request_id"), "must NOT reference request_id — no longer used");
   }
   ```
 
   Run: `cargo test -p trusted-server-core integrations::gpt`
-  Expected: FAIL — `__tsAdInit` not defined / assertion on `/ts-bids` string fails if old version present
+  Expected: FAIL
 
 - [ ] **Step 2: Replace `head_inserts()` in gpt.rs**
 
@@ -1771,42 +1434,39 @@ The `/ts-bids` endpoint is the client's fetch target for bid results. It long-po
               "<script>window.__tsjs_gpt_enabled=true;\
                window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                   .to_string(),
-              // __tsAdInit: fetches /ts-bids for bid targeting, then drives GPT.
-              // window.__ts_ad_slots and window.__ts_request_id are injected at head-open by TS.
-              // bidsPromise resolves concurrently with page rendering — never blocks FCP.
+              // __tsAdInit: reads window.__ts_bids synchronously (injected before </body>).
+              // No fetch, no Promise. Executes post-DCL when </body> has already arrived.
+              // Both nurl and burl fire client-side from slotRenderEnded — never server-side.
+              // Note: window.__tsjs_installGptShim above is an EXISTING function in the
+              // tsjs-core bundle that stubs googletag.cmd before the real GPT loads.
               concat!(
                   "<script>",
                   "window.__tsAdInit=function(){",
                     "var slots=window.__ts_ad_slots||[];",
-                    "var rid=window.__ts_request_id;",
-                    "var bidsPromise=rid",
-                      "?fetch('/ts-bids?rid='+encodeURIComponent(rid),{credentials:'omit'})",
-                          ".then(function(r){return r.ok?r.json():{};}).catch(function(){return{};})",
-                      ":Promise.resolve({});",
+                    "var bids=window.__ts_bids||{};",
                     "googletag.cmd.push(function(){",
                       "var gptSlots=slots.map(function(slot){",
                         "var s=googletag.defineSlot(slot.gam_unit_path,slot.formats,slot.div_id);",
                         "if(!s)return null;",
                         "s.addService(googletag.pubads());",
                         "Object.entries(slot.targeting||{}).forEach(function(e){s.setTargeting(e[0],e[1]);});",
+                        "var b=bids[slot.id]||{};",
+                        "[\"hb_pb\",\"hb_bidder\",\"hb_adid\"].forEach(function(k){if(b[k])s.setTargeting(k,b[k]);});",
+                        "s.setTargeting(\"ts_initial\",\"1\");",
                         "return{id:slot.id,gptSlot:s};",
                       "}).filter(Boolean);",
                       "googletag.pubads().enableSingleRequest();",
                       "googletag.enableServices();",
-                      "bidsPromise.then(function(bids){",
-                        "gptSlots.forEach(function(entry){",
-                          "var b=bids[entry.id]||{};",
-                          "[\"hb_pb\",\"hb_bidder\",\"hb_adid\"].forEach(function(k){if(b[k])entry.gptSlot.setTargeting(k,b[k]);});",
-                        "});",
-                        "googletag.pubads().addEventListener(\"slotRenderEnded\",function(ev){",
-                          "var id=ev.slot.getSlotElementId();",
-                          "var b=bids[id]||{};",
-                          "if(!ev.isEmpty&&b.burl&&ev.slot.getTargeting(\"hb_adid\")[0]===b.hb_adid){",
-                            "navigator.sendBeacon(b.burl);",
-                          "}",
-                        "});",
-                        "googletag.pubads().refresh();",
+                      "googletag.pubads().addEventListener(\"slotRenderEnded\",function(ev){",
+                        "var id=ev.slot.getSlotElementId();",
+                        "var b=bids[id]||{};",
+                        "var ourBidWon=!ev.isEmpty&&b.hb_adid&&ev.slot.getTargeting(\"hb_adid\")[0]===b.hb_adid;",
+                        "if(ourBidWon){",
+                          "if(b.nurl)navigator.sendBeacon(b.nurl);",
+                          "if(b.burl)navigator.sendBeacon(b.burl);",
+                        "}",
                       "});",
+                      "googletag.pubads().refresh();",
                     "});",
                   "};",
                   "</script>"
@@ -1825,18 +1485,18 @@ The `/ts-bids` endpoint is the client's fetch target for bid results. It long-po
 
   ```bash
   git add crates/trusted-server-core/src/integrations/gpt.rs
-  git commit -m "Emit __tsAdInit with /ts-bids fetch pattern from GPT head injector"
+  git commit -m "Emit __tsAdInit with synchronous window.__ts_bids read; nurl+burl from slotRenderEnded"
   ```
 
 ---
 
-## Task 12: `gpt/index.ts` — TypeScript `__tsAdInit` with `/ts-bids` fetch
+## Task 10: `gpt/index.ts` — TypeScript `__tsAdInit` with slim-Prebid lazy loader
 
 **Files:**
 
 - Modify: `crates/js/lib/src/integrations/gpt/index.ts`
 
-The TypeScript version mirrors the Rust inline string from Task 11. It uses the `bidsPromise` pattern — fetching `/ts-bids` concurrently with GPT slot definition.
+The TypeScript version mirrors the Rust inline string from Task 9 and adds the lazy slim-Prebid loader. Slim-Prebid loads post-`window.load` and handles two things: refresh auctions (via existing GPT refresh triggers) and userID module warm-up to enrich the EC graph for the next request.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1848,16 +1508,16 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
   describe('installTsAdInit', () => {
     beforeEach(() => {
       delete (window as any).__ts_ad_slots
-      delete (window as any).__ts_request_id
+      delete (window as any).__ts_bids
       delete (window as any).__tsAdInit
     })
 
-    it('fetches /ts-bids with request_id and applies bid targeting before refresh', async () => {
+    it('reads window.__ts_bids synchronously and applies bid targeting before refresh', async () => {
       const mockSlot = {
         addService: vi.fn().mockReturnThis(),
         setTargeting: vi.fn().mockReturnThis(),
         getSlotElementId: vi.fn().mockReturnValue('atf'),
-        getTargeting: vi.fn().mockReturnValue([]),
+        getTargeting: vi.fn().mockReturnValue(['abc']),
       }
       const mockPubads = {
         enableSingleRequest: vi.fn(),
@@ -1879,63 +1539,32 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
           targeting: { pos: 'atf' },
         },
       ]
-      ;(window as any).__ts_request_id = 'test-rid-123'
+      ;(window as any).__ts_bids = {
+        atf: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
+      }
 
-      const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          atf: {
-            hb_pb: '1.00',
-            hb_bidder: 'kargo',
-            hb_adid: 'abc',
-            burl: 'https://ssp/bill',
-          },
-        }),
-      } as Response)
+      const fetchSpy = vi.spyOn(global, 'fetch')
 
       const { installTsAdInit } = await import('./index')
       installTsAdInit()
-      await (window as any).__tsAdInit()
+      ;(window as any).__tsAdInit()
 
-      expect(fetchSpy).toHaveBeenCalledWith(
-        expect.stringContaining('/ts-bids?rid=test-rid-123'),
-        expect.objectContaining({ credentials: 'omit' })
-      )
+      expect(fetchSpy).not.toHaveBeenCalled()
       expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00')
       expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_bidder', 'kargo')
+      expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1')
       expect(mockPubads.refresh).toHaveBeenCalled()
 
       fetchSpy.mockRestore()
     })
 
-    it('calls refresh with empty bids when fetch fails', async () => {
-      const mockPubads = {
-        enableSingleRequest: vi.fn(),
-        addEventListener: vi.fn(),
-        refresh: vi.fn(),
-      }
-      ;(window as any).googletag = {
-        cmd: { push: vi.fn((fn: () => void) => fn()) },
-        defineSlot: vi.fn().mockReturnValue({
-          addService: vi.fn().mockReturnThis(),
-          setTargeting: vi.fn().mockReturnThis(),
-        }),
-        pubads: vi.fn().mockReturnValue(mockPubads),
-        enableServices: vi.fn(),
-      }
-      ;(window as any).__ts_ad_slots = []
-      ;(window as any).__ts_request_id = 'rid-fail'
-
-      vi.spyOn(global, 'fetch').mockRejectedValue(new Error('network error'))
-
-      const { installTsAdInit } = await import('./index')
-      installTsAdInit()
-      await (window as any).__tsAdInit()
-
-      expect(mockPubads.refresh).toHaveBeenCalled()
-    })
-
-    it('fires burl via sendBeacon on slotRenderEnded when our bid won', async () => {
+    it('fires both nurl and burl via sendBeacon on slotRenderEnded when our bid won', async () => {
       const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true)
       let capturedListener: ((e: any) => void) | undefined
 
@@ -1967,43 +1596,112 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
           targeting: {},
         },
       ]
-      ;(window as any).__ts_request_id = 'rid-burl-test'
-
-      vi.spyOn(global, 'fetch').mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          atf: {
-            hb_pb: '1.00',
-            hb_bidder: 'kargo',
-            hb_adid: 'abc',
-            burl: 'https://ssp/bill',
-          },
-        }),
-      } as Response)
+      ;(window as any).__ts_bids = {
+        atf: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
+      }
 
       const { installTsAdInit } = await import('./index')
       installTsAdInit()
-      await (window as any).__tsAdInit()
+      ;(window as any).__tsAdInit()
 
-      // Trigger slotRenderEnded — slot has our winning hb_adid
       expect(capturedListener).toBeDefined()
-      capturedListener!({
-        isEmpty: false,
-        slot: mockSlot,
-      })
+      capturedListener!({ isEmpty: false, slot: mockSlot })
 
+      expect(beaconSpy).toHaveBeenCalledWith('https://ssp/win')
       expect(beaconSpy).toHaveBeenCalledWith('https://ssp/bill')
       beaconSpy.mockRestore()
+    })
+
+    it('does not fire nurl/burl when bid did not win GAM line item', async () => {
+      const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true)
+      let capturedListener: ((e: any) => void) | undefined
+
+      const mockSlotNoMatch = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('atf'),
+        getTargeting: vi.fn().mockReturnValue(['OTHER_BID_ID']),
+      }
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        refresh: vi.fn(),
+        addEventListener: vi.fn((event: string, fn: (e: any) => void) => {
+          if (event === 'slotRenderEnded') capturedListener = fn
+        }),
+      }
+      ;(window as any).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn().mockReturnValue(mockSlotNoMatch),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      }
+      ;(window as any).__ts_ad_slots = [
+        {
+          id: 'atf',
+          gam_unit_path: '/123/atf',
+          div_id: 'atf',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ]
+      ;(window as any).__ts_bids = {
+        atf: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
+      }
+
+      const { installTsAdInit } = await import('./index')
+      installTsAdInit()
+      ;(window as any).__tsAdInit()
+      capturedListener!({ isEmpty: false, slot: mockSlotNoMatch })
+
+      expect(beaconSpy).not.toHaveBeenCalled()
+      beaconSpy.mockRestore()
+    })
+
+    it('calls refresh even when __ts_bids is empty (graceful fallback)', () => {
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        addEventListener: vi.fn(),
+        refresh: vi.fn(),
+      }
+      ;(window as any).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot: vi.fn().mockReturnValue({
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+        }),
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+      }
+      ;(window as any).__ts_ad_slots = []
+      ;(window as any).__ts_bids = {}
+
+      const { installTsAdInit } = require('./index')
+      installTsAdInit()
+      ;(window as any).__tsAdInit()
+
+      expect(mockPubads.refresh).toHaveBeenCalled()
     })
   })
   ```
 
   Run: `cd crates/js/lib && npx vitest run`
-  Expected: FAIL — `installTsAdInit` not exported or fetches wrong endpoint
+  Expected: FAIL — `installTsAdInit` not defined or assertions fail
 
-- [ ] **Step 2: Add `installTsAdInit` to `index.ts`**
+- [ ] **Step 2: Implement `installTsAdInit` in `index.ts`**
 
-  Add to `crates/js/lib/src/integrations/gpt/index.ts`:
+  Replace the old `/ts-bids` fetch implementation with:
 
   ```typescript
   interface TsAdSlot {
@@ -2018,38 +1716,30 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
     hb_pb?: string
     hb_bidder?: string
     hb_adid?: string
+    nurl?: string
     burl?: string
   }
 
   type TsWindow = Window & {
     __ts_ad_slots?: TsAdSlot[]
-    __ts_request_id?: string
+    __ts_bids?: Record<string, TsBidData>
     __tsAdInit?: () => void
   }
 
   /**
    * Install `window.__tsAdInit`.
    *
-   * Reads `window.__ts_ad_slots` and `window.__ts_request_id` (both injected by
-   * the edge at `<head>` open). Fetches bid results from `/ts-bids?rid=<request_id>`
-   * concurrently with GPT slot definition. Applies targeting and calls `refresh()`
-   * after the fetch resolves. Registers `slotRenderEnded` to fire `burl` via
-   * `sendBeacon` when our specific Prebid bid wins the GAM line item match.
+   * Reads `window.__ts_ad_slots` (injected at head-open) and `window.__ts_bids`
+   * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
+   * targeting to GPT slots, sets the `ts_initial` sentinel, registers
+   * `slotRenderEnded` to fire both nurl and burl via sendBeacon when our
+   * specific Prebid bid wins the GAM line item match, then calls refresh().
    */
   export function installTsAdInit(): void {
     const w = window as TsWindow
     w.__tsAdInit = function () {
       const slots = w.__ts_ad_slots ?? []
-      const rid = w.__ts_request_id
-
-      const bidsPromise: Promise<Record<string, TsBidData>> = rid
-        ? fetch(`/ts-bids?rid=${encodeURIComponent(rid)}`, {
-            credentials: 'omit',
-          })
-            .then((r) => (r.ok ? r.json() : {}))
-            .catch(() => ({}))
-        : Promise.resolve({})
-
+      const bids = w.__ts_bids ?? {}
       const g = (window as GptWindow).googletag
       if (!g) return
 
@@ -2066,6 +1756,11 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
             Object.entries(slot.targeting ?? {}).forEach(([k, v]) =>
               gptSlot.setTargeting(k, v)
             )
+            const bid = bids[slot.id] ?? {}
+            ;(['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
+              if (bid[key]) gptSlot.setTargeting(key, bid[key]!)
+            })
+            gptSlot.setTargeting('ts_initial', '1')
             return { id: slot.id, gptSlot }
           })
           .filter(Boolean) as Array<{
@@ -2076,153 +1771,86 @@ The TypeScript version mirrors the Rust inline string from Task 11. It uses the 
         g.pubads().enableSingleRequest()
         g.enableServices()
 
-        bidsPromise.then((bids) => {
-          gptSlots.forEach(({ id, gptSlot }) => {
-            const bid = bids[id] ?? {}
-            ;(['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
-              if (bid[key]) gptSlot.setTargeting(key, bid[key]!)
-            })
-          })
-
-          g.pubads().addEventListener?.('slotRenderEnded', (event: any) => {
-            const slotId: string = event.slot?.getSlotElementId?.() ?? ''
-            const bid = bids[slotId] ?? {}
-            if (
-              !event.isEmpty &&
-              bid.burl &&
-              event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
-            ) {
-              navigator.sendBeacon(bid.burl)
-            }
-          })
-
-          g.pubads().refresh()
+        g.pubads().addEventListener?.('slotRenderEnded', (event: any) => {
+          const slotId: string = event.slot?.getSlotElementId?.() ?? ''
+          const bid = bids[slotId] ?? {}
+          const ourBidWon =
+            !event.isEmpty &&
+            bid.hb_adid &&
+            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
+          if (ourBidWon) {
+            if (bid.nurl) navigator.sendBeacon(bid.nurl)
+            if (bid.burl) navigator.sendBeacon(bid.burl)
+          }
         })
+
+        g.pubads().refresh()
       })
     }
   }
   ```
 
-  Call `installTsAdInit()` from the integration's initialization path.
+- [ ] **Step 3: Add lazy slim-Prebid loader (post-`window.load`)**
 
-- [ ] **Step 3: Run JS tests**
+  After `installTsAdInit`, add:
+
+  ```typescript
+  /**
+   * Register the slim-Prebid lazy loader. Fires after window.load — off the
+   * critical path. slim-Prebid handles refresh auctions and userID module
+   * warm-up (ID5, sharedID, LiveRamp ATS, Lockr). It skips initial-render slots
+   * (ts_initial=1) and registers as the GPT refresh handler for scroll/sticky auctions.
+   *
+   * Phase 1: no-op unless window.__tsjs_slim_prebid_url is set (it won't be until
+   * the slim-Prebid bundle build target ships in a later phase).
+   */
+  export function installSlimPrebidLoader(): void {
+    const url = (window as any).__tsjs_slim_prebid_url as string | undefined
+    if (!url) return
+    window.addEventListener('load', () => {
+      const script = document.createElement('script')
+      script.src = url
+      script.defer = true
+      document.head.appendChild(script)
+    })
+  }
+  ```
+
+  Call `installTsAdInit()` from the integration's existing initialization path — wherever the module's init function runs at page load (look for the existing `init()` or module-level call that sets up the GPT integration). Add:
+
+  ```typescript
+  // In the integration's init / module entry point:
+  installTsAdInit()
+  ```
+
+  `window.__tsAdInit()` itself is called by `__tsAdInit` being invoked from the `<script>` block at the bottom of `</body>` (the same script block that calls `window.__tsAdInit()` after the browser receives it).
+
+- [ ] **Step 4: Run JS tests**
 
   Run: `cd crates/js/lib && npx vitest run`
   Expected: new tests pass
 
-- [ ] **Step 4: Build JS bundle**
+- [ ] **Step 5: Build JS bundle**
 
   Run: `cd crates/js/lib && node build-all.mjs`
   Expected: clean build
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
   ```bash
   git add crates/js/lib/src/integrations/gpt/
-  git commit -m "Add installTsAdInit with /ts-bids fetch pattern and slotRenderEnded burl firing"
+  git commit -m "Add synchronous __tsAdInit (reads window.__ts_bids inline); nurl+burl from slotRenderEnded; slim-Prebid lazy loader"
   ```
 
 ---
 
-## Task 13: `nurl` fire-and-forget
-
-**Files:**
-
-- Modify: `crates/trusted-server-core/src/integrations/prebid.rs`
-- Modify: `crates/trusted-server-core/src/publisher.rs`
-
-- [ ] **Step 1: Write failing test**
-
-  ```rust
-  #[test]
-  fn prebid_config_fire_nurl_defaults_to_true() {
-      let config = PrebidConfig::default();
-      assert!(config.fire_nurl_at_edge, "should fire nurl at edge by default");
-  }
-  ```
-
-  Run: `cargo test -p trusted-server-core integrations::prebid`
-  Expected: FAIL
-
-- [ ] **Step 2: Add `fire_nurl_at_edge` to `PrebidConfig`**
-
-  ```rust
-  #[serde(default = "default_fire_nurl_at_edge")]
-  pub fire_nurl_at_edge: bool,
-  ```
-
-  ```rust
-  fn default_fire_nurl_at_edge() -> bool { true }
-  ```
-
-- [ ] **Step 3: Fire nurls in publisher.rs after bid_cache.put()**
-
-  After the `bid_cache.put(...)` call (Task 9 Step 3), add:
-
-  ```rust
-  if let Some(ref result) = auction_result {
-      fire_winning_nurls(result, settings);
-  }
-  ```
-
-  Add helper:
-
-  ```rust
-  fn fire_winning_nurls(
-      result: &crate::auction::orchestrator::OrchestrationResult,
-      settings: &Settings,
-  ) {
-      use crate::backend::BackendConfig;
-
-      let fire_nurl = settings
-          .integrations
-          .get_typed::<crate::integrations::prebid::PrebidConfig>("prebid")
-          .map(|c| c.fire_nurl_at_edge)
-          .unwrap_or(true);
-
-      if !fire_nurl {
-          return;
-      }
-
-      for bid in result.winning_bids.values() {
-          let Some(ref nurl) = bid.nurl else { continue };
-          let backend_name = match BackendConfig::from_url(nurl, false) {
-              Ok(name) => name,
-              Err(e) => {
-                  log::warn!("nurl: cannot create backend for {nurl}: {e:?}");
-                  continue;
-              }
-          };
-          match fastly::Request::get(nurl).send_async(&backend_name) {
-              Ok(_) => log::debug!("nurl: fired for slot {}", bid.slot_id),
-              Err(e) => log::warn!("nurl: failed for slot {}: {e}", bid.slot_id),
-          }
-      }
-  }
-  ```
-
-- [ ] **Step 4: Run tests**
-
-  Run: `cargo test --workspace`
-  Expected: all pass
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add crates/trusted-server-core/src/integrations/prebid.rs \
-          crates/trusted-server-core/src/publisher.rs
-  git commit -m "Fire winning bid nurl fire-and-forget from edge; add fire_nurl_at_edge config"
-  ```
-
----
-
-## Task 14: End-to-end integration tests
+## Task 11: End-to-end integration tests
 
 **Files:**
 
 - Modify: `crates/trusted-server-core/src/publisher.rs` (test module)
 
-Tests use `pub(crate)` helpers from Task 9 directly.
+Tests use `pub(crate)` helpers from Task 8 directly.
 
 - [ ] **Step 1: Write tests**
 
@@ -2231,10 +1859,9 @@ Tests use `pub(crate)` helpers from Task 9 directly.
   ```rust
   #[cfg(test)]
   mod creative_opportunities_tests {
-      use super::{build_head_globals_script, build_bid_map, html_escape_for_script};
+      use super::{build_ad_slots_script, build_bids_script, build_bid_map, html_escape_for_script};
       use crate::creative_opportunities::{
           CreativeOpportunitiesConfig, CreativeOpportunitySlot, CreativeOpportunityFormat,
-          CreativeOpportunitiesFile, match_slots,
       };
       use crate::auction::types::{Bid, MediaType};
       use crate::price_bucket::PriceGranularity;
@@ -2264,23 +1891,21 @@ Tests use `pub(crate)` helpers from Task 9 directly.
       }
 
       #[test]
-      fn head_globals_script_contains_ad_slots_and_request_id() {
+      fn ad_slots_script_contains_slot_data() {
           let slots = vec![make_slot()];
           let config = make_config();
-          let rid = "550e8400-e29b-41d4-a716-446655440000";
-          let script = build_head_globals_script(&slots, rid, &config);
-          assert!(script.contains("window.__ts_ad_slots=JSON.parse"), "should use JSON.parse for slots");
+          let script = build_ad_slots_script(&slots, &config);
+          assert!(script.contains("window.__ts_ad_slots=JSON.parse"), "should use JSON.parse");
           assert!(script.contains("atf_sidebar_ad"), "should include slot id");
-          assert!(script.contains(&format!("window.__ts_request_id=\"{rid}\"")), "should include request_id");
-          assert!(!script.contains("__ts_bids"), "must NOT contain bids — bids come from /ts-bids");
+          assert!(!script.contains("__ts_bids"), "must NOT contain bids");
+          assert!(!script.contains("__ts_request_id"), "must NOT contain request_id");
       }
 
       #[test]
-      fn head_globals_script_is_xss_safe() {
+      fn ad_slots_script_is_xss_safe() {
           let slots = vec![make_slot()];
           let config = make_config();
-          let script = build_head_globals_script(&slots, "safe-rid", &config);
-          // Strip outer <script> tags to inspect the content
+          let script = build_ad_slots_script(&slots, &config);
           let inner = script
               .trim_start_matches("<script>")
               .trim_end_matches("</script>");
@@ -2289,7 +1914,7 @@ Tests use `pub(crate)` helpers from Task 9 directly.
       }
 
       #[test]
-      fn bid_map_uses_price_bucket_and_ad_id() {
+      fn bid_map_includes_nurl_and_burl() {
           let mut winning_bids = HashMap::new();
           winning_bids.insert("atf_sidebar_ad".to_string(), Bid {
               slot_id: "atf_sidebar_ad".to_string(),
@@ -2298,46 +1923,60 @@ Tests use `pub(crate)` helpers from Task 9 directly.
               creative: None,
               adomain: None,
               bidder: "kargo".to_string(),
-              width: 300, height: 250,
-              nurl: None,
-              burl: Some("https://ssp.example/billing?id=abc123".to_string()),
-              ad_id: Some("prebid-uuid-abc123".to_string()),
-              metadata: HashMap::new(),
+              width: 300,
+              height: 250,
+              nurl: Some("https://ssp/win".to_string()),
+              burl: Some("https://ssp/bill".to_string()),
+              ad_id: Some("abc123".to_string()),
+              metadata: Default::default(),
           });
-          let bid_map = build_bid_map(&winning_bids, PriceGranularity::Dense);
-          let slot_bids = bid_map.get("atf_sidebar_ad").expect("should have slot bids");
-          assert_eq!(
-              slot_bids.get("hb_pb").and_then(|v| v.as_str()),
-              Some("2.53"),
-              "should bucket 2.53 as 2.53 (dense)"
-          );
-          assert_eq!(
-              slot_bids.get("hb_bidder").and_then(|v| v.as_str()),
-              Some("kargo"),
-              "should include bidder"
-          );
-          assert_eq!(
-              slot_bids.get("hb_adid").and_then(|v| v.as_str()),
-              Some("prebid-uuid-abc123"),
-              "should use ad_id not creative markup"
-          );
+          let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+          let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
+          assert_eq!(entry.get("hb_pb").and_then(|v| v.as_str()), Some("2.50"));
+          assert_eq!(entry.get("hb_bidder").and_then(|v| v.as_str()), Some("kargo"));
+          assert_eq!(entry.get("hb_adid").and_then(|v| v.as_str()), Some("abc123"));
+          assert_eq!(entry.get("nurl").and_then(|v| v.as_str()), Some("https://ssp/win"));
+          assert_eq!(entry.get("burl").and_then(|v| v.as_str()), Some("https://ssp/bill"));
       }
 
       #[test]
-      fn html_escape_neutralizes_xss_in_json() {
-          let malicious = r#"{"zone":"</script><script>alert(1)//"}"#;
-          let escaped = html_escape_for_script(malicious);
-          assert!(!escaped.contains("</script>"), "should escape </script>");
-          assert!(escaped.contains("\\u003c"), "should unicode-escape <");
-          assert!(escaped.contains("\\u003e"), "should unicode-escape >");
+      fn bid_map_excludes_slot_when_price_is_none() {
+          let mut winning_bids = HashMap::new();
+          winning_bids.insert("no-price-slot".to_string(), Bid {
+              slot_id: "no-price-slot".to_string(),
+              price: None,
+              currency: "USD".to_string(),
+              creative: None,
+              adomain: None,
+              bidder: "kargo".to_string(),
+              width: 300,
+              height: 250,
+              nurl: None,
+              burl: None,
+              ad_id: None,
+              metadata: Default::default(),
+          });
+          let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+          assert!(map.is_empty(), "slot with no price should be excluded from bid map");
       }
 
       #[test]
-      fn url_matching_end_to_end() {
-          let file = CreativeOpportunitiesFile { slots: vec![make_slot()] };
-          assert_eq!(match_slots(&file.slots, "/2024/01/my-article").len(), 1, "should match article");
-          assert_eq!(match_slots(&file.slots, "/about").len(), 0, "should not match /about");
-          assert_eq!(match_slots(&file.slots, "/").len(), 0, "should not match root");
+      fn bids_script_is_xss_safe() {
+          let mut map = serde_json::Map::new();
+          map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
+          let script = build_bids_script(&map);
+          let inner = script
+              .trim_start_matches("<script>")
+              .trim_end_matches("</script>");
+          assert!(!inner.contains('<'), "no unescaped < in bids script");
+          assert!(!inner.contains('>'), "no unescaped > in bids script");
+      }
+
+      #[test]
+      fn html_escape_encodes_special_chars() {
+          assert_eq!(html_escape_for_script("<script>"), "\\u003cscript\\u003e");
+          assert_eq!(html_escape_for_script("&"), "\\u0026");
+          assert_eq!(html_escape_for_script("\u{2028}"), "\\u2028");
       }
   }
   ```
@@ -2347,53 +1986,19 @@ Tests use `pub(crate)` helpers from Task 9 directly.
   Run: `cargo test -p trusted-server-core creative_opportunities_tests`
   Expected: all pass
 
-- [ ] **Step 3: Run full suite + CI gates**
+- [ ] **Step 3: Run full workspace tests**
 
-  ```bash
-  cargo test --workspace
-  cargo clippy --workspace --all-targets --all-features -- -D warnings
-  cargo fmt --all -- --check
-  cd crates/js/lib && npx vitest run
-  cd crates/js/lib && npm run format
-  cd docs && npm run format
-  ```
+  Run: `cargo test --workspace`
+  Expected: all pass
 
-  Expected: all clean
+- [ ] **Step 4: Run JS tests**
 
-- [ ] **Step 4: Commit**
+  Run: `cd crates/js/lib && npx vitest run`
+  Expected: all pass
+
+- [ ] **Step 5: Commit**
 
   ```bash
   git add crates/trusted-server-core/src/publisher.rs
-  git commit -m "Add integration tests for creative opportunities pipeline (head globals, bid map, XSS)"
+  git commit -m "Add end-to-end publisher helper tests for body-injection architecture"
   ```
-
----
-
-## Manual Verification Checklist
-
-Run `fastly compute serve` and verify:
-
-- [ ] **No match:** Request `/about` — no `__ts_ad_slots`, no `__ts_request_id` in response HTML; no `Cache-Control: private, no-store`
-- [ ] **Match:** Request `/2024/01/article` — `window.__ts_ad_slots` and `window.__ts_request_id` in `<head>`; `Cache-Control: private, no-store`; **no `__ts_bids` in HTML**
-- [ ] **`/ts-bids` cache hit:** Request `/2024/01/article`, then `GET /ts-bids?rid=<rid-from-page>` — returns JSON within 30ms; `Content-Type: application/json`; `Cache-Control: private, no-store`
-- [ ] **`/ts-bids` unknown rid:** `GET /ts-bids?rid=not-a-real-id` — returns 404
-- [ ] **`/ts-bids` missing rid:** `GET /ts-bids` — returns 400
-- [ ] **Empty file kill-switch:** Empty `creative-opportunities.toml` → no globals injected on any URL; no cache headers
-- [ ] **Auction timeout:** Set `auction_timeout_ms = 1` → `/ts-bids` returns `{}` promptly
-- [ ] **XSS check:** Add `targeting = { zone = "</script><script>alert(1)//" }` to a slot → verify `<` and `>` in HTML source; no unescaped `<` or `>`
-- [ ] **Cache-Control absent when no slots match:** Confirm `Cache-Control: private, no-store` is NOT set for URLs with no slot match (preserves origin cache directives)
-
----
-
-## Known Limitations
-
-| Item                                                | Notes                                                                                                                                                                                                                                                                                                                                                                             |
-| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AuctionContext.request` placeholder                | After `send_async` consumes `req`, a blank `fastly::Request::new()` is passed. Providers reading User-Agent/IP/cookies from this field will degrade silently. Resolve before production: clone needed fields before `send_async` or remove the `request` field from `AuctionContext` in favor of `client_info`.                                                                   |
-| `nurl` dynamic backend allowlist                    | `fire_winning_nurls` uses `BackendConfig::from_url()`. The SSP domain must be in `fastly.toml`'s dynamic backend origins allowlist, or `allow_dynamic_backends = true`. Confirm with ops before enabling.                                                                                                                                                                         |
-| `bid_cache` not shared across Fastly edge instances | `BidCache` is per-process. If the browser's `/ts-bids` request routes to a different edge instance than the page request, it will receive 404 and GPT falls back gracefully. Acceptable for Phase 1; Phase 2 can use Fastly KV for cross-instance sharing.                                                                                                                        |
-| `burl` absent for APS                               | APS bids have no `burl`. The field is `null` in `/ts-bids` response for APS slots — the `slotRenderEnded` check correctly short-circuits on `!bid.burl`.                                                                                                                                                                                                                          |
-| `bid_cache` `Mutex` contention                      | In sustained high-traffic scenarios, the `Mutex` may become a contention point. Phase 1 workload (one lock per request, 50ms poll interval for `/ts-bids`) is well within Fastly's concurrency model. Revisit if profiling shows contention.                                                                                                                                      |
-| Long-poll sleep in `/ts-bids`                       | `std::thread::sleep(50ms)` is used inside `wait_for`. This cooperates well with Fastly's execution model in practice, but may affect throughput under extreme concurrency. Validated via load testing before production rollout.                                                                                                                                                  |
-| Chunked encoding and buffered origins               | Spec §4.3 requires stripping `Content-Length` and setting `Transfer-Encoding: chunked` on all responses (including buffered WordPress/Drupal origins). Task 9 Step 4 implements this, but the Fastly runtime may handle chunked re-encoding transparently for some origin types. Verify behavior with a known buffered origin (e.g., a static file server) during manual testing. |
-| Empty-file kill-switch behavior                     | Deploying `creative-opportunities.toml` with zero `[[slot]]` entries disables the feature entirely — no auction fires, no globals injected, no `Cache-Control: private, no-store` set. This is intentional and tested in the Manual Verification Checklist but has no automated unit test — add one to Task 4 or Task 14 if this path is operationally critical.                  |
