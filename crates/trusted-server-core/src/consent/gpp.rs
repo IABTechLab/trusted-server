@@ -71,10 +71,10 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     // Section ID 2 = TcfEuV2 in the GPP spec.
     let eu_tcf = decode_tcf_from_gpp(&parsed);
 
-    // The GPP header version is always 1 for current spec.
     let us_sale_opt_out = decode_us_sale_opt_out(&parsed);
 
     Ok(GppConsent {
+        // The GPP header version is always 1 for current spec.
         version: 1,
         section_ids,
         eu_tcf,

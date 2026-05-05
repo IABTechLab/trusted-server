@@ -3,6 +3,9 @@ import { log } from '../../core/log';
 const SP_CONSENT_PREFIX = '_sp_user_consent_';
 const GPP_COOKIE_NAME = '__gpp';
 const GPP_SID_COOKIE_NAME = '__gpp_sid';
+const GPP_SOURCE_COOKIE_NAME = '_ts_gpp_src';
+const GPP_SOURCE_SOURCEPOINT = 'sp';
+const INITIAL_RETRY_DELAY_MS = 500;
 
 interface SourcepointGppData {
   gppString: string;
@@ -12,6 +15,8 @@ interface SourcepointGppData {
 interface SourcepointConsentPayload {
   gppData?: SourcepointGppData;
 }
+
+let initialized = false;
 
 function findSourcepointConsent(): SourcepointConsentPayload | null {
   // Sourcepoint stores one consent payload per property under `_sp_user_consent_*`.
@@ -35,14 +40,50 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
   return null;
 }
 
+function readCookie(name: string): string | undefined {
+  const prefix = `${name}=`;
+  const cookie = document.cookie.split('; ').find((entry) => entry.startsWith(prefix));
+  return cookie?.slice(prefix.length);
+}
+
+function hasSourcepointMarker(): boolean {
+  return readCookie(GPP_SOURCE_COOKIE_NAME) === GPP_SOURCE_SOURCEPOINT;
+}
+
 function writeCookie(name: string, value: string): void {
   document.cookie = `${name}=${value}; path=/; Secure; SameSite=Lax`;
 }
 
 function clearCookie(name: string): void {
-  // Trusted Server is the only intended writer for these mirrored cookies, so
-  // clearing the origin-scoped cookie is sufficient for this integration.
   document.cookie = `${name}=; path=/; Secure; SameSite=Lax; Max-Age=0`;
+}
+
+function clearSourcepointCookies(): void {
+  if (!hasSourcepointMarker()) {
+    return;
+  }
+
+  clearCookie(GPP_COOKIE_NAME);
+  clearCookie(GPP_SID_COOKIE_NAME);
+  clearCookie(GPP_SOURCE_COOKIE_NAME);
+}
+
+function mirrorOnVisible(): void {
+  if (document.visibilityState === 'visible') {
+    mirrorSourcepointConsent();
+  }
+}
+
+function scheduleInitialRetry(): void {
+  const retry = (): void => {
+    mirrorSourcepointConsent();
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', retry, { once: true });
+  }
+
+  window.setTimeout(retry, INITIAL_RETRY_DELAY_MS);
 }
 
 /**
@@ -58,25 +99,24 @@ export function mirrorSourcepointConsent(): boolean {
 
   const payload = findSourcepointConsent();
   if (!payload?.gppData) {
-    clearCookie(GPP_COOKIE_NAME);
-    clearCookie(GPP_SID_COOKIE_NAME);
+    clearSourcepointCookies();
     log.debug('sourcepoint: no GPP data found in localStorage');
     return false;
   }
 
   const { gppString, applicableSections } = payload.gppData;
   if (!gppString) {
-    clearCookie(GPP_COOKIE_NAME);
-    clearCookie(GPP_SID_COOKIE_NAME);
+    clearSourcepointCookies();
     log.debug('sourcepoint: gppString is empty');
     return false;
   }
 
+  writeCookie(GPP_SOURCE_COOKIE_NAME, GPP_SOURCE_SOURCEPOINT);
   writeCookie(GPP_COOKIE_NAME, gppString);
 
   if (Array.isArray(applicableSections) && applicableSections.length > 0) {
     writeCookie(GPP_SID_COOKIE_NAME, applicableSections.join(','));
-  } else {
+  } else if (hasSourcepointMarker()) {
     clearCookie(GPP_SID_COOKIE_NAME);
   }
 
@@ -88,8 +128,24 @@ export function mirrorSourcepointConsent(): boolean {
   return true;
 }
 
-if (typeof window !== 'undefined') {
-  mirrorSourcepointConsent();
+/**
+ * Initializes Sourcepoint consent mirroring and bounded refresh hooks.
+ */
+export function initializeSourcepointConsentMirror(): void {
+  if (initialized || typeof window === 'undefined' || typeof document === 'undefined') {
+    return;
+  }
+
+  initialized = true;
+
+  if (!mirrorSourcepointConsent()) {
+    scheduleInitialRetry();
+  }
+
+  // Sourcepoint persists consent changes to localStorage. Re-mirror when a
+  // user returns to the page so session cookies do not remain stale.
+  document.addEventListener('visibilitychange', mirrorOnVisible);
+  window.addEventListener('focus', mirrorSourcepointConsent);
 }
 
-export default mirrorSourcepointConsent;
+initializeSourcepointConsentMirror();

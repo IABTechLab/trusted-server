@@ -798,7 +798,8 @@ impl IntegrationRegistry {
     pub fn js_module_ids(&self) -> Vec<&'static str> {
         // Rust-only integrations with no corresponding JS module
         const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
-        // JS-only modules always included (no Rust-side registration)
+        // JS-only modules always included (no Rust-side registration).
+        // Sourcepoint's JS guards cookie clearing with a Sourcepoint-owned marker.
         const JS_ALWAYS: &[&str] = &["creative", "sourcepoint"];
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();

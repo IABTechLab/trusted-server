@@ -225,40 +225,13 @@ Adding a new client-side bidder requires both a config change (`client_side_bidd
 
 ## User ID Modules
 
-Prebid's User ID Module resolves cross-publisher identifiers (SharedID, ID5, LiveRamp RampID, UID2, etc.) and exposes them via `pbjs.getUserIdsAsEids()`. The TSJS Prebid integration bundles the core `userId.js` module and a configurable set of ID submodules. When the publisher's origin-side `pbjs.setConfig({ userSync: { userIds: [...] } })` call runs during `processQueue()`, each listed submodule activates and begins resolving its ID asynchronously. After each auction the shim writes the resolved EIDs to a `ts-eids` cookie, which the Rust backend ingests into the Edge Cookie identity graph.
+Prebid.js can expose publisher-configured User ID Module output via
+`pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
+EIDs after auctions and forwards them to Trusted Server when they are available.
 
-### How it works
-
-1. `userId.js` is statically imported in `index.ts` — always bundled, not operator-configurable.
-2. The set of ID submodules is controlled by `TSJS_PREBID_USER_IDS` at build time and emitted into `_user_ids.generated.ts`.
-3. Publishers retain full control of which submodules actually run — activation is driven by their own `pbjs.setConfig({ userSync: { userIds: [...] } })` on origin. Bundling a submodule without a matching publisher config entry is inert (but costs bundle size).
-4. The `bidsBackHandler` shim calls `pbjs.getUserIdsAsEids()` after each auction and writes the resolved entries to the `ts-eids` cookie (base64-encoded JSON, 3072-byte cap with tail-trim).
-
-### Build-time submodule selection
-
-```bash
-# Default: the full ship-set of 13 submodules
-# (sharedIdSystem, criteoIdSystem, 33acrossIdSystem, pubProvidedIdSystem,
-#  quantcastIdSystem, id5IdSystem, identityLinkIdSystem, uid2IdSystem,
-#  euidIdSystem, intentIqIdSystem, lotamePanoramaIdSystem, connectIdSystem,
-#  merkleIdSystem)
-
-# Slim build — only SharedID and ID5
-TSJS_PREBID_USER_IDS=sharedIdSystem,id5IdSystem
-
-# Single submodule
-TSJS_PREBID_USER_IDS=sharedIdSystem
-```
-
-Values are Prebid module filenames without the `.js` extension. The build script (`build-all.mjs`) validates that each exists in `prebid.js/modules/{name}.js` and generates `_user_ids.generated.ts` with the appropriate imports. Unknown names log a warning and are skipped.
-
-::: warning
-`liveIntentIdSystem` is on a build-time denylist — its upstream module uses a dynamic `require()` that esbuild cannot statically resolve, throwing `ReferenceError: require is not defined` at browser runtime. Listing it in `TSJS_PREBID_USER_IDS` logs a warning and skips the module.
-:::
-
-::: tip
-Each bundled submodule bloats `tsjs-prebid.js`. If a publisher deployment only needs SharedID and ID5, set `TSJS_PREBID_USER_IDS` accordingly — the other ~100kb of dormant module code won't ship.
-:::
+Build-time configurable User ID submodule selection is not currently part of the
+TSJS build pipeline. Do not rely on a `TSJS_PREBID_USER_IDS` environment
+variable or generated `_user_ids.generated.ts` file for slim User ID builds.
 
 ## Identity Forwarding
 
