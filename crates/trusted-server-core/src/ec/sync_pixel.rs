@@ -69,8 +69,7 @@ pub fn handle_sync(
             .with_body_text_plain("rate_limit_exceeded"));
     }
 
-    let now = current_timestamp();
-    if let Err(err) = kv.upsert_partner_id(hash, &partner.id, &query.uid, now) {
+    if let Err(err) = kv.upsert_partner_id(hash, &partner.id, &query.uid) {
         log::warn!(
             "Pixel sync write failed for partner '{}' and hash '{}': {err:?}",
             partner.id,
@@ -282,13 +281,6 @@ impl RateLimiter for FastlyRateLimiter {
 
         Ok(false)
     }
-}
-
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

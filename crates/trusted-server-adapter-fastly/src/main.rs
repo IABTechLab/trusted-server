@@ -341,22 +341,18 @@ async fn route_request(
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => (
-            handle_first_party_proxy(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::GET, "/first-party/click") => (
-            handle_first_party_click(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => (
-            handle_first_party_proxy_sign(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::POST, "/first-party/proxy-rebuild") => (
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await,
-            false,
-        ),
+        (Method::GET, "/first-party/proxy") => {
+            (handle_first_party_proxy(settings, req).await, false)
+        }
+        (Method::GET, "/first-party/click") => {
+            (handle_first_party_click(settings, req).await, false)
+        }
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
+            (handle_first_party_proxy_sign(settings, req).await, false)
+        }
+        (Method::POST, "/first-party/proxy-rebuild") => {
+            (handle_first_party_proxy_rebuild(settings, req).await, false)
+        }
         (m, path) if integration_registry.has_route(&m, path) => {
             let result = integration_registry
                 .handle_proxy(
@@ -587,16 +583,4 @@ fn derive_device_signals(req: &Request) -> DeviceSignals {
     let h2_fp = req.get_client_h2_fingerprint();
 
     DeviceSignals::derive(ua, ja4, h2_fp)
-}
-
-/// Constructs a `PartnerStore` from settings, or returns 503 if the
-/// `partner_store` config is not set.
-fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
-    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
-            store_name: "ec.partner_store".to_owned(),
-            message: "ec.partner_store is not configured".to_owned(),
-        })
-    })?;
-    Ok(PartnerStore::new(store_name))
 }

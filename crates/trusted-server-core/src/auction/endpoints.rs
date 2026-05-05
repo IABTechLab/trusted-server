@@ -104,7 +104,6 @@ pub async fn handle_auction(
     let context = AuctionContext {
         settings,
         request: &req,
-        client_info: services.client_info(),
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
@@ -112,7 +111,7 @@ pub async fn handle_auction(
 
     // Run the auction
     let result = orchestrator
-        .run_auction(&auction_request, &context, services)
+        .run_auction(&auction_request, &context)
         .await
         .change_context(TrustedServerError::Auction {
             message: "Auction orchestration failed".to_string(),

@@ -49,6 +49,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -376,6 +377,7 @@ impl IntegrationProxy for GptIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
