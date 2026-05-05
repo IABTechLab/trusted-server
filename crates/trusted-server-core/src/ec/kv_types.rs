@@ -16,6 +16,9 @@ use crate::geo::GeoInfo;
 /// Current schema version for KV entries.
 pub const SCHEMA_VERSION: u8 = 1;
 
+// Unsupported schema versions fail closed on read. Future schema bumps must
+// add an explicit lazy migration or backfill path before changing this value.
+
 /// Maximum number of legacy publisher-domain entries accepted in
 /// [`KvPubProperties::seen_domains`].
 ///

@@ -133,7 +133,7 @@ fn create_test_settings() -> Settings {
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
-            passphrase = "test-secret-key"
+            passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
             enabled = false

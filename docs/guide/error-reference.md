@@ -145,13 +145,13 @@ Failed to generate EC ID: HMAC error
 
 ```toml
 [ec]
-passphrase = "your-secure-hmac-secret"
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 2. Or set via environment variable:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=your-secure-hmac-passphrase
+TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ---

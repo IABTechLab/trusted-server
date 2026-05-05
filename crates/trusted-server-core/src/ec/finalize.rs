@@ -55,7 +55,7 @@ pub fn ec_finalize_response(
         // currently usable for this request. This covers both explicit
         // revocation and fail-closed cases such as missing geo or undecodable
         // consent input.
-        clear_ec_headers_on_response(response);
+        clear_ec_headers_on_response(response, Some(registry));
 
         // Only expire the browser cookie and tombstone the identity-graph row
         // when the request carries an explicit withdrawal signal.
@@ -141,31 +141,23 @@ pub fn set_ec_cookie_and_header_on_response(
 
 /// Removes EC-specific response headers.
 ///
-/// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips any
-/// dynamic `X-ts-<partner_id>` headers (matching the `x-ts-` prefix) to
-/// prevent leaking EC identity data when consent is absent or withdrawn.
-fn clear_ec_headers_on_response(response: &mut Response) {
+/// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips dynamic
+/// `X-ts-<partner_id>` headers for registered partners. Other `x-ts-*` headers
+/// are intentionally preserved because they may be set by non-EC middleware.
+fn clear_ec_headers_on_response(response: &mut Response, registry: Option<&PartnerRegistry>) {
     for header in EC_RESPONSE_HEADERS {
         response.remove_header(*header);
     }
 
-    // Strip any dynamic x-ts-<partner_id> headers set by /identify or
-    // earlier processing. Collect names first to avoid borrow conflict.
-    let dynamic_ts_headers: Vec<String> = response
-        .get_header_names()
-        .filter_map(|name| {
-            let s = name.as_str();
-            if s.starts_with("x-ts-") {
-                Some(s.to_owned())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for header in &dynamic_ts_headers {
-        response.remove_header(header.as_str());
+    if let Some(registry) = registry {
+        for partner in registry.all() {
+            response.remove_header(partner_response_header(&partner.id).as_str());
+        }
     }
+}
+
+fn partner_response_header(partner_id: &str) -> String {
+    format!("x-ts-{partner_id}")
 }
 
 /// Clears EC cookie and removes EC-specific response headers.
@@ -173,7 +165,7 @@ fn clear_ec_headers_on_response(response: &mut Response) {
 /// Used when the request carries an explicit withdrawal signal.
 pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
     expire_ec_cookie(settings, response);
-    clear_ec_headers_on_response(response);
+    clear_ec_headers_on_response(response, None);
 }
 
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
@@ -208,6 +200,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::redacted::Redacted;
+    use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
 
     fn make_context(
@@ -250,6 +244,24 @@ mod tests {
 
     fn sample_ec_id(suffix: &str) -> String {
         format!("{}.{suffix}", "a".repeat(64))
+    }
+
+    fn make_partner(id: &str) -> EcPartner {
+        EcPartner {
+            id: id.to_owned(),
+            name: format!("Partner {id}"),
+            source_domain: format!("{id}.example.com"),
+            openrtb_atype: EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Redacted::new(format!("token-{id}")),
+            batch_rate_limit: EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }
     }
 
     #[test]
@@ -342,9 +354,7 @@ mod tests {
         let mut response = Response::new();
         response.set_header("x-ts-ec", "abc");
         response.set_header("x-ts-eids", "[]");
-        // Dynamic partner headers that should also be stripped
-        response.set_header("x-ts-ssp_x", "partner-uid-123");
-        response.set_header("x-ts-liveramp", "lr-uid-456");
+        response.set_header("x-ts-unrelated", "keep-me");
 
         clear_ec_on_response(&settings, &mut response);
 
@@ -356,13 +366,10 @@ mod tests {
             response.get_header("x-ts-eids").is_none(),
             "should remove x-ts-eids"
         );
-        assert!(
-            response.get_header("x-ts-ssp_x").is_none(),
-            "should remove dynamic x-ts-<partner_id> headers"
-        );
-        assert!(
-            response.get_header("x-ts-liveramp").is_none(),
-            "should remove dynamic x-ts-<partner_id> headers"
+        assert_eq!(
+            response.get_header_str("x-ts-unrelated"),
+            Some("keep-me"),
+            "should preserve unrelated x-ts headers without a partner registry"
         );
 
         let set_cookie = response
@@ -392,8 +399,11 @@ mod tests {
         let mut response = Response::new();
         response.set_header("x-ts-ec", "stale");
         response.set_header("x-ts-eids", "[]");
+        response.set_header("x-ts-ssp_x", "partner-uid-123");
+        response.set_header("x-ts-unrelated", "keep-me");
 
-        let test_registry = PartnerRegistry::empty();
+        let partners = vec![make_partner("ssp_x")];
+        let test_registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         ec_finalize_response(
             &settings,
             &ec_context,
@@ -411,6 +421,15 @@ mod tests {
         assert!(
             response.get_header("x-ts-eids").is_none(),
             "withdrawal should clear x-ts-eids header"
+        );
+        assert!(
+            response.get_header("x-ts-ssp_x").is_none(),
+            "withdrawal should clear registered partner header"
+        );
+        assert_eq!(
+            response.get_header_str("x-ts-unrelated"),
+            Some("keep-me"),
+            "withdrawal should preserve unrelated x-ts header"
         );
         let set_cookie = response
             .get_header("set-cookie")

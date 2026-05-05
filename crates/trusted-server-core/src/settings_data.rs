@@ -60,7 +60,7 @@ mod tests {
     fn toml_with_secrets(passphrase: &str, proxy_secret: &str) -> String {
         let original = crate_test_settings_str();
         let after_passphrase = original.replace(
-            r#"passphrase = "test-secret-key""#,
+            r#"passphrase = "test-secret-key-32-bytes-minimum""#,
             &format!(r#"passphrase = "{passphrase}""#),
         );
         assert_ne!(
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn rejects_placeholder_passphrase() {
-        let toml = toml_with_secrets("secret-key", "real-proxy-secret");
+        let toml = toml_with_secrets("trusted-server-placeholder-secret", "real-proxy-secret");
         let settings = Settings::from_toml(&toml).expect("should parse TOML");
         let err = settings
             .reject_placeholder_secrets()
@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn rejects_placeholder_proxy_secret() {
-        let toml = toml_with_secrets("real-secret-key", "change-me-proxy-secret");
+        let toml = toml_with_secrets(
+            "production-secret-key-32-bytes-min",
+            "change-me-proxy-secret",
+        );
         let settings = Settings::from_toml(&toml).expect("should parse TOML");
         let err = settings
             .reject_placeholder_secrets()
@@ -108,7 +111,10 @@ mod tests {
 
     #[test]
     fn rejects_both_placeholders_in_single_error() {
-        let toml = toml_with_secrets("secret_key", "change-me-proxy-secret");
+        let toml = toml_with_secrets(
+            "trusted-server-placeholder-secret",
+            "change-me-proxy-secret",
+        );
         let settings = Settings::from_toml(&toml).expect("should parse TOML");
         let err = settings
             .reject_placeholder_secrets()
@@ -131,7 +137,10 @@ mod tests {
 
     #[test]
     fn accepts_non_placeholder_secrets() {
-        let toml = toml_with_secrets("production-secret-key", "production-proxy-secret");
+        let toml = toml_with_secrets(
+            "production-secret-key-32-bytes-min",
+            "production-proxy-secret",
+        );
         let settings = Settings::from_toml(&toml).expect("should parse TOML");
         settings
             .reject_placeholder_secrets()
