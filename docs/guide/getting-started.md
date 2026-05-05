@@ -68,6 +68,8 @@ ts audit https://example.com
 
 `ts audit` currently uses a real Chromium browser session and expects Chrome/Chromium to already be installed on the host machine. It checks common PATH names and standard macOS app bundle locations.
 
+See [Trusted Server CLI](/guide/cli) for the full command reference.
+
 ## Configuration
 
 Use `ts config init` to generate `trusted-server.toml`, then edit it to configure:
@@ -89,4 +91,5 @@ fastly compute publish
 
 - Learn about [Edge Cookies](/guide/edge-cookies)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
+- Review the [Trusted Server CLI](/guide/cli)
 - Configure [Ad Serving](/guide/ad-serving)

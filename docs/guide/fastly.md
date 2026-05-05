@@ -52,7 +52,7 @@ ts auth fastly login
 ts auth fastly status
 ```
 
-For automation and CI, prefer setting `FASTLY_API_KEY` instead of storing a local credential.
+For automation and CI, prefer setting `FASTLY_API_KEY` instead of storing a local credential. See [Trusted Server CLI](/guide/cli#ts-auth-fastly-login) for credential precedence and JSON status output.
 
 ## Domain Configuration
 
@@ -86,6 +86,8 @@ FASTLY_RUNTIME_API_KEY=your-runtime-token \
 `apply` automatically activates the Fastly service version after changing resource bindings.
 
 The CLI provisions the runtime config store, request-signing stores, and required bindings from local configuration. When request signing is enabled, `apply` will bootstrap the initial signing keypair if the signing stores are empty, and it requires an explicit runtime Fastly API token for the `api-keys/api_key` secret. Use `FASTLY_RUNTIME_API_KEY`, `--runtime-api-key`, or `--reuse-management-api-key` for that runtime credential. After provisioning, update `request_signing.config_store_id` and `request_signing.secret_store_id` in `trusted-server.toml` to match the store IDs reported by provisioning.
+
+See [Trusted Server CLI](/guide/cli#ts-provision-fastly-plan) for the full provisioning command reference.
 
 ## Next Steps
 
