@@ -790,9 +790,10 @@ mod tests {
     ) {
         let out = rewrite_srcset_attr(attr_name, attr_value);
 
-        assert!(
-            out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "case `{}` expected two rewritten {} candidates: {}",
+        assert_eq!(
+            out.matches("/first-party/proxy?tsurl=").count(),
+            2,
+            "case `{}` expected exactly two rewritten {} candidates: {}",
             case_name,
             attr_name,
             out

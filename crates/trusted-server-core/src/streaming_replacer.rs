@@ -465,7 +465,7 @@ mod tests {
         let result = process_with_explicit_splits(
             create_url_replacer("example.com", "https://example.com", "new.com", "https"),
             content,
-            &[23, content.len()],
+            &[22, content.len()],
         );
 
         assert!(result.contains("https://new.com/før/bår/test"));
