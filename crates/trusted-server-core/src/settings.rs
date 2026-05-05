@@ -11,6 +11,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
+use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 
@@ -423,6 +424,8 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    #[serde(default)]
+    pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
 }
 
 #[allow(unused)]
@@ -1920,6 +1923,30 @@ mod tests {
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
+    #[test]
+    fn settings_parses_creative_opportunities_section() {
+        let toml = r#"
+[[handlers]]
+path = "^/admin"
+username = "admin"
+password = "changeme"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+"#;
+        let settings = Settings::from_toml(toml).expect("should parse");
+        let co = settings.creative_opportunities.expect("should have creative_opportunities");
+        assert_eq!(co.gam_network_id, "21765378893");
+        assert_eq!(co.auction_timeout_ms, Some(500));
+    }
+
     #[test]
     fn admin_endpoints_match_fastly_router() {
         let router_source = include_str!("../../trusted-server-adapter-fastly/src/main.rs");

@@ -3,6 +3,19 @@
 // in the build context, so `dead_code` is expected.
 #![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
+// Stub out dependencies for build.rs context
+mod glob {
+    pub struct Pattern;
+    impl Pattern {
+        pub fn new(_: &str) -> Result<Self, String> {
+            Ok(Pattern)
+        }
+        pub fn matches(&self, _: &str) -> bool {
+            false
+        }
+    }
+}
+
 #[path = "src/error.rs"]
 mod error;
 
@@ -14,6 +27,27 @@ mod redacted;
 
 #[path = "src/consent_config.rs"]
 mod consent_config;
+
+#[path = "src/price_bucket.rs"]
+mod price_bucket;
+
+// CreativeOpportunitiesConfig for build.rs deserialization only
+mod creative_opportunities {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    pub struct CreativeOpportunitiesConfig {
+        pub gam_network_id: String,
+        #[serde(default)]
+        pub auction_timeout_ms: Option<u32>,
+        #[serde(default = "default_price_granularity")]
+        pub price_granularity: String,
+    }
+
+    fn default_price_granularity() -> String {
+        "dense".to_string()
+    }
+}
 
 #[path = "src/settings.rs"]
 mod settings;

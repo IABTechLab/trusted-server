@@ -190,4 +190,8 @@ timeout_ms = 1000
 [integrations.adserver_mock.context_query_params]
 permutive_segments = "permutive"
 
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+price_granularity = "dense"
 
