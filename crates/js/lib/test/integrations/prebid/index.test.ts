@@ -53,7 +53,8 @@ vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// Mock the build-generated adapter imports (no-op in tests)
+// Mock the build-generated module imports (no-op in tests)
+vi.mock('../../../src/integrations/prebid/_user_id_modules.generated', () => ({}));
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
 
 import {
@@ -233,14 +234,33 @@ describe('prebid/installPrebidNpm', () => {
   });
 
   it('respects custom config values', () => {
+    const userSync = {
+      userIds: [
+        {
+          name: 'sharedId',
+          storage: { name: '_sharedID', type: 'cookie', expires: 365 },
+        },
+      ],
+      auctionDelay: 100,
+    };
+
     installPrebidNpm({
       endpoint: '/custom/auction',
       timeout: 2000,
       debug: true,
+      userSync,
     });
 
     expect(mockSetConfig).toHaveBeenCalledWith(
-      expect.objectContaining({ debug: true, bidderTimeout: 2000 })
+      expect.objectContaining({ debug: true, bidderTimeout: 2000, userSync })
+    );
+  });
+
+  it('ignores non-object userSync config values', () => {
+    installPrebidNpm({ userSync: 'sharedId' });
+
+    expect(mockSetConfig).toHaveBeenCalledWith(
+      expect.not.objectContaining({ userSync: expect.anything() })
     );
   });
 
@@ -754,6 +774,18 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     expect(mockSetConfig).toHaveBeenCalledWith(
       expect.objectContaining({ debug: false, bidderTimeout: 3000 })
     );
+  });
+
+  it('reads userSync from window.__tsjs_prebid', () => {
+    const userSync = {
+      userIds: [{ name: 'sharedId', storage: { name: '_sharedID', type: 'cookie' } }],
+      auctionDelay: 50,
+    };
+    (window as any).__tsjs_prebid = { userSync };
+
+    installPrebidNpm();
+
+    expect(mockSetConfig).toHaveBeenCalledWith(expect.objectContaining({ userSync }));
   });
 
   it('works with no config argument and no injected config', () => {

@@ -98,6 +98,14 @@ pub struct PrebidIntegrationConfig {
     /// manages both lists explicitly.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
+    /// Prebid.js `userSync` client configuration for User ID modules.
+    ///
+    /// The configured object is injected into `window.__tsjs_prebid.userSync`
+    /// and passed through to `pbjs.setConfig({ userSync })`. The corresponding
+    /// Prebid.js User ID modules must be included in the JS bundle at build
+    /// time with `TSJS_PREBID_USER_ID_MODULES`.
+    #[serde(default)]
+    pub user_sync: Option<Json>,
     /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
     /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
     /// — a non-standard Prebid.js field used as a temporary workaround),
@@ -364,6 +372,8 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: u32,
             debug: bool,
             bidders: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user_sync: Option<&'a Json>,
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             client_side_bidders: &'a [String],
         }
@@ -373,6 +383,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             timeout: self.config.timeout_ms,
             debug: self.config.debug,
             bidders: &self.config.bidders,
+            user_sync: self.config.user_sync.as_ref(),
             client_side_bidders: &self.config.client_side_bidders,
         };
 
@@ -1348,6 +1359,7 @@ mod tests {
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             client_side_bidders: Vec::new(),
+            user_sync: None,
             bid_param_zone_overrides: HashMap::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
@@ -1839,6 +1851,36 @@ server_url = "https://prebid.example"
         assert!(
             script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
             "should include clientSideBidders array: {}",
+            script
+        );
+    }
+
+    #[test]
+    fn head_injector_includes_user_sync_when_configured() {
+        let mut config = base_config();
+        config.user_sync = Some(json!({
+            "userIds": [
+                {
+                    "name": "sharedId",
+                    "storage": {"name": "_sharedID", "type": "cookie", "expires": 365}
+                }
+            ],
+            "auctionDelay": 100
+        }));
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        let script = &inserts[0];
+        assert!(
+            script.contains(r#""userSync":{"auctionDelay":100,"userIds":[{"name":"sharedId""#),
+            "should include userSync object: {}",
             script
         );
     }
