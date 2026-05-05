@@ -22,7 +22,7 @@ use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use lol_html::{element, html_content::ContentType, text, Settings as RewriterSettings};
+use lol_html::{element, html_content::{ContentType, EndTag}, text, EndTagHandler, Settings as RewriterSettings};
 
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
@@ -134,6 +134,13 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Pre-computed `<script>window.__ts_ad_slots=...;</script>`.
+    /// Injected at `<head>` open. `None` when no slots matched.
+    pub ad_slots_script: Option<String>,
+    /// Shared auction result — written by auction task before HTML processing begins.
+    /// Handler reads this in `el.on_end_tag()` on the body element.
+    /// `None` means no auction ran; inject empty `__ts_bids = {}` as fallback.
+    pub ad_bids_state: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl HtmlProcessorConfig {
@@ -151,6 +158,8 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             integrations: integrations.clone(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -230,6 +239,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     let injected_tsjs = Rc::new(Cell::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
+    let ad_slots_script = config.ad_slots_script.clone();
+    let ad_bids_state = config.ad_bids_state.clone();
 
     let mut element_content_handlers = vec![
         // Inject unified tsjs bundle once at the start of <head>
@@ -238,9 +249,14 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             let integrations = integration_registry.clone();
             let patterns = patterns.clone();
             let document_state = document_state.clone();
+            let ad_slots_script = ad_slots_script.clone();
             move |el| {
                 if !injected_tsjs.get() {
                     let mut snippet = String::new();
+                    // Inject ad slots script first so it appears before tsjs bundle.
+                    if let Some(ref slots_script) = ad_slots_script {
+                        snippet.push_str(slots_script);
+                    }
                     let ctx = IntegrationHtmlContext {
                         request_host: &patterns.request_host,
                         request_scheme: &patterns.request_scheme,
@@ -261,6 +277,30 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);
                     injected_tsjs.set(true);
+                }
+                Ok(())
+            }
+        }),
+        // Inject __ts_bids before </body> via end_tag_handlers.
+        element!("body", {
+            let state = ad_bids_state.clone();
+            move |el| {
+                let state = state.clone();
+                if let Some(handlers) = el.end_tag_handlers() {
+                    let handler: EndTagHandler<'static> =
+                        Box::new(move |end_tag: &mut EndTag<'_>| {
+                            let script_guard = state.read().expect("should read bid state");
+                            let bids_script = match &*script_guard {
+                                Some(s) => s.clone(),
+                                None => {
+                                    r#"<script>window.__ts_bids=JSON.parse("{}");</script>"#
+                                        .to_string()
+                                }
+                            };
+                            end_tag.before(&bids_script, ContentType::Html);
+                            Ok(())
+                        });
+                    handlers.push(handler);
                 }
                 Ok(())
             }
@@ -540,6 +580,8 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
+            ad_slots_script: None,
+            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -1183,6 +1225,87 @@ mod tests {
         assert!(
             output.contains("<!-- processed -->"),
             "should contain post-processor mutation"
+        );
+    }
+
+    #[test]
+    fn injects_ad_slots_at_head_open() {
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: Some(
+                r#"<script>window.__ts_ad_slots=JSON.parse("[]");</script>"#.to_string(),
+            ),
+            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(
+                b"<html><head><title>T</title></head><body>content</body></html>",
+                true,
+            )
+            .expect("should process");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+        assert!(
+            html.contains("window.__ts_ad_slots"),
+            "should inject ad slots at head-open"
+        );
+        assert!(
+            !html.contains("__ts_request_id"),
+            "must NOT inject request_id"
+        );
+    }
+
+    #[test]
+    fn injects_ts_bids_before_body_close() {
+        let bids_script =
+            r#"<script>window.__ts_bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
+        let state = std::sync::Arc::new(std::sync::RwLock::new(Some(bids_script.to_string())));
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: state,
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(b"<html><head></head><body>content</body></html>", true)
+            .expect("should process");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+        assert!(
+            html.contains("window.__ts_bids"),
+            "should inject bids before </body>"
+        );
+        let bids_pos = html
+            .find("window.__ts_bids")
+            .expect("bids should be in output");
+        let body_close_pos = html.find("</body>").expect("</body> should be in output");
+        assert!(bids_pos < body_close_pos, "bids must appear before </body>");
+    }
+
+    #[test]
+    fn injects_empty_ts_bids_when_state_is_none() {
+        let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: state,
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(b"<html><head></head><body>content</body></html>", true)
+            .expect("should process");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+        assert!(
+            html.contains("__ts_bids=JSON.parse(\"{}\")"),
+            "should inject empty bids on None state"
         );
     }
 }

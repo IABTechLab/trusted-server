@@ -855,6 +855,14 @@ impl IntegrationRegistry {
 
     #[cfg(test)]
     #[must_use]
+    pub fn empty_for_tests() -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner::default()),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
     pub fn from_rewriters(
         attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
         script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
