@@ -22,17 +22,21 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
+# Install the host-target CLI from this checkout
+# The alias targets Apple Silicon macOS. See the CLI guide for other hosts.
+cargo install_cli
+
 # Create a starter config
-cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- config init
+ts config init
 
 # Validate local config
-cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- config validate
+ts config validate
 
 # Start local Fastly development
-cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev -a fastly
+ts dev -a fastly
 
 # Audit a public page with a real Chromium browser
-cargo run --package trusted-server-cli --bin ts --target "$(rustc -vV | sed -n 's/^host: //p')" -- audit https://example.com
+ts audit https://example.com
 ```
 
 ## Development
@@ -50,8 +54,8 @@ cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^hos
 # Run runtime crate tests (wasm target)
 cargo test --workspace --exclude trusted-server-cli
 
-# Run CLI tests (host target)
-cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"
+# Run CLI tests (host target alias, Apple Silicon macOS)
+cargo test_cli
 ```
 
 `ts audit` is host-only and currently expects a local Chrome/Chromium installation. It checks common PATH names and standard macOS app bundle locations.

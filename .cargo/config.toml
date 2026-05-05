@@ -1,5 +1,9 @@
 [alias]
 test_details = ["test", "--target", "aarch64-apple-darwin"]
+build_cli = ["build", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+check_cli = ["check", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+test_cli = ["test", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+install_cli = ["install", "--path", "crates/trusted-server-cli", "--target", "aarch64-apple-darwin"]
 
 [build]
 target = "wasm32-wasip1"

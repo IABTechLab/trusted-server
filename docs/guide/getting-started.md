@@ -30,6 +30,16 @@ Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastl
 cargo install viceroy
 ```
 
+### Install Trusted Server CLI
+
+From the repository root, install the host-target `ts` CLI with the Cargo alias:
+
+```bash
+cargo install_cli
+```
+
+See [Trusted Server CLI](/guide/cli#cargo-aliases) if you need to run the CLI without installing it or if your host is not Apple Silicon macOS.
+
 ## Local Development
 
 ### Build the Project

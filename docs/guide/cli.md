@@ -17,23 +17,26 @@ The CLI is a host-target binary. Do not build or run it for `wasm32-wasip1`.
 
 ## Run from source
 
-From the repository root, run the CLI with the host Rust target:
+From the repository root, use the Cargo aliases in `.cargo/config.toml` when you need to build, check, test, or install the host-target CLI. These aliases avoid Cargo's default workspace target, which is `wasm32-wasip1` for the runtime crates.
 
 ```bash
-HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-cargo run --package trusted-server-cli --bin ts --target "$HOST_TARGET" -- --help
-```
-
-To install a local `ts` binary from the checkout:
-
-```bash
-cargo install --path crates/trusted-server-cli --bin ts --locked
+cargo build_cli
+cargo check_cli
+cargo test_cli
+cargo install_cli
 ```
 
 After installation, verify that the command is on your path:
 
 ```bash
 ts --help
+```
+
+If you do not want to install the binary, run it directly with an explicit host target:
+
+```bash
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo run --package trusted-server-cli --bin ts --target "$HOST_TARGET" -- --help
 ```
 
 ## Common workflow
@@ -79,6 +82,27 @@ ts provision fastly plan --service-id svc_123 --config config/publisher.toml
 ```
 
 Relative paths resolve from the current working directory. Absolute paths are used as-is.
+
+## Cargo aliases
+
+This repository sets `wasm32-wasip1` as the default Cargo build target because the runtime deploys to Fastly Compute. The CLI is host-only, so CLI Cargo commands must override that default target.
+
+Use these aliases from the repository root:
+
+| Alias                | Expands to                                                                     | Purpose                                                                     |
+| -------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| `cargo build_cli`    | `cargo build --package trusted-server-cli --target aarch64-apple-darwin`       | Build the CLI for the configured host target.                               |
+| `cargo check_cli`    | `cargo check --package trusted-server-cli --target aarch64-apple-darwin`       | Type-check the CLI for the configured host target.                          |
+| `cargo test_cli`     | `cargo test --package trusted-server-cli --target aarch64-apple-darwin`        | Run CLI tests on the configured host target.                                |
+| `cargo install_cli`  | `cargo install --path crates/trusted-server-cli --target aarch64-apple-darwin` | Install `ts` from the local checkout.                                       |
+| `cargo test_details` | `cargo test --target aarch64-apple-darwin`                                     | Run tests for the configured host target when you need host-target details. |
+
+The current aliases target `aarch64-apple-darwin`. If you are not on Apple Silicon macOS, use the explicit host-target form instead:
+
+```bash
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo test --package trusted-server-cli --target "$HOST_TARGET"
+```
 
 ## Command reference
 
@@ -423,9 +447,12 @@ secret_store_id = "..."
 
 ### The CLI tries to build for Wasm
 
-Run the CLI with the host target:
+Use the CLI Cargo aliases or pass the host target explicitly:
 
 ```bash
+cargo build_cli
+cargo test_cli
+
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 cargo run --package trusted-server-cli --bin ts --target "$HOST_TARGET" -- --help
 ```
