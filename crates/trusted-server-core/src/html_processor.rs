@@ -22,7 +22,11 @@ use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use lol_html::{element, html_content::{ContentType, EndTag}, text, EndTagHandler, Settings as RewriterSettings};
+use lol_html::{
+    element,
+    html_content::{ContentType, EndTag},
+    text, EndTagHandler, Settings as RewriterSettings,
+};
 
 use crate::integrations::{
     AttributeRewriteOutcome, IntegrationAttributeContext, IntegrationDocumentState,
@@ -164,7 +168,12 @@ impl HtmlProcessorConfig {
     }
 }
 
-/// Create an HTML processor with URL replacement and integration hooks
+/// Create an HTML processor with URL replacement and integration hooks.
+///
+/// # Panics
+///
+/// Panics if the `ad_bids_state` `RwLock` is poisoned. This cannot happen in
+/// normal operation since no code holds the write lock across a panic boundary.
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
@@ -292,10 +301,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             let script_guard = state.read().expect("should read bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
-                                None => {
-                                    r#"<script>window.__ts_bids=JSON.parse("{}");</script>"#
-                                        .to_string()
-                                }
+                                None => r#"<script>window.__ts_bids=JSON.parse("{}");</script>"#
+                                    .to_string(),
                             };
                             end_tag.before(&bids_script, ContentType::Html);
                             Ok(())

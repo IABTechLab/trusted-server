@@ -19,7 +19,9 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::auction::orchestrator::AuctionOrchestrator;
-use crate::auction::types::{AuctionContext, AuctionRequest, Bid, PublisherInfo, SiteInfo, UserInfo};
+use crate::auction::types::{
+    AuctionContext, AuctionRequest, Bid, PublisherInfo, SiteInfo, UserInfo,
+};
 use crate::backend::BackendConfig;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
@@ -456,6 +458,12 @@ pub fn stream_publisher_body<W: Write>(
 ///
 /// Returns a [`TrustedServerError`] if the proxy request fails or the
 /// origin backend is unreachable.
+///
+/// # Panics
+///
+/// Panics if `should_run_auction` is `true` but `settings.creative_opportunities` is `None`.
+/// This is a logic invariant: `should_run_auction` is only set when creative opportunities
+/// are configured, so this state is unreachable in practice.
 pub async fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
@@ -541,10 +549,12 @@ pub async fn handle_publisher_request(
     let request_path = req.get_path().to_string();
     let is_get = req.get_method() == fastly::http::Method::GET;
 
-    let is_prefetch = req.get_header_str("sec-purpose")
-        .map_or(false, |v| v.contains("prefetch"))
-        || req.get_header_str("purpose")
-        .map_or(false, |v| v.contains("prefetch"));
+    let is_prefetch = req
+        .get_header_str("sec-purpose")
+        .is_some_and(|v| v.contains("prefetch"))
+        || req
+            .get_header_str("purpose")
+            .is_some_and(|v| v.contains("prefetch"));
 
     let user_agent = req.get_header_str("user-agent").unwrap_or("");
     let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
@@ -563,13 +573,10 @@ pub async fn handle_publisher_request(
     let consent_allows_auction = consent_context
         .tcf
         .as_ref()
-        .map_or(false, |tcf| tcf.has_purpose_consent(1));
+        .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
-    let should_run_auction = is_get
-        && !is_prefetch
-        && !is_bot
-        && !matched_slots.is_empty()
-        && consent_allows_auction;
+    let should_run_auction =
+        is_get && !is_prefetch && !is_bot && !matched_slots.is_empty() && consent_allows_auction;
 
     let auction_timeout_ms = settings
         .creative_opportunities
@@ -583,14 +590,16 @@ pub async fn handle_publisher_request(
     restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
-    let pending_origin = req
-        .send_async(&backend_name)
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to dispatch async origin request".to_string(),
-        })?;
+    let pending_origin =
+        req.send_async(&backend_name)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to dispatch async origin request".to_string(),
+            })?;
 
     let auction_result = if should_run_auction {
-        let co_config = settings.creative_opportunities.as_ref()
+        let co_config = settings
+            .creative_opportunities
+            .as_ref()
             .expect("should be present when should_run_auction is true");
         let auction_request = build_auction_request(
             &matched_slots,
@@ -608,7 +617,10 @@ pub async fn handle_publisher_request(
             provider_responses: None,
             services,
         };
-        match orchestrator.run_auction(&auction_request, &auction_context, services).await {
+        match orchestrator
+            .run_auction(&auction_request, &auction_context, services)
+            .await
+        {
             Ok(result) => Some(result),
             Err(e) => {
                 log::warn!("server-side auction failed, proceeding without bids: {e:?}");
@@ -620,11 +632,13 @@ pub async fn handle_publisher_request(
     };
 
     if should_run_auction {
-        let co_config = settings.creative_opportunities.as_ref()
+        let co_config = settings
+            .creative_opportunities
+            .as_ref()
             .expect("should be present");
-        let empty: std::collections::HashMap<String, Bid> =
-            std::collections::HashMap::new();
-        let winning_bids = auction_result.as_ref()
+        let empty: std::collections::HashMap<String, Bid> = std::collections::HashMap::new();
+        let winning_bids = auction_result
+            .as_ref()
             .map(|r| &r.winning_bids)
             .unwrap_or(&empty);
         let bid_map = build_bid_map(winning_bids, co_config.price_granularity);
@@ -815,58 +829,103 @@ pub(crate) fn build_auction_request(
     }
 }
 
+/// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal.
+///
+/// Backslashes are doubled first (so they survive the next pass), then
+/// double-quotes are escaped so they do not terminate the JS string.
+/// The result is always valid to write as `JSON.parse("…")`.
+fn html_escape_for_script(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Build a price-bucketed bid map from winning bids.
 ///
-/// Returns a map of slot ID → bucketed CPM string.
+/// Returns a JSON object map of slot ID → bid metadata including the bucketed
+/// CPM (`hb_pb`), bidder (`hb_bidder`), and optional ad ID, nurl, and burl.
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
-) -> std::collections::HashMap<String, String> {
+) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
         .filter_map(|(slot_id, bid)| {
             bid.price.map(|cpm| {
                 let bucket = price_bucket(cpm, granularity);
-                (slot_id.clone(), bucket)
+                let mut obj = serde_json::Map::new();
+                obj.insert("hb_pb".to_string(), serde_json::Value::String(bucket));
+                obj.insert(
+                    "hb_bidder".to_string(),
+                    serde_json::Value::String(bid.bidder.clone()),
+                );
+                if let Some(ref ad_id) = bid.ad_id {
+                    obj.insert(
+                        "hb_adid".to_string(),
+                        serde_json::Value::String(ad_id.clone()),
+                    );
+                }
+                if let Some(ref nurl) = bid.nurl {
+                    obj.insert("nurl".to_string(), serde_json::Value::String(nurl.clone()));
+                }
+                if let Some(ref burl) = bid.burl {
+                    obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
+                }
+                (slot_id.clone(), serde_json::Value::Object(obj))
             })
         })
         .collect()
 }
 
-/// Build the `__ts_bids` inline script content from a bucketed bid map.
-pub(crate) fn build_bids_script(bid_map: &std::collections::HashMap<String, String>) -> String {
-    let entries: Vec<String> = bid_map
-        .iter()
-        .map(|(slot_id, bucket)| format!("\"{}\":\"{}\"", slot_id, bucket))
-        .collect();
-    format!("window.__ts_bids={{{}}};", entries.join(","))
+/// Build the `__ts_bids` `<script>` tag from a bucketed bid map.
+///
+/// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
+/// raw `</script>` sequences inside the string.
+pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let json = serde_json::to_string(bid_map).unwrap_or_else(|_| "{}".to_string());
+    let escaped = html_escape_for_script(&json);
+    format!(
+        "<script>window.__ts_bids=JSON.parse(\"{}\");</script>",
+        escaped
+    )
 }
 
-/// Build the `__ts_ad_slots` inline script content from matched slots.
+/// Build the `__ts_ad_slots` `<script>` tag from matched slots.
+///
+/// Property names match what the client-side TSJS bundle expects:
+/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
 ) -> String {
-    let entries: Vec<String> = matched_slots
+    let slots: Vec<serde_json::Value> = matched_slots
         .iter()
         .map(|slot| {
             let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
             let div_id = slot.resolved_div_id();
-            let formats: Vec<String> = slot
+            let formats: Vec<serde_json::Value> = slot
                 .formats
                 .iter()
-                .map(|f| format!("[{},{}]", f.width, f.height))
+                .map(|f| serde_json::json!([f.width, f.height]))
                 .collect();
-            format!(
-                "{{\"id\":\"{}\",\"div\":\"{}\",\"path\":\"{}\",\"sizes\":[{}]}}",
-                slot.id,
-                div_id,
-                gam_path,
-                formats.join(",")
-            )
+            let targeting: serde_json::Map<String, serde_json::Value> = slot
+                .targeting
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            serde_json::json!({
+                "id": slot.id,
+                "gam_unit_path": gam_path,
+                "div_id": div_id,
+                "formats": formats,
+                "targeting": targeting,
+            })
         })
         .collect();
-    format!("window.__ts_ad_slots=[{}];", entries.join(","))
+    let json = serde_json::to_string(&slots).unwrap_or_else(|_| "[]".to_string());
+    let escaped = html_escape_for_script(&json);
+    format!(
+        "<script>window.__ts_ad_slots=JSON.parse(\"{}\");</script>",
+        escaped
+    )
 }
 
 /// Whether the content type requires processing (URL rewriting, HTML injection).
