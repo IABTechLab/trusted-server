@@ -217,7 +217,11 @@ export function installTsAdInit(): void {
     g.cmd?.push(() => {
       slots
         .map((slot) => {
-          const gptSlot = g.defineSlot?.(slot.gam_unit_path, slot.formats as Array<number | number[]>, slot.div_id);
+          const gptSlot = g.defineSlot?.(
+            slot.gam_unit_path,
+            slot.formats as Array<number | number[]>,
+            slot.div_id
+          );
           if (!gptSlot) return null;
           gptSlot.addService(g.pubads!());
           Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
@@ -280,13 +284,13 @@ export function installSlimPrebidLoader(): void {
 // regardless of script order, the module also checks for a pre-set enable flag
 // immediately after registering the function.
 if (typeof window !== 'undefined') {
-  const win = window as Record<string, unknown>
+  const win = window as Record<string, unknown>;
 
-  win.__tsjs_installGptShim = installGptShim
+  win.__tsjs_installGptShim = installGptShim;
 
   if (win.__tsjs_gpt_enabled === true) {
-    installGptShim()
+    installGptShim();
   }
 
-  installTsAdInit()
+  installTsAdInit();
 }

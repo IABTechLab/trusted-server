@@ -675,20 +675,15 @@ mod tests {
         let bid = &bidder_resp["bids"][0];
         assert_eq!(bid["imp_id"], "slot-1");
 
-        // Key assertions for APS-style encoded price bids:
-        // 1. Should NOT have "price" field (or it should be null)
-        assert!(
-            bid["price"].is_null(),
-            "APS bids should not have decoded price, got: {:?}",
-            bid["price"]
-        );
-        // 2. Should have "encoded_price" field
+        // APS bids have no decoded price (bid.price == None), so the mock floor
+        // price (1.50) is used.  Mocktioneer requires a numeric price field and
+        // does not accept an opaque encoded_price string.
         assert_eq!(
-            bid["encoded_price"].as_str(),
-            Some("encoded-price-value"),
-            "APS bids should have encoded_price from metadata"
+            bid["price"].as_f64(),
+            Some(1.50),
+            "APS bids with no decoded price should fall back to mock floor price 1.50"
         );
-        // 3. adm should be null (not a string)
+        // adm should be null (not a string)
         assert!(
             bid["adm"].is_null(),
             "Creative-less bids should have null adm, got: {:?}",
