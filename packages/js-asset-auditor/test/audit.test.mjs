@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   ensureConfigPathWritable,
+  ensurePathWritable,
   parseArgs,
   readPublisherDomain,
   resolvePublisherDomain,
@@ -161,6 +162,17 @@ test("resolvePublisherDomain reports the selected source", () => {
   } finally {
     console.error = originalError;
   }
+});
+
+test("ensurePathWritable exits when a target already exists without --force", () => {
+  const repoRoot = mkdtempSync(join(tmpdir(), "js-asset-auditor-"));
+  const outputPath = join(repoRoot, "js-assets.toml");
+  writeFileSync(outputPath, "[[js_assets]]\n");
+
+  const result = captureExit(() => ensurePathWritable(outputPath, false));
+
+  assert.equal(result.error.code, 1);
+  assert.match(result.stderr, /already exists\. Use --force to overwrite\./);
 });
 
 test("ensureConfigPathWritable exits when config already exists without --force", () => {

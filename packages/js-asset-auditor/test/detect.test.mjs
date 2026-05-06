@@ -26,6 +26,24 @@ test("detectIntegrations matches APS documented path prefix", () => {
   assert.equal(detection.integrations[0].id, "aps");
 });
 
+test("detectIntegrations matches Lockr only on exact hosts or subdomains", () => {
+  const detection = detectIntegrations([
+    "https://aim.loc.kr/identity-lockr-trust-server.js",
+    "https://sub.aim.loc.kr/identity-lockr-trust-server.js",
+    "https://identity.loc.kr/identity-lockr-trust-server.js",
+    "https://notaim.loc.kr/identity-lockr-trust-server.js",
+    "https://aim.loc.kr.attacker.com/identity-lockr-trust-server.js",
+  ]);
+
+  assert.equal(detection.integrations.length, 1);
+  assert.equal(detection.integrations[0].id, "lockr");
+  assert.deepEqual(detection.integrations[0].sourceUrls, [
+    "https://aim.loc.kr/identity-lockr-trust-server.js",
+    "https://sub.aim.loc.kr/identity-lockr-trust-server.js",
+    "https://identity.loc.kr/identity-lockr-trust-server.js",
+  ]);
+});
+
 test("detectIntegrations picks up prebid wrapper/load script names", () => {
   const detection = detectIntegrations([
     "https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-load.js",
@@ -129,6 +147,20 @@ test("generateConfig only auto-enables fully configured integrations", () => {
   assert.match(config, /\[integrations\.gpt\]\nenabled = true/);
   assert.match(config, /\[integrations\.google_tag_manager\]\nenabled = false/);
   assert.match(config, /\[integrations\.prebid\]\nenabled = false/);
+});
+
+test("generateConfig includes Permutive override defaults", () => {
+  const detection = detectIntegrations([
+    "https://myorg.edge.permutive.app/workspace-web.js",
+  ]);
+  const config = generateConfig(
+    "publisher.com",
+    "https://www.publisher.com",
+    detection,
+  );
+
+  assert.match(config, /# cache_ttl_seconds = 3600/);
+  assert.match(config, /# rewrite_sdk = true/);
 });
 
 test("generateConfig escapes TOML strings safely", () => {

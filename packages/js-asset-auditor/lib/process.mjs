@@ -182,15 +182,19 @@ export function applyWildcards(url) {
 // TOML formatting
 // ---------------------------------------------------------------------------
 
+function formatTomlString(value) {
+  return JSON.stringify(value);
+}
+
 export function formatTomlEntry(asset, commented = false) {
   const pfx = commented ? "# " : "";
   let block = "";
   if (asset.hasWildcard && asset.originalUrl) {
     block += `${pfx}# ${asset.originalUrl} (wildcard detected)\n`;
   }
-  block += `${pfx}slug = "${asset.slug}"\n`;
-  block += `${pfx}path = "${asset.path}"\n`;
-  block += `${pfx}origin_url = "${asset.originUrl}"\n`;
+  block += `${pfx}slug = ${formatTomlString(asset.slug)}\n`;
+  block += `${pfx}path = ${formatTomlString(asset.path)}\n`;
+  block += `${pfx}origin_url = ${formatTomlString(asset.originUrl)}\n`;
   block += `${pfx}inject_in_head = ${asset.injectInHead}\n`;
   return block;
 }
@@ -265,6 +269,19 @@ export function processAssets(input, args) {
 
   const normalizedNetwork = [...new Set(rawNetworkUrls.map(normalizeUrl))];
   const normalizedHead = new Set(rawHeadUrls.map(normalizeUrl));
+  const wildcardedHead = new Set();
+  for (const headUrl of normalizedHead) {
+    let parsedHead;
+    try {
+      parsedHead = new URL(headUrl);
+    } catch {
+      continue;
+    }
+    if (parsedHead.protocol !== "http:" && parsedHead.protocol !== "https:") {
+      continue;
+    }
+    wildcardedHead.add(applyWildcards(headUrl).wildcarded);
+  }
 
   const firstPartyFiltered = [];
   const thirdPartyUrls = [];
@@ -337,7 +354,7 @@ export function processAssets(input, args) {
 
     const slug = generateSlug(args.domain, wildcarded);
     const prefix = slug.split(":")[0];
-    const injectInHead = normalizedHead.has(url);
+    const injectInHead = wildcardedHead.has(wildcarded);
 
     let path;
     if (hasWildcard) {

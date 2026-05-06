@@ -20,6 +20,10 @@ const PREBID_SUFFIXES = [
   "/prebidjs.min.js",
 ];
 
+function matchesHostOrSubdomain(hostname, baseHost) {
+  return hostname === baseHost || hostname.endsWith(`.${baseHost}`);
+}
+
 const INTEGRATION_PATTERNS = [
   {
     id: "gpt",
@@ -85,13 +89,12 @@ const INTEGRATION_PATTERNS = [
     id: "lockr",
     label: "Lockr Identity",
     match: (url) => {
+      const hostMatch =
+        matchesHostOrSubdomain(url.hostname, "aim.loc.kr") ||
+        matchesHostOrSubdomain(url.hostname, "identity.loc.kr");
+      if (!hostMatch) return false;
       const href = url.href.toLowerCase();
-      return (
-        (url.hostname.includes("aim.loc.kr") ||
-          url.hostname.includes("identity.loc.kr")) &&
-        href.includes("identity-lockr") &&
-        href.endsWith(".js")
-      );
+      return href.includes("identity-lockr") && href.endsWith(".js");
     },
     extract: (url) => ({
       sdk_url: url.href,
@@ -126,6 +129,8 @@ const INTEGRATION_PATTERNS = [
     defaults: {
       api_endpoint: "https://api.permutive.com",
       secure_signals_endpoint: "https://secure-signals.permutive.app",
+      cache_ttl_seconds: 3600,
+      rewrite_sdk: true,
     },
     todos: (extracted) => {
       const missing = [];

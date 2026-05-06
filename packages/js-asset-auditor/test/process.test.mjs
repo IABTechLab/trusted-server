@@ -4,7 +4,11 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { parseExistingToml, processAssets } from "../lib/process.mjs";
+import {
+  formatTomlEntry,
+  parseExistingToml,
+  processAssets,
+} from "../lib/process.mjs";
 
 test("processAssets skips non-http script URLs", () => {
   const result = processAssets(
@@ -35,6 +39,72 @@ test("processAssets skips non-http script URLs", () => {
   assert.doesNotMatch(result.toml, /origin_url = "null/);
   assert.doesNotMatch(result.toml, /blob:/);
   assert.doesNotMatch(result.toml, /https:\/\/example\.comhttps:\/\/example\.com/);
+});
+
+test("processAssets marks wildcarded assets as head-injected when any original is in head", () => {
+  const result = processAssets(
+    {
+      networkUrls: [
+        "https://cdn.vendor.test/prod/1.19.8/raven.js",
+        "https://cdn.vendor.test/prod/1.19.9/raven.js",
+      ],
+      headUrls: ["https://cdn.vendor.test/prod/1.19.9/raven.js"],
+    },
+    {
+      domain: "publisher.com",
+      target: "https://www.publisher.com",
+      output: "js-assets.toml",
+      diff: false,
+      firstParty: [],
+      noFilter: true,
+    },
+  );
+
+  assert.equal(result.summary.surfaced, 1);
+  assert.match(result.toml, /origin_url = "https:\/\/cdn\.vendor\.test\/prod\/\*\/raven\.js"/);
+  assert.equal(result.summary.assets[0].injectInHead, true);
+  assert.match(result.toml, /inject_in_head = true/);
+});
+
+test("processAssets leaves wildcarded assets body-only when no original is in head", () => {
+  const result = processAssets(
+    {
+      networkUrls: [
+        "https://cdn.vendor.test/prod/1.19.8/raven.js",
+        "https://cdn.vendor.test/prod/1.19.9/raven.js",
+      ],
+      headUrls: [],
+    },
+    {
+      domain: "publisher.com",
+      target: "https://www.publisher.com",
+      output: "js-assets.toml",
+      diff: false,
+      firstParty: [],
+      noFilter: true,
+    },
+  );
+
+  assert.equal(result.summary.surfaced, 1);
+  assert.equal(result.summary.assets[0].injectInHead, false);
+  assert.match(result.toml, /inject_in_head = false/);
+});
+
+test("formatTomlEntry escapes TOML strings", () => {
+  const toml = formatTomlEntry({
+    slug: 'prefix:quote"slash\\asset',
+    path: '/js-assets/prefix/quote"slash\\asset.js',
+    originUrl: 'https://cdn.example.com/quote"slash\\asset.js',
+    injectInHead: true,
+    hasWildcard: false,
+  });
+
+  assert.match(toml, /slug = "prefix:quote\\"slash\\\\asset"/);
+  assert.match(toml, /path = "\/js-assets\/prefix\/quote\\"slash\\\\asset\.js"/);
+  assert.match(
+    toml,
+    /origin_url = "https:\/\/cdn\.example\.com\/quote\\"slash\\\\asset\.js"/,
+  );
 });
 
 test("parseExistingToml includes commented diff suggestions", () => {

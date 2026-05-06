@@ -2,7 +2,6 @@
 status: implemented
 implemented_in: feature/js-asset-auditor
 last_reviewed: 2026-05-04
-verified_against_commit: 4773d13b
 ---
 
 # JS Asset Auditor Engineering Spec
@@ -122,11 +121,11 @@ Everything else surfaces for operator review.
 
 | Field            | Derivation                                                                                          |
 | ---------------- | --------------------------------------------------------------------------------------------------- |
-| `slug`           | `{publisher_prefix}:{asset_stem}`, see slug algorithm below                                        |
+| `slug`           | `{publisher_prefix}:{asset_stem}`, see slug algorithm below                                         |
 | `path`           | Fixed: `/js-assets/{publisher_prefix}/{asset_stem}.js`. Wildcard: `/js-assets/{publisher_prefix}/*` |
 | `origin_url`     | Normalized URL (see URL Processing), with wildcard substitution applied if versioned                |
-| `ttl_sec`        | Omitted, proxy defaults to 1800 (wildcard) or 3600 (fixed)                                         |
-| `stale_ttl_sec`  | Omitted, proxy defaults to 86400 (24h)                                                             |
+| `ttl_sec`        | Omitted, proxy defaults to 1800 (wildcard) or 3600 (fixed)                                          |
+| `stale_ttl_sec`  | Omitted, proxy defaults to 86400 (24h)                                                              |
 | `inject_in_head` | `true` if URL appeared in head script list from DOM evaluation, else `false`                        |
 
 ### Slug algorithm
@@ -205,11 +204,11 @@ Diff mode: /audit-js-assets <url> --diff
 
 Compares sweep results against the existing `js-assets.toml`.
 
-| Condition                   | Behavior                                                                |
-| --------------------------- | ----------------------------------------------------------------------- |
-| Asset in sweep, not in file | **New**, appended to `js-assets.toml` as a commented-out block         |
+| Condition                   | Behavior                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| Asset in sweep, not in file | **New**, appended to `js-assets.toml` as a commented-out block                 |
 | Asset in file, not in sweep | **Missing**, flagged in terminal summary with `(warning)`. Never auto-removed. |
-| Asset in both               | **Confirmed**, listed as present                                       |
+| Asset in both               | **Confirmed**, listed as present                                               |
 
 New entries are appended as TOML comments so the file stays valid and nothing is activated without the operator explicitly uncommenting.
 

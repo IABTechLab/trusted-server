@@ -18,7 +18,7 @@
 //   --headless          Run browser headlessly
 //   --output <path>     Output file path (default: js-assets.toml)
 //   --config [path]     Generate trusted-server.toml (default path: trusted-server.generated.toml)
-//   --force             Overwrite config file when used with --config
+//   --force             Overwrite existing output/config files
 //
 // Prerequisites:
 //   cd packages/js-asset-auditor && npm install && npx playwright install chromium
@@ -134,11 +134,13 @@ export function resolvePublisherDomain(args, repoRoot) {
   }
 }
 
-export function ensureConfigPathWritable(configPath, force) {
-  if (existsSync(configPath) && !force) {
-    fail(`${configPath} already exists. Use --force to overwrite.`);
+export function ensurePathWritable(path, force) {
+  if (existsSync(path) && !force) {
+    fail(`${path} already exists. Use --force to overwrite.`);
   }
 }
+
+export const ensureConfigPathWritable = ensurePathWritable;
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -311,6 +313,9 @@ export async function main() {
       process.exit(1);
     }
 
+    if (!args.diff) {
+      ensurePathWritable(args.output, args.force);
+    }
     writeFileSync(args.output, result.toml);
     const count =
       result.summary.mode === "init"
@@ -323,7 +328,7 @@ export async function main() {
       const detection = detectIntegrations(scriptUrls, runtimeSignals);
 
       if (detection.integrations.length > 0) {
-        ensureConfigPathWritable(args.config, args.force);
+        ensurePathWritable(args.config, args.force);
         const configToml = generateConfig(domain, args.url, detection);
         writeFileSync(args.config, configToml);
         console.error(

@@ -97,12 +97,12 @@ origin_url = "https://web.prebidwrapper.com/golf-WnLmpLyEjL/default-v2/prebid-lo
 inject_in_head = true
 ```
 
-| Field | Description |
-| --- | --- |
-| `slug` | Hash-derived identifier in the form `{publisher_prefix}:{asset_stem}`. |
-| `path` | First-party path where the asset proxy serves the script. |
-| `origin_url` | Normalized vendor URL. |
-| `inject_in_head` | `true` when the script appears in `<head>` after the page settles. |
+| Field            | Description                                                            |
+| ---------------- | ---------------------------------------------------------------------- |
+| `slug`           | Hash-derived identifier in the form `{publisher_prefix}:{asset_stem}`. |
+| `path`           | First-party path where the asset proxy serves the script.              |
+| `origin_url`     | Normalized vendor URL.                                                 |
+| `inject_in_head` | `true` when the script appears in `<head>` after the page settles.     |
 
 The auditor omits `ttl_sec` and `stale_ttl_sec`. The asset proxy applies its defaults when those fields are absent.
 
@@ -191,7 +191,7 @@ You can also provide an explicit path:
 audit-js-assets https://www.publisher.com --config ./tmp/publisher-audit.toml
 ```
 
-If the target file already exists, the command fails unless you pass `--force`.
+If the target config file already exists, the command fails unless you pass `--force`.
 
 The auditor detects known integrations from the raw swept URLs, before URL normalization. It can generate sections for GPT, Google Tag Manager, Didomi, Datadome, Lockr, Permutive, Prebid, and APS.
 
@@ -224,17 +224,17 @@ container_id = "GTM-TRCJMD6"  # auto-detected
 
 ## Common options
 
-| Option | Description |
-| --- | --- |
-| `--diff` | Compare against existing `js-assets.toml`. |
-| `--domain <domain>` | Override publisher domain used for slug generation. |
-| `--settle <ms>` | Settle window after page load. The default is 6000 ms. |
+| Option                 | Description                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------- |
+| `--diff`               | Compare against existing `js-assets.toml`.                                   |
+| `--domain <domain>`    | Override publisher domain used for slug generation.                          |
+| `--settle <ms>`        | Settle window after page load. The default is 6000 ms.                       |
 | `--first-party <host>` | Additional first-party host. Pass a comma-separated list for multiple hosts. |
-| `--no-filter` | Bypass heuristic filtering. |
-| `--headless` | Run browser headlessly. |
-| `--output <path>` | Output `js-assets.toml` path. |
-| `--config [path]` | Generate Trusted Server config skeleton. |
-| `--force` | Overwrite an existing `--config` target. |
+| `--no-filter`          | Bypass heuristic filtering.                                                  |
+| `--headless`           | Run browser headlessly.                                                      |
+| `--output <path>`      | Output `js-assets.toml` path.                                                |
+| `--config [path]`      | Generate Trusted Server config skeleton.                                     |
+| `--force`              | Overwrite an existing output or `--config` target.                           |
 
 ## Related docs
 
