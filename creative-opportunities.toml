@@ -16,6 +16,10 @@ zone = "atfSidebar"
 [slot.providers.aps]
 slot_id = "aps-slot-atf-sidebar"
 
+[slot.providers.pbs.bidders]
+mocktioneer = { bid = 2.00 }
+criteo = { networkId = 123456, pubid = "123456" }
+
 [[slot]]
 id = "homepage_header_ad"
 gam_unit_path = "/88059007/autoblog/homepage"
@@ -30,3 +34,7 @@ zone = "header"
 
 [slot.providers.aps]
 slot_id = "aps-slot-homepage-header"
+
+[slot.providers.pbs.bidders]
+mocktioneer = { bid = 2.00 }
+criteo = { networkId = 123456, pubid = "123456" }

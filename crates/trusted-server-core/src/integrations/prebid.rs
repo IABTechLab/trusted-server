@@ -26,8 +26,8 @@ use crate::integrations::{
 };
 use crate::openrtb::{
     to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt,
+    ImpStoredRequest, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt,
+    RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
 };
 use crate::platform::RuntimeServices;
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
@@ -529,22 +529,27 @@ impl PrebidAuctionProvider {
                 // Build the bidder map for PBS.
                 // The JS adapter sends "trustedServer" as the bidder (our orchestrator
                 // adapter name). Replace it with the real PBS bidders from config.
-                // Pass through any other bidders with their params as-is.
+                // Only pass through keys that are known PBS bidders — skip provider-specific
+                // keys like "aps" which belong to their own separate auction provider.
                 let mut bidder: HashMap<String, Json> = HashMap::new();
                 for (name, params) in &slot.bidders {
                     if name == TRUSTED_SERVER_BIDDER {
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
-                    } else {
+                    } else if self.config.bidders.iter().any(|b| b == name) {
                         bidder.insert(name.clone(), params.clone());
                     }
                 }
 
-                // Fallback to config bidders if none provided
-                if bidder.is_empty() {
-                    for b in &self.config.bidders {
-                        bidder.insert(b.clone(), Json::Object(serde_json::Map::new()));
-                    }
-                }
+                // When no inline PBS bidder params exist (e.g. creative-opportunity slots
+                // whose PBS params live in stored requests), tell PBS to resolve bidder
+                // config from the stored request keyed by this slot ID.
+                let storedrequest = if bidder.is_empty() {
+                    Some(ImpStoredRequest {
+                        id: slot.id.clone(),
+                    })
+                } else {
+                    None
+                };
 
                 // Apply zone-specific bid param overrides when configured.
                 for (name, params) in &mut bidder {
@@ -582,7 +587,10 @@ impl PrebidAuctionProvider {
                     secure: Some(true), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
                     ext: ImpExt {
-                        prebid: PrebidImpExt { bidder },
+                        prebid: PrebidImpExt {
+                            bidder,
+                            storedrequest,
+                        },
                     }
                     .to_ext(),
                     ..Default::default()
@@ -3043,5 +3051,91 @@ fixed_bottom = {placementId = "_s2sBottom"}
         assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0]["bidder"], "kargo");
         assert_eq!(statuses[1]["status"], "timeout");
+    }
+
+    // ========================================================================
+    // PBS stored request tests
+    // ========================================================================
+
+    #[test]
+    fn to_openrtb_uses_stored_request_when_slot_has_no_pbs_bidder_params() {
+        // Slot only has "aps" provider — not a PBS bidder
+        let slot = make_slot(
+            "atf_sidebar_ad",
+            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should not send inline bidder params when using stored request"
+        );
+        assert_eq!(
+            prebid["storedrequest"]["id"], "atf_sidebar_ad",
+            "should use slot id as stored request id"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_uses_stored_request_when_slot_has_empty_bidders() {
+        let slot = make_slot("homepage_header_ad", HashMap::new());
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert_eq!(
+            prebid["storedrequest"]["id"], "homepage_header_ad",
+            "should use slot id as stored request id for slot with no bidder map"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_uses_inline_bidder_params_not_stored_request_for_trusted_server_slots() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+
+        let slot = make_ts_slot(
+            "in_content_ad",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("storedrequest").is_none(),
+            "should not use stored request when inline bidder params are present"
+        );
+        assert_eq!(
+            prebid["bidder"]["kargo"]["placementId"], "client_123",
+            "should use inline bidder params from trustedServer expansion"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+        let slot = make_slot(
+            "atf_sidebar_ad",
+            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should not forward aps key into PBS imp.ext.prebid.bidder"
+        );
     }
 }
