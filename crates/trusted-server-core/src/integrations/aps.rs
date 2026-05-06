@@ -286,24 +286,46 @@ impl IntegrationConfig for ApsConfig {
 /// Amazon APS auction provider.
 pub struct ApsAuctionProvider {
     config: ApsConfig,
+    // Maps APS slot ID → creative opportunity slot ID for the in-flight request.
+    // Written by request_bids before the async send; read by parse_response when the
+    // response arrives. Safe because Fastly Compute runs each request in an isolated
+    // single-threaded Wasm instance — the Mutex never contends in practice.
+    slot_id_map: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl ApsAuctionProvider {
     /// Create a new APS auction provider.
     #[must_use]
     pub fn new(config: ApsConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            slot_id_map: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Convert unified `AuctionRequest` to APS TAM bid request format.
     ///
+    /// Returns the serialisable `ApsBidRequest` and a map of APS slot ID →
+    /// creative-opportunity slot ID so the caller can remap bids in the response.
     /// Populates consent fields (GDPR, US Privacy, GPP) from the
     /// [`ConsentContext`](crate::consent::ConsentContext) attached to the request.
-    fn to_aps_request(&self, request: &AuctionRequest) -> ApsBidRequest {
+    fn to_aps_request(&self, request: &AuctionRequest) -> (ApsBidRequest, HashMap<String, String>) {
+        let mut slot_id_map: HashMap<String, String> = HashMap::new();
         let slots: Vec<ApsSlot> = request
             .slots
             .iter()
             .map(|slot| {
+                // Use the APS-specific slot ID from [slot.providers.aps] if configured;
+                // fall back to the creative-opportunity slot ID otherwise.
+                let aps_slot_id = slot
+                    .bidders
+                    .get("aps")
+                    .and_then(|p| p.get("slotID"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&slot.id)
+                    .to_string();
+                slot_id_map.insert(aps_slot_id.clone(), slot.id.clone());
+
                 // Extract sizes from banner formats
                 let sizes: Vec<[u32; 2]> = slot
                     .formats
@@ -313,7 +335,7 @@ impl ApsAuctionProvider {
                     .collect();
 
                 ApsSlot {
-                    slot_id: slot.id.clone(),
+                    slot_id: aps_slot_id,
                     sizes,
                     slot_name: Some(slot.id.clone()),
                 }
@@ -337,7 +359,7 @@ impl ApsAuctionProvider {
             })
         });
 
-        ApsBidRequest {
+        let bid_request = ApsBidRequest {
             pub_id: self.config.pub_id.clone(),
             slots,
             page_url: request.publisher.page_url.clone(),
@@ -347,7 +369,8 @@ impl ApsAuctionProvider {
             us_privacy,
             gpp,
             gpp_sid,
-        }
+        };
+        (bid_request, slot_id_map)
     }
 
     /// Parse size string (e.g., "300x250") into width and height.
@@ -433,9 +456,19 @@ impl ApsAuctionProvider {
                 aps_response.contextual.slots.len()
             );
 
+            let slot_map = self
+                .slot_id_map
+                .lock()
+                .expect("should lock APS slot id map");
             for slot in aps_response.contextual.slots {
                 match self.parse_aps_slot(&slot) {
-                    Ok(bid) => {
+                    Ok(mut bid) => {
+                        // Remap APS slot ID (e.g. "aps-slot-atf-sidebar") back to the
+                        // creative-opportunity slot ID (e.g. "atf_sidebar_ad") so the
+                        // mediator and bid_map can match by creative slot ID.
+                        if let Some(creative_id) = slot_map.get(&bid.slot_id) {
+                            bid.slot_id = creative_id.clone();
+                        }
                         let encoded_price = bid
                             .metadata
                             .get("amznbid")
@@ -485,8 +518,13 @@ impl AuctionProvider for ApsAuctionProvider {
             self.config.pub_id
         );
 
-        // Transform to APS format
-        let aps_request = self.to_aps_request(request);
+        // Transform to APS format; store the APS-slot-ID → creative-slot-ID map so
+        // parse_response can remap bids back to the creative opportunity slot ID.
+        let (aps_request, slot_id_map) = self.to_aps_request(request);
+        *self
+            .slot_id_map
+            .lock()
+            .expect("should lock APS slot id map") = slot_id_map;
 
         // Serialize to JSON
         let aps_json =
@@ -703,7 +741,7 @@ mod tests {
 
         let provider = ApsAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
-        let aps_request = provider.to_aps_request(&auction_request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&auction_request);
 
         // Verify basic fields
         assert_eq!(aps_request.pub_id, "5128");
@@ -727,6 +765,83 @@ mod tests {
         assert_eq!(slot2.slot_id, "sidebar");
         assert_eq!(slot2.sizes.len(), 1);
         assert_eq!(slot2.sizes[0], [300, 250]);
+    }
+
+    #[test]
+    fn aps_slot_id_from_bidders_map_used_in_request_and_remapped_in_response() {
+        use serde_json::json;
+
+        let config = ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        };
+        let provider = ApsAuctionProvider::new(config);
+
+        let mut bidders = HashMap::new();
+        bidders.insert(
+            "aps".to_string(),
+            json!({ "slotID": "aps-slot-atf-sidebar" }),
+        );
+        let request = AuctionRequest {
+            id: "test".to_string(),
+            slots: vec![AdSlot {
+                id: "atf_sidebar_ad".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders,
+            }],
+            publisher: PublisherInfo {
+                domain: "example.com".to_string(),
+                page_url: None,
+            },
+            user: UserInfo {
+                id: "user-1".to_string(),
+                fresh_id: "fresh-1".to_string(),
+                consent: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        };
+
+        let (aps_request, slot_id_map) = provider.to_aps_request(&request);
+        assert_eq!(
+            aps_request.slots[0].slot_id, "aps-slot-atf-sidebar",
+            "should send configured APS slot ID to APS"
+        );
+        assert_eq!(
+            slot_id_map.get("aps-slot-atf-sidebar").map(String::as_str),
+            Some("atf_sidebar_ad"),
+            "should build reverse map from APS slot ID to creative slot ID"
+        );
+
+        *provider.slot_id_map.lock().expect("should lock") = slot_id_map;
+
+        let aps_response = json!({
+            "contextual": {
+                "slots": [{
+                    "slotID": "aps-slot-atf-sidebar",
+                    "size": "300x250",
+                    "fif": "1",
+                    "amznbid": "1gtm3q",
+                    "meta": ["slotID"]
+                }]
+            }
+        });
+
+        let response = provider.parse_aps_response(&aps_response, 100);
+        assert_eq!(response.bids.len(), 1, "should parse one bid");
+        assert_eq!(
+            response.bids[0].slot_id, "atf_sidebar_ad",
+            "bid slot_id should be remapped to creative slot ID"
+        );
     }
 
     #[test]
@@ -957,7 +1072,7 @@ mod tests {
             ..Default::default()
         });
 
-        let aps_request = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
 
         // Verify GDPR consent
         let gdpr = aps_request.gdpr.expect("should have gdpr");
@@ -986,7 +1101,7 @@ mod tests {
         let provider = ApsAuctionProvider::new(config);
         let request = create_test_auction_request(); // consent is None
 
-        let aps_request = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
 
         assert!(aps_request.gdpr.is_none());
         assert!(aps_request.us_privacy.is_none());
@@ -1013,7 +1128,7 @@ mod tests {
             ..Default::default()
         });
 
-        let aps_request = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
         let json = serde_json::to_value(&aps_request).expect("should serialize");
 
         // GDPR fields present
