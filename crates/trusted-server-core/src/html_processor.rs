@@ -20,6 +20,7 @@
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use lol_html::{
@@ -246,6 +247,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
     });
 
     let injected_tsjs = Rc::new(Cell::new(false));
+    let injected_bids = Arc::new(AtomicBool::new(false));
     let integration_registry = config.integrations.clone();
     let script_rewriters = integration_registry.script_rewriters();
     let ad_slots_script = config.ad_slots_script.clone();
@@ -291,13 +293,20 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             }
         }),
         // Inject __ts_bids before </body> via end_tag_handlers.
+        // Guard with AtomicBool so the script is only injected once even if
+        // the origin HTML contains multiple <body> elements (e.g. template fragments).
         element!("body", {
             let state = ad_bids_state.clone();
+            let injected_bids = injected_bids.clone();
             move |el| {
                 let state = state.clone();
+                let injected_bids = injected_bids.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
                     let handler: EndTagHandler<'static> = Box::new(
                         move |end_tag: &mut EndTag<'_>| {
+                            if injected_bids.swap(true, Ordering::SeqCst) {
+                                return Ok(());
+                            }
                             let script_guard = state.read().expect("should read bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
@@ -1293,6 +1302,32 @@ mod tests {
             .expect("bids should be in output");
         let body_close_pos = html.find("</body>").expect("</body> should be in output");
         assert!(bids_pos < body_close_pos, "bids must appear before </body>");
+    }
+
+    #[test]
+    fn injects_ts_bids_only_once_with_multiple_body_elements() {
+        let bids_script =
+            r#"<script>window.__ts_bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
+        let state = std::sync::Arc::new(std::sync::RwLock::new(Some(bids_script.to_string())));
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: None,
+            ad_bids_state: state,
+        };
+        let mut processor = create_html_processor(config);
+        // Malformed HTML with two <body> elements (common in CMS template pages)
+        let output = processor
+            .process_chunk(b"<html><body><body>content</body></body></html>", true)
+            .expect("should process");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+        assert_eq!(
+            html.matches("window.__ts_bids").count(),
+            1,
+            "should inject __ts_bids exactly once even with multiple <body> elements"
+        );
     }
 
     #[test]
