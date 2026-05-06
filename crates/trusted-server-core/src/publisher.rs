@@ -1898,4 +1898,204 @@ mod tests {
             "origin host must not leak. Got: {processed}"
         );
     }
+
+    #[cfg(test)]
+    mod creative_opportunities_tests {
+        use super::super::{
+            build_ad_slots_script, build_bid_map, build_bids_script, html_escape_for_script,
+        };
+        use crate::auction::types::{Bid, MediaType};
+        use crate::creative_opportunities::{
+            CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
+        };
+        use crate::price_bucket::PriceGranularity;
+        use std::collections::HashMap;
+
+        fn make_config() -> CreativeOpportunitiesConfig {
+            CreativeOpportunitiesConfig {
+                gam_network_id: "21765378893".to_string(),
+                auction_timeout_ms: Some(500),
+                price_granularity: PriceGranularity::Dense,
+            }
+        }
+
+        fn make_slot() -> CreativeOpportunitySlot {
+            CreativeOpportunitySlot {
+                id: "atf_sidebar_ad".to_string(),
+                gam_unit_path: Some("/21765378893/publisher/atf-sidebar".to_string()),
+                div_id: Some("div-atf-sidebar".to_string()),
+                page_patterns: vec!["/20**".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                }],
+                floor_price: Some(0.50),
+                targeting: [("pos".to_string(), "atf".to_string())]
+                    .into_iter()
+                    .collect(),
+                providers: Default::default(),
+            }
+        }
+
+        fn make_bid(
+            slot_id: &str,
+            price: f64,
+            bidder: &str,
+            ad_id: &str,
+            nurl: &str,
+            burl: &str,
+        ) -> Bid {
+            Bid {
+                slot_id: slot_id.to_string(),
+                price: Some(price),
+                currency: "USD".to_string(),
+                creative: None,
+                adomain: None,
+                bidder: bidder.to_string(),
+                width: 300,
+                height: 250,
+                nurl: Some(nurl.to_string()),
+                burl: Some(burl.to_string()),
+                ad_id: Some(ad_id.to_string()),
+                metadata: Default::default(),
+            }
+        }
+
+        #[test]
+        fn ad_slots_script_contains_slot_data() {
+            let slots = vec![make_slot()];
+            let config = make_config();
+            let script = build_ad_slots_script(&slots, &config);
+            assert!(
+                script.contains("window.__ts_ad_slots=JSON.parse"),
+                "should use JSON.parse"
+            );
+            assert!(script.contains("atf_sidebar_ad"), "should include slot id");
+            assert!(!script.contains("__ts_bids"), "must NOT contain bids");
+            assert!(
+                !script.contains("__ts_request_id"),
+                "must NOT contain request_id"
+            );
+        }
+
+        #[test]
+        fn ad_slots_script_is_xss_safe() {
+            let slots = vec![make_slot()];
+            let config = make_config();
+            let script = build_ad_slots_script(&slots, &config);
+            let inner = script
+                .trim_start_matches("<script>")
+                .trim_end_matches("</script>");
+            assert!(!inner.contains('<'), "no unescaped < in script content");
+            assert!(!inner.contains('>'), "no unescaped > in script content");
+        }
+
+        #[test]
+        fn bid_map_includes_nurl_and_burl() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                make_bid(
+                    "atf_sidebar_ad",
+                    1.50,
+                    "kargo",
+                    "abc123",
+                    "https://ssp/win",
+                    "https://ssp/bill",
+                ),
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
+            let obj = entry.as_object().expect("should be object");
+            assert_eq!(
+                obj.get("hb_pb").and_then(|v| v.as_str()),
+                Some("1.50"),
+                "should bucket price with dense granularity"
+            );
+            assert_eq!(
+                obj.get("hb_bidder").and_then(|v| v.as_str()),
+                Some("kargo"),
+                "should include bidder"
+            );
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("abc123"),
+                "should include ad_id"
+            );
+            assert_eq!(
+                obj.get("nurl").and_then(|v| v.as_str()),
+                Some("https://ssp/win"),
+                "should include nurl"
+            );
+            assert_eq!(
+                obj.get("burl").and_then(|v| v.as_str()),
+                Some("https://ssp/bill"),
+                "should include burl"
+            );
+        }
+
+        #[test]
+        fn bid_map_excludes_slot_when_price_is_none() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "no-price-slot".to_string(),
+                Bid {
+                    slot_id: "no-price-slot".to_string(),
+                    price: None,
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "kargo".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            assert!(
+                map.is_empty(),
+                "slot with no price should be excluded from bid map"
+            );
+        }
+
+        #[test]
+        fn bids_script_is_xss_safe() {
+            let mut map = serde_json::Map::new();
+            map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
+            let script = build_bids_script(&map);
+            let inner = script
+                .trim_start_matches("<script>")
+                .trim_end_matches("</script>");
+            assert!(!inner.contains('<'), "no unescaped < in bids script");
+            assert!(!inner.contains('>'), "no unescaped > in bids script");
+        }
+
+        #[test]
+        fn html_escape_encodes_special_chars() {
+            assert_eq!(
+                html_escape_for_script("text\\with\\backslash"),
+                "text\\\\with\\\\backslash",
+                "should escape backslashes"
+            );
+            assert_eq!(
+                html_escape_for_script("string\"with\"quotes"),
+                "string\\\"with\\\"quotes",
+                "should escape quotes"
+            );
+            assert_eq!(
+                html_escape_for_script("simple"),
+                "simple",
+                "should not change simple text"
+            );
+            assert_eq!(
+                html_escape_for_script("both\\\"mixed"),
+                "both\\\\\\\"mixed",
+                "should escape both backslashes and quotes"
+            );
+        }
+    }
 }
