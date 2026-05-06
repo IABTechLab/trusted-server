@@ -342,7 +342,7 @@ mod tests {
             .get("mocktioneer")
             .expect("should have mocktioneer bidder");
         assert_eq!(
-            mock_params.get("bid").and_then(|v| v.as_f64()),
+            mock_params.get("bid").and_then(serde_json::Value::as_f64),
             Some(2.0),
             "should wire mocktioneer bid param"
         );
@@ -351,7 +351,7 @@ mod tests {
             .get("criteo")
             .expect("should have criteo bidder");
         assert_eq!(
-            criteo_params.get("networkId").and_then(|v| v.as_i64()),
+            criteo_params.get("networkId").and_then(serde_json::Value::as_i64),
             Some(112141),
             "should wire criteo networkId param"
         );
