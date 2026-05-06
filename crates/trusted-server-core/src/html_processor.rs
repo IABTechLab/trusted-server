@@ -296,8 +296,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 let state = state.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
-                    let handler: EndTagHandler<'static> =
-                        Box::new(move |end_tag: &mut EndTag<'_>| {
+                    let handler: EndTagHandler<'static> = Box::new(
+                        move |end_tag: &mut EndTag<'_>| {
                             let script_guard = state.read().expect("should read bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
@@ -306,7 +306,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             };
                             end_tag.before(&bids_script, ContentType::Html);
                             Ok(())
-                        });
+                        },
+                    );
                     handlers.push(handler);
                 }
                 Ok(())
