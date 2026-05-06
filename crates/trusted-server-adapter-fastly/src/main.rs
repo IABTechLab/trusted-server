@@ -39,6 +39,8 @@ use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
+const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opportunities.toml");
+
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `Request::from_client()` instead of
@@ -80,6 +82,10 @@ fn main() {
         }
     };
 
+    let slots_file: trusted_server_core::creative_opportunities::CreativeOpportunitiesFile =
+        toml::from_str(CREATIVE_OPPORTUNITIES_TOML)
+            .expect("should parse creative-opportunities.toml");
+
     let integration_registry = match IntegrationRegistry::new(&settings) {
         Ok(r) => r,
         Err(e) => {
@@ -103,6 +109,7 @@ fn main() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
+        &slots_file,
         req,
     )) {
         response.send_to_client();
@@ -114,6 +121,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
+    slots_file: &trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
     mut req: Request,
 ) -> Option<Response> {
     // Strip client-spoofable forwarded headers at the edge.
@@ -221,8 +229,12 @@ async fn route_request(
                         settings,
                         integration_registry,
                         &publisher_services,
+                        orchestrator,
+                        slots_file,
                         req,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(PublisherResponse::Stream {
                             mut response,
                             body,

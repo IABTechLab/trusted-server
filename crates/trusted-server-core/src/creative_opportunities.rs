@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 
-use glob::Pattern;
 use serde::{Deserialize, Serialize};
+
+use glob::Pattern;
 
 use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
@@ -64,8 +65,9 @@ impl CreativeOpportunitySlot {
     /// Patterns that cannot be compiled even after normalisation are silently skipped.
     #[must_use]
     pub fn matches_path(&self, path: &str) -> bool {
-        self.page_patterns.iter().any(|pattern| {
-            match Pattern::new(pattern) {
+        self.page_patterns
+            .iter()
+            .any(|pattern| match Pattern::new(pattern) {
                 Ok(p) => p.matches(path),
                 Err(_) => {
                     let normalised = pattern.replace("**", "*");
@@ -73,8 +75,7 @@ impl CreativeOpportunitySlot {
                         .map(|p| p.matches(path))
                         .unwrap_or(false)
                 }
-            }
-        })
+            })
     }
 
     /// Returns the GAM ad unit path for this slot.
@@ -227,7 +228,10 @@ mod tests {
     #[test]
     fn glob_matches_article_path() {
         let slot = make_slot("atf", vec!["/20**"]);
-        assert!(slot.matches_path("/2024/01/my-article/"), "should match article path");
+        assert!(
+            slot.matches_path("/2024/01/my-article/"),
+            "should match article path"
+        );
         assert!(!slot.matches_path("/"), "should not match root");
     }
 
@@ -243,14 +247,20 @@ mod tests {
         assert!(validate_slot_id("atf_sidebar_ad").is_ok());
         assert!(validate_slot_id("below-content-0").is_ok());
         assert!(validate_slot_id("").is_err(), "empty id should fail");
-        assert!(validate_slot_id("xss<script>").is_err(), "html in id should fail");
+        assert!(
+            validate_slot_id("xss<script>").is_err(),
+            "html in id should fail"
+        );
         assert!(validate_slot_id("has space").is_err(), "spaces should fail");
     }
 
     #[test]
     fn resolved_gam_unit_path_uses_default_when_absent() {
         let slot = make_slot("atf", vec!["/"]);
-        assert_eq!(slot.resolved_gam_unit_path("21765378893"), "/21765378893/atf");
+        assert_eq!(
+            slot.resolved_gam_unit_path("21765378893"),
+            "/21765378893/atf"
+        );
     }
 
     #[test]
@@ -272,7 +282,9 @@ mod tests {
     #[test]
     fn to_ad_slot_wires_aps_params_into_bidders() {
         let mut slot = make_slot("atf", vec!["/"]);
-        slot.providers.aps = Some(ApsSlotParams { slot_id: "aps-slot-atf".to_string() });
+        slot.providers.aps = Some(ApsSlotParams {
+            slot_id: "aps-slot-atf".to_string(),
+        });
         let ad_slot = slot.to_ad_slot("21765378893");
         let aps_params = ad_slot.bidders.get("aps").expect("should have aps bidder");
         assert_eq!(

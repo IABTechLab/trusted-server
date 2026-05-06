@@ -92,14 +92,15 @@ fn main() {
 
     let co_path = Path::new(CREATIVE_OPPORTUNITIES_PATH);
     if co_path.exists() {
-        let co_content = fs::read_to_string(co_path)
-            .expect("should read creative-opportunities.toml");
-        let co_value: toml::Value = toml::from_str(&co_content)
-            .expect("creative-opportunities.toml: invalid TOML");
+        let co_content =
+            fs::read_to_string(co_path).expect("should read creative-opportunities.toml");
+        let co_value: toml::Value =
+            toml::from_str(&co_content).expect("creative-opportunities.toml: invalid TOML");
         let slot_id_re = regex::Regex::new(r"^[A-Za-z0-9_\-]+$").expect("should compile regex");
         if let Some(slots) = co_value.get("slot").and_then(|v| v.as_array()) {
             for slot in slots {
-                let id = slot.get("id")
+                let id = slot
+                    .get("id")
                     .and_then(|v| v.as_str())
                     .expect("creative-opportunities.toml: slot missing 'id' field");
                 if !slot_id_re.is_match(id) {

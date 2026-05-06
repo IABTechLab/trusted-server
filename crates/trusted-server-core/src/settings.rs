@@ -1942,7 +1942,9 @@ gam_network_id = "21765378893"
 auction_timeout_ms = 500
 "#;
         let settings = Settings::from_toml(toml).expect("should parse");
-        let co = settings.creative_opportunities.expect("should have creative_opportunities");
+        let co = settings
+            .creative_opportunities
+            .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
     }
