@@ -351,8 +351,10 @@ mod tests {
             .get("criteo")
             .expect("should have criteo bidder");
         assert_eq!(
-            criteo_params.get("networkId").and_then(serde_json::Value::as_i64),
-            Some(112141),
+            criteo_params
+                .get("networkId")
+                .and_then(serde_json::Value::as_i64),
+            Some(123456),
             "should wire criteo networkId param"
         );
     }
