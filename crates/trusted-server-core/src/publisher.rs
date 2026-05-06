@@ -668,7 +668,7 @@ pub async fn handle_publisher_request(
     };
 
     if ad_slots_script.is_some() {
-        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
+        response.set_header(header::CACHE_CONTROL, "private, no-store");
         response.remove_header("surrogate-control");
         response.remove_header("fastly-surrogate-control");
     }
