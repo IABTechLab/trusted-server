@@ -70,6 +70,17 @@ fn main() {
     };
     log::debug!("Settings {settings:?}");
 
+    // Short-circuit the ja4 debug probe before finalize_response so that
+    // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
+    if req.get_method() == Method::GET && req.get_path() == "/_ts/debug/ja4" {
+        if settings.debug.ja4_endpoint_enabled {
+            build_ja4_debug_response(&req).send_to_client();
+        } else {
+            Response::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+        }
+        return;
+    }
+
     // Build the auction orchestrator once at startup
     let orchestrator = match build_orchestrator(&settings) {
         Ok(o) => o,
@@ -109,16 +120,27 @@ fn main() {
     }
 }
 
+const FALLBACK_UNAVAILABLE: &str = "unavailable";
+const FALLBACK_NOT_SENT: &str = "not sent";
+const FALLBACK_NONE: &str = "none";
+
+// TODO: remove after JA4 evaluation completes — see #645
 fn build_ja4_debug_response(req: &Request) -> Response {
-    let ja4 = req.get_tls_ja4().unwrap_or("unavailable");
-    let h2 = req.get_client_h2_fingerprint().unwrap_or("unavailable");
-    let cipher = req.get_tls_cipher_openssl_name().unwrap_or("unavailable");
-    let tls_version = req.get_tls_protocol().unwrap_or("unavailable");
-    let ua = req.get_header_str("user-agent").unwrap_or("none");
-    let ch_mobile = req.get_header_str("sec-ch-ua-mobile").unwrap_or("not sent");
+    let ja4 = req.get_tls_ja4().unwrap_or(FALLBACK_UNAVAILABLE);
+    let h2 = req
+        .get_client_h2_fingerprint()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let cipher = req
+        .get_tls_cipher_openssl_name()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
+    let ch_mobile = req
+        .get_header_str("sec-ch-ua-mobile")
+        .unwrap_or(FALLBACK_NOT_SENT);
     let ch_platform = req
         .get_header_str("sec-ch-ua-platform")
-        .unwrap_or("not sent");
+        .unwrap_or(FALLBACK_NOT_SENT);
 
     let body = format!(
         "ja4:         {ja4}\n\
@@ -132,6 +154,10 @@ fn build_ja4_debug_response(req: &Request) -> Response {
 
     Response::from_status(fastly::http::StatusCode::OK)
         .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(
+            header::VARY,
+            "User-Agent, Sec-CH-UA-Mobile, Sec-CH-UA-Platform",
+        )
         .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
         .with_body(body)
 }
@@ -210,15 +236,6 @@ async fn route_request(
                     handle_auction(settings, orchestrator, &auction_services, req).await
                 }
                 Err(e) => Err(e),
-            }
-        }
-
-        // JA4/TLS debug endpoint — only active when debug.ja4_endpoint_enabled = true.
-        (Method::GET, "/_ts/debug/ja4") => {
-            if settings.debug.ja4_endpoint_enabled {
-                Ok(build_ja4_debug_response(&req))
-            } else {
-                Ok(Response::from_status(fastly::http::StatusCode::NOT_FOUND))
             }
         }
 
@@ -379,7 +396,7 @@ mod tests {
             "should return plain text content"
         );
         assert_eq!(
-            response.get_header_str("cache-control"),
+            response.get_header_str(header::CACHE_CONTROL),
             Some("no-store, private"),
             "should disable caching for the debug response"
         );
