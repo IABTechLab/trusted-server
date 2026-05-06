@@ -112,16 +112,21 @@ mod tests {
 
     #[test]
     fn tsjs_unified_helpers_use_all_module_ids() {
-        let src = tsjs_unified_script_src();
+        let unified = tsjs_unified_script_src();
+        let manual = tsjs_script_src(&all_module_ids());
 
+        assert_eq!(
+            unified, manual,
+            "unified helpers must hash every registered module",
+        );
         assert!(
-            src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
+            unified.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
             "should include the unified bundle path and cache-busting parameter",
         );
-        assert_sha256_hex_hash(&src);
+        assert_sha256_hex_hash(&unified);
         assert_eq!(
             tsjs_unified_script_tag(),
-            format!("<script src=\"{src}\" id=\"trustedserver-js\"></script>"),
+            format!("<script src=\"{unified}\" id=\"trustedserver-js\"></script>"),
             "should wrap the unified bundle source in the standard script tag",
         );
     }
@@ -129,17 +134,16 @@ mod tests {
     #[test]
     fn tsjs_deferred_helpers_format_single_module_urls_and_tags() {
         let module_id = "prebid";
-        let expected_hash = single_module_hash(module_id).expect("should hash known module");
-        let expected_src = format!("/static/tsjs=tsjs-{module_id}.min.js?v={expected_hash}");
+        let src = tsjs_deferred_script_src(module_id);
 
-        assert_eq!(
-            tsjs_deferred_script_src(module_id),
-            expected_src,
-            "should include the deferred module path and hash",
+        assert!(
+            src.starts_with("/static/tsjs=tsjs-prebid.min.js?v="),
+            "should include the deferred module path and cache-busting parameter",
         );
+        assert_sha256_hex_hash(&src);
         assert_eq!(
             tsjs_deferred_script_tag(module_id),
-            format!("<script src=\"{expected_src}\" defer></script>"),
+            format!("<script src=\"{src}\" defer></script>"),
             "should render a deferred script tag for the module",
         );
     }
@@ -155,16 +159,24 @@ mod tests {
 
     #[test]
     fn tsjs_deferred_script_tags_concatenates_tags_in_input_order() {
-        let module_ids = ["prebid", "creative"];
-        let expected = module_ids
-            .iter()
-            .map(|id| tsjs_deferred_script_tag(id))
-            .collect::<String>();
+        let result = tsjs_deferred_script_tags(&["prebid", "creative"]);
+        let prebid_pos = result
+            .find("tsjs-prebid")
+            .expect("should contain prebid script");
+        let creative_pos = result
+            .find("tsjs-creative")
+            .expect("should contain creative script");
 
+        assert!(prebid_pos < creative_pos, "should preserve input order");
         assert_eq!(
-            tsjs_deferred_script_tags(&module_ids),
-            expected,
-            "should concatenate one deferred script tag per module in order",
+            result.matches("<script ").count(),
+            2,
+            "should emit one tag per module",
+        );
+        assert_eq!(
+            result.matches(" defer></script>").count(),
+            2,
+            "should mark each deferred script tag with defer",
         );
     }
 }
