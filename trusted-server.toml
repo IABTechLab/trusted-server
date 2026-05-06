@@ -191,7 +191,7 @@ timeout_ms = 1000
 permutive_segments = "permutive"
 
 [creative_opportunities]
-gam_network_id = "21765378893"
-auction_timeout_ms = 3000
+gam_network_id = "88059007"
+auction_timeout_ms = 500
 price_granularity = "dense"
 
