@@ -43,7 +43,7 @@ interface GoogleTagPubAdsService {
 }
 
 interface GoogleTag {
-  cmd: { push: (fn: () => void) => unknown };
+  cmd: Array<() => void>;
   pubads(): GoogleTagPubAdsService;
   defineSlot(
     adUnitPath: string,
@@ -75,7 +75,7 @@ type GptWindow = Window & {
  */
 function ensureGoogleTagStub(win: GptWindow): Partial<GoogleTag> {
   const tag = (win.googletag = win.googletag ?? {});
-  tag.cmd = tag.cmd ?? (([] as unknown) as { push: (fn: () => void) => unknown });
+  tag.cmd = tag.cmd ?? [];
   return tag;
 }
 
@@ -110,7 +110,7 @@ function patchCommandQueue(tag: Partial<GoogleTag>): void {
   // Ensure the queue exists.
   if (!tag.cmd) {
     // Cast through unknown so an array satisfies the { push } type.
-    tag.cmd = ([] as unknown) as { push: (fn: () => void) => unknown };
+    tag.cmd = [];
   }
 
   const queue = tag.cmd;
@@ -214,7 +214,7 @@ export function installTsAdInit(): void {
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
-    g.cmd.push(() => {
+    g.cmd?.push(() => {
       slots
         .map((slot) => {
           const gptSlot = g.defineSlot?.(slot.gam_unit_path, slot.formats as Array<number | number[]>, slot.div_id);
