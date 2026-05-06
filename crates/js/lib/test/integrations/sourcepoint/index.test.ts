@@ -34,6 +34,7 @@ describe('integrations/sourcepoint', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    Object.defineProperty(document, 'readyState', { value: 'complete', configurable: true });
     clearAllCookies();
     localStorage.clear();
   });
@@ -80,6 +81,22 @@ describe('integrations/sourcepoint', () => {
     expect(result).toBe(false);
     expect(getCookie('__gpp')).toBe('other-cmp-gpp');
     expect(getCookie('__gpp_sid')).toBe('7,8');
+  });
+
+  it('does not overwrite GPP cookies owned by another CMP', () => {
+    document.cookie = '__gpp=other-cmp-gpp; path=/';
+    document.cookie = '__gpp_sid=2; path=/';
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('sourcepoint-gpp', [7]))
+    );
+
+    const result = mirrorSourcepointConsent();
+
+    expect(result).toBe(false);
+    expect(getCookie('__gpp')).toBe('other-cmp-gpp');
+    expect(getCookie('__gpp_sid')).toBe('2');
+    expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBeUndefined();
   });
 
   it('clears stale Sourcepoint-owned mirrored cookies when no valid Sourcepoint payload exists', () => {
@@ -150,6 +167,23 @@ describe('integrations/sourcepoint', () => {
     expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBe('sp');
   });
 
+  it('updates GPP cookies when Sourcepoint owns the marker', () => {
+    document.cookie = '__gpp=stale-sourcepoint-gpp; path=/';
+    document.cookie = '__gpp_sid=7; path=/';
+    document.cookie = `${SOURCEPOINT_MARKER_COOKIE}=sp; path=/`;
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('updated-sourcepoint-gpp', [8]))
+    );
+
+    const result = mirrorSourcepointConsent();
+
+    expect(result).toBe(true);
+    expect(getCookie('__gpp')).toBe('updated-sourcepoint-gpp');
+    expect(getCookie('__gpp_sid')).toBe('8');
+    expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBe('sp');
+  });
+
   it('refreshes mirrored cookies when the window regains focus', () => {
     localStorage.setItem(
       '_sp_user_consent_12345',
@@ -197,6 +231,57 @@ describe('integrations/sourcepoint', () => {
     vi.advanceTimersByTime(500);
 
     expect(getCookie('__gpp')).toBe('retry-gpp');
+    expect(getCookie('__gpp_sid')).toBe('7');
+  });
+
+  it('clears a pending initial retry after a successful manual mirror', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    localStorage.clear();
+    clearAllCookies();
+    Object.defineProperty(document, 'readyState', { value: 'loading', configurable: true });
+
+    const sourcepoint = await import('../../../src/integrations/sourcepoint');
+
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('manual-gpp', [7]))
+    );
+    expect(sourcepoint.mirrorSourcepointConsent()).toBe(true);
+
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('timer-gpp', [8]))
+    );
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    vi.advanceTimersByTime(500);
+
+    expect(getCookie('__gpp')).toBe('manual-gpp');
+    expect(getCookie('__gpp_sid')).toBe('7');
+  });
+
+  it('does not run both DOMContentLoaded and timer retries', async () => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    localStorage.clear();
+    clearAllCookies();
+    Object.defineProperty(document, 'readyState', { value: 'loading', configurable: true });
+
+    await import('../../../src/integrations/sourcepoint');
+
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('domcontentloaded-gpp', [7]))
+    );
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify(sourcepointPayload('timer-gpp', [8]))
+    );
+    vi.advanceTimersByTime(500);
+
+    expect(getCookie('__gpp')).toBe('domcontentloaded-gpp');
     expect(getCookie('__gpp_sid')).toBe('7');
   });
 });

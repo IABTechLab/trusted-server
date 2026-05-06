@@ -123,7 +123,7 @@ const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
 /// - `None` if no US section is present or no decodable US section yields a
 ///   usable `sale_opt_out` signal
 fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
-    let mut saw_not_opted_out = false;
+    let mut result = None;
 
     for us_section_id in parsed
         .section_ids()
@@ -132,7 +132,7 @@ fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
         match parsed.decode_section(*us_section_id) {
             Ok(section) => match us_sale_opt_out_from_section(&section) {
                 Some(true) => return Some(true),
-                Some(false) => saw_not_opted_out = true,
+                Some(false) => result = Some(false),
                 None => {}
             },
             Err(e) => {
@@ -141,11 +141,7 @@ fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
         }
     }
 
-    if saw_not_opted_out {
-        Some(false)
-    } else {
-        None
-    }
+    result
 }
 
 fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {

@@ -451,6 +451,7 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
 function syncPrebidEidsCookie(): void {
   try {
     if (typeof pbjs.getUserIdsAsEids !== 'function') {
+      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
       clearPrebidEidsCookie();
       return;
     }

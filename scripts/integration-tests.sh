@@ -53,7 +53,7 @@ fi
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
-TRUSTED_SERVER__EC__PASSPHRASE="integration-test-ec-secret" \
+TRUSTED_SERVER__EC__PASSPHRASE="integration-test-ec-secret-padded-32" \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 

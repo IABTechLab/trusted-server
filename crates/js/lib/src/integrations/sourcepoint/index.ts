@@ -17,6 +17,8 @@ interface SourcepointConsentPayload {
 }
 
 let initialized = false;
+let initialRetryDone = false;
+let retryTimer: ReturnType<typeof window.setTimeout> | undefined;
 
 function findSourcepointConsent(): SourcepointConsentPayload | null {
   // Sourcepoint stores one consent payload per property under `_sp_user_consent_*`.
@@ -74,8 +76,27 @@ function mirrorOnVisible(): void {
   }
 }
 
+function clearInitialRetryTimer(): void {
+  if (retryTimer === undefined) {
+    return;
+  }
+
+  window.clearTimeout(retryTimer);
+  retryTimer = undefined;
+}
+
 function scheduleInitialRetry(): void {
+  if (initialRetryDone || retryTimer !== undefined) {
+    return;
+  }
+
   const retry = (): void => {
+    if (initialRetryDone) {
+      return;
+    }
+
+    initialRetryDone = true;
+    clearInitialRetryTimer();
     mirrorSourcepointConsent();
   };
 
@@ -83,7 +104,7 @@ function scheduleInitialRetry(): void {
     document.addEventListener('DOMContentLoaded', retry, { once: true });
   }
 
-  window.setTimeout(retry, INITIAL_RETRY_DELAY_MS);
+  retryTimer = window.setTimeout(retry, INITIAL_RETRY_DELAY_MS);
 }
 
 /**
@@ -111,14 +132,23 @@ export function mirrorSourcepointConsent(): boolean {
     return false;
   }
 
+  const existingGppCookie = readCookie(GPP_COOKIE_NAME);
+  if (existingGppCookie && existingGppCookie !== gppString && !hasSourcepointMarker()) {
+    log.debug('sourcepoint: preserving existing __gpp cookie from another writer');
+    return false;
+  }
+
   writeCookie(GPP_SOURCE_COOKIE_NAME, GPP_SOURCE_SOURCEPOINT);
   writeCookie(GPP_COOKIE_NAME, gppString);
 
   if (Array.isArray(applicableSections) && applicableSections.length > 0) {
     writeCookie(GPP_SID_COOKIE_NAME, applicableSections.join(','));
-  } else if (hasSourcepointMarker()) {
+  } else {
     clearCookie(GPP_SID_COOKIE_NAME);
   }
+
+  initialRetryDone = true;
+  clearInitialRetryTimer();
 
   log.info('sourcepoint: mirrored GPP consent to cookies', {
     gppLength: gppString.length,
