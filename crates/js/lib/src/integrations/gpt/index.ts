@@ -32,13 +32,19 @@ interface GoogleTagSlot {
   getSlotElementId(): string;
   setTargeting(key: string, value: string | string[]): GoogleTagSlot;
   addService(service: GoogleTagPubAdsService): GoogleTagSlot;
+  getTargeting?(key: string): string[];
+}
+
+interface SlotRenderEndedEvent {
+  isEmpty: boolean;
+  slot: GoogleTagSlot;
 }
 
 interface GoogleTagPubAdsService {
   setTargeting(key: string, value: string | string[]): GoogleTagPubAdsService;
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
-  addEventListener(event: string, fn: (e: any) => void): void;
+  addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
   refresh(): void;
 }
 
@@ -57,6 +63,7 @@ interface GoogleTag {
 
 type GptWindow = Window & {
   googletag?: Partial<GoogleTag>;
+  __tsjs_slim_prebid_url?: string;
 };
 
 // ------------------------------------------------------------------
@@ -237,7 +244,7 @@ export function installTsAdInit(): void {
       g.pubads!().enableSingleRequest();
       g.enableServices?.();
 
-      g.pubads!().addEventListener?.('slotRenderEnded', (event: any) => {
+      g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
         const slotId: string = event.slot?.getSlotElementId?.() ?? '';
         const bid = bids[slotId] ?? {};
         const ourBidWon =
@@ -265,7 +272,7 @@ export function installTsAdInit(): void {
  * the slim-Prebid bundle build target ships in a later phase).
  */
 export function installSlimPrebidLoader(): void {
-  const url = (window as any).__tsjs_slim_prebid_url as string | undefined;
+  const url = (window as GptWindow).__tsjs_slim_prebid_url;
   if (!url) return;
   window.addEventListener('load', () => {
     const script = document.createElement('script');
@@ -284,7 +291,7 @@ export function installSlimPrebidLoader(): void {
 // regardless of script order, the module also checks for a pre-set enable flag
 // immediately after registering the function.
 if (typeof window !== 'undefined') {
-  const win = window as Record<string, unknown>;
+  const win = window as unknown as Record<string, unknown>;
 
   win.__tsjs_installGptShim = installGptShim;
 

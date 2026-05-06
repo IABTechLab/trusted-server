@@ -1,11 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+interface SlotRenderEvent {
+  isEmpty: boolean;
+  slot: {
+    getSlotElementId(): string;
+    getTargeting(key: string): string[];
+  };
+}
+
+type TestWindow = Window & {
+  googletag?: unknown;
+  __ts_ad_slots?: unknown;
+  __ts_bids?: unknown;
+  __tsAdInit?: () => void;
+};
+
 describe('installTsAdInit', () => {
   beforeEach(() => {
     vi.resetModules();
-    delete (window as any).__ts_ad_slots;
-    delete (window as any).__ts_bids;
-    delete (window as any).__tsAdInit;
+    delete (window as TestWindow).__ts_ad_slots;
+    delete (window as TestWindow).__ts_bids;
+    delete (window as TestWindow).__tsAdInit;
     // jsdom does not implement navigator.sendBeacon; polyfill it for tests
     if (!('sendBeacon' in navigator)) {
       Object.defineProperty(navigator, 'sendBeacon', {
@@ -28,13 +43,13 @@ describe('installTsAdInit', () => {
       addEventListener: vi.fn(),
       refresh: vi.fn(),
     };
-    (window as any).googletag = {
+    (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
       defineSlot: vi.fn().mockReturnValue(mockSlot),
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as any).__ts_ad_slots = [
+    (window as TestWindow).__ts_ad_slots = [
       {
         id: 'atf',
         gam_unit_path: '/123/atf',
@@ -43,7 +58,7 @@ describe('installTsAdInit', () => {
         targeting: { pos: 'atf' },
       },
     ];
-    (window as any).__ts_bids = {
+    (window as TestWindow).__ts_bids = {
       atf: {
         hb_pb: '1.00',
         hb_bidder: 'kargo',
@@ -57,7 +72,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as any).__tsAdInit();
+    (window as TestWindow).__tsAdInit!();
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
@@ -70,7 +85,7 @@ describe('installTsAdInit', () => {
 
   it('fires both nurl and burl via sendBeacon on slotRenderEnded when our bid won', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    let capturedListener: ((e: any) => void) | undefined;
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -81,17 +96,17 @@ describe('installTsAdInit', () => {
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       refresh: vi.fn(),
-      addEventListener: vi.fn((event: string, fn: (e: any) => void) => {
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
       }),
     };
-    (window as any).googletag = {
+    (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
       defineSlot: vi.fn().mockReturnValue(mockSlot),
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as any).__ts_ad_slots = [
+    (window as TestWindow).__ts_ad_slots = [
       {
         id: 'atf',
         gam_unit_path: '/123/atf',
@@ -100,7 +115,7 @@ describe('installTsAdInit', () => {
         targeting: {},
       },
     ];
-    (window as any).__ts_bids = {
+    (window as TestWindow).__ts_bids = {
       atf: {
         hb_pb: '1.00',
         hb_bidder: 'kargo',
@@ -112,7 +127,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as any).__tsAdInit();
+    (window as TestWindow).__tsAdInit!();
 
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
@@ -124,7 +139,7 @@ describe('installTsAdInit', () => {
 
   it('does not fire nurl/burl when bid did not win GAM line item', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
-    let capturedListener: ((e: any) => void) | undefined;
+    let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
     const mockSlotNoMatch = {
       addService: vi.fn().mockReturnThis(),
@@ -135,17 +150,17 @@ describe('installTsAdInit', () => {
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       refresh: vi.fn(),
-      addEventListener: vi.fn((event: string, fn: (e: any) => void) => {
+      addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
       }),
     };
-    (window as any).googletag = {
+    (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
       defineSlot: vi.fn().mockReturnValue(mockSlotNoMatch),
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as any).__ts_ad_slots = [
+    (window as TestWindow).__ts_ad_slots = [
       {
         id: 'atf',
         gam_unit_path: '/123/atf',
@@ -154,7 +169,7 @@ describe('installTsAdInit', () => {
         targeting: {},
       },
     ];
-    (window as any).__ts_bids = {
+    (window as TestWindow).__ts_bids = {
       atf: {
         hb_pb: '1.00',
         hb_bidder: 'kargo',
@@ -166,7 +181,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as any).__tsAdInit();
+    (window as TestWindow).__tsAdInit!();
     capturedListener!({ isEmpty: false, slot: mockSlotNoMatch });
 
     expect(beaconSpy).not.toHaveBeenCalled();
@@ -179,7 +194,7 @@ describe('installTsAdInit', () => {
       addEventListener: vi.fn(),
       refresh: vi.fn(),
     };
-    (window as any).googletag = {
+    (window as TestWindow).googletag = {
       cmd: { push: vi.fn((fn: () => void) => fn()) },
       defineSlot: vi.fn().mockReturnValue({
         addService: vi.fn().mockReturnThis(),
@@ -188,12 +203,12 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as any).__ts_ad_slots = [];
-    (window as any).__ts_bids = {};
+    (window as TestWindow).__ts_ad_slots = [];
+    (window as TestWindow).__ts_bids = {};
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as any).__tsAdInit();
+    (window as TestWindow).__tsAdInit!();
 
     expect(mockPubads.refresh).toHaveBeenCalled();
   });
