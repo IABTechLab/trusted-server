@@ -133,36 +133,21 @@ impl AdServerMockProvider {
                     .bids
                     .iter()
                     .map(|bid| {
-                        // Check if this is an APS bid with encoded price (inferred from amznbid in metadata)
-                        let encoded_price = bid
-                            .metadata
-                            .get("amznbid")
-                            .and_then(|v| v.as_str())
-                            .map(String::from);
-
-                        if encoded_price.is_some() {
-                            // APS bid - send encoded price for mediation to decode
-                            json!({
-                                "imp_id": bid.slot_id,
-                                "encoded_price": encoded_price,
-                                "adm": bid.creative,
-                                "w": bid.width,
-                                "h": bid.height,
-                                "crid": format!("{}-creative", bid.bidder),
-                                "adomain": bid.adomain,
-                            })
-                        } else {
-                            // Regular bid with decoded price
-                            json!({
-                                "imp_id": bid.slot_id,
-                                "price": bid.price,
-                                "adm": bid.creative,
-                                "w": bid.width,
-                                "h": bid.height,
-                                "crid": format!("{}-creative", bid.bidder),
-                                "adomain": bid.adomain,
-                            })
-                        }
+                        // Mocktioneer mediator always requires a numeric `price` field.
+                        // APS bids carry price as an opaque encoded string (`amznbid`)
+                        // that cannot be decoded client-side; use `bid.price` when set
+                        // (a real decoded value) or fall back to a mock floor price for
+                        // test/demo purposes.
+                        let price = bid.price.unwrap_or(1.50);
+                        json!({
+                            "imp_id": bid.slot_id,
+                            "price": price,
+                            "adm": bid.creative,
+                            "w": bid.width,
+                            "h": bid.height,
+                            "crid": format!("{}-creative", bid.bidder),
+                            "adomain": bid.adomain,
+                        })
                     })
                     .collect();
 

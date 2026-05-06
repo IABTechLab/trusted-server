@@ -161,16 +161,16 @@ rewrite_script = true
 
 [auction]
 enabled = true
-providers = ["prebid"]
-# mediator = "adserver_mock"  # will use mediator when set
+providers = ["prebid", "aps"]
+mediator = "adserver_mock"
 timeout_ms = 2000
 # Context keys the JS client is allowed to forward into auction requests.
 # Keys not in this list are silently dropped. An empty list blocks all keys.
 allowed_context_keys = ["permutive_segments"]
 
 [integrations.aps]
-enabled = false
-pub_id = "your-aps-publisher-id"
+enabled = true
+pub_id = "test-pub"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
 timeout_ms = 1000
 
@@ -180,7 +180,7 @@ container_id = "GTM-XXXXXX"
 # upstream_url = "https://www.googletagmanager.com"
 
 [integrations.adserver_mock]
-enabled = false
+enabled = true
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
 
@@ -192,6 +192,6 @@ permutive_segments = "permutive"
 
 [creative_opportunities]
 gam_network_id = "21765378893"
-auction_timeout_ms = 500
+auction_timeout_ms = 3000
 price_granularity = "dense"
 

@@ -5,7 +5,7 @@
 id = "atf_sidebar_ad"
 gam_unit_path = "/21765378893/publisher/atf-sidebar"
 div_id = "div-atf-sidebar"
-page_patterns = ["/20**"]
+page_patterns = ["/", "/20**", "/news/**"]
 formats = [{ width = 300, height = 250 }]
 floor_price = 0.50
 
