@@ -883,7 +883,7 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
     let json = serde_json::to_string(bid_map).unwrap_or_else(|_| "{}".to_string());
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>window.__ts_bids=JSON.parse(\"{}\");</script>",
+        "<script>window.__ts_bids=JSON.parse(\"{}\");if(typeof window.__tsAdInit===\"function\")window.__tsAdInit();</script>",
         escaped
     )
 }

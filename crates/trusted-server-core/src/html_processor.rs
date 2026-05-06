@@ -301,7 +301,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             let script_guard = state.read().expect("should read bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
-                                None => r#"<script>window.__ts_bids=JSON.parse("{}");</script>"#
+                                None => r#"<script>window.__ts_bids=JSON.parse("{}");if(typeof window.__tsAdInit==="function")window.__tsAdInit();</script>"#
                                     .to_string(),
                             };
                             end_tag.before(&bids_script, ContentType::Html);
