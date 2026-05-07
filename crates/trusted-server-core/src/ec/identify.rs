@@ -36,7 +36,11 @@ pub fn handle_identify(
     ec_context: &EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
     let allowed_origin = match classify_origin(req, settings) {
-        CorsDecision::Denied => return Ok(Response::from_status(StatusCode::FORBIDDEN)),
+        CorsDecision::Denied => {
+            return Ok(apply_identify_cache_headers(Response::from_status(
+                StatusCode::FORBIDDEN,
+            )));
+        }
         CorsDecision::NoOrigin => None,
         CorsDecision::Allowed(origin) => Some(origin),
     };
@@ -59,7 +63,7 @@ pub fn handle_identify(
     }
 
     let Some(ec_id) = ec_context.ec_value() else {
-        let response = Response::from_status(StatusCode::NO_CONTENT);
+        let response = apply_identify_cache_headers(Response::from_status(StatusCode::NO_CONTENT));
         return Ok(apply_cors_headers_if_allowed(
             response,
             allowed_origin.as_deref(),
@@ -145,7 +149,7 @@ pub fn cors_preflight_identify(
     };
 
     response.set_body(Vec::new());
-    Ok(response)
+    Ok(apply_identify_cache_headers(response))
 }
 
 #[derive(serde::Serialize)]
@@ -174,6 +178,7 @@ fn json_response_with_origin<T: serde::Serialize>(
     let response = Response::from_status(status)
         .with_content_type(fastly::mime::APPLICATION_JSON)
         .with_body(body);
+    let response = apply_identify_cache_headers(response);
 
     Ok(apply_cors_headers_if_allowed(response, allowed_origin))
 }
@@ -237,6 +242,13 @@ fn origin_authority_contains_uppercase_host(origin: &str) -> bool {
     host.bytes().any(|byte| byte.is_ascii_uppercase())
 }
 
+fn apply_identify_cache_headers(mut response: Response) -> Response {
+    response.set_header(header::CACHE_CONTROL, "no-store");
+    response.set_header(header::PRAGMA, "no-cache");
+    response.set_header(header::VARY, "Origin, Authorization, X-ts-ec");
+    response
+}
+
 fn apply_cors_headers_if_allowed(mut response: Response, allowed_origin: Option<&str>) -> Response {
     if let Some(origin) = allowed_origin {
         apply_cors_headers(&mut response, origin);
@@ -253,7 +265,7 @@ fn apply_cors_headers(response: &mut Response, origin: &str) {
         "Authorization, X-ts-ec",
     );
     response.set_header(header::ACCESS_CONTROL_MAX_AGE, "600");
-    response.set_header(header::VARY, "Origin");
+    response.set_header(header::VARY, "Origin, Authorization, X-ts-ec");
 }
 
 #[cfg(test)]
@@ -265,6 +277,16 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
+
+    const VALID_API_TOKEN: &str = "identify-test-token-32-bytes-min";
+
+    fn assert_no_store(response: &Response) {
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("no-store"),
+            "identify responses should not be cached"
+        );
+    }
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
         let consent = ConsentContext {
@@ -379,6 +401,7 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "should return 401 without Bearer token"
         );
+        assert_no_store(&response);
         let body = serde_json::from_slice::<serde_json::Value>(&response.take_body_bytes())
             .expect("should decode JSON body");
         assert_eq!(
@@ -391,7 +414,7 @@ mod tests {
     fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "real-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", "Bearer wrong-token");
@@ -405,16 +428,17 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "should return 401 for invalid Bearer token"
         );
+        assert_no_store(&response);
     }
 
     #[test]
     fn handle_identify_denied_consent_returns_403() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("authorization", "Bearer my-token");
+        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         let ec_context = make_ec_context(Jurisdiction::Unknown, None);
 
         let mut response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
@@ -425,6 +449,7 @@ mod tests {
             StatusCode::FORBIDDEN,
             "should return 403 when consent denies EC"
         );
+        assert_no_store(&response);
         let body = serde_json::from_slice::<serde_json::Value>(&response.take_body_bytes())
             .expect("should decode JSON body");
         assert_eq!(
@@ -438,10 +463,10 @@ mod tests {
     fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("authorization", "Bearer my-token");
+        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
         let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
@@ -452,16 +477,17 @@ mod tests {
             StatusCode::NO_CONTENT,
             "should return 204 when EC is unavailable"
         );
+        assert_no_store(&response);
     }
 
     #[test]
     fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("authorization", "Bearer my-token");
+        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
@@ -473,6 +499,7 @@ mod tests {
             StatusCode::OK,
             "should return 200 on degraded KV read"
         );
+        assert_no_store(&response);
         let body = serde_json::from_slice::<serde_json::Value>(&response.take_body_bytes())
             .expect("should decode identify response JSON");
 
@@ -497,10 +524,10 @@ mod tests {
     fn handle_identify_denies_mismatched_browser_origin() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("authorization", "Bearer my-token");
+        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         req.set_header("origin", "https://evil.example");
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
@@ -512,16 +539,17 @@ mod tests {
             StatusCode::FORBIDDEN,
             "should reject GET from non-publisher origin"
         );
+        assert_no_store(&response);
     }
 
     #[test]
     fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
-        req.set_header("authorization", "Bearer my-token");
+        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
         req.set_header("origin", "https://www.test-publisher.com");
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
@@ -533,6 +561,7 @@ mod tests {
             StatusCode::NO_CONTENT,
             "should preserve identify response status for allowed browser origin"
         );
+        assert_no_store(&response);
         assert_eq!(
             response.get_header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some("https://www.test-publisher.com"),
@@ -540,8 +569,8 @@ mod tests {
         );
         assert_eq!(
             response.get_header_str(header::VARY),
-            Some("Origin"),
-            "should vary on Origin for browser-direct identify responses"
+            Some("Origin, Authorization, X-ts-ec"),
+            "should vary on identity request inputs for browser-direct identify responses"
         );
     }
 
@@ -559,6 +588,7 @@ mod tests {
             StatusCode::FORBIDDEN,
             "should reject preflight from non-publisher origin"
         );
+        assert_no_store(&response);
     }
 
     #[test]
@@ -574,6 +604,12 @@ mod tests {
             response.get_status(),
             StatusCode::OK,
             "should allow preflight from publisher origin"
+        );
+        assert_no_store(&response);
+        assert_eq!(
+            response.get_header_str(header::VARY),
+            Some("Origin, Authorization, X-ts-ec"),
+            "should vary on identity request inputs for preflight"
         );
     }
 }

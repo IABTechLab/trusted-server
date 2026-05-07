@@ -290,7 +290,7 @@ ec_store = "ec_identity_store"
 id = "mocktioneer"
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
-api_token = "partner-api-token"
+api_token = "partner-api-token-32-bytes-minimum"
 bidstream_enabled = true
 ```
 

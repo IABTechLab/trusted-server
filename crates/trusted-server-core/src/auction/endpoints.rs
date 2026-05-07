@@ -9,6 +9,7 @@ use crate::consent::gate_eids_by_consent;
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::log_id;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
@@ -20,6 +21,10 @@ use crate::settings::Settings;
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
+
+const MAX_CLIENT_EID_SOURCES: usize = 64;
+const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
+const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 
 /// Handle auction request from /auction endpoint.
 ///
@@ -186,8 +191,8 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
     match parse_prebid_eids_cookie(cookie_value) {
         Ok(eids) if eids.is_empty() => None,
         Ok(eids) => Some(eids),
-        Err(err) => {
-            log::debug!("Auction EIDs: failed to parse ts-eids cookie: {err}");
+        Err(_) => {
+            log::trace!("Auction EIDs: failed to parse ts-eids cookie; dropping");
             None
         }
     }
@@ -201,6 +206,12 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
     let mut eids = Vec::new();
 
     for entry in entries {
+        if eids.len() >= MAX_CLIENT_EID_SOURCES {
+            log::debug!(
+                "Auction EIDs: reached max client EID source count ({MAX_CLIENT_EID_SOURCES})"
+            );
+            break;
+        }
         let JsonValue::Object(entry) = entry else {
             log::debug!("Auction EIDs: dropping malformed client EID entry");
             continue;
@@ -209,7 +220,8 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
         let Some(source) = entry
             .get("source")
             .and_then(JsonValue::as_str)
-            .filter(|source| !source.is_empty())
+            .filter(|source| !source.trim().is_empty())
+            .filter(|source| source.len() <= MAX_CLIENT_EID_SOURCE_BYTES)
             .map(str::to_owned)
         else {
             continue;
@@ -222,6 +234,7 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
         let uids: Vec<_> = raw_uids
             .iter()
             .filter_map(parse_client_auction_uid)
+            .take(MAX_CLIENT_UIDS_PER_SOURCE)
             .collect();
         if uids.is_empty() {
             continue;
@@ -245,7 +258,8 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
     let id = uid
         .get("id")
         .and_then(JsonValue::as_str)
-        .filter(|id| !id.is_empty())?
+        .filter(|id| !id.trim().is_empty())
+        .filter(|id| id.len() <= MAX_UID_LENGTH)?
         .to_owned();
 
     let atype = uid
@@ -291,7 +305,7 @@ fn merge_auction_eids(
         };
 
         for uid in eid.uids {
-            if uid.id.is_empty() {
+            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
                 continue;
             }
 
@@ -489,6 +503,56 @@ mod tests {
         assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
         assert_eq!(parsed[1].source, "sharedid.org");
         assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
+    }
+
+    #[test]
+    fn parse_client_auction_eids_caps_sources_and_uids() {
+        let entries: Vec<_> = (0..(MAX_CLIENT_EID_SOURCES + 5))
+            .map(|source_index| {
+                let uids: Vec<_> = (0..(MAX_CLIENT_UIDS_PER_SOURCE + 5))
+                    .map(|uid_index| json!({ "id": format!("uid-{source_index}-{uid_index}") }))
+                    .collect();
+                json!({
+                    "source": format!("source-{source_index}.example.com"),
+                    "uids": uids,
+                })
+            })
+            .collect();
+        let raw = JsonValue::Array(entries);
+
+        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse capped EIDs");
+
+        assert_eq!(
+            parsed.len(),
+            MAX_CLIENT_EID_SOURCES,
+            "should cap client EID sources"
+        );
+        assert!(
+            parsed
+                .iter()
+                .all(|eid| eid.uids.len() == MAX_CLIENT_UIDS_PER_SOURCE),
+            "should cap UIDs per source"
+        );
+    }
+
+    #[test]
+    fn parse_client_auction_eids_drops_whitespace_and_oversized_uids() {
+        let raw = json!([
+            {
+                "source": "id5-sync.com",
+                "uids": [
+                    { "id": "   " },
+                    { "id": "x".repeat(MAX_UID_LENGTH + 1) },
+                    { "id": "valid" }
+                ]
+            }
+        ]);
+
+        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid UID");
+
+        assert_eq!(parsed.len(), 1, "should retain source with valid UID");
+        assert_eq!(parsed[0].uids.len(), 1, "should drop invalid UIDs");
+        assert_eq!(parsed[0].uids[0].id, "valid", "should keep valid UID");
     }
 
     #[test]

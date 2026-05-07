@@ -10,6 +10,7 @@ use trusted_server_core::constants::{
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
@@ -217,10 +218,16 @@ async fn route_request(
     // Pass device signals to EcContext so they are stored on new entries.
     ec_context.set_device_signals(device_signals);
 
-    // Bot gate: suppress KV-backed EC side effects for unrecognized clients.
-    // Response finalization still runs for revocations/returning-user cookie
-    // reconciliation, but generated ECs are not written without a KV graph.
+    // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
+    // consent withdrawals. Revocations need the KV graph so tombstones remain
+    // authoritative even for privacy-extension-heavy clients that do not look
+    // like known browsers.
     let kv_graph = if is_real_browser {
+        maybe_identity_graph(settings)
+    } else {
+        None
+    };
+    let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
         maybe_identity_graph(settings)
     } else {
         None
@@ -234,7 +241,7 @@ async fn route_request(
             ec_finalize_response(
                 settings,
                 &ec_context,
-                kv_graph.as_ref(),
+                finalize_kv_graph.as_ref(),
                 partner_registry,
                 eids_cookie.as_deref(),
                 sharedid_cookie.as_deref(),
@@ -380,7 +387,7 @@ async fn route_request(
                     ec_finalize_response(
                         settings,
                         &ec_context,
-                        kv_graph.as_ref(),
+                        finalize_kv_graph.as_ref(),
                         partner_registry,
                         eids_cookie.as_deref(),
                         sharedid_cookie.as_deref(),
@@ -436,13 +443,13 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
-    // Bot gate still suppresses KV-backed side effects and pull sync via
-    // `kv_graph = None`, but response finalization always runs so cookie
-    // writes and revocations behave consistently for browser traffic.
+    // Bot gate still suppresses generated EC writes and pull sync via
+    // `kv_graph = None`, but withdrawal finalization uses `finalize_kv_graph`
+    // so revocation tombstones are not lost for bot-classified clients.
     ec_finalize_response(
         settings,
         &ec_context,
-        kv_graph.as_ref(),
+        finalize_kv_graph.as_ref(),
         partner_registry,
         eids_cookie.as_deref(),
         sharedid_cookie.as_deref(),

@@ -47,6 +47,10 @@ pub trait RateLimiter {
 }
 
 fn hourly_limit_to_per_minute_limit(hourly_limit: u32) -> u32 {
+    if hourly_limit == 0 {
+        return 0;
+    }
+
     let per_minute_limit = hourly_limit.saturating_add(59) / 60;
     per_minute_limit.max(1)
 }
@@ -79,6 +83,9 @@ impl RateLimiter for FastlyRateLimiter {
         // Follow-up: move to exact 1-hour enforcement once platform counters
         // expose longer windows or we add a dedicated KV-backed hour bucket.
         let per_minute_limit = hourly_limit_to_per_minute_limit(hourly_limit);
+        if per_minute_limit == 0 {
+            return Ok(true);
+        }
 
         let current = self
             .counter
@@ -108,6 +115,20 @@ impl RateLimiter for FastlyRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_hourly_limit_denies_all() {
+        assert_eq!(
+            hourly_limit_to_per_minute_limit(0),
+            0,
+            "should preserve deny-all zero limit"
+        );
+        assert_eq!(
+            effective_hourly_limit(0),
+            0,
+            "should preserve effective zero limit"
+        );
+    }
 
     #[test]
     fn hourly_limit_rounds_up_to_whole_requests_per_minute() {

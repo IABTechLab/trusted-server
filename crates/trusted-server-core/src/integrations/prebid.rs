@@ -1071,6 +1071,86 @@ impl PrebidAuctionProvider {
     }
 }
 
+impl PrebidAuctionProvider {
+    fn parse_response_inner(
+        &self,
+        mut response: fastly::Response,
+        response_time_ms: u64,
+        request_info: Option<&RequestInfo>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // Parse response
+        let body_bytes = response.take_body_bytes();
+
+        if !response.get_status().is_success() {
+            log::warn!(
+                "Prebid returned non-success status: {}",
+                response.get_status(),
+            );
+            if log::log_enabled!(log::Level::Trace) {
+                let body_preview = String::from_utf8_lossy(&body_bytes);
+                log::trace!(
+                    "Prebid error response body: {}",
+                    &body_preview[..body_preview.floor_char_boundary(1000)]
+                );
+            }
+            return Ok(AuctionResponse::error("prebid", response_time_ms));
+        }
+
+        let mut response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
+                message: "Failed to parse Prebid response".to_string(),
+            })?;
+
+        // Log the full response body when debug is enabled to surface
+        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
+        if self.config.debug && log::log_enabled!(log::Level::Trace) {
+            match serde_json::to_string_pretty(&response_json) {
+                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
+                Err(e) => {
+                    log::warn!("Prebid: failed to serialize response for logging: {e}");
+                }
+            }
+        }
+
+        let response_request_host = response_json
+            .get("ext")
+            .and_then(|ext| ext.get("trusted_server"))
+            .and_then(|trusted_server| trusted_server.get("request_host"))
+            .and_then(|value| value.as_str());
+        let response_request_scheme = response_json
+            .get("ext")
+            .and_then(|ext| ext.get("trusted_server"))
+            .and_then(|trusted_server| trusted_server.get("request_scheme"))
+            .and_then(|value| value.as_str());
+
+        let request_host = response_request_host
+            .map(str::to_owned)
+            .or_else(|| request_info.map(|info| info.host.clone()))
+            .unwrap_or_default();
+        let request_scheme = response_request_scheme
+            .map(str::to_owned)
+            .or_else(|| request_info.map(|info| info.scheme.clone()))
+            .unwrap_or_else(|| "https".to_owned());
+
+        if request_host.is_empty() {
+            log::warn!("Prebid response missing request host; skipping URL rewrites");
+        } else {
+            transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
+        }
+
+        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
+        self.enrich_response_metadata(&response_json, &mut auction_response);
+
+        log::info!(
+            "Prebid returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
+}
+
 impl AuctionProvider for PrebidAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "prebid"
@@ -1169,74 +1249,23 @@ impl AuctionProvider for PrebidAuctionProvider {
 
     fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: fastly::Response,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        // Parse response
-        let body_bytes = response.take_body_bytes();
+        self.parse_response_inner(response, response_time_ms, None)
+    }
 
-        if !response.get_status().is_success() {
-            log::warn!(
-                "Prebid returned non-success status: {}",
-                response.get_status(),
-            );
-            if log::log_enabled!(log::Level::Trace) {
-                let body_preview = String::from_utf8_lossy(&body_bytes);
-                log::trace!(
-                    "Prebid error response body: {}",
-                    &body_preview[..body_preview.floor_char_boundary(1000)]
-                );
-            }
-            return Ok(AuctionResponse::error("prebid", response_time_ms));
-        }
-
-        let mut response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
-                message: "Failed to parse Prebid response".to_string(),
-            })?;
-
-        // Log the full response body when debug is enabled to surface
-        // ext.debug.httpcalls, resolvedrequest, bidstatus, errors, etc.
-        if self.config.debug && log::log_enabled!(log::Level::Trace) {
-            match serde_json::to_string_pretty(&response_json) {
-                Ok(json) => log::trace!("Prebid OpenRTB response:\n{json}"),
-                Err(e) => {
-                    log::warn!("Prebid: failed to serialize response for logging: {e}");
-                }
-            }
-        }
-
-        let request_host = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_host"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let request_scheme = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_scheme"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("https")
-            .to_string();
-
-        if request_host.is_empty() {
-            log::warn!("Prebid response missing request host; skipping URL rewrites");
-        } else {
-            transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
-        }
-
-        let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
-        self.enrich_response_metadata(&response_json, &mut auction_response);
-
-        log::info!(
-            "Prebid returned {} bids in {}ms",
-            auction_response.bids.len(),
-            response_time_ms
-        );
-
-        Ok(auction_response)
+    fn parse_response_with_context(
+        &self,
+        response: fastly::Response,
+        response_time_ms: u64,
+        context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        self.parse_response_inner(
+            response,
+            response_time_ms,
+            Some(&RequestInfo::from_request(context.request)),
+        )
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -1602,6 +1631,44 @@ passphrase = "test-secret-key-32-bytes-minimum"
                 "tracking URLs should be proxied"
             );
         }
+    }
+
+    #[test]
+    fn parse_response_uses_request_context_when_pbs_does_not_echo_trusted_server_ext() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let settings = make_settings();
+        let mut req = Request::new("POST", "https://pub.example/auction");
+        req.set_header(header::HOST, "pub.example");
+        req.set_header("fastly-ssl", "1");
+        let context = create_test_auction_context(&settings, &req);
+        let response_body = json!({
+            "id": "auction-123",
+            "seatbid": [{
+                "seat": "exampleBidder",
+                "bid": [{
+                    "impid": "slot-1",
+                    "price": 1.23,
+                    "adm": r#"<img src="https://cdn.adsrvr.org/pixel.png">"#,
+                    "w": 300,
+                    "h": 250
+                }]
+            }]
+        });
+        let response = Response::from_status(StatusCode::OK)
+            .with_body(serde_json::to_vec(&response_body).expect("should serialize response"));
+
+        let parsed = provider
+            .parse_response_with_context(response, 10, &context)
+            .expect("should parse response");
+
+        let creative = parsed.bids[0]
+            .creative
+            .as_deref()
+            .expect("should keep creative");
+        assert!(
+            creative.contains("https://pub.example/ad-proxy/adsrvr"),
+            "should rewrite using local request host when PBS omits ext.trusted_server"
+        );
     }
 
     #[test]

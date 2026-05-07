@@ -9,7 +9,7 @@
 //! the entry no longer stores per-partner sync timestamps.
 
 use fastly::http::request::PendingRequest;
-use fastly::http::{Method, StatusCode};
+use fastly::http::{header, Method, StatusCode};
 use fastly::Request;
 use serde::Deserialize;
 use url::Url;
@@ -296,6 +296,39 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
 /// This prevents a misbehaving partner from exhausting WASM memory.
 const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024;
 
+fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id: &str) -> bool {
+    let Some(value) = response.get_header(header::CONTENT_LENGTH) else {
+        return false;
+    };
+
+    let Some(value) = value.to_str().ok() else {
+        log::warn!(
+            "Pull sync: partner '{}' returned invalid Content-Length header, rejecting",
+            partner_id
+        );
+        return true;
+    };
+
+    let Ok(length) = value.parse::<usize>() else {
+        log::warn!(
+            "Pull sync: partner '{}' returned malformed Content-Length header, rejecting",
+            partner_id
+        );
+        return true;
+    };
+
+    if length > MAX_PULL_RESPONSE_BYTES {
+        log::warn!(
+            "Pull sync: partner '{}' returned oversized Content-Length ({} bytes), rejecting",
+            partner_id,
+            length
+        );
+        return true;
+    }
+
+    false
+}
+
 fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<String> {
     let status = response.get_status();
 
@@ -313,6 +346,10 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
             partner_id,
             status
         );
+        return None;
+    }
+
+    if response_content_length_exceeds_limit(&response, partner_id) {
         return None;
     }
 
@@ -547,6 +584,44 @@ mod tests {
             Some("abc123"),
             "should parse uid from 200 body"
         );
+    }
+
+    #[test]
+    fn extract_pull_uid_rejects_oversized_content_length_before_body_read() {
+        let response = fastly::Response::from_status(StatusCode::OK)
+            .with_header(
+                header::CONTENT_LENGTH,
+                (MAX_PULL_RESPONSE_BYTES + 1).to_string(),
+            )
+            .with_body("{\"uid\":\"abc123\"}");
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert!(
+            uid.is_none(),
+            "should reject oversized Content-Length before parsing body"
+        );
+    }
+
+    #[test]
+    fn extract_pull_uid_accepts_small_body_without_content_length() {
+        let response =
+            fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":\"abc123\"}");
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert_eq!(
+            uid.as_deref(),
+            Some("abc123"),
+            "should accept small valid response without Content-Length"
+        );
+    }
+
+    #[test]
+    fn extract_pull_uid_rejects_body_larger_than_limit() {
+        let body = format!("{{\"uid\":\"{}\"}}", "x".repeat(MAX_PULL_RESPONSE_BYTES));
+        let response = fastly::Response::from_status(StatusCode::OK).with_body(body);
+
+        let uid = extract_pull_uid(response, "ssp_x");
+        assert!(uid.is_none(), "should reject body larger than limit");
     }
 
     #[test]
