@@ -94,6 +94,7 @@ pub async fn handle_auction(
         client_info: &services.client_info,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
+        services,
     };
 
     // Run the auction

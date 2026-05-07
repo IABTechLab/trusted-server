@@ -748,6 +748,15 @@ impl IntegrationRegistry {
         self.inner.script_rewriters.clone()
     }
 
+    /// Check whether any HTML post-processors are registered.
+    ///
+    /// Cheaper than [`html_post_processors()`](Self::html_post_processors) when
+    /// only the presence check is needed — avoids cloning `Vec<Arc<…>>`.
+    #[must_use]
+    pub fn has_html_post_processors(&self) -> bool {
+        !self.inner.html_post_processors.is_empty()
+    }
+
     /// Expose registered HTML post-processors.
     #[must_use]
     pub fn html_post_processors(&self) -> Vec<Arc<dyn IntegrationHtmlPostProcessor>> {
