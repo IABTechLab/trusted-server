@@ -172,7 +172,7 @@ allowed_context_keys = ["permutive_segments"]
 enabled = true
 pub_id = "test-pub"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
-timeout_ms = 1000
+timeout_ms = 400
 
 [integrations.google_tag_manager]
 enabled = false
@@ -182,7 +182,7 @@ container_id = "GTM-XXXXXX"
 [integrations.adserver_mock]
 enabled = true
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
-timeout_ms = 1000
+timeout_ms = 400
 
 # Map auction-request context keys to mediation URL query parameters.
 # Each key is a context key from the JS client; the value becomes the
@@ -192,6 +192,6 @@ permutive_segments = "permutive"
 
 [creative_opportunities]
 gam_network_id = "88059007"
-auction_timeout_ms = 1500
+auction_timeout_ms = 500
 price_granularity = "dense"
 
