@@ -205,6 +205,7 @@ type TsWindow = Window & {
   __tsAdInit?: () => void;
   __tsPrevGptSlots?: GoogleTagSlot[];
   __tsServicesEnabled?: boolean;
+  __tsDivToSlotId?: Record<string, string>;
 };
 
 /**
@@ -235,6 +236,7 @@ export function installTsAdInit(): void {
       }
 
       const newSlots: GoogleTagSlot[] = [];
+      const divToSlotId: Record<string, string> = {};
 
       slots.forEach((slot) => {
         const gptSlot = g.defineSlot?.(
@@ -250,10 +252,13 @@ export function installTsAdInit(): void {
           if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
         });
         gptSlot.setTargeting('ts_initial', '1');
+        divToSlotId[slot.div_id] = slot.id;
         newSlots.push(gptSlot);
       });
 
       w.__tsPrevGptSlots = newSlots;
+      // Replace (not merge) so destroyed slots from previous navigation don't linger.
+      w.__tsDivToSlotId = divToSlotId;
 
       // enableSingleRequest and enableServices must only be called once per page load.
       if (!w.__tsServicesEnabled) {
@@ -262,12 +267,18 @@ export function installTsAdInit(): void {
         w.__tsServicesEnabled = true;
 
         g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
-          const slotId: string = event.slot?.getSlotElementId?.() ?? '';
+          const divId: string = event.slot?.getSlotElementId?.() ?? '';
+          const slotId = (w.__tsDivToSlotId ?? {})[divId];
+          if (!slotId) return;
           const bid = (w.__ts_bids ?? {})[slotId] ?? {};
+          // Prebid: compare hb_adid targeting to verify the specific creative won.
+          // APS: no hb_adid equivalent — fires if bidder exists and slot is non-empty.
+          // Known limitation: APS path may over-fire if a non-APS line item wins.
           const ourBidWon =
             !event.isEmpty &&
-            bid.hb_adid &&
-            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
+            (bid.hb_adid
+              ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
+              : !!bid.hb_bidder);
           if (ourBidWon) {
             if (bid.nurl) navigator.sendBeacon(bid.nurl);
             if (bid.burl) navigator.sendBeacon(bid.burl);
