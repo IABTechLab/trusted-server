@@ -299,11 +299,6 @@ async fn route_request(
                 false,
             )
         }
-        (Method::POST, "/admin/partners/register")
-        | (Method::POST, "/_ts/admin/partners/register") => (
-            require_partner_store(settings).and_then(|store| handle_register_partner(&store, req)),
-            false,
-        ),
         (Method::GET, "/_ts/api/v1/identify") => (
             // Bot gate is intentionally write-only in this PR. `/identify` reads
             // remain gated by bearer auth + consent, even when request-classification
@@ -330,6 +325,7 @@ async fn route_request(
                     kv_graph.as_ref(),
                     registry_ref,
                     &ec_context,
+                    runtime_services,
                     req,
                 )
                 .await,
@@ -520,18 +516,6 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
     }
-}
-
-/// Constructs a `PartnerStore` from settings, or returns 503 if the
-/// `partner_store` config is not set.
-fn require_partner_store(settings: &Settings) -> Result<PartnerStore, Report<TrustedServerError>> {
-    let store_name = settings.ec.partner_store.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::KvStore {
-            store_name: "ec.partner_store".to_owned(),
-            message: "ec.partner_store is not configured".to_owned(),
-        })
-    })?;
-    Ok(PartnerStore::new(store_name))
 }
 
 /// Constructs a `KvIdentityGraph` from settings, or returns 503 if the

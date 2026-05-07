@@ -26,10 +26,6 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
-    /// Insecure placeholder configuration was detected.
-    #[display("Insecure default value configured for {field}")]
-    InsecureDefault { field: String },
-
     /// Auction orchestration error.
     #[display("Auction error: {message}")]
     Auction { message: String },
@@ -117,9 +113,7 @@ impl IntoHttpResponse for TrustedServerError {
         match self {
             Self::Auction { .. } => StatusCode::BAD_GATEWAY,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            Self::Configuration { .. } | Self::InsecureDefault { .. } | Self::Settings { .. } => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Gam { .. } => StatusCode::BAD_GATEWAY,
             Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
