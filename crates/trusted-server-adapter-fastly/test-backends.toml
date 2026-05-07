@@ -1,0 +1,21 @@
+# Test-only backend routing config.
+# Embedded at compile time when ROUTING_TEST_BACKENDS=1 is set.
+# Ports 19090-19093 are used by MockOrigin servers in tests/routing.rs.
+
+[[backends]]
+id = "site-a"
+origin_url = "http://127.0.0.1:19091"
+domains = ["site-a.test", "www.site-a.test"]
+
+[[backends]]
+id = "site-b"
+origin_url = "http://127.0.0.1:19092"
+domains = ["site-b.test"]
+
+[[backends]]
+id = "api"
+origin_url = "http://127.0.0.1:19093"
+
+  [[backends.path_patterns]]
+  host = "*"
+  path_prefix = "/.api/"

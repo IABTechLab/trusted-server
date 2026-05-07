@@ -117,6 +117,10 @@ export default withMermaid(
               link: '/guide/proxy-signing',
             },
             { text: 'Collective Sync', link: '/guide/collective-sync' },
+            {
+              text: 'Multi-Backend Routing',
+              link: '/guide/multi-backend-routing',
+            },
           ],
         },
         {

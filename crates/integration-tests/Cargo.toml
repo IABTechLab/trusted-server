@@ -9,6 +9,11 @@ name = "integration"
 path = "tests/integration.rs"
 harness = true
 
+[[test]]
+name = "routing"
+path = "tests/routing.rs"
+harness = true
+
 [dev-dependencies]
 testcontainers = { version = "0.25", features = ["blocking"] }
 reqwest = { version = "0.12", features = ["blocking"] }

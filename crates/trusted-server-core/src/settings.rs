@@ -327,6 +327,38 @@ impl Default for Proxy {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[validate(schema(function = validate_path_pattern))]
+pub struct PathPattern {
+    /// Optional host pattern. If None, matches all hosts (wildcard).
+    pub host: Option<String>,
+    /// Optional path prefix to match (e.g., "/.api/").
+    pub path_prefix: Option<String>,
+    /// Optional path regex pattern to match (e.g., "^/image/upload/").
+    pub path_regex: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct BackendRoutingConfig {
+   
+    /// The actual Fastly backend will be created dynamically at request time.
+    #[validate(url)]
+    pub origin_url: String,
+    /// List of domains that should route to this backend.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Optional path-based routing patterns.
+    #[serde(default)]
+    #[validate(nested)]
+    pub path_patterns: Vec<PathPattern>,
+    /// Enable TLS certificate verification for this backend.
+    #[serde(default = "default_certificate_check")]
+    pub certificate_check: bool,
+    /// Unique identifier for logging/debugging (optional).
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -351,6 +383,11 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    /// Optional multi-backend routing configuration.
+    /// Use `BackendRouter::new()` to create a router from this config.
+    #[serde(default)]
+    #[validate(nested)]
+    pub backends: Vec<BackendRoutingConfig>,
 }
 
 #[allow(unused)]
@@ -510,6 +547,16 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_path_pattern(pattern: &PathPattern) -> Result<(), ValidationError> {
+    if pattern.path_prefix.is_some() && pattern.path_regex.is_some() {
+        let mut err = ValidationError::new("conflicting_path_pattern");
+        err.message =
+            Some("path_prefix and path_regex are mutually exclusive; set only one".into());
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
@@ -1528,5 +1575,77 @@ mod tests {
                  Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
+    }
+
+    #[test]
+    fn backend_routing_config_accepts_valid_origin_url() {
+        let config = BackendRoutingConfig {
+            origin_url: "https://testpublisher.com".to_string(),
+            domains: vec![],
+            path_patterns: vec![],
+            certificate_check: true,
+            id: None,
+        };
+        config
+            .validate()
+            .expect("should accept a valid HTTPS origin URL");
+    }
+
+    #[test]
+    fn backend_routing_config_rejects_empty_origin_url() {
+        let config = BackendRoutingConfig {
+            origin_url: "".to_string(),
+            domains: vec![],
+            path_patterns: vec![],
+            certificate_check: true,
+            id: None,
+        };
+        config
+            .validate()
+            .expect_err("should reject empty origin_url");
+    }
+
+    #[test]
+    fn backend_routing_config_rejects_bare_hostname() {
+        let config = BackendRoutingConfig {
+            origin_url: "testpublisher.com".to_string(),
+            domains: vec![],
+            path_patterns: vec![],
+            certificate_check: true,
+            id: None,
+        };
+        config
+            .validate()
+            .expect_err("should reject bare hostname without scheme");
+    }
+
+    #[test]
+    fn backend_routing_config_rejects_non_url_string() {
+        let config = BackendRoutingConfig {
+            origin_url: "not-a-url".to_string(),
+            domains: vec![],
+            path_patterns: vec![],
+            certificate_check: true,
+            id: None,
+        };
+        config
+            .validate()
+            .expect_err("should reject non-URL string as origin_url");
+    }
+
+    #[test]
+    fn backend_routing_config_accepts_http_origin_url() {
+        // HTTP origins are valid — internal backends may not use TLS.
+        // The validate(url) rule accepts any valid URL scheme.
+        let config = BackendRoutingConfig {
+            origin_url: "http://internal-service.example.com".to_string(),
+            domains: vec![],
+            path_patterns: vec![],
+            certificate_check: true,
+            id: None,
+        };
+        config
+            .validate()
+            .expect("should accept a valid HTTP origin URL");
     }
 }

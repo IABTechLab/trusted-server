@@ -75,3 +75,20 @@ RUST_LOG=info \
         --manifest-path crates/integration-tests/Cargo.toml \
         --target "$TARGET" \
         -- --include-ignored --test-threads=1 "${TEST_ARGS[@]}"
+
+echo "==> Building routing WASM binary (test backends: ports 19090-19093)..."
+ROUTING_TEST_BACKENDS=1 \
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:19090" \
+TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
+TRUSTED_SERVER__SYNTHETIC__SECRET_KEY="integration-test-secret-key" \
+TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
+    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+
+echo "==> Running routing integration tests..."
+ROUTING_WASM_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm" \
+RUST_LOG=info \
+    cargo test \
+        --manifest-path crates/integration-tests/Cargo.toml \
+        --target "$TARGET" \
+        --test routing \
+        -- --test-threads=1

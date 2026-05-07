@@ -161,6 +161,91 @@ curl -X POST https://your-domain.com/integrations/datadome/js/check
 
 Ensure `rewrite_sdk = true` and that your pages are being proxied through Trusted Server's HTML processing pipeline.
 
+## Server-Side Validation
+
+In addition to first-party JS delivery, Trusted Server can call the DataDome
+server-side API to validate each request at the edge before forwarding it to
+your origin. Bots are blocked with a `403 Forbidden` response without ever
+reaching your backend.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant TS as Trusted Server
+    participant DD as api-fastly.datadome.co
+    participant Origin
+
+    Browser->>TS: GET /article
+    TS->>DD: POST /validate-request\n(IP, path, headers, cookie)
+    DD-->>TS: 200 OK (allow) or 403 (block)
+    alt allowed
+        TS->>Origin: Proxy request
+        Origin-->>TS: Response
+        TS-->>Browser: Response
+    else blocked
+        TS-->>Browser: 403 Forbidden
+    end
+```
+
+Validation runs before the request reaches your origin. The DataDome cookie
+(`datadome=`) is forwarded when present so DataDome can maintain session
+continuity for users it has already classified.
+
+### Configuration
+
+```toml
+[integrations.datadome]
+enabled = true
+server_side_enabled = true
+server_side_key = "your-datadome-server-side-key"
+```
+
+Set `server_side_key` via environment variable to keep it out of
+`trusted-server.toml`:
+
+```bash
+TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY=your-key
+```
+
+### Configuration Options
+
+| Option                  | Type    | Default                          | Description                                                          |
+| ----------------------- | ------- | -------------------------------- | -------------------------------------------------------------------- |
+| `server_side_enabled`   | boolean | `false`                          | Enable server-side validation                                        |
+| `server_side_key`       | string  | —                                | DataDome server-side API key (required when enabled)                 |
+| `validation_endpoint`   | string  | `https://api-fastly.datadome.co` | DataDome validation API base URL                                     |
+| `validation_timeout_ms` | integer | `200`                            | Timeout for the validation request (50–1000 ms)                      |
+| `fail_open`             | boolean | `true`                           | Allow the request if validation times out or errors                  |
+| `sample_rate`           | integer | `100`                            | Percentage of requests to validate (0–100). Use for gradual rollout. |
+
+### Gradual Rollout
+
+Use `sample_rate` to enable validation for a fraction of traffic while you
+gain confidence:
+
+```toml
+[integrations.datadome]
+server_side_enabled = true
+server_side_key = "your-key"
+sample_rate = 10   # validate 10% of requests
+```
+
+Increase toward 100 once you're satisfied with the block rate and latency
+impact. Sampling is IP-stable — a given IP address consistently falls in or out
+of the sampled set across requests.
+
+### Fail-Open vs Fail-Closed
+
+`fail_open = true` (the default) means any DataDome API error or timeout
+results in the request being allowed through. This keeps your site available
+even if DataDome is unreachable.
+
+`fail_open = false` blocks requests whenever validation cannot be completed.
+Only use this after validating DataDome uptime in your region and at your
+traffic volume.
+
 ## See Also
 
 - [DataDome First-Party Integration Docs](https://docs.datadome.co/docs/integrations#first-party-javascript-tag)

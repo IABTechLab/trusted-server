@@ -3,6 +3,7 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
+use crate::backend_router::BackendRouter;
 use crate::consent::{allows_ssc_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_SYNTHETIC_ID, HEADER_X_COMPRESS_HINT, HEADER_X_SYNTHETIC_ID};
 use crate::cookies::{expire_synthetic_cookie, handle_request_cookies, set_synthetic_cookie};
@@ -271,17 +272,82 @@ pub fn handle_publisher_request(
         ssc_allowed,
     );
 
-    let backend_name = BackendConfig::from_url(
-        &settings.publisher.origin_url,
-        settings.proxy.certificate_check,
-    )?;
-    let origin_host = settings.publisher.origin_host();
+    let request_path = req.get_path();
+
+    let router = if settings.backends.is_empty() {
+        None
+    } else {
+        BackendRouter::new(
+            &settings.backends,
+            settings.publisher.origin_url.clone(),
+            settings.proxy.certificate_check,
+        )
+        .map_err(|e| {
+            log::error!("Failed to build backend router: {:?}", e);
+            e
+        })
+        .ok()
+    };
+
+    let (origin_url, certificate_check) = if let Some(ref router) = router {
+        let (url, cert_check) = router.select_origin(request_host, request_path);
+        log::info!(
+            "Backend routing: host={}, path={} → {}",
+            request_host,
+            request_path,
+            url
+        );
+        (url, cert_check)
+    } else {
+        (
+            settings.publisher.origin_url.as_str(),
+            settings.proxy.certificate_check,
+        )
+    };
+
+    let backend_name = BackendConfig::from_url(origin_url, certificate_check)?;
+
+    let origin_host = url::Url::parse(origin_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| match url.port() {
+                Some(port) => format!("{}:{}", host, port),
+                None => host.to_string(),
+            })
+        })
+        .unwrap_or_else(|| origin_url.to_string());
 
     log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
-        settings.publisher.origin_url
+        origin_url
     );
+
+    // DataDome server-side validation (if enabled)
+    // This validates requests at the edge before they reach the origin
+    match crate::integrations::datadome::validate_request_server_side(settings, &req) {
+        Ok(true) => {
+            // Request allowed - continue to origin
+            log::debug!("[datadome] Request validated - proceeding to origin");
+        }
+        Ok(false) => {
+            // Request blocked - bot detected
+            log::warn!("[datadome] Request blocked by server-side validation");
+            let mut blocked_response = Response::from_status(StatusCode::FORBIDDEN);
+            blocked_response.set_body("Forbidden");
+            blocked_response.set_header(header::CONTENT_TYPE, "text/plain");
+            return Ok(blocked_response);
+        }
+        Err(e) => {
+            // Validation error with fail_open=false
+            log::error!("[datadome] Validation error: {:?}", e);
+            let mut error_response = Response::from_status(StatusCode::SERVICE_UNAVAILABLE);
+            error_response.set_body("Service Temporarily Unavailable");
+            error_response.set_header(header::CONTENT_TYPE, "text/plain");
+            return Ok(error_response);
+        }
+    }
+
     req.set_header("host", &origin_host);
 
     let mut response = req
@@ -328,7 +394,7 @@ pub fn handle_publisher_request(
         let params = ProcessResponseParams {
             content_encoding: &content_encoding,
             origin_host: &origin_host,
-            origin_url: &settings.publisher.origin_url,
+            origin_url,
             request_host,
             request_scheme,
             settings,

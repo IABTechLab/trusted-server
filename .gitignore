@@ -36,3 +36,6 @@ src/*.html
 /crates/integration-tests/browser/test-results/
 /crates/integration-tests/browser/playwright-report/
 /crates/integration-tests/browser/.browser-test-state.json
+
+# Fastly VCL exports (reference snapshots, not source)
+*.vcl
