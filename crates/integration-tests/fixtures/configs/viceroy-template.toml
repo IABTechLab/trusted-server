@@ -25,9 +25,27 @@
             key = "placeholder"
             data = "placeholder"
 
-        # Pre-seeded EC row for KV-backed EC lifecycle tests.
+        # Pre-seeded EC rows for KV-backed EC lifecycle tests. Each scenario
+        # uses a separate row so withdrawal tombstones do not leak across
+        # sequential scenario execution in the same Viceroy instance.
         [[local_server.kv_stores.ec_identity_store]]
             key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
+            data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.test02"
+            data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.test03"
+            data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.test04"
+            data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
+
+        [[local_server.kv_stores.ec_identity_store]]
+            key = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.test05"
             data = '{"v":1,"created":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US","region":"CA"}}'
 
         [[local_server.kv_stores.ec_partner_store]]
