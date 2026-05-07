@@ -781,41 +781,48 @@ mod tests {
         rewrite_creative_html(&settings, &html)
     }
 
-    fn assert_rewritten_srcset_attr_case(
-        case_name: &str,
-        attr_name: &str,
-        attr_value: &str,
-        expected_relative: &str,
-        expected_descriptors: &[&str],
-    ) {
-        let out = rewrite_srcset_attr(attr_name, attr_value);
+    struct SrcsetCase<'a> {
+        name: &'a str,
+        attr_value: &'a str,
+        expected_relative: &'a str,
+        expected_descriptors: &'a [&'a str],
+    }
+
+    fn assert_rewritten_srcset_attr_case(attr_name: &str, case: &SrcsetCase<'_>) {
+        let out = rewrite_srcset_attr(attr_name, case.attr_value);
 
         assert_eq!(
             out.matches("/first-party/proxy?tsurl=").count(),
             2,
             "case `{}` expected exactly two rewritten {} candidates: {}",
-            case_name,
+            case.name,
             attr_name,
             out
         );
         assert!(
-            out.contains(expected_relative),
+            out.contains(case.expected_relative),
             "case `{}` expected relative {} candidate `{}` to be preserved in {}",
-            case_name,
+            case.name,
             attr_name,
-            expected_relative,
+            case.expected_relative,
             out
         );
 
-        for descriptor in expected_descriptors {
+        for descriptor in case.expected_descriptors {
             assert!(
                 out.contains(descriptor),
                 "case `{}` expected {} descriptor `{}` in {}",
-                case_name,
+                case.name,
                 attr_name,
                 descriptor,
                 out
             );
+        }
+    }
+
+    fn assert_rewritten_srcset_attr_cases(attr_name: &str, cases: &[SrcsetCase<'_>]) {
+        for case in cases {
+            assert_rewritten_srcset_attr_case(attr_name, case);
         }
     }
 
@@ -986,13 +993,6 @@ mod tests {
 
     #[test]
     fn rewrites_srcset_attribute_cases() {
-        struct SrcsetCase<'a> {
-            name: &'a str,
-            attr_value: &'a str,
-            expected_relative: &'a str,
-            expected_descriptors: &'a [&'a str],
-        }
-
         let cases = [
             SrcsetCase {
                 name: "absolute and protocol-relative candidates",
@@ -1020,15 +1020,7 @@ mod tests {
             },
         ];
 
-        for case in cases {
-            assert_rewritten_srcset_attr_case(
-                case.name,
-                "srcset",
-                case.attr_value,
-                case.expected_relative,
-                case.expected_descriptors,
-            );
-        }
+        assert_rewritten_srcset_attr_cases("srcset", &cases);
     }
 
     #[test]
@@ -1093,13 +1085,6 @@ mod tests {
 
     #[test]
     fn rewrites_imagesrcset_attribute_cases() {
-        struct SrcsetCase<'a> {
-            name: &'a str,
-            attr_value: &'a str,
-            expected_relative: &'a str,
-            expected_descriptors: &'a [&'a str],
-        }
-
         let cases = [
             SrcsetCase {
                 name: "absolute and protocol-relative candidates",
@@ -1127,15 +1112,7 @@ mod tests {
             },
         ];
 
-        for case in cases {
-            assert_rewritten_srcset_attr_case(
-                case.name,
-                "imagesrcset",
-                case.attr_value,
-                case.expected_relative,
-                case.expected_descriptors,
-            );
-        }
+        assert_rewritten_srcset_attr_cases("imagesrcset", &cases);
     }
 
     #[test]
