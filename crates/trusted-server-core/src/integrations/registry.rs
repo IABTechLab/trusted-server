@@ -684,8 +684,11 @@ impl IntegrationRegistry {
             }
 
             // Set EC ID header on the request so integrations can read it.
+            // Remove any caller-supplied invalid value rather than forwarding it.
             if let Some(ec_id) = ec_context.ec_value() {
                 req.set_header(HEADER_X_TS_EC, ec_id);
+            } else {
+                req.remove_header(HEADER_X_TS_EC);
             }
 
             Some(proxy.handle(settings, req).await)
@@ -1291,7 +1294,7 @@ mod tests {
         // Provide an existing EC via header (client IP is unavailable in
         // the test environment, so generation would fail).
         let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
-        req.set_header("x-ts-ec", "test-ec-id-from-header");
+        req.set_header("x-ts-ec", format!("{}.HdrEc1", "a".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
@@ -1408,7 +1411,7 @@ mod tests {
 
         let mut req =
             Request::post("https://test-publisher.com/integrations/test/ec").with_body("test body");
-        req.set_header("x-ts-ec", "test-ec-id-from-header");
+        req.set_header("x-ts-ec", format!("{}.HdrEc1", "a".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 

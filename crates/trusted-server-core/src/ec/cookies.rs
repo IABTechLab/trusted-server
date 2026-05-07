@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(
             cookie_str,
             format!(
-                "{}=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+                "{}=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
                 COOKIE_TS_EC, settings.publisher.domain,
             ),
             "expiry cookie should retain the same security attributes as the live cookie"
