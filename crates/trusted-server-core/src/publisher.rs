@@ -668,7 +668,7 @@ pub async fn handle_publisher_request(
     };
 
     if ad_slots_script.is_some() {
-        response.set_header(header::CACHE_CONTROL, "private, no-store");
+        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
         response.remove_header("surrogate-control");
         response.remove_header("fastly-surrogate-control");
     }
@@ -988,6 +988,154 @@ fn apply_ec_headers(
             consent_context.jurisdiction,
         );
     }
+}
+
+/// Handle `GET /__ts/page-bids?path=<path>` — server-side auction for SPA navigation.
+///
+/// Matches creative opportunity slots for the given path, runs a server-side
+/// auction (APS + PBS), and returns the slot definitions and winning bids as JSON.
+/// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
+pub async fn handle_page_bids(
+    settings: &Settings,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let Some(co_config) = &settings.creative_opportunities else {
+        return Ok(Response::from_status(StatusCode::NOT_FOUND)
+            .with_body_text_plain("Creative opportunities not configured"));
+    };
+
+    let path_param = req
+        .get_url()
+        .query_pairs()
+        .find(|(k, _)| k == "path")
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_else(|| "/".to_string());
+
+    let matched_slots: Vec<_> =
+        crate::creative_opportunities::match_slots(&slots_file.slots, &path_param)
+            .into_iter()
+            .cloned()
+            .collect();
+
+    let request_info = crate::http_util::RequestInfo::from_request(&req, &services.client_info);
+    let cookie_jar = handle_request_cookies(&req)?;
+    let ec_id = get_or_generate_ec_id(settings, services, &req)?;
+    let geo = services
+        .geo()
+        .lookup(services.client_info.client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    let consent_context = build_consent_context(&ConsentPipelineInput {
+        jar: cookie_jar.as_ref(),
+        req: &req,
+        config: &settings.consent,
+        geo: geo.as_ref(),
+        ec_id: Some(ec_id.as_str()),
+        kv_store: settings
+            .consent
+            .consent_store
+            .as_deref()
+            .map(|_| services.kv_store()),
+    });
+
+    let consent_allows_auction = consent_context
+        .tcf
+        .as_ref()
+        .is_some_and(|tcf| tcf.has_purpose_consent(1));
+
+    let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
+        let mut auction_request = build_auction_request(
+            &matched_slots,
+            &ec_id,
+            &consent_context,
+            &request_info,
+            co_config,
+        );
+        let page_url = format!(
+            "{}://{}{}",
+            request_info.scheme, request_info.host, path_param
+        );
+        auction_request.publisher.page_url = Some(page_url.clone());
+        if let Some(ref mut site) = auction_request.site {
+            site.page = page_url;
+        }
+        let timeout_ms = co_config
+            .auction_timeout_ms
+            .unwrap_or(settings.auction.timeout_ms);
+        let placeholder_req = fastly::Request::get("https://placeholder.invalid/");
+        let auction_context = AuctionContext {
+            settings,
+            request: &placeholder_req,
+            client_info: services.client_info(),
+            timeout_ms,
+            provider_responses: None,
+            services,
+        };
+        match orchestrator
+            .run_auction(&auction_request, &auction_context, services)
+            .await
+        {
+            Ok(result) => result.winning_bids,
+            Err(e) => {
+                log::warn!("page-bids auction failed: {e:?}");
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let bid_map = build_bid_map(&winning_bids, co_config.price_granularity);
+
+    let slots_json: Vec<serde_json::Value> = matched_slots
+        .iter()
+        .map(|slot| {
+            let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
+            let div_id = slot.resolved_div_id();
+            let formats: Vec<serde_json::Value> = slot
+                .formats
+                .iter()
+                .map(|f| serde_json::json!([f.width, f.height]))
+                .collect();
+            let targeting: serde_json::Map<String, serde_json::Value> = slot
+                .targeting
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            serde_json::json!({
+                "id": slot.id,
+                "gam_unit_path": gam_path,
+                "div_id": div_id,
+                "formats": formats,
+                "targeting": targeting,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "slots": slots_json,
+        "bids": bid_map,
+    });
+
+    let json_str = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
+        message: "Failed to serialize page-bids response".to_string(),
+    })?;
+
+    let mut response = Response::from_status(StatusCode::OK);
+    response.set_header(header::CONTENT_TYPE, "application/json");
+    response.set_header(header::CACHE_CONTROL, "private, no-store");
+    response.set_body(json_str);
+
+    Ok(response)
 }
 
 #[cfg(test)]

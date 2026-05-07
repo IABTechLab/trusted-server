@@ -45,7 +45,7 @@ interface GoogleTagPubAdsService {
   getTargeting(key: string): string[];
   enableSingleRequest(): void;
   addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
-  refresh(): void;
+  refresh(slots?: GoogleTagSlot[]): void;
 }
 
 interface GoogleTag {
@@ -56,6 +56,7 @@ interface GoogleTag {
     size: Array<number | number[]>,
     elementId: string
   ): GoogleTagSlot | null;
+  destroySlots(slots?: GoogleTagSlot[]): boolean;
   enableServices(): void;
   display(elementId: string): void;
   _loaded_?: boolean;
@@ -202,6 +203,8 @@ type TsWindow = Window & {
   __ts_ad_slots?: TsAdSlot[];
   __ts_bids?: Record<string, TsBidData>;
   __tsAdInit?: () => void;
+  __tsPrevGptSlots?: GoogleTagSlot[];
+  __tsServicesEnabled?: boolean;
 };
 
 /**
@@ -212,6 +215,9 @@ type TsWindow = Window & {
  * targeting to GPT slots, sets the `ts_initial` sentinel, registers
  * `slotRenderEnded` to fire both nurl and burl via sendBeacon when our
  * specific Prebid bid wins the GAM line item match, then calls refresh().
+ *
+ * Idempotent: destroys previously created TS-managed slots before redefining them,
+ * so it is safe to call again after SPA navigation updates `__ts_ad_slots`/`__ts_bids`.
  */
 export function installTsAdInit(): void {
   const w = window as TsWindow;
@@ -222,44 +228,126 @@ export function installTsAdInit(): void {
     if (!g) return;
 
     g.cmd?.push(() => {
-      slots
-        .map((slot) => {
-          const gptSlot = g.defineSlot?.(
-            slot.gam_unit_path,
-            slot.formats as Array<number | number[]>,
-            slot.div_id
-          );
-          if (!gptSlot) return null;
-          gptSlot.addService(g.pubads!());
-          Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
-          const bid = bids[slot.id] ?? {};
-          (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
-            if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
-          });
-          gptSlot.setTargeting('ts_initial', '1');
-          return { id: slot.id, gptSlot };
-        })
-        .filter(Boolean);
+      // Destroy previously defined TS slots before redefining for the new page.
+      if (w.__tsPrevGptSlots && w.__tsPrevGptSlots.length > 0) {
+        g.destroySlots?.(w.__tsPrevGptSlots);
+        w.__tsPrevGptSlots = [];
+      }
 
-      g.pubads!().enableSingleRequest();
-      g.enableServices?.();
+      const newSlots: GoogleTagSlot[] = [];
 
-      g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
-        const slotId: string = event.slot?.getSlotElementId?.() ?? '';
-        const bid = bids[slotId] ?? {};
-        const ourBidWon =
-          !event.isEmpty &&
-          bid.hb_adid &&
-          event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
-        if (ourBidWon) {
-          if (bid.nurl) navigator.sendBeacon(bid.nurl);
-          if (bid.burl) navigator.sendBeacon(bid.burl);
-        }
+      slots.forEach((slot) => {
+        const gptSlot = g.defineSlot?.(
+          slot.gam_unit_path,
+          slot.formats as Array<number | number[]>,
+          slot.div_id
+        );
+        if (!gptSlot) return;
+        gptSlot.addService(g.pubads!());
+        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
+        const bid = bids[slot.id] ?? {};
+        (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
+          if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
+        });
+        gptSlot.setTargeting('ts_initial', '1');
+        newSlots.push(gptSlot);
       });
 
-      g.pubads!().refresh();
+      w.__tsPrevGptSlots = newSlots;
+
+      // enableSingleRequest and enableServices must only be called once per page load.
+      if (!w.__tsServicesEnabled) {
+        g.pubads!().enableSingleRequest();
+        g.enableServices?.();
+        w.__tsServicesEnabled = true;
+
+        g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
+          const slotId: string = event.slot?.getSlotElementId?.() ?? '';
+          const bid = (w.__ts_bids ?? {})[slotId] ?? {};
+          const ourBidWon =
+            !event.isEmpty &&
+            bid.hb_adid &&
+            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
+          if (ourBidWon) {
+            if (bid.nurl) navigator.sendBeacon(bid.nurl);
+            if (bid.burl) navigator.sendBeacon(bid.burl);
+          }
+        });
+      }
+
+      if (newSlots.length > 0) {
+        g.pubads!().refresh(newSlots);
+      }
     });
   };
+}
+
+interface PageBidsResponse {
+  slots: TsAdSlot[];
+  bids: Record<string, TsBidData>;
+}
+
+/**
+ * Install SPA navigation hook.
+ *
+ * Patches `history.pushState` and `history.replaceState`, and listens to
+ * `popstate`, so that after each client-side route change the trusted server
+ * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
+ * `window.__ts_ad_slots` / `window.__ts_bids`, and calls `window.__tsAdInit()`.
+ *
+ * Idempotent: guarded by `window.__tsSpaHookInstalled` so multiple calls are safe.
+ */
+export function installSpaAuctionHook(): void {
+  if (typeof window === 'undefined') return;
+  const win = window as TsWindow & { __tsSpaHookInstalled?: boolean };
+  if (win.__tsSpaHookInstalled) return;
+  win.__tsSpaHookInstalled = true;
+
+  let inflight: AbortController | null = null;
+
+  async function onNavigate(path: string): Promise<void> {
+    inflight?.abort();
+    const controller = new AbortController();
+    inflight = controller;
+
+    try {
+      const res = await fetch(`/__ts/page-bids?path=${encodeURIComponent(path)}`, {
+        credentials: 'include',
+        signal: controller.signal,
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as PageBidsResponse;
+      win.__ts_ad_slots = data.slots;
+      win.__ts_bids = data.bids;
+      win.__tsAdInit?.();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      log.warn('SPA auction hook: fetch failed', err);
+    }
+  }
+
+  function patchHistoryMethod(method: 'pushState' | 'replaceState'): void {
+    const original = history[method].bind(history);
+    history[method] = function (
+      state: unknown,
+      unused: string,
+      url?: string | URL | null
+    ): void {
+      const prevPath = location.pathname;
+      original(state, unused, url);
+      const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
+      if (newPath !== prevPath) {
+        void onNavigate(newPath);
+      }
+    };
+  }
+
+  patchHistoryMethod('pushState');
+  patchHistoryMethod('replaceState');
+
+  window.addEventListener('popstate', () => {
+    void onNavigate(location.pathname);
+  });
 }
 
 /**
@@ -300,4 +388,5 @@ if (typeof window !== 'undefined') {
   }
 
   installTsAdInit();
+  installSpaAuctionHook();
 }

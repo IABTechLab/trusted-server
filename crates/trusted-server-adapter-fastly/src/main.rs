@@ -19,7 +19,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    PublisherResponse,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -189,6 +190,17 @@ async fn route_request(
             match runtime_services_for_consent_route(settings, runtime_services) {
                 Ok(auction_services) => {
                     handle_auction(settings, orchestrator, &auction_services, req).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+
+        // SPA/CSR navigation endpoint — returns slots + bids JSON for the given path
+        (Method::GET, "/__ts/page-bids") => {
+            match runtime_services_for_consent_route(settings, runtime_services) {
+                Ok(publisher_services) => {
+                    handle_page_bids(settings, orchestrator, &publisher_services, slots_file, req)
+                        .await
                 }
                 Err(e) => Err(e),
             }

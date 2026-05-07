@@ -13,6 +13,9 @@ type TestWindow = Window & {
   __ts_ad_slots?: unknown;
   __ts_bids?: unknown;
   __tsAdInit?: () => void;
+  __tsPrevGptSlots?: unknown;
+  __tsServicesEnabled?: boolean;
+  __tsSpaHookInstalled?: boolean;
 };
 
 describe('installTsAdInit', () => {
@@ -21,6 +24,9 @@ describe('installTsAdInit', () => {
     delete (window as TestWindow).__ts_ad_slots;
     delete (window as TestWindow).__ts_bids;
     delete (window as TestWindow).__tsAdInit;
+    delete (window as TestWindow).__tsPrevGptSlots;
+    delete (window as TestWindow).__tsSpaHookInstalled;
+    (window as TestWindow).__tsServicesEnabled = false;
     // jsdom does not implement navigator.sendBeacon; polyfill it for tests
     if (!('sendBeacon' in navigator)) {
       Object.defineProperty(navigator, 'sendBeacon', {
@@ -203,7 +209,15 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [];
+    (window as TestWindow).__ts_ad_slots = [
+      {
+        id: 'atf',
+        gam_unit_path: '/123/atf',
+        div_id: 'atf',
+        formats: [[300, 250]],
+        targeting: {},
+      },
+    ];
     (window as TestWindow).__ts_bids = {};
 
     const { installTsAdInit } = await import('./index');
