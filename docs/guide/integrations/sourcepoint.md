@@ -38,9 +38,9 @@ cache_ttl_seconds = 3600
 
 ## Endpoints
 
-| Method     | Path                              | Description                                   |
-| ---------- | --------------------------------- | --------------------------------------------- |
-| `GET/POST` | `/integrations/sourcepoint/cdn/*` | Proxy Sourcepoint CDN assets and wrapper APIs |
+| Method                  | Path                              | Description                                   |
+| ----------------------- | --------------------------------- | --------------------------------------------- |
+| `GET/POST/HEAD/OPTIONS` | `/integrations/sourcepoint/cdn/*` | Proxy Sourcepoint CDN assets and wrapper APIs |
 
 ## HTML Rewriting
 

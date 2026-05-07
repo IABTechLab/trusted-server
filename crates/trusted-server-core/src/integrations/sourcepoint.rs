@@ -16,7 +16,7 @@
 //!
 //! | Method | Path | Upstream |
 //! |--------|------|----------|
-//! | `GET/POST` | `/integrations/sourcepoint/cdn/*` | `cdn.privacy-mgmt.com` |
+//! | `GET/POST/HEAD/OPTIONS` | `/integrations/sourcepoint/cdn/*` | `cdn.privacy-mgmt.com` |
 
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
@@ -247,17 +247,11 @@ fn validate_auth_cookie_name(value: &str) -> Result<(), ValidationError> {
 
 struct SourcepointIntegration {
     config: Arc<SourcepointConfig>,
-    backend_name: String,
 }
 
 impl SourcepointIntegration {
     fn new(config: Arc<SourcepointConfig>) -> Arc<Self> {
-        let backend_name = BackendConfig::from_url(&config.cdn_origin, true)
-            .expect("should configure Sourcepoint backend from validated origin");
-        Arc::new(Self {
-            config,
-            backend_name,
-        })
+        Arc::new(Self { config })
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -335,6 +329,8 @@ impl SourcepointIntegration {
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
+            header::HeaderName::from_static("access-control-request-method"),
+            header::HeaderName::from_static("access-control-request-headers"),
         ] {
             if let Some(value) = original_req.get_header(&header_name) {
                 proxy_req.set_header(&header_name, value);
@@ -634,7 +630,13 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get("/cdn/*"), self.post("/cdn/*")]
+        let endpoint_path = format!("/integrations/{SOURCEPOINT_INTEGRATION_ID}/cdn/*");
+        vec![
+            self.get("/cdn/*"),
+            self.post("/cdn/*"),
+            IntegrationEndpoint::new(Method::HEAD, endpoint_path.clone()),
+            IntegrationEndpoint::new(Method::OPTIONS, endpoint_path),
+        ]
     }
 
     async fn handle(
@@ -669,15 +671,18 @@ impl IntegrationProxy for SourcepointIntegration {
             proxy_req.set_header(header::ACCEPT_ENCODING, ae);
         }
 
-        if matches!(req.get_method(), &Method::POST) {
+        if matches!(method, Method::POST) {
             if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
                 proxy_req.set_header(header::CONTENT_TYPE, content_type);
             }
             proxy_req.set_body(req.into_body());
         }
 
+        let backend_name = BackendConfig::from_url(&self.config.cdn_origin, true)
+            .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
+
         let mut response = proxy_req
-            .send(&self.backend_name)
+            .send(&backend_name)
             .change_context(Self::error("Sourcepoint upstream request failed"))?;
 
         log::info!(
@@ -707,7 +712,8 @@ impl IntegrationProxy for SourcepointIntegration {
 
         // Rewrite CDN URLs inside JavaScript responses so that dynamically
         // loaded chunks and API calls route through the first-party proxy.
-        if response.get_status() == StatusCode::OK
+        if matches!(method, Method::GET)
+            && response.get_status() == StatusCode::OK
             && self.config.rewrite_sdk
             && Self::is_javascript_response(&response)
         {
@@ -849,7 +855,7 @@ impl IntegrationHeadInjector for SourcepointIntegration {
                 "get:function(){{return v}},",
                 "set:function(n){{v=p(n)}}",
                 "}});",
-                "}}catch(e){{}}}})();",
+                "}}catch(e){{if(window.console&&console.warn)console.warn(\"Sourcepoint: failed to install runtime config rewrite trap\",e)}}}})();",
                 "</script>",
             ),
             cdn_host = SOURCEPOINT_CDN_HOST,
@@ -1016,13 +1022,12 @@ mod tests {
             .expect("should insert config");
 
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        assert!(
-            registry.has_route(
-                &Method::GET,
-                "/integrations/sourcepoint/cdn/wrapper/v2/messages"
-            ),
-            "should register CDN proxy route"
-        );
+        for method in [Method::GET, Method::POST, Method::HEAD, Method::OPTIONS] {
+            assert!(
+                registry.has_route(&method, "/integrations/sourcepoint/cdn/wrapper/v2/messages"),
+                "should register {method} CDN proxy route"
+            );
+        }
     }
 
     #[test]
@@ -1103,6 +1108,10 @@ mod tests {
         assert!(
             trap_script.contains("try{") && trap_script.contains("catch(e)"),
             "should guard best-effort trap installation: {trap_script}",
+        );
+        assert!(
+            trap_script.contains("console.warn"),
+            "should log trap installation failures for observability: {trap_script}",
         );
         assert!(
             trap_script.contains("Object.defineProperty"),
@@ -1351,6 +1360,30 @@ mod tests {
             proxy_req.get_header_str("X-Forwarded-For"),
             Some("203.0.113.10"),
             "should forward platform-provided client IP"
+        );
+    }
+
+    #[test]
+    fn copy_headers_forwards_preflight_headers() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut original_req =
+            Request::new(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
+        original_req.set_header("Access-Control-Request-Method", "POST");
+        original_req.set_header("Access-Control-Request-Headers", "Content-Type, X-Test");
+        let mut proxy_req =
+            Request::new(Method::OPTIONS, "https://cdn.privacy-mgmt.com/wrapper.js");
+
+        integration.copy_headers(None, &original_req, &mut proxy_req);
+
+        assert_eq!(
+            proxy_req.get_header_str("Access-Control-Request-Method"),
+            Some("POST"),
+            "should forward requested preflight method"
+        );
+        assert_eq!(
+            proxy_req.get_header_str("Access-Control-Request-Headers"),
+            Some("Content-Type, X-Test"),
+            "should forward requested preflight headers"
         );
     }
 
