@@ -553,6 +553,13 @@ fn default_certificate_check() -> bool {
     true
 }
 
+fn is_admin_placeholder_password(password: &str) -> bool {
+    matches!(
+        password.trim().to_ascii_lowercase().as_str(),
+        "changeme" | "password" | "admin"
+    )
+}
+
 impl Default for Proxy {
     fn default() -> Self {
         Self {
@@ -661,6 +668,7 @@ impl Settings {
         })?;
 
         settings.validate_admin_coverage()?;
+        settings.validate_admin_handler_passwords()?;
 
         Ok(settings)
     }
@@ -706,6 +714,7 @@ impl Settings {
 
         settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
+        settings.validate_admin_handler_passwords()?;
 
         Ok(settings)
     }
@@ -823,6 +832,27 @@ impl Settings {
                 uncovered.join(", ")
             ),
         }))
+    }
+
+    fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            let covers_admin = Self::ADMIN_ENDPOINTS
+                .iter()
+                .try_fold(false, |covered, path| {
+                    handler.matches_path(path).map(|matches| covered || matches)
+                })?;
+
+            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        handler.path
+                    ),
+                }));
+            }
+        }
+
+        Ok(())
     }
 
     /// Retrieves the integration configuration of a specific type.
@@ -2524,6 +2554,30 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_admin_handler_placeholder_password() {
+        let toml_str = crate_test_settings_str()
+            .replace(r#"password = "admin-pass""#, r#"password = "changeme""#);
+
+        let result = Settings::from_toml(&toml_str);
+        assert!(
+            result.is_err(),
+            "should reject placeholder password on admin handler"
+        );
+        let err = format!("{:?}", result.expect_err("should reject placeholder"));
+        assert!(
+            err.contains("placeholder password"),
+            "error should mention placeholder admin password, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_non_placeholder_admin_password() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should accept non-placeholder admin password");
+        assert_eq!(settings.handlers.len(), 2, "should parse handlers");
     }
 
     #[test]

@@ -6,7 +6,7 @@ password = "pass"
 [[handlers]]
 path = "^/_ts/admin"
 username = "admin"
-password = "changeme"
+password = "replace-with-admin-password-32-bytes"
 
 [publisher]
 domain = "test-publisher.com"
@@ -27,7 +27,7 @@ pull_sync_concurrency = 3
 # source_domain = "liveramp.com"
 # openrtb_atype = 3
 # bidstream_enabled = true
-# api_token = "partner-api-token"
+# api_token = "partner-api-token-32-bytes-minimum"
 # batch_rate_limit = 60
 # pull_sync_enabled = false
 
@@ -37,7 +37,7 @@ name = "Prebid SharedID"
 source_domain = "sharedid.org"
 openrtb_atype = 1
 bidstream_enabled = true
-api_token = "sharedid-internal-token"
+api_token = "sharedid-internal-token-32-bytes"
 
 # Integration test partners (used by crates/integration-tests)
 [[ec.partners]]
@@ -45,14 +45,14 @@ id = "inttest"
 name = "Integration Test Partner"
 source_domain = "inttest.example.com"
 bidstream_enabled = true
-api_token = "inttest-api-key-1"
+api_token = "inttest-api-key-1-32-bytes-minimum"
 
 [[ec.partners]]
 id = "inttest2"
 name = "Integration Test Partner 2"
 source_domain = "inttest2.example.com"
 bidstream_enabled = true
-api_token = "inttest2-api-key-2"
+api_token = "inttest2-api-key-2-32-bytes-minimum"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex

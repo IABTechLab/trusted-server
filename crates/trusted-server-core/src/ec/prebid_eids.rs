@@ -96,8 +96,8 @@ pub fn ingest_prebid_eids(
 
     let eids = match parse_prebid_eids_cookie(cookie_value) {
         Ok(eids) => eids,
-        Err(err) => {
-            log::debug!("Prebid EIDs: failed to decode ts-eids cookie: {err}");
+        Err(_) => {
+            log::trace!("Prebid EIDs: failed to decode ts-eids cookie; dropping");
             return;
         }
     };
@@ -109,19 +109,16 @@ pub fn ingest_prebid_eids(
         };
 
         // KV stores one UID per partner. Preserve the previous cookie-ingestion
-        // behavior by syncing the first valid UID under each source.
-        let Some(uid) = eid.uids.iter().find(|uid| !uid.id.is_empty()) else {
-            continue;
-        };
-
-        if eid_id_exceeds_size_limit(&uid.id) {
+        // behavior by syncing the first valid UID under each source, while
+        // skipping malformed candidates instead of dropping the whole source.
+        let Some(uid) = first_valid_uid(&eid.uids) else {
             log::debug!(
-                "Prebid EIDs: rejecting oversized uid for partner '{}' from source '{}'",
+                "Prebid EIDs: no valid uid for partner '{}' from source '{}'",
                 partner.id,
                 eid.source,
             );
             continue;
-        }
+        };
 
         match kv.upsert_partner_id(ec_id, &partner.id, &uid.id) {
             Ok(_) => {
@@ -139,6 +136,12 @@ pub fn ingest_prebid_eids(
             }
         }
     }
+}
+
+fn first_valid_uid(uids: &[Uid]) -> Option<&Uid> {
+    uids.iter()
+        .filter(|uid| !uid.id.trim().is_empty())
+        .find(|uid| !eid_id_exceeds_size_limit(&uid.id))
 }
 
 /// `SharedID` EID source domain used for partner registry lookup.
@@ -356,6 +359,40 @@ mod tests {
         assert!(
             !eid_id_exceeds_size_limit(&exact_limit),
             "should allow EID values exactly at MAX_UID_LENGTH"
+        );
+    }
+
+    #[test]
+    fn first_valid_uid_skips_oversized_and_uses_later_valid_uid() {
+        let oversized = "x".repeat(MAX_UID_LENGTH + 1);
+        let uids = vec![
+            Uid {
+                id: oversized,
+                atype: Some(1),
+                ext: None,
+            },
+            Uid {
+                id: "valid-uid".to_owned(),
+                atype: Some(1),
+                ext: None,
+            },
+        ];
+
+        let uid = first_valid_uid(&uids).expect("should find later valid UID");
+        assert_eq!(uid.id, "valid-uid", "should skip oversized first UID");
+    }
+
+    #[test]
+    fn first_valid_uid_rejects_whitespace_only_ids() {
+        let uids = vec![Uid {
+            id: "   ".to_owned(),
+            atype: Some(1),
+            ext: None,
+        }];
+
+        assert!(
+            first_valid_uid(&uids).is_none(),
+            "should reject whitespace UID"
         );
     }
 }

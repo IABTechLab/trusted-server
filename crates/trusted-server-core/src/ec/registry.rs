@@ -14,6 +14,9 @@ use crate::settings::EcPartner;
 
 use super::partner::{hash_api_key, validate_partner_id};
 
+/// Minimum length for inbound partner Bearer API tokens.
+pub const MIN_API_TOKEN_LENGTH: usize = 32;
+
 /// Runtime-ready partner configuration with precomputed API key hash.
 #[derive(Debug, Clone)]
 pub struct PartnerConfig {
@@ -86,6 +89,8 @@ impl PartnerRegistry {
                     message: format!("ec.partners: duplicate partner ID '{}'", partner.id),
                 }));
             }
+
+            validate_api_token(&partner.id, partner.api_token.expose())?;
 
             let api_key_hash = hash_api_key(partner.api_token.expose());
 
@@ -195,6 +200,24 @@ impl PartnerRegistry {
     }
 }
 
+fn validate_api_token(partner_id: &str, api_token: &str) -> Result<(), Report<TrustedServerError>> {
+    if api_token.trim().is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("ec.partners: partner '{partner_id}' api_token must not be empty"),
+        }));
+    }
+
+    if api_token.len() < MIN_API_TOKEN_LENGTH {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "ec.partners: partner '{partner_id}' api_token must be at least {MIN_API_TOKEN_LENGTH} bytes"
+            ),
+        }));
+    }
+
+    Ok(())
+}
+
 fn build_partner_config(
     partner: &EcPartner,
     api_key_hash: &str,
@@ -295,6 +318,10 @@ mod tests {
     use super::*;
     use crate::redacted::Redacted;
 
+    fn valid_api_token(label: &str) -> String {
+        format!("{label}-api-token-32-bytes-minimum")
+    }
+
     fn make_partner(id: &str, source_domain: &str, api_token: &str) -> EcPartner {
         EcPartner {
             id: id.to_owned(),
@@ -321,7 +348,11 @@ mod tests {
 
     #[test]
     fn lookup_by_id_returns_configured_partner() {
-        let partners = vec![make_partner("ssp_x", "ssp.example.com", "token-a")];
+        let partners = vec![make_partner(
+            "ssp_x",
+            "ssp.example.com",
+            &valid_api_token("token-a"),
+        )];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
         let found = registry.get("ssp_x");
@@ -335,10 +366,14 @@ mod tests {
 
     #[test]
     fn lookup_by_api_key_hash_returns_partner() {
-        let partners = vec![make_partner("ssp_x", "ssp.example.com", "my-secret")];
+        let partners = vec![make_partner(
+            "ssp_x",
+            "ssp.example.com",
+            &valid_api_token("my-secret"),
+        )];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
-        let hash = hash_api_key("my-secret");
+        let hash = hash_api_key(&valid_api_token("my-secret"));
         let found = registry.find_by_api_key_hash(&hash);
         assert!(found.is_some(), "should find partner by API key hash");
         assert_eq!(
@@ -350,7 +385,11 @@ mod tests {
 
     #[test]
     fn lookup_by_source_domain_is_case_insensitive() {
-        let partners = vec![make_partner("ssp_x", "SSP.Example.Com", "token-a")];
+        let partners = vec![make_partner(
+            "ssp_x",
+            "SSP.Example.Com",
+            &valid_api_token("token-a"),
+        )];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
         let found = registry.find_by_source_domain("ssp.example.com");
@@ -363,8 +402,8 @@ mod tests {
     #[test]
     fn duplicate_partner_id_is_rejected() {
         let partners = vec![
-            make_partner("ssp_x", "a.com", "token-a"),
-            make_partner("ssp_x", "b.com", "token-b"),
+            make_partner("ssp_x", "a.com", &valid_api_token("token-a")),
+            make_partner("ssp_x", "b.com", &valid_api_token("token-b")),
         ];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject duplicate partner ID");
@@ -373,8 +412,8 @@ mod tests {
     #[test]
     fn duplicate_source_domain_is_rejected() {
         let partners = vec![
-            make_partner("ssp_a", "same.com", "token-a"),
-            make_partner("ssp_b", "same.com", "token-b"),
+            make_partner("ssp_a", "same.com", &valid_api_token("token-a")),
+            make_partner("ssp_b", "same.com", &valid_api_token("token-b")),
         ];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject duplicate source domain");
@@ -382,21 +421,30 @@ mod tests {
 
     #[test]
     fn reserved_partner_id_is_rejected() {
-        let partners = vec![make_partner("ec", "ec.example.com", "token-a")];
+        let partners = vec![make_partner(
+            "ec",
+            "ec.example.com",
+            &valid_api_token("token-a"),
+        )];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject reserved partner ID 'ec'");
     }
 
     #[test]
     fn pull_enabled_partners_filters_correctly() {
-        let mut pull_partner = make_partner("puller", "pull.example.com", "token-p");
+        let mut pull_partner =
+            make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
         pull_partner.pull_sync_enabled = true;
         pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
         pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
 
         let partners = vec![
-            make_partner("no_pull", "nopull.example.com", "token-np"),
+            make_partner(
+                "no_pull",
+                "nopull.example.com",
+                &valid_api_token("token-np"),
+            ),
             pull_partner,
         ];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -424,7 +472,7 @@ mod tests {
 
     #[test]
     fn partner_debug_output_redacts_pull_token() {
-        let mut partner = make_partner("puller", "pull.example.com", "token-p");
+        let mut partner = make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
@@ -447,8 +495,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_api_token_is_rejected() {
+        let partner = make_partner("ssp_x", "ssp.example.com", "   ");
+
+        let result = PartnerRegistry::from_config(&[partner]);
+        assert!(result.is_err(), "should reject empty api_token");
+    }
+
+    #[test]
+    fn short_api_token_is_rejected() {
+        let partner = make_partner("ssp_x", "ssp.example.com", "short-token");
+
+        let result = PartnerRegistry::from_config(&[partner]);
+        assert!(result.is_err(), "should reject short api_token");
+    }
+
+    #[test]
+    fn api_token_at_minimum_length_is_accepted() {
+        let token = "x".repeat(MIN_API_TOKEN_LENGTH);
+        let partners = vec![make_partner("ssp_x", "ssp.example.com", &token)];
+
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        assert!(
+            registry.get("ssp_x").is_some(),
+            "should accept minimum-length token"
+        );
+    }
+
+    #[test]
     fn zero_batch_rate_limit_is_rejected() {
-        let mut partner = make_partner("ssp_x", "ssp.example.com", "token-a");
+        let mut partner = make_partner("ssp_x", "ssp.example.com", &valid_api_token("token-a"));
         partner.batch_rate_limit = 0;
 
         let result = PartnerRegistry::from_config(&[partner]);
@@ -457,7 +533,7 @@ mod tests {
 
     #[test]
     fn zero_pull_sync_rate_limit_is_rejected() {
-        let mut partner = make_partner("puller", "pull.example.com", "token-p");
+        let mut partner = make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];

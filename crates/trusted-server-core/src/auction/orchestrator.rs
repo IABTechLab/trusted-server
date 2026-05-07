@@ -159,7 +159,7 @@ impl AuctionOrchestrator {
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
-                .parse_response(backend_response, response_time_ms)
+                .parse_response_with_context(backend_response, response_time_ms, &mediator_context)
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} parse failed", mediator.provider_name()),
                 })?;
@@ -374,7 +374,11 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms) {
+                        match provider.parse_response_with_context(
+                            response,
+                            response_time_ms,
+                            context,
+                        ) {
                             Ok(auction_response) => {
                                 log::info!(
                                     "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",

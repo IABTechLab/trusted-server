@@ -350,13 +350,16 @@ mod tests {
 
     fn authorized_batch_request(body: &str) -> Request {
         let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
-        req.set_header("authorization", "Bearer test-token");
+        req.set_header("authorization", "Bearer test-token-32-bytes-minimum-value");
         req.set_body(body.to_owned());
         req
     }
 
     fn test_registry() -> PartnerRegistry {
-        let partners = vec![make_test_partner("ssp_x", "test-token")];
+        let partners = vec![make_test_partner(
+            "ssp_x",
+            "test-token-32-bytes-minimum-value",
+        )];
         PartnerRegistry::from_config(&partners).expect("should build registry")
     }
 

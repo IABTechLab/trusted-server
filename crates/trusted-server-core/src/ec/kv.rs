@@ -665,11 +665,14 @@ impl KvIdentityGraph {
             log_id(ec_id)
         );
 
-        // Best-effort CAS write-back — update the network field.
+        // Best-effort CAS write-back — update only the cluster size so any
+        // future `network` fields are preserved across this lazy write.
         let mut updated_entry = entry.clone();
-        updated_entry.network = Some(KvNetwork {
-            cluster_size: Some(cluster_size),
-        });
+        let mut network = updated_entry
+            .network
+            .unwrap_or(KvNetwork { cluster_size: None });
+        network.cluster_size = Some(cluster_size);
+        updated_entry.network = Some(network);
 
         let store = self.open_store()?;
         let (body, meta_str) = Self::serialize_entry(&updated_entry, &self.store_name)?;

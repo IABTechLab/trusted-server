@@ -7,10 +7,12 @@ use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::compat;
 use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
-    HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
+    COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION,
+    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -141,7 +143,7 @@ fn main() -> Result<(), Error> {
     }
 
     if let Some(context) = pull_sync_context {
-        run_pull_sync_after_send(&settings, &context);
+        run_pull_sync_after_send(&settings, &partner_registry, &context);
     }
 
     Ok(())
@@ -212,7 +214,23 @@ async fn route_request(
     #[allow(deprecated)]
     let geo_info = GeoInfo::from_request(&req);
 
-    let is_real_browser = true;
+    // Extract the Prebid EIDs cookie before routing consumes the request.
+    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
+
+    // Derive device signals from TLS/H2/UA for bot detection.
+    // This is pure in-memory computation — no KV I/O.
+    let device_signals = derive_device_signals(&req);
+    let is_real_browser = device_signals.looks_like_browser();
+
+    if !is_real_browser {
+        log::debug!(
+            "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
+            device_signals.ja4_class,
+            device_signals.platform_class,
+            device_signals.is_mobile,
+        );
+    }
 
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
@@ -253,7 +271,19 @@ async fn route_request(
             }
         };
 
+    // Pass device signals to EcContext so they are stored on new entries.
+    ec_context.set_device_signals(device_signals);
+
+    // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
+    // consent withdrawals. Revocations need the KV graph so tombstones remain
+    // authoritative even for privacy-extension-heavy clients that do not look
+    // like known browsers.
     let kv_graph = if is_real_browser {
+        maybe_identity_graph(settings)
+    } else {
+        None
+    };
+    let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
         maybe_identity_graph(settings)
     } else {
         None
@@ -268,9 +298,11 @@ async fn route_request(
             let mut response = compat::to_fastly_response(response);
             ec_finalize_response(
                 settings,
-                geo_info.as_ref(),
                 &ec_context,
-                kv_graph.as_ref(),
+                finalize_kv_graph.as_ref(),
+                partner_registry,
+                eids_cookie.as_deref(),
+                sharedid_cookie.as_deref(),
                 &mut response,
             );
             finalize_response(settings, geo_info.as_ref(), &mut response);
@@ -415,7 +447,7 @@ async fn route_request(
                     ec_finalize_response(
                         settings,
                         &ec_context,
-                        kv_graph.as_ref(),
+                        finalize_kv_graph.as_ref(),
                         partner_registry,
                         eids_cookie.as_deref(),
                         sharedid_cookie.as_deref(),
@@ -471,14 +503,16 @@ async fn route_request(
     // Convert any errors to HTTP error responses
     let mut response = result.unwrap_or_else(|e| to_error_response(&e));
 
-    // Bot gate still suppresses KV-backed side effects and pull sync via
-    // `kv_graph = None`, but response finalization always runs so cookie
-    // writes and revocations behave consistently for browser traffic.
+    // Bot gate still suppresses generated EC writes and pull sync via
+    // `kv_graph = None`, but withdrawal finalization uses `finalize_kv_graph`
+    // so revocation tombstones are not lost for bot-classified clients.
     ec_finalize_response(
         settings,
-        geo_info.as_ref(),
         &ec_context,
-        kv_graph.as_ref(),
+        finalize_kv_graph.as_ref(),
+        partner_registry,
+        eids_cookie.as_deref(),
+        sharedid_cookie.as_deref(),
         &mut response,
     );
 
@@ -504,7 +538,11 @@ fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
     settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
 }
 
-fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
+fn run_pull_sync_after_send(
+    settings: &Settings,
+    partner_registry: &PartnerRegistry,
+    context: &PullSyncContext,
+) {
     let kv = match require_identity_graph(settings) {
         Ok(kv) => kv,
         Err(err) => {
@@ -513,16 +551,8 @@ fn run_pull_sync_after_send(settings: &Settings, context: &PullSyncContext) {
         }
     };
 
-    let partner_store = match require_partner_store(settings) {
-        Ok(store) => store,
-        Err(err) => {
-            log::debug!("Pull sync: partner store unavailable, skipping: {err:?}");
-            return;
-        }
-    };
-
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(settings, &kv, &partner_store, &limiter, context);
+    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context);
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
@@ -576,6 +606,32 @@ fn require_identity_graph(
         })
     })?;
     Ok(KvIdentityGraph::new(store_name))
+}
+
+/// Extracts a named cookie value from the request's `Cookie` header.
+fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
+    let cookie_header = req.get_header_str("cookie")?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some((key, value)) = pair.split_once('=') {
+            if key.trim() == name {
+                return Some(value.trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Derives device signals from TLS, H2, and UA request data.
+///
+/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
+/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
+fn derive_device_signals(req: &Request) -> DeviceSignals {
+    let ua = req.get_header_str("user-agent").unwrap_or("");
+    let ja4 = req.get_tls_ja4();
+    let h2_fp = req.get_client_h2_fingerprint();
+
+    DeviceSignals::derive(ua, ja4, h2_fp)
 }
 
 #[cfg(test)]
