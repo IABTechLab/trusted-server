@@ -328,11 +328,7 @@ export function installSpaAuctionHook(): void {
 
   function patchHistoryMethod(method: 'pushState' | 'replaceState'): void {
     const original = history[method].bind(history);
-    history[method] = function (
-      state: unknown,
-      unused: string,
-      url?: string | URL | null
-    ): void {
+    history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
       const prevPath = location.pathname;
       original(state, unused, url);
       const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
