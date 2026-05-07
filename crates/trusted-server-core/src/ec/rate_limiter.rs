@@ -25,6 +25,10 @@ pub trait RateLimiter {
     /// any positive limit below `60/hr` rounds up to `1/min` (`60/hr`
     /// effective).
     ///
+    /// Implementations may use a read-then-increment counter API, so callers
+    /// should treat this as best-effort throttling: concurrent requests can
+    /// overshoot the configured limit by the in-flight burst size.
+    ///
     /// # Errors
     ///
     /// Returns [`TrustedServerError`] on rate counter I/O failure.
