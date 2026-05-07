@@ -1,7 +1,6 @@
 use error_stack::Report;
 use fastly::http::Method;
 use fastly::{Request, Response};
-use log_fastly::Logger;
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -30,11 +29,14 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod error;
+mod logging;
+mod management_api;
 mod platform;
 #[cfg(test)]
 mod route_tests;
 
 use crate::error::to_error_response;
+use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
 /// Entry point for the Fastly Compute program.
@@ -163,12 +165,16 @@ async fn route_request(
         }
 
         // Signature verification endpoint
-        (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
+        (Method::POST, "/verify-signature") => {
+            handle_verify_signature(settings, runtime_services, req)
+        }
 
         // Key rotation admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
-        (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
+        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, runtime_services, req),
+        (Method::POST, "/admin/keys/deactivate") => {
+            handle_deactivate_key(settings, runtime_services, req)
+        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
@@ -313,31 +319,4 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
     }
-}
-
-fn init_logger() {
-    let logger = Logger::builder()
-        .default_endpoint("tslog")
-        .echo_stdout(true)
-        .max_level(log::LevelFilter::Info)
-        .build()
-        .expect("should build Logger");
-
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} {} [{}] {}",
-                chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                record.level(),
-                record
-                    .target()
-                    .split("::")
-                    .last()
-                    .unwrap_or(record.target()),
-                message
-            ))
-        })
-        .chain(Box::new(logger) as Box<dyn log::Log>)
-        .apply()
-        .expect("should initialize logger");
 }
