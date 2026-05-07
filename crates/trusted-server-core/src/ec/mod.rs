@@ -105,7 +105,7 @@ fn parse_ec_from_request(req: &Request) -> Result<RequestEc, Report<TrustedServe
     let cookie_ec = jar
         .as_ref()
         .and_then(|j| j.get(COOKIE_TS_EC))
-        .map(|cookie| cookie.value())
+        .map(cookie::Cookie::value)
         .filter(|id| cookies::ec_id_has_only_allowed_chars(id))
         .map(str::to_owned);
 
