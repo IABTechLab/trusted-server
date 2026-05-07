@@ -108,7 +108,8 @@ fn parse_ec_from_request(req: &Request) -> Result<RequestEc, Report<TrustedServe
     let cookie_ec = jar
         .as_ref()
         .and_then(|j| j.get(COOKIE_TS_EC))
-        .and_then(|cookie| request_ec_id_if_allowed(cookie.value(), "ts-ec cookie"));
+        .map(cookie::Cookie::value)
+        .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
 
     Ok(RequestEc {
         header_ec,
