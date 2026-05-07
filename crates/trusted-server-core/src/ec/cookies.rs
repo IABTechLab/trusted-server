@@ -102,7 +102,7 @@ fn format_set_cookie(domain: &str, value: &str, max_age: i32) -> String {
 /// sanitized through a narrow outbound allowlist as a defense-in-depth
 /// backstop against header injection.
 #[must_use]
-pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
+pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
     let safe_id = sanitize_ec_id_for_cookie(ec_id);
 
     format_set_cookie(
