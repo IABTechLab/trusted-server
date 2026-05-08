@@ -106,7 +106,7 @@ pub fn ec_finalize_response(
     // identity-graph row, producing a phantom ID on later requests.
     if ec_context.ec_generated() {
         let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) else {
-            log::debug!("Skipping generated EC response write because KV graph is unavailable");
+            log::info!("Skipping generated EC response write because KV graph is unavailable");
             return;
         };
 

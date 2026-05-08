@@ -170,7 +170,7 @@ async fn route_request(
     let is_real_browser = device_signals.looks_like_browser();
 
     if !is_real_browser {
-        log::debug!(
+        log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
             device_signals.ja4_class,
             device_signals.platform_class,

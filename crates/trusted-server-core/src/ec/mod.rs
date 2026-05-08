@@ -232,6 +232,14 @@ impl EcContext {
             geo: geo_info,
         });
 
+        log::info!(
+            "EC context: present={}, cookie_present={}, consent_allowed={}, jurisdiction={}",
+            ec_was_present,
+            parsed.cookie_ec.is_some(),
+            consent::ec_consent_granted(&consent),
+            consent.jurisdiction,
+        );
+
         Ok(Self {
             ec_value,
             cookie_ec_value: parsed.cookie_ec,
@@ -267,7 +275,7 @@ impl EcContext {
         }
 
         if !consent::ec_consent_granted(&self.consent) {
-            log::debug!(
+            log::info!(
                 "EC generation skipped: consent not granted (jurisdiction={})",
                 self.consent.jurisdiction,
             );
@@ -281,7 +289,7 @@ impl EcContext {
         })?;
 
         let ec_id = generation::generate_ec_id(settings, client_ip)?;
-        log::trace!("Generated new EC ID: {}", log_id(&ec_id));
+        log::info!("Generated new EC ID: {}", log_id(&ec_id));
         self.ec_value = Some(ec_id);
         self.ec_generated = true;
 
