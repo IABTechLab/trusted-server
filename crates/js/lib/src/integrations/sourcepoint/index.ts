@@ -8,19 +8,108 @@ const GPP_SOURCE_SOURCEPOINT = 'sp';
 const INITIAL_RETRY_DELAY_MS = 500;
 
 interface SourcepointGppData {
-  gppString: string;
-  applicableSections: number[];
+  gppString?: string;
+  applicableSections?: number[];
+}
+
+interface SourcepointConsentStringEntry {
+  sectionId?: number;
+}
+
+interface SourcepointSectionPayload {
+  consentString?: string;
+  applicableSections?: number[];
+  consentStrings?: SourcepointConsentStringEntry[];
 }
 
 interface SourcepointConsentPayload {
   gppData?: SourcepointGppData;
+  [key: string]: unknown;
+}
+
+interface MirroredSourcepointConsent {
+  gppString: string;
+  applicableSections?: number[];
 }
 
 let initialized = false;
 let initialRetryDone = false;
 let retryTimer: ReturnType<typeof window.setTimeout> | undefined;
 
-function findSourcepointConsent(): SourcepointConsentPayload | null {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'number');
+}
+
+function isConsentStringEntryArray(value: unknown): value is SourcepointConsentStringEntry[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        isRecord(item) &&
+        (typeof item.sectionId === 'number' || typeof item.sectionId === 'undefined')
+    )
+  );
+}
+
+function normalizeSectionPayload(value: unknown): SourcepointSectionPayload | null {
+  if (!isRecord(value)) return null;
+
+  return {
+    consentString: typeof value.consentString === 'string' ? value.consentString : undefined,
+    applicableSections: isNumberArray(value.applicableSections)
+      ? value.applicableSections
+      : undefined,
+    consentStrings: isConsentStringEntryArray(value.consentStrings)
+      ? value.consentStrings
+      : undefined,
+  };
+}
+
+function sectionIdsFromConsentStrings(
+  consentStrings: SourcepointConsentStringEntry[] | undefined
+): number[] | undefined {
+  const ids = consentStrings
+    ?.map((entry) => entry.sectionId)
+    .filter((sectionId): sectionId is number => typeof sectionId === 'number');
+
+  return ids && ids.length > 0 ? ids : undefined;
+}
+
+function looksLikeGpp(consentString: string): boolean {
+  return consentString.includes('~');
+}
+
+function extractMirroredConsent(
+  payload: SourcepointConsentPayload
+): MirroredSourcepointConsent | null {
+  if (payload.gppData?.gppString) {
+    return {
+      gppString: payload.gppData.gppString,
+      applicableSections: payload.gppData.applicableSections,
+    };
+  }
+
+  for (const [sectionName, rawSection] of Object.entries(payload)) {
+    if (sectionName === 'gppData') continue;
+
+    const section = normalizeSectionPayload(rawSection);
+    if (!section?.consentString || !looksLikeGpp(section.consentString)) continue;
+
+    return {
+      gppString: section.consentString,
+      applicableSections:
+        section.applicableSections ?? sectionIdsFromConsentStrings(section.consentStrings),
+    };
+  }
+
+  return null;
+}
+
+function findSourcepointConsent(): MirroredSourcepointConsent | null {
   // Sourcepoint stores one consent payload per property under `_sp_user_consent_*`.
   // We intentionally take the first valid match and mirror that origin-scoped payload.
   for (let i = 0; i < localStorage.length; i++) {
@@ -32,8 +121,9 @@ function findSourcepointConsent(): SourcepointConsentPayload | null {
 
     try {
       const payload = JSON.parse(raw) as SourcepointConsentPayload;
-      if (payload.gppData?.gppString) {
-        return payload;
+      const consent = extractMirroredConsent(payload);
+      if (consent) {
+        return consent;
       }
     } catch {
       log.debug('sourcepoint: failed to parse localStorage value', { key });
@@ -111,6 +201,10 @@ function scheduleInitialRetry(): void {
  * Reads Sourcepoint consent from localStorage and mirrors it into
  * `__gpp` and `__gpp_sid` cookies for Trusted Server to read.
  *
+ * Sourcepoint stores different shapes depending on the campaign/module. US
+ * National data is commonly stored under `usnat.consentString` and
+ * `usnat.applicableSections`, while some setups expose `gppData.gppString`.
+ *
  * Returns `true` if cookies were written, `false` otherwise.
  */
 export function mirrorSourcepointConsent(): boolean {
@@ -118,14 +212,14 @@ export function mirrorSourcepointConsent(): boolean {
     return false;
   }
 
-  const payload = findSourcepointConsent();
-  if (!payload?.gppData) {
+  const consent = findSourcepointConsent();
+  if (!consent) {
     clearSourcepointCookies();
     log.debug('sourcepoint: no GPP data found in localStorage');
     return false;
   }
 
-  const { gppString, applicableSections } = payload.gppData;
+  const { gppString, applicableSections } = consent;
   if (!gppString) {
     clearSourcepointCookies();
     log.debug('sourcepoint: gppString is empty');

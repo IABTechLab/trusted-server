@@ -50,6 +50,38 @@ describe('integrations/sourcepoint', () => {
     expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBe('sp');
   });
 
+  it('mirrors __gpp and __gpp_sid from Sourcepoint usnat localStorage shape', () => {
+    localStorage.setItem(
+      '_sp_user_consent_36922',
+      JSON.stringify({
+        usnat: {
+          applicableSections: [7],
+          consentString: 'DBABLA~BVQqAAAAAgA.QA',
+          consentStrings: [
+            {
+              sectionId: 7,
+              sectionName: 'usnat',
+              consentString: 'BVQqAAAAAgA.QA',
+            },
+          ],
+          consentStatus: {
+            consentedToAll: true,
+            consentedToAny: true,
+            rejectedAny: false,
+          },
+        },
+        version: 1,
+      })
+    );
+
+    const result = mirrorSourcepointConsent();
+
+    expect(result).toBe(true);
+    expect(getCookie('__gpp')).toBe('DBABLA~BVQqAAAAAgA.QA');
+    expect(getCookie('__gpp_sid')).toBe('7');
+    expect(getCookie(SOURCEPOINT_MARKER_COOKIE)).toBe('sp');
+  });
+
   it('handles multiple applicable sections', () => {
     localStorage.setItem(
       '_sp_user_consent_99999',
