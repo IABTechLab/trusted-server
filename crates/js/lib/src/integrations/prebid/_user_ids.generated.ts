@@ -5,3 +5,9 @@
 // list of module names (e.g. "connectId,criteo,sharedId") before building.
 // Default: ""
 
+import 'prebid.js/modules/connectIdSystem.js';
+import 'prebid.js/modules/criteoIdSystem.js';
+import 'prebid.js/modules/identityLinkIdSystem.js';
+import 'prebid.js/modules/uid2IdSystem.js';
+import 'prebid.js/modules/sharedIdSystem.js';
+import 'prebid.js/modules/unifiedIdSystem.js';

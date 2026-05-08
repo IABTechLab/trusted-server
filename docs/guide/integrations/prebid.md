@@ -234,8 +234,12 @@ Build-time selection *is* supported for User ID submodules via
 
 ```bash
 # Include all listed modules in the TSJS bundle
-TSJS_PREBID_USER_ID_MODULES=connectId,criteo,identityLink,liveIntent,uid2,sharedId,unifiedId
+TSJS_PREBID_USER_ID_MODULES=connectId,criteo,identityLink,uid2,sharedId,unifiedId
 ```
+
+If any listed module uses CommonJS `require(...)`, TSJS cannot safely include it in
+its IIFE browser bundle and will skip it with a build warning. In the current
+Prebid version, `liveIntent` is one such module and must currently be omitted.
 
 `build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
 that list (for example: `import 'prebid.js/modules/criteoIdSystem.js'`).

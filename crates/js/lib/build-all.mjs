@@ -62,6 +62,19 @@ const USER_ID_MODULE_OVERRIDES = {
 };
 
 /**
+ * Check whether a candidate file uses CommonJS `require`, which is not supported
+ * by this browser bundle output mode.
+ */
+function hasRequireSyntax(filePath) {
+  try {
+    const source = fs.readFileSync(filePath, 'utf8');
+    return /\brequire\s*\(/.test(source);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Generate `_adapters.generated.ts` with import statements for each adapter
  * listed in the TSJS_PREBID_ADAPTERS environment variable.
  *
@@ -172,24 +185,37 @@ function generatePrebidUserIdModules() {
         ];
 
     let imported = false;
+    let skippedForUnsupportedSyntax = false;
     for (const candidate of candidateNames) {
       const moduleFile = `${candidate}.js`;
       const modulePath = path.join(modulesDir, moduleFile);
       const publicModulePath = path.join(modulesPublicDir, moduleFile);
-      if (fs.existsSync(modulePath) || fs.existsSync(publicModulePath)) {
-        const importLine = `import 'prebid.js/modules/${moduleFile}';`;
-        if (!imports.includes(importLine)) {
-          imports.push(importLine);
-          loadedModuleNames.push(rawName);
-        } else if (!loadedModuleNames.includes(rawName)) {
-          loadedModuleNames.push(rawName);
-        }
-        imported = true;
+
+      const moduleFilePaths = [modulePath, publicModulePath].filter(fs.existsSync);
+      if (moduleFilePaths.length === 0) {
+        continue;
+      }
+
+      if (moduleFilePaths.some((candidatePath) => hasRequireSyntax(candidatePath))) {
+        console.error(
+          `[build-all] WARNING: Prebid user ID module "${rawName}" uses require() and is not supported in the TSJS bundle, skipping`,
+        );
+        skippedForUnsupportedSyntax = true;
         break;
       }
+
+      const importLine = `import 'prebid.js/modules/${moduleFile}';`;
+      if (!imports.includes(importLine)) {
+        imports.push(importLine);
+        loadedModuleNames.push(rawName);
+      } else if (!loadedModuleNames.includes(rawName)) {
+        loadedModuleNames.push(rawName);
+      }
+      imported = true;
+      break;
     }
 
-    if (!imported) {
+    if (!imported && !skippedForUnsupportedSyntax) {
       console.error(
         `[build-all] WARNING: Prebid user ID module "${rawName}" not found, skipping`,
       );
