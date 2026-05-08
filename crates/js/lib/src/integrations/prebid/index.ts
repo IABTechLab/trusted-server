@@ -21,10 +21,13 @@ import 'prebid.js/modules/userId.js';
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
 // build time. See _adapters.generated.ts (written by build-all.mjs).
+// User ID submodules are controlled by TSJS_PREBID_USER_ID_MODULES.
+// See _user_ids.generated.ts.
 // When a bidder is listed in `client_side_bidders` in trusted-server.toml,
 // the requestBids shim leaves its bids untouched and the corresponding
 // adapter handles them natively in the browser.
 import './_adapters.generated';
+import './_user_ids.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';

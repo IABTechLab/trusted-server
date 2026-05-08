@@ -229,9 +229,19 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
-Build-time configurable User ID submodule selection is not currently part of the
-TSJS build pipeline. Do not rely on a `TSJS_PREBID_USER_IDS` environment
-variable or generated `_user_ids.generated.ts` file for slim User ID builds.
+Build-time selection *is* supported for User ID submodules via
+`TSJS_PREBID_USER_ID_MODULES`.
+
+```bash
+# Include all listed modules in the TSJS bundle
+TSJS_PREBID_USER_ID_MODULES=connectId,criteo,identityLink,liveIntent,uid2,sharedId,unifiedId
+```
+
+`build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
+that list (for example: `import 'prebid.js/modules/criteoIdSystem.js'`).
+
+This is separate from `TSJS_PREBID_ADAPTERS`, which continues to control
+client-side bidder adapter modules.
 
 ## Identity Forwarding
 
