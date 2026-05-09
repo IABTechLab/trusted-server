@@ -697,17 +697,20 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                 | Type          | Default                                                                | Description                                                                                                                                           |
-| --------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`             | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
-| `server_url`          | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
-| `timeout_ms`          | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
-| `bidders`             | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
-| `debug`               | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
-| `test_mode`           | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
-| `debug_query_params`  | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
-| `client_side_bidders` | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
-| `script_patterns`     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+| Field                      | Type          | Default                                                                | Description                                                                                                                                           |
+| -------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
+| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
+| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
+| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
+| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
+| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
+| `debug`                    | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
+| `test_mode`                | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
+| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
+| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
 **Example**:
 
@@ -725,6 +728,18 @@ client_side_bidders = ["rubicon"]
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+pubid = "server-pub"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = { placementId = "_s2sHeaderPlacement" }
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "_s2sHeaderPlacement" }
 ```
 
 **Environment Override**:
@@ -734,6 +749,9 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,appnexus,openx
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":99999,"pubid":"server-pub"}}'
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_ZONE_OVERRIDES='{"kargo":{"header":{"placementId":"_s2sHeaderPlacement"}}}'
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_s2sHeaderPlacement"}}]'
 TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=rubicon
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
@@ -750,6 +768,14 @@ The `script_patterns` configuration determines which Prebid scripts are intercep
 - **Disable interception**: Set `script_patterns = []` to keep client-side Prebid
 
 See [Prebid Integration](/guide/integrations/prebid) for full details.
+
+**Bid Param Override Surfaces**:
+
+- `bid_param_overrides`: Static per-bidder shallow-merge overrides.
+- `bid_param_zone_overrides`: Per-bidder, per-zone shallow-merge overrides.
+- `bid_param_override_rules`: Canonical ordered rules with `when` matchers and `set` objects.
+
+Compatibility fields are normalized into the same runtime engine as canonical rules. Explicit `bid_param_override_rules` run after compatibility-derived rules, so later canonical rules win on conflicts.
 
 ### Next.js Integration
 
