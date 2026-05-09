@@ -98,10 +98,12 @@ pub struct PrebidIntegrationConfig {
     /// manages both lists explicitly.
     #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
     pub client_side_bidders: Vec<String>,
-    /// Per-bidder, per-zone param overrides. The outer key is a bidder name, the
-    /// inner key is a zone name (sent by the JS adapter from `mediaTypes.banner.name`
-    /// — a non-standard Prebid.js field used as a temporary workaround),
-    /// and the value is a JSON object shallow-merged into that bidder's params.
+    /// Compatibility sugar for per-bidder, per-zone param overrides.
+    ///
+    /// This preserves the natural `bidder -> zone -> params` config shape for
+    /// the existing zone-based use case, but it is normalized into the
+    /// canonical [`bid_param_override_rules`](Self::bid_param_override_rules)
+    /// engine before runtime use.
     ///
     /// Example in TOML:
     /// ```toml
@@ -111,7 +113,49 @@ pub struct PrebidIntegrationConfig {
     /// fixed_bottom = {placementId = "_s2sBottomId"}
     /// ```
     #[serde(default)]
-    pub bid_param_zone_overrides: HashMap<String, HashMap<String, Json>>,
+    pub bid_param_zone_overrides: HashMap<String, HashMap<String, serde_json::Map<String, Json>>>,
+    /// Compatibility sugar for static per-bidder parameter overrides.
+    ///
+    /// These rules are normalized into the canonical
+    /// [`bid_param_override_rules`](Self::bid_param_override_rules) engine and
+    /// therefore share the same validation and precedence behavior as explicit
+    /// rules.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [integrations.prebid.bid_param_overrides.bidder-name]
+    /// param1 = 12345
+    /// param2 = "value"
+    /// ```
+    ///
+    /// Example via environment variable:
+    /// ```text
+    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"bidder-name":{"param1":12345,"param2":"value"}}'
+    /// ```
+    #[serde(default)]
+    pub bid_param_overrides: HashMap<String, serde_json::Map<String, Json>>,
+    /// Canonical ordered bidder-param override rules.
+    ///
+    /// Each rule has structured `when` matchers and a non-empty `set` object
+    /// that is shallow-merged into the bidder params when every matcher
+    /// matches. Compatibility fields such as [`bid_param_overrides`](Self::bid_param_overrides)
+    /// and [`bid_param_zone_overrides`](Self::bid_param_zone_overrides) are
+    /// normalized into the same runtime rule engine before request handling.
+    ///
+    /// Example in TOML:
+    /// ```toml
+    /// [[integrations.prebid.bid_param_override_rules]]
+    /// when.bidder = "kargo"
+    /// when.zone = "header"
+    /// set = { placementId = "_abc" }
+    /// ```
+    ///
+    /// Example via environment variable:
+    /// ```text
+    /// TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_abc"}}]'
+    /// ```
+    #[serde(default)]
+    pub bid_param_override_rules: Vec<BidParamOverrideRule>,
     /// How consent signals are forwarded to Prebid Server.
     ///
     /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
@@ -125,6 +169,35 @@ impl IntegrationConfig for PrebidIntegrationConfig {
     fn is_enabled(&self) -> bool {
         self.enabled
     }
+}
+
+/// Canonical bidder-param override rule.
+///
+/// A rule matches against the request-time facts in [`BidParamOverrideWhen`]
+/// and shallow-merges [`set`](Self::set) into the bidder params when all
+/// populated matchers are equal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BidParamOverrideRule {
+    /// Structured exact-match conditions for this rule.
+    pub when: BidParamOverrideWhen,
+    /// Parameters shallow-merged into bidder params when the rule matches.
+    /// Top-level keys in this object are inserted or replaced; nested objects
+    /// are replaced wholesale rather than recursed into.
+    pub set: serde_json::Map<String, Json>,
+}
+
+/// Structured exact-match conditions for a [`BidParamOverrideRule`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BidParamOverrideWhen {
+    /// Bidder name matcher.
+    #[serde(default)]
+    pub bidder: Option<String>,
+    /// Zone matcher from `mediaTypes.banner.name` propagated via
+    /// `trustedServer.zone`.
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 fn default_timeout_ms() -> u32 {
@@ -156,11 +229,25 @@ fn default_script_patterns() -> Vec<String> {
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
+    engine: Arc<BidParamOverrideEngine>,
 }
 
 impl PrebidIntegration {
+    fn try_new(config: PrebidIntegrationConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        let engine = Arc::new(BidParamOverrideEngine::try_from_config(&config)?);
+        Ok(Arc::new(Self { config, engine }))
+    }
+
+    #[cfg(test)]
     fn new(config: PrebidIntegrationConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        Self::try_new(config).expect("should compile prebid bid param overrides")
+    }
+
+    fn auction_provider(&self) -> PrebidAuctionProvider {
+        PrebidAuctionProvider {
+            config: self.config.clone(),
+            bid_param_override_engine: Arc::clone(&self.engine),
+        }
     }
 
     fn matches_script_url(&self, attr_value: &str) -> bool {
@@ -264,7 +351,7 @@ fn build(
         }
     }
 
-    Ok(Some(PrebidIntegration::new(config)))
+    Ok(Some(PrebidIntegration::try_new(config)?))
 }
 
 /// Register the Prebid integration when enabled.
@@ -420,6 +507,303 @@ fn expand_trusted_server_bidders(
         })
         .collect()
 }
+
+/// Shallow-merges `override_obj` into `params`.
+///
+/// When `params` is a JSON object, each top-level key in `override_obj` is
+/// inserted or replaced in `params`. Nested objects are replaced wholesale —
+/// they are not recursed into. When `params` is not an object, it is left
+/// untouched to preserve pre-existing behavior.
+///
+/// Returns whether `params` was an object and the merge path ran.
+fn merge_bidder_param_object(
+    params: &mut Json,
+    override_obj: &serde_json::Map<String, Json>,
+) -> bool {
+    if let Json::Object(base) = params {
+        for (k, v) in override_obj {
+            base.insert(k.clone(), v.clone());
+        }
+
+        true
+    } else {
+        false
+    }
+}
+
+// ============================================================================
+// Generic bid-parameter override engine
+// ============================================================================
+
+fn warn_unconfigured_bidder(config: &PrebidIntegrationConfig, bidder: &str, field: &str) {
+    if !config.bidders.iter().any(|b| b == bidder) {
+        if config.client_side_bidders.iter().any(|b| b == bidder) {
+            log::warn!(
+                "prebid: {field} entry targets client-side-only bidder \
+                 '{bidder}' — server-side override will never apply"
+            );
+        } else {
+            log::warn!(
+                "prebid: {field} entry references unconfigured bidder \
+                 '{bidder}' — rule will never fire"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct BidParamOverrideEngine {
+    rules: Vec<CompiledBidParamOverrideRule>,
+    // Maps bidder name to the indices (into `rules`) of rules that constrain on that bidder.
+    // Rules with no bidder constraint (zone-only or catch-all) are kept in `wildcard_indices`.
+    // Both slices are in declaration order; `apply` merges them without allocation.
+    bidder_index: HashMap<String, Vec<usize>>,
+    wildcard_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledBidParamOverrideRule {
+    bidder: Option<String>,
+    zone: Option<String>,
+    set: serde_json::Map<String, Json>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct BidParamOverrideFacts<'a> {
+    bidder: &'a str,
+    zone: Option<&'a str>,
+}
+
+impl BidParamOverrideEngine {
+    fn try_from_config(
+        config: &PrebidIntegrationConfig,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut rules = Vec::new();
+
+        let mut bidder_overrides = config.bid_param_overrides.iter().collect::<Vec<_>>();
+        bidder_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        for (bidder, set) in bidder_overrides {
+            warn_unconfigured_bidder(config, bidder, "bid_param_overrides");
+            rules.push(CompiledBidParamOverrideRule::from_bidder_override(
+                bidder.as_str(),
+                set,
+            )?);
+        }
+
+        let mut zone_overrides = config.bid_param_zone_overrides.iter().collect::<Vec<_>>();
+        zone_overrides.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+        for (bidder, zone_override_sets) in zone_overrides {
+            warn_unconfigured_bidder(config, bidder, "bid_param_zone_overrides");
+            let mut sorted_zone_overrides = zone_override_sets.iter().collect::<Vec<_>>();
+            sorted_zone_overrides
+                .sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+
+            for (zone, set) in sorted_zone_overrides {
+                rules.push(CompiledBidParamOverrideRule::from_zone_override(
+                    bidder.as_str(),
+                    zone.as_str(),
+                    set,
+                )?);
+            }
+        }
+
+        for rule in &config.bid_param_override_rules {
+            if let Some(bidder) = &rule.when.bidder {
+                warn_unconfigured_bidder(config, bidder, "bid_param_override_rules");
+            }
+            rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
+        }
+
+        let mut bidder_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut wildcard_indices: Vec<usize> = Vec::new();
+        for (idx, rule) in rules.iter().enumerate() {
+            match &rule.bidder {
+                Some(bidder) => bidder_index.entry(bidder.clone()).or_default().push(idx),
+                None => wildcard_indices.push(idx),
+            }
+        }
+
+        Ok(Self {
+            rules,
+            bidder_index,
+            wildcard_indices,
+        })
+    }
+
+    fn apply(&self, facts: BidParamOverrideFacts<'_>, params: &mut Json) {
+        let bidder_indices = self.bidder_index.get(facts.bidder).map(Vec::as_slice);
+        for idx in merged_rule_indices(&self.wildcard_indices, bidder_indices) {
+            let rule = &self.rules[idx];
+            if rule.matches(facts) {
+                if merge_bidder_param_object(params, &rule.set) {
+                    log::debug!(
+                        "prebid: applying bidder param override for bidder '{}' zone {:?}: keys {:?}",
+                        facts.bidder,
+                        facts.zone,
+                        rule.set.keys().collect::<Vec<_>>()
+                    );
+                } else {
+                    log::debug!(
+                        "prebid: skipping bidder param override for bidder '{}' zone {:?}: params is not a JSON object",
+                        facts.bidder,
+                        facts.zone
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn merged_rule_indices<'a>(
+    wildcard_indices: &'a [usize],
+    bidder_indices: Option<&'a [usize]>,
+) -> impl Iterator<Item = usize> + 'a {
+    let mut wildcard = wildcard_indices.iter().copied().peekable();
+    let mut bidder = bidder_indices.unwrap_or(&[]).iter().copied().peekable();
+
+    std::iter::from_fn(move || match (wildcard.peek(), bidder.peek()) {
+        (Some(wildcard_idx), Some(bidder_idx)) if wildcard_idx <= bidder_idx => wildcard.next(),
+        (Some(_), Some(_)) => bidder.next(),
+        (Some(_), None) => wildcard.next(),
+        (None, Some(_)) => bidder.next(),
+        (None, None) => None,
+    })
+}
+
+impl CompiledBidParamOverrideRule {
+    fn from_bidder_override(
+        bidder: &str,
+        set: &serde_json::Map<String, Json>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        Self::new(
+            Some(bidder),
+            None,
+            set,
+            &format!("integrations.prebid.bid_param_overrides.{bidder}"),
+            false,
+        )
+    }
+
+    fn from_zone_override(
+        bidder: &str,
+        zone: &str,
+        set: &serde_json::Map<String, Json>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        Self::new(
+            Some(bidder),
+            Some(zone),
+            set,
+            &format!("integrations.prebid.bid_param_zone_overrides.{bidder}.{zone}"),
+            false,
+        )
+    }
+
+    fn new(
+        bidder: Option<&str>,
+        zone: Option<&str>,
+        set: &serde_json::Map<String, Json>,
+        source: &str,
+        is_canonical: bool,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let bidder = bidder
+            .map(|value| validate_override_matcher_string(value, "when.bidder", source))
+            .transpose()?;
+        let zone = zone
+            .map(|value| validate_override_matcher_string(value, "when.zone", source))
+            .transpose()?;
+
+        if bidder.is_none() && zone.is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!("{source} must include at least one matcher"),
+            }));
+        }
+
+        Ok(Self {
+            bidder,
+            zone,
+            set: non_empty_override_object(set, source, is_canonical)?,
+        })
+    }
+
+    fn matches(&self, facts: BidParamOverrideFacts<'_>) -> bool {
+        if let Some(expected_bidder) = self.bidder.as_deref() {
+            if expected_bidder != facts.bidder {
+                return false;
+            }
+        }
+
+        if let Some(expected_zone) = self.zone.as_deref() {
+            if facts.zone != Some(expected_zone) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl TryFrom<BidParamOverrideRule> for CompiledBidParamOverrideRule {
+    type Error = Report<TrustedServerError>;
+
+    fn try_from(rule: BidParamOverrideRule) -> Result<Self, Self::Error> {
+        Self::try_from(&rule)
+    }
+}
+
+impl TryFrom<&BidParamOverrideRule> for CompiledBidParamOverrideRule {
+    type Error = Report<TrustedServerError>;
+
+    fn try_from(rule: &BidParamOverrideRule) -> Result<Self, Self::Error> {
+        Self::new(
+            rule.when.bidder.as_deref(),
+            rule.when.zone.as_deref(),
+            &rule.set,
+            "integrations.prebid.bid_param_override_rules[*]",
+            true,
+        )
+    }
+}
+
+// Trims leading/trailing whitespace from config-side matcher strings so that
+// accidental padding in TOML/JSON does not produce a silently non-matching rule.
+// Runtime facts (bidder name, zone) are not trimmed — they come from controlled
+// internal sources (bidder-map keys, trustedServer.zone) where whitespace is
+// never expected. Matching is exact and case-sensitive after this normalisation.
+fn validate_override_matcher_string(
+    value: &str,
+    field: &str,
+    source: &str,
+) -> Result<String, Report<TrustedServerError>> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{source}.{field} must not be empty"),
+        }));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn non_empty_override_object(
+    value: &serde_json::Map<String, Json>,
+    source: &str,
+    is_canonical: bool,
+) -> Result<serde_json::Map<String, Json>, Report<TrustedServerError>> {
+    if value.is_empty() {
+        let message = if is_canonical {
+            format!("{source}.set must not be empty")
+        } else {
+            format!("{source} entry must not be empty")
+        };
+        return Err(Report::new(TrustedServerError::Configuration { message }));
+    }
+
+    Ok(value.clone())
+}
+
 /// Copies browser headers to the outgoing Prebid Server request.
 ///
 /// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
@@ -466,13 +850,25 @@ fn append_query_params(url: &str, params: &str) -> String {
 /// Prebid Server auction provider.
 pub struct PrebidAuctionProvider {
     config: PrebidIntegrationConfig,
+    bid_param_override_engine: Arc<BidParamOverrideEngine>,
 }
 
 impl PrebidAuctionProvider {
-    /// Create a new Prebid auction provider.
-    #[must_use]
-    pub fn new(config: PrebidIntegrationConfig) -> Self {
-        Self { config }
+    #[cfg(test)]
+    fn new(config: PrebidIntegrationConfig) -> Self {
+        Self::try_new(config).expect("should compile prebid bid param overrides")
+    }
+
+    /// Create a new Prebid auction provider with validated override rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured bidder-param override rules are invalid.
+    pub fn try_new(config: PrebidIntegrationConfig) -> Result<Self, Report<TrustedServerError>> {
+        Ok(Self {
+            bid_param_override_engine: Arc::new(BidParamOverrideEngine::try_from_config(&config)?),
+            config,
+        })
     }
 
     /// Convert auction request to `OpenRTB` format with all enrichments.
@@ -542,26 +938,10 @@ impl PrebidAuctionProvider {
                     }
                 }
 
-                // Apply zone-specific bid param overrides when configured.
+                // Apply canonical and compatibility-derived rules in normalized order.
                 for (name, params) in &mut bidder {
-                    let zone_override = zone.and_then(|z| {
-                        self.config
-                            .bid_param_zone_overrides
-                            .get(name.as_str())
-                            .and_then(|zones| zones.get(z))
-                    });
-
-                    if let Some(Json::Object(ovr)) = zone_override {
-                        if let Json::Object(base) = params {
-                            log::debug!(
-                                "prebid: zone override for '{}' zone '{}': keys {:?}",
-                                name,
-                                zone.unwrap_or(""),
-                                ovr.keys().collect::<Vec<_>>()
-                            );
-                            base.extend(ovr.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        }
-                    }
+                    self.bid_param_override_engine
+                        .apply(BidParamOverrideFacts { bidder: name, zone }, params);
                 }
 
                 Some(Imp {
@@ -1182,31 +1562,23 @@ impl AuctionProvider for PrebidAuctionProvider {
 pub fn register_auction_provider(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+    let Some(integration) = build(settings)? else {
+        log::info!("Prebid auction provider not registered: integration not found or disabled");
+        return Ok(Vec::new());
+    };
 
-    match settings.integration_config::<PrebidIntegrationConfig>("prebid") {
-        Ok(Some(config)) => {
-            log::info!(
-                "Registering Prebid auction provider (server_url={})",
-                config.server_url
-            );
-            if config.debug {
-                log::warn!(
-                    "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
-                     bidstatus) will be included in /auction responses"
-                );
-            }
-            providers.push(Arc::new(PrebidAuctionProvider::new(config)));
-        }
-        Ok(None) => {
-            log::info!("Prebid auction provider not registered: integration not found or disabled");
-        }
-        Err(e) => {
-            return Err(e);
-        }
+    log::info!(
+        "Registering Prebid auction provider (server_url={})",
+        integration.config.server_url
+    );
+    if integration.config.debug {
+        log::warn!(
+            "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+             bidstatus) will be included in /auction responses"
+        );
     }
 
-    Ok(providers)
+    Ok(vec![Arc::new(integration.auction_provider())])
 }
 
 #[cfg(test)]
@@ -1256,7 +1628,9 @@ mod tests {
             debug_query_params: None,
             script_patterns: default_script_patterns(),
             client_side_bidders: Vec::new(),
-            bid_param_zone_overrides: HashMap::new(),
+            bid_param_zone_overrides: HashMap::default(),
+            bid_param_overrides: HashMap::default(),
+            bid_param_override_rules: Vec::new(),
             consent_forwarding: ConsentForwardingMode::Both,
         }
     }
@@ -1339,11 +1713,27 @@ secret_key = "test-secret-key"
             .expect("should be enabled")
     }
 
+    fn parse_prebid_toml_result(
+        prebid_section: &str,
+    ) -> Result<PrebidIntegrationConfig, Report<TrustedServerError>> {
+        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let settings = Settings::from_toml(&toml_str)?;
+        settings
+            .integration_config::<PrebidIntegrationConfig>("prebid")?
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::Configuration {
+                    message: "prebid integration config should be present and enabled".to_string(),
+                })
+            })
+    }
+
+    fn json_object(value: Json) -> serde_json::Map<String, Json> {
+        serde_json::from_value(value).expect("should build JSON object")
+    }
+
     #[test]
     fn attribute_rewriter_removes_prebid_scripts() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
             request_host: "pub.example",
@@ -1360,9 +1750,7 @@ secret_key = "test-secret-key"
 
     #[test]
     fn attribute_rewriter_handles_query_strings_and_links() {
-        let integration = PrebidIntegration {
-            config: base_config(),
-        };
+        let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "href",
             request_host: "pub.example",
@@ -2706,6 +3094,103 @@ server_url = "https://prebid.example"
     }
 
     // ========================================================================
+    // bid_param_overrides tests
+    // ========================================================================
+
+    #[test]
+    fn bidder_param_override_replaces_and_merges_client_params() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+pubid = "server-pub"
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "criteo": {
+                    "networkId": 11111,
+                    "pubid": "client-pub",
+                    "keep": "present"
+                }
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["criteo"]["networkId"], 99999,
+            "override should replace the client-side networkId"
+        );
+        assert_eq!(
+            params["criteo"]["pubid"], "server-pub",
+            "override should replace the client-side pubid"
+        );
+        assert_eq!(
+            params["criteo"]["keep"], "present",
+            "override should preserve unrelated bidder params"
+        );
+    }
+
+    #[test]
+    fn bidder_param_override_replaces_nested_objects() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["appnexus"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = { bidder = "appnexus" }
+set = { keywords = { genre = "news" } }
+"#,
+        );
+
+        // Client sends a nested `keywords` object; shallow merge replaces the
+        // entire `keywords` value with the override object.
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "appnexus": {
+                    "placementId": 12345,
+                    "keywords": { "sport": "football", "genre": "sports" }
+                }
+            }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+        let keywords = &params["appnexus"]["keywords"];
+
+        assert_eq!(
+            keywords["genre"], "news",
+            "override should replace the client-side keywords object"
+        );
+        assert_eq!(
+            keywords["sport"],
+            Json::Null,
+            "shallow merge should replace the entire keywords object, not preserve stale sub-keys"
+        );
+        assert_eq!(
+            params["appnexus"]["placementId"], 12345,
+            "shallow merge should preserve unrelated top-level bidder params"
+        );
+    }
+
+    // ========================================================================
     // bid_param_zone_overrides tests
     // ========================================================================
 
@@ -2730,7 +3215,7 @@ server_url = "https://prebid.example"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "s2s_header_id" }),
+                json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
 
@@ -2757,7 +3242,7 @@ server_url = "https://prebid.example"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "zone_header_id" }),
+                json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
 
@@ -2785,7 +3270,7 @@ server_url = "https://prebid.example"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "zone_header_id" }),
+                json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
 
@@ -2813,7 +3298,7 @@ server_url = "https://prebid.example"
             "kargo".to_string(),
             HashMap::from([(
                 "header".to_string(),
-                json!({ "placementId": "s2s_header_id" }),
+                json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
 
@@ -2845,7 +3330,10 @@ server_url = "https://prebid.example"
         config.bidders = vec!["kargo".to_string()];
         config.bid_param_zone_overrides.insert(
             "kargo".to_string(),
-            HashMap::from([("header".to_string(), json!({ "placementId": "s2s_header" }))]),
+            HashMap::from([(
+                "header".to_string(),
+                json_object(json!({ "placementId": "s2s_header" })),
+            )]),
         );
 
         // Client sends extra field alongside placementId
@@ -2898,6 +3386,549 @@ fixed_bottom = {placementId = "_s2sBottom"}
             kargo_zones["fixed_bottom"]["placementId"], "_s2sBottom",
             "should parse fixed_bottom zone"
         );
+    }
+
+    #[test]
+    fn bid_param_override_rules_config_parsing_from_toml() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "_s2sHeader", extra = "x" }
+"#,
+        );
+
+        assert_eq!(
+            config.bid_param_override_rules.len(),
+            1,
+            "should parse one canonical override rule"
+        );
+        assert_eq!(
+            config.bid_param_override_rules[0].when.bidder.as_deref(),
+            Some("kargo"),
+            "should parse bidder matcher"
+        );
+        assert_eq!(
+            config.bid_param_override_rules[0].when.zone.as_deref(),
+            Some("header"),
+            "should parse zone matcher"
+        );
+        assert_eq!(
+            config.bid_param_override_rules[0].set["placementId"], "_s2sHeader",
+            "should parse canonical set object"
+        );
+    }
+
+    #[test]
+    fn bid_param_overrides_config_rejects_non_object_bidder_value() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_overrides]
+criteo = "not-an-object"
+"#,
+        );
+
+        assert!(result.is_err(), "should reject non-object bidder overrides");
+    }
+
+    #[test]
+    fn zone_overrides_config_rejects_non_object_zone_value() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = "not-an-object"
+"#,
+        );
+
+        assert!(result.is_err(), "should reject non-object zone overrides");
+    }
+
+    #[test]
+    fn bid_param_override_rules_config_rejects_non_object_set() {
+        let result = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+set = "not-an-object"
+"#,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject canonical override rules with non-object sets"
+        );
+    }
+
+    #[test]
+    fn explicit_bid_param_override_rule_applies_for_bidder_and_zone() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "rule_header", keep = "server" }
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({
+                "kargo": {
+                    "placementId": "client",
+                    "keep": "client",
+                    "other": "present"
+                }
+            }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let params = bidder_params(&ortb);
+
+        assert_eq!(
+            params["kargo"]["placementId"], "rule_header",
+            "canonical rule should override placementId"
+        );
+        assert_eq!(
+            params["kargo"]["keep"], "server",
+            "canonical rule should replace overlapping keys"
+        );
+        assert_eq!(
+            params["kargo"]["other"], "present",
+            "canonical rule should preserve unrelated keys"
+        );
+    }
+
+    #[test]
+    fn explicit_bid_param_override_rule_wins_over_zone_compatibility_rule() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["kargo"]
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = { placementId = "compat_header" }
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "explicit_header" }
+"#,
+        );
+
+        let slot = make_ts_slot(
+            "ad-header-0",
+            &json!({ "kargo": { "placementId": "client" } }),
+            Some("header"),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        assert_eq!(
+            bidder_params(&ortb)["kargo"]["placementId"],
+            "explicit_header",
+            "canonical rules should run after compatibility-derived rules"
+        );
+    }
+
+    // ========================================================================
+    // BidParamOverrideEngine unit tests
+    // ========================================================================
+
+    mod bid_param_override_engine {
+        use super::*;
+
+        fn empty_params() -> Json {
+            Json::Object(serde_json::Map::new())
+        }
+
+        fn params_with(key: &str, value: Json) -> Json {
+            let mut map = serde_json::Map::new();
+            map.insert(key.to_string(), value);
+            Json::Object(map)
+        }
+
+        fn rule_signature(rule: &CompiledBidParamOverrideRule) -> String {
+            format!(
+                "{}:{}",
+                rule.bidder.as_deref().unwrap_or("*"),
+                rule.zone.as_deref().unwrap_or("*")
+            )
+        }
+
+        #[test]
+        fn engine_normalizes_static_compatibility_rule() {
+            let mut config = base_config();
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 99 })),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile static compatibility overrides");
+
+            assert_eq!(engine.rules.len(), 1, "should compile one static rule");
+            assert_eq!(
+                engine.rules[0].bidder.as_deref(),
+                Some("criteo"),
+                "should set bidder matcher"
+            );
+            assert_eq!(
+                engine.rules[0].zone, None,
+                "should not set zone matcher for static overrides"
+            );
+            assert_eq!(
+                engine.rules[0].set.get("networkId"),
+                Some(&json!(99)),
+                "should preserve set object"
+            );
+        }
+
+        #[test]
+        fn engine_normalizes_zone_compatibility_rule() {
+            let mut config = base_config();
+            config.bid_param_zone_overrides.insert(
+                "kargo".to_string(),
+                HashMap::from([(
+                    "header".to_string(),
+                    json_object(json!({ "placementId": "zone-header" })),
+                )]),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile zone compatibility overrides");
+
+            assert_eq!(engine.rules.len(), 1, "should compile one zone rule");
+            assert_eq!(
+                engine.rules[0].bidder.as_deref(),
+                Some("kargo"),
+                "should set bidder matcher"
+            );
+            assert_eq!(
+                engine.rules[0].zone.as_deref(),
+                Some("header"),
+                "should set zone matcher"
+            );
+            assert_eq!(
+                engine.rules[0].set.get("placementId"),
+                Some(&json!("zone-header")),
+                "should preserve zone set object"
+            );
+        }
+
+        #[test]
+        fn engine_applies_bidder_only_rule() {
+            let mut config = base_config();
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 42 })),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile bidder-only override");
+            let mut params = empty_params();
+
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "criteo",
+                    zone: Some("header"),
+                },
+                &mut params,
+            );
+
+            assert_eq!(
+                params["networkId"], 42,
+                "bidder-only override should apply regardless of zone"
+            );
+        }
+
+        #[test]
+        fn engine_applies_bidder_and_zone_rule() {
+            let mut config = base_config();
+            config.bid_param_zone_overrides.insert(
+                "kargo".to_string(),
+                HashMap::from([(
+                    "header".to_string(),
+                    json_object(json!({ "placementId": "s2s_h" })),
+                )]),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile bidder-and-zone override");
+            let mut params = params_with("placementId", json!("client"));
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "kargo",
+                    zone: Some("header"),
+                },
+                &mut params,
+            );
+            assert_eq!(
+                params["placementId"], "s2s_h",
+                "bidder-and-zone override should apply when both facts match"
+            );
+        }
+
+        #[test]
+        fn engine_noop_when_facts_do_not_match() {
+            let mut config = base_config();
+            config.bid_param_zone_overrides.insert(
+                "kargo".to_string(),
+                HashMap::from([(
+                    "header".to_string(),
+                    json_object(json!({ "placementId": "s2s_h" })),
+                )]),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile unmatched override");
+            let mut params = params_with("placementId", json!("client"));
+
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "kargo",
+                    zone: Some("sidebar"),
+                },
+                &mut params,
+            );
+
+            assert_eq!(
+                params["placementId"], "client",
+                "should leave params unchanged when facts do not match"
+            );
+        }
+
+        #[test]
+        fn merge_reports_skip_for_non_object_params() {
+            let mut params = json!("client-string");
+            let override_obj = json_object(json!({ "placementId": "server" }));
+
+            let merged = merge_bidder_param_object(&mut params, &override_obj);
+
+            assert!(
+                !merged,
+                "should report skip when bidder params are not an object"
+            );
+            assert_eq!(
+                params,
+                json!("client-string"),
+                "should leave non-object bidder params unchanged"
+            );
+        }
+
+        #[test]
+        fn engine_apply_is_noop_for_non_object_params() {
+            let mut config = base_config();
+            config.bid_param_overrides.insert(
+                "criteo".to_string(),
+                json_object(json!({ "networkId": 42 })),
+            );
+
+            let engine = BidParamOverrideEngine::try_from_config(&config).expect("should compile");
+            let mut params = json!("client-string");
+
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "criteo",
+                    zone: None,
+                },
+                &mut params,
+            );
+
+            assert_eq!(
+                params,
+                json!("client-string"),
+                "should leave non-object params unchanged when a matching rule exists"
+            );
+        }
+
+        #[test]
+        fn engine_applies_later_rule_last_write_wins() {
+            let mut config = base_config();
+            config.bid_param_overrides.insert(
+                "kargo".to_string(),
+                json_object(json!({ "placementId": "compat" })),
+            );
+            config.bid_param_override_rules.push(BidParamOverrideRule {
+                when: BidParamOverrideWhen {
+                    bidder: Some("kargo".to_string()),
+                    zone: Some("header".to_string()),
+                },
+                set: json_object(json!({ "placementId": "explicit", "extra": "x" })),
+            });
+
+            let engine = BidParamOverrideEngine::try_from_config(&config)
+                .expect("should compile ordered overrides");
+            let mut params = params_with("keep", json!("yes"));
+
+            engine.apply(
+                BidParamOverrideFacts {
+                    bidder: "kargo",
+                    zone: Some("header"),
+                },
+                &mut params,
+            );
+
+            assert_eq!(
+                params["placementId"], "explicit",
+                "later canonical rule should override earlier compatibility rule"
+            );
+            assert_eq!(
+                params["extra"], "x",
+                "should merge additional explicit keys"
+            );
+            assert_eq!(params["keep"], "yes", "should preserve unrelated params");
+        }
+
+        #[test]
+        fn merged_rule_indices_preserve_declaration_order() {
+            let wildcard_indices = [0, 3, 6];
+            let bidder_indices = [1, 2, 5, 7];
+
+            let actual =
+                merged_rule_indices(&wildcard_indices, Some(&bidder_indices)).collect::<Vec<_>>();
+
+            assert_eq!(
+                actual,
+                vec![0, 1, 2, 3, 5, 6, 7],
+                "merged indices should preserve global declaration order"
+            );
+        }
+
+        #[test]
+        fn compile_rule_trims_matcher_whitespace() {
+            let rule = BidParamOverrideRule {
+                when: BidParamOverrideWhen {
+                    bidder: Some(" kargo ".to_string()),
+                    zone: Some(" header ".to_string()),
+                },
+                set: json_object(json!({ "placementId": "trimmed" })),
+            };
+
+            let compiled = CompiledBidParamOverrideRule::try_from(rule)
+                .expect("should compile rule with surrounding whitespace");
+
+            assert_eq!(
+                compiled.bidder.as_deref(),
+                Some("kargo"),
+                "should store trimmed bidder matcher"
+            );
+            assert_eq!(
+                compiled.zone.as_deref(),
+                Some("header"),
+                "should store trimmed zone matcher"
+            );
+            assert!(
+                compiled.matches(BidParamOverrideFacts {
+                    bidder: "kargo",
+                    zone: Some("header"),
+                }),
+                "trimmed matchers should match normalized request facts"
+            );
+        }
+
+        #[test]
+        fn engine_compiles_compatibility_rules_in_sorted_matcher_order() {
+            let expected = [
+                "alpha:*",
+                "beta:*",
+                "gamma:*",
+                "kargo:footer",
+                "kargo:header",
+                "openx:sidebar",
+            ];
+
+            for iteration in 0..16 {
+                let mut config = base_config();
+                config.bid_param_overrides = HashMap::from([
+                    ("gamma".to_string(), json_object(json!({ "networkId": 3 }))),
+                    ("alpha".to_string(), json_object(json!({ "networkId": 1 }))),
+                    ("beta".to_string(), json_object(json!({ "networkId": 2 }))),
+                ]);
+                config.bid_param_zone_overrides = HashMap::from([
+                    (
+                        "openx".to_string(),
+                        HashMap::from([(
+                            "sidebar".to_string(),
+                            json_object(json!({ "placementId": "openx-sidebar" })),
+                        )]),
+                    ),
+                    (
+                        "kargo".to_string(),
+                        HashMap::from([
+                            (
+                                "header".to_string(),
+                                json_object(json!({ "placementId": "kargo-header" })),
+                            ),
+                            (
+                                "footer".to_string(),
+                                json_object(json!({ "placementId": "kargo-footer" })),
+                            ),
+                        ]),
+                    ),
+                ]);
+
+                let engine = BidParamOverrideEngine::try_from_config(&config)
+                    .expect("should compile compatibility overrides");
+                let actual = engine.rules.iter().map(rule_signature).collect::<Vec<_>>();
+
+                assert_eq!(
+                    actual,
+                    expected,
+                    "compatibility rules should compile in sorted matcher order on iteration {iteration}"
+                );
+            }
+        }
+
+        #[test]
+        fn compile_rule_rejects_empty_when() {
+            let rule = BidParamOverrideRule {
+                when: BidParamOverrideWhen::default(),
+                set: json_object(json!({ "placementId": "x" })),
+            };
+
+            let result = CompiledBidParamOverrideRule::try_from(rule);
+            assert!(result.is_err(), "should reject empty when");
+        }
+
+        #[test]
+        fn compile_rule_rejects_empty_object_set() {
+            let rule = BidParamOverrideRule {
+                when: BidParamOverrideWhen {
+                    bidder: Some("kargo".to_string()),
+                    zone: None,
+                },
+                set: serde_json::Map::new(),
+            };
+
+            let result = CompiledBidParamOverrideRule::try_from(rule);
+            assert!(result.is_err(), "should reject empty set object");
+        }
     }
 
     #[test]
@@ -3025,5 +4056,53 @@ fixed_bottom = {placementId = "_s2sBottom"}
         assert_eq!(statuses.len(), 2);
         assert_eq!(statuses[0]["bidder"], "kargo");
         assert_eq!(statuses[1]["status"], "timeout");
+    }
+
+    #[test]
+    fn register_rejects_invalid_bid_param_override_rule() {
+        let toml = format!(
+            "{}\n{}",
+            TOML_BASE,
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = {}
+set = { networkId = 42 }
+"#
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let result = register(&settings);
+        assert!(
+            result.is_err(),
+            "should fail fast when a canonical rule has no matcher fields"
+        );
+    }
+
+    #[test]
+    fn register_auction_provider_rejects_invalid_bid_param_override_rule() {
+        let toml = format!(
+            "{}\n{}",
+            TOML_BASE,
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bidders = ["criteo"]
+
+[[integrations.prebid.bid_param_override_rules]]
+when = {}
+set = { networkId = 42 }
+"#
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let result = register_auction_provider(&settings);
+        assert!(
+            result.is_err(),
+            "should fail fast when a canonical rule has no matcher fields"
+        );
     }
 }
