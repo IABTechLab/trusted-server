@@ -5,8 +5,9 @@
 
 use std::net::IpAddr;
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::Request;
+use fastly::Request as FastlyRequest;
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -108,8 +109,14 @@ pub fn generate_ec_id(
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerError>> {
-    if let Some(ec_id) = req.get_header(HEADER_X_TS_EC).and_then(|h| h.to_str().ok()) {
+pub(crate) fn get_ec_id_from_http_request(
+    req: &http::Request<EdgeBody>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    if let Some(ec_id) = req
+        .headers()
+        .get(HEADER_X_TS_EC)
+        .and_then(|h| h.to_str().ok())
+    {
         if ec_id_has_only_allowed_chars(ec_id) {
             log::trace!("Using existing EC ID from header: {}", ec_id);
             return Ok(Some(ec_id.to_string()));
@@ -117,8 +124,7 @@ pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerEr
         log::warn!("Rejected EC ID from x-ts-ec header with disallowed characters");
     }
 
-    let http_req = compat::from_fastly_headers_ref(req);
-    match handle_request_cookies(&http_req)? {
+    match handle_request_cookies(req)? {
         Some(jar) => {
             if let Some(cookie) = jar.get(COOKIE_TS_EC) {
                 let value = cookie.value();
@@ -137,6 +143,16 @@ pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerEr
     Ok(None)
 }
 
+/// Gets an existing EC ID from a Fastly request.
+///
+/// # Errors
+///
+/// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
+pub fn get_ec_id(req: &FastlyRequest) -> Result<Option<String>, Report<TrustedServerError>> {
+    let http_req = compat::from_fastly_headers_ref(req);
+    get_ec_id_from_http_request(&http_req)
+}
+
 /// Gets or creates an EC ID from the request.
 ///
 /// Attempts to retrieve an existing EC ID from:
@@ -148,12 +164,12 @@ pub fn get_ec_id(req: &Request) -> Result<Option<String>, Report<TrustedServerEr
 /// # Errors
 ///
 /// Returns an error if ID generation fails.
-pub fn get_or_generate_ec_id(
+pub(crate) fn get_or_generate_ec_id_from_http_request(
     settings: &Settings,
     services: &RuntimeServices,
-    req: &Request,
+    req: &http::Request<EdgeBody>,
 ) -> Result<String, Report<TrustedServerError>> {
-    if let Some(id) = get_ec_id(req)? {
+    if let Some(id) = get_ec_id_from_http_request(req)? {
         return Ok(id);
     }
 
@@ -161,6 +177,20 @@ pub fn get_or_generate_ec_id(
     let ec_id = generate_ec_id(settings, services)?;
     log::trace!("No existing EC ID, generated: {}", ec_id);
     Ok(ec_id)
+}
+
+/// Gets or creates an EC ID from a Fastly request.
+///
+/// # Errors
+///
+/// Returns an error if ID generation fails.
+pub fn get_or_generate_ec_id(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &FastlyRequest,
+) -> Result<String, Report<TrustedServerError>> {
+    let http_req = compat::from_fastly_headers_ref(req);
+    get_or_generate_ec_id_from_http_request(settings, services, &http_req)
 }
 
 #[cfg(test)]
@@ -202,8 +232,8 @@ mod tests {
         assert_eq!(normalize_ip(ipv6_a), "2001:db8:abcd:1::");
     }
 
-    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> Request {
-        let mut req = Request::new("GET", "http://example.com");
+    fn create_test_request(headers: Vec<(HeaderName, &str)>) -> FastlyRequest {
+        let mut req = FastlyRequest::new("GET", "http://example.com");
         for (key, value) in headers {
             req.set_header(
                 key,
@@ -333,6 +363,39 @@ mod tests {
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
             .expect("should reuse cookie EC ID");
         assert_eq!(ec_id, "existing_cookie_id");
+    }
+
+    #[test]
+    fn test_get_ec_id_from_http_request_with_header() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header(HEADER_X_TS_EC, "existing_http_ec_id")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let ec_id = get_ec_id_from_http_request(&req).expect("should get EC ID from http request");
+
+        assert_eq!(ec_id, Some("existing_http_ec_id".to_string()));
+    }
+
+    #[test]
+    fn test_get_or_generate_ec_id_from_http_request_reuses_cookie() {
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header(
+                fastly::http::header::COOKIE,
+                format!("{}=existing_http_cookie_id", COOKIE_TS_EC),
+            )
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let ec_id = get_or_generate_ec_id_from_http_request(&settings, &noop_services(), &req)
+            .expect("should reuse cookie EC ID from http request");
+
+        assert_eq!(ec_id, "existing_http_cookie_id");
     }
 
     #[test]

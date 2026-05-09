@@ -67,7 +67,7 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
-                fastly_resp.set_body(bytes.to_vec());
+                fastly_resp.set_body(bytes.as_ref());
             }
         }
         EdgeBody::Stream(_) => {
@@ -142,17 +142,9 @@ pub fn set_fastly_ec_cookie(
     response: &mut fastly::Response,
     ec_id: &str,
 ) {
-    if !crate::cookies::ec_cookie_value_is_safe(ec_id) {
-        log::warn!(
-            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            ec_id.len()
-        );
-        return;
+    if let Some(cookie) = crate::cookies::try_build_ec_cookie_value(settings, ec_id) {
+        response.append_header(header::SET_COOKIE, cookie);
     }
-    response.append_header(
-        header::SET_COOKIE,
-        crate::cookies::create_ec_cookie(settings, ec_id),
-    );
 }
 
 /// Expire the EC ID cookie on a `fastly::Response`.

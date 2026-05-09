@@ -148,7 +148,8 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
 /// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
 /// are removed before forwarding. If stripping leaves no cookies or yields an
 /// invalid header value, the stripped header is omitted. Non-UTF-8 cookie
-/// headers are forwarded unchanged.
+/// headers are forwarded unchanged. Existing `Cookie` headers on `to` are
+/// preserved; source values are appended after them.
 pub fn forward_cookie_header(
     from: &Request<EdgeBody>,
     to: &mut Request<EdgeBody>,
@@ -247,6 +248,19 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
     )
 }
 
+#[must_use]
+pub(crate) fn try_build_ec_cookie_value(settings: &Settings, ec_id: &str) -> Option<String> {
+    if !ec_cookie_value_is_safe(ec_id) {
+        log::warn!(
+            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
+            ec_id.len()
+        );
+        return None;
+    }
+
+    Some(create_ec_cookie(settings, ec_id))
+}
+
 /// Sets the EC ID cookie on the given response.
 ///
 /// Validates `ec_id` against RFC 6265 `cookie-octet` rules before
@@ -263,17 +277,13 @@ pub fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 /// [`http::HeaderValue::from_str`] is called, so the expect is unreachable.
 /// Listed here only because clippy cannot prove it statically.
 pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
-    if !ec_cookie_value_is_safe(ec_id) {
-        log::warn!(
-            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            ec_id.len()
-        );
+    let Some(cookie) = try_build_ec_cookie_value(settings, ec_id) else {
         return;
-    }
+    };
+
     response.headers_mut().append(
         header::SET_COOKIE,
-        http::HeaderValue::from_str(&create_ec_cookie(settings, ec_id))
-            .expect("should build Set-Cookie header value"),
+        http::HeaderValue::from_str(&cookie).expect("should build Set-Cookie header value"),
     );
 }
 
@@ -664,6 +674,26 @@ mod tests {
         assert_eq!(all_cookies.len(), 2, "should append all Cookie headers");
         assert!(all_cookies.iter().any(|v| v.contains("session=abc123")));
         assert!(all_cookies.iter().any(|v| v.contains("theme=dark")));
+    }
+
+    #[test]
+    fn test_forward_cookie_header_appends_to_existing_target_cookies() {
+        let from = build_request(Some("session=abc123"));
+        let mut to = build_request(Some("template=existing"));
+
+        forward_cookie_header(&from, &mut to, false);
+
+        let all_cookies: Vec<_> = to
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            all_cookies,
+            vec!["template=existing", "session=abc123"],
+            "should preserve existing target cookies and append source cookies after them"
+        );
     }
 
     // ---------------------------------------------------------------
