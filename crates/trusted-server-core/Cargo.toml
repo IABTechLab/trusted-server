@@ -31,6 +31,7 @@ http = { workspace = true }
 iab_gpp = { workspace = true }
 jose-jwk = { workspace = true }
 log = { workspace = true }
+mime = { workspace = true }
 rand = { workspace = true }
 lol_html = { workspace = true }
 matchit = { workspace = true }

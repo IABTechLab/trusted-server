@@ -8,8 +8,8 @@ use fastly::http::Method;
 use fastly::{Request, Response};
 use matchit::Router;
 
+use crate::compat;
 use crate::constants::HEADER_X_TS_EC;
-use crate::cookies::set_ec_cookie;
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
@@ -696,7 +696,7 @@ impl IntegrationRegistry {
                         // Cookie is intentionally not set when EC ID contains RFC 6265-illegal
                         // characters (e.g. a crafted x-ts-ec header value). The response header
                         // is still emitted; only cookie persistence is skipped.
-                        set_ec_cookie(settings, response, ec_id.as_str());
+                        compat::set_fastly_ec_cookie(settings, response, ec_id.as_str());
                     }
                     Err(ref err) => {
                         log::warn!("Failed to generate EC ID for integration response: {err:?}");

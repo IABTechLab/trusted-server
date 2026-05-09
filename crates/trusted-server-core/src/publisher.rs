@@ -18,10 +18,11 @@ use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
 use crate::backend::BackendConfig;
+use crate::compat;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::cookies::{expire_ec_cookie, handle_request_cookies, set_ec_cookie};
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::cookies::handle_request_cookies;
+use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -129,12 +130,15 @@ pub fn handle_tsjs_dynamic(
         return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
     }
     let filename = &path[PREFIX.len()..];
+    let http_req = compat::from_fastly_headers_ref(req);
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid)
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        let http_resp =
+            serve_static_with_etag(&body, &http_req, "application/javascript; charset=utf-8");
+        let mut resp = compat::to_fastly_response(http_resp);
         resp.set_header(HEADER_X_COMPRESS_HINT, "on");
         return Ok(resp);
     }
@@ -146,8 +150,9 @@ pub fn handle_tsjs_dynamic(
             return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
         }
         if let Some(content) = trusted_server_js::module_bundle(module_id) {
-            let mut resp =
-                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            let http_resp =
+                serve_static_with_etag(content, &http_req, "application/javascript; charset=utf-8");
+            let mut resp = compat::to_fastly_response(http_resp);
             resp.set_header(HEADER_X_COMPRESS_HINT, "on");
             return Ok(resp);
         }
@@ -452,8 +457,10 @@ pub fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
+    let http_req = compat::from_fastly_headers_ref(&req);
+
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&req, &services.client_info);
+    let request_info = RequestInfo::from_request(&http_req, &services.client_info);
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
@@ -467,7 +474,7 @@ pub fn handle_publisher_request(
     );
 
     // Parse cookies once for reuse by both consent extraction and EC ID logic.
-    let cookie_jar = handle_request_cookies(&req)?;
+    let cookie_jar = handle_request_cookies(&http_req)?;
 
     // Capture the current EC cookie value for revocation handling.
     // This must come from the cookie itself (not the x-ts-ec header)
@@ -480,7 +487,7 @@ pub fn handle_publisher_request(
     // Generate EC identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let ec_id = get_or_generate_ec_id(settings, services, &req)?;
+    let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &http_req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
@@ -496,7 +503,7 @@ pub fn handle_publisher_request(
         });
     let consent_context = build_consent_context(&ConsentPipelineInput {
         jar: cookie_jar.as_ref(),
-        req: &req,
+        req: &http_req,
         config: &settings.consent,
         geo: geo.as_ref(),
         ec_id: Some(ec_id.as_str()),
@@ -697,14 +704,14 @@ fn apply_ec_headers(
         response.set_header(HEADER_X_TS_EC, ec_id);
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        set_ec_cookie(settings, response, ec_id);
+        compat::set_fastly_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        expire_ec_cookie(settings, response);
+        compat::expire_fastly_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -719,6 +726,7 @@ fn apply_ec_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge_cookie::get_or_generate_ec_id;
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -1188,7 +1196,8 @@ mod tests {
         req.set_header("x-ts-ec", "header_id");
         req.set_header("cookie", "ts-ec=cookie_id; other=value");
 
-        let cookie_jar = handle_request_cookies(&req).expect("should parse cookies");
+        let http_req = compat::from_fastly_headers_ref(&req);
+        let cookie_jar = handle_request_cookies(&http_req).expect("should parse cookies");
         let existing_ec_cookie = cookie_jar
             .as_ref()
             .and_then(|jar| jar.get(COOKIE_TS_EC))

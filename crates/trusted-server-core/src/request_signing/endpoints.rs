@@ -48,7 +48,7 @@ pub fn handle_trusted_server_discovery(
     )?;
 
     Ok(Response::from_status(200)
-        .with_content_type(fastly::mime::APPLICATION_JSON)
+        .with_content_type(mime::APPLICATION_JSON)
         .with_body(json))
 }
 
@@ -133,7 +133,7 @@ pub fn handle_verify_signature(
     })?;
 
     Ok(Response::from_status(200)
-        .with_content_type(fastly::mime::APPLICATION_JSON)
+        .with_content_type(mime::APPLICATION_JSON)
         .with_body(response_json))
 }
 
@@ -275,7 +275,7 @@ pub fn handle_rotate_key(
             })?;
 
             Ok(Response::from_status(200)
-                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_content_type(mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
         Err(e) => {
@@ -297,7 +297,7 @@ pub fn handle_rotate_key(
             })?;
 
             Ok(Response::from_status(status)
-                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_content_type(mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
     }
@@ -398,7 +398,7 @@ pub fn handle_deactivate_key(
             })?;
 
             Ok(Response::from_status(200)
-                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_content_type(mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
         Err(e) => {
@@ -423,7 +423,7 @@ pub fn handle_deactivate_key(
             })?;
 
             Ok(Response::from_status(status)
-                .with_content_type(fastly::mime::APPLICATION_JSON)
+                .with_content_type(mime::APPLICATION_JSON)
                 .with_body(response_json))
         }
     }
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
             resp.get_content_type(),
-            Some(fastly::mime::APPLICATION_JSON),
+            Some(mime::APPLICATION_JSON),
             "should return application/json content type"
         );
 
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(resp.get_status(), StatusCode::OK);
         assert_eq!(
             resp.get_content_type(),
-            Some(fastly::mime::APPLICATION_JSON),
+            Some(mime::APPLICATION_JSON),
             "should return application/json content type"
         );
 
