@@ -292,13 +292,21 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 Ok(())
             }
         }),
-        // Inject __ts_bids before </body> via end_tag_handlers.
+        // Inject __ts_bids before </body> via end_tag_handlers — only when
+        // slots matched this URL. When no slots matched, skip injection entirely
+        // so the publisher's existing client-side Prebid/GPT flow is unmodified
+        // (dual-mode rollout: calling __tsAdInit with empty slots would invoke
+        // enableSingleRequest/enableServices and conflict with the publisher's GPT init).
         // Guard with AtomicBool so the script is only injected once even if
         // the origin HTML contains multiple <body> elements (e.g. template fragments).
         element!("body", {
             let state = ad_bids_state.clone();
             let injected_bids = injected_bids.clone();
+            let has_slots = ad_slots_script.is_some();
             move |el| {
+                if !has_slots {
+                    return Ok(());
+                }
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
@@ -1285,7 +1293,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
-            ad_slots_script: None,
+            ad_slots_script: Some("<script>window.__ts_ad_slots=[];</script>".to_string()),
             ad_bids_state: state,
         };
         let mut processor = create_html_processor(config);
@@ -1314,7 +1322,7 @@ mod tests {
             request_host: "example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
-            ad_slots_script: None,
+            ad_slots_script: Some("<script>window.__ts_ad_slots=[];</script>".to_string()),
             ad_bids_state: state,
         };
         let mut processor = create_html_processor(config);
@@ -1331,7 +1339,34 @@ mod tests {
     }
 
     #[test]
-    fn injects_empty_ts_bids_when_state_is_none() {
+    fn injects_empty_ts_bids_when_slots_matched_but_auction_returned_nothing() {
+        // Slots matched (ad_slots_script is Some) but auction task never wrote a result
+        // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
+        let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.example.com".to_string(),
+            request_host: "example.com".to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::empty_for_tests(),
+            ad_slots_script: Some("<script>window.__ts_ad_slots=[];</script>".to_string()),
+            ad_bids_state: state,
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(b"<html><head></head><body>content</body></html>", true)
+            .expect("should process");
+        let html = std::str::from_utf8(&output).expect("should be utf8");
+        assert!(
+            html.contains("__ts_bids=JSON.parse(\"{}\")"),
+            "should inject empty bids fallback when auction produced nothing"
+        );
+    }
+
+    #[test]
+    fn does_not_inject_ts_bids_when_no_slots_matched() {
+        // No slots matched this URL — ad_slots_script is None. __ts_bids must be
+        // omitted entirely so the publisher's existing client-side GPT flow is
+        // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::RwLock::new(None));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
@@ -1347,8 +1382,8 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            html.contains("__ts_bids=JSON.parse(\"{}\")"),
-            "should inject empty bids on None state"
+            !html.contains("__ts_bids"),
+            "should NOT inject __ts_bids when no slots matched"
         );
     }
 }

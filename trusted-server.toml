@@ -192,6 +192,12 @@ permutive_segments = "permutive"
 
 [creative_opportunities]
 gam_network_id = "88059007"
+# FCP is not affected by this value — body content above </body> has already
+# streamed and painted before the hold begins. What this caps is the slip on
+# DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
+# drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
+# default; raise only if your SSPs need more headroom and your analytics confirm
+# the DCL slip is acceptable.
 auction_timeout_ms = 1500
 price_granularity = "dense"
 

@@ -13,6 +13,23 @@ use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
+/// In-flight auction requests dispatched to SSP backends.
+///
+/// Created by [`AuctionOrchestrator::dispatch_auction`] and consumed by
+/// [`AuctionOrchestrator::collect_dispatched_auction`]. Carrying this handle
+/// across `pending_origin.wait()` lets origin response and SSP HTTP requests
+/// race in Fastly's native layer, enabling TTFB ≈ origin latency rather than
+/// TTFB ≈ auction timeout.
+pub struct DispatchedAuction {
+    pending_requests: Vec<PlatformPendingRequest>,
+    backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
+    auction_start: Instant,
+    timeout_ms: u32,
+    floor_prices: HashMap<String, f64>,
+    /// Carried so the mediator call in collect can pass it as the auction request.
+    request: AuctionRequest,
+}
+
 /// Compute the remaining time budget from a deadline.
 ///
 /// Returns the number of milliseconds left before `timeout_ms` is exceeded,
@@ -582,6 +599,327 @@ impl AuctionOrchestrator {
                 message: format!("Provider '{}' not registered", name),
             })
         })
+    }
+
+    /// Dispatch SSP bid requests without blocking WASM.
+    ///
+    /// Calls each enabled provider's [`AuctionProvider::request_bids`] (which
+    /// internally calls Fastly's `send_async`), then returns immediately with a
+    /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
+    /// while WASM continues to `pending_origin.wait()`.
+    ///
+    /// Returns `None` when no providers are configured or all providers are
+    /// disabled / over budget. The caller should fall back to the synchronous
+    /// `run_auction` path.
+    #[must_use]
+    pub fn dispatch_auction(
+        &self,
+        request: &AuctionRequest,
+        context: &AuctionContext<'_>,
+    ) -> Option<DispatchedAuction> {
+        let provider_names = self.config.provider_names();
+        if provider_names.is_empty() {
+            return None;
+        }
+
+        let auction_start = Instant::now();
+        let mut backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)> =
+            HashMap::new();
+        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+
+        for provider_name in provider_names {
+            let provider = match self.providers.get(provider_name) {
+                Some(p) => p,
+                None => {
+                    log::warn!("Provider '{}' not registered, skipping", provider_name);
+                    continue;
+                }
+            };
+
+            if !provider.is_enabled() {
+                log::debug!("Provider '{}' is disabled, skipping", provider.provider_name());
+                continue;
+            }
+
+            let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
+            let effective_timeout = remaining_ms.min(provider.timeout_ms());
+
+            if effective_timeout == 0 {
+                log::warn!(
+                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
+                    context.timeout_ms,
+                    provider.provider_name()
+                );
+                continue;
+            }
+
+            let backend_name = match provider.backend_name(effective_timeout) {
+                Some(name) => name,
+                None => {
+                    log::warn!("Provider '{}' has no backend_name, skipping", provider.provider_name());
+                    continue;
+                }
+            };
+
+            let provider_context = AuctionContext {
+                settings: context.settings,
+                request: context.request,
+                client_info: context.client_info,
+                timeout_ms: effective_timeout,
+                provider_responses: context.provider_responses,
+                services: context.services,
+            };
+
+            let start_time = Instant::now();
+            match provider.request_bids(request, &provider_context) {
+                Ok(pending) => {
+                    log::info!(
+                        "Dispatching bid request to '{}' (backend: {}, budget: {}ms)",
+                        provider.provider_name(),
+                        backend_name,
+                        effective_timeout
+                    );
+                    backend_to_provider.insert(
+                        backend_name.clone(),
+                        (provider.provider_name().to_string(), start_time, Arc::clone(provider)),
+                    );
+                    pending_requests
+                        .push(PlatformPendingRequest::new(pending).with_backend_name(backend_name));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Provider '{}' failed to dispatch request: {:?}",
+                        provider.provider_name(),
+                        e
+                    );
+                }
+            }
+        }
+
+        if pending_requests.is_empty() {
+            return None;
+        }
+
+        log::info!(
+            "Dispatched {} SSP requests (timeout: {}ms); Fastly host will race them against origin",
+            pending_requests.len(),
+            context.timeout_ms
+        );
+
+        Some(DispatchedAuction {
+            pending_requests,
+            backend_to_provider,
+            auction_start,
+            timeout_ms: context.timeout_ms,
+            floor_prices: self.floor_prices_by_slot(request),
+            request: request.clone(),
+        })
+    }
+
+    /// Collect bid responses from a previously-dispatched auction.
+    ///
+    /// Runs the select-loop phase (equivalent to Phase 2 of
+    /// `run_providers_parallel`) and, if the orchestrator has a mediator
+    /// configured, forwards collected bids to it. The overall auction deadline
+    /// is enforced from `dispatched.auction_start`.
+    ///
+    /// On any error or partial failure the method returns the best available
+    /// result rather than propagating — the caller should still inject the
+    /// winning bids even if some providers timed out.
+    pub async fn collect_dispatched_auction(
+        &self,
+        dispatched: DispatchedAuction,
+        services: &RuntimeServices,
+        context: &AuctionContext<'_>,
+    ) -> OrchestrationResult {
+        let DispatchedAuction {
+            pending_requests,
+            mut backend_to_provider,
+            auction_start,
+            timeout_ms,
+            floor_prices,
+            request,
+        } = dispatched;
+
+        let deadline = Duration::from_millis(u64::from(timeout_ms));
+
+        log::info!(
+            "Collecting {} in-flight SSP responses (timeout: {}ms remaining: {}ms)",
+            pending_requests.len(),
+            timeout_ms,
+            remaining_budget_ms(auction_start, timeout_ms),
+        );
+
+        let mut responses: Vec<AuctionResponse> = Vec::new();
+        let mut remaining = pending_requests;
+
+        while !remaining.is_empty() {
+            let select_result = match services
+                .http_client()
+                .select(remaining)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "HTTP select failed".to_string(),
+                }) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("select() failed during auction collection: {:?}", e);
+                    break;
+                }
+            };
+            remaining = select_result.remaining;
+
+            match select_result.ready {
+                Ok(platform_response) => {
+                    let backend_name = platform_response.backend_name.clone().unwrap_or_default();
+                    if let Some((provider_name, start_time, provider)) =
+                        backend_to_provider.remove(&backend_name)
+                    {
+                        let response_time_ms = start_time.elapsed().as_millis() as u64;
+                        match platform_response_to_fastly(platform_response) {
+                            Ok(response) => match provider.parse_response(response, response_time_ms) {
+                                Ok(auction_response) => {
+                                    log::info!(
+                                        "Provider '{}' returned {} bids ({}ms)",
+                                        auction_response.provider,
+                                        auction_response.bids.len(),
+                                        auction_response.response_time_ms
+                                    );
+                                    responses.push(auction_response);
+                                }
+                                Err(e) => {
+                                    log::warn!("Provider '{}' parse failed: {:?}", provider_name, e);
+                                    responses.push(AuctionResponse::error(&provider_name, response_time_ms));
+                                }
+                            },
+                            Err(e) => {
+                                log::warn!("Provider '{}' unsupported body: {:?}", provider_name, e);
+                                responses.push(AuctionResponse::error(&provider_name, response_time_ms));
+                            }
+                        }
+                    } else {
+                        log::warn!("Received response from unknown backend '{}', ignoring", backend_name);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("A provider request failed during collection: {:?}", e);
+                }
+            }
+
+            if auction_start.elapsed() >= deadline && !remaining.is_empty() {
+                log::warn!(
+                    "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
+                    timeout_ms,
+                    remaining.len()
+                );
+                break;
+            }
+        }
+
+        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
+            match self.providers.get(mediator_name.as_str()) {
+                Some(mediator) => {
+                    let remaining_ms = remaining_budget_ms(auction_start, timeout_ms);
+                    if remaining_ms == 0 {
+                        log::warn!("Auction timeout exhausted during bidding — skipping mediator");
+                        let winning = self.select_winning_bids(&responses, &floor_prices);
+                        return OrchestrationResult {
+                            provider_responses: responses,
+                            mediator_response: None,
+                            winning_bids: winning,
+                            total_time_ms: auction_start.elapsed().as_millis() as u64,
+                            metadata: HashMap::new(),
+                        };
+                    }
+                    let placeholder = fastly::Request::get("https://placeholder.invalid/");
+                    let mediator_context = AuctionContext {
+                        settings: context.settings,
+                        request: &placeholder,
+                        client_info: context.client_info,
+                        timeout_ms: remaining_ms,
+                        provider_responses: Some(&responses),
+                        services: context.services,
+                    };
+                    match mediator.request_bids(&request, &mediator_context) {
+                        Ok(pending) => {
+                            let platform_resp = services
+                                .http_client()
+                                .wait(PlatformPendingRequest::new(pending))
+                                .await;
+                            match platform_resp.change_context(TrustedServerError::Auction {
+                                message: format!("Mediator {} request failed", mediator.provider_name()),
+                            }) {
+                                Ok(platform_resp) => {
+                                    match platform_response_to_fastly(platform_resp).change_context(
+                                        TrustedServerError::Auction {
+                                            message: format!("Mediator {} unsupported body", mediator.provider_name()),
+                                        },
+                                    ) {
+                                        Ok(response) => {
+                                            let response_time_ms =
+                                                remaining_ms as u64 - remaining_budget_ms(auction_start, timeout_ms) as u64;
+                                            match mediator.parse_response(response, response_time_ms) {
+                                                Ok(mediator_resp) => {
+                                                    let winning = mediator_resp
+                                                        .bids
+                                                        .iter()
+                                                        .filter_map(|bid| {
+                                                            if bid.price.is_none() {
+                                                                log::warn!(
+                                                                    "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
+                                                                    mediator.provider_name(),
+                                                                    bid.slot_id
+                                                                );
+                                                                None
+                                                            } else {
+                                                                Some((bid.slot_id.clone(), bid.clone()))
+                                                            }
+                                                        })
+                                                        .collect();
+                                                    let winning = self.apply_floor_prices(winning, &floor_prices);
+                                                    (Some(mediator_resp), winning)
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Mediator '{}' parse failed: {:?}", mediator.provider_name(), e);
+                                                    let winning = self.select_winning_bids(&responses, &floor_prices);
+                                                    (None, winning)
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Mediator body error: {:?}", e);
+                                            (None, self.select_winning_bids(&responses, &floor_prices))
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Mediator request failed: {:?}", e);
+                                    (None, self.select_winning_bids(&responses, &floor_prices))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Mediator '{}' failed to dispatch: {:?}", mediator.provider_name(), e);
+                            (None, self.select_winning_bids(&responses, &floor_prices))
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("Mediator '{}' not registered", mediator_name);
+                    (None, self.select_winning_bids(&responses, &floor_prices))
+                }
+            }
+        } else {
+            (None, self.select_winning_bids(&responses, &floor_prices))
+        };
+
+        OrchestrationResult {
+            provider_responses: responses,
+            mediator_response,
+            winning_bids,
+            total_time_ms: auction_start.elapsed().as_millis() as u64,
+            metadata: HashMap::new(),
+        }
     }
 
     /// Check if orchestrator is enabled.

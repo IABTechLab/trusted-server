@@ -18,7 +18,7 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
-use crate::auction::orchestrator::AuctionOrchestrator;
+use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, PublisherInfo, SiteInfo, UserInfo,
 };
@@ -31,7 +31,7 @@ use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::RuntimeServices;
-use crate::price_bucket::price_bucket;
+use crate::price_bucket::{price_bucket, PriceGranularity};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
@@ -301,8 +301,9 @@ pub enum PublisherResponse {
         response: Response,
         /// Origin body to be piped through the streaming pipeline.
         body: Body,
-        /// Parameters for `process_response_streaming`.
-        params: OwnedProcessResponseParams,
+        /// Parameters for `process_response_streaming`. Boxed to keep this
+        /// variant's on-stack size comparable to the other variants.
+        params: Box<OwnedProcessResponseParams>,
     },
     /// Non-processable 2xx response (images, fonts, video). The adapter must
     /// reattach the body via `response.set_body(body)` before returning.
@@ -407,6 +408,12 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: Arc<RwLock<Option<String>>>,
+    /// In-flight SSP bids dispatched before `pending_origin.wait()`.
+    /// The streaming phase collects these and writes bids to `ad_bids_state`
+    /// before processing the last body chunk, so `</body>` injection sees live bids.
+    pub(crate) dispatched_auction: Option<DispatchedAuction>,
+    /// Price granularity used to bucket bids when building `__ts_bids`.
+    pub(crate) price_granularity: PriceGranularity,
 }
 
 /// Stream the publisher response body through the processing pipeline.
@@ -439,6 +446,261 @@ pub fn stream_publisher_body<W: Write>(
         ad_bids_state: &params.ad_bids_state,
     };
     process_response_streaming(body, output, &borrowed)
+}
+
+/// Stream publisher body with a "last-chunk hold" for live bid injection.
+///
+/// Drives the origin body through the HTML pipeline one chunk at a time, using a
+/// one-behind buffer so the last raw origin chunk is held back.  When the origin
+/// body is exhausted (`read` returns `Ok(0)`):
+///
+/// 1. [`collect_dispatched_auction`](AuctionOrchestrator::collect_dispatched_auction)
+///    is awaited with the remaining deadline.
+/// 2. Winning bids are written to `ad_bids_state`.
+/// 3. The held last chunk is fed through the pipeline — `lol_html` fires its
+///    `</body>` handler with bids now in state.
+///
+/// For non-HTML content types the auction is collected before any body bytes
+/// are written (no `</body>` to inject).  If `params.dispatched_auction` is
+/// `None` the function falls back to the synchronous
+/// [`stream_publisher_body`] path.
+///
+/// # Errors
+///
+/// Returns an error if processing fails mid-stream. Headers are already
+/// committed at that point; the caller logs and drops the `StreamingBody`.
+pub async fn stream_publisher_body_async<W: Write>(
+    body: Body,
+    output: &mut W,
+    params: &mut OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+) -> Result<(), Report<TrustedServerError>> {
+    let Some(dispatched) = params.dispatched_auction.take() else {
+        // No auction — use the existing sync pipeline unchanged.
+        return stream_publisher_body(body, output, params, settings, integration_registry);
+    };
+
+    let is_html = params.content_type.contains("text/html");
+
+    if !is_html {
+        // Non-HTML: collect auction first, then stream.  There is no </body>
+        // to hold, so delaying the entire body until collection is acceptable.
+        let placeholder = Request::get("https://placeholder.invalid/");
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, services, &make_collect_context(settings, services, &placeholder))
+            .await;
+        write_bids_to_state(&result.winning_bids, params.price_granularity, &params.ad_bids_state);
+        return stream_publisher_body(body, output, params, settings, integration_registry);
+    }
+
+    // HTML: build the processor once and drive it chunk by chunk.
+    // One-behind buffer: stream chunk N-1 immediately; hold chunk N until origin
+    // EOF, then await auction and process chunk N (which contains </body>).
+    let mut processor = create_html_stream_processor(
+        &params.origin_host,
+        &params.request_host,
+        &params.request_scheme,
+        settings,
+        integration_registry,
+        params.ad_slots_script.as_deref().map(str::to_string),
+        params.ad_bids_state.clone(),
+    )?;
+
+    let compression = Compression::from_content_encoding(&params.content_encoding);
+    stream_html_with_auction_hold(
+        body,
+        output,
+        &mut processor,
+        compression,
+        AuctionCollectCtx {
+            dispatched,
+            price_granularity: params.price_granularity,
+            ad_bids_state: &params.ad_bids_state,
+            orchestrator,
+            services,
+            settings,
+        },
+    )
+    .await
+}
+
+/// Build a minimal [`AuctionContext`] for the mediator call in collection.
+///
+/// The `request` field is a short-lived placeholder (providers use it only for
+/// header extraction; the placeholder is functionally equivalent to the original
+/// since `req` was already consumed by `send_async` before dispatch).
+fn make_collect_context<'a>(
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    placeholder: &'a Request,
+) -> AuctionContext<'a> {
+    AuctionContext {
+        settings,
+        request: placeholder,
+        client_info: services.client_info(),
+        timeout_ms: 0,
+        provider_responses: None,
+        services,
+    }
+}
+
+/// Write winning bids from an auction result into the shared `ad_bids_state` lock.
+pub(crate) fn write_bids_to_state(
+    winning_bids: &std::collections::HashMap<String, Bid>,
+    price_granularity: PriceGranularity,
+    ad_bids_state: &Arc<RwLock<Option<String>>>,
+) {
+    let bid_map = build_bid_map(winning_bids, price_granularity);
+    let bids_script = build_bids_script(&bid_map);
+    *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
+}
+
+/// Bundles the auction-collection dependencies passed through the streaming helpers.
+struct AuctionCollectCtx<'a> {
+    dispatched: DispatchedAuction,
+    price_granularity: PriceGranularity,
+    ad_bids_state: &'a Arc<RwLock<Option<String>>>,
+    orchestrator: &'a AuctionOrchestrator,
+    services: &'a RuntimeServices,
+    settings: &'a Settings,
+}
+
+/// Run the one-behind chunk loop for HTML bodies, collecting the auction before
+/// the last chunk so `lol_html`'s `</body>` handler sees live bids.
+async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
+    body: Body,
+    output: &mut W,
+    processor: &mut P,
+    compression: Compression,
+    ctx: AuctionCollectCtx<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    use brotli::enc::writer::CompressorWriter;
+    use brotli::enc::BrotliEncoderParams;
+    use brotli::Decompressor;
+    use flate2::read::{GzDecoder, ZlibDecoder};
+    use flate2::write::{GzEncoder, ZlibEncoder};
+
+    match compression {
+        Compression::None => one_behind_loop(body, output, processor, ctx).await,
+        Compression::Gzip => {
+            let decoder = GzDecoder::new(body);
+            let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
+            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize gzip encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Deflate => {
+            let decoder = ZlibDecoder::new(body);
+            let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
+            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            encoder.finish().change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize deflate encoder".to_string(),
+            })?;
+            Ok(())
+        }
+        Compression::Brotli => {
+            let decoder = Decompressor::new(body, 4096);
+            let params = BrotliEncoderParams {
+                quality: 4,
+                lgwin: 22,
+                ..Default::default()
+            };
+            let mut encoder = CompressorWriter::with_params(&mut *output, 4096, &params);
+            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            let _ = encoder.into_inner();
+            Ok(())
+        }
+    }
+}
+
+/// Core one-behind chunk loop.
+///
+/// Reads from `reader`, writing processed output to `writer` for every chunk
+/// except the current one (which is held pending).  On EOF, the auction is
+/// collected, bids written, and the held chunk processed last.
+async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
+    mut reader: R,
+    writer: &mut W,
+    processor: &mut P,
+    ctx: AuctionCollectCtx<'_>,
+) -> Result<(), Report<TrustedServerError>> {
+    let AuctionCollectCtx { dispatched, price_granularity, ad_bids_state, orchestrator, services, settings } = ctx;
+    const CHUNK_SIZE: usize = 8192;
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                // Origin exhausted — pending holds the last chunk.
+                // Collect the auction before feeding it to lol_html so that
+                // the </body> handler sees populated ad_bids_state.
+                let placeholder = Request::get("https://placeholder.invalid/");
+                let collect_ctx = make_collect_context(settings, services, &placeholder);
+                let result = orchestrator
+                    .collect_dispatched_auction(dispatched, services, &collect_ctx)
+                    .await;
+                write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
+
+                // Process the held last chunk (not is_last — finalization is separate).
+                if !pending.is_empty() {
+                    let out = processor.process_chunk(&pending, false).change_context(
+                        TrustedServerError::Proxy {
+                            message: "Failed to process last chunk".to_string(),
+                        },
+                    )?;
+                    if !out.is_empty() {
+                        writer.write_all(&out).change_context(TrustedServerError::Proxy {
+                            message: "Failed to write last chunk".to_string(),
+                        })?;
+                    }
+                }
+                // Signal EOF to lol_html (fires end() which flushes remaining state).
+                let final_out = processor.process_chunk(&[], true).change_context(
+                    TrustedServerError::Proxy {
+                        message: "Failed to finalize processor".to_string(),
+                    },
+                )?;
+                if !final_out.is_empty() {
+                    writer.write_all(&final_out).change_context(TrustedServerError::Proxy {
+                        message: "Failed to write finalized output".to_string(),
+                    })?;
+                }
+                break;
+            }
+            Ok(n) => {
+                // Stream the previously held chunk (it is not the last).
+                if !pending.is_empty() {
+                    let out = processor.process_chunk(&pending, false).change_context(
+                        TrustedServerError::Proxy {
+                            message: "Failed to process chunk".to_string(),
+                        },
+                    )?;
+                    if !out.is_empty() {
+                        writer.write_all(&out).change_context(TrustedServerError::Proxy {
+                            message: "Failed to write chunk".to_string(),
+                        })?;
+                    }
+                }
+                pending = buffer[..n].to_vec();
+            }
+            Err(e) => {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("Failed to read origin body: {e}"),
+                }));
+            }
+        }
+    }
+
+    writer.flush().change_context(TrustedServerError::Proxy {
+        message: "Failed to flush output".to_string(),
+    })?;
+    Ok(())
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -590,13 +852,22 @@ pub async fn handle_publisher_request(
     restrict_accept_encoding(&mut req);
     req.set_header("host", &origin_host);
 
+    // Dispatch origin request first.
     let pending_origin =
         req.send_async(&backend_name)
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to dispatch async origin request".to_string(),
             })?;
 
-    let auction_result = if should_run_auction {
+    // Dispatch SSP bid requests BEFORE awaiting origin — all HTTP is now in-flight
+    // in Fastly's native layer.  WASM yields only for origin (fast, cache-hit path),
+    // so TTFB ≈ origin latency instead of TTFB ≈ auction timeout.
+    let price_granularity = settings
+        .creative_opportunities
+        .as_ref()
+        .map(|co| co.price_granularity)
+        .unwrap_or_default();
+    let dispatched_auction = if should_run_auction {
         let co_config = settings
             .creative_opportunities
             .as_ref()
@@ -617,35 +888,12 @@ pub async fn handle_publisher_request(
             provider_responses: None,
             services,
         };
-        match orchestrator
-            .run_auction(&auction_request, &auction_context, services)
-            .await
-        {
-            Ok(result) => Some(result),
-            Err(e) => {
-                log::warn!("server-side auction failed, proceeding without bids: {e:?}");
-                None
-            }
-        }
+        orchestrator.dispatch_auction(&auction_request, &auction_context)
     } else {
         None
     };
 
-    if should_run_auction {
-        let co_config = settings
-            .creative_opportunities
-            .as_ref()
-            .expect("should be present");
-        let empty: std::collections::HashMap<String, Bid> = std::collections::HashMap::new();
-        let winning_bids = auction_result
-            .as_ref()
-            .map(|r| &r.winning_bids)
-            .unwrap_or(&empty);
-        let bid_map = build_bid_map(winning_bids, co_config.price_granularity);
-        let bids_script = build_bids_script(&bid_map);
-        *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
-    }
-
+    // Now yield for origin — SSP requests are already racing in Fastly's native layer.
     let mut response = pending_origin
         .wait()
         .change_context(TrustedServerError::Proxy {
@@ -754,7 +1002,7 @@ pub async fn handle_publisher_request(
             Ok(PublisherResponse::Stream {
                 response,
                 body,
-                params: OwnedProcessResponseParams {
+                params: Box::new(OwnedProcessResponseParams {
                     content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
@@ -763,7 +1011,9 @@ pub async fn handle_publisher_request(
                     content_type,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
-                },
+                    dispatched_auction,
+                    price_granularity,
+                }),
             })
         }
         ResponseRoute::BufferedProcessed => {
@@ -1790,6 +2040,9 @@ mod tests {
             content_type: "text/css".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(RwLock::new(None)),
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+
         };
 
         let mut output = Vec::new();
@@ -1833,6 +2086,9 @@ mod tests {
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(RwLock::new(None)),
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+
         };
 
         let mut output = Vec::new();
@@ -1867,6 +2123,9 @@ mod tests {
             content_type: "text/html".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(RwLock::new(None)),
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+
         };
 
         let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
@@ -1968,6 +2227,9 @@ mod tests {
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(RwLock::new(None)),
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -2020,6 +2282,9 @@ mod tests {
             content_type: "text/html".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(RwLock::new(None)),
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+
         };
 
         let mut output = Vec::new();

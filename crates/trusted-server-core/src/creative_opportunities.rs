@@ -18,7 +18,21 @@ use crate::price_bucket::PriceGranularity;
 pub struct CreativeOpportunitiesConfig {
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
-    /// Auction timeout in milliseconds.
+    /// Maximum time in milliseconds to wait for the server-side auction before
+    /// closing the response body.
+    ///
+    /// The auction runs concurrently with HTML body streaming. Body content
+    /// above `</body>` has already been delivered and painted before the hold
+    /// begins, so **FCP is not affected**. What this timeout bounds is the slip
+    /// on `DOMContentLoaded` and `window.load`: third-party scripts that hook
+    /// those events fire later by at most this duration.
+    ///
+    /// The worst case is a cache-hit page where the origin drains in <50 ms
+    /// but the auction takes the full timeout — the browser sits idle waiting
+    /// for `</body>`. 500 ms is the recommended default and the hard upper
+    /// bound on DCL slip the publisher is willing to accept.
+    ///
+    /// When absent, falls back to `[auction].timeout_ms` from global config.
     #[serde(default)]
     pub auction_timeout_ms: Option<u32>,
     /// Price granularity for header-bidding price bucketing.

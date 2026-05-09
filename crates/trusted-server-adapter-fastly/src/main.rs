@@ -19,7 +19,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body_async,
     PublisherResponse,
 };
 use trusted_server_core::request_signing::{
@@ -250,18 +250,26 @@ async fn route_request(
                         Ok(PublisherResponse::Stream {
                             mut response,
                             body,
-                            params,
+                            mut params,
                         }) => {
                             // Streaming path: finalize headers, then stream body to client.
+                            // TTFB happens at stream_to_client() — SSP bids are already
+                            // in-flight in Fastly's native layer (dispatched before origin wait).
                             finalize_response(settings, geo_info.as_ref(), &mut response);
                             let mut streaming_body = response.stream_to_client();
-                            if let Err(e) = stream_publisher_body(
+                            // stream_publisher_body_async falls back to the sync path
+                            // when no auction was dispatched (dispatched_auction is None).
+                            let stream_result = stream_publisher_body_async(
                                 body,
                                 &mut streaming_body,
-                                &params,
+                                &mut *params,
                                 settings,
                                 integration_registry,
-                            ) {
+                                orchestrator,
+                                &publisher_services,
+                            )
+                            .await;
+                            if let Err(e) = stream_result {
                                 // Headers already committed. Log and abort — client
                                 // sees a truncated response. Standard proxy behavior.
                                 log::error!("Streaming processing failed: {e:?}");
