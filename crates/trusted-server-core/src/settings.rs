@@ -399,6 +399,18 @@ impl Proxy {
     }
 }
 
+/// Debug-only features. All flags default to `false` (off in production).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct DebugConfig {
+    /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
+    ///
+    /// When `false` (the default), the endpoint returns 404. Enable only for
+    /// intentional Fastly/browser TLS investigation — the endpoint reflects
+    /// Fastly-observed TLS details that browser JS cannot normally read.
+    #[serde(default)]
+    pub ja4_endpoint_enabled: bool,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -423,6 +435,8 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 #[allow(unused)]
