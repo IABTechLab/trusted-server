@@ -556,7 +556,7 @@ struct BidParamOverrideEngine {
     rules: Vec<CompiledBidParamOverrideRule>,
     // Maps bidder name to the indices (into `rules`) of rules that constrain on that bidder.
     // Rules with no bidder constraint (zone-only or catch-all) are kept in `wildcard_indices`.
-    // Both slices are in declaration order; `apply` merges and re-sorts to restore that order.
+    // Both slices are in declaration order; `apply` merges them without allocation.
     bidder_index: HashMap<String, Vec<usize>>,
     wildcard_indices: Vec<usize>,
 }
@@ -610,10 +610,10 @@ impl BidParamOverrideEngine {
         }
 
         for rule in &config.bid_param_override_rules {
-            rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
             if let Some(bidder) = &rule.when.bidder {
                 warn_unconfigured_bidder(config, bidder, "bid_param_override_rules");
             }
+            rules.push(CompiledBidParamOverrideRule::try_from(rule)?);
         }
 
         let mut bidder_index: HashMap<String, Vec<usize>> = HashMap::new();
@@ -633,14 +633,8 @@ impl BidParamOverrideEngine {
     }
 
     fn apply(&self, facts: BidParamOverrideFacts<'_>, params: &mut Json) {
-        let mut indices: Vec<usize> = self.wildcard_indices.clone();
-        if let Some(bidder_indices) = self.bidder_index.get(facts.bidder) {
-            indices.extend_from_slice(bidder_indices);
-        }
-        // Re-sort to restore declaration order so last-write-wins semantics are preserved.
-        indices.sort_unstable();
-
-        for &idx in &indices {
+        let bidder_indices = self.bidder_index.get(facts.bidder).map(Vec::as_slice);
+        for idx in merged_rule_indices(&self.wildcard_indices, bidder_indices) {
             let rule = &self.rules[idx];
             if rule.matches(facts) {
                 if merge_bidder_param_object(params, &rule.set) {
@@ -660,6 +654,22 @@ impl BidParamOverrideEngine {
             }
         }
     }
+}
+
+fn merged_rule_indices<'a>(
+    wildcard_indices: &'a [usize],
+    bidder_indices: Option<&'a [usize]>,
+) -> impl Iterator<Item = usize> + 'a {
+    let mut wildcard = wildcard_indices.iter().copied().peekable();
+    let mut bidder = bidder_indices.unwrap_or(&[]).iter().copied().peekable();
+
+    std::iter::from_fn(move || match (wildcard.peek(), bidder.peek()) {
+        (Some(wildcard_idx), Some(bidder_idx)) if wildcard_idx <= bidder_idx => wildcard.next(),
+        (Some(_), Some(_)) => bidder.next(),
+        (Some(_), None) => wildcard.next(),
+        (None, Some(_)) => bidder.next(),
+        (None, None) => None,
+    })
 }
 
 impl CompiledBidParamOverrideRule {
@@ -3793,6 +3803,21 @@ set = { placementId = "explicit_header" }
                 "should merge additional explicit keys"
             );
             assert_eq!(params["keep"], "yes", "should preserve unrelated params");
+        }
+
+        #[test]
+        fn merged_rule_indices_preserve_declaration_order() {
+            let wildcard_indices = [0, 3, 6];
+            let bidder_indices = [1, 2, 5, 7];
+
+            let actual =
+                merged_rule_indices(&wildcard_indices, Some(&bidder_indices)).collect::<Vec<_>>();
+
+            assert_eq!(
+                actual,
+                vec![0, 1, 2, 3, 5, 6, 7],
+                "merged indices should preserve global declaration order"
+            );
         }
 
         #[test]
