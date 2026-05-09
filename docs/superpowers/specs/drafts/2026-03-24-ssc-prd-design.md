@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # Product Requirements: Edge Cookie (EC)
 
 **Status:** Draft

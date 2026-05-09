@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # Runtime Integration Attestation Architecture
 
 > **Status:** Proposal

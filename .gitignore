@@ -24,6 +24,7 @@ src/*.html
 !.claude/settings.json
 !.claude/commands/
 !.claude/agents/
+!.claude/skills/
 
 # SSL certificates
 *.pem

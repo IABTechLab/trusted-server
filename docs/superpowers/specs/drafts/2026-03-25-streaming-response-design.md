@@ -1,3 +1,7 @@
+---
+status: draft
+---
+
 # Streaming Response Optimization (Next.js Disabled)
 
 ## Problem
