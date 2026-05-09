@@ -312,6 +312,9 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderValue;
+
+    use crate::error::TrustedServerError;
     use crate::test_support::tests::create_test_settings;
 
     use super::*;
@@ -399,13 +402,35 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_request_cookies_invalid_cookie_header() {
+    fn test_handle_request_cookies_malformed_cookie_string() {
         let req = build_request(Some("invalid"));
         let jar = handle_request_cookies(&req)
             .expect("should parse cookies")
             .expect("should have cookie jar");
 
         assert!(jar.iter().count() == 0);
+    }
+
+    #[test]
+    fn test_handle_request_cookies_invalid_utf8_cookie_header() {
+        // Truncated 4-byte UTF-8 sequence: `\xF0` starts a 4-byte code point but
+        // only two continuation bytes follow, so `to_str()` rejects it.
+        let invalid_cookie_value =
+            HeaderValue::from_bytes(b"\xF0\x90\x80").expect("should build header value");
+        let mut req = build_request(None);
+        req.headers_mut()
+            .insert(header::COOKIE, invalid_cookie_value);
+
+        let err =
+            handle_request_cookies(&req).expect_err("should reject invalid UTF-8 cookie header");
+
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::InvalidHeaderValue { .. }
+            ),
+            "should return InvalidHeaderValue for non-UTF-8 cookie header"
+        );
     }
 
     #[test]

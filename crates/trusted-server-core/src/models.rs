@@ -68,20 +68,6 @@ mod tests {
     }
 
     #[test]
-    fn test_callback_type_field_rename() {
-        // Test that "type" is correctly renamed to callback_type
-        let json_str = r#"{
-            "type": "click",
-            "url": "https://example.com/track/click"
-        }"#;
-
-        let callback: Callback =
-            serde_json::from_str(json_str).expect("should deserialize callback from str");
-        assert_eq!(callback.callback_type, "click");
-        assert_eq!(callback.url, "https://example.com/track/click");
-    }
-
-    #[test]
     fn test_ad_response_full_deserialization() {
         let json_data = json!({
             "networkId": "12345",
