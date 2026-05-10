@@ -915,7 +915,13 @@ pub async fn handle_publisher_request(
         None
     };
 
-    if ad_slots_script.is_some() {
+    // §4.7: assembled HTML responses must never be shared-cached — per-user bid data
+    // travels inline. Apply regardless of slot match or auction outcome (§8).
+    let origin_content_type = response
+        .get_header(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    if origin_content_type.contains("text/html") {
         response.set_header(header::CACHE_CONTROL, "private, max-age=0");
         response.remove_header("surrogate-control");
         response.remove_header("fastly-surrogate-control");
