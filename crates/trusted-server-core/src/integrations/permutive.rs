@@ -13,12 +13,13 @@ use serde::Deserialize;
 use validator::Validate;
 
 use crate::backend::BackendConfig;
+use crate::compat;
 use crate::error::TrustedServerError;
-use crate::http_util::copy_custom_headers;
 use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const PERMUTIVE_INTEGRATION_ID: &str = "permutive";
@@ -494,7 +495,7 @@ impl PermutiveIntegration {
         }
 
         // Copy any X-* custom headers, skipping TS-internal headers
-        copy_custom_headers(from, to);
+        compat::copy_fastly_custom_headers(from, to);
     }
 }
 
@@ -560,6 +561,7 @@ impl IntegrationProxy for PermutiveIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();

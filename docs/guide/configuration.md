@@ -23,11 +23,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 ### Environment Variable Overrides
@@ -40,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
+export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
 ```
 
 ### Generate Secure Secrets
@@ -63,7 +60,7 @@ openssl rand -base64 32
 | Section             | Purpose                                      |
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
-| `[synthetic]`       | Synthetic ID generation                      |
+| `[edge_cookie]`     | Edge Cookie (EC) ID generation               |
 | `[proxy]`           | Proxy SSRF allowlist                         |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
@@ -78,11 +75,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-hmac-secret-key"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 
 [request_signing]
 enabled = true
@@ -205,11 +199,11 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 #### `cookie_domain`
 
-**Purpose**: Domain scope for synthetic ID cookies.
+**Purpose**: Domain scope for EC cookies.
 
 **Usage**:
 
-- Set on `synthetic_id` cookie
+- Set on `ts-ec` cookie
 - Controls cookie sharing across subdomains
 
 **Format**: Domain with optional leading dot
@@ -267,95 +261,34 @@ openssl rand -base64 32
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
-## Synthetic ID Configuration
+## EC Configuration
 
-Settings for generating privacy-preserving synthetic identifiers.
+Settings for generating privacy-preserving Edge Cookie identifiers.
 
-### `[synthetic]`
+### `[edge_cookie]`
 
-| Field           | Type   | Required | Description                                    |
-| --------------- | ------ | -------- | ---------------------------------------------- |
-| `counter_store` | String | Yes      | Fastly KV store name for counters              |
-| `opid_store`    | String | Yes      | Fastly KV store name for publisher ID mappings |
-| `secret_key`    | String | Yes      | HMAC secret for ID generation                  |
-| `template`      | String | Yes      | Handlebars template for ID composition         |
+| Field        | Type   | Required | Description                   |
+| ------------ | ------ | -------- | ----------------------------- |
+| `secret_key` | String | Yes      | HMAC secret for ID generation |
 
 **Example**:
 
 ```toml
-[synthetic]
-counter_store = "counter_store"
-opid_store = "opid_store"
+[edge_cookie]
 secret_key = "your-secure-hmac-secret"
-template = "{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__SYNTHETIC__COUNTER_STORE=counter_store
-TRUSTED_SERVER__SYNTHETIC__OPID_STORE=opid_store
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=your-secret
-TRUSTED_SERVER__SYNTHETIC__TEMPLATE="{{ client_ip }}:{{ user_agent }}:{{ accept_language }}:{{ accept_encoding }}"
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
 ```
 
 ### Field Details
 
-#### `counter_store`
-
-**Purpose**: Fastly KV store for synthetic ID counters.
-
-**Usage**:
-
-- Stores incrementing counters per domain
-- Ensures ID uniqueness
-- Accessed via Fastly KV Store API
-
-**Setup**:
-
-```bash
-# Create KV store
-fastly kv-store create --name=counter_store
-```
-
-**Data Format**:
-
-```json
-{
-  "publisher.com": 12345,
-  "another.com": 67890
-}
-```
-
-#### `opid_store`
-
-**Purpose**: Fastly KV store for publisher-provided ID mappings.
-
-**Usage**:
-
-- Maps publisher IDs to synthetic IDs
-- Enables first-party ID integration
-- Optional (used if publisher provides IDs)
-
-**Setup**:
-
-```bash
-# Create KV store
-fastly kv-store create --name=opid_store
-```
-
-**Data Format**:
-
-```json
-{
-  "publisher-id-123": "synthetic-abc",
-  "publisher-id-456": "synthetic-def"
-}
-```
-
 #### `secret_key`
 
-**Purpose**: HMAC secret for synthetic ID base generation.
+**Purpose**: HMAC secret for EC ID base generation.
 
 **Security**:
 
@@ -373,50 +306,6 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
-
-#### `template`
-
-**Purpose**: Handlebars template defining ID composition.
-
-**Available Variables**:
-
-| Variable          | Description                                | Example                                |
-| ----------------- | ------------------------------------------ | -------------------------------------- |
-| `client_ip`       | Client IP address (IPv6 normalized to /64) | `192.168.1.1`                          |
-| `user_agent`      | User-Agent header                          | `Mozilla/5.0...`                       |
-| `accept_language` | Accept-Language header (first token)       | `en-US`                                |
-| `accept_encoding` | Accept-Encoding header                     | `gzip, deflate`                        |
-| `random_uuid`     | Random UUID v4 per generation              | `9b1d3b94-1e26-4a5f-bc39-1e6f2b6a3a0f` |
-
-**Template Examples**:
-
-**Simple (IP + UA)**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}"
-```
-
-**With Locale + Encoding**:
-
-```toml
-template = "{{ client_ip }}:{{ accept_language }}:{{ accept_encoding }}"
-```
-
-**With Randomized Suffix Input**:
-
-```toml
-template = "{{ client_ip }}:{{ user_agent }}:{{ random_uuid }}"
-```
-
-**Validation**: Must be non-empty string.
-
-::: tip Template Design
-Choose template variables based on your privacy and uniqueness requirements:
-
-- **More variables** = More unique IDs, less privacy
-- **Fewer variables** = More privacy, potential collisions
-- **Include `random_uuid`** only if you want a new ID for every generation
-  :::
 
 ## Response Headers
 
@@ -808,17 +697,20 @@ apply when the integration section exists in `trusted-server.toml`.
 
 **Section**: `[integrations.prebid]`
 
-| Field                 | Type          | Default                                                                | Description                                                                                                                                           |
-| --------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`             | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
-| `server_url`          | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
-| `timeout_ms`          | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
-| `bidders`             | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
-| `debug`               | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
-| `test_mode`           | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
-| `debug_query_params`  | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
-| `client_side_bidders` | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
-| `script_patterns`     | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
+| Field                      | Type          | Default                                                                | Description                                                                                                                                           |
+| -------------------------- | ------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                             |
+| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                            |
+| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                       |
+| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                               |
+| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
+| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
+| `debug`                    | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
+| `test_mode`                | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
+| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
+| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side (see [Prebid docs](/guide/integrations/prebid#client-side-bidders)) |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                           |
 
 **Example**:
 
@@ -836,6 +728,18 @@ client_side_bidders = ["rubicon"]
 
 # Customize script interception (optional)
 script_patterns = ["/prebid.js", "/prebid.min.js"]
+
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+pubid = "server-pub"
+
+[integrations.prebid.bid_param_zone_overrides.kargo]
+header = { placementId = "_s2sHeaderPlacement" }
+
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "_s2sHeaderPlacement" }
 ```
 
 **Environment Override**:
@@ -845,6 +749,9 @@ TRUSTED_SERVER__INTEGRATIONS__PREBID__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL=https://prebid.example/auction
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=1200
 TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS=kargo,appnexus,openx
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":99999,"pubid":"server-pub"}}'
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_ZONE_OVERRIDES='{"kargo":{"header":{"placementId":"_s2sHeaderPlacement"}}}'
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_s2sHeaderPlacement"}}]'
 TRUSTED_SERVER__INTEGRATIONS__PREBID__CLIENT_SIDE_BIDDERS=rubicon
 TRUSTED_SERVER__INTEGRATIONS__PREBID__DEBUG=false
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TEST_MODE=false
@@ -861,6 +768,14 @@ The `script_patterns` configuration determines which Prebid scripts are intercep
 - **Disable interception**: Set `script_patterns = []` to keep client-side Prebid
 
 See [Prebid Integration](/guide/integrations/prebid) for full details.
+
+**Bid Param Override Surfaces**:
+
+- `bid_param_overrides`: Static per-bidder shallow-merge overrides.
+- `bid_param_zone_overrides`: Per-bidder, per-zone shallow-merge overrides.
+- `bid_param_override_rules`: Canonical ordered rules with `when` matchers and `set` objects.
+
+Compatibility fields are normalized into the same runtime engine as canonical rules. Explicit `bid_param_override_rules` run after compatibility-derived rules, so later canonical rules win on conflicts.
 
 ### Next.js Integration
 
@@ -995,10 +910,10 @@ Configuration is validated at startup:
 - All fields non-empty
 - `origin_url` is valid URL
 
-**Synthetic Validation**:
+**EC Validation**:
 
 - `secret_key` ≥ 1 character
-- `template` non-empty
+- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 
 **Handler Validation**:
 
@@ -1055,7 +970,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__SYNTHETIC__SECRET_KEY=$(cat /run/secrets/synthetic_secret)
+TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1107,6 +1022,13 @@ trusted-server.dev.toml      # Development overrides
 - Verify all required fields present
 - Check environment variable format
 
+**"Configuration field '...' is set to a known placeholder value"**:
+
+- `edge_cookie.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
+- Must be non-empty
+- Change to a secure random value (see generation commands above)
+
 **"Invalid regex"**:
 
 - Handler `path` must be valid regex
@@ -1156,5 +1078,5 @@ cat trusted-server.toml | npx toml-cli validate
 
 - Set up [Request Signing](/guide/request-signing) for secure API calls
 - Configure [First-Party Proxy](/guide/first-party-proxy) for URL proxying
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-preserving identification
+- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-preserving identification
 - Review [Integrations](/guide/integrations-overview) for partner support

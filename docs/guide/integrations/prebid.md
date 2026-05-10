@@ -30,10 +30,21 @@ client_side_bidders = ["rubicon"]
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
+# Optional static per-bidder param overrides (shallow merge)
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+pubid = "server-pub"
+
 # Optional per-bidder, per-zone param overrides (shallow merge)
 [integrations.prebid.bid_param_zone_overrides.kargo]
 header       = {placementId = "_s2sHeaderPlacement"}
 in_content   = {placementId = "_s2sContentPlacement"}
+
+# Optional canonical ordered override rules
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "_s2sHeaderPlacement" }
 ```
 
 ### Configuration Options
@@ -44,7 +55,9 @@ in_content   = {placementId = "_s2sContentPlacement"}
 | `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                       |
 | `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                  |
 | `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                          |
-| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; zone values are shallow-merged into bidder params                                                          |
+| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                      |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                   |
+| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts    |
 | `debug`                    | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)             |
 | `test_mode`                | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand |
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                        |
@@ -111,12 +124,12 @@ Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
-- Adds synthetic ID for privacy-safe tracking
+- Adds EC ID for privacy-safe tracking
 - Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
-### Synthetic ID Injection
+### EC ID Injection
 
-Automatically injects privacy-preserving synthetic ID into bid requests for user recognition without cookies.
+Automatically injects privacy-preserving EC ID into bid requests for user recognition without cookies.
 
 ### Request Signing
 
@@ -147,6 +160,32 @@ script_patterns = []
 
 When a request matches a script pattern, Trusted Server returns an empty JavaScript file with aggressive caching (`max-age=31536000, immutable`).
 
+### Bid Param Overrides
+
+Use `bid_param_overrides` for static per-bidder param overrides when the same override should apply regardless of ad zone.
+
+**Behavior**:
+
+- Overrides are matched by bidder name only
+- Override params are shallow-merged into incoming bidder params
+- Override values win on key conflicts
+- Unrelated incoming fields are preserved
+- These compatibility entries are normalized into the same runtime engine as `bid_param_override_rules`
+
+**Example**:
+
+```toml
+[integrations.prebid.bid_param_overrides.criteo]
+networkId = 99999
+pubid = "server-pub"
+```
+
+**Environment variable**:
+
+```text
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDES='{"criteo":{"networkId":99999,"pubid":"server-pub"}}'
+```
+
 ### Bid Param Zone Overrides
 
 Use `bid_param_zone_overrides` for per-zone, per-bidder param overrides. This is designed for bidders like Kargo that use different server-to-server placement IDs per ad zone.
@@ -159,6 +198,7 @@ The JS adapter reads the zone from `mediaTypes.banner.name` on each Prebid ad un
 - Override params are shallow-merged into incoming bidder params (override values win on key conflicts)
 - Non-conflicting incoming fields are preserved
 - When no zone override matches (unknown zone or missing zone), incoming params are left unchanged
+- These compatibility entries are normalized into the same runtime engine as `bid_param_override_rules`
 
 **Example**:
 
@@ -182,6 +222,41 @@ the outgoing bidder params become:
 ```
 
 For an unrecognised zone (e.g., `sidebar`), the incoming params are left unchanged.
+
+**Environment variable**:
+
+```text
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_ZONE_OVERRIDES='{"kargo":{"header":{"placementId":"_s2sHeaderPlacement"}}}'
+```
+
+### Bid Param Override Rules
+
+Use `bid_param_override_rules` for the canonical ordered override format. Each rule contains exact-match `when` conditions and a non-empty `set` object that is shallow-merged into bidder params when all populated matchers match.
+
+**Behavior**:
+
+- Rules can match on `when.bidder`, `when.zone`, or both
+- Matching is exact and case-sensitive — `when.bidder = "Kargo"` will not match a runtime bidder named `kargo`
+- Rules are evaluated in declaration order
+- Later matching rules win on overlapping keys
+- Compatibility fields from `bid_param_overrides` and `bid_param_zone_overrides` are normalized into earlier rules, so explicit canonical rules take precedence on conflicts
+- Within compat fields, `bid_param_overrides` is normalized before `bid_param_zone_overrides`, so zone overrides win on overlapping keys when both fields target the same bidder
+- `set` values may be `null`; `null` is inserted into outgoing bidder params wholesale — behavior varies by PBS adapter, so verify adapter handling before relying on this. Note: TOML has no null literal — null values are only reachable via the env-var JSON shape (e.g. `[{"when":{"bidder":"kargo"},"set":{"placementId":null}}]`)
+
+**Example**:
+
+```toml
+[[integrations.prebid.bid_param_override_rules]]
+when.bidder = "kargo"
+when.zone = "header"
+set = { placementId = "_s2sHeaderPlacement", keep = "server" }
+```
+
+**Environment variable**:
+
+```text
+TRUSTED_SERVER__INTEGRATIONS__PREBID__BID_PARAM_OVERRIDE_RULES='[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"_s2sHeaderPlacement","keep":"server"}}]'
+```
 
 ## Client-Side Bidders
 
@@ -289,7 +364,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Marks impressions as `secure: 1` (HTTPS-only creatives)
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
-- Injects synthetic ID in the user object
+- Injects EC ID in the user object
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields
@@ -298,7 +373,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
 - Sets the top-level `test: 1` flag when `test_mode` is enabled
 - Appends `debug_query_params` to page URL when configured
-- Applies `bid_param_zone_overrides` to `imp.ext.prebid.bidder` before request dispatch
+- Applies `bid_param_overrides`, `bid_param_zone_overrides`, and `bid_param_override_rules` via the unified override engine before request dispatch
 - Signs requests when request signing is enabled
 
 ## Best Practices
@@ -313,4 +388,4 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Review [Ad Serving Guide](/guide/ad-serving) for general concepts
 - Check [OpenRTB Support](/roadmap) on the roadmap for enhancements
 - Explore [Request Signing](/guide/request-signing) for authentication
-- Learn about [Synthetic IDs](/guide/synthetic-ids) for privacy-safe tracking
+- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-safe tracking

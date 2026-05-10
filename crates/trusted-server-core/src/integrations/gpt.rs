@@ -49,6 +49,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -129,7 +130,7 @@ impl GptIntegration {
             .with_streaming()
             .without_forward_headers();
         config.follow_redirects = false;
-        config.forward_synthetic_id = false;
+        config.forward_ec_id = false;
 
         Self::apply_request_header_allowlist(config, req)
     }
@@ -238,12 +239,13 @@ impl GptIntegration {
     async fn proxy_gpt_asset(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
         target_url: &str,
         context: &str,
     ) -> Result<Response, Report<TrustedServerError>> {
         let config = Self::build_proxy_config(target_url, &req);
-        let response = proxy_request(settings, req, config)
+        let response = proxy_request(settings, req, config, services)
             .await
             .change_context(Self::error(context))?;
 
@@ -287,12 +289,14 @@ impl GptIntegration {
     async fn handle_script_serving(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let script_url = &self.config.script_url;
         log::info!("Fetching GPT script from: {}", script_url);
         self.proxy_gpt_asset(
             settings,
+            services,
             req,
             script_url,
             &format!("Failed to fetch GPT script from {script_url}"),
@@ -309,6 +313,7 @@ impl GptIntegration {
     async fn handle_pagead_proxy(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let original_path = req.get_path();
@@ -320,6 +325,7 @@ impl GptIntegration {
         log::info!("GPT proxy: forwarding to {}", target_url);
         self.proxy_gpt_asset(
             settings,
+            services,
             req,
             &target_url,
             &format!("Failed to fetch GPT resource from {target_url}"),
@@ -376,16 +382,17 @@ impl IntegrationProxy for GptIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
 
         if path == "/integrations/gpt/script" {
-            self.handle_script_serving(settings, req).await
+            self.handle_script_serving(settings, services, req).await
         } else if path.starts_with("/integrations/gpt/pagead/")
             || path.starts_with("/integrations/gpt/tag/")
         {
-            self.handle_pagead_proxy(settings, req).await
+            self.handle_pagead_proxy(settings, services, req).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown GPT route: {}",
@@ -625,7 +632,7 @@ mod tests {
     // -- GPT proxy configuration --
 
     #[test]
-    fn build_proxy_config_uses_streaming_without_synthetic_forwarding_or_redirects() {
+    fn build_proxy_config_uses_streaming_without_ec_forwarding_or_redirects() {
         let req = Request::new(
             Method::GET,
             "https://edge.example.com/integrations/gpt/script",
@@ -640,8 +647,8 @@ mod tests {
             "should stream GPT assets verbatim without rewrite processing"
         );
         assert!(
-            !config.forward_synthetic_id,
-            "should not append synthetic_id to GPT asset requests"
+            !config.forward_ec_id,
+            "should not append EC ID to GPT asset requests"
         );
         assert!(
             !config.follow_redirects,

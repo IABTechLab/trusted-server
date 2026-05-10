@@ -34,7 +34,7 @@ fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
 }
 
 /// Default first-byte timeout for backends (15 seconds).
-const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Configuration for creating a dynamic Fastly backend.
 ///

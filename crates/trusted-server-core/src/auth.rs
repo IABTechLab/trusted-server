@@ -1,7 +1,8 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use fastly::http::{header, StatusCode};
-use fastly::{Request, Response};
+use http::header;
+use http::{Request, Response, StatusCode};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
@@ -27,9 +28,9 @@ const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 /// un-compilable path regex.
 pub fn enforce_basic_auth(
     settings: &Settings,
-    req: &Request,
-) -> Result<Option<Response>, Report<TrustedServerError>> {
-    let Some(handler) = settings.handler_for_path(req.get_path())? else {
+    req: &Request<EdgeBody>,
+) -> Result<Option<Response<EdgeBody>>, Report<TrustedServerError>> {
+    let Some(handler) = settings.handler_for_path(req.uri().path())? else {
         return Ok(None);
     };
 
@@ -53,14 +54,15 @@ pub fn enforce_basic_auth(
     if bool::from(username_match & password_match) {
         Ok(None)
     } else {
-        log::warn!("Basic auth failed for path: {}", req.get_path());
+        log::warn!("Basic auth failed for path: {}", req.uri().path());
         Ok(Some(unauthorized_response()))
     }
 }
 
-fn extract_credentials(req: &Request) -> Option<(String, String)> {
+fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
     let header_value = req
-        .get_header(header::AUTHORIZATION)
+        .headers()
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())?;
 
     let mut parts = header_value.splitn(2, ' ');
@@ -84,25 +86,42 @@ fn extract_credentials(req: &Request) -> Option<(String, String)> {
     Some((username, password))
 }
 
-fn unauthorized_response() -> Response {
-    Response::from_status(StatusCode::UNAUTHORIZED)
-        .with_header(header::WWW_AUTHENTICATE, BASIC_AUTH_REALM)
-        .with_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .with_body_text_plain("Unauthorized")
+fn unauthorized_response() -> Response<EdgeBody> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(header::WWW_AUTHENTICATE, BASIC_AUTH_REALM)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(EdgeBody::from(b"Unauthorized".as_ref()))
+        .expect("should build unauthorized response")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
-    use fastly::http::{header, Method};
+    use http::{header, HeaderValue, Method};
 
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    fn build_request(method: Method, uri: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    fn set_authorization(req: &mut Request<EdgeBody>, value: &str) {
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("should build authorization header"),
+        );
+    }
 
     #[test]
     fn no_challenge_for_non_protected_path() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/open");
+        let req = build_request(Method::GET, "https://example.com/open");
 
         assert!(enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
@@ -112,14 +131,15 @@ mod tests {
     #[test]
     fn challenge_when_missing_credentials() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/secure");
+        let req = build_request(Method::GET, "https://example.com/secure");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let realm = response
-            .get_header(header::WWW_AUTHENTICATE)
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
             .expect("should have WWW-Authenticate header");
         assert_eq!(realm, BASIC_AUTH_REALM);
     }
@@ -127,9 +147,9 @@ mod tests {
     #[test]
     fn allow_when_credentials_match() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let mut req = build_request(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("user:pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         assert!(enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
@@ -139,29 +159,29 @@ mod tests {
     #[test]
     fn challenge_when_both_credentials_wrong() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let mut req = build_request(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("wrong:wrong");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn challenge_when_username_wrong_password_correct() {
         // Validates that both fields are always evaluated — no short-circuit username oracle.
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let mut req = build_request(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("wrong-user:pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::UNAUTHORIZED,
             "should reject wrong username even with correct password"
         );
@@ -170,15 +190,15 @@ mod tests {
     #[test]
     fn challenge_when_username_correct_password_wrong() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure/data");
+        let mut req = build_request(Method::GET, "https://example.com/secure/data");
         let token = STANDARD.encode("user:wrong-pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::UNAUTHORIZED,
             "should reject correct username with wrong password"
         );
@@ -187,13 +207,13 @@ mod tests {
     #[test]
     fn challenge_when_scheme_is_not_basic() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/secure");
-        req.set_header(header::AUTHORIZATION, "Bearer token");
+        let mut req = build_request(Method::GET, "https://example.com/secure");
+        set_authorization(&mut req, "Bearer token");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -210,9 +230,9 @@ mod tests {
     #[test]
     fn allow_admin_path_with_valid_credentials() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:admin-pass");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         assert!(
             enforce_basic_auth(&settings, &req)
@@ -225,24 +245,24 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
         let settings = create_test_settings();
-        let mut req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
-        req.set_header(header::AUTHORIZATION, format!("Basic {token}"));
+        set_authorization(&mut req, &format!("Basic {token}"));
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge admin path with wrong credentials");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
         let settings = create_test_settings();
-        let req = Request::new(Method::POST, "https://example.com/admin/keys/rotate");
+        let req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")
             .expect("should challenge admin path with missing credentials");
-        assert_eq!(response.get_status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

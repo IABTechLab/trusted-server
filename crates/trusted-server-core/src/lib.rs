@@ -16,8 +16,7 @@
 //! - [`privacy`]: Privacy utilities and helpers
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
-//! - [`synthetic`]: Synthetic ID generation using HMAC
-//! - [`templates`]: Handlebars template handling
+//! - [`edge_cookie`]: Edge Cookie (EC) ID generation using HMAC
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`why`]: Debugging and introspection utilities
 
@@ -36,11 +35,14 @@ pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
 pub mod backend;
+#[doc(hidden)]
+pub mod compat;
 pub mod consent;
 pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
+pub mod edge_cookie;
 pub mod error;
 pub mod geo;
 pub(crate) mod host_rewrite;
@@ -60,6 +62,8 @@ pub mod settings_data;
 pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
-pub mod synthetic;
 pub mod test_support;
 pub mod tsjs;
+
+#[cfg(test)]
+mod migration_guards;

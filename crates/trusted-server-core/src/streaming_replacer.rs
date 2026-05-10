@@ -2,6 +2,8 @@
 //!
 //! This module provides functionality for replacing patterns in content
 //! in streaming fashion, handling content that may be split across multiple chunks.
+//!
+//! See [`crate::platform`] module doc for platform notes.
 
 // Note: std::io::{Read, Write} were previously used by stream_process function
 // which has been removed in favor of StreamingPipeline
@@ -197,6 +199,39 @@ pub fn create_url_replacer(
 mod tests {
     use super::*;
 
+    fn process_with_fixed_chunk_size(
+        mut replacer: StreamingReplacer,
+        content: &[u8],
+        chunk_size: usize,
+    ) -> String {
+        let chunks: Vec<_> = content.chunks(chunk_size).collect();
+        let mut result = Vec::new();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let is_last_chunk = index == chunks.len() - 1;
+            result.extend(replacer.process_chunk(chunk, is_last_chunk));
+        }
+
+        String::from_utf8(result).expect("output should be valid UTF-8")
+    }
+
+    fn process_with_explicit_splits(
+        mut replacer: StreamingReplacer,
+        content: &[u8],
+        split_points: &[usize],
+    ) -> String {
+        let mut result = Vec::new();
+        let mut start = 0usize;
+
+        for (index, end) in split_points.iter().copied().enumerate() {
+            let is_last_chunk = index == split_points.len() - 1;
+            result.extend(replacer.process_chunk(&content[start..end], is_last_chunk));
+            start = end;
+        }
+
+        String::from_utf8(result).expect("output should be valid UTF-8")
+    }
+
     #[test]
     fn test_streaming_replacer_basic() {
         let mut replacer =
@@ -369,61 +404,85 @@ mod tests {
     }
 
     #[test]
-    fn test_process_chunk_utf8_boundary() {
-        let mut replacer =
-            create_url_replacer("origin.com", "https://origin.com", "test.com", "https");
-
-        // Create content with multi-byte UTF-8 characters that could cause boundary issues
-        let content = "https://origin.com/test 思怙ᕏ测试 https://origin.com/more".as_bytes();
-
-        // Process in small chunks to force potential boundary issues
-        let chunk_size = 20;
-        let mut result = Vec::new();
-
-        for (i, chunk) in content.chunks(chunk_size).enumerate() {
-            let is_last = i == content.chunks(chunk_size).count() - 1;
-            result.extend(replacer.process_chunk(chunk, is_last));
+    fn test_process_chunk_utf8_boundary_cases() {
+        struct Utf8BoundaryCase<'a> {
+            name: &'a str,
+            replacer: StreamingReplacer,
+            content: &'a str,
+            chunk_size: usize,
+            expected_fragments: &'a [&'a str],
         }
 
-        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
-        assert!(result_str.contains("https://test.com/test"));
-        assert!(result_str.contains("https://test.com/more"));
-        assert!(result_str.contains("思怙ᕏ测试"));
+        let cases = [
+            Utf8BoundaryCase {
+                name: "multibyte text with chunked url replacements",
+                replacer: create_url_replacer(
+                    "origin.com",
+                    "https://origin.com",
+                    "test.com",
+                    "https",
+                ),
+                content: "https://origin.com/test 思怙ᕏ测试 https://origin.com/more",
+                chunk_size: 20,
+                expected_fragments: &[
+                    "https://test.com/test",
+                    "https://test.com/more",
+                    "思怙ᕏ测试",
+                ],
+            },
+            Utf8BoundaryCase {
+                name: "small chunks preserve utf8 without replacements",
+                replacer: create_url_replacer("test.com", "https://test.com", "new.com", "https"),
+                content: "Some text 思怙ᕏ测试 more text with 🎉 emoji",
+                chunk_size: 8,
+                expected_fragments: &["Some text", "思怙ᕏ测试", "🎉 emoji"],
+            },
+        ];
+
+        for case in cases {
+            let result = process_with_fixed_chunk_size(
+                case.replacer,
+                case.content.as_bytes(),
+                case.chunk_size,
+            );
+
+            for expected_fragment in case.expected_fragments {
+                assert!(
+                    result.contains(expected_fragment),
+                    "case `{}` should contain `{}` but was `{}`",
+                    case.name,
+                    expected_fragment,
+                    result
+                );
+            }
+        }
     }
 
     #[test]
     fn test_process_chunk_boundary_in_multibyte_char() {
-        let mut replacer =
-            create_url_replacer("example.com", "https://example.com", "new.com", "https");
-
-        // Create a scenario where chunk boundary falls in the middle of a multi-byte character
         let content = "https://example.com/før/bår/test".as_bytes();
 
-        // Split at byte 23, which should be in the middle of 'ø' (2-byte character)
-        let chunk1 = &content[..23];
-        let chunk2 = &content[23..];
+        let result = process_with_explicit_splits(
+            create_url_replacer("example.com", "https://example.com", "new.com", "https"),
+            content,
+            &[22, content.len()],
+        );
 
-        let mut result = Vec::new();
-        result.extend(replacer.process_chunk(chunk1, false));
-        result.extend(replacer.process_chunk(chunk2, true));
-
-        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
-        assert!(result_str.contains("https://new.com/før/bår/test"));
+        assert!(result.contains("https://new.com/før/bår/test"));
     }
 
     #[test]
-    fn test_process_chunk_emoji_boundary() {
-        let mut replacer =
-            create_url_replacer("emoji.com", "https://emoji.com", "test.com", "https");
+    fn test_process_chunk_boundary_in_emoji() {
+        let content = "🎉🎊🎋 https://emoji.com/more".as_bytes();
 
-        // Test with 4-byte emoji characters
-        let content = "https://emoji.com/test 🎉🎊🎋 https://emoji.com/more".as_bytes();
+        let result = process_with_explicit_splits(
+            create_url_replacer("emoji.com", "https://emoji.com", "test.com", "https"),
+            content,
+            &[2, content.len()],
+        );
 
-        // Process the entire content at once to verify it works
-        let all_at_once = replacer.process_chunk(content, true);
-        let expected = String::from_utf8(all_at_once).expect("output should be valid UTF-8");
-        assert!(expected.contains("https://test.com/test"));
-        assert!(expected.contains("https://test.com/more"));
+        assert!(result.contains("🎉🎊🎋"));
+        assert!(result.contains("https://test.com/more"));
     }
 
     #[test]
@@ -448,29 +507,6 @@ mod tests {
         let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
         assert!(result_str.contains("https://test.com/page1"));
         assert!(result_str.contains("https://test.com/page2"));
-    }
-
-    #[test]
-    fn test_process_chunk_utf8_boundary_small_chunks() {
-        let mut replacer = create_url_replacer("test.com", "https://test.com", "new.com", "https");
-
-        // Test with multi-byte characters and very small chunks to stress UTF-8 boundaries
-        let content = "Some text 思怙ᕏ测试 more text with 🎉 emoji".as_bytes();
-
-        // Use very small chunks to force UTF-8 boundary handling
-        let chunk_size = 8;
-        let mut result = Vec::new();
-        let chunks: Vec<_> = content.chunks(chunk_size).collect();
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let is_last = i == chunks.len() - 1;
-            result.extend(replacer.process_chunk(chunk, is_last));
-        }
-
-        let result_str = String::from_utf8(result).expect("output should be valid UTF-8");
-        // Just verify the content is preserved correctly
-        assert!(result_str.contains("思怙ᕏ测试"));
-        assert!(result_str.contains("🎉"));
     }
 
     #[test]

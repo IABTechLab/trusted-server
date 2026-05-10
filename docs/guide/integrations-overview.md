@@ -4,12 +4,13 @@ Trusted Server provides built-in integrations with popular third-party services,
 
 ## Quick Comparison
 
-| Integration   | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
-| ------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
-| **Prebid**    | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
-| **Next.js**   | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
-| **Permutive** | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
-| **Testlight** | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
+| Integration     | Type             | Endpoints  | HTML Rewriting               | Primary Use Case            | Status      |
+| --------------- | ---------------- | ---------- | ---------------------------- | --------------------------- | ----------- |
+| **Prebid**      | Proxy + Rewriter | 2-3 routes | Removes Prebid.js scripts    | Server-side header bidding  | Production  |
+| **Next.js**     | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
+| **Permutive**   | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
+| **Sourcepoint** | Proxy + Rewriter | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
+| **Testlight**   | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
 
@@ -20,7 +21,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 **Key Features:**
 
 - OpenRTB 2.x protocol conversion
-- Synthetic ID injection for privacy
+- EC ID injection for privacy
 - First-party creative resource proxying
 - CDN URL rewriting (7+ major SSPs)
 - GPC signal support
@@ -119,13 +120,46 @@ rewrite_sdk = true
 
 ---
 
+### Sourcepoint
+
+**What it does:** Proxies Sourcepoint CMP CDN endpoints through Trusted Server and rewrites publisher references to first-party paths.
+
+**Key Features:**
+
+- CDN proxy for `cdn.privacy-mgmt.com`
+- HTML attribute rewriting for Sourcepoint assets
+- JavaScript body rewriting for webpack chunks and API URLs
+- Head-injected `window._sp_` property trap for runtime config
+- Client-side script guard for dynamic script insertion
+
+**Configuration:**
+
+```toml
+[integrations.sourcepoint]
+enabled = true
+rewrite_sdk = true
+cdn_origin = "https://cdn.privacy-mgmt.com"
+# auth_cookie_name = "sp_auth"
+cache_ttl_seconds = 3600
+```
+
+**Endpoints:**
+
+- `GET/POST /integrations/sourcepoint/cdn/*` - Sourcepoint CDN proxy
+
+**When to use:** You load Sourcepoint CMP assets and want them to flow through first-party paths without introducing an open-ended proxy.
+
+**Learn more:** [Sourcepoint Integration](./integrations/sourcepoint.md)
+
+---
+
 ### Testlight
 
 **What it does:** Testing/development integration for validating the integration system with OpenRTB-like auctions.
 
 **Key Features:**
 
-- Synthetic ID injection demonstration
+- EC ID injection demonstration
 - Flexible JSON schema (preserves unknown fields)
 - Stream passthrough mode
 - Script replacement capability
@@ -146,7 +180,7 @@ rewrite_scripts = false
 
 - `POST /integrations/testlight/auction` - Auction endpoint with ID injection
 
-**When to use:** You're developing or testing integration functionality and need a simple endpoint to validate synthetic ID injection.
+**When to use:** You're developing or testing integration functionality and need a simple endpoint to validate EC ID injection.
 
 **Learn more:** [Testing Guide](./testing.md)
 
@@ -198,6 +232,10 @@ Do you use Permutive for audience data?
 ├─ Yes → Enable Permutive integration
 └─ No → Skip Permutive
 
+Do you use Sourcepoint for consent management?
+├─ Yes → Enable Sourcepoint integration
+└─ No → Skip Sourcepoint
+
 Are you developing/testing integrations?
 ├─ Yes → Enable Testlight integration
 └─ No → Skip Testlight
@@ -205,12 +243,13 @@ Are you developing/testing integrations?
 
 ## Performance Considerations
 
-| Integration   | Performance Impact | Caching Strategy            | Notes                                        |
-| ------------- | ------------------ | --------------------------- | -------------------------------------------- |
-| **Prebid**    | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
-| **Next.js**   | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
-| **Permutive** | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
-| **Testlight** | Low                | No caching                  | Development use only                         |
+| Integration     | Performance Impact | Caching Strategy            | Notes                                        |
+| --------------- | ------------------ | --------------------------- | -------------------------------------------- |
+| **Prebid**      | Medium             | Response caching possible   | Timeout configurable (default 1s)            |
+| **Next.js**     | Low                | N/A (streaming rewrite)     | Minimal overhead, runs during HTML streaming |
+| **Permutive**   | Low                | SDK cached (1 hour default) | API calls proxied in real-time               |
+| **Sourcepoint** | Low                | CDN cached (1 hour default) | JS rewriting adds minor overhead             |
+| **Testlight**   | Low                | No caching                  | Development use only                         |
 
 ## Environment Variables
 
@@ -229,6 +268,10 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
 # Permutive
 TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__ORGANIZATION_ID="neworg"
 TRUSTED_SERVER__INTEGRATIONS__PERMUTIVE__WORKSPACE_ID="workspace-123"
+
+# Sourcepoint
+TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__ENABLED=true
+TRUSTED_SERVER__INTEGRATIONS__SOURCEPOINT__CDN_ORIGIN="https://cdn.privacy-mgmt.com"
 
 # Testlight
 TRUSTED_SERVER__INTEGRATIONS__TESTLIGHT__ENDPOINT="https://test.example.com"
@@ -263,7 +306,7 @@ No. Integration configuration is read at startup. You must redeploy to change in
 
 ### Are integrations required?
 
-No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for synthetic ID generation and first-party proxying.
+No. All integrations are optional. You can run Trusted Server with no integrations enabled and use it purely for EC ID generation and first-party proxying.
 
 ### How do I add a new integration?
 

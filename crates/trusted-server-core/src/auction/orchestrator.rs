@@ -1,12 +1,13 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
 use error_stack::{Report, ResultExt};
-use fastly::http::request::{select, PendingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
+use crate::platform::{PlatformPendingRequest, RuntimeServices};
+use crate::proxy::platform_response_to_fastly;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
@@ -65,6 +66,7 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
+        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let start_time = Instant::now();
 
@@ -72,12 +74,13 @@ impl AuctionOrchestrator {
         let (strategy_name, result) = if self.config.has_mediator() {
             (
                 "parallel_mediation",
-                self.run_parallel_mediation(request, context).await?,
+                self.run_parallel_mediation(request, context, services)
+                    .await?,
             )
         } else {
             (
                 "parallel_only",
-                self.run_parallel_only(request, context).await?,
+                self.run_parallel_only(request, context, services).await?,
             )
         };
 
@@ -102,9 +105,12 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
+        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let mediation_start = Instant::now();
-        let provider_responses = self.run_providers_parallel(request, context).await?;
+        let provider_responses = self
+            .run_providers_parallel(request, context, services)
+            .await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
@@ -139,8 +145,10 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
+                client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
+                services: context.services,
             };
 
             let start_time = Instant::now();
@@ -150,9 +158,21 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
-            let backend_response = pending.wait().change_context(TrustedServerError::Auction {
-                message: format!("Mediator {} request failed", mediator.provider_name()),
-            })?;
+            let platform_resp = services
+                .http_client()
+                .wait(PlatformPendingRequest::new(pending))
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!("Mediator {} request failed", mediator.provider_name()),
+                })?;
+            let backend_response = platform_response_to_fastly(platform_resp).change_context(
+                TrustedServerError::Auction {
+                    message: format!(
+                        "Mediator {} returned an unsupported response body",
+                        mediator.provider_name()
+                    ),
+                },
+            )?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
@@ -205,8 +225,11 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
+        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
-        let provider_responses = self.run_providers_parallel(request, context).await?;
+        let provider_responses = self
+            .run_providers_parallel(request, context, services)
+            .await?;
         let floor_prices = self.floor_prices_by_slot(request);
         let winning_bids = self.select_winning_bids(&provider_responses, &floor_prices);
 
@@ -221,12 +244,14 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses `fastly::http::request::select()` to process responses as they
-    /// become ready, rather than waiting for each response sequentially.
+    /// Uses [`RuntimeServices::http_client`] and
+    /// [`crate::platform::PlatformHttpClient::select`] to process responses as
+    /// they become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
+        services: &RuntimeServices,
     ) -> Result<Vec<AuctionResponse>, Report<TrustedServerError>> {
         let provider_names = self.config.provider_names();
 
@@ -248,7 +273,7 @@ impl AuctionOrchestrator {
         // Maps backend_name -> (provider_name, start_time, provider)
         let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
             HashMap::new();
-        let mut pending_requests: Vec<PendingRequest> = Vec::new();
+        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -300,8 +325,10 @@ impl AuctionOrchestrator {
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
+                client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
+                services: context.services,
             };
 
             log::info!(
@@ -315,10 +342,11 @@ impl AuctionOrchestrator {
             match provider.request_bids(request, &provider_context) {
                 Ok(pending) => {
                     backend_to_provider.insert(
-                        backend_name,
+                        backend_name.clone(),
                         (provider.provider_name(), start_time, provider.as_ref()),
                     );
-                    pending_requests.push(pending);
+                    pending_requests
+                        .push(PlatformPendingRequest::new(pending).with_backend_name(backend_name));
                     log::debug!(
                         "Request to '{}' launched successfully",
                         provider.provider_name()
@@ -353,33 +381,54 @@ impl AuctionOrchestrator {
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
-            let (result, rest) = select(remaining);
-            remaining = rest;
+            let select_result = services
+                .http_client()
+                .select(remaining)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "HTTP select failed".to_string(),
+                })?;
+            remaining = select_result.remaining;
 
-            match result {
-                Ok(response) => {
+            match select_result.ready {
+                Ok(platform_response) => {
                     // Identify the provider from the backend name
-                    let backend_name = response.get_backend_name().unwrap_or_default().to_string();
+                    let backend_name = platform_response.backend_name.clone().unwrap_or_default();
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms) {
-                            Ok(auction_response) => {
-                                log::info!(
-                                    "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
-                                    auction_response.provider,
-                                    auction_response.bids.len(),
-                                    auction_response.status,
-                                    auction_response.response_time_ms
-                                );
-                                responses.push(auction_response);
+                        match platform_response_to_fastly(platform_response) {
+                            Ok(response) => {
+                                match provider.parse_response(response, response_time_ms) {
+                                    Ok(auction_response) => {
+                                        log::info!(
+                                        "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
+                                        auction_response.provider,
+                                        auction_response.bids.len(),
+                                        auction_response.status,
+                                        auction_response.response_time_ms
+                                    );
+                                        responses.push(auction_response);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Provider '{}' failed to parse response: {:?}",
+                                            provider_name,
+                                            e
+                                        );
+                                        responses.push(AuctionResponse::error(
+                                            provider_name,
+                                            response_time_ms,
+                                        ));
+                                    }
+                                }
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "Provider '{}' failed to parse response: {:?}",
+                                    "Provider '{}' returned an unsupported response body: {:?}",
                                     provider_name,
                                     e
                                 );
@@ -584,9 +633,20 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionContext, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
     };
+
+    // All-None ClientInfo used across tests that don't need real IP/TLS data.
+    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
+    // the temporary-lifetime issue that arises with &ClientInfo::default().
+    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
+        client_ip: None,
+        tls_protocol: None,
+        tls_cipher: None,
+    };
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::Request;
     use std::collections::{HashMap, HashSet};
@@ -638,18 +698,6 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
-    }
-
-    fn create_test_context<'a>(
-        settings: &'a crate::settings::Settings,
-        req: &'a Request,
-    ) -> AuctionContext<'a> {
-        AuctionContext {
-            settings,
-            request: req,
-            timeout_ms: 2000,
-            provider_responses: None,
-        }
     }
 
     #[test]
@@ -739,9 +787,11 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_context(&settings, &req);
+        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
 
-        let result = orchestrator.run_auction(&request, &context).await;
+        let result = orchestrator
+            .run_auction(&request, &context, &noop_services())
+            .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

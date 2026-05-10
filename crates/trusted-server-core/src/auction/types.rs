@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
+use crate::platform::{ClientInfo, RuntimeServices};
 use crate::settings::Settings;
 
 /// Represents a unified auction request across all providers.
@@ -69,7 +70,7 @@ pub struct PublisherInfo {
 /// Privacy-preserving user information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    /// Synthetic/hashed user ID
+    /// Stable EC ID (from cookie or freshly generated)
     pub id: String,
     /// Fresh ID for this session
     pub fresh_id: String,
@@ -102,10 +103,13 @@ pub struct SiteInfo {
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request,
+    pub client_info: &'a ClientInfo,
     pub timeout_ms: u32,
     /// Provider responses from the bidding phase, used by mediators.
     /// This is `None` for regular bidders and `Some` when calling a mediator.
     pub provider_responses: Option<&'a [AuctionResponse]>,
+    /// Platform services (config store, secret store, etc.) for use by providers.
+    pub services: &'a RuntimeServices,
 }
 
 /// Response from a single auction provider.
