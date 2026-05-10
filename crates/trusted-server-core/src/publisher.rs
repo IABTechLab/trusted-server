@@ -490,9 +490,17 @@ pub async fn stream_publisher_body_async<W: Write>(
         // to hold, so delaying the entire body until collection is acceptable.
         let placeholder = Request::get("https://placeholder.invalid/");
         let result = orchestrator
-            .collect_dispatched_auction(dispatched, services, &make_collect_context(settings, services, &placeholder))
+            .collect_dispatched_auction(
+                dispatched,
+                services,
+                &make_collect_context(settings, services, &placeholder),
+            )
             .await;
-        write_bids_to_state(&result.winning_bids, params.price_granularity, &params.ad_bids_state);
+        write_bids_to_state(
+            &result.winning_bids,
+            params.price_granularity,
+            &params.ad_bids_state,
+        );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
 
@@ -629,7 +637,14 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     processor: &mut P,
     ctx: AuctionCollectCtx<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
-    let AuctionCollectCtx { dispatched, price_granularity, ad_bids_state, orchestrator, services, settings } = ctx;
+    let AuctionCollectCtx {
+        dispatched,
+        price_granularity,
+        ad_bids_state,
+        orchestrator,
+        services,
+        settings,
+    } = ctx;
     const CHUNK_SIZE: usize = 8192;
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut pending: Vec<u8> = Vec::new();
@@ -655,9 +670,11 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         },
                     )?;
                     if !out.is_empty() {
-                        writer.write_all(&out).change_context(TrustedServerError::Proxy {
-                            message: "Failed to write last chunk".to_string(),
-                        })?;
+                        writer
+                            .write_all(&out)
+                            .change_context(TrustedServerError::Proxy {
+                                message: "Failed to write last chunk".to_string(),
+                            })?;
                     }
                 }
                 // Signal EOF to lol_html (fires end() which flushes remaining state).
@@ -667,9 +684,11 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     },
                 )?;
                 if !final_out.is_empty() {
-                    writer.write_all(&final_out).change_context(TrustedServerError::Proxy {
-                        message: "Failed to write finalized output".to_string(),
-                    })?;
+                    writer
+                        .write_all(&final_out)
+                        .change_context(TrustedServerError::Proxy {
+                            message: "Failed to write finalized output".to_string(),
+                        })?;
                 }
                 break;
             }
@@ -682,9 +701,11 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         },
                     )?;
                     if !out.is_empty() {
-                        writer.write_all(&out).change_context(TrustedServerError::Proxy {
-                            message: "Failed to write chunk".to_string(),
-                        })?;
+                        writer
+                            .write_all(&out)
+                            .change_context(TrustedServerError::Proxy {
+                                message: "Failed to write chunk".to_string(),
+                            })?;
                     }
                 }
                 pending = buffer[..n].to_vec();
@@ -2048,7 +2069,6 @@ mod tests {
             ad_bids_state: Arc::new(RwLock::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-
         };
 
         let mut output = Vec::new();
@@ -2094,7 +2114,6 @@ mod tests {
             ad_bids_state: Arc::new(RwLock::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-
         };
 
         let mut output = Vec::new();
@@ -2131,7 +2150,6 @@ mod tests {
             ad_bids_state: Arc::new(RwLock::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-
         };
 
         let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
@@ -2235,7 +2253,6 @@ mod tests {
             ad_bids_state: Arc::new(RwLock::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
@@ -2290,7 +2307,6 @@ mod tests {
             ad_bids_state: Arc::new(RwLock::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
-
         };
 
         let mut output = Vec::new();

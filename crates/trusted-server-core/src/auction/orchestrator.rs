@@ -637,7 +637,10 @@ impl AuctionOrchestrator {
             };
 
             if !provider.is_enabled() {
-                log::debug!("Provider '{}' is disabled, skipping", provider.provider_name());
+                log::debug!(
+                    "Provider '{}' is disabled, skipping",
+                    provider.provider_name()
+                );
                 continue;
             }
 
@@ -656,7 +659,10 @@ impl AuctionOrchestrator {
             let backend_name = match provider.backend_name(effective_timeout) {
                 Some(name) => name,
                 None => {
-                    log::warn!("Provider '{}' has no backend_name, skipping", provider.provider_name());
+                    log::warn!(
+                        "Provider '{}' has no backend_name, skipping",
+                        provider.provider_name()
+                    );
                     continue;
                 }
             };
@@ -681,7 +687,11 @@ impl AuctionOrchestrator {
                     );
                     backend_to_provider.insert(
                         backend_name.clone(),
-                        (provider.provider_name().to_string(), start_time, Arc::clone(provider)),
+                        (
+                            provider.provider_name().to_string(),
+                            start_time,
+                            Arc::clone(provider),
+                        ),
                     );
                     pending_requests
                         .push(PlatformPendingRequest::new(pending).with_backend_name(backend_name));
@@ -777,28 +787,45 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
                         match platform_response_to_fastly(platform_response) {
-                            Ok(response) => match provider.parse_response(response, response_time_ms) {
-                                Ok(auction_response) => {
-                                    log::info!(
-                                        "Provider '{}' returned {} bids ({}ms)",
-                                        auction_response.provider,
-                                        auction_response.bids.len(),
-                                        auction_response.response_time_ms
-                                    );
-                                    responses.push(auction_response);
+                            Ok(response) => {
+                                match provider.parse_response(response, response_time_ms) {
+                                    Ok(auction_response) => {
+                                        log::info!(
+                                            "Provider '{}' returned {} bids ({}ms)",
+                                            auction_response.provider,
+                                            auction_response.bids.len(),
+                                            auction_response.response_time_ms
+                                        );
+                                        responses.push(auction_response);
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Provider '{}' parse failed: {:?}",
+                                            provider_name,
+                                            e
+                                        );
+                                        responses.push(AuctionResponse::error(
+                                            &provider_name,
+                                            response_time_ms,
+                                        ));
+                                    }
                                 }
-                                Err(e) => {
-                                    log::warn!("Provider '{}' parse failed: {:?}", provider_name, e);
-                                    responses.push(AuctionResponse::error(&provider_name, response_time_ms));
-                                }
-                            },
+                            }
                             Err(e) => {
-                                log::warn!("Provider '{}' unsupported body: {:?}", provider_name, e);
-                                responses.push(AuctionResponse::error(&provider_name, response_time_ms));
+                                log::warn!(
+                                    "Provider '{}' unsupported body: {:?}",
+                                    provider_name,
+                                    e
+                                );
+                                responses
+                                    .push(AuctionResponse::error(&provider_name, response_time_ms));
                             }
                         }
                     } else {
-                        log::warn!("Received response from unknown backend '{}', ignoring", backend_name);
+                        log::warn!(
+                            "Received response from unknown backend '{}', ignoring",
+                            backend_name
+                        );
                     }
                 }
                 Err(e) => {
@@ -847,18 +874,27 @@ impl AuctionOrchestrator {
                                 .wait(PlatformPendingRequest::new(pending))
                                 .await;
                             match platform_resp.change_context(TrustedServerError::Auction {
-                                message: format!("Mediator {} request failed", mediator.provider_name()),
+                                message: format!(
+                                    "Mediator {} request failed",
+                                    mediator.provider_name()
+                                ),
                             }) {
                                 Ok(platform_resp) => {
                                     match platform_response_to_fastly(platform_resp).change_context(
                                         TrustedServerError::Auction {
-                                            message: format!("Mediator {} unsupported body", mediator.provider_name()),
+                                            message: format!(
+                                                "Mediator {} unsupported body",
+                                                mediator.provider_name()
+                                            ),
                                         },
                                     ) {
                                         Ok(response) => {
-                                            let response_time_ms =
-                                                remaining_ms as u64 - remaining_budget_ms(auction_start, timeout_ms) as u64;
-                                            match mediator.parse_response(response, response_time_ms) {
+                                            let response_time_ms = remaining_ms as u64
+                                                - remaining_budget_ms(auction_start, timeout_ms)
+                                                    as u64;
+                                            match mediator
+                                                .parse_response(response, response_time_ms)
+                                            {
                                                 Ok(mediator_resp) => {
                                                     let winning = mediator_resp
                                                         .bids
@@ -876,19 +912,30 @@ impl AuctionOrchestrator {
                                                             }
                                                         })
                                                         .collect();
-                                                    let winning = self.apply_floor_prices(winning, &floor_prices);
+                                                    let winning = self
+                                                        .apply_floor_prices(winning, &floor_prices);
                                                     (Some(mediator_resp), winning)
                                                 }
                                                 Err(e) => {
-                                                    log::warn!("Mediator '{}' parse failed: {:?}", mediator.provider_name(), e);
-                                                    let winning = self.select_winning_bids(&responses, &floor_prices);
+                                                    log::warn!(
+                                                        "Mediator '{}' parse failed: {:?}",
+                                                        mediator.provider_name(),
+                                                        e
+                                                    );
+                                                    let winning = self.select_winning_bids(
+                                                        &responses,
+                                                        &floor_prices,
+                                                    );
                                                     (None, winning)
                                                 }
                                             }
                                         }
                                         Err(e) => {
                                             log::warn!("Mediator body error: {:?}", e);
-                                            (None, self.select_winning_bids(&responses, &floor_prices))
+                                            (
+                                                None,
+                                                self.select_winning_bids(&responses, &floor_prices),
+                                            )
                                         }
                                     }
                                 }
@@ -899,7 +946,11 @@ impl AuctionOrchestrator {
                             }
                         }
                         Err(e) => {
-                            log::warn!("Mediator '{}' failed to dispatch: {:?}", mediator.provider_name(), e);
+                            log::warn!(
+                                "Mediator '{}' failed to dispatch: {:?}",
+                                mediator.provider_name(),
+                                e
+                            );
                             (None, self.select_winning_bids(&responses, &floor_prices))
                         }
                     }
