@@ -853,10 +853,13 @@ pub async fn handle_publisher_request(
         Vec::new()
     };
 
-    let consent_allows_auction = consent_context
-        .tcf
-        .as_ref()
-        .is_some_and(|tcf| tcf.has_purpose_consent(1));
+    // Non-GDPR regions (US, etc.) have no TCF string — auction is freely allowed.
+    // GDPR regions require TCF Purpose 1 (storage/access) before firing.
+    let consent_allows_auction = !consent_context.gdpr_applies
+        || consent_context
+            .tcf
+            .as_ref()
+            .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
     let should_run_auction =
         is_get && !is_prefetch && !is_bot && !matched_slots.is_empty() && consent_allows_auction;
@@ -1324,10 +1327,11 @@ pub async fn handle_page_bids(
             .map(|_| services.kv_store()),
     });
 
-    let consent_allows_auction = consent_context
-        .tcf
-        .as_ref()
-        .is_some_and(|tcf| tcf.has_purpose_consent(1));
+    let consent_allows_auction = !consent_context.gdpr_applies
+        || consent_context
+            .tcf
+            .as_ref()
+            .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
     let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
         let mut auction_request = build_auction_request(
