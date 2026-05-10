@@ -262,7 +262,7 @@ async fn route_request(
                             let stream_result = stream_publisher_body_async(
                                 body,
                                 &mut streaming_body,
-                                &mut *params,
+                                &mut params,
                                 settings,
                                 integration_registry,
                                 orchestrator,
