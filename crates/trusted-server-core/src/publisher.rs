@@ -872,25 +872,16 @@ pub async fn handle_publisher_request(
 
     let ad_bids_state: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-    // Only advertise encodings the rewrite pipeline can decode and re-encode.
-    restrict_accept_encoding(&mut req);
-    req.set_header("host", &origin_host);
-
-    // Dispatch origin request first.
-    let pending_origin =
-        req.send_async(&backend_name)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to dispatch async origin request".to_string(),
-            })?;
-
-    // Dispatch SSP bid requests BEFORE awaiting origin — all HTTP is now in-flight
-    // in Fastly's native layer.  WASM yields only for origin (fast, cache-hit path),
-    // so TTFB ≈ origin latency instead of TTFB ≈ auction timeout.
     let price_granularity = settings
         .creative_opportunities
         .as_ref()
         .map(|co| co.price_granularity)
         .unwrap_or_default();
+
+    // Dispatch SSP bid requests while req still has the original client headers
+    // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
+    // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
+    // can be mutated and sent to origin immediately after.
     let dispatched_auction = if should_run_auction {
         let co_config = settings
             .creative_opportunities
@@ -903,10 +894,9 @@ pub async fn handle_publisher_request(
             &request_info,
             co_config,
         );
-        let placeholder_req = fastly::Request::get("https://placeholder.invalid/");
         let auction_context = AuctionContext {
             settings,
-            request: &placeholder_req,
+            request: &req,
             client_info: services.client_info(),
             timeout_ms: auction_timeout_ms,
             provider_responses: None,
@@ -917,7 +907,19 @@ pub async fn handle_publisher_request(
         None
     };
 
-    // Now yield for origin — SSP requests are already racing in Fastly's native layer.
+    // Only advertise encodings the rewrite pipeline can decode and re-encode.
+    restrict_accept_encoding(&mut req);
+    req.set_header("host", &origin_host);
+
+    // Dispatch origin — SSP requests are already racing in Fastly's native layer.
+    // TTFB ≈ origin latency instead of TTFB ≈ auction timeout.
+    let pending_origin =
+        req.send_async(&backend_name)
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to dispatch async origin request".to_string(),
+            })?;
+
+    // Now yield for origin.
     let mut response = pending_origin
         .wait()
         .change_context(TrustedServerError::Proxy {
