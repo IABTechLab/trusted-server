@@ -677,6 +677,29 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 );
                 write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
 
+                if settings.debug.auction_html_comment {
+                    let ssp_count = result.provider_responses.len();
+                    let mediator_info = match &result.mediator_response {
+                        Some(r) => format!("ok({}_bids)", r.bids.len()),
+                        None => "none".to_string(),
+                    };
+                    let debug_comment = format!(
+                        "<!-- ts-debug: ssp={ssp_count} mediator={mediator_info} winning={} -->",
+                        result.winning_bids.len()
+                    );
+                    let mut state = ad_bids_state
+                        .write()
+                        .expect("should write bid state for debug");
+                    match &mut *state {
+                        Some(script) => {
+                            *script = format!("{debug_comment}\n{script}");
+                        }
+                        None => {
+                            *state = Some(debug_comment);
+                        }
+                    }
+                }
+
                 // Process the held last chunk (not is_last — finalization is separate).
                 if !pending.is_empty() {
                     let out = processor.process_chunk(&pending, false).change_context(
@@ -909,6 +932,7 @@ pub async fn handle_publisher_request(
             &ec_id,
             &consent_context,
             &request_info,
+            &request_path,
             co_config,
         );
         let auction_context = AuctionContext {
@@ -1109,18 +1133,23 @@ pub(crate) fn build_auction_request(
     ec_id: &str,
     consent_context: &crate::consent::ConsentContext,
     request_info: &crate::http_util::RequestInfo,
+    request_path: &str,
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
 ) -> AuctionRequest {
     let slots = matched_slots
         .iter()
         .map(|s| s.to_ad_slot(&co_config.gam_network_id))
         .collect();
+    let page_url = format!(
+        "{}://{}{}",
+        request_info.scheme, request_info.host, request_path
+    );
     AuctionRequest {
         id: format!("ts-{}", ec_id),
         slots,
         publisher: PublisherInfo {
             domain: request_info.host.clone(),
-            page_url: None,
+            page_url: Some(page_url.clone()),
         },
         user: UserInfo {
             id: ec_id.to_string(),
@@ -1130,7 +1159,7 @@ pub(crate) fn build_auction_request(
         device: None,
         site: Some(SiteInfo {
             domain: request_info.host.clone(),
-            page: String::new(),
+            page: page_url,
         }),
         context: std::collections::HashMap::new(),
     }
@@ -1363,21 +1392,14 @@ pub async fn handle_page_bids(
             .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
     let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
-        let mut auction_request = build_auction_request(
+        let auction_request = build_auction_request(
             &matched_slots,
             &ec_id,
             &consent_context,
             &request_info,
+            &path_param,
             co_config,
         );
-        let page_url = format!(
-            "{}://{}{}",
-            request_info.scheme, request_info.host, path_param
-        );
-        auction_request.publisher.page_url = Some(page_url.clone());
-        if let Some(ref mut site) = auction_request.site {
-            site.page = page_url;
-        }
         let timeout_ms = co_config
             .auction_timeout_ms
             .unwrap_or(settings.auction.timeout_ms);

@@ -410,6 +410,12 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
+    /// auction pipeline stats (SSP count, mediator status, winning bid count).
+    /// Never enable in production — visible in page source.
+    #[serde(default)]
+    pub auction_html_comment: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]

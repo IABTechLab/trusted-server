@@ -208,7 +208,11 @@ endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
 
 # Debug configuration (all flags default to false — do not enable in production)
-# [debug]
+# TODO: remove [debug] block before merging to main
+[debug]
+# Inject <!-- ts-debug: ssp=N mediator=ok(N_bids) winning=N --> before </body>.
+# Visible in page source. Disable after investigation.
+auction_html_comment = true
 # Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
 # Returns a plain-text response with the following fields (Fastly-observed values):
 #   ja4         — JA4 TLS client fingerprint
