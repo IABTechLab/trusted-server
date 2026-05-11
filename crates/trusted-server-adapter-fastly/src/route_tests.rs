@@ -332,11 +332,10 @@ fn routes_use_request_local_consent() {
 #[test]
 fn asset_routes_bypass_publisher_consent_dependencies() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -361,11 +360,10 @@ fn asset_routes_bypass_publisher_consent_dependencies() {
 #[test]
 fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -405,11 +403,10 @@ fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
 #[test]
 fn asset_routes_proxy_head_requests() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -456,11 +453,10 @@ fn asset_routes_proxy_head_requests() {
 #[test]
 fn asset_routes_ignore_query_string_for_matching() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -502,11 +498,10 @@ fn asset_routes_ignore_query_string_for_matching() {
 #[test]
 fn asset_routes_pass_redirect_responses_through() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -548,11 +543,10 @@ fn asset_routes_pass_redirect_responses_through() {
 #[test]
 fn asset_routes_skip_non_get_head_requests() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.images/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -574,10 +568,10 @@ fn asset_routes_skip_non_get_head_requests() {
     ))
     .expect("should route non-asset POST request");
 
-    assert_ne!(
+    assert_eq!(
         resp.get_status(),
-        StatusCode::OK,
-        "should not return the asset-origin response for POST requests"
+        StatusCode::SERVICE_UNAVAILABLE,
+        "should fall through to publisher fallback for POST requests"
     );
     assert!(
         http_client
@@ -592,11 +586,10 @@ fn asset_routes_skip_non_get_head_requests() {
 #[test]
 fn built_in_routes_take_precedence_over_asset_routes() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/.well-known/".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.well-known/",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -621,11 +614,10 @@ fn built_in_routes_take_precedence_over_asset_routes() {
 #[test]
 fn integration_routes_take_precedence_over_asset_routes() {
     let mut settings = create_test_settings();
-    settings.proxy.asset_routes = vec![ProxyAssetRoute {
-        prefix: "/prebid.js".to_string(),
-        origin_url: "https://assets.example.com".to_string(),
-        ..Default::default()
-    }];
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/prebid.js",
+        "https://assets.example.com",
+    )];
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");

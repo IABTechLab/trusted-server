@@ -325,10 +325,6 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
-    let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
-        .then(|| settings.asset_route_for_path(&path))
-        .flatten();
-
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
         // Serve the tsjs library
@@ -428,7 +424,11 @@ async fn route_request(
         }
 
         // No known route matched, proxy to an asset origin or publisher origin as fallback
-        _ => {
+        (method, _) => {
+            let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+                .then(|| settings.asset_route_for_path(&path))
+                .flatten();
+
             if let Some(asset_route) = matched_asset_route {
                 log::info!(
                     "No explicit route matched for path: {}, proxying via asset route prefix {} to {}",

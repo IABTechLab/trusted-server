@@ -12,9 +12,6 @@ password = "replace-with-admin-password-32-bytes"
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
-# Optional: override the upstream Host header while still connecting to origin_url.
-# Useful when an origin routes sites by Host but the backend DNS name differs.
-# origin_host_header = "test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
