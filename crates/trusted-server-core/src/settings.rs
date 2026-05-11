@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -28,6 +28,9 @@ pub struct Publisher {
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
+    /// Optional upstream Host header value used when connecting to an origin
+    /// whose routing host differs from the backend host.
+    pub origin_host_header: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -58,6 +61,61 @@ impl Publisher {
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
     }
 
+    fn normalize(&mut self) {
+        self.origin_host_header = self
+            .origin_host_header
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    /// Eagerly validate runtime-only publisher configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the configured origin Host header is invalid.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        if let Some(host_header) = &self.origin_host_header {
+            validate_host_header_value(host_header).map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "publisher.origin_host_header `{host_header}` is invalid: {err}"
+                    ),
+                })
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the upstream Host header to send to the publisher origin.
+    #[must_use]
+    pub fn origin_host_header_value(&self) -> String {
+        self.origin_host_header
+            .clone()
+            .unwrap_or_else(|| self.origin_host())
+    }
+
+    /// Returns the public origin URL whose URLs should be rewritten to the request host.
+    ///
+    /// When `origin_host_header` is configured, the backend connection target
+    /// (`origin_url`) may be an internal routing host while page content still
+    /// references the public origin host. In that case, rewrite against the
+    /// configured Host header using the origin URL's scheme.
+    #[must_use]
+    pub fn origin_rewrite_url(&self) -> String {
+        let Some(host_header) = self.origin_host_header.as_deref() else {
+            return self.origin_url.clone();
+        };
+
+        let scheme = Url::parse(&self.origin_url)
+            .ok()
+            .map(|url| url.scheme().to_string())
+            .unwrap_or_else(|| "https".to_string());
+
+        format!("{scheme}://{host_header}")
+    }
+
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -69,6 +127,7 @@ impl Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
+    ///     origin_host_header: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -564,6 +623,150 @@ fn default_request_signing_enabled() -> bool {
     false
 }
 
+/// A path-prefix asset route that proxies matched first-party requests to an alternate origin.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct ProxyAssetRoute {
+    /// Path prefix matched against the incoming request path. Must start with `/`.
+    ///
+    /// Matching uses string-prefix semantics, not path-segment semantics. Include
+    /// a trailing `/` unless you intentionally want `/static` to match paths such
+    /// as `/staticfile.js`.
+    pub prefix: String,
+    /// Absolute `http` or `https` origin used for upstream requests.
+    ///
+    /// Only the scheme, host, and port are used. Any path or query configured on
+    /// this URL is rejected because the incoming request path/query, or the
+    /// configured rewrite result, replaces them at runtime.
+    pub origin_url: String,
+    /// Optional regex matched against the incoming request path before proxying.
+    pub path_pattern: Option<String>,
+    /// Optional regex replacement used with [`Self::path_pattern`] to build the upstream path.
+    ///
+    /// Must be configured together with [`Self::path_pattern`] and must produce a
+    /// path that starts with `/`.
+    pub target_path: Option<String>,
+}
+
+impl ProxyAssetRoute {
+    fn normalize(&mut self) {
+        self.prefix = self.prefix.trim().to_string();
+        self.origin_url = self.origin_url.trim().to_string();
+        self.path_pattern = self
+            .path_pattern
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.target_path = self
+            .target_path
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    fn compiled_path_pattern(&self) -> Result<Option<Regex>, Report<TrustedServerError>> {
+        let Some(pattern) = self.path_pattern.as_deref() else {
+            return Ok(None);
+        };
+
+        Regex::new(pattern).map(Some).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.asset_routes path_pattern `{pattern}` failed to compile: {err}"
+                ),
+            })
+        })
+    }
+
+    /// Rewrite a matched request path to the configured upstream target path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a proxy/configuration error if the rewrite is incomplete, does not
+    /// match the request path, or produces a path that does not start with `/`.
+    pub fn target_path_for(&self, path: &str) -> Result<String, Report<TrustedServerError>> {
+        match (&self.path_pattern, &self.target_path) {
+            (None, None) => Ok(path.to_string()),
+            (Some(_), Some(target_path)) => {
+                let regex = self.compiled_path_pattern()?.ok_or_else(|| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "proxy.asset_routes prefix `{}` has a target_path without path_pattern",
+                            self.prefix
+                        ),
+                    })
+                })?;
+
+                if !regex.is_match(path) {
+                    return Err(Report::new(TrustedServerError::Proxy {
+                        message: format!(
+                            "asset path `{path}` matched prefix `{}` but did not match path_pattern",
+                            self.prefix
+                        ),
+                    }));
+                }
+
+                let rewritten = regex.replace(path, target_path.as_str()).into_owned();
+                if !rewritten.starts_with('/') {
+                    return Err(Report::new(TrustedServerError::Configuration {
+                        message: format!(
+                            "proxy.asset_routes prefix `{}` rewrote `{path}` to `{rewritten}`, which must start with '/'",
+                            self.prefix
+                        ),
+                    }));
+                }
+
+                Ok(rewritten)
+            }
+            _ => Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.asset_routes prefix `{}` must configure path_pattern and target_path together",
+                    self.prefix
+                ),
+            })),
+        }
+    }
+
+    /// Eagerly validate runtime-only asset-route configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the asset-route prefix, origin URL, or
+    /// path rewrite settings are invalid.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        validate_asset_route_prefix(&self.prefix).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.asset_routes prefix `{}` is invalid: {err}",
+                    self.prefix
+                ),
+            })
+        })?;
+
+        validate_proxy_origin_url(&self.origin_url).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.asset_routes origin_url `{}` is invalid: {err}",
+                    self.origin_url
+                ),
+            })
+        })?;
+
+        match (&self.path_pattern, &self.target_path) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "proxy.asset_routes prefix `{}` must configure path_pattern and target_path together",
+                        self.prefix
+                    ),
+                }));
+            }
+        }
+
+        self.compiled_path_pattern().map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
@@ -582,6 +785,9 @@ pub struct Proxy {
     /// initiated by signed first-party proxy URLs.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
     pub allowed_domains: Vec<String>,
+    /// Path-prefix-based asset proxy routes evaluated before publisher fallback.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub asset_routes: Vec<ProxyAssetRoute>,
 }
 
 fn default_certificate_check() -> bool {
@@ -600,6 +806,7 @@ impl Default for Proxy {
         Self {
             certificate_check: default_certificate_check(),
             allowed_domains: Vec::new(),
+            asset_routes: Vec::new(),
         }
     }
 }
@@ -634,6 +841,55 @@ impl Proxy {
                 "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
             );
         }
+
+        for route in &mut self.asset_routes {
+            route.normalize();
+        }
+
+        let mut seen_prefixes = HashSet::new();
+        for route in &self.asset_routes {
+            if !route.prefix.is_empty() && !seen_prefixes.insert(route.prefix.clone()) {
+                log::warn!(
+                    "proxy.asset_routes contains duplicate prefix `{}`; the first configured route will be used",
+                    route.prefix
+                );
+            }
+        }
+    }
+
+    /// Eagerly validate runtime-only proxy settings artifacts.
+    ///
+    /// Asset-route validation lives here so regex compilation and origin URL
+    /// semantic checks fail fast alongside other runtime-prepared settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if any configured asset route is invalid.
+    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        for route in &self.asset_routes {
+            route.prepare_runtime()?;
+        }
+
+        Ok(())
+    }
+
+    /// Resolve the longest matching asset route for the given request path.
+    #[must_use]
+    pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
+        let mut best_match: Option<&ProxyAssetRoute> = None;
+
+        for route in &self.asset_routes {
+            if !path.starts_with(&route.prefix) {
+                continue;
+            }
+
+            match best_match {
+                Some(current) if current.prefix.len() >= route.prefix.len() => {}
+                _ => best_match = Some(route),
+            }
+        }
+
+        best_match
     }
 }
 
@@ -692,6 +948,7 @@ impl Settings {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
+        settings.publisher.normalize();
         settings.proxy.normalize();
         settings.consent.validate();
         settings.prepare_runtime()?;
@@ -738,6 +995,7 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
+        settings.publisher.normalize();
         settings.proxy.normalize();
         settings.consent.validate();
 
@@ -760,6 +1018,9 @@ impl Settings {
     ///
     /// Returns a configuration error if any handler path regex does not compile.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+        self.publisher.prepare_runtime()?;
+        self.proxy.prepare_runtime()?;
+
         for handler in &self.handlers {
             handler.prepare_runtime()?;
         }
@@ -795,6 +1056,12 @@ impl Settings {
         Err(Report::new(TrustedServerError::InsecureDefault {
             field: insecure_fields.join(", "),
         }))
+    }
+
+    /// Resolve the longest matching asset route for the request path.
+    #[must_use]
+    pub fn asset_route_for_path(&self, path: &str) -> Option<&ProxyAssetRoute> {
+        self.proxy.asset_route_for_path(path)
     }
 
     /// Resolve the first handler whose regex matches the request path.
@@ -954,7 +1221,7 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
     if value.ends_with('/') {
         let mut err = ValidationError::new("trailing_slash");
         err.add_param("value".into(), &value);
-        err.message = Some("origin_url must not end with '/'".into());
+        err.message = Some("origin_url must not include a trailing slash".into());
         return Err(err);
     }
     Ok(())
@@ -964,6 +1231,72 @@ fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), Validatio
     if value.expose().is_empty() {
         return Err(ValidationError::new("empty_value"));
     }
+    Ok(())
+}
+
+fn validate_host_header_value(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() || value.contains(['\0', '\n', '\r']) {
+        let mut err = ValidationError::new("invalid_host_header");
+        err.add_param("value".into(), &value);
+        err.message =
+            Some("host header must be non-empty and must not contain control characters".into());
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn validate_asset_route_prefix(value: &str) -> Result<(), ValidationError> {
+    if !value.starts_with('/') {
+        let mut err = ValidationError::new("invalid_prefix");
+        err.add_param("value".into(), &value);
+        err.message = Some("asset-route prefix must start with '/'".into());
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn validate_proxy_origin_url(value: &str) -> Result<(), ValidationError> {
+    validate_no_trailing_slash(value)?;
+
+    let parsed = Url::parse(value).map_err(|parse_error| {
+        let mut err = ValidationError::new("invalid_origin_url");
+        err.add_param("value".into(), &value);
+        err.add_param("message".into(), &parse_error.to_string());
+        err.message = Some("origin_url must be an absolute http or https URL".into());
+        err
+    })?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        let mut err = ValidationError::new("invalid_origin_url_scheme");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must use http or https".into());
+        return Err(err);
+    }
+
+    if parsed.host_str().is_none() {
+        let mut err = ValidationError::new("missing_origin_host");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must include a host".into());
+        return Err(err);
+    }
+
+    if !matches!(parsed.path(), "" | "/") {
+        let mut err = ValidationError::new("origin_url_has_path");
+        err.add_param("value".into(), &value);
+        err.message =
+            Some("origin_url must not include a path; only scheme/host/port are used".into());
+        return Err(err);
+    }
+
+    if parsed.query().is_some() {
+        let mut err = ValidationError::new("origin_url_has_query");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must not include a query string".into());
+        return Err(err);
+    }
+
     Ok(())
 }
 
@@ -1927,6 +2260,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -1936,6 +2270,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
@@ -1945,6 +2280,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -1954,6 +2290,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -1963,6 +2300,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
@@ -1972,9 +2310,80 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
+            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
+    }
+
+    #[test]
+    fn publisher_origin_host_header_defaults_to_origin_host() {
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            origin_host_header: None,
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+
+        assert_eq!(
+            publisher.origin_host_header_value(),
+            "origin.example.com",
+            "should preserve existing Host header behavior by default"
+        );
+    }
+
+    #[test]
+    fn publisher_origin_host_header_uses_configured_value() {
+        let mut publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://backend.example.net".to_string(),
+            origin_host_header: Some("  example.com  ".to_string()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+        publisher.normalize();
+
+        assert_eq!(
+            publisher.origin_host_header_value(),
+            "example.com",
+            "should use the normalized configured upstream Host header"
+        );
+    }
+
+    #[test]
+    fn publisher_origin_rewrite_url_uses_configured_host_with_origin_scheme() {
+        let mut publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://backend.example.net".to_string(),
+            origin_host_header: Some("www.example.com".to_string()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+        publisher.normalize();
+
+        assert_eq!(
+            publisher.origin_rewrite_url(),
+            "https://www.example.com",
+            "should rewrite public-origin URLs instead of backend routing host URLs"
+        );
+    }
+
+    #[test]
+    fn publisher_origin_rewrite_url_defaults_to_origin_url_without_host_override() {
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            origin_host_header: None,
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+
+        assert_eq!(
+            publisher.origin_rewrite_url(),
+            "https://origin.example.com",
+            "should preserve existing rewrite behavior without a Host override"
+        );
     }
 
     #[test]
@@ -2356,6 +2765,7 @@ mod tests {
                 "  AD.EXAMPLE.COM  ".to_string(),
                 "*.Example.Org".to_string(),
             ],
+            asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -2375,6 +2785,7 @@ mod tests {
                 "".to_string(),
                 "cdn.example.com".to_string(),
             ],
+            asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -2389,6 +2800,7 @@ mod tests {
         let mut proxy = Proxy {
             certificate_check: true,
             allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
+            asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
@@ -2403,6 +2815,7 @@ mod tests {
         let mut proxy = Proxy {
             certificate_check: true,
             allowed_domains: vec!["*".to_string()],
+            asset_routes: vec![],
         };
         proxy.normalize();
         assert!(
@@ -2416,11 +2829,186 @@ mod tests {
         let mut proxy = Proxy {
             certificate_check: true,
             allowed_domains: vec!["  ".to_string(), "\t".to_string()],
+            asset_routes: vec![],
         };
         proxy.normalize();
         assert!(
             proxy.allowed_domains.is_empty(),
             "all-blank list should normalize to empty (open mode)"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_trims_asset_routes() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![],
+            asset_routes: vec![ProxyAssetRoute {
+                prefix: "  /.images/  ".to_string(),
+                origin_url: "  https://assets.example.com  ".to_string(),
+                ..Default::default()
+            }],
+        };
+        proxy.normalize();
+        assert_eq!(
+            proxy.asset_routes[0].prefix, "/.images/",
+            "should trim asset-route prefix"
+        );
+        assert_eq!(
+            proxy.asset_routes[0].origin_url, "https://assets.example.com",
+            "should trim asset-route origin_url"
+        );
+    }
+
+    #[test]
+    fn proxy_normalize_trims_asset_route_rewrite_fields() {
+        let mut proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![],
+            asset_routes: vec![ProxyAssetRoute {
+                prefix: "/.images/".to_string(),
+                origin_url: "https://assets.example.com".to_string(),
+                path_pattern: Some("  ^/(.*)$  ".to_string()),
+                target_path: Some("  /rewritten/$1  ".to_string()),
+            }],
+        };
+        proxy.normalize();
+
+        assert_eq!(
+            proxy.asset_routes[0].path_pattern.as_deref(),
+            Some("^/(.*)$"),
+            "should trim asset-route path_pattern"
+        );
+        assert_eq!(
+            proxy.asset_routes[0].target_path.as_deref(),
+            Some("/rewritten/$1"),
+            "should trim asset-route target_path"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_rewrite_fields_parse_from_toml() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
+            target_path = "/image/upload/$1.$2"
+            "#;
+        let settings = Settings::from_toml(&toml_str).expect("should parse asset route rewrite");
+        let route = settings
+            .asset_route_for_path("/.image/options/id/example.jpg")
+            .expect("should match configured asset route");
+
+        assert_eq!(
+            route.path_pattern.as_deref(),
+            Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$"),
+            "should preserve the configured rewrite pattern"
+        );
+        assert_eq!(
+            route.target_path.as_deref(),
+            Some("/image/upload/$1.$2"),
+            "should preserve the configured replacement"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_incomplete_rewrite() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            path_pattern = "^/\\.image/(.*)$"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject incomplete asset route rewrite");
+
+        assert!(
+            format!("{err:?}").contains("must configure path_pattern and target_path together"),
+            "should mention the incomplete rewrite configuration: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_invalid_path_pattern() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            path_pattern = "["
+            target_path = "/image/upload/$1"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject invalid asset route path_pattern");
+
+        assert!(
+            format!("{err:?}").contains("failed to compile"),
+            "should mention the invalid regex: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_for_path_prefers_longest_prefix() {
+        let proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![],
+            asset_routes: vec![
+                ProxyAssetRoute {
+                    prefix: "/.images/".to_string(),
+                    origin_url: "https://a.example.com".to_string(),
+                    ..Default::default()
+                },
+                ProxyAssetRoute {
+                    prefix: "/.images/special/".to_string(),
+                    origin_url: "https://b.example.com".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let route = proxy
+            .asset_route_for_path("/.images/special/banner.png")
+            .expect("should match a configured asset route");
+        assert_eq!(
+            route.origin_url, "https://b.example.com",
+            "should prefer the most specific prefix"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_for_path_keeps_first_duplicate_prefix() {
+        let proxy = Proxy {
+            certificate_check: true,
+            allowed_domains: vec![],
+            asset_routes: vec![
+                ProxyAssetRoute {
+                    prefix: "/.images/".to_string(),
+                    origin_url: "https://first.example.com".to_string(),
+                    ..Default::default()
+                },
+                ProxyAssetRoute {
+                    prefix: "/.images/".to_string(),
+                    origin_url: "https://second.example.com".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let route = proxy
+            .asset_route_for_path("/.images/banner.png")
+            .expect("should match duplicate prefixes deterministically");
+        assert_eq!(
+            route.origin_url, "https://first.example.com",
+            "should keep the first configured duplicate prefix"
         );
     }
 
@@ -2439,6 +3027,96 @@ mod tests {
                 "*.cdn.example.com".to_string()
             ],
             "from_toml should normalize allowed_domains"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_prefix_without_leading_slash() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = ".images/"
+            origin_url = "https://assets.example.com"
+            "#;
+        let err =
+            Settings::from_toml(&toml_str).expect_err("should reject invalid asset-route prefix");
+        assert!(
+            format!("{err:?}").contains("asset-route prefix must start with '/'"),
+            "should mention the prefix validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_non_http_origin_url() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "ftp://assets.example.com"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject non-http asset-route origin_url");
+        assert!(
+            format!("{err:?}").contains("origin_url must use http or https"),
+            "should mention the origin_url validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_origin_url_path() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com/api"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject asset-route origin_url with path");
+        assert!(
+            format!("{err:?}").contains("origin_url must not include a path"),
+            "should mention the origin_url path validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_origin_url_query() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com?token=abc"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject asset-route origin_url with query");
+        assert!(
+            format!("{err:?}").contains("origin_url must not include a query string"),
+            "should mention the origin_url query validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_accepts_origin_url_host_and_port() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com:8443"
+            "#;
+        let settings =
+            Settings::from_toml(&toml_str).expect("should accept asset-route origin host and port");
+        assert_eq!(
+            settings.proxy.asset_routes[0].origin_url, "https://assets.example.com:8443",
+            "should preserve valid origin URL with non-standard port"
         );
     }
 

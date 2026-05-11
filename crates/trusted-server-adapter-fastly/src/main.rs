@@ -27,8 +27,8 @@ use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
@@ -325,6 +325,10 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
+    let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+        .then(|| settings.asset_route_for_path(&path))
+        .flatten();
+
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
         // Serve the tsjs library
@@ -387,18 +391,22 @@ async fn route_request(
         }
 
         // tsjs endpoints
-        (Method::GET, "/first-party/proxy") => {
-            (handle_first_party_proxy(settings, req).await, false)
-        }
-        (Method::GET, "/first-party/click") => {
-            (handle_first_party_click(settings, req).await, false)
-        }
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            (handle_first_party_proxy_sign(settings, req).await, false)
-        }
-        (Method::POST, "/first-party/proxy-rebuild") => {
-            (handle_first_party_proxy_rebuild(settings, req).await, false)
-        }
+        (Method::GET, "/first-party/proxy") => (
+            handle_first_party_proxy(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::GET, "/first-party/click") => (
+            handle_first_party_click(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => (
+            handle_first_party_proxy_sign(settings, runtime_services, req).await,
+            false,
+        ),
+        (Method::POST, "/first-party/proxy-rebuild") => (
+            handle_first_party_proxy_rebuild(settings, runtime_services, req).await,
+            false,
+        ),
         (m, path) if integration_registry.has_route(&m, path) => {
             let result = integration_registry
                 .handle_proxy(ProxyDispatchInput {
@@ -407,6 +415,7 @@ async fn route_request(
                     settings,
                     kv: kv_graph.as_ref(),
                     ec_context: &mut ec_context,
+                    services: runtime_services,
                     req,
                 })
                 .await
@@ -418,78 +427,91 @@ async fn route_request(
             (result, true)
         }
 
-        // No known route matched, proxy to publisher origin as fallback
+        // No known route matched, proxy to an asset origin or publisher origin as fallback
         _ => {
-            log::info!(
-                "No known route matched for path: {}, proxying to publisher origin",
-                path
-            );
+            if let Some(asset_route) = matched_asset_route {
+                log::info!(
+                    "No explicit route matched for path: {}, proxying via asset route prefix {} to {}",
+                    path,
+                    asset_route.prefix,
+                    asset_route.origin_url
+                );
+                (
+                    handle_asset_proxy_request(settings, runtime_services, req, asset_route).await,
+                    false,
+                )
+            } else {
+                log::info!(
+                    "No known route matched for path: {}, proxying to publisher origin",
+                    path
+                );
 
-            match handle_publisher_request(
-                settings,
-                integration_registry,
-                runtime_services,
-                kv_graph.as_ref(),
-                &mut ec_context,
-                req,
-            ) {
-                Ok(PublisherResponse::Stream {
-                    mut response,
-                    body,
-                    params,
-                }) => {
-                    // Publisher fallback has multiple delivery modes.
-                    // EC finalization is header-only, so it must happen before
-                    // headers are committed on the streaming path.
-                    ec_finalize_response(
-                        settings,
-                        &ec_context,
-                        finalize_kv_graph.as_ref(),
-                        partner_registry,
-                        eids_cookie.as_deref(),
-                        sharedid_cookie.as_deref(),
-                        &mut response,
-                    );
-                    finalize_response(settings, geo_info.as_ref(), &mut response);
-
-                    let mut streaming_body = response.stream_to_client();
-                    let mut stream_succeeded = false;
-                    if let Err(err) = stream_publisher_body(
+                match handle_publisher_request(
+                    settings,
+                    integration_registry,
+                    runtime_services,
+                    kv_graph.as_ref(),
+                    &mut ec_context,
+                    req,
+                ) {
+                    Ok(PublisherResponse::Stream {
+                        mut response,
                         body,
-                        &mut streaming_body,
-                        &params,
-                        settings,
-                        integration_registry,
-                    ) {
-                        // Headers are already committed. Log and abort rather
-                        // than trying to replace the response mid-stream.
-                        log::error!("Streaming processing failed: {err:?}");
-                        drop(streaming_body);
-                    } else if let Err(err) = streaming_body.finish() {
-                        log::error!("Failed to finish streaming body: {err}");
-                    } else {
-                        stream_succeeded = true;
+                        params,
+                    }) => {
+                        // Publisher fallback has multiple delivery modes.
+                        // EC finalization is header-only, so it must happen before
+                        // headers are committed on the streaming path.
+                        ec_finalize_response(
+                            settings,
+                            &ec_context,
+                            finalize_kv_graph.as_ref(),
+                            partner_registry,
+                            eids_cookie.as_deref(),
+                            sharedid_cookie.as_deref(),
+                            &mut response,
+                        );
+                        finalize_response(settings, geo_info.as_ref(), &mut response);
+
+                        let mut streaming_body = response.stream_to_client();
+                        let mut stream_succeeded = false;
+                        if let Err(err) = stream_publisher_body(
+                            body,
+                            &mut streaming_body,
+                            &params,
+                            settings,
+                            integration_registry,
+                        ) {
+                            // Headers are already committed. Log and abort rather
+                            // than trying to replace the response mid-stream.
+                            log::error!("Streaming processing failed: {err:?}");
+                            drop(streaming_body);
+                        } else if let Err(err) = streaming_body.finish() {
+                            log::error!("Failed to finish streaming body: {err}");
+                        } else {
+                            stream_succeeded = true;
+                        }
+
+                        let pull_sync_context = if is_real_browser && stream_succeeded {
+                            build_pull_sync_context(&ec_context)
+                        } else {
+                            None
+                        };
+
+                        return Ok(RouteOutcome {
+                            response: None,
+                            pull_sync_context,
+                        });
                     }
-
-                    let pull_sync_context = if is_real_browser && stream_succeeded {
-                        build_pull_sync_context(&ec_context)
-                    } else {
-                        None
-                    };
-
-                    return Ok(RouteOutcome {
-                        response: None,
-                        pull_sync_context,
-                    });
-                }
-                Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                    response.set_body(body);
-                    (Ok(response), true)
-                }
-                Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
-                Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    (Err(e), true)
+                    Ok(PublisherResponse::PassThrough { mut response, body }) => {
+                        response.set_body(body);
+                        (Ok(response), true)
+                    }
+                    Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
+                    Err(e) => {
+                        log::error!("Failed to proxy to publisher origin: {:?}", e);
+                        (Err(e), true)
+                    }
                 }
             }
         }
