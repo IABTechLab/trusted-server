@@ -835,24 +835,25 @@ impl AuctionOrchestrator {
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
             match self.providers.get(mediator_name.as_str()) {
                 Some(mediator) => {
-                    let remaining_ms = remaining_budget_ms(auction_start, timeout_ms);
-                    if remaining_ms == 0 {
-                        log::warn!("Auction timeout exhausted during bidding — skipping mediator");
-                        let winning = self.select_winning_bids(&responses, &floor_prices);
-                        return OrchestrationResult {
-                            provider_responses: responses,
-                            mediator_response: None,
-                            winning_bids: winning,
-                            total_time_ms: auction_start.elapsed().as_millis() as u64,
-                            metadata: HashMap::new(),
-                        };
-                    }
+                    // Use the mediator's own configured timeout, not the remaining SSP
+                    // budget. In the async-dispatch path, SSPs race against origin, so
+                    // auction_start.elapsed() can exceed the SSP budget by the time the
+                    // origin body finishes streaming. Skipping the mediator in that case
+                    // would discard all bids — the mediator is the primary bid source.
+                    let mediator_timeout = mediator.timeout_ms();
+                    let mediator_start = Instant::now();
+                    log::info!(
+                        "Running mediator '{}' with {}ms budget (SSP budget remaining: {}ms)",
+                        mediator.provider_name(),
+                        mediator_timeout,
+                        remaining_budget_ms(auction_start, timeout_ms),
+                    );
                     let placeholder = fastly::Request::get("https://placeholder.invalid/");
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: &placeholder,
                         client_info: context.client_info,
-                        timeout_ms: remaining_ms,
+                        timeout_ms: mediator_timeout,
                         provider_responses: Some(&responses),
                         services: context.services,
                     };
@@ -878,9 +879,8 @@ impl AuctionOrchestrator {
                                         },
                                     ) {
                                         Ok(response) => {
-                                            let response_time_ms = remaining_ms as u64
-                                                - remaining_budget_ms(auction_start, timeout_ms)
-                                                    as u64;
+                                            let response_time_ms =
+                                                mediator_start.elapsed().as_millis() as u64;
                                             match mediator
                                                 .parse_response(response, response_time_ms)
                                             {
