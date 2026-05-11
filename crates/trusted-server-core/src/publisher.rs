@@ -561,6 +561,15 @@ pub(crate) fn write_bids_to_state(
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<RwLock<Option<String>>>,
 ) {
+    log::info!(
+        "write_bids_to_state: {} winning bid(s): [{}]",
+        winning_bids.len(),
+        winning_bids
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let bid_map = build_bid_map(winning_bids, price_granularity);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
@@ -655,11 +664,16 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 // Origin exhausted — pending holds the last chunk.
                 // Collect the auction before feeding it to lol_html so that
                 // the </body> handler sees populated ad_bids_state.
+                log::info!("one_behind_loop: EOF — collecting dispatched auction");
                 let placeholder = Request::get("https://placeholder.invalid/");
                 let collect_ctx = make_collect_context(settings, services, &placeholder);
                 let result = orchestrator
                     .collect_dispatched_auction(dispatched, services, &collect_ctx)
                     .await;
+                log::info!(
+                    "one_behind_loop: collect complete — {} winning bid(s)",
+                    result.winning_bids.len()
+                );
                 write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
 
                 // Process the held last chunk (not is_last — finalization is separate).
@@ -906,6 +920,14 @@ pub async fn handle_publisher_request(
     } else {
         None
     };
+    log::info!(
+        "dispatch_auction: {}",
+        if dispatched_auction.is_some() {
+            "Some — auction running async"
+        } else {
+            "None — falling back to sync or skipped"
+        }
+    );
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);

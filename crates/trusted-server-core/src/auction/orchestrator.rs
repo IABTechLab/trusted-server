@@ -751,8 +751,6 @@ impl AuctionOrchestrator {
             request,
         } = dispatched;
 
-        let deadline = Duration::from_millis(u64::from(timeout_ms));
-
         log::info!(
             "Collecting {} in-flight SSP responses (timeout: {}ms remaining: {}ms)",
             pending_requests.len(),
@@ -833,14 +831,6 @@ impl AuctionOrchestrator {
                 }
             }
 
-            if auction_start.elapsed() >= deadline && !remaining.is_empty() {
-                log::warn!(
-                    "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
-                    timeout_ms,
-                    remaining.len()
-                );
-                break;
-            }
         }
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
