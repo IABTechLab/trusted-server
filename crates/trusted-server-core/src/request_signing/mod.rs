@@ -7,11 +7,12 @@
 //!
 //! Platform stores have two identifiers:
 //!
-//! - **Store name** ([`JWKS_CONFIG_STORE_NAME`], [`SIGNING_SECRET_STORE_NAME`]):
-//!   used for runtime reads via [`crate::platform::PlatformConfigStore::get`]
-//!   and [`crate::platform::PlatformSecretStore::get_bytes`] through
-//!   [`crate::platform::RuntimeServices`]. These names are configured in
-//!   `fastly.toml` for the Fastly adapter.
+//! - **Runtime resource-link alias** ([`JWKS_CONFIG_STORE_NAME`],
+//!   [`SIGNING_SECRET_STORE_NAME`]): used for runtime reads via
+//!   [`crate::platform::PlatformConfigStore::get`] and
+//!   [`crate::platform::PlatformSecretStore::get_bytes`] through
+//!   [`crate::platform::RuntimeServices`]. Provisioning may link custom
+//!   underlying Fastly store resources using these fixed aliases.
 //!
 //! - **Store ID**: used for write operations via
 //!   [`crate::platform::PlatformConfigStore::put`] /
@@ -33,16 +34,16 @@ pub mod jwks;
 pub mod rotation;
 pub mod signing;
 
-/// Config store name for JWKS public keys used by runtime read operations.
+/// Fixed Fastly resource-link alias for JWKS public keys.
 ///
-/// This must match the store name declared in `fastly.toml` under
-/// `[local_server.config_stores]`.
+/// Runtime reads use this alias. The linked underlying Fastly Config Store
+/// resource can have a provider-scoped custom name.
 pub const JWKS_CONFIG_STORE_NAME: &str = "jwks_store";
 
-/// Secret store name for Ed25519 signing keys used by runtime read operations.
+/// Fixed Fastly resource-link alias for Ed25519 signing keys.
 ///
-/// This must match the store name declared in `fastly.toml` under
-/// `[local_server.secret_stores]`.
+/// Runtime reads use this alias. The linked underlying Fastly Secret Store
+/// resource can have a provider-scoped custom name.
 pub const SIGNING_SECRET_STORE_NAME: &str = "signing_keys";
 
 /// Lazily constructed [`StoreName`] for JWKS config-store reads.

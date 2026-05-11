@@ -168,13 +168,13 @@ For local testing, configure stores in `fastly.toml`:
 
 ### Configuration in trusted-server.toml
 
-Update `trusted-server.toml` with your store IDs:
+Update `trusted-server.toml` with your store IDs. These fields are deprecated provider-management fields, but runtime key-rotation endpoints still use them for Fastly management API writes:
 
 ```toml
 [request_signing]
 enabled = true
 config_store_id = "<config-store-id>"  # Your jwks_store ID
-secret_store_id = "<secret-store-id"  # Your signing_keys ID
+secret_store_id = "<secret-store-id>"  # Your signing_keys ID
 ```
 
 ::: tip Getting Store IDs
@@ -599,7 +599,7 @@ Test rotation in staging first:
 
 - Verify all required stores are created (see [Prerequisites](#prerequisites))
 - Check Fastly API token is stored in `api-keys` secret store as `api_key`
-- Verify `config_store_id` and `secret_store_id` in `trusted-server.toml` match your actual store IDs
+- Verify deprecated `config_store_id` and `secret_store_id` in `trusted-server.toml` match your actual store IDs if runtime key rotation is used
 - Ensure stores are linked to your Compute service
 - Confirm API token has `global:read` and `global:write` permissions
 

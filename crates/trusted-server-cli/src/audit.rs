@@ -63,13 +63,13 @@ pub fn analyze_html(target_url: &Url, html: &str) -> Result<AuditArtifact, Repor
 
 pub fn perform_audit(target_url: &Url) -> Result<AuditOutputs, Report<CliError>> {
     let collected = browser_collector::collect_page_via_browser(target_url)?;
-    build_audit_outputs(collected)
+    build_audit_outputs(&collected)
 }
 
 fn build_audit_outputs(
-    collected: collector::CollectedPage,
+    collected: &collector::CollectedPage,
 ) -> Result<AuditOutputs, Report<CliError>> {
-    let artifact = analyze_collected_page(&collected)?;
+    let artifact = analyze_collected_page(collected)?;
     let final_url = collected.final_url().map_err(|error| {
         Report::new(CliError::Audit).attach(format!("invalid final URL: {error}"))
     })?;
@@ -304,7 +304,7 @@ mod tests {
             warnings: Vec::new(),
         };
 
-        let outputs = build_audit_outputs(collected).expect("should build audit outputs");
+        let outputs = build_audit_outputs(&collected).expect("should build audit outputs");
 
         assert_eq!(
             outputs.artifact.audited_url, "https://www.publisher.example/landing",

@@ -27,8 +27,27 @@ secret_key = "trusted-server"
 # Enable signing of OpenRTB requests and other API calls
 [request_signing]
 enabled = false  # Set to true to enable request signing
-config_store_id = "<fastly-config-store-id>" # set config/secret store ids for key rotation
+# Deprecated: Fastly management store IDs are still read from here by runtime
+# key-rotation endpoints. Provisioning warns if these do not match resolved stores.
+config_store_id = "<fastly-config-store-id>"
 secret_store_id = "<fastly-secret-store-id>"
+
+# Fastly provider/deployment configuration. These values are excluded from the
+# canonical app config payload and config hash. Store names below are underlying
+# Fastly resource names; provisioning links them using fixed runtime aliases
+# such as `ts_config_store`, `jwks_store`, `signing_keys`, and `api-keys`.
+# [providers.fastly]
+# service_id = "svc_123"
+#
+# [providers.fastly.application_config]
+# store_name = "ts_config_store"
+#
+# [providers.fastly.request_signing]
+# jwks_store_name = "jwks_store"
+# signing_secret_store_name = "signing_keys"
+# runtime_api_secret_store_name = "api-keys"
+# Runtime key rotation always reads the fixed `api_key` secret from the
+# `api-keys` alias.
 
 [integrations.prebid]
 enabled = true

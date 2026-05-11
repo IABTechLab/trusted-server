@@ -65,14 +65,15 @@ ts config validate
 
 ## Key Sections
 
-| Section             | Purpose                                      |
-| ------------------- | -------------------------------------------- |
-| `[publisher]`       | Domain, origin, proxy settings               |
-| `[edge_cookie]`     | Edge Cookie (EC) ID generation               |
-| `[proxy]`           | Proxy SSRF allowlist                         |
-| `[request_signing]` | Ed25519 request signing                      |
-| `[auction]`         | Auction orchestration                        |
-| `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
+| Section              | Purpose                                      |
+| -------------------- | -------------------------------------------- |
+| `[publisher]`        | Domain, origin, proxy settings               |
+| `[edge_cookie]`      | Edge Cookie (EC) ID generation               |
+| `[proxy]`            | Proxy SSRF allowlist                         |
+| `[request_signing]`  | Ed25519 request signing                      |
+| `[providers.fastly]` | Fastly deployment/provisioning metadata      |
+| `[auction]`          | Auction orchestration                        |
+| `[integrations.*]`   | Partner integrations (Prebid, Next.js, etc.) |
 
 ## Example: Production Setup
 
@@ -102,6 +103,34 @@ client_side_bidders = ["rubicon"]
 ## Detailed Reference
 
 The sections below consolidate the full configuration reference on this page.
+
+## Provider configuration
+
+The optional `[providers]` section stores deployment metadata for CLI tooling. It is excluded from the canonical application config payload and does not affect the runtime config hash.
+
+```toml
+[providers.fastly]
+service_id = "svc_123"
+
+[providers.fastly.application_config]
+store_name = "customer_a_ts_config_store"
+
+[providers.fastly.request_signing]
+jwks_store_name = "customer_a_jwks"
+signing_secret_store_name = "customer_a_signing_keys"
+runtime_api_secret_store_name = "customer_a_api_keys"
+```
+
+| Field                                                            | Default           | Purpose                                                                        |
+| ---------------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------------ |
+| `providers.fastly.service_id`                                    | unset             | Fastly Compute service ID used by provisioning when `--service-id` is omitted. |
+| `providers.fastly.application_config.store_name`                 | `ts_config_store` | Underlying Fastly Config Store linked at runtime as `ts_config_store`.         |
+| `providers.fastly.request_signing.jwks_store_name`               | `jwks_store`      | Underlying Fastly Config Store linked at runtime as `jwks_store`.              |
+| `providers.fastly.request_signing.signing_secret_store_name`     | `signing_keys`    | Underlying Fastly Secret Store linked at runtime as `signing_keys`.            |
+| `providers.fastly.request_signing.runtime_api_secret_store_name` | `api-keys`        | Underlying Fastly Secret Store linked at runtime as `api-keys`.                |
+| `providers.fastly.request_signing.runtime_api_secret_key`        | `api_key`         | Secret key for the runtime Fastly API token.                                   |
+
+Provider store names must be non-empty. Config Store names used for application config and JWKS must be distinct, and Secret Store names used for signing keys and runtime API credentials must be distinct.
 
 ## Runtime config store
 

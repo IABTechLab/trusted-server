@@ -15,7 +15,10 @@ use validator::Validate;
 use crate::error::TrustedServerError;
 use crate::settings::{parse_toml_document, Settings, TOP_LEVEL_APPLICATION_CONFIG_KEYS};
 
-/// Hardcoded runtime config store name.
+/// Fixed Fastly resource-link alias for the runtime application config store.
+///
+/// Provisioning may link any underlying Fastly Config Store resource using
+/// this alias. Runtime code opens the alias, not the underlying resource name.
 pub const APPLICATION_CONFIG_STORE_NAME: &str = "ts_config_store";
 
 /// Hardcoded runtime config payload key.

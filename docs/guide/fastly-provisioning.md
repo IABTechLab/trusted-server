@@ -6,18 +6,21 @@ Use this page when you want to understand which config changes produce Fastly in
 
 ## Summary
 
-Most Trusted Server config changes do not create new Fastly resources. They update the canonical app config stored in Fastly Config Store `ts_config_store`, item `ts-config`.
+Most Trusted Server config changes do not create new Fastly resources. They update the canonical app config stored in the Config Store linked at runtime as `ts_config_store`, item `ts-config`.
 
 Only these config surfaces can change the Fastly resource plan:
 
-| Config change                                                                              | Fastly provisioning effect                                                                                 |
-| ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| Any valid `trusted-server.toml` content change                                             | Updates `ts_config_store` item `ts-config`. Creates and binds `ts_config_store` if missing.                |
-| `[request_signing] enabled = true`                                                         | Creates and binds `jwks_store`, `signing_keys`, and `api-keys` if missing. May bootstrap signing material. |
-| `[consent] consent_store = "<name>"`                                                       | Creates and binds a Fastly KV store named `<name>` if missing.                                             |
-| `request_signing.config_store_id` or `request_signing.secret_store_id` differs from Fastly | Adds warnings telling you to update IDs after provisioning. Does not choose resource names.                |
+| Config change                                                                              | Fastly provisioning effect                                                                                         |
+| ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| Any valid application config content change                                                | Updates the `ts-config` item in the store linked as `ts_config_store`. Creates and binds that store if missing.    |
+| `[providers.fastly].service_id`                                                            | Supplies the Fastly service ID when `--service-id` is omitted. Does not create resources.                          |
+| `[providers.fastly.application_config].store_name`                                         | Chooses the underlying Config Store resource that provisioning links as `ts_config_store`.                         |
+| `[request_signing] enabled = true`                                                         | Creates and binds JWKS, signing-key, and runtime API credential stores if missing. May bootstrap signing material. |
+| `[providers.fastly.request_signing]` store-name fields                                     | Choose the underlying request-signing Config/Secret Store resources while preserving fixed runtime aliases.        |
+| `[consent] consent_store = "<name>"`                                                       | Creates and binds a Fastly KV store named `<name>` if missing.                                                     |
+| `request_signing.config_store_id` or `request_signing.secret_store_id` differs from Fastly | Adds warnings telling you to update IDs after provisioning. Does not choose resource names.                        |
 
-All other publisher, integration, handler, proxy, header, and auction settings are application config. They are deployed by updating `ts_config_store/ts-config`.
+All other publisher, integration, handler, proxy, header, and auction settings are application config. They are deployed by updating `ts_config_store/ts-config` through the configured underlying store.
 
 ## Provisioning commands
 
@@ -45,11 +48,11 @@ See [Trusted Server CLI](/guide/cli#ts-provision-fastly-plan) for the full comma
 
 The app config store is always planned.
 
-| Fastly resource   | Type    | Name or key       | Planned when                                                              |
-| ----------------- | ------- | ----------------- | ------------------------------------------------------------------------- |
-| Config Store      | Store   | `ts_config_store` | The store is missing.                                                     |
-| Config Store item | Item    | `ts-config`       | The item is missing or its value differs from the canonical local config. |
-| Resource link     | Binding | `ts_config_store` | The current service version has no matching resource link.                |
+| Fastly resource   | Type    | Name or key                                                                | Planned when                                                              |
+| ----------------- | ------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Config Store      | Store   | `providers.fastly.application_config.store_name` default `ts_config_store` | The underlying store is missing.                                          |
+| Config Store item | Item    | `ts-config`                                                                | The item is missing or its value differs from the canonical local config. |
+| Resource link     | Binding | fixed runtime alias `ts_config_store`                                      | The current service version has no matching resource link.                |
 
 The CLI stores the canonical TOML, not the raw file bytes. Reordering or formatting changes that canonicalize to the same config should not produce an app config item update.
 
@@ -79,21 +82,21 @@ secret_store_id = "..."
 
 When enabled, provisioning manages these resources:
 
-| Fastly resource   | Type     | Name or key                              | Purpose                                            |
-| ----------------- | -------- | ---------------------------------------- | -------------------------------------------------- |
-| Config Store      | Store    | `jwks_store`                             | Stores public JWKS material and key state.         |
-| Config Store item | Item     | `current-kid`                            | Current signing key ID.                            |
-| Config Store item | Item     | `active-kids`                            | Comma-separated active key IDs.                    |
-| Config Store item | Item     | `<kid>`                                  | Public JWK JSON for a signing key.                 |
-| Secret Store      | Store    | `signing_keys`                           | Stores private signing keys.                       |
-| Secret Store item | Secret   | `<kid>`                                  | Private Ed25519 signing key bytes, base64 encoded. |
-| Secret Store      | Store    | `api-keys`                               | Stores runtime API credentials.                    |
-| Secret Store item | Secret   | `api_key`                                | Runtime Fastly API token used for key rotation.    |
-| Resource links    | Bindings | `jwks_store`, `signing_keys`, `api-keys` | Make the stores available to the service version.  |
+| Fastly resource   | Type     | Name or key                                                                         | Purpose                                            |
+| ----------------- | -------- | ----------------------------------------------------------------------------------- | -------------------------------------------------- |
+| Config Store      | Store    | `providers.fastly.request_signing.jwks_store_name` default `jwks_store`             | Stores public JWKS material and key state.         |
+| Config Store item | Item     | `current-kid`                                                                       | Current signing key ID.                            |
+| Config Store item | Item     | `active-kids`                                                                       | Comma-separated active key IDs.                    |
+| Config Store item | Item     | `<kid>`                                                                             | Public JWK JSON for a signing key.                 |
+| Secret Store      | Store    | `providers.fastly.request_signing.signing_secret_store_name` default `signing_keys` | Stores private signing keys.                       |
+| Secret Store item | Secret   | `<kid>`                                                                             | Private Ed25519 signing key bytes, base64 encoded. |
+| Secret Store      | Store    | `providers.fastly.request_signing.runtime_api_secret_store_name` default `api-keys` | Stores runtime API credentials.                    |
+| Secret Store item | Secret   | `providers.fastly.request_signing.runtime_api_secret_key` default `api_key`         | Runtime Fastly API token used for key rotation.    |
+| Resource links    | Bindings | fixed runtime aliases `jwks_store`, `signing_keys`, `api-keys`                      | Make the stores available to the service version.  |
 
 If `jwks_store` and `signing_keys` are empty, `plan` warns that `apply` will bootstrap the first Ed25519 keypair. `apply` writes the public key material to `jwks_store` and the private signing key to `signing_keys`.
 
-If `api-keys/api_key` is missing, `apply` requires exactly one runtime API token source:
+If the configured runtime API Secret Store lacks the configured runtime API token secret, `apply` requires exactly one runtime API token source:
 
 ```bash
 FASTLY_RUNTIME_API_KEY=runtime-token ts provision fastly apply --service-id svc_123
@@ -107,12 +110,13 @@ Prefer `FASTLY_RUNTIME_API_KEY` because it avoids putting the token in shell his
 
 ### Request signing IDs
 
-The CLI uses fixed Fastly store names for request signing:
+The CLI links request-signing stores using fixed runtime aliases:
 
 - `jwks_store`
 - `signing_keys`
+- `api-keys`
 
-The config fields `request_signing.config_store_id` and `request_signing.secret_store_id` are runtime IDs used by key rotation code. They do not control which stores provisioning creates.
+The underlying Fastly resource names default to those aliases and can be customized under `[providers.fastly.request_signing]`. The config fields `request_signing.config_store_id` and `request_signing.secret_store_id` are runtime IDs used by key rotation code. They do not control which stores provisioning creates.
 
 After provisioning, update these fields if the plan or apply output warns that the configured IDs differ from Fastly:
 
@@ -210,11 +214,11 @@ secret_store_id = ""
 Provisioning effect:
 
 - Ensure `ts_config_store/ts-config` is current.
-- Create or bind `jwks_store`.
-- Create or bind `signing_keys`.
-- Create or bind `api-keys`.
+- Create or bind the JWKS store as `jwks_store`.
+- Create or bind the signing-key store as `signing_keys`.
+- Create or bind the runtime API credential store as `api-keys`.
 - Bootstrap key material if signing stores are empty.
-- Require a runtime Fastly API token if `api-keys/api_key` is missing.
+- Require a runtime Fastly API token if the configured runtime API token secret is missing.
 - Warn to update `config_store_id` and `secret_store_id` after store IDs are known.
 
 ### Enable consent persistence

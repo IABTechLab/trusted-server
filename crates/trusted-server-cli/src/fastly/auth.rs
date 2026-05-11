@@ -142,6 +142,8 @@ mod tests {
 
     use super::*;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Clone, Default)]
     struct MemoryCredentialStore {
         value: Arc<Mutex<Option<String>>>,
@@ -165,6 +167,7 @@ mod tests {
 
     #[test]
     fn env_credential_wins_over_stored_credential() {
+        let _guard = ENV_LOCK.lock().expect("should lock environment");
         let store = MemoryCredentialStore::default();
         store.write("stored-token").expect("should store token");
         unsafe {
@@ -183,6 +186,7 @@ mod tests {
 
     #[test]
     fn stored_credential_is_used_when_env_is_missing() {
+        let _guard = ENV_LOCK.lock().expect("should lock environment");
         let store = MemoryCredentialStore::default();
         store.write("stored-token").expect("should store token");
         unsafe {

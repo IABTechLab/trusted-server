@@ -310,14 +310,16 @@ This does not unset `FASTLY_API_KEY`. If the environment variable is set, it rem
 Preview Fastly resources and bindings needed for the local config.
 
 ```bash
-ts provision fastly plan --service-id <service-id> [--config <path>] [--json]
+ts provision fastly plan [--service-id <service-id>] [--config <path>] [--json]
 ```
 
 | Option                      | Description                                                  |
 | --------------------------- | ------------------------------------------------------------ |
-| `--service-id <service-id>` | Existing Fastly Compute service ID. Required.                |
+| `--service-id <service-id>` | Existing Fastly Compute service ID. Overrides config.        |
 | `--config <path>`           | Config file to provision. Defaults to `trusted-server.toml`. |
 | `--json`                    | Write the plan as JSON.                                      |
+
+Service ID resolution uses this precedence: `--service-id`, then `[providers.fastly].service_id`, then `fastly.toml` `service_id` as a convenience fallback.
 
 The command uses `FASTLY_API_KEY` or the stored Fastly credential from `ts auth fastly login`. It does not modify the service.
 
@@ -359,12 +361,12 @@ JSON output uses this high-level shape:
 Apply the Fastly provisioning plan.
 
 ```bash
-ts provision fastly apply --service-id <service-id> [options]
+ts provision fastly apply [--service-id <service-id>] [options]
 ```
 
 | Option                       | Description                                                  |
 | ---------------------------- | ------------------------------------------------------------ |
-| `--service-id <service-id>`  | Existing Fastly Compute service ID. Required.                |
+| `--service-id <service-id>`  | Existing Fastly Compute service ID. Overrides config.        |
 | `--config <path>`            | Config file to provision. Defaults to `trusted-server.toml`. |
 | `--json`                     | Write apply results as JSON.                                 |
 | `--yes`                      | Skip the interactive confirmation prompt.                    |
@@ -396,15 +398,27 @@ JSON output uses this high-level shape:
 
 ## Fastly provisioning resources
 
-Fastly provisioning is config-driven. The CLI reads the validated local config and plans the resources that runtime code expects. See [Fastly Provisioning Map](/guide/fastly-provisioning) for how config changes map to Fastly actions.
+Fastly provisioning is config-driven. The CLI reads the local source config, separates provider/deployment settings from application settings, and uploads only the canonical application config. `[providers]` does not participate in the canonical app config hash. See [Fastly Provisioning Map](/guide/fastly-provisioning) for how config changes map to Fastly actions.
 
-| Resource                    | Type         | When used                                                                                            |
-| --------------------------- | ------------ | ---------------------------------------------------------------------------------------------------- |
-| `ts_config_store`           | Config store | Always. Stores canonical app config under `ts-config`.                                               |
-| `jwks_store`                | Config store | When `request_signing.enabled = true`. Stores `current-kid`, `active-kids`, and public JWK entries.  |
-| `signing_keys`              | Secret store | When `request_signing.enabled = true`. Stores private signing keys by key ID.                        |
-| `api-keys`                  | Secret store | When `request_signing.enabled = true`. Stores runtime Fastly API token under `api_key` when missing. |
-| Configured consent KV store | KV store     | When `[consent] consent_store = "..."` is set.                                                       |
+Fastly provider store names are underlying Fastly resource names. Runtime code opens fixed resource-link aliases, so provisioning links each underlying resource using the alias the runtime expects. This lets multiple Trusted Server instances use separate underlying stores while sharing the same runtime binary and aliases.
+
+```toml
+[providers.fastly]
+service_id = "svc_123"
+
+[providers.fastly.application_config]
+store_name = "customer_a_ts_config_store"
+```
+
+In this example, provisioning finds or creates the `customer_a_ts_config_store` Config Store and links it to the service as `ts_config_store`; runtime opens `ts_config_store` and reads `ts-config`.
+
+| Fixed runtime alias         | Type         | Default underlying resource | When used                                                                                            |
+| --------------------------- | ------------ | --------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `ts_config_store`           | Config store | `ts_config_store`           | Always. Stores canonical app config under `ts-config`.                                               |
+| `jwks_store`                | Config store | `jwks_store`                | When `request_signing.enabled = true`. Stores `current-kid`, `active-kids`, and public JWK entries.  |
+| `signing_keys`              | Secret store | `signing_keys`              | When `request_signing.enabled = true`. Stores private signing keys by key ID.                        |
+| `api-keys`                  | Secret store | `api-keys`                  | When `request_signing.enabled = true`. Stores runtime Fastly API token under `api_key` when missing. |
+| Configured consent KV store | KV store     | same as config value        | When `[consent] consent_store = "..."` is set.                                                       |
 
 When request signing is enabled and the signing stores are empty, `plan` warns that `apply` will bootstrap an initial Ed25519 keypair. `apply` writes the public JWK data to `jwks_store` and the private signing key to `signing_keys`.
 
@@ -420,7 +434,7 @@ ts provision fastly apply --service-id svc_123 --reuse-management-api-key
 
 Prefer `FASTLY_RUNTIME_API_KEY` for local use and CI because it avoids putting the token in shell history. Use `--reuse-management-api-key` only when your management token is acceptable for runtime key rotation.
 
-After provisioning request signing resources, update these config fields if the plan or apply output warns that the configured IDs differ from Fastly:
+After provisioning request signing resources, update these deprecated config fields if the plan or apply output warns that the configured IDs differ from Fastly. They remain in `[request_signing]` for now because runtime key-rotation endpoints still use them for Fastly management API writes:
 
 ```toml
 [request_signing]

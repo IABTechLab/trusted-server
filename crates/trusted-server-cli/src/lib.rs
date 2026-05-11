@@ -5,11 +5,11 @@ mod error;
 mod fastly;
 mod output;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 
 use crate::error::CliError;
 use crate::fastly::api::ReqwestFastlyApi;
@@ -130,7 +130,7 @@ enum FastlyProvisionCommand {
 #[derive(Debug, Args)]
 struct FastlyProvisionArgs {
     #[arg(long)]
-    service_id: String,
+    service_id: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -140,7 +140,7 @@ struct FastlyProvisionArgs {
 #[derive(Debug, Args)]
 struct FastlyProvisionApplyArgs {
     #[arg(long)]
-    service_id: String,
+    service_id: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -374,6 +374,15 @@ fn resolve_runtime_api_key_for_apply(
     Ok(None)
 }
 
+fn fastly_manifest_dirs(config_path: &Path) -> Result<Vec<PathBuf>, Report<CliError>> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = config_path.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.push(std::env::current_dir().change_context(CliError::Io)?);
+    Ok(dirs)
+}
+
 fn run_provision(command: ProvisionCommand) -> Result<(), Report<CliError>> {
     let store = SystemCredentialStore;
     let resolved = resolve_fastly_api_key(&store)?;
@@ -391,7 +400,12 @@ fn run_provision(command: ProvisionCommand) -> Result<(), Report<CliError>> {
             command: FastlyProvisionCommand::Plan(args),
         } => {
             let validated = config::load_validated_config(args.config.as_deref())?;
-            let plan = plan_fastly_provisioning(&api, &validated, &args.service_id)?;
+            let service_id = config::resolve_fastly_service_id(
+                args.service_id.as_deref(),
+                &validated.providers.fastly,
+                &fastly_manifest_dirs(&validated.path)?,
+            )?;
+            let plan = plan_fastly_provisioning(&api, &validated, &service_id)?;
             if args.json {
                 write_json(&plan.json)
             } else {
@@ -439,10 +453,15 @@ fn run_provision(command: ProvisionCommand) -> Result<(), Report<CliError>> {
                     .as_ref()
                     .is_some_and(|request_signing| request_signing.enabled),
             )?;
+            let service_id = config::resolve_fastly_service_id(
+                args.service_id.as_deref(),
+                &validated.providers.fastly,
+                &fastly_manifest_dirs(&validated.path)?,
+            )?;
             let applied = apply_fastly_provisioning(
                 &api,
                 &validated,
-                &args.service_id,
+                &service_id,
                 runtime_api_key.as_deref(),
                 args.yes,
             )?;

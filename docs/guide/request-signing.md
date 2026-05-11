@@ -216,9 +216,14 @@ Configure request signing in `trusted-server.toml`:
 
 ```toml
 [request_signing]
-config_store_id = "jwks_store"
-secret_store_id = "signing_keys"
+enabled = true
+# Deprecated but still used by runtime key-rotation endpoints for Fastly
+# management API writes.
+config_store_id = "<jwks-config-store-id>"
+secret_store_id = "<signing-secret-store-id>"
 ```
+
+Fastly resource names used by provisioning can be customized separately under `[providers.fastly.request_signing]`. Provisioning links those underlying resources using the fixed runtime aliases `jwks_store`, `signing_keys`, and `api-keys`. The runtime API token secret key remains fixed as `api_key`.
 
 ### Fastly Config Store Setup
 

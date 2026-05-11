@@ -10,12 +10,11 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::runtime_config::{APPLICATION_CONFIG_KEY, APPLICATION_CONFIG_STORE_NAME};
 use uuid::Uuid;
 
-use crate::config::ValidatedConfig;
+use crate::config::{
+    FASTLY_API_SECRET_KEY, FASTLY_API_SECRET_STORE_NAME, FastlyProviderConfig, ValidatedConfig,
+};
 use crate::error::CliError;
 use crate::fastly::api::{FastlyApi, NamedResource, ResourceLink};
-
-const FASTLY_API_SECRET_STORE_NAME: &str = "api-keys";
-const FASTLY_API_SECRET_KEY: &str = "api_key";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -109,6 +108,7 @@ enum SecretValuePlan {
 
 #[derive(Debug, Clone)]
 struct LinkPlan {
+    alias: String,
     existing_link_id: Option<String>,
     action: Option<ChangeKind>,
 }
@@ -140,13 +140,20 @@ pub fn plan_fastly_provisioning(
         .ok_or_else(|| Report::new(CliError::Provisioning).attach("service has no versions"))?;
     let existing_links = api.list_resource_links(service_id, latest_version.number)?;
 
-    let mut resources = vec![plan_app_config_resource(api, validated, &existing_links)?];
+    let fastly_config = &validated.providers.fastly;
+    let mut resources = vec![plan_app_config_resource(
+        api,
+        validated,
+        fastly_config,
+        &existing_links,
+    )?];
     let mut warnings = Vec::new();
 
     if let Some(request_signing) = validated.loaded.settings.request_signing.as_ref()
         && request_signing.enabled
     {
-        let request_signing_plan = plan_request_signing_resources(api, &existing_links)?;
+        let request_signing_plan =
+            plan_request_signing_resources(api, fastly_config, &existing_links)?;
         if request_signing_plan.bootstrap_planned {
             warnings.push(
                 "request signing stores are uninitialized; apply will generate and upload an initial Ed25519 signing keypair"
@@ -154,10 +161,13 @@ pub fn plan_fastly_provisioning(
             );
         }
         if request_signing_plan.runtime_api_key_required {
-            warnings.push(
-                "request signing requires a runtime Fastly API token for the `api-keys/api_key` secret; apply must be given `FASTLY_RUNTIME_API_KEY`, `--runtime-api-key`, or `--reuse-management-api-key`"
-                    .to_string(),
-            );
+            warnings.push(format!(
+                "request signing requires a runtime Fastly API token for the `{}/{}` secret; apply must be given `FASTLY_RUNTIME_API_KEY`, `--runtime-api-key`, or `--reuse-management-api-key`",
+                fastly_config
+                    .request_signing
+                    .runtime_api_secret_store_name,
+                FASTLY_API_SECRET_KEY
+            ));
         }
         resources.extend(request_signing_plan.resources);
         append_request_signing_warnings(
@@ -323,16 +333,17 @@ pub fn apply_fastly_provisioning(
                         service_id,
                         target_version,
                         &resource_id,
-                        &resource.name,
+                        &link.alias,
                     )?;
                     completed_actions.push(ProvisionActionJson {
                         action: ChangeKind::Bind,
                         resource_kind: resource.kind,
                         name: resource.name.clone(),
                         detail: format!(
-                            "bind {} `{}` to service version {}",
+                            "bind {} `{}` as `{}` to service version {}",
                             resource_kind_label(resource.kind),
                             resource.name,
+                            link.alias,
                             target_version
                         ),
                         remote_id: Some(resource_id.clone()),
@@ -348,16 +359,17 @@ pub fn apply_fastly_provisioning(
                         target_version,
                         link_id,
                         &resource_id,
-                        &resource.name,
+                        &link.alias,
                     )?;
                     completed_actions.push(ProvisionActionJson {
                         action: ChangeKind::Update,
                         resource_kind: resource.kind,
                         name: resource.name.clone(),
                         detail: format!(
-                            "update binding for {} `{}` on service version {}",
+                            "update binding for {} `{}` as `{}` on service version {}",
                             resource_kind_label(resource.kind),
                             resource.name,
+                            link.alias,
                             target_version
                         ),
                         remote_id: Some(resource_id.clone()),
@@ -387,9 +399,11 @@ pub fn apply_fastly_provisioning(
 fn plan_app_config_resource(
     api: &dyn FastlyApi,
     validated: &ValidatedConfig,
+    fastly_config: &FastlyProviderConfig,
     existing_links: &[ResourceLink],
 ) -> Result<PlannedResource, Report<CliError>> {
-    let store = api.find_config_store_by_name(APPLICATION_CONFIG_STORE_NAME)?;
+    let store_name = &fastly_config.application_config.store_name;
+    let store = api.find_config_store_by_name(store_name)?;
     let items = match &store {
         Some(store) => api.list_config_store_items(&store.id)?,
         None => HashMap::new(),
@@ -403,7 +417,7 @@ fn plan_app_config_resource(
 
     Ok(PlannedResource {
         kind: ResourceKind::Config,
-        name: APPLICATION_CONFIG_STORE_NAME.to_string(),
+        name: store_name.clone(),
         existing_id: store.as_ref().map(|store| store.id.clone()),
         create_store: store.is_none(),
         config_items: vec![ConfigItemPlan {
@@ -422,15 +436,19 @@ fn plan_app_config_resource(
 
 fn plan_request_signing_resources(
     api: &dyn FastlyApi,
+    fastly_config: &FastlyProviderConfig,
     existing_links: &[ResourceLink],
 ) -> Result<PlannedRequestSigningResources, Report<CliError>> {
-    let config_store = api.find_config_store_by_name(JWKS_CONFIG_STORE_NAME)?;
+    let request_signing_config = &fastly_config.request_signing;
+    let jwks_store_name = &request_signing_config.jwks_store_name;
+    let signing_secret_store_name = &request_signing_config.signing_secret_store_name;
+    let config_store = api.find_config_store_by_name(jwks_store_name)?;
     let config_items = match &config_store {
         Some(store) => api.list_config_store_items(&store.id)?,
         None => HashMap::new(),
     };
 
-    let signing_secret_store = api.find_secret_store_by_name(SIGNING_SECRET_STORE_NAME)?;
+    let signing_secret_store = api.find_secret_store_by_name(signing_secret_store_name)?;
     let signing_secret_names = match &signing_secret_store {
         Some(store) => api.list_secret_names(&store.id)?,
         None => Vec::new(),
@@ -440,7 +458,7 @@ fn plan_request_signing_resources(
 
     let config_resource = PlannedResource {
         kind: ResourceKind::Config,
-        name: JWKS_CONFIG_STORE_NAME.to_string(),
+        name: jwks_store_name.clone(),
         existing_id: config_store.as_ref().map(|store| store.id.clone()),
         create_store: config_store.is_none(),
         config_items: bootstrap
@@ -475,7 +493,7 @@ fn plan_request_signing_resources(
 
     let secret_resource = PlannedResource {
         kind: ResourceKind::Secret,
-        name: SIGNING_SECRET_STORE_NAME.to_string(),
+        name: signing_secret_store_name.clone(),
         existing_id: signing_secret_store.as_ref().map(|store| store.id.clone()),
         create_store: signing_secret_store.is_none(),
         config_items: Vec::new(),
@@ -496,7 +514,8 @@ fn plan_request_signing_resources(
         )),
     };
 
-    let runtime_api_secret_resource = plan_runtime_api_secret_resource(api, existing_links)?;
+    let runtime_api_secret_resource =
+        plan_runtime_api_secret_resource(api, fastly_config, existing_links)?;
     let runtime_api_key_required = runtime_api_secret_resource
         .secrets
         .iter()
@@ -581,26 +600,28 @@ fn generate_request_signing_bootstrap() -> Result<RequestSigningBootstrap, Repor
 
 fn plan_runtime_api_secret_resource(
     api: &dyn FastlyApi,
+    fastly_config: &FastlyProviderConfig,
     existing_links: &[ResourceLink],
 ) -> Result<PlannedResource, Report<CliError>> {
-    let store = api.find_secret_store_by_name(FASTLY_API_SECRET_STORE_NAME)?;
+    let request_signing_config = &fastly_config.request_signing;
+    let store_name = &request_signing_config.runtime_api_secret_store_name;
+    let secret_key = FASTLY_API_SECRET_KEY;
+    let store = api.find_secret_store_by_name(store_name)?;
     let secret_names = match &store {
         Some(store) => api.list_secret_names(&store.id)?,
         None => Vec::new(),
     };
-    let secret_exists = secret_names
-        .iter()
-        .any(|name| name == FASTLY_API_SECRET_KEY);
+    let secret_exists = secret_names.iter().any(|name| name == secret_key);
     let secret_action = (!secret_exists).then_some(ChangeKind::Create);
 
     Ok(PlannedResource {
         kind: ResourceKind::Secret,
-        name: FASTLY_API_SECRET_STORE_NAME.to_string(),
+        name: store_name.clone(),
         existing_id: store.as_ref().map(|store| store.id.clone()),
         create_store: store.is_none(),
         config_items: Vec::new(),
         secrets: vec![SecretPlan {
-            name: FASTLY_API_SECRET_KEY.to_string(),
+            name: secret_key.to_string(),
             value: SecretValuePlan::RuntimeApiKey,
             action: secret_action,
         }],
@@ -646,6 +667,7 @@ fn plan_link(
 ) -> LinkPlan {
     let Some(store) = store else {
         return LinkPlan {
+            alias: alias.to_string(),
             existing_link_id: None,
             action: Some(ChangeKind::Bind),
         };
@@ -653,14 +675,17 @@ fn plan_link(
 
     match existing_links.iter().find(|link| link.name == alias) {
         Some(link) if link.resource_id == store.id => LinkPlan {
+            alias: alias.to_string(),
             existing_link_id: Some(link.id.clone()),
             action: None,
         },
         Some(link) => LinkPlan {
+            alias: alias.to_string(),
             existing_link_id: Some(link.id.clone()),
             action: Some(ChangeKind::Update),
         },
         None => LinkPlan {
+            alias: alias.to_string(),
             existing_link_id: None,
             action: Some(ChangeKind::Bind),
         },
@@ -737,9 +762,10 @@ fn collect_actions(resources: &[PlannedResource]) -> Vec<ProvisionActionJson> {
                 resource_kind: resource.kind,
                 name: resource.name.clone(),
                 detail: format!(
-                    "bind {} `{}` to the service",
+                    "bind {} `{}` as `{}` to the service",
                     resource_kind_label(resource.kind),
-                    resource.name
+                    resource.name,
+                    link.alias
                 ),
                 remote_id: resource.existing_id.clone(),
             });
@@ -756,23 +782,26 @@ fn append_request_signing_warnings(
     configured_secret_store_id: &str,
 ) {
     for resource in resources {
-        if resource.name == JWKS_CONFIG_STORE_NAME
+        let link_alias = resource.link.as_ref().map(|link| link.alias.as_str());
+        if link_alias == Some(JWKS_CONFIG_STORE_NAME)
             && let Some(actual_id) = resource.existing_id.as_deref()
             && !configured_config_store_id.is_empty()
             && configured_config_store_id != actual_id
         {
             warnings.push(format!(
-                "`request_signing.config_store_id` is `{configured_config_store_id}` but the Fastly `{}` store currently has ID `{actual_id}`; update trusted-server.toml after provisioning so runtime key rotation uses the correct ID",
+                "deprecated `request_signing.config_store_id` is `{configured_config_store_id}` but the Fastly config store `{}` linked as `{}` currently has ID `{actual_id}`; update trusted-server.toml manually if runtime key rotation is used",
+                resource.name,
                 JWKS_CONFIG_STORE_NAME
             ));
         }
-        if resource.name == SIGNING_SECRET_STORE_NAME
+        if link_alias == Some(SIGNING_SECRET_STORE_NAME)
             && let Some(actual_id) = resource.existing_id.as_deref()
             && !configured_secret_store_id.is_empty()
             && configured_secret_store_id != actual_id
         {
             warnings.push(format!(
-                "`request_signing.secret_store_id` is `{configured_secret_store_id}` but the Fastly `{}` store currently has ID `{actual_id}`; update trusted-server.toml after provisioning so runtime key rotation uses the correct ID",
+                "deprecated `request_signing.secret_store_id` is `{configured_secret_store_id}` but the Fastly secret store `{}` linked as `{}` currently has ID `{actual_id}`; update trusted-server.toml manually if runtime key rotation is used",
+                resource.name,
                 SIGNING_SECRET_STORE_NAME
             ));
         }
@@ -818,6 +847,8 @@ mod tests {
         clone_result: Option<ServiceVersion>,
         upserted_config_items: Mutex<Vec<(String, String, String)>>,
         recreated_secrets: Mutex<Vec<(String, String, String)>>,
+        created_resource_links: Mutex<Vec<(String, String)>>,
+        updated_resource_links: Mutex<Vec<(String, String, String)>>,
         activated_versions: Mutex<Vec<(String, u32)>>,
     }
 
@@ -951,6 +982,10 @@ mod tests {
             resource_id: &str,
             name: &str,
         ) -> Result<ResourceLink, Report<CliError>> {
+            self.created_resource_links
+                .lock()
+                .expect("should lock created resource links")
+                .push((resource_id.to_string(), name.to_string()));
             Ok(ResourceLink {
                 id: format!("link-{name}"),
                 name: name.to_string(),
@@ -966,6 +1001,14 @@ mod tests {
             resource_id: &str,
             name: &str,
         ) -> Result<ResourceLink, Report<CliError>> {
+            self.updated_resource_links
+                .lock()
+                .expect("should lock updated resource links")
+                .push((
+                    link_id.to_string(),
+                    resource_id.to_string(),
+                    name.to_string(),
+                ));
             Ok(ResourceLink {
                 id: link_id.to_string(),
                 name: name.to_string(),
@@ -975,6 +1018,13 @@ mod tests {
     }
 
     fn validated_config(enable_request_signing: bool) -> crate::config::ValidatedConfig {
+        validated_config_with_provider(enable_request_signing, "")
+    }
+
+    fn validated_config_with_provider(
+        enable_request_signing: bool,
+        provider_toml: &str,
+    ) -> crate::config::ValidatedConfig {
         let tempdir = tempfile::tempdir().expect("should create tempdir");
         let path = tempdir.path().join("trusted-server.toml");
         let mut config = crate::config::STARTER_CONFIG_TEMPLATE.to_string();
@@ -984,6 +1034,7 @@ mod tests {
                 "enabled = true",
             );
         }
+        config.push_str(provider_toml);
         std::fs::write(&path, config).expect("should write config");
         crate::config::load_validated_config(Some(&path)).expect("should validate config")
     }
@@ -1026,6 +1077,138 @@ mod tests {
         assert!(
             plan.json.service_version.clone_required,
             "should require a clone when bindings would be added on a locked version"
+        );
+    }
+
+    #[test]
+    fn plan_uses_custom_app_config_store_name_with_fixed_link_alias() {
+        let custom_store = NamedResource {
+            id: "cfg_custom".to_string(),
+            name: "customer_ts_config".to_string(),
+        };
+        let api = MockFastlyApi {
+            config_stores: HashMap::from([("customer_ts_config".to_string(), custom_store)]),
+            links: vec![ResourceLink {
+                id: "old-link".to_string(),
+                name: APPLICATION_CONFIG_STORE_NAME.to_string(),
+                resource_id: "cfg_old".to_string(),
+            }],
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: false,
+            }],
+            ..Default::default()
+        };
+        let validated = validated_config_with_provider(
+            false,
+            r#"
+[providers.fastly.application_config]
+store_name = "customer_ts_config"
+"#,
+        );
+
+        let plan = plan_fastly_provisioning(&api, &validated, "svc_123")
+            .expect("should plan provisioning");
+
+        assert!(
+            plan.json
+                .actions
+                .iter()
+                .any(|action| action.name == "customer_ts_config"
+                    && action.detail.contains("as `ts_config_store`")),
+            "should bind custom underlying store as the fixed runtime alias"
+        );
+    }
+
+    #[test]
+    fn apply_links_custom_underlying_store_using_fixed_alias() {
+        let api = MockFastlyApi {
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: false,
+            }],
+            ..Default::default()
+        };
+        let validated = validated_config_with_provider(
+            false,
+            r#"
+[providers.fastly.application_config]
+store_name = "customer_ts_config"
+"#,
+        );
+
+        apply_fastly_provisioning(&api, &validated, "svc_123", None, true)
+            .expect("should apply provisioning");
+
+        assert_eq!(
+            api.created_resource_links
+                .lock()
+                .expect("should lock created resource links")
+                .as_slice(),
+            &[(
+                "created-customer_ts_config".to_string(),
+                APPLICATION_CONFIG_STORE_NAME.to_string()
+            )],
+            "should create link with fixed runtime alias"
+        );
+    }
+
+    #[test]
+    fn plan_uses_custom_request_signing_store_names_with_fixed_aliases() {
+        let api = MockFastlyApi {
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: false,
+            }],
+            ..Default::default()
+        };
+        let validated = validated_config_with_provider(
+            true,
+            r#"
+[providers.fastly.request_signing]
+jwks_store_name = "customer_jwks"
+signing_secret_store_name = "customer_signing"
+runtime_api_secret_store_name = "customer_api_keys"
+"#,
+        );
+
+        let plan = plan_fastly_provisioning(&api, &validated, "svc_123")
+            .expect("should plan provisioning");
+
+        assert!(
+            plan.json
+                .actions
+                .iter()
+                .any(|action| action.name == "customer_jwks"
+                    && action.detail.contains("as `jwks_store`")),
+            "should bind custom JWKS store under fixed runtime alias"
+        );
+        assert!(
+            plan.json
+                .actions
+                .iter()
+                .any(|action| action.name == "customer_signing"
+                    && action.detail.contains("as `signing_keys`")),
+            "should bind custom signing store under fixed runtime alias"
+        );
+        assert!(
+            plan.json
+                .actions
+                .iter()
+                .any(|action| action.name == "customer_api_keys"
+                    && action.detail.contains("as `api-keys`")),
+            "should bind custom runtime API store under fixed runtime alias"
+        );
+        assert!(
+            plan.json
+                .actions
+                .iter()
+                .any(|action| action.name == "customer_api_keys"
+                    && action.detail.contains("upload secret `api_key`")),
+            "should use the fixed runtime API secret key for provisioning"
         );
     }
 
@@ -1079,6 +1262,47 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("FASTLY_RUNTIME_API_KEY")),
             "should warn that apply needs an explicit runtime token"
+        );
+    }
+
+    #[test]
+    fn plan_warns_that_legacy_request_signing_ids_are_deprecated() {
+        let jwks_store = NamedResource {
+            id: "cfg_actual".to_string(),
+            name: JWKS_CONFIG_STORE_NAME.to_string(),
+        };
+        let signing_store = NamedResource {
+            id: "sec_actual".to_string(),
+            name: SIGNING_SECRET_STORE_NAME.to_string(),
+        };
+        let api = MockFastlyApi {
+            config_stores: HashMap::from([(JWKS_CONFIG_STORE_NAME.to_string(), jwks_store)]),
+            secret_stores: HashMap::from([(SIGNING_SECRET_STORE_NAME.to_string(), signing_store)]),
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: false,
+            }],
+            ..Default::default()
+        };
+        let validated = validated_config(true);
+
+        let plan = plan_fastly_provisioning(&api, &validated, "svc_123")
+            .expect("should plan provisioning");
+
+        assert!(
+            plan.json
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("deprecated `request_signing.config_store_id`")),
+            "should warn that config store ID field is deprecated"
+        );
+        assert!(
+            plan.json
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("runtime key rotation")),
+            "should explain why the legacy IDs still matter"
         );
     }
 
