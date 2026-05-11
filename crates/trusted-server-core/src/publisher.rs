@@ -1210,13 +1210,25 @@ pub(crate) fn build_auction_request(
     }
 }
 
-/// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal.
+/// Escape a JSON string so it is safe to embed inside a JS double-quoted string literal
+/// inside an HTML `<script>` block.
 ///
-/// Backslashes are doubled first (so they survive the next pass), then
-/// double-quotes are escaped so they do not terminate the JS string.
-/// The result is always valid to write as `JSON.parse("…")`.
+/// Escapes required:
+/// - `\` and `"` — prevent JS string termination / invalid escape sequences
+/// - `<`, `>`, `&` — prevent `</script>` injection breaking out of the script context
+/// - U+2028, U+2029 — line/paragraph separators that are valid JSON but terminate
+///   a JS string literal in some parsers
+///
+/// All substitutions use `\uXXXX` form, which is valid inside both JSON strings
+/// and JS string literals. The result is always safe to write as `JSON.parse("…")`.
 fn html_escape_for_script(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('<', "\\u003C")
+        .replace('>', "\\u003E")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// Build a price-bucketed bid map from winning bids.
@@ -2632,6 +2644,26 @@ mod tests {
                 html_escape_for_script("both\\\"mixed"),
                 "both\\\\\\\"mixed",
                 "should escape both backslashes and quotes"
+            );
+            assert_eq!(
+                html_escape_for_script("<script>alert(1)</script>"),
+                "\\u003Cscript\\u003Ealert(1)\\u003C/script\\u003E",
+                "should unicode-escape angle brackets to prevent script injection"
+            );
+            assert_eq!(
+                html_escape_for_script("a&b"),
+                "a\\u0026b",
+                "should unicode-escape ampersand"
+            );
+            assert_eq!(
+                html_escape_for_script("line\u{2028}sep"),
+                "line\\u2028sep",
+                "should unicode-escape U+2028 line separator"
+            );
+            assert_eq!(
+                html_escape_for_script("para\u{2029}sep"),
+                "para\\u2029sep",
+                "should unicode-escape U+2029 paragraph separator"
             );
         }
     }

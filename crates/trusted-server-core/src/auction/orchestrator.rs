@@ -835,18 +835,38 @@ impl AuctionOrchestrator {
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
             match self.providers.get(mediator_name.as_str()) {
                 Some(mediator) => {
-                    // Use the mediator's own configured timeout, not the remaining SSP
-                    // budget. In the async-dispatch path, SSPs race against origin, so
-                    // auction_start.elapsed() can exceed the SSP budget by the time the
-                    // origin body finishes streaming. Skipping the mediator in that case
-                    // would discard all bids — the mediator is the primary bid source.
-                    let mediator_timeout = mediator.timeout_ms();
+                    // Cap the mediator at whichever is tighter: its own configured
+                    // timeout or the remaining auction budget (A_deadline).  The old
+                    // comment here claimed origin drain could exhaust the budget before
+                    // collection, but SSP backends are given first_byte_timeout =
+                    // effective_timeout (capped at their provider timeout) at dispatch
+                    // time, so they cannot run past A_deadline independently.  Giving
+                    // the mediator an uncapped timeout lets it run past A_deadline,
+                    // violating the bounded hold invariant.
+                    let remaining = remaining_budget_ms(auction_start, timeout_ms);
+                    if remaining == 0 {
+                        log::warn!(
+                            "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
+                            mediator.provider_name(),
+                            responses.len(),
+                        );
+                        let winning = self.select_winning_bids(&responses, &floor_prices);
+                        return OrchestrationResult {
+                            provider_responses: responses,
+                            mediator_response: None,
+                            winning_bids: winning,
+                            total_time_ms: auction_start.elapsed().as_millis() as u64,
+                            metadata: HashMap::new(),
+                        };
+                    }
+                    let mediator_timeout = remaining.min(mediator.timeout_ms());
                     let mediator_start = Instant::now();
                     log::info!(
-                        "Running mediator '{}' with {}ms budget (SSP budget remaining: {}ms)",
+                        "Running mediator '{}' with {}ms budget (A_deadline remaining: {}ms, configured: {}ms)",
                         mediator.provider_name(),
                         mediator_timeout,
-                        remaining_budget_ms(auction_start, timeout_ms),
+                        remaining,
+                        mediator.timeout_ms(),
                     );
                     let placeholder = fastly::Request::get("https://placeholder.invalid/");
                     let mediator_context = AuctionContext {
