@@ -201,7 +201,7 @@ struct StubPendingResponse {
 /// Test stub for [`PlatformHttpClient`] that records call backend names and
 /// returns pre-queued canned responses for `send`, `send_async`, and `select`.
 ///
-/// Responses are stored as `(status_code, body_bytes)` to remain [`Send`].
+/// Responses are stored as status/body/header parts to remain [`Send`].
 /// [`PlatformResponse`] contains [`edgezero_core::body::Body`] which wraps a
 /// `LocalBoxStream` that is `!Send`, so it cannot be stored directly in a
 /// `Mutex` field.
@@ -212,10 +212,15 @@ struct StubPendingResponse {
 /// sites.
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
-    // (status_code, body_bytes) — kept Send by avoiding Body::Stream
-    responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
+}
+
+struct StubHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
 }
 
 impl StubHttpClient {
@@ -229,10 +234,28 @@ impl StubHttpClient {
 
     /// Queue a canned response by status code and body bytes.
     pub fn push_response(&self, status: u16, body: Vec<u8>) {
+        self.push_response_with_headers(status, body, Vec::<(String, String)>::new());
+    }
+
+    /// Queue a canned response with headers.
+    pub fn push_response_with_headers(
+        &self,
+        status: u16,
+        body: Vec<u8>,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+    ) {
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
         self.responses
             .lock()
             .expect("should lock responses")
-            .push_back((status, body));
+            .push_back(StubHttpResponse {
+                status,
+                body,
+                headers,
+            });
     }
 
     /// Return backend names recorded across all `send` calls, in order.
@@ -269,16 +292,19 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock request_headers")
             .push(headers);
 
-        let (status, body_bytes) = self
+        let response = self
             .responses
             .lock()
             .expect("should lock responses")
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
 
-        let edge_response = edgezero_core::http::response_builder()
-            .status(status)
-            .body(edgezero_core::body::Body::from(body_bytes))
+        let mut builder = edgezero_core::http::response_builder().status(response.status);
+        for (name, value) in response.headers {
+            builder = builder.header(name, value);
+        }
+        let edge_response = builder
+            .body(edgezero_core::body::Body::from(response.body))
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -294,7 +320,7 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock calls")
             .push(backend_name.clone());
 
-        let (status, body_bytes) = self
+        let response = self
             .responses
             .lock()
             .expect("should lock responses")
@@ -303,8 +329,8 @@ impl PlatformHttpClient for StubHttpClient {
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
-            status,
-            body: body_bytes,
+            status: response.status,
+            body: response.body,
         };
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
