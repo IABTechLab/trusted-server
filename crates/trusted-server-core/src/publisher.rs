@@ -1103,6 +1103,49 @@ pub async fn handle_publisher_request(
                 content_type, content_encoding, request_host, origin_host
             );
 
+            // Collect any in-flight auction before processing buffered HTML.
+            // BufferedProcessed is taken when HTML has post-processors (e.g. Next.js rewriters).
+            // Unlike the Stream path, the body is fully buffered first — collect auction
+            // now so bids are available when the </body> handler fires.
+            if let Some(dispatched) = dispatched_auction {
+                let placeholder = fastly::Request::get("https://placeholder.invalid/");
+                let result = orchestrator
+                    .collect_dispatched_auction(
+                        dispatched,
+                        services,
+                        &make_collect_context(settings, services, &placeholder),
+                    )
+                    .await;
+                log::info!(
+                    "BufferedProcessed: auction collected — {} winning bid(s)",
+                    result.winning_bids.len()
+                );
+                write_bids_to_state(&result.winning_bids, price_granularity, &ad_bids_state);
+
+                if settings.debug.auction_html_comment {
+                    let ssp_count = result.provider_responses.len();
+                    let mediator_info = match &result.mediator_response {
+                        Some(r) => format!("ok({}_bids)", r.bids.len()),
+                        None => "none".to_string(),
+                    };
+                    let debug_comment = format!(
+                        "<!-- ts-debug: ssp={ssp_count} mediator={mediator_info} winning={} -->",
+                        result.winning_bids.len()
+                    );
+                    let mut state = ad_bids_state
+                        .write()
+                        .expect("should write bid state for debug");
+                    match &mut *state {
+                        Some(script) => {
+                            *script = format!("{debug_comment}\n{script}");
+                        }
+                        None => {
+                            *state = Some(debug_comment);
+                        }
+                    }
+                }
+            }
+
             let body = response.take_body();
             let params = ProcessResponseParams {
                 content_encoding: &content_encoding,
