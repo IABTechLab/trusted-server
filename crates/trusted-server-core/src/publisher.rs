@@ -1332,7 +1332,8 @@ pub async fn handle_page_bids(
             .collect();
 
     let http_req = compat::from_fastly_headers_ref(&req);
-    let request_info = crate::http_util::RequestInfo::from_request(&http_req, &services.client_info);
+    let request_info =
+        crate::http_util::RequestInfo::from_request(&http_req, &services.client_info);
     let cookie_jar = handle_request_cookies(&http_req)?;
     let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &http_req)?;
     let geo = services
