@@ -684,8 +684,9 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         None => "none".to_string(),
                     };
                     let debug_comment = format!(
-                        "<!-- ts-debug: ssp={ssp_count} mediator={mediator_info} winning={} -->",
-                        result.winning_bids.len()
+                        "<!-- ts-debug: path=stream ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+                        result.winning_bids.len(),
+                        result.total_time_ms,
                     );
                     let mut state = ad_bids_state
                         .write()
@@ -1129,8 +1130,9 @@ pub async fn handle_publisher_request(
                         None => "none".to_string(),
                     };
                     let debug_comment = format!(
-                        "<!-- ts-debug: ssp={ssp_count} mediator={mediator_info} winning={} -->",
-                        result.winning_bids.len()
+                        "<!-- ts-debug: path=buffered ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+                        result.winning_bids.len(),
+                        result.total_time_ms,
                     );
                     let mut state = ad_bids_state
                         .write()
