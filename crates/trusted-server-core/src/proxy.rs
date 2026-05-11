@@ -43,13 +43,14 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
 ///
 /// Unlike the HTML publisher fallback, asset requests need cache validation and
 /// byte-range semantics to keep 304/206 responses working for browsers.
-const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 12] = [
+/// Client-supplied forwarding headers are stripped at the edge and are not
+/// reconstructed here, so asset origins see Trusted Server as the client.
+const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
     HEADER_USER_AGENT,
     HEADER_ACCEPT,
     HEADER_ACCEPT_ENCODING,
     HEADER_ACCEPT_LANGUAGE,
     HEADER_REFERER,
-    HEADER_X_FORWARDED_FOR,
     header::IF_NONE_MATCH,
     header::IF_MODIFIED_SINCE,
     header::IF_MATCH,
@@ -57,6 +58,9 @@ const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 12] = [
     header::RANGE,
     header::IF_RANGE,
 ];
+
+const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
+    ["set-cookie", "strict-transport-security", "clear-site-data"];
 
 /// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
 ///
@@ -658,10 +662,11 @@ pub async fn handle_asset_proxy_request(
 
     let mut response = platform_response_to_fastly(platform_resp)?;
 
-    // Asset origins must not be able to set first-party cookies or publisher
-    // domain transport security policy through this proxy path.
-    response.remove_header(header::SET_COOKIE);
-    response.remove_header(header::STRICT_TRANSPORT_SECURITY);
+    // Asset origins must not be able to mutate publisher-domain browser state
+    // or security policy through this proxy path.
+    for header_name in ASSET_PROXY_STRIP_RESPONSE_HEADERS {
+        response.remove_header(header_name);
+    }
 
     Ok(response)
 }
@@ -2369,11 +2374,7 @@ mod tests {
 
     #[test]
     fn build_asset_proxy_target_url_preserves_path_and_query() {
-        let route = ProxyAssetRoute {
-            prefix: "/.images/".to_string(),
-            origin_url: "https://assets.example.com".to_string(),
-            ..Default::default()
-        };
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
         let target_url =
             build_asset_proxy_target_url(&route, "/.images/foo.jpg", "auto=webp&width=800")
                 .expect("should build asset target URL");
@@ -2387,12 +2388,9 @@ mod tests {
 
     #[test]
     fn build_asset_proxy_target_url_applies_cdn_style_rewrite() {
-        let route = ProxyAssetRoute {
-            prefix: "/.image/".to_string(),
-            origin_url: "https://assets-cdn.example.com".to_string(),
-            path_pattern: Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string()),
-            target_path: Some("/image/upload/$1.$2".to_string()),
-        };
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets-cdn.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
+        route.target_path = Some("/image/upload/$1.$2".to_string());
         let target_url = build_asset_proxy_target_url(
             &route,
             "/.image/c_fit,w_1440/MjA/example.jpg",
@@ -2409,12 +2407,9 @@ mod tests {
 
     #[test]
     fn build_asset_proxy_target_url_applies_static_prefix_rewrite() {
-        let route = ProxyAssetRoute {
-            prefix: "/_next/static/".to_string(),
-            origin_url: "https://static-assets.example.com".to_string(),
-            path_pattern: Some(r"^(.*)$".to_string()),
-            target_path: Some("/_network$1".to_string()),
-        };
+        let mut route = ProxyAssetRoute::new("/_next/static/", "https://static-assets.example.com");
+        route.path_pattern = Some(r"^(.*)$".to_string());
+        route.target_path = Some("/_network$1".to_string());
         let target_url = build_asset_proxy_target_url(&route, "/_next/static/chunks/app.js", "")
             .expect("should build rewritten static asset target URL");
 
@@ -2427,12 +2422,9 @@ mod tests {
 
     #[test]
     fn build_asset_proxy_target_url_errors_when_rewrite_pattern_misses() {
-        let route = ProxyAssetRoute {
-            prefix: "/.image/".to_string(),
-            origin_url: "https://assets.example.com".to_string(),
-            path_pattern: Some(r"^/\.image/(.*)\.jpg$".to_string()),
-            target_path: Some("/image/upload/$1.jpg".to_string()),
-        };
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)\.jpg$".to_string());
+        route.target_path = Some("/image/upload/$1.jpg".to_string());
         let err = build_asset_proxy_target_url(&route, "/.image/foo.png", "")
             .expect_err("should reject paths that do not match the configured rewrite");
 
@@ -2444,12 +2436,9 @@ mod tests {
 
     #[test]
     fn build_asset_proxy_target_url_errors_when_rewrite_omits_leading_slash() {
-        let route = ProxyAssetRoute {
-            prefix: "/assets/".to_string(),
-            origin_url: "https://assets.example.com".to_string(),
-            path_pattern: Some(r"^/assets/(.*)$".to_string()),
-            target_path: Some("$1".to_string()),
-        };
+        let mut route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/assets/(.*)$".to_string());
+        route.target_path = Some("$1".to_string());
         let err = build_asset_proxy_target_url(&route, "/assets/app.js", "")
             .expect_err("should reject rewritten paths without a leading slash");
 
@@ -2508,13 +2497,10 @@ mod tests {
         req.set_header(header::IF_UNMODIFIED_SINCE, "Thu, 13 Mar 2025 09:00:00 GMT");
         req.set_header(header::RANGE, "bytes=0-1023");
         req.set_header(header::IF_RANGE, "\"asset-range\"");
+        req.set_header(HEADER_X_FORWARDED_FOR, "198.51.100.10");
         req.set_header(header::HeaderName::from_static("x-custom-test"), "drop-me");
 
-        let route = ProxyAssetRoute {
-            prefix: "/.images/".to_string(),
-            origin_url: "https://assets.example.com:8443".to_string(),
-            ..Default::default()
-        };
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy asset request");
@@ -2573,6 +2559,10 @@ mod tests {
             "should override Host to the asset origin host"
         );
         assert!(
+            header_value("x-forwarded-for").is_none(),
+            "should not forward client-supplied X-Forwarded-For"
+        );
+        assert!(
             header_value("x-custom-test").is_none(),
             "should not forward unrelated custom headers"
         );
@@ -2591,6 +2581,7 @@ mod tests {
                     header::STRICT_TRANSPORT_SECURITY.as_str(),
                     "max-age=31536000; includeSubDomains; preload",
                 ),
+                ("clear-site-data", "\"*\""),
                 (header::ETAG.as_str(), "\"asset-etag\""),
             ],
         );
@@ -2600,11 +2591,7 @@ mod tests {
         let settings = create_test_settings();
         let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
 
-        let route = ProxyAssetRoute {
-            prefix: "/.images/".to_string(),
-            origin_url: "https://assets.example.com".to_string(),
-            ..Default::default()
-        };
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy asset request");
@@ -2618,6 +2605,10 @@ mod tests {
                 .get_header(header::STRICT_TRANSPORT_SECURITY)
                 .is_none(),
             "should strip upstream HSTS headers from asset responses"
+        );
+        assert!(
+            response.get_header("clear-site-data").is_none(),
+            "should strip upstream Clear-Site-Data headers from asset responses"
         );
         assert_eq!(
             response.get_header_str(header::ETAG),
