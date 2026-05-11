@@ -46,16 +46,16 @@ certain path prefixes to a different backend.
 - Multiple configured asset-route rules
 - Per-rule alternate `origin_url`
 - Transparent proxying for ordinary inbound `GET`/`HEAD` requests
-- Preservation of the incoming path and query string
-- Raw response pass-through from the matched asset origin
+- Preservation of the incoming path and query string by default
+- Optional regex-based path rewrite after prefix route selection
+- Raw response pass-through from the matched asset origin, except unsafe publisher-domain state/security headers
 - Deterministic longest-prefix route selection
 - Request routing that happens after built-in and integration routes, but
   before publisher-origin fallback
 
 ### Out of scope
 
-- Regex-based route matching
-- Path rewrite / prefix replacement
+- Regex-based route selection
 - Cookie, consent, HTML, CSS, or JS rewriting on asset-route responses
 - Redirect following for asset routes
 - Special cache policy overrides
@@ -79,7 +79,7 @@ proxies it directly to that route's configured origin.
 
 ### 2. Match on simple path prefixes
 
-Routes are configured as simple prefixes, not regexes.
+Routes are selected by simple prefixes, not regexes. Optional regexes may rewrite the upstream path only after a prefix route has already matched.
 
 Examples:
 
@@ -91,17 +91,28 @@ Examples:
 Rule matching is performed against the request path only. Query strings are
 ignored for matching.
 
-### 3. Preserve path and query exactly
+### 3. Preserve path and query by default, with optional path rewrite
 
-When a rule matches, Trusted Server replaces only the upstream origin
-(scheme/host/port) and preserves the rest of the request URL exactly.
+When a rule matches without rewrite settings, Trusted Server replaces only the
+upstream origin (scheme/host/port) and preserves the rest of the request URL
+exactly.
 
 Example:
 
 - inbound: `/.images/foo/bar.jpg?auto=webp&width=1200`
 - upstream path/query: `/.images/foo/bar.jpg?auto=webp&width=1200`
 
-There is no path rewrite in v1.
+Routes may optionally configure `path_pattern` and `target_path` together. In
+that case, `path_pattern` is matched against the incoming request path after the
+prefix route has been selected, and `target_path` is used as the regex
+replacement for the upstream path. The incoming query string is still preserved.
+
+Example:
+
+- inbound: `/.images/foo/bar.jpg?auto=webp&width=1200`
+- `path_pattern`: `^/\.images/(.*)$`
+- `target_path`: `/cdn/$1`
+- upstream path/query: `/cdn/foo/bar.jpg?auto=webp&width=1200`
 
 ### 4. Multiple rules supported
 
@@ -232,7 +243,24 @@ origin_url = "https://assets.example.net"
 - absolute `http` or `https` URL
 - must not include a trailing slash
 - used as the upstream scheme/host/port base
-- request path and query are preserved from the incoming request
+- request query is preserved from the incoming request
+- request path is preserved unless `path_pattern` / `target_path` rewrite it
+
+#### `path_pattern`
+
+- optional
+- string
+- regex matched against the incoming request path after prefix route selection
+- must be configured together with `target_path`
+- does not participate in route selection
+
+#### `target_path`
+
+- optional
+- string
+- regex replacement applied to `path_pattern` matches
+- must be configured together with `path_pattern`
+- replacement output must start with `/`
 
 ### Validation rules
 
@@ -245,6 +273,9 @@ These should fail configuration loading:
 - `origin_url` missing
 - `origin_url` is not an absolute `http`/`https` URL
 - `origin_url` has a trailing slash
+- `path_pattern` is configured without `target_path`, or vice versa
+- `path_pattern` does not compile as a regex
+- `target_path` rewrite output does not start with `/`
 
 #### Warning-only validation
 
@@ -446,11 +477,15 @@ If upstream returns a redirect, return it to the client.
 
 ### Response handling
 
-Treat the response as raw pass-through:
+Treat the response as raw pass-through except for publisher-domain state and
+security headers that asset origins must not control:
 
 - preserve status code
 - preserve response body bytes
 - preserve response headers, including cache headers
+- strip `Set-Cookie`
+- strip `Strict-Transport-Security`
+- strip `Clear-Site-Data`
 - do not inspect content type for rewriting
 - do not run creative, HTML, CSS, or RSC processors
 
@@ -542,6 +577,13 @@ unexpected application headers being tunneled upstream.
 This feature does not reuse `/first-party/proxy` URL-signing behavior. It is a
 separate static routing mechanism.
 
+### 5. Asset origins cannot mutate publisher browser state
+
+Because responses are served on the publisher first-party domain, asset origins
+must not be able to set cookies, alter transport-security policy, or clear
+publisher storage. Asset responses therefore strip `Set-Cookie`,
+`Strict-Transport-Security`, and `Clear-Site-Data`.
+
 ---
 
 ## Acceptance Criteria
@@ -565,7 +607,7 @@ separate static routing mechanism.
 
 ### Proxy semantics
 
-- matched requests preserve path and query exactly
+- matched requests preserve path and query exactly unless optional rewrite settings change the path
 - matched requests use the asset origin's scheme/host/port
 - upstream `Host` header matches asset origin host
 - redirects are returned to the client, not followed
@@ -576,7 +618,7 @@ separate static routing mechanism.
 ### Response processing
 
 - matched asset routes bypass publisher consent/cookie/rewriting logic
-- matched asset routes behave as raw pass-through
+- matched asset routes behave as raw pass-through except unsafe publisher-domain state/security headers are stripped
 
 ---
 
@@ -589,6 +631,7 @@ separate static routing mechanism.
 - rejects `origin_url` with trailing slash
 - rejects non-absolute `origin_url`
 - warns on duplicate exact prefixes
+- rejects invalid `path_pattern` / `target_path` combinations
 
 ### Route-selection tests
 
@@ -606,7 +649,8 @@ separate static routing mechanism.
 
 ### Proxy-construction tests
 
-- path preserved exactly
+- path preserved exactly without rewrite settings
+- path rewritten when `path_pattern` and `target_path` are configured
 - query preserved exactly
 - upstream host header uses asset origin host
 - `HEAD` preserved
@@ -626,10 +670,11 @@ Recommended implementation outline:
 3. Add a path-matching helper that selects the longest prefix
 4. Add a lean asset-proxy handler that:
    - builds a backend from matched `origin_url`
-   - preserves path + query
+   - preserves path + query by default
+   - applies optional path rewrite while preserving query
    - forwards a minimal header set
    - does not follow redirects
-   - returns raw upstream response
+   - returns raw upstream response after stripping unsafe publisher-domain state/security headers
 5. Insert asset-route handling into top-level routing after explicit routes and
    before publisher fallback
 6. Add focused tests for config, matching, precedence, and proxy construction
@@ -640,8 +685,7 @@ Recommended implementation outline:
 
 Potential future work, intentionally excluded from v1:
 
-- regex path matching
-- path rewrite rules
+- regex route selection
 - per-route custom headers
 - per-route cache overrides
 - per-route certificate-check options

@@ -28,9 +28,6 @@ pub struct Publisher {
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
-    /// Optional upstream Host header value used when connecting to an origin
-    /// whose routing host differs from the backend host.
-    pub origin_host_header: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -61,61 +58,6 @@ impl Publisher {
             .any(|p| p.eq_ignore_ascii_case(proxy_secret))
     }
 
-    fn normalize(&mut self) {
-        self.origin_host_header = self
-            .origin_host_header
-            .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-    }
-
-    /// Eagerly validate runtime-only publisher configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns a configuration error if the configured origin Host header is invalid.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        if let Some(host_header) = &self.origin_host_header {
-            validate_host_header_value(host_header).map_err(|err| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "publisher.origin_host_header `{host_header}` is invalid: {err}"
-                    ),
-                })
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// Returns the upstream Host header to send to the publisher origin.
-    #[must_use]
-    pub fn origin_host_header_value(&self) -> String {
-        self.origin_host_header
-            .clone()
-            .unwrap_or_else(|| self.origin_host())
-    }
-
-    /// Returns the public origin URL whose URLs should be rewritten to the request host.
-    ///
-    /// When `origin_host_header` is configured, the backend connection target
-    /// (`origin_url`) may be an internal routing host while page content still
-    /// references the public origin host. In that case, rewrite against the
-    /// configured Host header using the origin URL's scheme.
-    #[must_use]
-    pub fn origin_rewrite_url(&self) -> String {
-        let Some(host_header) = self.origin_host_header.as_deref() else {
-            return self.origin_url.clone();
-        };
-
-        let scheme = Url::parse(&self.origin_url)
-            .ok()
-            .map(|url| url.scheme().to_string())
-            .unwrap_or_else(|| "https".to_string());
-
-        format!("{scheme}://{host_header}")
-    }
-
     /// Extracts the host (including port if present) from the `origin_url`.
     ///
     /// # Examples
@@ -127,7 +69,6 @@ impl Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
-    ///     origin_host_header: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -645,9 +586,21 @@ pub struct ProxyAssetRoute {
     /// Must be configured together with [`Self::path_pattern`] and must produce a
     /// path that starts with `/`.
     pub target_path: Option<String>,
+    #[serde(skip, default)]
+    compiled_pattern: OnceLock<Result<Regex, String>>,
 }
 
 impl ProxyAssetRoute {
+    /// Create an asset route with the required prefix and origin URL.
+    #[must_use]
+    pub fn new(prefix: impl Into<String>, origin_url: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            origin_url: origin_url.into(),
+            ..Self::default()
+        }
+    }
+
     fn normalize(&mut self) {
         self.prefix = self.prefix.trim().to_string();
         self.origin_url = self.origin_url.trim().to_string();
@@ -663,18 +616,22 @@ impl ProxyAssetRoute {
             .filter(|value| !value.is_empty());
     }
 
-    fn compiled_path_pattern(&self) -> Result<Option<Regex>, Report<TrustedServerError>> {
+    fn compiled_path_pattern(&self) -> Result<Option<&Regex>, Report<TrustedServerError>> {
         let Some(pattern) = self.path_pattern.as_deref() else {
             return Ok(None);
         };
 
-        Regex::new(pattern).map(Some).map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
+        match self
+            .compiled_pattern
+            .get_or_init(|| Regex::new(pattern).map_err(|err| err.to_string()))
+        {
+            Ok(regex) => Ok(Some(regex)),
+            Err(message) => Err(Report::new(TrustedServerError::Configuration {
                 message: format!(
-                    "proxy.asset_routes path_pattern `{pattern}` failed to compile: {err}"
+                    "proxy.asset_routes path_pattern `{pattern}` failed to compile: {message}"
                 ),
-            })
-        })
+            })),
+        }
     }
 
     /// Rewrite a matched request path to the configured upstream target path.
@@ -687,14 +644,14 @@ impl ProxyAssetRoute {
         match (&self.path_pattern, &self.target_path) {
             (None, None) => Ok(path.to_string()),
             (Some(_), Some(target_path)) => {
-                let regex = self.compiled_path_pattern()?.ok_or_else(|| {
-                    Report::new(TrustedServerError::Configuration {
+                let Some(regex) = self.compiled_path_pattern()? else {
+                    return Err(Report::new(TrustedServerError::Configuration {
                         message: format!(
-                            "proxy.asset_routes prefix `{}` has a target_path without path_pattern",
+                            "proxy.asset_routes prefix `{}` must configure path_pattern and target_path together",
                             self.prefix
                         ),
-                    })
-                })?;
+                    }));
+                };
 
                 if !regex.is_match(path) {
                     return Err(Report::new(TrustedServerError::Proxy {
@@ -948,7 +905,6 @@ impl Settings {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
-        settings.publisher.normalize();
         settings.proxy.normalize();
         settings.consent.validate();
         settings.prepare_runtime()?;
@@ -995,7 +951,6 @@ impl Settings {
                 })?;
 
         settings.integrations.normalize();
-        settings.publisher.normalize();
         settings.proxy.normalize();
         settings.consent.validate();
 
@@ -1018,7 +973,6 @@ impl Settings {
     ///
     /// Returns a configuration error if any handler path regex does not compile.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
-        self.publisher.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
 
         for handler in &self.handlers {
@@ -1231,18 +1185,6 @@ fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), Validatio
     if value.expose().is_empty() {
         return Err(ValidationError::new("empty_value"));
     }
-    Ok(())
-}
-
-fn validate_host_header_value(value: &str) -> Result<(), ValidationError> {
-    if value.is_empty() || value.contains(['\0', '\n', '\r']) {
-        let mut err = ValidationError::new("invalid_host_header");
-        err.add_param("value".into(), &value);
-        err.message =
-            Some("host header must be non-empty and must not contain control characters".into());
-        return Err(err);
-    }
-
     Ok(())
 }
 
@@ -2260,7 +2202,6 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -2270,7 +2211,6 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
@@ -2280,7 +2220,6 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -2290,7 +2229,6 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -2300,7 +2238,6 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
@@ -2310,80 +2247,9 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
-            origin_host_header: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
-    }
-
-    #[test]
-    fn publisher_origin_host_header_defaults_to_origin_host() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            origin_host_header: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-        };
-
-        assert_eq!(
-            publisher.origin_host_header_value(),
-            "origin.example.com",
-            "should preserve existing Host header behavior by default"
-        );
-    }
-
-    #[test]
-    fn publisher_origin_host_header_uses_configured_value() {
-        let mut publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://backend.example.net".to_string(),
-            origin_host_header: Some("  example.com  ".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-        };
-        publisher.normalize();
-
-        assert_eq!(
-            publisher.origin_host_header_value(),
-            "example.com",
-            "should use the normalized configured upstream Host header"
-        );
-    }
-
-    #[test]
-    fn publisher_origin_rewrite_url_uses_configured_host_with_origin_scheme() {
-        let mut publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://backend.example.net".to_string(),
-            origin_host_header: Some("www.example.com".to_string()),
-            proxy_secret: Redacted::new("test-secret".to_string()),
-        };
-        publisher.normalize();
-
-        assert_eq!(
-            publisher.origin_rewrite_url(),
-            "https://www.example.com",
-            "should rewrite public-origin URLs instead of backend routing host URLs"
-        );
-    }
-
-    #[test]
-    fn publisher_origin_rewrite_url_defaults_to_origin_url_without_host_override() {
-        let publisher = Publisher {
-            domain: "example.com".to_string(),
-            cookie_domain: ".example.com".to_string(),
-            origin_url: "https://origin.example.com".to_string(),
-            origin_host_header: None,
-            proxy_secret: Redacted::new("test-secret".to_string()),
-        };
-
-        assert_eq!(
-            publisher.origin_rewrite_url(),
-            "https://origin.example.com",
-            "should preserve existing rewrite behavior without a Host override"
-        );
     }
 
     #[test]
@@ -2870,6 +2736,7 @@ mod tests {
                 origin_url: "https://assets.example.com".to_string(),
                 path_pattern: Some("  ^/(.*)$  ".to_string()),
                 target_path: Some("  /rewritten/$1  ".to_string()),
+                ..Default::default()
             }],
         };
         proxy.normalize();
