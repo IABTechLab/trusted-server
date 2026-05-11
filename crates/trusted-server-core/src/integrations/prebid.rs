@@ -3258,6 +3258,24 @@ server_url = "https://prebid.example"
         );
     }
 
+    #[test]
+    fn prebid_body_preview_ignores_bytes_after_bounded_slice() {
+        let mut body = vec![b'x'; PREBID_ERROR_BODY_PREVIEW_BYTES];
+        body.extend_from_slice(&[0xff, b't', b'a', b'i', b'l']);
+
+        let preview = prebid_body_preview(&body);
+
+        assert_eq!(
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should keep the public preview capped"
+        );
+        assert!(
+            !preview.contains('\u{fffd}') && !preview.contains("tail"),
+            "should not process bytes beyond the bounded preview slice"
+        );
+    }
+
     fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
         AuctionRequest {
             id: "test-auction-1".to_string(),
