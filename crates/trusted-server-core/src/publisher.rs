@@ -564,11 +564,7 @@ pub(crate) fn write_bids_to_state(
     log::info!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
-        winning_bids
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
+        winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
     let bid_map = build_bid_map(winning_bids, price_granularity);
     let bids_script = build_bids_script(&bid_map);

@@ -830,7 +830,6 @@ impl AuctionOrchestrator {
                     log::warn!("A provider request failed during collection: {:?}", e);
                 }
             }
-
         }
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
