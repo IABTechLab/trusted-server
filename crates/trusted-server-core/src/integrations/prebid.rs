@@ -1622,31 +1622,23 @@ impl AuctionProvider for PrebidAuctionProvider {
 pub fn register_auction_provider(
     settings: &Settings,
 ) -> Result<Vec<Arc<dyn AuctionProvider>>, Report<TrustedServerError>> {
-    let mut providers: Vec<Arc<dyn AuctionProvider>> = Vec::new();
+    let Some(integration) = build(settings)? else {
+        log::info!("Prebid auction provider not registered: integration not found or disabled");
+        return Ok(Vec::new());
+    };
 
-    match settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID) {
-        Ok(Some(config)) => {
-            log::info!(
-                "Registering Prebid auction provider (server_url={})",
-                config.server_url
-            );
-            if config.debug {
-                log::warn!(
-                    "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
-                     bidstatus) will be included in /auction responses"
-                );
-            }
-            providers.push(Arc::new(PrebidAuctionProvider::new(config)));
-        }
-        Ok(None) => {
-            log::info!("Prebid auction provider not registered: integration not found or disabled");
-        }
-        Err(e) => {
-            return Err(e);
-        }
+    log::info!(
+        "Registering Prebid auction provider (server_url={})",
+        integration.config.server_url
+    );
+    if integration.config.debug {
+        log::warn!(
+            "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+             bidstatus) will be included in /auction responses"
+        );
     }
 
-    Ok(providers)
+    Ok(vec![Arc::new(integration.auction_provider())])
 }
 
 #[cfg(test)]
@@ -3364,9 +3356,7 @@ server_url = "https://prebid.example"
             "should include upstream HTTP status"
         );
         assert!(
-            !auction_response
-                .metadata
-                .contains_key("body_preview"),
+            !auction_response.metadata.contains_key("body_preview"),
             "should omit upstream body preview unless Prebid debug is enabled"
         );
     }
