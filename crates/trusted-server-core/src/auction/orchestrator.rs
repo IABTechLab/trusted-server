@@ -740,6 +740,27 @@ mod tests {
     }
 
     #[test]
+    fn launch_failed_response_has_safe_static_message() {
+        let response = super::provider_launch_failed_response("prebid", 58);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark launch failures as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("launch_failed"),
+            "should include launch_failed classification"
+        );
+        assert_eq!(
+            response.metadata["message"],
+            serde_json::json!("Provider launch failed"),
+            "should use a safe, stable public launch failure message"
+        );
+    }
+
+    #[test]
     fn provider_error_message_truncates_user_safe_context() {
         let long_message = "x".repeat(super::PROVIDER_ERROR_MESSAGE_CHARS + 100);
         let error = Report::new(TrustedServerError::Auction {
