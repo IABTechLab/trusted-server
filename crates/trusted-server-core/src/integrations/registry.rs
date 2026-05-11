@@ -8,8 +8,8 @@ use fastly::http::Method;
 use fastly::{Request, Response};
 use matchit::Router;
 
+use crate::compat;
 use crate::constants::HEADER_X_TS_EC;
-use crate::cookies::set_ec_cookie;
 use crate::edge_cookie::get_or_generate_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
@@ -492,6 +492,8 @@ struct IntegrationRegistryInner {
     put_router: Router<RouteValue>,
     delete_router: Router<RouteValue>,
     patch_router: Router<RouteValue>,
+    head_router: Router<RouteValue>,
+    options_router: Router<RouteValue>,
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
@@ -510,6 +512,8 @@ impl Default for IntegrationRegistryInner {
             put_router: Router::new(),
             delete_router: Router::new(),
             patch_router: Router::new(),
+            head_router: Router::new(),
+            options_router: Router::new(),
             routes: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
@@ -587,6 +591,8 @@ impl IntegrationRegistry {
                             Method::PUT => &mut inner.put_router,
                             Method::DELETE => &mut inner.delete_router,
                             Method::PATCH => &mut inner.patch_router,
+                            Method::HEAD => &mut inner.head_router,
+                            Method::OPTIONS => &mut inner.options_router,
                             _ => {
                                 log::warn!(
                                     "Unsupported HTTP method {} for route {}",
@@ -639,6 +645,8 @@ impl IntegrationRegistry {
             Method::PUT => &self.inner.put_router,
             Method::DELETE => &self.inner.delete_router,
             Method::PATCH => &self.inner.patch_router,
+            Method::HEAD => &self.inner.head_router,
+            Method::OPTIONS => &self.inner.options_router,
             _ => return None, // Unsupported method
         };
 
@@ -688,7 +696,7 @@ impl IntegrationRegistry {
                         // Cookie is intentionally not set when EC ID contains RFC 6265-illegal
                         // characters (e.g. a crafted x-ts-ec header value). The response header
                         // is still emitted; only cookie persistence is skipped.
-                        set_ec_cookie(settings, response, ec_id.as_str());
+                        compat::set_fastly_ec_cookie(settings, response, ec_id.as_str());
                     }
                     Err(ref err) => {
                         log::warn!("Failed to generate EC ID for integration response: {err:?}");
@@ -874,6 +882,8 @@ impl IntegrationRegistry {
                 put_router: Router::new(),
                 delete_router: Router::new(),
                 patch_router: Router::new(),
+                head_router: Router::new(),
+                options_router: Router::new(),
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
@@ -898,6 +908,8 @@ impl IntegrationRegistry {
                 put_router: Router::new(),
                 delete_router: Router::new(),
                 patch_router: Router::new(),
+                head_router: Router::new(),
+                options_router: Router::new(),
                 routes: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
@@ -921,6 +933,8 @@ impl IntegrationRegistry {
         let mut put_router = Router::new();
         let mut delete_router = Router::new();
         let mut patch_router = Router::new();
+        let mut head_router = Router::new();
+        let mut options_router = Router::new();
 
         for (method, path, value) in routes {
             // Convert /* wildcard to matchit's {*rest} syntax
@@ -939,6 +953,8 @@ impl IntegrationRegistry {
                 Method::PUT => &mut put_router,
                 Method::DELETE => &mut delete_router,
                 Method::PATCH => &mut patch_router,
+                Method::HEAD => &mut head_router,
+                Method::OPTIONS => &mut options_router,
                 _ => continue,
             };
 
@@ -954,6 +970,8 @@ impl IntegrationRegistry {
                 put_router,
                 delete_router,
                 patch_router,
+                head_router,
+                options_router,
                 routes: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),

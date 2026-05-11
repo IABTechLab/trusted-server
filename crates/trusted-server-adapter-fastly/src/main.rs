@@ -1,17 +1,17 @@
 use error_stack::Report;
-use fastly::http::Method;
+use fastly::http::{header, Method};
 use fastly::{Request, Response};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::compat;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
     HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
 };
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -73,6 +73,17 @@ fn main() {
     };
     log::debug!("Settings {settings:?}");
 
+    // Short-circuit the ja4 debug probe before finalize_response so that
+    // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
+    if req.get_method() == Method::GET && req.get_path() == "/_ts/debug/ja4" {
+        if settings.debug.ja4_endpoint_enabled {
+            build_ja4_debug_response(&req).send_to_client();
+        } else {
+            Response::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+        }
+        return;
+    }
+
     // Build the auction orchestrator once at startup
     let orchestrator = match build_orchestrator(&settings) {
         Ok(o) => o,
@@ -117,6 +128,48 @@ fn main() {
     }
 }
 
+const FALLBACK_UNAVAILABLE: &str = "unavailable";
+const FALLBACK_NOT_SENT: &str = "not sent";
+const FALLBACK_NONE: &str = "none";
+
+// TODO: remove after JA4 evaluation completes — see #645
+fn build_ja4_debug_response(req: &Request) -> Response {
+    let ja4 = req.get_tls_ja4().unwrap_or(FALLBACK_UNAVAILABLE);
+    let h2 = req
+        .get_client_h2_fingerprint()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let cipher = req
+        .get_tls_cipher_openssl_name()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
+    let ch_mobile = req
+        .get_header_str("sec-ch-ua-mobile")
+        .unwrap_or(FALLBACK_NOT_SENT);
+    let ch_platform = req
+        .get_header_str("sec-ch-ua-platform")
+        .unwrap_or(FALLBACK_NOT_SENT);
+
+    let body = format!(
+        "ja4:         {ja4}\n\
+         h2_fp:       {h2}\n\
+         cipher:      {cipher}\n\
+         tls_version: {tls_version}\n\
+         user-agent:  {ua}\n\
+         ch-mobile:   {ch_mobile}\n\
+         ch-platform: {ch_platform}\n"
+    );
+
+    Response::from_status(fastly::http::StatusCode::OK)
+        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(
+            header::VARY,
+            "User-Agent, Sec-CH-UA-Mobile, Sec-CH-UA-Platform",
+        )
+        .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
+        .with_body(body)
+}
+
 async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
@@ -128,7 +181,7 @@ async fn route_request(
     // Strip client-spoofable forwarded headers at the edge.
     // On Fastly this service IS the first proxy — these headers from
     // clients are untrusted and can hijack URL rewriting (see #409).
-    sanitize_forwarded_headers(&mut req);
+    compat::sanitize_fastly_forwarded_headers(&mut req);
 
     // Look up geo info via the platform abstraction using the client IP
     // already captured in RuntimeServices at the entry point.
@@ -143,8 +196,10 @@ async fn route_request(
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    match enforce_basic_auth(settings, &req) {
-        Ok(Some(mut response)) => {
+    let auth_req = compat::from_fastly_headers_ref(&req);
+    match enforce_basic_auth(settings, &auth_req) {
+        Ok(Some(response)) => {
+            let mut response = compat::to_fastly_response(response);
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Some(response);
         }
@@ -350,5 +405,65 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
 
     for (key, value) in &settings.response_headers {
         response.set_header(key, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::mime;
+
+    #[test]
+    fn ja4_debug_response_uses_plain_text_and_fallback_values() {
+        let req = Request::get("https://example.com/_ts/debug/ja4");
+
+        let mut response = build_ja4_debug_response(&req);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should return 200 OK"
+        );
+        assert_eq!(
+            response.get_content_type(),
+            Some(mime::TEXT_PLAIN_UTF_8),
+            "should return plain text content"
+        );
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("no-store, private"),
+            "should disable caching for the debug response"
+        );
+
+        let body = response.take_body_str();
+
+        assert!(
+            body.contains("ja4:         unavailable"),
+            "should include JA4 fallback"
+        );
+        assert!(
+            body.contains("h2_fp:       unavailable"),
+            "should include H2 fingerprint fallback"
+        );
+        assert!(
+            body.contains("cipher:      unavailable"),
+            "should include cipher fallback"
+        );
+        assert!(
+            body.contains("tls_version: unavailable"),
+            "should include TLS version fallback"
+        );
+        assert!(
+            body.contains("user-agent:  none"),
+            "should include user-agent fallback"
+        );
+        assert!(
+            body.contains("ch-mobile:   not sent"),
+            "should include sec-ch-ua-mobile fallback"
+        );
+        assert!(
+            body.contains("ch-platform: not sent"),
+            "should include sec-ch-ua-platform fallback"
+        );
     }
 }

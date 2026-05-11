@@ -43,7 +43,8 @@ pub use types::{
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
-use fastly::Request;
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
 
 use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
 use crate::geo::GeoInfo;
@@ -62,7 +63,7 @@ pub struct ConsentPipelineInput<'a> {
     /// Parsed cookie jar from the incoming request.
     pub jar: Option<&'a CookieJar>,
     /// The incoming HTTP request (for header access).
-    pub req: &'a Request,
+    pub req: &'a Request<EdgeBody>,
     /// Publisher consent configuration.
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
@@ -612,7 +613,8 @@ fn log_consent_context(ctx: &ConsentContext) {
 
 #[cfg(test)]
 mod tests {
-    use fastly::Request;
+    use edgezero_core::body::Body as EdgeBody;
+    use http::Request;
 
     use super::{
         allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
@@ -625,6 +627,14 @@ mod tests {
     };
     use crate::consent_config::{ConflictMode, ConsentConfig, ConsentMode};
     use crate::cookies::parse_cookies_to_jar;
+
+    fn build_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method("GET")
+            .uri("https://example.com")
+            .body(EdgeBody::empty())
+            .expect("should build consent test request")
+    }
 
     /// Builder for [`TcfConsent`] test fixtures with sensible defaults.
     ///
@@ -739,7 +749,7 @@ mod tests {
     #[test]
     fn proxy_mode_marks_gdpr_when_raw_tc_exists() {
         let jar = parse_cookies_to_jar("euconsent-v2=CPXxGfAPXxGfA");
-        let req = Request::get("https://example.com");
+        let req = build_request();
         let config = ConsentConfig {
             mode: ConsentMode::Proxy,
             ..ConsentConfig::default()
@@ -769,7 +779,7 @@ mod tests {
     #[test]
     fn proxy_mode_marks_gdpr_when_gpp_sid_contains_tcf_section() {
         let jar = parse_cookies_to_jar("__gpp_sid=2,6");
-        let req = Request::get("https://example.com");
+        let req = build_request();
         let config = ConsentConfig {
             mode: ConsentMode::Proxy,
             ..ConsentConfig::default()

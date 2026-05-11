@@ -47,11 +47,26 @@ debug = false
 # be statically imported in the JS bundle.
 client_side_bidders = ["rubicon"]
 
-# Zone-specific bid param overrides for Kargo s2s placement IDs.
-# The JS adapter reads the zone from mediaTypes.banner.name on each ad unit
-# and includes it in the request. The server maps zone → s2s placementId here.
-[integrations.prebid.bid_param_zone_overrides.kargo]
+# Compatibility sugar for static per-bidder params merged into every outgoing
+# PBS request. These normalize into bid_param_override_rules internally.
+# Example:
+# [integrations.prebid.bid_param_overrides.bidder-name]
+# param1 = 12345
+# param2 = "value"
+
+# Compatibility sugar for zone-specific bid param overrides.
+# The JS adapter reads the zone from mediaTypes.banner.name on each ad unit and
+# includes it in the request. These normalize into bid_param_override_rules
+# internally.
+# [integrations.prebid.bid_param_zone_overrides.kargo]
 # header = {placementId = "_abc"}
+
+# Preferred canonical override format for future rules.
+# Rules run in order with exact-match conditions and shallow last-write-wins merge.
+# [[integrations.prebid.bid_param_override_rules]]
+# when.bidder = "kargo"
+# when.zone = "header"
+# set = { placementId = "_abc" }
 
 [integrations.nextjs]
 enabled = false
@@ -68,6 +83,14 @@ rewrite_scripts = true
 enabled = false
 sdk_origin = "https://sdk.privacy-center.org"
 api_origin = "https://api.privacy-center.org"
+
+[integrations.sourcepoint]
+enabled = false
+rewrite_sdk = true
+cdn_origin = "https://cdn.privacy-mgmt.com"
+# Optional: forward a custom Sourcepoint authCookie name upstream.
+# auth_cookie_name = "sp_auth"
+cache_ttl_seconds = 3600
 
 [integrations.permutive]
 enabled = false
@@ -183,6 +206,24 @@ container_id = "GTM-XXXXXX"
 enabled = true
 endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
 timeout_ms = 1000
+
+# Debug configuration (all flags default to false — do not enable in production)
+# [debug]
+# Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
+# Returns a plain-text response with the following fields (Fastly-observed values):
+#   ja4         — JA4 TLS client fingerprint
+#   h2_fp       — HTTP/2 client fingerprint
+#   cipher      — TLS cipher suite (OpenSSL name)
+#   tls_version — TLS protocol version
+#   user-agent  — User-Agent request header
+#   ch-mobile   — Sec-CH-UA-Mobile client hint
+#   ch-platform — Sec-CH-UA-Platform client hint
+# Fastly TLS/fingerprint fields fall back to "unavailable"; client hints fall back
+# to "not sent"; user-agent falls back to "none" when absent.
+# Response always carries Cache-Control: no-store, private.
+# IMPORTANT: This endpoint reflects TLS details that browser JS cannot normally read.
+# Disable after investigation is complete.
+# ja4_endpoint_enabled = false
 
 # Map auction-request context keys to mediation URL query parameters.
 # Each key is a context key from the JS client; the value becomes the

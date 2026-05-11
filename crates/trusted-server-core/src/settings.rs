@@ -400,6 +400,18 @@ impl Proxy {
     }
 }
 
+/// Debug-only features. All flags default to `false` (off in production).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct DebugConfig {
+    /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
+    ///
+    /// When `false` (the default), the endpoint returns 404. Enable only for
+    /// intentional Fastly/browser TLS investigation — the endpoint reflects
+    /// Fastly-observed TLS details that browser JS cannot normally read.
+    #[serde(default)]
+    pub ja4_endpoint_enabled: bool,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
@@ -426,6 +438,8 @@ pub struct Settings {
     pub proxy: Proxy,
     #[serde(default)]
     pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
+    #[serde(default)]
+    pub debug: DebugConfig,
 }
 
 #[allow(unused)]
@@ -1030,6 +1044,113 @@ mod tests {
                         );
                     });
                 });
+            },
+        );
+    }
+
+    #[test]
+    fn test_prebid_bid_param_overrides_override_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let env_key = format!(
+            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDES",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(
+                    env_key,
+                    Some(r#"{"criteo":{"networkId":99999,"pubid":"server-pub"}}"#),
+                    || {
+                        let settings = Settings::from_toml_and_env(&toml_str)
+                            .expect("Settings should parse with bidder param override env");
+                        let cfg = settings
+                            .integration_config::<PrebidIntegrationConfig>("prebid")
+                            .expect("Prebid config query should succeed")
+                            .expect("Prebid config should exist with env override");
+                        let cfg_json =
+                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
+
+                        assert_eq!(
+                            cfg_json["bid_param_overrides"]["criteo"]["networkId"],
+                            json!(99999),
+                            "should deserialize networkId override from env JSON"
+                        );
+                        assert_eq!(
+                            cfg_json["bid_param_overrides"]["criteo"]["pubid"],
+                            json!("server-pub"),
+                            "should deserialize pubid override from env JSON"
+                        );
+                    },
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_prebid_bid_param_override_rules_override_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let env_key = format!(
+            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDE_RULES",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            origin_key,
+            Some("https://origin.test-publisher.com"),
+            || {
+                temp_env::with_var(
+                    env_key,
+                    Some(
+                        r#"[{"when":{"bidder":"kargo","zone":"header"},"set":{"placementId":"server-header","keep":"yes"}}]"#,
+                    ),
+                    || {
+                        let settings = Settings::from_toml_and_env(&toml_str)
+                            .expect("Settings should parse canonical bidder param override rules");
+                        let cfg = settings
+                            .integration_config::<PrebidIntegrationConfig>("prebid")
+                            .expect("Prebid config query should succeed")
+                            .expect("Prebid config should exist with env override");
+                        let cfg_json =
+                            serde_json::to_value(&cfg).expect("should serialize config to JSON");
+
+                        assert_eq!(
+                            cfg_json["bid_param_override_rules"][0]["when"]["bidder"],
+                            json!("kargo"),
+                            "should deserialize bidder matcher from env JSON"
+                        );
+                        assert_eq!(
+                            cfg_json["bid_param_override_rules"][0]["when"]["zone"],
+                            json!("header"),
+                            "should deserialize zone matcher from env JSON"
+                        );
+                        assert_eq!(
+                            cfg_json["bid_param_override_rules"][0]["set"]["placementId"],
+                            json!("server-header"),
+                            "should deserialize set object from env JSON"
+                        );
+                    },
+                );
             },
         );
     }
