@@ -12,6 +12,9 @@ password = "replace-with-admin-password-32-bytes"
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
+# Optional: override the upstream Host header while still connecting to origin_url.
+# Useful when an origin routes sites by Host but the backend DNS name differs.
+# origin_host_header = "test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
@@ -192,6 +195,32 @@ rewrite_script = true
 # Defaults to true. Set to false only for local development with self-signed certificates.
 # certificate_check = true
 
+# Configure first-party asset paths that should proxy to a different backend origin.
+# Matching is path-prefix-based and the longest matching prefix wins.
+# Include a trailing / unless you intentionally want /static to also match paths such as /staticfile.js.
+# Only GET/HEAD requests participate. Built-in and integration routes still take precedence.
+# Trusted Server preserves the incoming query string. By default it also preserves
+# the incoming path, but path_pattern/target_path can generically rewrite paths
+# before sending them upstream.
+#
+# [[proxy.asset_routes]]
+# prefix = "/.images/"
+# origin_url = "https://some.fastly-service.com"
+#
+# Example: CDN-style first-party image path rewrite.
+# [[proxy.asset_routes]]
+# prefix = "/.image/"
+# origin_url = "https://assets-cdn.example.com"
+# path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
+# target_path = "/image/upload/$1.$2"
+#
+# Example: shared static assets stored under an upstream /_network prefix.
+# [[proxy.asset_routes]]
+# prefix = "/_next/static/"
+# origin_url = "https://static-assets.example.com"
+# path_pattern = "^(.*)$"
+# target_path = "/_network$1"
+#
 # Restrict redirect destinations for the first-party proxy to an explicit domain allowlist.
 # Supports exact match ("example.com") and subdomain wildcard prefix ("*.example.com").
 # Wildcard prefix also matches the apex domain ("*.example.com" matches "example.com").

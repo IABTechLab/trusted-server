@@ -46,6 +46,7 @@ pub struct BackendConfig<'a> {
     port: Option<u16>,
     certificate_check: bool,
     first_byte_timeout: Duration,
+    override_host: Option<&'a str>,
 }
 
 impl<'a> BackendConfig<'a> {
@@ -61,6 +62,7 @@ impl<'a> BackendConfig<'a> {
             port: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            override_host: None,
         }
     }
 
@@ -76,6 +78,14 @@ impl<'a> BackendConfig<'a> {
     #[must_use]
     pub fn certificate_check(mut self, check: bool) -> Self {
         self.certificate_check = check;
+        self
+    }
+
+    /// Override the Host header sent upstream while keeping the backend target,
+    /// TLS SNI, and certificate verification tied to [`Self::host`].
+    #[must_use]
+    pub fn override_host(mut self, override_host: Option<&'a str>) -> Self {
+        self.override_host = override_host;
         self
     }
 
@@ -109,6 +119,14 @@ impl<'a> BackendConfig<'a> {
                 message: "host contains control characters".to_string(),
             }));
         }
+        if self
+            .override_host
+            .is_some_and(|host| host.is_empty() || host.chars().any(char::is_control))
+        {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "override host is empty or contains control characters".to_string(),
+            }));
+        }
         if self.scheme.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "scheme contains control characters".to_string(),
@@ -125,11 +143,17 @@ impl<'a> BackendConfig<'a> {
         } else {
             "_nocert"
         };
+        let override_host_suffix = self
+            .override_host
+            .filter(|host| !host.is_empty())
+            .map(|host| format!("_oh_{}", host.replace(['.', ':'], "_")))
+            .unwrap_or_default();
         let timeout_ms = self.first_byte_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}_t{}",
+            "backend_{}{}{}_t{}",
             name_base.replace(['.', ':'], "_"),
             cert_suffix,
+            override_host_suffix,
             timeout_ms
         );
 
@@ -165,11 +189,12 @@ impl<'a> BackendConfig<'a> {
 
         let host_with_port = format!("{}:{}", self.host, target_port);
 
-        let host_header = compute_host_header(self.scheme, self.host, target_port);
+        let default_host_header = compute_host_header(self.scheme, self.host, target_port);
+        let host_header = self.override_host.unwrap_or(&default_host_header);
 
         // Target base is host[:port]; SSL is enabled only for https scheme
         let mut builder = Backend::builder(&backend_name, &host_with_port)
-            .override_host(&host_header)
+            .override_host(host_header)
             .connect_timeout(Duration::from_secs(1))
             .first_byte_timeout(self.first_byte_timeout)
             .between_bytes_timeout(Duration::from_secs(10));
@@ -279,12 +304,33 @@ impl<'a> BackendConfig<'a> {
         certificate_check: bool,
         first_byte_timeout: Duration,
     ) -> Result<String, Report<TrustedServerError>> {
+        Self::from_url_with_first_byte_timeout_and_override_host(
+            origin_url,
+            certificate_check,
+            first_byte_timeout,
+            None,
+        )
+    }
+
+    /// Parse an origin URL and ensure a dynamic backend with an optional upstream Host override.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL cannot be parsed or lacks a host, or if
+    /// backend creation fails.
+    pub fn from_url_with_first_byte_timeout_and_override_host(
+        origin_url: &str,
+        certificate_check: bool,
+        first_byte_timeout: Duration,
+        override_host: Option<&str>,
+    ) -> Result<String, Report<TrustedServerError>> {
         let (scheme, host, port) = Self::parse_origin(origin_url)?;
 
         BackendConfig::new(&scheme, &host)
             .port(port)
             .certificate_check(certificate_check)
             .first_byte_timeout(first_byte_timeout)
+            .override_host(override_host)
             .ensure()
     }
 
@@ -398,6 +444,31 @@ mod tests {
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
         assert_eq!(name, "backend_http_example_org_80_t15000");
+    }
+
+    #[test]
+    fn override_host_changes_backend_name() {
+        let (name, _) = BackendConfig::new("https", "backend.example.net")
+            .override_host(Some("www.example.com"))
+            .compute_name()
+            .expect("should compute name with Host override");
+
+        assert_eq!(
+            name, "backend_https_backend_example_net_443_oh_www_example_com_t15000",
+            "should isolate dynamic backends with different Host overrides"
+        );
+    }
+
+    #[test]
+    fn error_on_override_host_with_control_characters() {
+        let err = BackendConfig::new("https", "origin.example.com")
+            .override_host(Some("www.example.com\nINFO fake log entry"))
+            .predict_name()
+            .expect_err("should reject override host containing newline");
+        assert!(
+            err.to_string().contains("override host"),
+            "should report invalid override host in error message"
+        );
     }
 
     #[test]

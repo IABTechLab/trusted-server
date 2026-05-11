@@ -28,6 +28,7 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, IntegrationScriptContext,
     IntegrationScriptRewriter, ScriptRewriteAction,
 };
+use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -427,6 +428,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -482,7 +484,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             }
         };
 
-        let mut response = proxy_request(settings, req, proxy_config)
+        let mut response = proxy_request(settings, req, proxy_config, services)
             .await
             .change_context(Self::error("Failed to proxy GTM request"))?;
 

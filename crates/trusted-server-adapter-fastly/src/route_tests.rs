@@ -1,9 +1,11 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::StatusCode;
+use fastly::http::{header, Method, StatusCode};
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::ec::registry::PartnerRegistry;
@@ -15,7 +17,7 @@ use trusted_server_core::platform::{
     StoreName,
 };
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
-use trusted_server_core::settings::Settings;
+use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 
 use super::route_request;
 
@@ -85,6 +87,92 @@ impl PlatformBackend for NoopBackend {
 }
 
 struct NoopHttpClient;
+
+struct RecordingHttpClient {
+    calls: Mutex<Vec<RecordedHttpCall>>,
+    response_status: StatusCode,
+    response_headers: Vec<(String, String)>,
+}
+
+impl RecordingHttpClient {
+    fn new(response_status: StatusCode) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            response_status,
+            response_headers: Vec::new(),
+        }
+    }
+
+    fn with_response_headers(
+        mut self,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.response_headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        self
+    }
+}
+
+struct RecordedHttpCall {
+    method: Method,
+    uri: String,
+    backend_name: String,
+}
+
+struct FixedBackend;
+
+impl PlatformBackend for FixedBackend {
+    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        Ok(format!("{}-{}", spec.scheme, spec.host))
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.predict_name(spec)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for RecordingHttpClient {
+    async fn send(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.calls
+            .lock()
+            .expect("should lock calls")
+            .push(RecordedHttpCall {
+                method: request.request.method().clone(),
+                uri: request.request.uri().to_string(),
+                backend_name: request.backend_name,
+            });
+
+        let mut builder = edge_response_builder().status(self.response_status);
+        for (name, value) in &self.response_headers {
+            builder = builder.header(name, value);
+        }
+        let edge_response = builder
+            .body(EdgeBody::from(Vec::new()))
+            .map_err(|_| Report::new(PlatformError::HttpClient))?;
+
+        Ok(PlatformResponse::new(edge_response))
+    }
+
+    async fn send_async(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    async fn select(
+        &self,
+        _pending_requests: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
 
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for NoopHttpClient {
@@ -161,12 +249,24 @@ fn create_test_settings() -> Settings {
 }
 
 fn test_runtime_services(req: &Request) -> RuntimeServices {
+    test_runtime_services_with_http_client(
+        req,
+        Arc::new(NoopBackend),
+        Arc::new(NoopHttpClient) as Arc<dyn PlatformHttpClient>,
+    )
+}
+
+fn test_runtime_services_with_http_client(
+    req: &Request,
+    backend: Arc<dyn PlatformBackend>,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(StubJwksConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
         .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
+        .backend(backend)
+        .http_client(http_client)
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
@@ -227,4 +327,327 @@ fn routes_use_request_local_consent() {
 
     // Routes no longer depend on a separate consent KV store. Live consent is
     // request-local, and EC lifecycle state uses the EC identity store only.
+}
+
+#[test]
+fn asset_routes_bypass_publisher_consent_dependencies() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let asset_req = Request::get("https://test.com/.images/logo.png?auto=webp");
+    let asset_services = test_runtime_services(&asset_req);
+    let asset_resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &asset_services,
+        asset_req,
+    ))
+    .expect("should return an error response for asset proxy requests");
+    assert_eq!(
+        asset_resp.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should bypass publisher consent dependencies and fail only on the missing upstream client"
+    );
+}
+
+#[test]
+fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.images/logo.png");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::OK));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(NoopBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should return an error response for failed asset origin");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should stop asset-origin backend failures at the asset proxy path"
+    );
+    assert!(
+        http_client
+            .calls
+            .lock()
+            .expect("should lock recorded calls")
+            .is_empty(),
+        "should not invoke the publisher origin when asset backend registration fails"
+    );
+}
+
+#[test]
+fn asset_routes_proxy_head_requests() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::head("https://test.com/.images/logo.png");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::NO_CONTENT));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route HEAD asset request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::NO_CONTENT,
+        "should pass through asset-origin HEAD response status"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should send exactly one asset request");
+    assert_eq!(
+        calls[0].method,
+        Method::HEAD,
+        "should forward HEAD upstream"
+    );
+    assert!(
+        calls[0].backend_name.contains("assets.example.com"),
+        "should send to the asset backend, got {}",
+        calls[0].backend_name
+    );
+}
+
+#[test]
+fn asset_routes_ignore_query_string_for_matching() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.images/logo.png?auto=webp");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::OK));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route asset request with query string");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should match by path only"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should send exactly one asset request");
+    assert!(
+        calls[0].uri.ends_with("/.images/logo.png?auto=webp"),
+        "should preserve query on the upstream asset request, got {}",
+        calls[0].uri
+    );
+}
+
+#[test]
+fn asset_routes_pass_redirect_responses_through() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.images/logo.png");
+    let http_client = Arc::new(
+        RecordingHttpClient::new(StatusCode::FOUND).with_response_headers(vec![(
+            header::LOCATION.as_str(),
+            "https://cdn.example.com/logo.png",
+        )]),
+    );
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route redirecting asset request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::FOUND,
+        "should pass redirect status through without following it"
+    );
+    assert_eq!(
+        resp.get_header_str(header::LOCATION),
+        Some("https://cdn.example.com/logo.png"),
+        "should preserve asset-origin redirect location"
+    );
+}
+
+#[test]
+fn asset_routes_skip_non_get_head_requests() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.images/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::post("https://test.com/.images/logo.png");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::OK));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route non-asset POST request");
+
+    assert_ne!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should not return the asset-origin response for POST requests"
+    );
+    assert!(
+        http_client
+            .calls
+            .lock()
+            .expect("should lock recorded calls")
+            .is_empty(),
+        "should not send POST requests through asset routing"
+    );
+}
+
+#[test]
+fn built_in_routes_take_precedence_over_asset_routes() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/.well-known/".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.well-known/trusted-server.json");
+    let services = test_runtime_services(&req);
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route discovery request");
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should keep explicit built-in routes ahead of asset routes"
+    );
+}
+
+#[test]
+fn integration_routes_take_precedence_over_asset_routes() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute {
+        prefix: "/prebid.js".to_string(),
+        origin_url: "https://assets.example.com".to_string(),
+        ..Default::default()
+    }];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/prebid.js");
+    let services = test_runtime_services(&req);
+    let mut resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route integration request");
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should keep explicit integration routes ahead of asset routes"
+    );
+    assert_eq!(
+        resp.take_body_str(),
+        "// Script overridden by Trusted Server\n",
+        "should serve the integration response instead of proxying to the asset origin"
+    );
 }
