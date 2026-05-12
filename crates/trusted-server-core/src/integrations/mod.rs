@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, RuntimeServices};
+use crate::platform::{PlatformBackendSpec, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT};
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -53,7 +53,7 @@ pub(crate) fn ensure_integration_backend(
             url,
             integration,
             true,
-            std::time::Duration::from_secs(15),
+            DEFAULT_FIRST_BYTE_TIMEOUT,
         )?)
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),
@@ -92,7 +92,7 @@ pub(crate) fn ensure_integration_backend_with_timeout(
         })
 }
 
-/// Compute the deterministic backend name for a URL without registering a backend.
+/// Compute the deterministic platform backend name for a URL without registering it.
 ///
 /// Parses `url`, builds a [`PlatformBackendSpec`], and delegates to
 /// [`crate::platform::PlatformBackend::predict_name`].

@@ -39,10 +39,10 @@ mod platform;
 #[cfg(test)]
 mod route_tests;
 
-use crate::app::{build_state, TrustedServerApp};
+use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::apply_finalize_headers;
-use crate::platform::{build_runtime_services, open_kv_store, FastlyPlatformGeo};
+use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 use edgezero_core::app::Hooks as _;
 
 /// Returns `true` if the raw config-store value represents an enabled flag.
@@ -302,24 +302,6 @@ pub(crate) fn resolve_publisher_response(
             Ok(response)
         }
     }
-}
-
-fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.

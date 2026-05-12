@@ -1,4 +1,3 @@
-use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
@@ -15,7 +14,9 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{
+    PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT,
+};
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
