@@ -1829,10 +1829,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1884,10 +1881,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1921,10 +1915,7 @@ server_url = "https://prebid.example"
         });
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -1956,10 +1947,7 @@ server_url = "https://prebid.example"
         let auction_request = create_test_auction_request();
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2014,10 +2002,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2042,10 +2027,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2069,10 +2051,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2116,10 +2095,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2169,10 +2145,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2210,10 +2183,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2241,10 +2211,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2267,10 +2234,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2296,10 +2260,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2522,10 +2483,7 @@ server_url = "https://prebid.example"
         request
             .headers_mut()
             .insert("DNT", http::header::HeaderValue::from_static("1"));
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2554,10 +2512,7 @@ server_url = "https://prebid.example"
             "Accept-Language",
             http::header::HeaderValue::from_static("en-US,en;q=0.9,fr;q=0.8"),
         );
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2590,10 +2545,7 @@ server_url = "https://prebid.example"
             "Accept-Language",
             http::header::HeaderValue::from_static(""),
         );
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2629,10 +2581,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2667,10 +2616,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2703,10 +2649,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2736,10 +2679,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2766,10 +2706,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2803,10 +2740,7 @@ server_url = "https://prebid.example"
             "Referer",
             http::header::HeaderValue::from_static("https://google.com/search?q=test"),
         );
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -2830,10 +2764,7 @@ server_url = "https://prebid.example"
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(
-            &settings,
-            &request,
-        );
+        let context = create_test_auction_context(&settings, &request);
 
         let openrtb = provider.to_openrtb(
             &auction_request,

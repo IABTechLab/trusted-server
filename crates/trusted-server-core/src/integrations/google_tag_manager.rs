@@ -547,7 +547,12 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             }
             log::debug!("Rewriting GTM/gtag script content");
             let status = response.status();
-            let body_bytes = collect_response_bounded(response.into_body(), UPSTREAM_SDK_MAX_RESPONSE_BYTES, GTM_INTEGRATION_ID).await?;
+            let body_bytes = collect_response_bounded(
+                response.into_body(),
+                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+                GTM_INTEGRATION_ID,
+            )
+            .await?;
             let body_str = String::from_utf8_lossy(&body_bytes);
             let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 
