@@ -72,6 +72,15 @@ pub fn ingest_prebid_eids(
             continue;
         }
 
+        if eid.id.len() > MAX_UID_LENGTH {
+            log::debug!(
+                "Prebid EIDs: id for source '{}' exceeds MAX_UID_LENGTH ({} bytes)",
+                eid.source,
+                eid.id.len()
+            );
+            continue;
+        }
+
         // Debounce: skip if this partner was synced recently.
         if let Ok(Some((entry, _))) = kv.get(ec_id) {
             if let Some(existing) = entry.ids.get(&partner.id) {
