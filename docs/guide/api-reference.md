@@ -50,57 +50,8 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 ## Edge Cookie Endpoints
 
-### POST /\_ts/admin/v1/partners/register
-
-Registers or updates a partner used for EC sync and bidstream enrichment.
-
-**Auth:** Basic auth (admin credentials)
-
-**Request Body:**
-
-```json
-{
-  "id": "mocktioneer",
-  "name": "Mocktioneer SSP",
-  "api_key": "partner-secret-key",
-  "allowed_return_domains": ["formally-vital-lion.edgecompute.app"],
-  "source_domain": "formally-vital-lion.edgecompute.app",
-  "bidstream_enabled": true
-}
-```
-
-**Response:**
-
-- `201 Created` when newly created
-- `200 OK` when existing partner is updated
-
----
-
-### GET /\_ts/api/v1/sync
-
-Browser pixel sync endpoint. Associates an EC ID with a partner UID.
-
-**Query Parameters:**
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `partner` | string | Yes | Registered partner id |
-| `uid` | string | Yes | Partner's user id |
-| `return` | string (URL) | Yes | Redirect URL after sync |
-
-**Request Requirements:**
-
-- `ts-ec` cookie present
-- valid consent signal (`euconsent-v2`) for consent-required jurisdictions
-
-**Response:**
-
-- `302 Found` redirect
-- Success: `Location: <return>?ts_synced=1`
-- Failure: `Location: <return>?ts_synced=0&ts_reason=<reason>`
-
-Common `ts_reason` values: `no_ec`, `no_consent`, `write_failed`, `rate_limited`.
-
----
+> Partners are configured statically in `trusted-server.toml` under
+> `[[ec.partners]]` — there is no runtime partner-registration endpoint.
 
 ### GET /\_ts/api/v1/identify
 
