@@ -6,7 +6,7 @@
 //!
 //! The schema is versioned (`v: 1`) to allow future migrations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +19,11 @@ pub const SCHEMA_VERSION: u8 = 1;
 // Unsupported schema versions fail closed on read. Future schema bumps must
 // add an explicit lazy migration or backfill path before changing this value.
 
-/// Maximum number of legacy publisher-domain entries accepted in
+/// Maximum number of publisher-domain entries accepted in
 /// [`KvPubProperties::seen_domains`].
 ///
-/// New entries seed this map with the creation domain only. Runtime organic
-/// requests no longer append domains or update visit counts.
+/// New entries seed this set with the creation domain only. Runtime organic
+/// requests no longer append domains.
 pub const MAX_SEEN_DOMAINS: usize = 50;
 
 /// Maximum allowed hostname length for publisher domains stored in KV.
@@ -104,29 +104,43 @@ pub struct KvPartnerId {
     pub uid: String,
 }
 
-/// A legacy domain visit record within [`KvPubProperties::seen_domains`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KvDomainVisit {
-    /// Legacy visit count retained for schema compatibility.
-    pub visits: u32,
-}
-
 /// Publisher property metadata captured when an EC entry is created.
 ///
 /// Earlier schema versions treated `seen_domains` as mutable domain history.
 /// To avoid recurring organic-request KV writes, new entries now seed only the
-/// creation domain and runtime requests do not append domains or increment
-/// visits. The fields remain for compatibility with existing records.
+/// creation domain and runtime requests do not append domains. Legacy map-shaped
+/// records are accepted on read and reserialized as a domain list on future writes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvPubProperties {
     /// Apex domain where this EC entry was first created.
     pub origin_domain: String,
-    /// Legacy per-domain visit map, keyed by apex domain.
+    /// Bounded set of publisher apex domains seen for this EC entry.
     ///
     /// New entries include the creation domain only; runtime requests do not
-    /// update this map.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub seen_domains: BTreeMap<String, KvDomainVisit>,
+    /// update this set.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_seen_domains",
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub seen_domains: BTreeSet<String>,
+}
+
+fn deserialize_seen_domains<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SeenDomains {
+        List(Vec<String>),
+        LegacyMap(BTreeMap<String, serde_json::Value>),
+    }
+
+    match SeenDomains::deserialize(deserializer)? {
+        SeenDomains::List(domains) => Ok(domains.into_iter().collect()),
+        SeenDomains::LegacyMap(domains) => Ok(domains.into_keys().collect()),
+    }
 }
 
 /// Coarse, non-PII device signals derived from TLS handshake and UA.
@@ -256,8 +270,8 @@ impl KvEntry {
     #[must_use]
     pub fn new(consent: &ConsentContext, geo: Option<&GeoInfo>, now: u64, domain: &str) -> Self {
         let pub_properties = validated_stored_domain(domain).map(|validated_domain| {
-            let mut seen_domains = BTreeMap::new();
-            seen_domains.insert(validated_domain.clone(), KvDomainVisit { visits: 1 });
+            let mut seen_domains = BTreeSet::new();
+            seen_domains.insert(validated_domain.clone());
 
             KvPubProperties {
                 origin_domain: validated_domain,
@@ -393,7 +407,7 @@ impl KvEntry {
                 ));
             }
 
-            for domain in pub_properties.seen_domains.keys() {
+            for domain in &pub_properties.seen_domains {
                 if validated_stored_domain(domain).as_deref() != Some(domain.as_str()) {
                     return Err(format!(
                         "seen_domains contains invalid stored domain '{domain}'"
@@ -513,8 +527,9 @@ mod tests {
                 && !json.contains("synced")
                 && !json.contains("first")
                 && !json.contains("last")
-                && !json.contains("cluster_checked"),
-            "serialized entry should omit removed timestamp fields: {json}"
+                && !json.contains("cluster_checked")
+                && !json.contains("visits"),
+            "serialized entry should omit removed timestamp and visit fields: {json}"
         );
     }
 
@@ -553,13 +568,12 @@ mod tests {
                 .map(|partner| partner.uid.as_str()),
             Some("abc")
         );
-        assert_eq!(
+        assert!(
             entry
                 .pub_properties
                 .as_ref()
-                .and_then(|props| props.seen_domains.get("example.com"))
-                .map(|visit| visit.visits),
-            Some(3)
+                .is_some_and(|props| props.seen_domains.contains("example.com")),
+            "should preserve legacy seen domain key"
         );
         assert_eq!(
             entry
@@ -575,8 +589,9 @@ mod tests {
                 && !reserialized.contains("synced")
                 && !reserialized.contains("first")
                 && !reserialized.contains("last")
-                && !reserialized.contains("cluster_checked"),
-            "reserialized entry should omit removed timestamp fields: {reserialized}"
+                && !reserialized.contains("cluster_checked")
+                && !reserialized.contains("visits"),
+            "reserialized entry should omit removed timestamp and visit fields: {reserialized}"
         );
     }
 
@@ -666,11 +681,10 @@ mod tests {
             .expect("should have pub_properties");
         assert_eq!(props.origin_domain, "example.com");
         assert_eq!(props.seen_domains.len(), 1);
-        let visit = props
-            .seen_domains
-            .get("example.com")
-            .expect("should have origin domain visit");
-        assert_eq!(visit.visits, 1);
+        assert!(
+            props.seen_domains.contains("example.com"),
+            "should have origin domain"
+        );
     }
 
     #[test]
@@ -767,10 +781,9 @@ mod tests {
             .expect("should initialize pub_properties");
 
         for idx in 0..MAX_SEEN_DOMAINS {
-            pub_properties.seen_domains.insert(
-                format!("extra-{idx}.example.com"),
-                KvDomainVisit { visits: 1 },
-            );
+            pub_properties
+                .seen_domains
+                .insert(format!("extra-{idx}.example.com"));
         }
 
         let err = entry
@@ -794,10 +807,10 @@ mod tests {
 
         pub_properties
             .seen_domains
-            .insert("z.example.com".to_owned(), KvDomainVisit { visits: 1 });
+            .insert("z.example.com".to_owned());
         pub_properties
             .seen_domains
-            .insert("a.example.com".to_owned(), KvDomainVisit { visits: 1 });
+            .insert("a.example.com".to_owned());
 
         let json = serde_json::to_string(&entry).expect("should serialize KV entry");
         let a_index = json
@@ -962,11 +975,10 @@ mod tests {
             .expect("should have pub_properties");
         assert_eq!(props.origin_domain, "autoblog.com");
         assert_eq!(props.seen_domains.len(), 1);
-        let visit = props
-            .seen_domains
-            .get("autoblog.com")
-            .expect("should have origin visit");
-        assert_eq!(visit.visits, 1);
+        assert!(
+            props.seen_domains.contains("autoblog.com"),
+            "should have origin domain"
+        );
     }
 
     #[test]
@@ -999,12 +1011,21 @@ mod tests {
     }
 
     #[test]
-    fn domain_visit_roundtrip() {
-        let visit = KvDomainVisit { visits: 5 };
-        let json = serde_json::to_string(&visit).expect("should serialize");
-        let deserialized: KvDomainVisit = serde_json::from_str(&json).expect("should deserialize");
+    fn pub_properties_deserializes_new_seen_domains_list_shape() {
+        let json = r#"{
+            "origin_domain": "autoblog.com",
+            "seen_domains": ["autoblog.com"]
+        }"#;
 
-        assert_eq!(deserialized.visits, 5);
+        let props: KvPubProperties =
+            serde_json::from_str(json).expect("should deserialize new seen_domains list shape");
+
+        assert_eq!(props.origin_domain, "autoblog.com");
+        assert_eq!(props.seen_domains.len(), 1);
+        assert!(
+            props.seen_domains.contains("autoblog.com"),
+            "should include listed domain"
+        );
     }
 
     #[test]

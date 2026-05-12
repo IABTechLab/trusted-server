@@ -603,9 +603,7 @@ Partners are defined in config (`[[ec.partners]]` in TOML) and loaded into an in
   },
   "pub_properties": {
     "origin_domain": "autoblog.com",
-    "seen_domains": {
-      "autoblog.com": { "visits": 1 }
-    }
+    "seen_domains": ["autoblog.com"]
   },
   "network": {
     "cluster_size": 2
@@ -684,15 +682,10 @@ pub struct KvPartnerId {
 pub struct KvPubProperties {
     /// Apex domain where this EC entry was first created.
     pub origin_domain: String,
-    /// Per-domain visit history, keyed by apex domain.
-    /// Capped at 50 entries; new domains silently dropped at cap.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub seen_domains: HashMap<String, KvDomainVisit>,
-}
-
-pub struct KvDomainVisit {
-    /// Legacy visit count retained for schema compatibility.
-    pub visits: u32,
+    /// Bounded set of publisher apex domains seen for this EC entry.
+    /// Capped at 50 entries.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub seen_domains: BTreeSet<String>,
 }
 
 /// Coarse device signals derived from TLS handshake and UA.
@@ -1089,27 +1082,22 @@ entry" rather than "unknown device."
 `KvPubProperties` records the publisher domain where the EC entry was created.
 Earlier drafts treated `seen_domains` as mutable domain history, but the current
 implementation avoids recurring organic-request KV writes. New entries seed only
-the creation domain and runtime requests do not append domains or increment
-visit counts. The `seen_domains`/`visits` shape remains for compatibility with
-legacy records.
+the creation domain and runtime requests do not append domains. Legacy
+map-shaped records with per-domain visit objects are accepted on read and
+reserialized as a domain list on future writes.
 
 ```rust
 pub struct KvPubProperties {
     pub origin_domain: String,
-    pub seen_domains: HashMap<String, KvDomainVisit>,
-}
-
-pub struct KvDomainVisit {
-    pub visits: u32,
+    pub seen_domains: BTreeSet<String>,
 }
 ```
 
 **Written:** on `KvEntry::new()` / `create_or_revive()` for the creation domain
 only. Ordinary returning-user requests do not update this structure.
 
-**Cap:** legacy `seen_domains` maps are capped at 50 entries
-(`MAX_SEEN_DOMAINS`) during validation so old or malformed records cannot grow
-unbounded.
+**Cap:** `seen_domains` sets are capped at 50 entries (`MAX_SEEN_DOMAINS`)
+during validation so old or malformed records cannot grow unbounded.
 
 ### 7A.8 Network cluster disambiguation (`KvNetwork`)
 
