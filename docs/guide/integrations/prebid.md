@@ -237,6 +237,17 @@ that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
 production builds so publisher-specific ID choices do not change the attested JS
 artifact.
 
+This is deliberate: Trusted Server replaces the publisher's Prebid.js bundle so
+we can install the `trustedServer` adapter and route auctions through `/auction`,
+but publishers often have custom or opaque Prebid builds. It is difficult to
+know every User ID submodule needed for a publisher before runtime, and making
+that list an environment-driven build input would produce different JS bytes per
+publisher. Those publisher-specific bundles would undermine deployment
+attestation because the trusted artifact hash would vary based on integration
+configuration rather than code changes. Keeping a broad, reviewed preset in
+source control makes the auction flow predictable while keeping the generated
+bundle stable across publishers.
+
 The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
 LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
 Unified ID / TDID. LiveIntent is imported through a local ESM shim because the
