@@ -8,7 +8,7 @@ use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
@@ -485,7 +485,7 @@ pub async fn handle_publisher_request(
     // Generate EC identifiers before the request body is consumed.
     // Always generated for internal use (KV lookups, logging) even when
     // consent is absent — the cookie is only *set* when consent allows it.
-    let ec_id = get_or_generate_ec_id(settings, services, &req)?;
+    let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
     // from the incoming request. The ConsentContext carries both raw strings
@@ -775,6 +775,7 @@ fn apply_ec_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge_cookie::get_or_generate_ec_id;
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::{
         build_services_with_http_client, noop_services, StubHttpClient,

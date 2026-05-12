@@ -1,4 +1,6 @@
 use core::str;
+use std::sync::OnceLock;
+
 use error_stack::{Report, ResultExt};
 use validator::Validate;
 
@@ -8,6 +10,7 @@ use crate::settings::{EdgeCookie, Publisher, Settings};
 pub use crate::auction_config_types::AuctionConfig;
 
 const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.toml");
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 /// Creates a new [`Settings`] instance from the embedded configuration file.
 ///
@@ -20,6 +23,21 @@ const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.
 /// - [`TrustedServerError::InvalidUtf8`] if the embedded TOML file contains invalid UTF-8
 /// - [`TrustedServerError::Configuration`] if the configuration is invalid or missing required fields
 pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
+    if let Some(settings) = SETTINGS.get() {
+        return Ok(settings.clone());
+    }
+
+    let settings = load_settings()?;
+    if SETTINGS.set(settings.clone()).is_err() {
+        if let Some(settings) = SETTINGS.get() {
+            return Ok(settings.clone());
+        }
+    }
+
+    Ok(settings)
+}
+
+fn load_settings() -> Result<Settings, Report<TrustedServerError>> {
     let toml_bytes = SETTINGS_DATA;
     let toml_str = str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {
         message: "embedded trusted-server.toml file".to_string(),

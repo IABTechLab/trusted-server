@@ -25,9 +25,10 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, AttributeRewriteAction, IntegrationAttributeContext,
+    collect_response_bounded, AttributeRewriteAction, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -546,7 +547,12 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             }
             log::debug!("Rewriting GTM/gtag script content");
             let status = response.status();
-            let body_bytes = collect_body(response.into_body(), GTM_INTEGRATION_ID).await?;
+            let body_bytes = collect_response_bounded(
+                response.into_body(),
+                UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+                GTM_INTEGRATION_ID,
+            )
+            .await?;
             let body_str = String::from_utf8_lossy(&body_bytes);
             let rewritten_body = Self::rewrite_gtm_urls(&body_str);
 

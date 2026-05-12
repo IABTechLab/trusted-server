@@ -569,7 +569,7 @@ Set `mock = false` in APS config when real APS integration is ready.
 
 ```rust
 let orchestrator = AuctionOrchestrator::new(config);
-orchestrator.register_provider(Arc::new(PrebidAuctionProvider::new(prebid_config)));
+orchestrator.register_provider(Arc::new(PrebidAuctionProvider::try_new(prebid_config)?));
 orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
 
 let result = orchestrator.run_auction(&request, &context, &services).await?;

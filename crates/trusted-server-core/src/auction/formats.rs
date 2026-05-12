@@ -142,7 +142,7 @@ pub fn convert_tsjs_to_auction_request(
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
-        ip: services.client_info.client_ip.map(|ip| ip.to_string()),
+        ip: services.client_info().client_ip.map(|ip| ip.to_string()),
         geo,
     });
 
