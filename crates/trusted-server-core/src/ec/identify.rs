@@ -35,6 +35,18 @@ pub fn handle_identify(
     req: &Request,
     ec_context: &EcContext,
 ) -> Result<Response, Report<TrustedServerError>> {
+    let cors = classify_origin(req, settings);
+    let response = handle_identify_inner(settings, kv, registry, req, ec_context)?;
+    Ok(apply_cors_decision(response, &cors))
+}
+
+fn handle_identify_inner(
+    settings: &Settings,
+    kv: &KvIdentityGraph,
+    registry: &PartnerRegistry,
+    req: &Request,
+    ec_context: &EcContext,
+) -> Result<Response, Report<TrustedServerError>> {
     // Authenticate via Bearer token.
     let Some(partner) = authenticate_bearer(registry, req) else {
         return json_response(
@@ -166,6 +178,13 @@ enum CorsDecision {
     NoOrigin,
     Allowed(String),
     Denied,
+}
+
+fn apply_cors_decision(mut response: Response, decision: &CorsDecision) -> Response {
+    if let CorsDecision::Allowed(origin) = decision {
+        apply_cors_headers(&mut response, origin);
+    }
+    response
 }
 
 fn classify_origin(req: &Request, settings: &Settings) -> CorsDecision {
@@ -409,6 +428,59 @@ mod tests {
         assert!(
             body.get("eid").is_none(),
             "eid should be omitted when KV read fails"
+        );
+    }
+
+    #[test]
+    fn handle_identify_sets_cors_headers_for_publisher_origin() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
+        req.set_header("origin", "https://www.test-publisher.com");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+
+        assert_eq!(
+            response
+                .get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://www.test-publisher.com"),
+            "should echo publisher origin in Access-Control-Allow-Origin"
+        );
+        assert_eq!(
+            response
+                .get_header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "should allow credentials for publisher origin"
+        );
+    }
+
+    #[test]
+    fn handle_identify_omits_cors_headers_for_mismatched_origin() {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::new("missing_store");
+        let partners = vec![make_test_partner("ssp_x", "my-token")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
+        req.set_header("authorization", "Bearer my-token");
+        req.set_header("origin", "https://evil.example");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+
+        assert!(
+            response
+                .get_header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "should not set Access-Control-Allow-Origin for mismatched origin"
         );
     }
 
