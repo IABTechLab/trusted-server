@@ -12,9 +12,10 @@ use validator::Validate;
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, collect_body_bounded, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -211,7 +212,12 @@ impl IntegrationProxy for TestlightIntegration {
         let (parts, body) = response.into_parts();
 
         // Attempt to parse response into structured form for logging/future transforms.
-        let response_body = collect_body(body, TESTLIGHT_INTEGRATION_ID).await?;
+        let response_body = collect_response_bounded(
+            body,
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            TESTLIGHT_INTEGRATION_ID,
+        )
+        .await?;
         match serde_json::from_slice::<TestlightResponseBody>(&response_body) {
             Ok(body) => {
                 let response_body = serde_json::to_vec(&body)

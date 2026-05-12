@@ -132,10 +132,6 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
         fastly_resp.append_header(name.as_str(), value.as_bytes());
     }
 
-    debug_assert!(
-        matches!(&body, EdgeBody::Once(_)),
-        "streaming body passed to compat::to_fastly_response will be silently truncated"
-    );
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {

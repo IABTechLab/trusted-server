@@ -242,8 +242,7 @@ impl IntegrationProxy for DidomiIntegration {
         let request_body = if parts.method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DIDOMI_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error("Didomi request body too large"))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

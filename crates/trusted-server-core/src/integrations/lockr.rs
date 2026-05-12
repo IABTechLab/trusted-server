@@ -148,9 +148,13 @@ impl LockrIntegration {
             ))));
         }
 
-        let sdk_body = collect_response_bounded(lockr_response.into_body(), UPSTREAM_SDK_MAX_RESPONSE_BYTES, LOCKR_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read Lockr SDK response body"))?;
+        let sdk_body = collect_response_bounded(
+            lockr_response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            LOCKR_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read Lockr SDK response body"))?;
         log::info!("Fetched Lockr SDK ({} bytes)", sdk_body.len());
 
         // TODO: Cache in KV store (future enhancement)
@@ -203,8 +207,7 @@ impl LockrIntegration {
         let request_body = if method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, LOCKR_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error("Lockr API request body too large"))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

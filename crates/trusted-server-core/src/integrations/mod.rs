@@ -81,40 +81,8 @@ pub(crate) const UPSTREAM_RTB_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum response body size from SDK/proxy integrations.
 pub(crate) const UPSTREAM_SDK_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Drains an [`EdgeBody`] into a byte vector.
-///
-/// For upstream response bodies with a size cap, use [`collect_response_bounded`] instead.
-///
-/// # Errors
-///
-/// Returns an error when a streaming body chunk cannot be read.
-pub(crate) async fn collect_body(
-    body: EdgeBody,
-    integration: &'static str,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => Ok(bytes.to_vec()),
-        EdgeBody::Stream(mut stream) => {
-            let mut body_bytes = Vec::new();
-            while let Some(chunk_result) = stream.next().await {
-                let chunk = chunk_result.map_err(|error| {
-                    Report::new(TrustedServerError::Integration {
-                        integration: integration.to_string(),
-                        message: format!("Failed to read response body: {error}"),
-                    })
-                })?;
-                body_bytes.extend_from_slice(&chunk);
-            }
-            Ok(body_bytes)
-        }
-    }
-}
-
 /// Drains an [`EdgeBody`] into a byte vector, rejecting bodies larger than
 /// `max_bytes` with [`TrustedServerError::RequestTooLarge`].
-///
-/// Use this instead of [`collect_body`] for inbound request bodies where an
-/// unbounded read would allow clients to exhaust memory.
 ///
 /// # Errors
 ///
@@ -169,10 +137,10 @@ pub(crate) async fn collect_body_bounded(
 /// Use this for upstream (provider/integration) response bodies to bound
 /// memory usage when a third-party server misbehaves. Unlike
 /// [`collect_body_bounded`], oversized bodies are classified as
-/// [`TrustedServerError::Integration`] (502 BAD_GATEWAY) rather than
+/// [`TrustedServerError::Integration`] (502 `BAD_GATEWAY`) rather than
 /// [`TrustedServerError::RequestTooLarge`] (413).
 ///
-/// Note: the effective bound for streaming bodies is ≤ max_bytes + one_chunk
+/// Note: the effective bound for streaming bodies is ≤ `max_bytes` + `one_chunk`
 /// because the size check runs after each chunk is materialized. Fastly
 /// H2/H3 chunks are ≤ 16 KiB in practice, making the overshoot negligible.
 ///

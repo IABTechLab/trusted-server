@@ -300,9 +300,13 @@ impl DataDomeIntegration {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .cloned();
-        let body = collect_response_bounded(backend_resp.response.into_body(), UPSTREAM_SDK_MAX_RESPONSE_BYTES, DATADOME_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read DataDome SDK response body"))?;
+        let body = collect_response_bounded(
+            backend_resp.response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            DATADOME_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read DataDome SDK response body"))?;
         let rewritten = self.rewrite_script_content(&String::from_utf8_lossy(&body));
 
         // Build response with caching headers
@@ -360,8 +364,7 @@ impl DataDomeIntegration {
         let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DATADOME_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error("DataDome API request body too large"))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

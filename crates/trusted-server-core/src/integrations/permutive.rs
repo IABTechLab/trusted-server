@@ -150,9 +150,13 @@ impl PermutiveIntegration {
             ))));
         }
 
-        let sdk_body = collect_response_bounded(permutive_response.into_body(), UPSTREAM_SDK_MAX_RESPONSE_BYTES, PERMUTIVE_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read Permutive SDK response body"))?;
+        let sdk_body = collect_response_bounded(
+            permutive_response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            PERMUTIVE_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read Permutive SDK response body"))?;
         log::info!(
             "Successfully fetched Permutive SDK: {} bytes",
             sdk_body.len()
@@ -211,10 +215,7 @@ impl PermutiveIntegration {
         let request_body = if method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, PERMUTIVE_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error(format!(
-                        "Permutive {route_name} request body too large"
-                    )))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

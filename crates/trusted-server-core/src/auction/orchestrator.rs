@@ -336,7 +336,7 @@ impl AuctionOrchestrator {
                         .backend_name()
                         .map(str::to_string)
                         .unwrap_or_else(|| {
-                            log::debug!(
+                            log::warn!(
                                 "Provider '{}' pending request returned no backend name; \
                              using predicted name '{}'",
                                 provider.provider_name(),
