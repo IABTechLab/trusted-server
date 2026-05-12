@@ -140,7 +140,6 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
     Ok(None)
 }
 
-
 /// Gets or creates an EC ID from the request.
 ///
 /// Attempts to retrieve an existing EC ID from:
