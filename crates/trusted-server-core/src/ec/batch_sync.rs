@@ -12,6 +12,7 @@ use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_body_bounded;
 
 use super::auth::authenticate_bearer;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
@@ -120,15 +121,15 @@ fn handle_batch_sync_with_writer(
         ));
     }
 
-    // 3. Parse body (with size limit to prevent OOM before validation)
+    // 3. Parse body. The size cap is enforced *before* the body is buffered so
+    // an oversized payload cannot OOM the instance before validation.
     const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    let body_bytes = req.take_body_bytes();
-    if body_bytes.len() > MAX_BODY_SIZE {
+    let Some(body_bytes) = read_body_bounded(req, MAX_BODY_SIZE) else {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body_too_large",
         ));
-    }
+    };
     let body: BatchSyncRequest = serde_json::from_slice(&body_bytes).map_err(|e| {
         Report::new(TrustedServerError::BadRequest {
             message: format!("Invalid request body: {e}"),

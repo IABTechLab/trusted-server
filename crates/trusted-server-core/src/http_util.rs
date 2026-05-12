@@ -1,3 +1,5 @@
+use std::io::Read as _;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use fastly::http::{header, StatusCode};
@@ -289,6 +291,25 @@ pub fn serve_static_with_etag(body: &str, req: &Request, content_type: &str) -> 
         .with_body(body)
 }
 
+/// Reads a request body into memory, rejecting it before the full payload is
+/// buffered when it exceeds `max_bytes`.
+///
+/// The read is bounded to `max_bytes + 1` bytes so an oversized (or hostile)
+/// body cannot trigger an unbounded allocation on the `wasm32-wasip1` instance.
+///
+/// Returns `None` when the body is larger than `max_bytes` or cannot be read
+/// (e.g. the client disconnected mid-body). Callers should respond with
+/// `413 Payload Too Large` in that case.
+#[must_use]
+pub fn read_body_bounded(req: &mut Request, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let limit = max_bytes as u64 + 1;
+    match req.take_body().take(limit).read_to_end(&mut buf) {
+        Ok(_) if buf.len() <= max_bytes => Some(buf),
+        _ => None,
+    }
+}
+
 /// Encrypts a URL using XChaCha20-Poly1305 with a key derived from the publisher `proxy_secret`.
 /// Returns a Base64 URL-safe (no padding) token: b"x1" || nonce(24) || ciphertext+tag.
 ///
@@ -417,6 +438,29 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_body_bounded_accepts_body_within_limit() {
+        let mut req = Request::new("POST", "https://edge.example.com/x").with_body(vec![b'a'; 100]);
+        let body = read_body_bounded(&mut req, 128).expect("should accept body within limit");
+        assert_eq!(body.len(), 100, "should return the full body");
+    }
+
+    #[test]
+    fn read_body_bounded_accepts_body_exactly_at_limit() {
+        let mut req = Request::new("POST", "https://edge.example.com/x").with_body(vec![b'a'; 128]);
+        let body = read_body_bounded(&mut req, 128).expect("should accept body at the limit");
+        assert_eq!(body.len(), 128, "should return the full body");
+    }
+
+    #[test]
+    fn read_body_bounded_rejects_oversized_body() {
+        let mut req = Request::new("POST", "https://edge.example.com/x").with_body(vec![b'a'; 200]);
+        assert!(
+            read_body_bounded(&mut req, 128).is_none(),
+            "should reject a body larger than the limit"
+        );
+    }
 
     #[test]
     fn encode_decode_roundtrip() {

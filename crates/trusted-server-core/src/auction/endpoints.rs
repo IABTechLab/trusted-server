@@ -1,6 +1,7 @@
 //! HTTP endpoint handlers for auction requests.
 
 use error_stack::{Report, ResultExt};
+use fastly::http::StatusCode;
 use fastly::{Request, Response};
 
 use crate::auction::formats::AdRequest;
@@ -11,6 +12,7 @@ use crate::ec::log_id;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::http_util::read_body_bounded;
 use crate::openrtb::Eid;
 use crate::settings::Settings;
 
@@ -39,12 +41,16 @@ pub async fn handle_auction(
     ec_context: &EcContext,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Parse request body
-    let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Auction {
+    // Parse request body. The size cap is enforced *before* the body is
+    // buffered so an oversized payload cannot OOM the instance before parsing.
+    const MAX_AUCTION_BODY_SIZE: usize = 1024 * 1024; // 1 MB
+    let Some(body_bytes) = read_body_bounded(&mut req, MAX_AUCTION_BODY_SIZE) else {
+        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+    };
+    let body: AdRequest =
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
-        },
-    )?;
+        })?;
 
     log::info!(
         "Auction request received for {} ad units",
