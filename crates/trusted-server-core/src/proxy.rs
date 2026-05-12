@@ -22,6 +22,9 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
 
+const SIGN_MAX_BODY_BYTES: usize = 65536;
+const REBUILD_MAX_BODY_BYTES: usize = 65536;
+
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
     Cursor::new(body.into_bytes())
 }
@@ -912,20 +915,20 @@ pub async fn handle_first_party_proxy_sign(
 
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > 65536 {
+        if body_bytes.len() > SIGN_MAX_BODY_BYTES {
             return Err(Report::new(TrustedServerError::RequestTooLarge {
                 message: format!(
-                    "payload size {} exceeds limit of 65536 bytes",
-                    body_bytes.len()
+                    "payload size {} exceeds limit of {} bytes",
+                    body_bytes.len(),
+                    SIGN_MAX_BODY_BYTES,
                 ),
             }));
         }
-        let body = String::from_utf8(body_bytes.to_vec()).change_context(
-            TrustedServerError::InvalidUtf8 {
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
-            },
-        )?;
-        serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
+            })?;
+        serde_json::from_str::<ProxySignReq>(body).change_context(TrustedServerError::Proxy {
             message: "invalid JSON".to_string(),
         })?
     } else {
@@ -1035,24 +1038,22 @@ pub async fn handle_first_party_proxy_rebuild(
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > 65536 {
+        if body_bytes.len() > REBUILD_MAX_BODY_BYTES {
             return Err(Report::new(TrustedServerError::RequestTooLarge {
                 message: format!(
-                    "payload size {} exceeds limit of 65536 bytes",
-                    body_bytes.len()
+                    "payload size {} exceeds limit of {} bytes",
+                    body_bytes.len(),
+                    REBUILD_MAX_BODY_BYTES,
                 ),
             }));
         }
-        let body = String::from_utf8(body_bytes.to_vec()).change_context(
-            TrustedServerError::InvalidUtf8 {
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
-            },
-        )?;
-        serde_json::from_str::<ProxyRebuildReq>(&body).change_context(
-            TrustedServerError::Proxy {
-                message: "invalid JSON".to_string(),
-            },
-        )?
+            })?;
+        serde_json::from_str::<ProxyRebuildReq>(body).change_context(TrustedServerError::Proxy {
+            message: "invalid JSON".to_string(),
+        })?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
         let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {

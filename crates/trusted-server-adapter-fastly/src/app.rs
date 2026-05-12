@@ -42,7 +42,7 @@ use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderValue, Method, Request, Response};
+use edgezero_core::http::{header, HandlerFuture, HeaderValue, Method, Request, Response};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -221,7 +221,11 @@ async fn dispatch_fallback(
     handle_publisher_request(&state.settings, &state.registry, services, req)
         .await
         .and_then(|pub_response| {
-            crate::resolve_publisher_response(pub_response, &state.settings, &state.registry)
+            crate::resolve_publisher_response_buffered(
+                pub_response,
+                &state.settings,
+                &state.registry,
+            )
         })
 }
 
@@ -283,162 +287,185 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 }
 
 // ---------------------------------------------------------------------------
+// Route registration
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum NamedRouteHandler {
+    TrustedServerDiscovery,
+    VerifySignature,
+    RotateKey,
+    DeactivateKey,
+    Auction,
+    FirstPartyProxy,
+    FirstPartyClick,
+    FirstPartySign,
+    FirstPartyProxyRebuild,
+}
+
+struct NamedRoute {
+    path: &'static str,
+    primary_methods: &'static [Method],
+    handler: NamedRouteHandler,
+}
+
+fn named_routes() -> [NamedRoute; 9] {
+    [
+        NamedRoute {
+            path: "/.well-known/trusted-server.json",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::TrustedServerDiscovery,
+        },
+        NamedRoute {
+            path: "/verify-signature",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::VerifySignature,
+        },
+        NamedRoute {
+            path: "/admin/keys/rotate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::RotateKey,
+        },
+        NamedRoute {
+            path: "/admin/keys/deactivate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::DeactivateKey,
+        },
+        NamedRoute {
+            path: "/auction",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::Auction,
+        },
+        NamedRoute {
+            path: "/first-party/proxy",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::FirstPartyProxy,
+        },
+        NamedRoute {
+            path: "/first-party/click",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::FirstPartyClick,
+        },
+        NamedRoute {
+            path: "/first-party/sign",
+            primary_methods: &[Method::GET, Method::POST],
+            handler: NamedRouteHandler::FirstPartySign,
+        },
+        NamedRoute {
+            path: "/first-party/proxy-rebuild",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::FirstPartyProxyRebuild,
+        },
+    ]
+}
+
+fn named_route_handler(
+    state: Arc<AppState>,
+    handler: NamedRouteHandler,
+) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(execute_handler(
+            state,
+            ctx,
+            move |state, services, req| async move {
+                match handler {
+                    NamedRouteHandler::TrustedServerDiscovery => {
+                        handle_trusted_server_discovery(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::VerifySignature => {
+                        handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::RotateKey => {
+                        handle_rotate_key(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::DeactivateKey => {
+                        handle_deactivate_key(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::Auction => {
+                        match runtime_services_for_consent_route(&state.settings, &services) {
+                            Ok(consent_services) => {
+                                handle_auction(
+                                    &state.settings,
+                                    &state.orchestrator,
+                                    &consent_services,
+                                    req,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    NamedRouteHandler::FirstPartyProxy => {
+                        handle_first_party_proxy(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartyClick => {
+                        handle_first_party_click(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartySign => {
+                        handle_first_party_proxy_sign(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartyProxyRebuild => {
+                        handle_first_party_proxy_rebuild(&state.settings, &services, req).await
+                    }
+                }
+            },
+        ))
+    }
+}
+
+fn fallback_route_handler(
+    state: Arc<AppState>,
+) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(execute_handler(
+            state,
+            ctx,
+            |state, services, req| async move {
+                match runtime_services_for_consent_route(&state.settings, &services) {
+                    Ok(consent_services) => dispatch_fallback(&state, &consent_services, req).await,
+                    Err(e) => Err(e),
+                }
+            },
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrustedServerApp
 // ---------------------------------------------------------------------------
 
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
-impl Hooks for TrustedServerApp {
-    fn name() -> &'static str {
-        "TrustedServer"
-    }
-
-    fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        // Each named route only selects its core handler; the request/context
-        // scaffolding and Report -> HTTP mapping live in execute_handler().
-        let s = Arc::clone(&state);
-        let discovery_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_trusted_server_discovery(&state.settings, &services, req)
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let verify_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_verify_signature(&state.settings, &services, req)
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_rotate_key(&state.settings, &services, req)
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_deactivate_key(&state.settings, &services, req)
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let auction_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                match runtime_services_for_consent_route(&state.settings, &services) {
-                    Ok(consent_services) => {
-                        handle_auction(&state.settings, &state.orchestrator, &consent_services, req)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                }
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fp_proxy_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_first_party_proxy(&state.settings, &services, req).await
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fp_click_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_first_party_click(&state.settings, &services, req).await
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fp_sign_get_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_first_party_proxy_sign(&state.settings, &services, req).await
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fp_sign_post_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_first_party_proxy_sign(&state.settings, &services, req).await
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fp_rebuild_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                handle_first_party_proxy_rebuild(&state.settings, &services, req).await
-            })
-        };
-
-        let s = Arc::clone(&state);
-        let fallback_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            execute_handler(s, ctx, |state, services, req| async move {
-                match runtime_services_for_consent_route(&state.settings, &services) {
-                    Ok(consent_services) => dispatch_fallback(&state, &consent_services, req).await,
-                    Err(e) => Err(e),
-                }
-            })
-        };
-
+impl TrustedServerApp {
+    fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
                 Arc::new(FastlyPlatformGeo),
             ))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
-            .get("/.well-known/trusted-server.json", discovery_handler)
-            .post("/verify-signature", verify_handler)
-            .post("/admin/keys/rotate", rotate_handler)
-            .post("/admin/keys/deactivate", deactivate_handler)
-            .post("/auction", auction_handler)
-            .get("/first-party/proxy", fp_proxy_handler)
-            .get("/first-party/click", fp_click_handler)
-            .get("/first-party/sign", fp_sign_get_handler)
-            .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
-        // matchit prefers exact path+method over a wildcard catch-all. Named paths
-        // registered above for a single method (e.g. GET /first-party/proxy) would
-        // return 405 for other methods (HEAD, OPTIONS, …) instead of falling through
-        // to the publisher fallback. Registering all publisher_fallback_methods on
-        // each named path restores the legacy all-method proxy-to-publisher guarantee.
-        let named_paths_primary_methods: &[(&str, &[Method])] = &[
-            ("/.well-known/trusted-server.json", &[Method::GET]),
-            ("/verify-signature", &[Method::POST]),
-            ("/admin/keys/rotate", &[Method::POST]),
-            ("/admin/keys/deactivate", &[Method::POST]),
-            ("/auction", &[Method::POST]),
-            ("/first-party/proxy", &[Method::GET]),
-            ("/first-party/click", &[Method::GET]),
-            ("/first-party/sign", &[Method::GET, Method::POST]),
-            ("/first-party/proxy-rebuild", &[Method::POST]),
-        ];
-        for (path, primary_methods) in named_paths_primary_methods {
+        let fallback_handler = fallback_route_handler(Arc::clone(state));
+
+        // matchit prefers exact path+method over a wildcard catch-all. Each
+        // named route is registered from this single table, then every
+        // non-primary publisher fallback method is registered from the same
+        // row. Adding a named route now requires editing only this table.
+        for route in named_routes() {
+            for method in route.primary_methods {
+                router = router.route(
+                    route.path,
+                    method.clone(),
+                    named_route_handler(Arc::clone(state), route.handler),
+                );
+            }
+
             for method in publisher_fallback_methods() {
-                if !primary_methods.contains(&method) {
-                    router = router.route(path, method, fallback_handler.clone());
+                if !route.primary_methods.contains(&method) {
+                    router = router.route(route.path, method, fallback_handler.clone());
                 }
             }
         }
@@ -454,17 +481,94 @@ impl Hooks for TrustedServerApp {
     }
 }
 
+impl Hooks for TrustedServerApp {
+    fn name() -> &'static str {
+        "TrustedServer"
+    }
+
+    fn routes() -> RouterService {
+        let state = match build_state() {
+            Ok(s) => s,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return startup_error_router(e);
+            }
+        };
+
+        Self::routes_for_state(&state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{startup_error_router, TrustedServerApp};
+    use super::{startup_error_router, AppState, TrustedServerApp};
+
+    use std::sync::Arc;
 
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
     use error_stack::Report;
     use futures::executor::block_on;
+    use serde_json::json;
+    use trusted_server_core::auction::build_orchestrator;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::IntegrationRegistry;
+    use trusted_server_core::platform::PlatformKvStore;
+    use trusted_server_core::settings::Settings;
+
+    fn settings_with_missing_consent_store() -> Settings {
+        Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/admin"
+                username = "admin"
+                password = "admin-pass"
+
+                [publisher]
+                domain = "test-publisher.com"
+                cookie_domain = ".test-publisher.com"
+                origin_url = "https://origin.test-publisher.com"
+                proxy_secret = "unit-test-proxy-secret"
+
+                [edge_cookie]
+                secret_key = "test-secret-key"
+
+                [request_signing]
+                enabled = false
+                config_store_id = "test-config-store-id"
+                secret_store_id = "test-secret-store-id"
+
+                [consent]
+                consent_store = "missing-consent-store"
+
+                [integrations.prebid]
+                enabled = true
+                server_url = "https://test-prebid.com/openrtb2/auction"
+
+                [auction]
+                enabled = true
+                providers = ["prebid"]
+                timeout_ms = 2000
+            "#,
+        )
+        .expect("should parse EdgeZero app test settings")
+    }
+
+    fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
+        let orchestrator =
+            build_orchestrator(&settings).expect("should build auction orchestrator");
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let kv_store = Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+
+        Arc::new(AppState {
+            settings: Arc::new(settings),
+            orchestrator: Arc::new(orchestrator),
+            registry: Arc::new(registry),
+            kv_store,
+        })
+    }
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {
         request_builder()
@@ -591,6 +695,27 @@ mod tests {
             response.status(),
             StatusCode::METHOD_NOT_ALLOWED,
             "HEAD on a named GET path should reach the publisher fallback, not return 405"
+        );
+    }
+
+    #[test]
+    fn dispatch_auction_with_missing_consent_store_returns_503() {
+        let state = app_state_for_settings(settings_with_missing_consent_store());
+        let router = TrustedServerApp::routes_for_state(&state);
+        let body = json!({ "adUnits": [] }).to_string();
+        let req = request_builder()
+            .method(Method::POST)
+            .uri("/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("should build auction request");
+
+        let response = block_on(router.oneshot(req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auction route should fail closed when configured consent store cannot be opened"
         );
     }
 
