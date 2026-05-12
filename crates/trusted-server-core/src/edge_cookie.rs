@@ -151,7 +151,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
 /// # Errors
 ///
 /// Returns an error if ID generation fails.
-pub fn get_or_generate_ec_id(
+pub(crate) fn get_or_generate_ec_id_from_http_request(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
@@ -164,6 +164,19 @@ pub fn get_or_generate_ec_id(
     let ec_id = generate_ec_id(settings, services)?;
     log::trace!("No existing EC ID, generated: {}", ec_id);
     Ok(ec_id)
+}
+
+/// Gets or creates an EC ID from the request.
+///
+/// # Errors
+///
+/// Returns an error if ID generation fails.
+pub fn get_or_generate_ec_id(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
+) -> Result<String, Report<TrustedServerError>> {
+    get_or_generate_ec_id_from_http_request(settings, services, req)
 }
 
 #[cfg(test)]
@@ -335,6 +348,39 @@ mod tests {
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
             .expect("should reuse cookie EC ID");
         assert_eq!(ec_id, "existing_cookie_id");
+    }
+
+    #[test]
+    fn test_get_ec_id_from_http_request_with_header() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header(HEADER_X_TS_EC, "existing_http_ec_id")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let ec_id = get_ec_id(&req).expect("should get EC ID from http request");
+
+        assert_eq!(ec_id, Some("existing_http_ec_id".to_string()));
+    }
+
+    #[test]
+    fn test_get_or_generate_ec_id_from_http_request_reuses_cookie() {
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com")
+            .header(
+                fastly::http::header::COOKIE,
+                format!("{}=existing_http_cookie_id", COOKIE_TS_EC),
+            )
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build test request");
+
+        let ec_id = get_or_generate_ec_id_from_http_request(&settings, &noop_services(), &req)
+            .expect("should reuse cookie EC ID from http request");
+
+        assert_eq!(ec_id, "existing_http_cookie_id");
     }
 
     #[test]

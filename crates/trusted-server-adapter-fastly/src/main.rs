@@ -23,7 +23,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -42,6 +43,28 @@ mod route_tests;
 use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+
+/// Result of routing a request, distinguishing buffered from streaming publisher responses.
+///
+/// The streaming arm keeps the publisher body out of WASM heap until it is written directly
+/// to the client via [`fastly::Response::stream_to_client`].  All other routes are buffered.
+enum HandlerOutcome {
+    Buffered(HttpResponse),
+    Streaming {
+        response: HttpResponse,
+        body: EdgeBody,
+        params: OwnedProcessResponseParams,
+    },
+}
+
+impl HandlerOutcome {
+    fn status(&self) -> edgezero_core::http::StatusCode {
+        match self {
+            HandlerOutcome::Buffered(resp) => resp.status(),
+            HandlerOutcome::Streaming { response, .. } => response.status(),
+        }
+    }
+}
 
 /// Entry point for the Fastly Compute program.
 ///
@@ -71,6 +94,17 @@ fn main() {
     };
     log::debug!("Settings {settings:?}");
 
+    // Short-circuit the ja4 debug probe before finalize_response so that
+    // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+        if settings.debug.ja4_endpoint_enabled {
+            build_ja4_debug_response(&req).send_to_client();
+        } else {
+            FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+        }
+        return;
+    }
+
     // Build the auction orchestrator once at startup
     let orchestrator = match build_orchestrator(&settings) {
         Ok(o) => o,
@@ -99,16 +133,17 @@ fn main() {
     let runtime_services = build_runtime_services(&req, kv_store);
     let http_req = compat::from_fastly_request(req);
 
-    let mut response = futures::executor::block_on(route_request(
+    let outcome = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &runtime_services,
         http_req,
     ))
-    .unwrap_or_else(|e| http_error_response(&e));
+    .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
-    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+    // Skip geo lookup for 401s: avoids exposing geo headers to unauthenticated callers.
+    let geo_info = if outcome.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
         None
     } else {
         runtime_services
@@ -120,9 +155,82 @@ fn main() {
             })
     };
 
-    finalize_response(&settings, geo_info.as_ref(), &mut response);
+    match outcome {
+        HandlerOutcome::Buffered(mut response) => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            compat::to_fastly_response(response).send_to_client();
+        }
+        HandlerOutcome::Streaming {
+            mut response,
+            body,
+            params,
+        } => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut streaming_body = fastly_resp.stream_to_client();
+            match stream_publisher_body(
+                body,
+                &mut streaming_body,
+                &params,
+                &settings,
+                &integration_registry,
+            ) {
+                Ok(()) => {
+                    if let Err(e) = streaming_body.finish() {
+                        log::error!("failed to finish streaming body: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("streaming processing failed: {e:?}");
+                    if let Err(finish_err) = streaming_body.finish() {
+                        log::error!("failed to finish streaming body after error: {finish_err}");
+                    }
+                }
+            }
+        }
+    }
+}
 
-    compat::to_fastly_response(response).send_to_client();
+const FALLBACK_UNAVAILABLE: &str = "unavailable";
+const FALLBACK_NOT_SENT: &str = "not sent";
+const FALLBACK_NONE: &str = "none";
+
+// TODO: remove after JA4 evaluation completes — see #645
+fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
+    let ja4 = req.get_tls_ja4().unwrap_or(FALLBACK_UNAVAILABLE);
+    let h2 = req
+        .get_client_h2_fingerprint()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let cipher = req
+        .get_tls_cipher_openssl_name()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
+    let ch_mobile = req
+        .get_header_str("sec-ch-ua-mobile")
+        .unwrap_or(FALLBACK_NOT_SENT);
+    let ch_platform = req
+        .get_header_str("sec-ch-ua-platform")
+        .unwrap_or(FALLBACK_NOT_SENT);
+
+    let body = format!(
+        "ja4:         {ja4}\n\
+         h2_fp:       {h2}\n\
+         cipher:      {cipher}\n\
+         tls_version: {tls_version}\n\
+         user-agent:  {ua}\n\
+         ch-mobile:   {ch_mobile}\n\
+         ch-platform: {ch_platform}\n"
+    );
+
+    FastlyResponse::from_status(fastly::http::StatusCode::OK)
+        .with_header(fastly::http::header::CACHE_CONTROL, "no-store, private")
+        .with_header(
+            fastly::http::header::VARY,
+            "User-Agent, Sec-CH-UA-Mobile, Sec-CH-UA-Platform",
+        )
+        .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
+        .with_body(body)
 }
 
 async fn route_request(
@@ -131,12 +239,12 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
     req: HttpRequest,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
+) -> Result<HandlerOutcome, Report<TrustedServerError>> {
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
-        Ok(Some(response)) => return Ok(response),
+        Ok(Some(response)) => return Ok(HandlerOutcome::Buffered(response)),
         Ok(None) => {}
         Err(e) => return Err(e),
     }
@@ -149,31 +257,36 @@ async fn route_request(
     match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&req, integration_registry)
+            handle_tsjs_dynamic(&req, integration_registry).map(HandlerOutcome::Buffered)
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
             handle_trusted_server_discovery(settings, runtime_services, req)
+                .map(HandlerOutcome::Buffered)
         }
 
         // Signature verification endpoint
         (Method::POST, "/verify-signature") => {
-            handle_verify_signature(settings, runtime_services, req)
+            handle_verify_signature(settings, runtime_services, req).map(HandlerOutcome::Buffered)
         }
 
         // Key rotation admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, runtime_services, req),
+        (Method::POST, "/admin/keys/rotate") => {
+            handle_rotate_key(settings, runtime_services, req).map(HandlerOutcome::Buffered)
+        }
         (Method::POST, "/admin/keys/deactivate") => {
-            handle_deactivate_key(settings, runtime_services, req)
+            handle_deactivate_key(settings, runtime_services, req).map(HandlerOutcome::Buffered)
         }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
             match runtime_services_for_consent_route(settings, runtime_services) {
                 Ok(auction_services) => {
-                    handle_auction(settings, orchestrator, &auction_services, req).await
+                    handle_auction(settings, orchestrator, &auction_services, req)
+                        .await
+                        .map(HandlerOutcome::Buffered)
                 }
                 Err(e) => Err(e),
             }
@@ -181,16 +294,24 @@ async fn route_request(
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => {
-            handle_first_party_proxy(settings, runtime_services, req).await
+            handle_first_party_proxy(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::GET, "/first-party/click") => {
-            handle_first_party_click(settings, runtime_services, req).await
+            handle_first_party_click(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, runtime_services, req).await
+            handle_first_party_proxy_sign(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await
+            handle_first_party_proxy_rebuild(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (m, path) if integration_registry.has_route(&m, path) => integration_registry
             .handle_proxy(&m, path, settings, runtime_services, req)
@@ -199,7 +320,8 @@ async fn route_request(
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            }),
+            })
+            .map(HandlerOutcome::Buffered),
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
@@ -216,9 +338,7 @@ async fn route_request(
                     req,
                 )
                 .await
-                .and_then(|pub_response| {
-                    resolve_publisher_response(pub_response, settings, integration_registry)
-                }),
+                .and_then(resolve_publisher_response),
                 Err(e) => Err(e),
             }
         }
@@ -227,28 +347,21 @@ async fn route_request(
 
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
+) -> Result<HandlerOutcome, Report<TrustedServerError>> {
     match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Buffered(response) => Ok(HandlerOutcome::Buffered(response)),
         PublisherResponse::Stream {
-            mut response,
+            response,
             body,
             params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(output);
-            Ok(response)
-        }
+        } => Ok(HandlerOutcome::Streaming {
+            response,
+            body,
+            params,
+        }),
         PublisherResponse::PassThrough { mut response, body } => {
             *response.body_mut() = body;
-            Ok(response)
+            Ok(HandlerOutcome::Buffered(response))
         }
     }
 }
@@ -323,4 +436,64 @@ fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastly::mime;
+
+    #[test]
+    fn ja4_debug_response_uses_plain_text_and_fallback_values() {
+        let req = FastlyRequest::get("https://example.com/_ts/debug/ja4");
+
+        let mut response = build_ja4_debug_response(&req);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should return 200 OK"
+        );
+        assert_eq!(
+            response.get_content_type(),
+            Some(mime::TEXT_PLAIN_UTF_8),
+            "should return plain text content"
+        );
+        assert_eq!(
+            response.get_header_str(fastly::http::header::CACHE_CONTROL),
+            Some("no-store, private"),
+            "should disable caching for the debug response"
+        );
+
+        let body = response.take_body_str();
+
+        assert!(
+            body.contains("ja4:         unavailable"),
+            "should include JA4 fallback"
+        );
+        assert!(
+            body.contains("h2_fp:       unavailable"),
+            "should include H2 fingerprint fallback"
+        );
+        assert!(
+            body.contains("cipher:      unavailable"),
+            "should include cipher fallback"
+        );
+        assert!(
+            body.contains("tls_version: unavailable"),
+            "should include TLS version fallback"
+        );
+        assert!(
+            body.contains("user-agent:  none"),
+            "should include user-agent fallback"
+        );
+        assert!(
+            body.contains("ch-mobile:   not sent"),
+            "should include sec-ch-ua-mobile fallback"
+        );
+        assert!(
+            body.contains("ch-platform: not sent"),
+            "should include sec-ch-ua-platform fallback"
+        );
+    }
 }

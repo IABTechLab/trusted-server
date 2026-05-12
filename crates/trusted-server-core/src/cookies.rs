@@ -148,7 +148,8 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
 /// When `strip_consent` is `true`, cookies listed in [`CONSENT_COOKIE_NAMES`]
 /// are removed before forwarding. If stripping leaves no cookies or yields an
 /// invalid header value, the stripped header is omitted. Non-UTF-8 cookie
-/// headers are forwarded unchanged.
+/// headers are forwarded unchanged. Existing `Cookie` headers on `to` are
+/// preserved; source values are appended after them.
 pub fn forward_cookie_header(
     from: &Request<EdgeBody>,
     to: &mut Request<EdgeBody>,
@@ -302,6 +303,9 @@ pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) 
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderValue;
+
+    use crate::error::TrustedServerError;
     use crate::test_support::tests::create_test_settings;
 
     use super::*;
@@ -396,6 +400,28 @@ mod tests {
             .expect("should have cookie jar");
 
         assert!(jar.iter().count() == 0);
+    }
+
+    #[test]
+    fn test_handle_request_cookies_invalid_utf8_cookie_header() {
+        // Truncated 4-byte UTF-8 sequence: `\xF0` starts a 4-byte code point but
+        // only two continuation bytes follow, so `to_str()` rejects it.
+        let invalid_cookie_value =
+            HeaderValue::from_bytes(b"\xF0\x90\x80").expect("should build header value");
+        let mut req = build_request(None);
+        req.headers_mut()
+            .insert(header::COOKIE, invalid_cookie_value);
+
+        let err =
+            handle_request_cookies(&req).expect_err("should reject invalid UTF-8 cookie header");
+
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::InvalidHeaderValue { .. }
+            ),
+            "should return InvalidHeaderValue for non-UTF-8 cookie header"
+        );
     }
 
     #[test]
@@ -664,6 +690,26 @@ mod tests {
         assert_eq!(all_cookies.len(), 2, "should append all Cookie headers");
         assert!(all_cookies.iter().any(|v| v.contains("session=abc123")));
         assert!(all_cookies.iter().any(|v| v.contains("theme=dark")));
+    }
+
+    #[test]
+    fn test_forward_cookie_header_appends_to_existing_target_cookies() {
+        let from = build_request(Some("session=abc123"));
+        let mut to = build_request(Some("template=existing"));
+
+        forward_cookie_header(&from, &mut to, false);
+
+        let all_cookies: Vec<_> = to
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            all_cookies,
+            vec!["template=existing", "session=abc123"],
+            "should preserve existing target cookies and append source cookies after them"
+        );
     }
 
     // ---------------------------------------------------------------

@@ -77,10 +77,13 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
+                // bytes.to_vec() is an O(N) copy at the compat boundary; goes away in PR 15.
                 fastly_req.set_body(bytes.to_vec());
             }
         }
         EdgeBody::Stream(_) => {
+            // Audited call sites: only integration proxy routes, which always carry buffered
+            // Once bodies from from_fastly_request.  No streaming body reaches this path today.
             log::warn!("streaming body in compat::to_fastly_request; body will be empty");
         }
     }
@@ -135,14 +138,35 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
+                // bytes.to_vec() is an O(N) copy at the compat boundary; goes away in PR 15.
                 fastly_resp.set_body(bytes.to_vec());
             }
         }
         EdgeBody::Stream(_) => {
+            // Audited call sites: streaming publisher bodies are dispatched via
+            // to_fastly_response_skeleton + stream_to_client before reaching here.
+            // No streaming body reaches to_fastly_response in the current adapter.
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }
 
+    fastly_resp
+}
+
+/// Convert an `http::Response<EdgeBody>` into a `fastly::Response` with headers only.
+///
+/// Body is discarded — use when the caller will stream the body separately via
+/// [`fastly::Response::stream_to_client`]. Audited call sites: only the streaming
+/// publisher dispatch path in the adapter, which streams the body directly to the
+/// client via [`crate::publisher::stream_publisher_body`]. (Removal target: PR 15.)
+///
+/// # PR 15 removal target
+pub fn to_fastly_response_skeleton(resp: http::Response<EdgeBody>) -> fastly::Response {
+    let (parts, _body) = resp.into_parts();
+    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
+    for (name, value) in &parts.headers {
+        fastly_resp.append_header(name.as_str(), value.as_bytes());
+    }
     fastly_resp
 }
 

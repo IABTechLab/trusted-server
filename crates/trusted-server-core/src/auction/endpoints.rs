@@ -7,7 +7,7 @@ use http::{Request, Response};
 use crate::auction::formats::AdRequest;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::integrations::collect_body_bounded;
 use crate::platform::RuntimeServices;
@@ -56,12 +56,12 @@ pub async fn handle_auction(
 
     // Generate EC ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
-    let ec_id = get_or_generate_ec_id(settings, services, &http_req).change_context(
-        TrustedServerError::Auction {
+    let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &http_req)
+        .change_context(TrustedServerError::Auction {
             message: "Failed to generate EC ID".to_string(),
-        },
-    )?;
+        })?;
 
+    // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
