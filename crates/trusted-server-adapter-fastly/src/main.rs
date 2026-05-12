@@ -168,14 +168,18 @@ fn main() {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
             let fastly_resp = compat::to_fastly_response_skeleton(response);
             let mut streaming_body = fastly_resp.stream_to_client();
-            if let Err(e) = stream_publisher_body(
-                body,
-                &mut streaming_body,
-                &params,
-                &settings,
-                &integration_registry,
-            ) {
-                log::error!("streaming processing failed: {e:?}");
+            match stream_publisher_body(body, &mut streaming_body, &params, &settings, &integration_registry) {
+                Ok(()) => {
+                    if let Err(e) = streaming_body.finish() {
+                        log::error!("failed to finish streaming body: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("streaming processing failed: {e:?}");
+                    if let Err(finish_err) = streaming_body.finish() {
+                        log::error!("failed to finish streaming body after error: {finish_err}");
+                    }
+                }
             }
         }
     }
