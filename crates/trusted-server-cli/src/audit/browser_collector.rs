@@ -52,120 +52,120 @@ async fn collect_page_via_browser_async(
         }
     });
 
-    let page = browser
-        .new_page("about:blank")
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to create browser page for audit")?;
+    let result = async {
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to create browser page for audit")?;
 
-    page.evaluate_on_new_document(
-        r#"
-        Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
-            get: () => false,
-        });
-        "#,
-    )
-    .await
-    .change_context(CliError::Audit)
-    .attach("failed to inject browser audit init script")?;
+        page.goto(target_url.as_str())
+            .await
+            .change_context(CliError::Audit)
+            .attach(format!("failed to navigate to `{target_url}`"))?;
 
-    page.goto(target_url.as_str())
-        .await
-        .change_context(CliError::Audit)
-        .attach(format!("failed to navigate to `{target_url}`"))?;
+        let navigation_response = page
+            .wait_for_navigation_response()
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read main document navigation response")?;
+        validate_navigation_response(target_url, navigation_response)?;
 
-    let navigation_response = page
-        .wait_for_navigation_response()
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read main document navigation response")?;
-    validate_navigation_response(target_url, navigation_response)?;
+        let mut warnings = Vec::new();
+        if !wait_for_page_settle(&page).await? {
+            warnings.push(
+                "browser audit timed out while waiting for the page to settle; results may be partial"
+                    .to_string(),
+            );
+        }
 
-    let mut warnings = Vec::new();
-    if !wait_for_page_settle(&page).await? {
-        warnings.push(
-            "browser audit timed out while waiting for the page to settle; results may be partial"
-                .to_string(),
-        );
+        let final_url = page
+            .url()
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read final page URL")?
+            .ok_or_else(|| {
+                Report::new(CliError::Audit).attach("browser page URL was empty after navigation")
+            })?;
+        let page_title = page
+            .get_title()
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read page title")?;
+        let html = page
+            .content()
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read rendered page HTML")?;
+
+        let script_tags: Vec<BrowserScriptTag> = page
+            .evaluate(
+                r#"() => Array.from(document.scripts).map((script) => ({
+                    src: script.src || null,
+                    inline_text: script.src ? null : (script.textContent || null),
+                }))"#,
+            )
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read rendered script tags")?
+            .into_value()
+            .change_context(CliError::Audit)
+            .attach("failed to decode rendered script tag data")?;
+
+        let network_requests: Vec<BrowserPerformanceEntry> = page
+            .evaluate(
+                r#"() => performance.getEntriesByType('resource').map((entry) => ({
+                    url: entry.name,
+                    initiator_type: entry.initiatorType || null,
+                }))"#,
+            )
+            .await
+            .change_context(CliError::Audit)
+            .attach("failed to read browser performance resource entries")?
+            .into_value()
+            .change_context(CliError::Audit)
+            .attach("failed to decode browser performance resource data")?;
+
+        Ok(CollectedPage {
+            requested_url: target_url.to_string(),
+            final_url,
+            page_title: page_title.filter(|title| !title.trim().is_empty()),
+            html,
+            script_tags: script_tags
+                .into_iter()
+                .map(|script| CollectedScriptTag {
+                    src: script.src,
+                    inline_text: script.inline_text.filter(|text| !text.trim().is_empty()),
+                })
+                .collect(),
+            network_requests: network_requests
+                .into_iter()
+                .map(|entry| CollectedRequest {
+                    url: entry.url,
+                    method: "GET".to_string(),
+                    resource_type: entry.initiator_type,
+                    status: None,
+                })
+                .collect(),
+            warnings,
+        })
     }
+    .await;
 
-    let final_url = page
-        .url()
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read final page URL")?
-        .ok_or_else(|| {
-            Report::new(CliError::Audit).attach("browser page URL was empty after navigation")
-        })?;
-    let page_title = page
-        .get_title()
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read page title")?;
-    let html = page
-        .content()
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read rendered page HTML")?;
-
-    let script_tags: Vec<BrowserScriptTag> = page
-        .evaluate(
-            r#"() => Array.from(document.scripts).map((script) => ({
-                src: script.src || null,
-                inline_text: script.src ? null : (script.textContent || null),
-            }))"#,
-        )
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read rendered script tags")?
-        .into_value()
-        .change_context(CliError::Audit)
-        .attach("failed to decode rendered script tag data")?;
-
-    let network_requests: Vec<BrowserPerformanceEntry> = page
-        .evaluate(
-            r#"() => performance.getEntriesByType('resource').map((entry) => ({
-                url: entry.name,
-                initiator_type: entry.initiatorType || null,
-            }))"#,
-        )
-        .await
-        .change_context(CliError::Audit)
-        .attach("failed to read browser performance resource entries")?
-        .into_value()
-        .change_context(CliError::Audit)
-        .attach("failed to decode browser performance resource data")?;
-
-    browser
+    let close_result = browser
         .close()
         .await
         .change_context(CliError::Audit)
-        .attach("failed to close browser after audit")?;
+        .attach("failed to close browser after audit");
+    if close_result.is_err() {
+        handler_task.abort();
+    }
     let _ = handler_task.await;
 
-    Ok(CollectedPage {
-        requested_url: target_url.to_string(),
-        final_url,
-        page_title: page_title.filter(|title| !title.trim().is_empty()),
-        html,
-        script_tags: script_tags
-            .into_iter()
-            .map(|script| CollectedScriptTag {
-                src: script.src,
-                inline_text: script.inline_text.filter(|text| !text.trim().is_empty()),
-            })
-            .collect(),
-        network_requests: network_requests
-            .into_iter()
-            .map(|entry| CollectedRequest {
-                url: entry.url,
-                method: "GET".to_string(),
-                resource_type: entry.initiator_type,
-                status: None,
-            })
-            .collect(),
-        warnings,
-    })
+    match (result, close_result) {
+        (Ok(collected), Ok(_)) => Ok(collected),
+        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+    }
 }
 
 async fn wait_for_page_settle(page: &chromiumoxide::Page) -> Result<bool, Report<CliError>> {
@@ -208,13 +208,9 @@ async fn wait_for_page_settle(page: &chromiumoxide::Page) -> Result<bool, Report
 }
 
 fn validate_navigation_response(
-    target_url: &Url,
+    _target_url: &Url,
     navigation_response: ArcHttpRequest,
 ) -> Result<(), Report<CliError>> {
-    if !matches!(target_url.scheme(), "http" | "https") {
-        return Ok(());
-    }
-
     let request = navigation_response.ok_or_else(|| {
         Report::new(CliError::Audit)
             .attach("browser audit did not capture the main document response")
@@ -281,7 +277,18 @@ fn browser_executable_fallbacks() -> &'static [&'static str] {
         ]
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+        ]
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         &[]
     }
@@ -319,5 +326,16 @@ mod tests {
         assert!(browser_executable_fallbacks().iter().any(|candidate| {
             *candidate == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_fallbacks_include_standard_linux_chromium_paths() {
+        assert!(
+            browser_executable_fallbacks()
+                .iter()
+                .any(|candidate| *candidate == "/usr/bin/chromium"),
+            "should check common Linux Chromium install path"
+        );
     }
 }

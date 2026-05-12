@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use error_stack::{Report, ResultExt};
@@ -107,6 +108,8 @@ impl ReqwestFastlyApi {
     pub fn new(api_key: String) -> Result<Self, Report<CliError>> {
         let client = Client::builder()
             .user_agent("trusted-server-cli/0.1")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .change_context(CliError::FastlyApi)?;
         Ok(Self { client, api_key })

@@ -7,7 +7,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   test-rust:
@@ -35,7 +34,7 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-${{ runner.os }}-wasm
 
       - name: Cache Viceroy binary
         id: cache-viceroy
@@ -67,7 +66,7 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version-cli.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-shared-key: cargo-${{ runner.os }}-host
 
       - name: Retrieve Rust host target
         id: rust-host-target

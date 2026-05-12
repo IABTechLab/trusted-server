@@ -69,6 +69,24 @@ pub struct ProvisionApplyJson {
     pub activated_version: bool,
 }
 
+/// Partial apply result and underlying error for a failed mutating action.
+#[derive(Debug)]
+pub struct ProvisionApplyFailure {
+    /// JSON-safe apply state, including completed actions and the failed action.
+    pub json: ProvisionApplyJson,
+    /// Underlying error to report on stderr and use for the process exit status.
+    pub error: Report<CliError>,
+}
+
+/// Outcome of a Fastly provisioning apply attempt.
+#[derive(Debug)]
+pub enum ProvisionApplyOutcome {
+    /// All planned actions completed successfully.
+    Success(ProvisionApplyJson),
+    /// A mutating action failed after apply began.
+    Failure(ProvisionApplyFailure),
+}
+
 #[derive(Debug, Clone)]
 pub struct ProvisionPlan {
     pub json: ProvisionPlanJson,
@@ -188,7 +206,7 @@ pub fn plan_fastly_provisioning(
 
     if clone_required {
         warnings.push(format!(
-            "latest service version {} is locked; apply will clone it before creating or updating bindings",
+            "latest service version {} is locked; apply will clone it before creating or updating bindings. If another operator creates a newer version before apply runs, rerun plan/apply to avoid cloning from a stale version",
             latest_version.number
         ));
     }
@@ -216,13 +234,14 @@ pub fn plan_fastly_provisioning(
     })
 }
 
-pub fn apply_fastly_provisioning(
+/// Applies planned Fastly resources and preserves partial JSON state on action failure.
+pub fn apply_fastly_provisioning_with_outcome(
     api: &dyn FastlyApi,
     validated: &ValidatedConfig,
     service_id: &str,
     runtime_api_key: Option<&str>,
     yes: bool,
-) -> Result<ProvisionApplyJson, Report<CliError>> {
+) -> Result<ProvisionApplyOutcome, Report<CliError>> {
     let mut plan = plan_fastly_provisioning(api, validated, service_id)?;
 
     if requires_runtime_api_key(&plan.resources) && runtime_api_key.is_none() {
@@ -263,10 +282,7 @@ pub fn apply_fastly_provisioning(
         };
 
         if resource.create_store {
-            let created = create_store(api, resource)?;
-            resource_id = created.id.clone();
-            resolved_ids.insert(resource.name.clone(), created.id.clone());
-            completed_actions.push(ProvisionActionJson {
+            let attempted_action = ProvisionActionJson {
                 action: ChangeKind::Create,
                 resource_kind: resource.kind,
                 name: resource.name.clone(),
@@ -275,7 +291,27 @@ pub fn apply_fastly_provisioning(
                     resource_kind_label(resource.kind),
                     resource.name
                 ),
+                remote_id: None,
+            };
+            let created = match create_store(api, resource) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                        service_id,
+                        validated,
+                        &plan,
+                        completed_actions,
+                        attempted_action,
+                        activated_version,
+                        error,
+                    )));
+                }
+            };
+            resource_id = created.id.clone();
+            resolved_ids.insert(resource.name.clone(), created.id.clone());
+            completed_actions.push(ProvisionActionJson {
                 remote_id: Some(created.id),
+                ..attempted_action
             });
         } else if let Some(existing_id) = &resource.existing_id {
             resolved_ids.insert(resource.name.clone(), existing_id.clone());
@@ -289,14 +325,25 @@ pub fn apply_fastly_provisioning(
 
         for item in &resource.config_items {
             if let Some(action) = item.action {
-                api.upsert_config_item(&resource_id, &item.key, &item.value)?;
-                completed_actions.push(ProvisionActionJson {
+                let attempted_action = ProvisionActionJson {
                     action,
                     resource_kind: resource.kind,
                     name: resource.name.clone(),
                     detail: format!("set config item `{}` in `{}`", item.key, resource.name),
                     remote_id: Some(resource_id.clone()),
-                });
+                };
+                if let Err(error) = api.upsert_config_item(&resource_id, &item.key, &item.value) {
+                    return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                        service_id,
+                        validated,
+                        &plan,
+                        completed_actions,
+                        attempted_action,
+                        activated_version,
+                        error,
+                    )));
+                }
+                completed_actions.push(attempted_action);
             }
         }
 
@@ -312,8 +359,7 @@ pub fn apply_fastly_provisioning(
                         })?
                         .to_string(),
                 };
-                api.recreate_secret(&resource_id, &secret.name, &secret_value)?;
-                completed_actions.push(ProvisionActionJson {
+                let attempted_action = ProvisionActionJson {
                     action,
                     resource_kind: resource.kind,
                     name: resource.name.clone(),
@@ -322,20 +368,26 @@ pub fn apply_fastly_provisioning(
                         secret.name, resource.name
                     ),
                     remote_id: Some(resource_id.clone()),
-                });
+                };
+                if let Err(error) = api.recreate_secret(&resource_id, &secret.name, &secret_value) {
+                    return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                        service_id,
+                        validated,
+                        &plan,
+                        completed_actions,
+                        attempted_action,
+                        activated_version,
+                        error,
+                    )));
+                }
+                completed_actions.push(attempted_action);
             }
         }
 
         if let Some(link) = &resource.link {
             match link.action {
                 Some(ChangeKind::Bind) => {
-                    api.create_resource_link(
-                        service_id,
-                        target_version,
-                        &resource_id,
-                        &link.alias,
-                    )?;
-                    completed_actions.push(ProvisionActionJson {
+                    let attempted_action = ProvisionActionJson {
                         action: ChangeKind::Bind,
                         resource_kind: resource.kind,
                         name: resource.name.clone(),
@@ -347,21 +399,31 @@ pub fn apply_fastly_provisioning(
                             target_version
                         ),
                         remote_id: Some(resource_id.clone()),
-                    });
+                    };
+                    if let Err(error) = api.create_resource_link(
+                        service_id,
+                        target_version,
+                        &resource_id,
+                        &link.alias,
+                    ) {
+                        return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                            service_id,
+                            validated,
+                            &plan,
+                            completed_actions,
+                            attempted_action,
+                            activated_version,
+                            error,
+                        )));
+                    }
+                    completed_actions.push(attempted_action);
                     activated_version = true;
                 }
                 Some(ChangeKind::Update) => {
                     let link_id = link.existing_link_id.as_deref().ok_or_else(|| {
                         Report::new(CliError::Provisioning).attach("missing resource link ID")
                     })?;
-                    api.update_resource_link(
-                        service_id,
-                        target_version,
-                        link_id,
-                        &resource_id,
-                        &link.alias,
-                    )?;
-                    completed_actions.push(ProvisionActionJson {
+                    let attempted_action = ProvisionActionJson {
                         action: ChangeKind::Update,
                         resource_kind: resource.kind,
                         name: resource.name.clone(),
@@ -373,7 +435,25 @@ pub fn apply_fastly_provisioning(
                             target_version
                         ),
                         remote_id: Some(resource_id.clone()),
-                    });
+                    };
+                    if let Err(error) = api.update_resource_link(
+                        service_id,
+                        target_version,
+                        link_id,
+                        &resource_id,
+                        &link.alias,
+                    ) {
+                        return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                            service_id,
+                            validated,
+                            &plan,
+                            completed_actions,
+                            attempted_action,
+                            activated_version,
+                            error,
+                        )));
+                    }
+                    completed_actions.push(attempted_action);
                     activated_version = true;
                 }
                 _ => {}
@@ -385,15 +465,56 @@ pub fn apply_fastly_provisioning(
         api.activate_service_version(service_id, target_version)?;
     }
 
-    Ok(ProvisionApplyJson {
+    Ok(ProvisionApplyOutcome::Success(build_apply_json(
+        service_id,
+        validated,
+        &plan,
+        completed_actions,
+        None,
+        activated_version,
+    )))
+}
+
+fn build_apply_json(
+    service_id: &str,
+    validated: &ValidatedConfig,
+    plan: &ProvisionPlan,
+    completed_actions: Vec<ProvisionActionJson>,
+    failed_action: Option<ProvisionActionJson>,
+    activated_version: bool,
+) -> ProvisionApplyJson {
+    ProvisionApplyJson {
         service_id: service_id.to_string(),
         config_path: validated.path.display().to_string(),
-        service_version: plan.json.service_version,
+        service_version: plan.json.service_version.clone(),
         completed_actions,
-        warnings: plan.json.warnings,
-        failed_action: None,
+        warnings: plan.json.warnings.clone(),
+        failed_action,
         activated_version,
-    })
+    }
+}
+
+fn build_apply_failure(
+    service_id: &str,
+    validated: &ValidatedConfig,
+    plan: &ProvisionPlan,
+    completed_actions: Vec<ProvisionActionJson>,
+    failed_action: ProvisionActionJson,
+    activated_version: bool,
+    error: Report<CliError>,
+) -> ProvisionApplyFailure {
+    let failed_detail = failed_action.detail.clone();
+    let mut json = build_apply_json(
+        service_id,
+        validated,
+        plan,
+        completed_actions,
+        Some(failed_action),
+        activated_version,
+    );
+    json.warnings
+        .push(format!("apply failed during `{failed_detail}`: {error}"));
+    ProvisionApplyFailure { json, error }
 }
 
 fn plan_app_config_resource(
@@ -850,6 +971,7 @@ mod tests {
         created_resource_links: Mutex<Vec<(String, String)>>,
         updated_resource_links: Mutex<Vec<(String, String, String)>>,
         activated_versions: Mutex<Vec<(String, u32)>>,
+        fail_upsert_config_item: bool,
     }
 
     impl FastlyApi for MockFastlyApi {
@@ -880,6 +1002,9 @@ mod tests {
             key: &str,
             value: &str,
         ) -> Result<(), Report<CliError>> {
+            if self.fail_upsert_config_item {
+                return Err(Report::new(CliError::FastlyApi).attach("injected config item failure"));
+            }
             self.upserted_config_items
                 .lock()
                 .expect("should lock upserted config items")
@@ -1017,6 +1142,23 @@ mod tests {
         }
     }
 
+    fn apply_success(
+        api: &dyn FastlyApi,
+        validated: &ValidatedConfig,
+        runtime_api_key: Option<&str>,
+    ) -> Result<ProvisionApplyJson, Report<CliError>> {
+        match apply_fastly_provisioning_with_outcome(
+            api,
+            validated,
+            "svc_123",
+            runtime_api_key,
+            true,
+        )? {
+            ProvisionApplyOutcome::Success(json) => Ok(json),
+            ProvisionApplyOutcome::Failure(failure) => Err(failure.error),
+        }
+    }
+
     fn validated_config(enable_request_signing: bool) -> crate::config::ValidatedConfig {
         validated_config_with_provider(enable_request_signing, "")
     }
@@ -1139,8 +1281,7 @@ store_name = "customer_ts_config"
 "#,
         );
 
-        apply_fastly_provisioning(&api, &validated, "svc_123", None, true)
-            .expect("should apply provisioning");
+        apply_success(&api, &validated, None).expect("should apply provisioning");
 
         assert_eq!(
             api.created_resource_links
@@ -1307,6 +1448,49 @@ runtime_api_secret_store_name = "customer_api_keys"
     }
 
     #[test]
+    fn apply_outcome_preserves_completed_actions_and_failed_action() {
+        let api = MockFastlyApi {
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: false,
+            }],
+            fail_upsert_config_item: true,
+            ..Default::default()
+        };
+        let validated = validated_config(false);
+
+        let outcome =
+            apply_fastly_provisioning_with_outcome(&api, &validated, "svc_123", None, true)
+                .expect("should return apply outcome");
+
+        assert!(
+            matches!(outcome, ProvisionApplyOutcome::Failure(_)),
+            "should return partial failure outcome"
+        );
+        if let ProvisionApplyOutcome::Failure(failure) = outcome {
+            assert_eq!(
+                failure.json.completed_actions.len(),
+                1,
+                "should preserve the already-created store action"
+            );
+            assert_eq!(
+                failure.json.completed_actions[0].action,
+                ChangeKind::Create,
+                "should record completed create action"
+            );
+            assert!(
+                failure
+                    .json
+                    .failed_action
+                    .as_ref()
+                    .is_some_and(|action| action.detail.contains("set config item")),
+                "should identify the failed config item action"
+            );
+        }
+    }
+
+    #[test]
     fn apply_requires_explicit_runtime_token_when_request_signing_needs_one() {
         let api = MockFastlyApi {
             versions: vec![ServiceVersion {
@@ -1318,7 +1502,7 @@ runtime_api_secret_store_name = "customer_api_keys"
         };
         let validated = validated_config(true);
 
-        let error = apply_fastly_provisioning(&api, &validated, "svc_123", None, true)
+        let error = apply_success(&api, &validated, None)
             .expect_err("should reject implicit reuse of the management token");
 
         assert!(
@@ -1344,8 +1528,7 @@ runtime_api_secret_store_name = "customer_api_keys"
         };
         let validated = validated_config(false);
 
-        let applied = apply_fastly_provisioning(&api, &validated, "svc_123", None, true)
-            .expect("should apply provisioning");
+        let applied = apply_success(&api, &validated, None).expect("should apply provisioning");
 
         assert!(
             applied.activated_version,

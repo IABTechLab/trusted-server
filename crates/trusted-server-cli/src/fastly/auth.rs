@@ -125,11 +125,12 @@ pub fn login_fastly(store: &dyn CredentialStore) -> Result<(), Report<CliError>>
         .interact()
         .change_context(CliError::Authentication)?;
 
-    if token.trim().is_empty() {
+    let token = token.trim();
+    if token.is_empty() {
         return Err(Report::new(CliError::Authentication).attach("Fastly API key cannot be empty"));
     }
 
-    store.write(&token)
+    store.write(token)
 }
 
 pub fn logout_fastly(store: &dyn CredentialStore) -> Result<(), Report<CliError>> {

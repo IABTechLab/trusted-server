@@ -45,6 +45,7 @@ pub fn write_local_fastly_manifest(
 
 pub fn run_fastly_dev(
     project_dir: &Path,
+    fastly_env: &str,
     passthrough_args: &[String],
 ) -> Result<ExitStatus, Report<CliError>> {
     let mut args = vec![
@@ -52,8 +53,13 @@ pub fn run_fastly_dev(
         "serve".to_string(),
         "--dir".to_string(),
         project_dir.display().to_string(),
-        "--env=local".to_string(),
     ];
+    if !passthrough_args
+        .iter()
+        .any(|arg| arg == "--env" || arg.strip_prefix("--env=").is_some())
+    {
+        args.push(format!("--env={fastly_env}"));
+    }
     args.extend(passthrough_args.iter().cloned());
 
     let has_skip_build = passthrough_args.iter().any(|arg| arg == "--skip-build");
@@ -62,10 +68,10 @@ pub fn run_fastly_dev(
         .any(|arg| arg == "--file" || arg.strip_prefix("--file=").is_some());
 
     if has_skip_build && !has_file {
+        let target_dir = cargo_target_dir(project_dir);
         let release_path =
-            project_dir.join("target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm");
-        let debug_path =
-            project_dir.join("target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm");
+            target_dir.join("wasm32-wasip1/release/trusted-server-adapter-fastly.wasm");
+        let debug_path = target_dir.join("wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm");
         let wasm_path = if release_path.exists() {
             release_path
         } else if debug_path.exists() {
@@ -86,16 +92,24 @@ pub fn run_fastly_dev(
         .attach("failed to launch `fastly compute serve`")
 }
 
+fn cargo_target_dir(project_dir: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_dir.join("target"))
+}
+
 pub fn run_dev_command(
     adapter: Adapter,
     validated: &ValidatedConfig,
+    fastly_env: &str,
     passthrough_args: &[String],
 ) -> Result<ExitStatus, Report<CliError>> {
     match adapter {
         Adapter::Fastly => {
             let project_dir = std::env::current_dir().change_context(CliError::Io)?;
             write_local_fastly_manifest(&project_dir, &validated.loaded.canonical_toml)?;
-            run_fastly_dev(&project_dir, passthrough_args)
+            run_fastly_dev(&project_dir, fastly_env, passthrough_args)
         }
     }
 }
@@ -119,5 +133,29 @@ mod tests {
             rendered.contains("ts-config = \"[publisher]\\ndomain = \\\"example.com\\\"\\n\""),
             "should embed canonical TOML under ts-config"
         );
+    }
+
+    #[test]
+    fn cargo_target_dir_defaults_to_project_target() {
+        temp_env::with_var_unset("CARGO_TARGET_DIR", || {
+            let project_dir = Path::new("/repo");
+
+            assert_eq!(
+                cargo_target_dir(project_dir),
+                PathBuf::from("/repo/target"),
+                "should default to the project target directory"
+            );
+        });
+    }
+
+    #[test]
+    fn cargo_target_dir_honors_environment_override() {
+        temp_env::with_var("CARGO_TARGET_DIR", Some("/tmp/cargo-target"), || {
+            assert_eq!(
+                cargo_target_dir(Path::new("/repo")),
+                PathBuf::from("/tmp/cargo-target"),
+                "should honor CARGO_TARGET_DIR for --skip-build lookup"
+            );
+        });
     }
 }

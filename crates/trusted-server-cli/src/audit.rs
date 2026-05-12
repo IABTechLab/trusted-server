@@ -1,7 +1,6 @@
 mod analyzer;
 mod browser_collector;
 mod collector;
-mod http_collector;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -54,11 +53,6 @@ pub struct AuditOutputs {
     pub artifact: AuditArtifact,
     pub js_assets_toml: String,
     pub draft_config_toml: String,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn analyze_html(target_url: &Url, html: &str) -> Result<AuditArtifact, Report<CliError>> {
-    analyzer::analyze_html(target_url, html)
 }
 
 pub fn perform_audit(target_url: &Url) -> Result<AuditOutputs, Report<CliError>> {
@@ -228,7 +222,17 @@ mod tests {
             </html>
         "#;
 
-        let artifact = analyze_html(&url, html).expect("should analyze HTML");
+        let collected = collector::CollectedPage {
+            requested_url: url.to_string(),
+            final_url: url.to_string(),
+            page_title: None,
+            html: html.to_string(),
+            script_tags: Vec::new(),
+            network_requests: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let artifact = analyze_collected_page(&collected).expect("should analyze HTML");
 
         assert_eq!(artifact.page_title.as_deref(), Some("Example Publisher"));
         assert_eq!(artifact.js_asset_count, 2, "should count script assets");

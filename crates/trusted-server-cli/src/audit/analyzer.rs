@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use scraper::{Html, Selector};
@@ -8,6 +9,9 @@ use crate::audit::collector::CollectedPage;
 use crate::audit::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
 use crate::error::CliError;
 use error_stack::Report;
+
+static GTM_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex"));
 
 pub fn analyze_collected_page(
     collected: &CollectedPage,
@@ -113,19 +117,6 @@ pub fn analyze_collected_page(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn analyze_html(target_url: &Url, html: &str) -> Result<AuditArtifact, Report<CliError>> {
-    analyze_collected_page(&CollectedPage {
-        requested_url: target_url.to_string(),
-        final_url: target_url.to_string(),
-        page_title: None,
-        html: html.to_string(),
-        script_tags: Vec::new(),
-        network_requests: Vec::new(),
-        warnings: Vec::new(),
-    })
-}
-
 fn insert_asset(
     assets_by_url: &mut BTreeMap<String, AuditedAsset>,
     page_url: &Url,
@@ -159,14 +150,21 @@ pub fn classify_party(page_url: &Url, asset_url: &Url) -> AssetParty {
     let page_host = page_url.host_str().unwrap_or_default();
     let asset_host = asset_url.host_str().unwrap_or_default();
 
-    if asset_host == page_host
-        || asset_host.ends_with(&format!(".{page_host}"))
-        || page_host.ends_with(&format!(".{asset_host}"))
-    {
+    if host_matches(page_host, asset_host) {
         AssetParty::FirstParty
     } else {
         AssetParty::ThirdParty
     }
+}
+
+fn host_matches(page_host: &str, asset_host: &str) -> bool {
+    asset_host == page_host
+        || asset_host
+            .strip_suffix(page_host)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+        || page_host
+            .strip_suffix(asset_host)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 pub fn detect_integration_from_url(url: &Url) -> Option<String> {
@@ -198,9 +196,8 @@ pub fn detect_integration_from_url(url: &Url) -> Option<String> {
 
 pub fn detect_integrations_from_inline_script(script: &str) -> Vec<(String, String)> {
     let mut matches = Vec::new();
-    let gtm_regex = Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex");
 
-    if let Some(container_id) = gtm_regex.find(script) {
+    if let Some(container_id) = GTM_REGEX.find(script) {
         matches.push((
             "google_tag_manager".to_string(),
             container_id.as_str().to_string(),
@@ -221,17 +218,15 @@ pub fn detect_integrations_from_inline_script(script: &str) -> Vec<(String, Stri
 }
 
 pub fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<String> {
-    let regex = Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex");
-
     for integration in &artifact.detected_integrations {
-        if integration.id == "google_tag_manager" && regex.is_match(&integration.evidence) {
+        if integration.id == "google_tag_manager" && GTM_REGEX.is_match(&integration.evidence) {
             return Some(integration.evidence.clone());
         }
     }
 
     for asset in &artifact.assets {
         if asset.integration.as_deref() == Some("google_tag_manager")
-            && let Some(matched) = regex.find(asset.url.as_str())
+            && let Some(matched) = GTM_REGEX.find(asset.url.as_str())
         {
             return Some(matched.as_str().to_string());
         }

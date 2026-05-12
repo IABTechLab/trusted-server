@@ -12,7 +12,7 @@ harness = true
 [dev-dependencies]
 testcontainers = { version = "0.25", features = ["blocking"] }
 reqwest = { version = "0.12", features = ["blocking"] }
-scraper = "0.21"
+scraper = "0.24"
 log = "0.4.29"
 serde_json = "1.0.149"
 error-stack = "0.6"

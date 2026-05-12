@@ -163,13 +163,14 @@ When validation fails with `--json`, the command still writes JSON to stdout, se
 Validate local config, write a Fastly local manifest, and run `fastly compute serve`.
 
 ```bash
-ts dev [--adapter fastly] [--config <path>] [passthrough args...]
+ts dev [--adapter fastly] [--config <path>] [--env <name>] [passthrough args...]
 ```
 
 | Option                 | Description                                                                                 |
 | ---------------------- | ------------------------------------------------------------------------------------------- |
 | `-a, --adapter fastly` | Select the runtime adapter. `fastly` is the only supported value.                           |
 | `--config <path>`      | Use this config file. Defaults to `trusted-server.toml`.                                    |
+| `--env <name>`         | Fastly local server environment profile. Defaults to `local`.                               |
 | `passthrough args...`  | Pass extra arguments to `fastly compute serve`. Use `--` before Fastly options for clarity. |
 
 The command writes `fastly.local.toml` in the current working directory. That file extends `fastly.toml` and embeds the canonical Trusted Server config in the local Fastly config store named `ts_config_store`, under item key `ts-config`.
@@ -185,13 +186,14 @@ Pass Fastly CLI options after `--`:
 ```bash
 ts dev -- --skip-build
 ts dev -- --watch
+ts dev --env production
 ts dev -- --addr 127.0.0.1:7676
 ```
 
-When `--skip-build` is passed without `--file`, the CLI looks for an existing Wasm binary at:
+When `--skip-build` is passed without `--file`, the CLI looks for an existing Wasm binary under `CARGO_TARGET_DIR` when that environment variable is set, otherwise under the project `target` directory:
 
-1. `target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm`
-2. `target/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm`
+1. `<target-dir>/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm`
+2. `<target-dir>/wasm32-wasip1/debug/trusted-server-adapter-fastly.wasm`
 
 If neither file exists, build the Fastly adapter first:
 
@@ -209,7 +211,7 @@ ts audit [options] <url>
 
 | Option               | Description                                                                            |
 | -------------------- | -------------------------------------------------------------------------------------- |
-| `<url>`              | Public page URL to audit.                                                              |
+| `<url>`              | Public `http` or `https` page URL to audit.                                            |
 | `--js-assets <path>` | Write the JS asset audit to this path. Defaults to `js-assets.toml`.                   |
 | `--config <path>`    | Write the draft Trusted Server config to this path. Defaults to `trusted-server.toml`. |
 | `--no-js-assets`     | Do not write the JS asset audit file.                                                  |
@@ -266,6 +268,8 @@ ts auth fastly login
 ```
 
 Use this for local development. For CI and automation, set `FASTLY_API_KEY` instead of storing a credential on the machine.
+
+On Linux, secure storage uses the Secret Service backend and requires an active D-Bus session. Minimal containers and CI runners often do not provide one; in those environments, prefer `FASTLY_API_KEY`.
 
 ### `ts auth fastly status`
 
@@ -364,14 +368,14 @@ Apply the Fastly provisioning plan.
 ts provision fastly apply [--service-id <service-id>] [options]
 ```
 
-| Option                       | Description                                                  |
-| ---------------------------- | ------------------------------------------------------------ |
-| `--service-id <service-id>`  | Existing Fastly Compute service ID. Overrides config.        |
-| `--config <path>`            | Config file to provision. Defaults to `trusted-server.toml`. |
-| `--json`                     | Write apply results as JSON.                                 |
-| `--yes`                      | Skip the interactive confirmation prompt.                    |
-| `--runtime-api-key <token>`  | Runtime Fastly API token for request-signing provisioning.   |
-| `--reuse-management-api-key` | Use the management Fastly API token as the runtime token.    |
+| Option                       | Description                                                                                                                                                                                     |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--service-id <service-id>`  | Existing Fastly Compute service ID. Overrides config.                                                                                                                                           |
+| `--config <path>`            | Config file to provision. Defaults to `trusted-server.toml`.                                                                                                                                    |
+| `--json`                     | Write apply results as JSON.                                                                                                                                                                    |
+| `--yes`                      | Skip the interactive confirmation prompt.                                                                                                                                                       |
+| `--runtime-api-key <token>`  | Runtime Fastly API token for request-signing provisioning.                                                                                                                                      |
+| `--reuse-management-api-key` | Use the management Fastly API token as the runtime token. This is a smoke-test convenience and prompts for explicit confirmation because it stores a full management token as a runtime secret. |
 
 `apply` prompts before making changes unless `--yes` is passed. If binding changes are required and the latest Fastly service version is locked, the CLI clones it first. When bindings are created or updated, the CLI activates the target service version.
 
@@ -395,6 +399,8 @@ JSON output uses this high-level shape:
   "activated_version": true
 }
 ```
+
+When `--json` apply fails after completing one or more actions, the command still writes this JSON shape before exiting non-zero. In that case, `completed_actions` contains the actions already applied and `failed_action` identifies the action that failed.
 
 ## Fastly provisioning resources
 
@@ -432,7 +438,7 @@ ts provision fastly apply --service-id svc_123 --runtime-api-key runtime-token
 ts provision fastly apply --service-id svc_123 --reuse-management-api-key
 ```
 
-Prefer `FASTLY_RUNTIME_API_KEY` for local use and CI because it avoids putting the token in shell history. Use `--reuse-management-api-key` only when your management token is acceptable for runtime key rotation.
+Prefer `FASTLY_RUNTIME_API_KEY` for local use and CI because it avoids putting the token in shell history. Use `--runtime-api-key` only with a scoped runtime token. Use `--reuse-management-api-key` only for smoke tests or trusted local environments where storing the full management token as an edge-readable runtime secret is acceptable; the CLI requires an explicit confirmation prompt for this path even when `--yes` is passed.
 
 After provisioning request signing resources, update these deprecated config fields if the plan or apply output warns that the configured IDs differ from Fastly. They remain in `[request_signing]` for now because runtime key-rotation endpoints still use them for Fastly management API writes:
 

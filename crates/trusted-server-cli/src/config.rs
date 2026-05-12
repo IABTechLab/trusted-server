@@ -10,7 +10,10 @@ use trusted_server_core::runtime_config::{APPLICATION_CONFIG_STORE_NAME, LoadedR
 use crate::error::CliError;
 
 pub const DEFAULT_CONFIG_PATH: &str = "trusted-server.toml";
-pub const STARTER_CONFIG_TEMPLATE: &str = include_str!("../../../trusted-server.example.toml");
+pub const STARTER_CONFIG_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../trusted-server.example.toml"
+));
 pub const FASTLY_MANIFEST_PATH: &str = "fastly.toml";
 pub const FASTLY_API_SECRET_STORE_NAME: &str = "api-keys";
 pub const FASTLY_API_SECRET_KEY: &str = "api_key";
@@ -335,7 +338,7 @@ pub fn validate_config_json(path: Option<&Path>) -> ValidateConfigJson {
                 valid: false,
                 path: resolved_path,
                 config_hash: None,
-                errors: vec![format!("{error:?}")],
+                errors: format!("{error:?}").lines().map(str::to_string).collect(),
             }
         }
     }

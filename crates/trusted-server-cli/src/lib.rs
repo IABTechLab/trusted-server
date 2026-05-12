@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use dialoguer::Confirm;
 use error_stack::{Report, ResultExt};
 
 use crate::error::CliError;
@@ -16,7 +17,9 @@ use crate::fastly::api::ReqwestFastlyApi;
 use crate::fastly::auth::{
     SystemCredentialStore, fastly_auth_status, login_fastly, logout_fastly, resolve_fastly_api_key,
 };
-use crate::fastly::provision::{apply_fastly_provisioning, plan_fastly_provisioning};
+use crate::fastly::provision::{
+    ProvisionApplyOutcome, apply_fastly_provisioning_with_outcome, plan_fastly_provisioning,
+};
 use crate::output::{format_report, write_json, write_stderr_line, write_stdout_line};
 
 #[derive(Debug, Parser)]
@@ -88,6 +91,8 @@ struct DevArgs {
     adapter: dev::Adapter,
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long, default_value = "local")]
+    env: String,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     passthrough: Vec<String>,
 }
@@ -149,7 +154,10 @@ struct FastlyProvisionApplyArgs {
     yes: bool,
     #[arg(long)]
     runtime_api_key: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Use the management Fastly API token as the runtime token. Warning: this stores a full management token in the runtime secret store; use only for smoke tests or trusted local environments."
+    )]
     reuse_management_api_key: bool,
 }
 
@@ -215,10 +223,7 @@ fn run_audit(args: &AuditArgs) -> Result<(), Report<CliError>> {
             .attach("nothing to do: both --no-js-assets and --no-config were set"));
     }
 
-    let url = url::Url::parse(&args.url).map_err(|error| {
-        Report::new(CliError::Arguments)
-            .attach(format!("invalid audit URL `{}`: {error}", args.url))
-    })?;
+    let url = parse_audit_url(&args.url)?;
     let outputs = audit::perform_audit(&url)?;
 
     let js_assets_path = if args.no_js_assets {
@@ -275,7 +280,7 @@ fn run_audit(args: &AuditArgs) -> Result<(), Report<CliError>> {
 
 fn run_dev(args: &DevArgs) -> Result<(), Report<CliError>> {
     let validated = config::load_validated_config(args.config.as_deref())?;
-    let status = dev::run_dev_command(args.adapter, &validated, &args.passthrough)?;
+    let status = dev::run_dev_command(args.adapter, &validated, &args.env, &args.passthrough)?;
     if status.success() {
         Ok(())
     } else {
@@ -333,14 +338,35 @@ fn run_auth(command: AuthCommand) -> Result<(), Report<CliError>> {
 
 const FASTLY_RUNTIME_API_KEY_ENV: &str = "FASTLY_RUNTIME_API_KEY";
 
+struct RuntimeApiKeySelection {
+    value: Option<String>,
+    reused_management_key: bool,
+}
+
+fn parse_audit_url(value: &str) -> Result<url::Url, Report<CliError>> {
+    let url = url::Url::parse(value).map_err(|error| {
+        Report::new(CliError::Arguments).attach(format!("invalid audit URL `{value}`: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Report::new(CliError::Arguments).attach(format!(
+            "`ts audit` only supports http/https URLs, got `{}`",
+            url.scheme()
+        )));
+    }
+    Ok(url)
+}
+
 fn resolve_runtime_api_key_for_apply(
     management_api_key: &str,
     explicit_runtime_api_key: Option<&str>,
     reuse_management_api_key: bool,
     request_signing_enabled: bool,
-) -> Result<Option<String>, Report<CliError>> {
+) -> Result<RuntimeApiKeySelection, Report<CliError>> {
     if !request_signing_enabled {
-        return Ok(None);
+        return Ok(RuntimeApiKeySelection {
+            value: None,
+            reused_management_key: false,
+        });
     }
 
     let explicit_runtime_api_key = explicit_runtime_api_key
@@ -362,16 +388,43 @@ fn resolve_runtime_api_key_for_apply(
     }
 
     if let Some(value) = explicit_runtime_api_key {
-        return Ok(Some(value));
+        return Ok(RuntimeApiKeySelection {
+            value: Some(value),
+            reused_management_key: false,
+        });
     }
     if let Some(value) = env_runtime_api_key {
-        return Ok(Some(value));
+        return Ok(RuntimeApiKeySelection {
+            value: Some(value),
+            reused_management_key: false,
+        });
     }
     if reuse_management_api_key {
-        return Ok(Some(management_api_key.to_string()));
+        return Ok(RuntimeApiKeySelection {
+            value: Some(management_api_key.to_string()),
+            reused_management_key: true,
+        });
     }
 
-    Ok(None)
+    Ok(RuntimeApiKeySelection {
+        value: None,
+        reused_management_key: false,
+    })
+}
+
+fn confirm_reuse_management_api_key() -> Result<(), Report<CliError>> {
+    let confirmed = Confirm::new()
+        .with_prompt(
+            "Reuse the management Fastly API key as a runtime secret? This stores a full management token where edge runtime code can read it.",
+        )
+        .default(false)
+        .interact()
+        .change_context(CliError::Cancelled)?;
+    if confirmed {
+        Ok(())
+    } else {
+        Err(Report::new(CliError::Cancelled).attach("user declined management API key reuse"))
+    }
 }
 
 fn fastly_manifest_dirs(config_path: &Path) -> Result<Vec<PathBuf>, Report<CliError>> {
@@ -442,45 +495,64 @@ fn run_provision(command: ProvisionCommand) -> Result<(), Report<CliError>> {
             command: FastlyProvisionCommand::Apply(args),
         } => {
             let validated = config::load_validated_config(args.config.as_deref())?;
+            let request_signing_enabled = validated
+                .loaded
+                .settings
+                .request_signing
+                .as_ref()
+                .is_some_and(|request_signing| request_signing.enabled);
             let runtime_api_key = resolve_runtime_api_key_for_apply(
                 &resolved.value,
                 args.runtime_api_key.as_deref(),
                 args.reuse_management_api_key,
-                validated
-                    .loaded
-                    .settings
-                    .request_signing
-                    .as_ref()
-                    .is_some_and(|request_signing| request_signing.enabled),
+                request_signing_enabled,
             )?;
+            if runtime_api_key.reused_management_key {
+                confirm_reuse_management_api_key()?;
+            }
             let service_id = config::resolve_fastly_service_id(
                 args.service_id.as_deref(),
                 &validated.providers.fastly,
                 &fastly_manifest_dirs(&validated.path)?,
             )?;
-            let applied = apply_fastly_provisioning(
+            let outcome = apply_fastly_provisioning_with_outcome(
                 &api,
                 &validated,
                 &service_id,
-                runtime_api_key.as_deref(),
+                runtime_api_key.value.as_deref(),
                 args.yes,
             )?;
-            if args.json {
-                write_json(&applied)
-            } else {
-                write_stdout_line(format!(
-                    "Applied {} change(s) to service {} using version {}\nActivated version: {}",
-                    applied.completed_actions.len(),
-                    applied.service_id,
-                    applied.service_version.target_version,
-                    if applied.activated_version {
-                        "yes"
-                    } else {
-                        "no"
+            match outcome {
+                ProvisionApplyOutcome::Success(applied) => write_apply_result(&applied, args.json),
+                ProvisionApplyOutcome::Failure(failure) => {
+                    if args.json {
+                        write_json(&failure.json)?;
                     }
-                ))
+                    Err(failure.error)
+                }
             }
         }
+    }
+}
+
+fn write_apply_result(
+    applied: &crate::fastly::provision::ProvisionApplyJson,
+    json: bool,
+) -> Result<(), Report<CliError>> {
+    if json {
+        write_json(applied)
+    } else {
+        write_stdout_line(format!(
+            "Applied {} change(s) to service {} using version {}\nActivated version: {}",
+            applied.completed_actions.len(),
+            applied.service_id,
+            applied.service_version.target_version,
+            if applied.activated_version {
+                "yes"
+            } else {
+                "no"
+            }
+        ))
     }
 }
 
@@ -492,5 +564,26 @@ mod tests {
     #[test]
     fn clap_command_debug_asserts() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parse_audit_url_accepts_http_and_https() {
+        assert!(parse_audit_url("http://publisher.example").is_ok());
+        assert!(parse_audit_url("https://publisher.example").is_ok());
+    }
+
+    #[test]
+    fn parse_audit_url_rejects_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "data:text/html,hello",
+            "chrome://version",
+        ] {
+            let error = parse_audit_url(url).expect_err("should reject non-http URL");
+            assert!(
+                format!("{error:?}").contains("only supports http/https"),
+                "should explain scheme restriction"
+            );
+        }
     }
 }
