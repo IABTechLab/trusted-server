@@ -155,6 +155,81 @@ Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shap
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
 
+### EID Seeding and Prebid Bidstream Forwarding
+
+EIDs can reach the EC identity graph from either server-side pull sync or browser-side Prebid sync. During a Prebid-routed auction, Trusted Server combines those stored IDs with any same-request EIDs from Prebid.js, applies consent gating, and forwards the merged set to Prebid Server as OpenRTB `user.ext.eids`. Prebid Server then passes those EIDs downstream to demand partners in its OpenRTB requests.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser / Prebid.js
+    participant TSJS as TSJS Prebid Module
+    participant TS as Trusted Server
+    participant KV as EC KV Identity Graph
+    participant PS as Prebid Server
+    participant DSP as Downstream Partners / DSPs
+
+    alt Pull sync seeds partner UID
+        TS->>DSP: Background pull sync request<br/>(EC ID + consent context)
+        DSP-->>TS: Partner UID for EC
+        TS->>KV: Upsert ids[partner_id] = UID
+    else Prebid sync seeds browser EIDs
+        B->>B: Prebid User ID modules resolve IDs
+        B->>TSJS: getUserIdsAsEids()
+        TSJS->>B: Write ts-eids cookie<br/>Base64 OpenRTB-style EIDs
+        B->>TS: Next request with ts-eids
+        TS->>KV: Decode cookie and upsert matched partner UIDs
+    end
+
+    Note over B,TS: Prebid-routed auction
+    B->>B: getUserIdsAsEids() for current auction
+    B->>TS: POST /auction<br/>adUnits + eids[] + ts-ec cookie
+    TS->>KV: Resolve EC-backed partner IDs
+    KV-->>TS: Stored partner UIDs
+    TS->>TS: Convert stored UIDs to EIDs<br/>Merge + dedupe with request eids[]<br/>Apply consent gating
+    TS->>PS: OpenRTB request<br/>user.ext.eids = merged EID set
+    PS->>DSP: OpenRTB bid request<br/>user.ext.eids preserved for bidders
+    DSP-->>PS: OpenRTB bid response
+    PS-->>TS: OpenRTB seatbid response
+    TS-->>B: Auction response + x-ts-eids header when available
+```
+
+The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
+
+```json
+{
+  "user": {
+    "id": "<ec-id-when-forwarding-is-allowed>",
+    "ext": {
+      "eids": [
+        {
+          "source": "id5-sync.com",
+          "uids": [
+            {
+              "id": "ID5-abc123",
+              "atype": 1
+            }
+          ]
+        },
+        {
+          "source": "liveramp.com",
+          "uids": [
+            {
+              "id": "LR-xyz789",
+              "atype": 3,
+              "ext": {
+                "rtiPartner": "idl"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. When a partner UID already exists in KV, pull sync does not periodically refresh it; browser-side Prebid sync can still replace the stored UID if a later `ts-eids` cookie carries a different value for the same configured partner source.
+
 ## Configuration
 
 Configure EC settings in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `[ec]` section and environment variable overrides.
