@@ -6,6 +6,10 @@
 //! [`startup_error_router`] returns a bare router without middleware.
 //! Builds the [`AppState`] once per Wasm instance.
 //!
+//! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
+//! protocol or cipher metadata. The `EdgeZero` path therefore preserves TLS
+//! metadata as `None` until the upstream adapter exposes those fields.
+//!
 //! # Route inventory
 //!
 //! | Method | Path pattern | Handler |

@@ -1,4 +1,10 @@
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use edgezero_adapter_fastly::FastlyConfigStore;
+use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::{
     header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
 };
@@ -41,9 +47,11 @@ mod route_tests;
 
 use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
-use crate::middleware::apply_finalize_headers;
+use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, FastlyPlatformGeo};
-use edgezero_core::app::Hooks as _;
+
+const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
+const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
 ///
@@ -76,23 +84,40 @@ fn parse_edgezero_flag(value: &str) -> bool {
     v.eq_ignore_ascii_case("true") || v == "1"
 }
 
-/// Reads the `edgezero_enabled` key from the `"trusted_server_config"` Fastly
-/// [`ConfigStore`].
-///
-/// Returns `Err` on any store open or key-read failure, so callers should use
-/// `.unwrap_or(false)` to ensure the legacy path is the safe default.
+/// Opens the shared Fastly Config Store used by both the `EdgeZero` flag read and
+/// `EdgeZero` dispatch metadata.
 ///
 /// # Errors
 ///
-/// - [`fastly::Error`] if the config store cannot be opened or the key cannot be read.
-fn is_edgezero_enabled() -> Result<bool, fastly::Error> {
-    let store = fastly::ConfigStore::try_open("trusted_server_config")
+/// Returns [`fastly::Error`] if the config store cannot be opened.
+fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
+    let store = FastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE)
         .map_err(|e| fastly::Error::msg(format!("failed to open config store: {e}")))?;
-    let value = store
-        .try_get("edgezero_enabled")
-        .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?
-        .unwrap_or_default();
-    Ok(parse_edgezero_flag(&value))
+    Ok(ConfigStoreHandle::new(Arc::new(store)))
+}
+
+/// Reads the `edgezero_enabled` key from the prepared Fastly Config Store
+/// handle.
+///
+/// Returns `Err` on any key-read failure, so callers should use the legacy path
+/// as the safe default.
+///
+/// # Errors
+///
+/// - [`fastly::Error`] if the key cannot be read.
+fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly::Error> {
+    let value = config_store
+        .get(EDGEZERO_ENABLED_KEY)
+        .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
+    Ok(value.as_deref().is_some_and(parse_edgezero_flag))
+}
+
+fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
+        return Some(FastlyResponse::from_status(200).with_body_text_plain("ok"));
+    }
+
+    None
 }
 
 /// Entry point for the Fastly Compute program.
@@ -104,21 +129,28 @@ fn main() {
     let req = FastlyRequest::from_client();
 
     // Health probe bypasses logging, settings, and app construction as a cheap liveness signal.
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
-        FastlyResponse::from_status(200)
-            .with_body_text_plain("ok")
-            .send_to_client();
+    if let Some(response) = health_response(&req) {
+        response.send_to_client();
         return;
     }
 
     logging::init_logger();
 
-    if is_edgezero_enabled().unwrap_or_else(|e| {
+    let edgezero_config_store = match open_trusted_server_config_store() {
+        Ok(config_store) => config_store,
+        Err(e) => {
+            log::warn!("failed to open EdgeZero config store, falling back to legacy path: {e}");
+            legacy_main(req);
+            return;
+        }
+    };
+
+    if is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
     }) {
         log::debug!("routing request through EdgeZero path");
-        edgezero_main(req);
+        edgezero_main(req, edgezero_config_store);
     } else {
         log::debug!("routing request through legacy path");
         legacy_main(req);
@@ -126,7 +158,7 @@ fn main() {
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest) {
+fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     let app = TrustedServerApp::build_app();
 
     // Strip client-spoofable forwarded headers before handing off to the
@@ -138,10 +170,10 @@ fn edgezero_main(mut req: FastlyRequest) {
 
     // `run_app_with_config` and `run_app_with_logging` call `init_logger`
     // internally. A second `set_logger` call panics because our custom fern
-    // logger is already initialised above. `dispatch_with_config` skips logger
+    // logger is already initialised above. `dispatch_with_config_handle` skips logger
     // initialisation and injects the config store directly.
     let mut response =
-        match edgezero_adapter_fastly::dispatch_with_config(&app, req, "trusted_server_config") {
+        match edgezero_adapter_fastly::dispatch_with_config_handle(&app, req, config_store) {
             Ok(response) => compat::from_fastly_response(response),
             Err(e) => {
                 log::error!("EdgeZero dispatch failed: {e}");
@@ -152,28 +184,51 @@ fn edgezero_main(mut req: FastlyRequest) {
             }
         };
 
-    // Apply finalize headers at the entry point so that router-level 405/404
-    // responses for unregistered HTTP methods (e.g. TRACE, WebDAV verbs) carry
-    // TS/geo headers. Responses that already ran through FinalizeResponseMiddleware
-    // have those headers overwritten here, so the 401 geo-skip rule is reproduced.
-    match get_settings() {
-        Ok(settings) => {
-            let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
-                None
-            } else {
-                FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
-                    log::warn!("entry-point geo lookup failed: {e}");
-                    None
+    if !response_was_finalized_by_middleware(&mut response) {
+        // Apply finalize headers at the entry point so that router-level
+        // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
+        // verbs) carry TS/geo headers. Middleware-finalized responses are
+        // skipped here to avoid a second settings read and geo lookup on the
+        // normal registered-route path.
+        match get_settings() {
+            Ok(settings) => {
+                apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
+                    FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+                        log::warn!("entry-point geo lookup failed: {e}");
+                        None
+                    })
                 })
-            };
-            apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
-        }
-        Err(e) => {
-            log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+            }
+            Err(e) => {
+                log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+            }
         }
     }
 
     compat::to_fastly_response(response).send_to_client();
+}
+
+fn response_was_finalized_by_middleware(response: &mut HttpResponse) -> bool {
+    response
+        .headers_mut()
+        .remove(HEADER_X_TS_FINALIZED)
+        .is_some()
+}
+
+fn apply_entry_point_finalize<F>(
+    settings: &Settings,
+    client_ip: Option<IpAddr>,
+    response: &mut HttpResponse,
+    lookup_geo: F,
+) where
+    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
+{
+    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+        None
+    } else {
+        lookup_geo(client_ip)
+    };
+    apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
 /// Handles a request using the original Fastly-native entry point.
@@ -504,6 +559,7 @@ fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::http::response_builder;
     use fastly::mime;
 
     #[test]
@@ -531,6 +587,74 @@ mod tests {
             "should not parse whitespace-only"
         );
         assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
+    }
+
+    #[test]
+    fn health_response_short_circuits_get_health() {
+        let req = FastlyRequest::get("https://example.com/health");
+
+        let mut response = health_response(&req).expect("should build health response");
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should return 200 OK"
+        );
+        assert_eq!(
+            response.take_body_str(),
+            "ok",
+            "should return the health body"
+        );
+    }
+
+    #[test]
+    fn health_response_ignores_non_health_paths() {
+        let req = FastlyRequest::get("https://example.com/auction");
+
+        assert!(
+            health_response(&req).is_none(),
+            "should only short-circuit /health"
+        );
+    }
+
+    #[test]
+    fn response_was_finalized_by_middleware_strips_sentinel() {
+        let mut response = HttpResponse::new(EdgeBody::empty());
+        response
+            .headers_mut()
+            .insert("x-ts-finalized", HeaderValue::from_static("1"));
+
+        assert!(
+            response_was_finalized_by_middleware(&mut response),
+            "should detect middleware-finalized responses"
+        );
+        assert!(
+            response.headers().get("x-ts-finalized").is_none(),
+            "sentinel should not be sent to clients"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn entry_point_finalize_skips_geo_lookup_for_401() {
+        let settings = get_settings().expect("should load settings");
+        let mut response = response_builder()
+            .status(edgezero_core::http::StatusCode::UNAUTHORIZED)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+
+        apply_entry_point_finalize(&settings, None, &mut response, |_| {
+            panic!("should skip entry-point geo lookup for 401 responses");
+        });
+
+        assert_eq!(
+            response
+                .headers()
+                .get(trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE)
+                .and_then(|v| v.to_str().ok()),
+            Some("false"),
+            "401 responses should still carry geo-unavailable headers"
+        );
     }
 
     #[test]
