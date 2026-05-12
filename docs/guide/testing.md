@@ -69,9 +69,6 @@ cargo test -p trusted-server-core
 
 # Run tests matching a pattern
 cargo test ec
-
-# Show test output
-cargo test -- --nocapture
 ```
 
 ### Integration Tests

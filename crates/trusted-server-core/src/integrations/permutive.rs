@@ -16,9 +16,10 @@ use validator::Validate;
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -149,9 +150,13 @@ impl PermutiveIntegration {
             ))));
         }
 
-        let sdk_body = collect_body(permutive_response.into_body(), PERMUTIVE_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read Permutive SDK response body"))?;
+        let sdk_body = collect_response_bounded(
+            permutive_response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            PERMUTIVE_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read Permutive SDK response body"))?;
         log::info!(
             "Successfully fetched Permutive SDK: {} bytes",
             sdk_body.len()
@@ -207,13 +212,10 @@ impl PermutiveIntegration {
 
         log::info!("Forwarding {} to {}", route_name, target_url);
 
-        let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+        let request_body = if method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, PERMUTIVE_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error(format!(
-                        "Permutive {route_name} request body too large"
-                    )))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

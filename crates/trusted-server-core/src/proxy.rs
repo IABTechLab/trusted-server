@@ -1,4 +1,3 @@
-use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
@@ -15,12 +14,17 @@ use crate::constants::{
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{
+    PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT,
+};
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
+
+const SIGN_MAX_BODY_BYTES: usize = 65536;
+const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
     Cursor::new(body.into_bytes())
@@ -77,16 +81,9 @@ pub struct ProxyRequestConfig<'a> {
     /// operator setup time rather than at request time.
     ///
     /// **Restricted mode** (non-empty slice): only hosts matching a listed pattern are
-    /// permitted. First-party proxy handlers pass `&settings.proxy.allowed_domains`
-    /// because they follow redirect chains that may originate from untrusted
-    /// creative-supplied URLs.
-    ///
-    /// **Behavior change from pre-PR-14**: `proxy_with_redirects` previously always
-    /// enforced `&settings.proxy.allowed_domains` regardless of the caller. After PR 14,
-    /// only [`handle_first_party_proxy`] and its siblings enforce the operator allowlist;
-    /// integration proxies use open mode. This is intentional: applying the operator
-    /// domain allowlist to integration redirects would require every operator to enumerate
-    /// every integration CDN in their config, which is impractical.
+    /// permitted. Currently only [`handle_first_party_proxy`] passes
+    /// `&settings.proxy.allowed_domains` because it follows redirect chains that may
+    /// originate from untrusted creative-supplied URLs.
     pub allowed_domains: &'a [String],
 }
 
@@ -919,20 +916,20 @@ pub async fn handle_first_party_proxy_sign(
 
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > 65536 {
+        if body_bytes.len() > SIGN_MAX_BODY_BYTES {
             return Err(Report::new(TrustedServerError::RequestTooLarge {
                 message: format!(
-                    "payload size {} exceeds limit of 65536 bytes",
-                    body_bytes.len()
+                    "payload size {} exceeds limit of {} bytes",
+                    body_bytes.len(),
+                    SIGN_MAX_BODY_BYTES,
                 ),
             }));
         }
-        let body = String::from_utf8(body_bytes.to_vec()).change_context(
-            TrustedServerError::InvalidUtf8 {
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
-            },
-        )?;
-        serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
+            })?;
+        serde_json::from_str::<ProxySignReq>(body).change_context(TrustedServerError::Proxy {
             message: "invalid JSON".to_string(),
         })?
     } else {
@@ -1042,24 +1039,22 @@ pub async fn handle_first_party_proxy_rebuild(
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > 65536 {
+        if body_bytes.len() > REBUILD_MAX_BODY_BYTES {
             return Err(Report::new(TrustedServerError::RequestTooLarge {
                 message: format!(
-                    "payload size {} exceeds limit of 65536 bytes",
-                    body_bytes.len()
+                    "payload size {} exceeds limit of {} bytes",
+                    body_bytes.len(),
+                    REBUILD_MAX_BODY_BYTES,
                 ),
             }));
         }
-        let body = String::from_utf8(body_bytes.to_vec()).change_context(
-            TrustedServerError::InvalidUtf8 {
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
-            },
-        )?;
-        serde_json::from_str::<ProxyRebuildReq>(&body).change_context(
-            TrustedServerError::Proxy {
-                message: "invalid JSON".to_string(),
-            },
-        )?
+            })?;
+        serde_json::from_str::<ProxyRebuildReq>(body).change_context(TrustedServerError::Proxy {
+            message: "invalid JSON".to_string(),
+        })?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
         let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {

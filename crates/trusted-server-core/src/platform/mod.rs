@@ -31,6 +31,8 @@
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
 
+use std::time::Duration;
+
 mod error;
 mod http;
 mod kv;
@@ -51,6 +53,9 @@ pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,
 };
+
+/// Default first-byte timeout for platform backends.
+pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
 mod tests {

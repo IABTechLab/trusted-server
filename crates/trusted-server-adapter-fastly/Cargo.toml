@@ -23,7 +23,6 @@ serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
-trusted-server-js = { path = "../js" }
 
 [dev-dependencies]
 bytes = { workspace = true }
