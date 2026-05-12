@@ -7,7 +7,7 @@ use fastly::http::StatusCode;
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
 use trusted_server_core::compat;
-use trusted_server_core::error::IntoHttpResponse;
+use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -18,7 +18,14 @@ use trusted_server_core::platform::{
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
 use trusted_server_core::settings::Settings;
 
-use super::route_request;
+use super::{route_request, HandlerOutcome};
+
+fn outcome_status(result: &Result<HandlerOutcome, Report<TrustedServerError>>) -> StatusCode {
+    match result {
+        Ok(outcome) => outcome.status(),
+        Err(e) => e.current_context().status_code(),
+    }
+}
 
 struct StubJwksConfigStore;
 
@@ -229,10 +236,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &auction_services,
         compat::from_fastly_request(auction_fastly_req),
     ));
-    let auction_status = match auction_result {
-        Ok(resp) => resp.status(),
-        Err(ref e) => e.current_context().status_code(),
-    };
+    let auction_status = outcome_status(&auction_result);
     assert_eq!(
         auction_status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -248,10 +252,7 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &publisher_services,
         compat::from_fastly_request(publisher_fastly_req),
     ));
-    let publisher_status = match publisher_result {
-        Ok(resp) => resp.status(),
-        Err(ref e) => e.current_context().status_code(),
-    };
+    let publisher_status = outcome_status(&publisher_result);
     assert_eq!(
         publisher_status,
         StatusCode::SERVICE_UNAVAILABLE,

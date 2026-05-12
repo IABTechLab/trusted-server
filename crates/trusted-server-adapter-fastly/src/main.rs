@@ -23,7 +23,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -42,6 +43,28 @@ mod route_tests;
 use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
+
+/// Result of routing a request, distinguishing buffered from streaming publisher responses.
+///
+/// The streaming arm keeps the publisher body out of WASM heap until it is written directly
+/// to the client via [`fastly::Response::stream_to_client`].  All other routes are buffered.
+enum HandlerOutcome {
+    Buffered(HttpResponse),
+    Streaming {
+        response: HttpResponse,
+        body: EdgeBody,
+        params: OwnedProcessResponseParams,
+    },
+}
+
+impl HandlerOutcome {
+    fn status(&self) -> edgezero_core::http::StatusCode {
+        match self {
+            HandlerOutcome::Buffered(resp) => resp.status(),
+            HandlerOutcome::Streaming { response, .. } => response.status(),
+        }
+    }
+}
 
 /// Entry point for the Fastly Compute program.
 ///
@@ -99,16 +122,17 @@ fn main() {
     let runtime_services = build_runtime_services(&req, kv_store);
     let http_req = compat::from_fastly_request(req);
 
-    let mut response = futures::executor::block_on(route_request(
+    let outcome = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &runtime_services,
         http_req,
     ))
-    .unwrap_or_else(|e| http_error_response(&e));
+    .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
-    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+    // Skip geo lookup for 401s: avoids exposing geo headers to unauthenticated callers.
+    let geo_info = if outcome.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
         None
     } else {
         runtime_services
@@ -120,9 +144,30 @@ fn main() {
             })
     };
 
-    finalize_response(&settings, geo_info.as_ref(), &mut response);
-
-    compat::to_fastly_response(response).send_to_client();
+    match outcome {
+        HandlerOutcome::Buffered(mut response) => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            compat::to_fastly_response(response).send_to_client();
+        }
+        HandlerOutcome::Streaming {
+            mut response,
+            body,
+            params,
+        } => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut streaming_body = fastly_resp.stream_to_client();
+            if let Err(e) = stream_publisher_body(
+                body,
+                &mut streaming_body,
+                &params,
+                &settings,
+                &integration_registry,
+            ) {
+                log::error!("streaming processing failed: {e:?}");
+            }
+        }
+    }
 }
 
 async fn route_request(
@@ -131,12 +176,12 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
     req: HttpRequest,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
+) -> Result<HandlerOutcome, Report<TrustedServerError>> {
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
-        Ok(Some(response)) => return Ok(response),
+        Ok(Some(response)) => return Ok(HandlerOutcome::Buffered(response)),
         Ok(None) => {}
         Err(e) => return Err(e),
     }
@@ -149,31 +194,36 @@ async fn route_request(
     match (method, path.as_str()) {
         // Serve the tsjs library
         (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            handle_tsjs_dynamic(&req, integration_registry)
+            handle_tsjs_dynamic(&req, integration_registry).map(HandlerOutcome::Buffered)
         }
 
         // Discovery endpoint for trusted-server capabilities and JWKS
         (Method::GET, "/.well-known/trusted-server.json") => {
             handle_trusted_server_discovery(settings, runtime_services, req)
+                .map(HandlerOutcome::Buffered)
         }
 
         // Signature verification endpoint
         (Method::POST, "/verify-signature") => {
-            handle_verify_signature(settings, runtime_services, req)
+            handle_verify_signature(settings, runtime_services, req).map(HandlerOutcome::Buffered)
         }
 
         // Key rotation admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, runtime_services, req),
+        (Method::POST, "/admin/keys/rotate") => {
+            handle_rotate_key(settings, runtime_services, req).map(HandlerOutcome::Buffered)
+        }
         (Method::POST, "/admin/keys/deactivate") => {
-            handle_deactivate_key(settings, runtime_services, req)
+            handle_deactivate_key(settings, runtime_services, req).map(HandlerOutcome::Buffered)
         }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
             match runtime_services_for_consent_route(settings, runtime_services) {
                 Ok(auction_services) => {
-                    handle_auction(settings, orchestrator, &auction_services, req).await
+                    handle_auction(settings, orchestrator, &auction_services, req)
+                        .await
+                        .map(HandlerOutcome::Buffered)
                 }
                 Err(e) => Err(e),
             }
@@ -181,16 +231,24 @@ async fn route_request(
 
         // tsjs endpoints
         (Method::GET, "/first-party/proxy") => {
-            handle_first_party_proxy(settings, runtime_services, req).await
+            handle_first_party_proxy(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::GET, "/first-party/click") => {
-            handle_first_party_click(settings, runtime_services, req).await
+            handle_first_party_click(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-            handle_first_party_proxy_sign(settings, runtime_services, req).await
+            handle_first_party_proxy_sign(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await
+            handle_first_party_proxy_rebuild(settings, runtime_services, req)
+                .await
+                .map(HandlerOutcome::Buffered)
         }
         (m, path) if integration_registry.has_route(&m, path) => {
             // TODO(PR13): migrate integration trait to http types here
@@ -209,6 +267,7 @@ async fn route_request(
                     }))
                 })
                 .map(compat::from_fastly_response)
+                .map(HandlerOutcome::Buffered)
         }
 
         // No known route matched, proxy to publisher origin as fallback
@@ -226,9 +285,7 @@ async fn route_request(
                     req,
                 )
                 .await
-                .and_then(|pub_response| {
-                    resolve_publisher_response(pub_response, settings, integration_registry)
-                }),
+                .and_then(resolve_publisher_response),
                 Err(e) => Err(e),
             }
         }
@@ -237,28 +294,21 @@ async fn route_request(
 
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
+) -> Result<HandlerOutcome, Report<TrustedServerError>> {
     match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Buffered(response) => Ok(HandlerOutcome::Buffered(response)),
         PublisherResponse::Stream {
-            mut response,
+            response,
             body,
             params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(output);
-            Ok(response)
-        }
+        } => Ok(HandlerOutcome::Streaming {
+            response,
+            body,
+            params,
+        }),
         PublisherResponse::PassThrough { mut response, body } => {
             *response.body_mut() = body;
-            Ok(response)
+            Ok(HandlerOutcome::Buffered(response))
         }
     }
 }
