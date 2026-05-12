@@ -20,6 +20,7 @@ use crate::redacted::Redacted;
 pub const TOP_LEVEL_APPLICATION_CONFIG_KEYS: &[&str] = &[
     "auction",
     "consent",
+    "debug",
     "edge_cookie",
     "handlers",
     "integrations",
