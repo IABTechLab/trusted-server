@@ -229,20 +229,36 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
-Build-time selection *is* supported for User ID submodules via
-`TSJS_PREBID_USER_ID_MODULES`.
-
-```bash
-# Include all listed modules in the TSJS bundle
-TSJS_PREBID_USER_ID_MODULES=connectId,criteo,identityLink,uid2,sharedId,unifiedId
-```
-
-If any listed module uses CommonJS `require(...)`, TSJS cannot safely include it in
-its IIFE browser bundle and will skip it with a build warning. In the current
-Prebid version, `liveIntent` is one such module and must currently be omitted.
-
+User ID submodule inclusion is deterministic for attested builds. The module
+preset is checked in at
+`crates/js/lib/src/integrations/prebid/user_id_modules.json`, and
 `build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
-that list (for example: `import 'prebid.js/modules/criteoIdSystem.js'`).
+that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
+production builds so publisher-specific ID choices do not change the attested JS
+artifact.
+
+The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
+LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
+Unified ID / TDID. LiveIntent is imported through a local ESM shim because the
+public Prebid wrapper contains a CommonJS `require(...)` mode switch that is not
+safe for the TSJS IIFE bundle.
+
+Example EID source mapping:
+
+| EID source                                                        | Included module        |
+| ----------------------------------------------------------------- | ---------------------- |
+| `yahoo.com`                                                       | `connectIdSystem`      |
+| `criteo.com`                                                      | `criteoIdSystem`       |
+| `liveintent.com`, `bidswitch.net`, `openx.net`, `pubmatic.com`, … | `liveIntentIdSystem`   |
+| `pubcid.org`                                                      | `sharedIdSystem`       |
+| `adserver.org` with `rtiPartner = TDID`                           | `unifiedIdSystem`      |
+| `uidapi.com`                                                      | `uid2IdSystem`         |
+| `id5-sync.com`                                                    | `id5IdSystem`          |
+| `liveramp.com`                                                    | `identityLinkIdSystem` |
+
+For local experiments only, `TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE` can
+replace the preset. Do not use that override for trusted deployments because it
+changes the bundle hash.
 
 This is separate from `TSJS_PREBID_ADAPTERS`, which continues to control
 client-side bidder adapter modules.

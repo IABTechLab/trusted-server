@@ -53,8 +53,9 @@ vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// Mock the build-generated adapter imports (no-op in tests)
+// Mock the build-generated side-effect imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
+vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({}));
 
 import {
   collectBidders,

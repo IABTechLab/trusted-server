@@ -14,17 +14,21 @@
  *     Each name must have a corresponding {name}BidAdapter.js module in
  *     the prebid.js package. Default: "rubicon".
  *
- *   TSJS_PREBID_USER_ID_MODULES — Comma-separated list of Prebid.js User ID
- *     submodules to include (e.g. "connectId,criteo,uid2").
- *     Modules must exist in prebid.js/modules with a matching JS/TS file.
+ *   TSJS_PREBID_USER_ID_MODULES — Ignored for production builds. User ID
+ *     modules are selected from src/integrations/prebid/user_id_modules.json
+ *     so attested bundles are deterministic. For local experiments only, use
+ *     TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const srcDir = path.resolve(__dirname, 'src');
 const distDir = path.resolve(__dirname, '..', 'dist');
 const integrationsDir = path.join(srcDir, 'integrations');
@@ -34,45 +38,28 @@ const integrationsDir = path.join(srcDir, 'integrations');
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PREBID_ADAPTERS = 'rubicon';
-const ADAPTERS_FILE = path.join(
+const ADAPTERS_FILE = path.join(integrationsDir, 'prebid', '_adapters.generated.ts');
+const USER_IDS_FILE = path.join(integrationsDir, 'prebid', '_user_ids.generated.ts');
+
+const USER_ID_REGISTRY_FILE = path.join(integrationsDir, 'prebid', 'user_id_modules.json');
+const USER_IDS_MANIFEST_FILE = path.join(distDir, 'prebid-user-id-modules.json');
+const LIVE_INTENT_SHIM_ALIAS = 'prebid.js/modules/liveIntentIdSystem.js';
+const PREBID_PACKAGE_DIR = path.join(__dirname, 'node_modules', 'prebid.js');
+const PREBID_LIVE_INTENT_STANDARD = path.join(
+  PREBID_PACKAGE_DIR,
+  'dist',
+  'src',
+  'libraries',
+  'liveIntentId',
+  'idSystem.js'
+);
+const PREBID_GLOBAL_MODULE = path.join(PREBID_PACKAGE_DIR, 'dist', 'src', 'src', 'prebidGlobal.js');
+const LIVE_INTENT_SHIM = path.join(
   integrationsDir,
   'prebid',
-  '_adapters.generated.ts',
+  'prebid_modules',
+  'liveIntentIdSystem.ts'
 );
-const USER_IDS_FILE = path.join(
-  integrationsDir,
-  'prebid',
-  '_user_ids.generated.ts',
-);
-
-const DEFAULT_PREBID_USER_ID_MODULES = '';
-
-/**
- * Some User ID module names need explicit mapping instead of the default
- * `name + 'IdSystem'` convention.
- */
-const USER_ID_MODULE_OVERRIDES = {
-  connectId: ['connectIdSystem'],
-  identityLink: ['identityLinkIdSystem'],
-  sharedId: ['sharedIdSystem'],
-  unifiedId: ['unifiedIdSystem'],
-  liveIntent: ['liveIntentIdSystem'],
-  criteo: ['criteoIdSystem'],
-  uid2: ['uid2IdSystem'],
-};
-
-/**
- * Check whether a candidate file uses CommonJS `require`, which is not supported
- * by this browser bundle output mode.
- */
-function hasRequireSyntax(filePath) {
-  try {
-    const source = fs.readFileSync(filePath, 'utf8');
-    return /\brequire\s*\(/.test(source);
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Generate `_adapters.generated.ts` with import statements for each adapter
@@ -91,17 +78,12 @@ function generatePrebidAdapters() {
   if (names.length === 0) {
     console.warn(
       '[build-all] TSJS_PREBID_ADAPTERS is empty, falling back to default:',
-      DEFAULT_PREBID_ADAPTERS,
+      DEFAULT_PREBID_ADAPTERS
     );
     names.push(DEFAULT_PREBID_ADAPTERS);
   }
 
-  const modulesDir = path.join(
-    __dirname,
-    'node_modules',
-    'prebid.js',
-    'modules',
-  );
+  const modulesDir = path.join(__dirname, 'node_modules', 'prebid.js', 'modules');
 
   // Validate each adapter and build import lines
   const imports = [];
@@ -110,7 +92,7 @@ function generatePrebidAdapters() {
     const modulePath = path.join(modulesDir, moduleFile);
     if (!fs.existsSync(modulePath)) {
       console.error(
-        `[build-all] WARNING: Prebid adapter "${name}" not found (expected ${moduleFile}), skipping`,
+        `[build-all] WARNING: Prebid adapter "${name}" not found (expected ${moduleFile}), skipping`
       );
       continue;
     }
@@ -119,7 +101,7 @@ function generatePrebidAdapters() {
 
   if (imports.length === 0) {
     console.error(
-      '[build-all] WARNING: No valid Prebid adapters found, bundle will have no client-side adapters',
+      '[build-all] WARNING: No valid Prebid adapters found, bundle will have no client-side adapters'
     );
   }
 
@@ -138,103 +120,105 @@ function generatePrebidAdapters() {
   fs.writeFileSync(ADAPTERS_FILE, content);
 
   const adapterNames = names.filter((name) =>
-    fs.existsSync(path.join(modulesDir, `${name}BidAdapter.js`)),
+    fs.existsSync(path.join(modulesDir, `${name}BidAdapter.js`))
   );
   console.log('[build-all] Prebid adapters:', adapterNames);
 }
 
-/**
- * Generate `_user_ids.generated.ts` with import statements for each User ID
- * submodule listed in TSJS_PREBID_USER_ID_MODULES.
- *
- * Invalid module names (those without a matching module file in
- * prebid.js) are logged and skipped.
- */
-function generatePrebidUserIdModules() {
-  const raw = process.env.TSJS_PREBID_USER_ID_MODULES || DEFAULT_PREBID_USER_ID_MODULES;
-  const names = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+function readUserIdRegistry() {
+  return JSON.parse(fs.readFileSync(USER_ID_REGISTRY_FILE, 'utf8'));
+}
 
-  const modulesDir = path.join(
-    __dirname,
-    'node_modules',
-    'prebid.js',
-    'modules',
-  );
-  const modulesPublicDir = path.join(
-    __dirname,
-    'node_modules',
-    'prebid.js',
-    'dist',
-    'src',
-    'public',
-  );
+function requireExistingFile(filePath, description) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`[build-all] Missing ${description}: ${filePath}`);
+  }
+}
 
-  const imports = [];
-  const loadedModuleNames = [];
+function prebidPackageVersion() {
+  const packageJsonPath = path.join(PREBID_PACKAGE_DIR, 'package.json');
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+  return packageJson.version;
+}
 
-  for (const rawName of names) {
-    const candidateNames = USER_ID_MODULE_OVERRIDES[rawName]
-      ? [...USER_ID_MODULE_OVERRIDES[rawName]]
-      : [
-          `${rawName}IdSystem`,
-          `${rawName}System`,
-          rawName,
-        ];
-
-    let imported = false;
-    let skippedForUnsupportedSyntax = false;
-    for (const candidate of candidateNames) {
-      const moduleFile = `${candidate}.js`;
-      const modulePath = path.join(modulesDir, moduleFile);
-      const publicModulePath = path.join(modulesPublicDir, moduleFile);
-
-      const moduleFilePaths = [modulePath, publicModulePath].filter(fs.existsSync);
-      if (moduleFilePaths.length === 0) {
-        continue;
-      }
-
-      if (moduleFilePaths.some((candidatePath) => hasRequireSyntax(candidatePath))) {
-        console.error(
-          `[build-all] WARNING: Prebid user ID module "${rawName}" uses require() and is not supported in the TSJS bundle, skipping`,
-        );
-        skippedForUnsupportedSyntax = true;
-        break;
-      }
-
-      const importLine = `import 'prebid.js/modules/${moduleFile}';`;
-      if (!imports.includes(importLine)) {
-        imports.push(importLine);
-        loadedModuleNames.push(rawName);
-      } else if (!loadedModuleNames.includes(rawName)) {
-        loadedModuleNames.push(rawName);
-      }
-      imported = true;
-      break;
-    }
-
-    if (!imported && !skippedForUnsupportedSyntax) {
-      console.error(
-        `[build-all] WARNING: Prebid user ID module "${rawName}" not found, skipping`,
-      );
+function sourceToModuleMap(entries) {
+  const map = {};
+  for (const entry of entries) {
+    for (const source of entry.eidSources ?? []) {
+      map[source] = entry.moduleName;
     }
   }
+  return map;
+}
 
-  if (names.length > 0 && imports.length === 0) {
-    console.error(
-      '[build-all] WARNING: No valid Prebid user ID modules found, browser will rely on server-only IDs',
+function validateUserIdImport(entry) {
+  requireExistingFile(LIVE_INTENT_SHIM, 'LiveIntent ESM shim');
+  requireExistingFile(PREBID_LIVE_INTENT_STANDARD, 'Prebid LiveIntent standard ESM module');
+  requireExistingFile(PREBID_GLOBAL_MODULE, 'Prebid global module');
+
+  if (entry.moduleName === 'liveIntentIdSystem') {
+    return;
+  }
+
+  try {
+    require.resolve(entry.importPath, { paths: [__dirname] });
+  } catch (error) {
+    throw new Error(
+      `[build-all] Required Prebid user ID module "${entry.moduleName}" could not be resolved from ${entry.importPath}: ${error.message}`
     );
   }
+}
+
+/**
+ * Generate `_user_ids.generated.ts` with deterministic User ID imports.
+ *
+ * Production builds intentionally ignore TSJS_PREBID_USER_ID_MODULES so the
+ * attested JS artifact does not vary per publisher. A dev-only override exists
+ * for local experiments and should not be used for trusted deployments.
+ */
+function generatePrebidUserIdModules() {
+  const registry = readUserIdRegistry();
+  const entriesByModule = new Map(registry.modules.map((entry) => [entry.moduleName, entry]));
+  const override = process.env.TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE;
+  const moduleNames = override
+    ? override
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : registry.defaultPreset;
+
+  if (process.env.TSJS_PREBID_USER_ID_MODULES && !override) {
+    console.warn(
+      '[build-all] TSJS_PREBID_USER_ID_MODULES is ignored for deterministic attested builds. ' +
+        'Use TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE only for local experiments.'
+    );
+  }
+
+  if (override) {
+    console.warn(
+      '[build-all] WARNING: using TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE. ' +
+        'This changes the Prebid bundle and breaks production attestation assumptions.'
+    );
+  }
+
+  const selectedEntries = moduleNames.map((moduleName) => {
+    const entry = entriesByModule.get(moduleName);
+    if (!entry) {
+      throw new Error(`[build-all] Unknown Prebid user ID module in preset: ${moduleName}`);
+    }
+    validateUserIdImport(entry);
+    return entry;
+  });
+
+  const imports = selectedEntries.map((entry) => `import '${entry.importPath}';`);
 
   const content = [
     '// Auto-generated by build-all.mjs — manual edits will be overwritten at build time.',
     '//',
-    '// Controls which Prebid.js user ID modules are included in the bundle.',
-    '// Set the TSJS_PREBID_USER_ID_MODULES environment variable to a comma-separated',
-    '// list of module names (e.g. "connectId,criteo,sharedId") before building.',
-    `// Default: "${DEFAULT_PREBID_USER_ID_MODULES}"`,
+    '// Deterministic Prebid.js user ID module preset for attested builds.',
+    '// TSJS_PREBID_USER_ID_MODULES is intentionally ignored in production builds.',
+    '// Use TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE only for local experiments.',
+    `// Modules: ${moduleNames.join(', ')}`,
     '',
     ...imports,
     '',
@@ -242,21 +226,27 @@ function generatePrebidUserIdModules() {
 
   fs.writeFileSync(USER_IDS_FILE, content);
 
-  if (names.length > 0) {
-    console.log('[build-all] Prebid user ID modules:', loadedModuleNames);
-  } else {
-    console.log('[build-all] Prebid user ID modules: []');
-  }
+  const manifest = {
+    prebidVersion: prebidPackageVersion(),
+    deterministic: !override,
+    modules: moduleNames,
+    sourceToModule: sourceToModuleMap(registry.modules),
+    generatedFileHash: crypto.createHash('sha256').update(content).digest('hex'),
+  };
+
+  console.log('[build-all] Prebid user ID modules:', moduleNames);
+  return manifest;
 }
 
 generatePrebidAdapters();
-generatePrebidUserIdModules();
+const prebidUserIdManifest = generatePrebidUserIdModules();
 
 // ---------------------------------------------------------------------------
 
 // Clean dist directory
 fs.rmSync(distDir, { recursive: true, force: true });
 fs.mkdirSync(distDir, { recursive: true });
+fs.writeFileSync(USER_IDS_MANIFEST_FILE, `${JSON.stringify(prebidUserIdManifest, null, 2)}\n`);
 
 // Discover integration modules: directories in src/integrations/ with index.ts
 const integrationModules = fs.existsSync(integrationsDir)
@@ -265,8 +255,7 @@ const integrationModules = fs.existsSync(integrationsDir)
       .filter((name) => {
         const fullPath = path.join(integrationsDir, name);
         return (
-          fs.statSync(fullPath).isDirectory() &&
-          fs.existsSync(path.join(fullPath, 'index.ts'))
+          fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
         );
       })
       .sort()
@@ -284,11 +273,15 @@ async function buildModule(name, entryPath) {
     root: __dirname,
     resolve: {
       alias: {
+        [LIVE_INTENT_SHIM_ALIAS]: LIVE_INTENT_SHIM,
+        'prebid.js/modules/liveIntentIdSystem': LIVE_INTENT_SHIM,
+        'tsjs-prebid/liveIntentIdSystemStandard': PREBID_LIVE_INTENT_STANDARD,
+        'tsjs-prebid/prebidGlobal': PREBID_GLOBAL_MODULE,
         // prebid.js doesn't expose src/adapterManager.js via its package
         // "exports" map, but we need it for client-side bidder validation.
         'prebid.js/src/adapterManager.js': path.resolve(
           __dirname,
-          'node_modules/prebid.js/dist/src/src/adapterManager.js',
+          'node_modules/prebid.js/dist/src/src/adapterManager.js'
         ),
       },
     },
@@ -321,9 +314,7 @@ async function buildModule(name, entryPath) {
 await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
 
 await Promise.all(
-  integrationModules.map((name) =>
-    buildModule(name, path.join(integrationsDir, name, 'index.ts')),
-  ),
+  integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
 );
 
 // List all built files
