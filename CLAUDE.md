@@ -277,8 +277,8 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-3. `cargo test --workspace`
+2. `cargo clippy-fastly && cargo clippy-axum`
+3. `cargo test-fastly && cargo test-axum`
 4. JS build and test (`cd crates/js/lib && npx vitest run`)
 5. JS format (`cd crates/js/lib && npm run format`)
 6. Docs format (`cd docs && npm run format`)
@@ -291,7 +291,7 @@ Every PR must pass:
 2. **Get approval** — for non-trivial changes, present a plan first.
 3. **Implement incrementally** — small, testable changes. Every change should
    impact as little code as possible.
-4. **Test after every change** — `cargo test --workspace`.
+4. **Test after every change** — `cargo test-fastly && cargo test-axum`.
 5. **Explain as you go** — describe what you changed and why.
 6. **If blocked** — explain what's blocking and why.
 

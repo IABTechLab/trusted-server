@@ -32,8 +32,11 @@ jobs:
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
-      - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run cargo clippy (Fastly — wasm32-wasip1)
+        run: cargo clippy-fastly
+
+      - name: Run cargo clippy (Axum — native)
+        run: cargo clippy-axum
 
   format-typescript:
     runs-on: ubuntu-latest
