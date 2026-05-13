@@ -108,7 +108,7 @@ fn build_draft_config(
     let host = target_url
         .host_str()
         .ok_or_else(|| Report::new(CliError::Audit).attach("audited URL is missing a host"))?;
-    let origin = format!("{}://{}", target_url.scheme(), host);
+    let origin = target_url.origin().ascii_serialization();
 
     draft = replace_once(
         &draft,
@@ -293,6 +293,31 @@ mod tests {
         assert!(
             draft.contains("[integrations.gpt]\nenabled = true"),
             "should enable GPT"
+        );
+    }
+
+    #[test]
+    fn builds_draft_config_preserves_non_default_origin_port() {
+        let url = Url::parse("https://publisher.example:8443/page").expect("should parse URL");
+        let artifact = AuditArtifact {
+            audited_url: url.to_string(),
+            page_title: None,
+            js_asset_count: 0,
+            third_party_asset_count: 0,
+            detected_integrations: Vec::new(),
+            assets: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let draft = build_draft_config(&url, &artifact).expect("should build draft config");
+
+        assert!(
+            draft.contains("domain = \"publisher.example\""),
+            "should derive the config domain without the port"
+        );
+        assert!(
+            draft.contains("origin_url = \"https://publisher.example:8443\""),
+            "should preserve the origin port"
         );
     }
 

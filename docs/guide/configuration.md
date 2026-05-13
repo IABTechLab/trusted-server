@@ -128,7 +128,8 @@ runtime_api_secret_store_name = "customer_a_api_keys"
 | `providers.fastly.request_signing.jwks_store_name`               | `jwks_store`      | Underlying Fastly Config Store linked at runtime as `jwks_store`.              |
 | `providers.fastly.request_signing.signing_secret_store_name`     | `signing_keys`    | Underlying Fastly Secret Store linked at runtime as `signing_keys`.            |
 | `providers.fastly.request_signing.runtime_api_secret_store_name` | `api-keys`        | Underlying Fastly Secret Store linked at runtime as `api-keys`.                |
-| `providers.fastly.request_signing.runtime_api_secret_key`        | `api_key`         | Secret key for the runtime Fastly API token.                                   |
+
+The runtime API token Secret Store item key is fixed to `api_key`; only the `runtime_api_secret_store_name` store name is configurable.
 
 Provider store names must be non-empty. Config Store names used for application config and JWKS must be distinct, and Secret Store names used for signing keys and runtime API credentials must be distinct.
 

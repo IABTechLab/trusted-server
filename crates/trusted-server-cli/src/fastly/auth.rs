@@ -74,11 +74,20 @@ pub struct ResolvedCredential {
     pub source: CredentialSource,
 }
 
+fn normalize_credential(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn resolve_fastly_api_key(
     store: &dyn CredentialStore,
 ) -> Result<ResolvedCredential, Report<CliError>> {
     if let Ok(value) = env::var("FASTLY_API_KEY")
-        && !value.trim().is_empty()
+        && let Some(value) = normalize_credential(&value)
     {
         return Ok(ResolvedCredential {
             value,
@@ -87,7 +96,7 @@ pub fn resolve_fastly_api_key(
     }
 
     if let Some(value) = store.read()?
-        && !value.trim().is_empty()
+        && let Some(value) = normalize_credential(&value)
     {
         return Ok(ResolvedCredential {
             value,
@@ -101,9 +110,11 @@ pub fn resolve_fastly_api_key(
 
 pub fn fastly_auth_status(store: &dyn CredentialStore) -> Result<AuthStatusJson, Report<CliError>> {
     let has_env_credential = env::var("FASTLY_API_KEY")
-        .map(|value| !value.trim().is_empty())
+        .map(|value| normalize_credential(&value).is_some())
         .unwrap_or(false);
-    let has_stored_credential = store.read()?.is_some_and(|value| !value.trim().is_empty());
+    let has_stored_credential = store
+        .read()?
+        .is_some_and(|value| normalize_credential(&value).is_some());
     let effective_source = if has_env_credential {
         Some(CredentialSource::Environment)
     } else if has_stored_credential {
@@ -186,10 +197,43 @@ mod tests {
     }
 
     #[test]
+    fn env_credential_is_trimmed() {
+        let _guard = ENV_LOCK.lock().expect("should lock environment");
+        let store = MemoryCredentialStore::default();
+        unsafe {
+            env::set_var("FASTLY_API_KEY", "  env-token\n");
+        }
+
+        let resolved = resolve_fastly_api_key(&store).expect("should resolve token");
+
+        assert_eq!(resolved.value, "env-token");
+        assert_eq!(resolved.source, CredentialSource::Environment);
+
+        unsafe {
+            env::remove_var("FASTLY_API_KEY");
+        }
+    }
+
+    #[test]
     fn stored_credential_is_used_when_env_is_missing() {
         let _guard = ENV_LOCK.lock().expect("should lock environment");
         let store = MemoryCredentialStore::default();
         store.write("stored-token").expect("should store token");
+        unsafe {
+            env::remove_var("FASTLY_API_KEY");
+        }
+
+        let resolved = resolve_fastly_api_key(&store).expect("should resolve stored token");
+
+        assert_eq!(resolved.value, "stored-token");
+        assert_eq!(resolved.source, CredentialSource::SecureStorage);
+    }
+
+    #[test]
+    fn stored_credential_is_trimmed() {
+        let _guard = ENV_LOCK.lock().expect("should lock environment");
+        let store = MemoryCredentialStore::default();
+        store.write("  stored-token\t").expect("should store token");
         unsafe {
             env::remove_var("FASTLY_API_KEY");
         }

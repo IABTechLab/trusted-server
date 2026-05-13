@@ -91,7 +91,7 @@ When enabled, provisioning manages these resources:
 | Secret Store      | Store    | `providers.fastly.request_signing.signing_secret_store_name` default `signing_keys` | Stores private signing keys.                       |
 | Secret Store item | Secret   | `<kid>`                                                                             | Private Ed25519 signing key bytes, base64 encoded. |
 | Secret Store      | Store    | `providers.fastly.request_signing.runtime_api_secret_store_name` default `api-keys` | Stores runtime API credentials.                    |
-| Secret Store item | Secret   | `providers.fastly.request_signing.runtime_api_secret_key` default `api_key`         | Runtime Fastly API token used for key rotation.    |
+| Secret Store item | Secret   | fixed key `api_key`                                                                 | Runtime Fastly API token used for key rotation.    |
 | Resource links    | Bindings | fixed runtime aliases `jwks_store`, `signing_keys`, `api-keys`                      | Make the stores available to the service version.  |
 
 If `jwks_store` and `signing_keys` are empty, `plan` warns that `apply` will bootstrap the first Ed25519 keypair. `apply` writes the public key material to `jwks_store` and the private signing key to `signing_keys`.

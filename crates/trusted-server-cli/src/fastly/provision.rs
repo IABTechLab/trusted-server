@@ -22,6 +22,7 @@ pub enum ResourceKind {
     Config,
     Secret,
     Kv,
+    ServiceVersion,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -30,6 +31,7 @@ pub enum ChangeKind {
     Create,
     Update,
     Bind,
+    Activate,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -273,6 +275,7 @@ pub fn apply_fastly_provisioning_with_outcome(
 
     let mut resolved_ids = HashMap::<String, String>::new();
     let mut completed_actions = Vec::new();
+    let mut activation_required = false;
     let mut activated_version = false;
 
     for resource in &plan.resources {
@@ -417,7 +420,7 @@ pub fn apply_fastly_provisioning_with_outcome(
                         )));
                     }
                     completed_actions.push(attempted_action);
-                    activated_version = true;
+                    activation_required = true;
                 }
                 Some(ChangeKind::Update) => {
                     let link_id = link.existing_link_id.as_deref().ok_or_else(|| {
@@ -454,15 +457,33 @@ pub fn apply_fastly_provisioning_with_outcome(
                         )));
                     }
                     completed_actions.push(attempted_action);
-                    activated_version = true;
+                    activation_required = true;
                 }
                 _ => {}
             }
         }
     }
 
-    if activated_version {
-        api.activate_service_version(service_id, target_version)?;
+    if activation_required {
+        let attempted_action = ProvisionActionJson {
+            action: ChangeKind::Activate,
+            resource_kind: ResourceKind::ServiceVersion,
+            name: target_version.to_string(),
+            detail: format!("activate service version {target_version} for service {service_id}"),
+            remote_id: Some(service_id.to_string()),
+        };
+        if let Err(error) = api.activate_service_version(service_id, target_version) {
+            return Ok(ProvisionApplyOutcome::Failure(build_apply_failure(
+                service_id,
+                validated,
+                &plan,
+                completed_actions,
+                attempted_action,
+                activated_version,
+                error,
+            )));
+        }
+        activated_version = true;
     }
 
     Ok(ProvisionApplyOutcome::Success(build_apply_json(
@@ -937,6 +958,8 @@ fn create_store(
         ResourceKind::Config => api.create_config_store(&resource.name),
         ResourceKind::Secret => api.create_secret_store(&resource.name),
         ResourceKind::Kv => api.create_kv_store(&resource.name),
+        ResourceKind::ServiceVersion => Err(Report::new(CliError::Provisioning)
+            .attach("service versions cannot be created as resource stores")),
     }
 }
 
@@ -945,6 +968,7 @@ fn resource_kind_label(kind: ResourceKind) -> &'static str {
         ResourceKind::Config => "config store",
         ResourceKind::Secret => "secret store",
         ResourceKind::Kv => "KV store",
+        ResourceKind::ServiceVersion => "service version",
     }
 }
 
@@ -971,6 +995,7 @@ mod tests {
         created_resource_links: Mutex<Vec<(String, String)>>,
         updated_resource_links: Mutex<Vec<(String, String, String)>>,
         activated_versions: Mutex<Vec<(String, u32)>>,
+        fail_activate_service_version: bool,
         fail_upsert_config_item: bool,
     }
 
@@ -1081,6 +1106,9 @@ mod tests {
             service_id: &str,
             version_number: u32,
         ) -> Result<ServiceVersion, Report<CliError>> {
+            if self.fail_activate_service_version {
+                return Err(Report::new(CliError::FastlyApi).attach("injected activation failure"));
+            }
             self.activated_versions
                 .lock()
                 .expect("should lock activated versions")
@@ -1486,6 +1514,67 @@ runtime_api_secret_store_name = "customer_api_keys"
                     .as_ref()
                     .is_some_and(|action| action.detail.contains("set config item")),
                 "should identify the failed config item action"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_outcome_preserves_partial_json_when_activation_fails() {
+        let api = MockFastlyApi {
+            versions: vec![ServiceVersion {
+                number: 9,
+                active: true,
+                locked: true,
+            }],
+            clone_result: Some(ServiceVersion {
+                number: 10,
+                active: false,
+                locked: false,
+            }),
+            fail_activate_service_version: true,
+            ..Default::default()
+        };
+        let validated = validated_config(false);
+
+        let outcome =
+            apply_fastly_provisioning_with_outcome(&api, &validated, "svc_123", None, true)
+                .expect("should return apply outcome");
+
+        assert!(
+            matches!(outcome, ProvisionApplyOutcome::Failure(_)),
+            "should return partial failure outcome"
+        );
+        if let ProvisionApplyOutcome::Failure(failure) = outcome {
+            assert!(
+                failure
+                    .json
+                    .completed_actions
+                    .iter()
+                    .any(|action| action.action == ChangeKind::Bind),
+                "should preserve the completed binding action"
+            );
+            assert!(
+                !failure.json.activated_version,
+                "should report that activation did not complete"
+            );
+            let failed_action = failure
+                .json
+                .failed_action
+                .as_ref()
+                .expect("should record failed activation action");
+            assert_eq!(
+                failed_action.action,
+                ChangeKind::Activate,
+                "should identify activation as the failed action"
+            );
+            assert_eq!(
+                failed_action.resource_kind,
+                ResourceKind::ServiceVersion,
+                "should identify service version activation"
+            );
+            assert!(
+                failed_action.detail.contains("activate service version 10"),
+                "should describe the failed activation"
             );
         }
     }
