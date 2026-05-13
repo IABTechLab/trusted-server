@@ -3,7 +3,7 @@
 /pkg
 /target
 
-# EdgeZero local KV store (created by axum dev server)
+# EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
 /crates/integration-tests/target
 
