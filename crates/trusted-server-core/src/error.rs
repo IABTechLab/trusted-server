@@ -210,4 +210,110 @@ mod tests {
         };
         assert_eq!(error.user_message(), "Invalid header value");
     }
+
+    #[test]
+    fn status_code_maps_each_error_variant_to_expected_http_response() {
+        let cases = vec![
+            (
+                TrustedServerError::BadRequest {
+                    message: "bad input".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::GdprConsent {
+                    message: "missing consent".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::InvalidHeaderValue {
+                    message: "invalid header".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::Forbidden {
+                    message: "not allowed".to_string(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::AllowlistViolation {
+                    host: "evil.example".to_string(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::Configuration {
+                    message: "config failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Settings {
+                    message: "settings failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::InvalidUtf8 {
+                    message: "invalid utf-8".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Ec {
+                    message: "ec failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::KvStore {
+                    store_name: "store".to_string(),
+                    message: "kv failed".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::Auction {
+                    message: "auction failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Gam {
+                    message: "gam failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Prebid {
+                    message: "prebid failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Integration {
+                    integration: "test".to_string(),
+                    message: "integration failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Proxy {
+                    message: "proxy failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                error.status_code(),
+                expected,
+                "should map {error:?} to expected HTTP status"
+            );
+        }
+    }
 }

@@ -483,3 +483,409 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auction::context::ContextValue;
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::{AuctionResponse, Bid, BidStatus};
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
+    use fastly::http::HeaderValue;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    fn make_request() -> Request {
+        let mut req = Request::new("POST", "https://publisher.example/auction");
+        req.set_header(
+            header::USER_AGENT,
+            HeaderValue::from_str("Mozilla/5.0 test").expect("should create user-agent header"),
+        );
+        req
+    }
+
+    fn make_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "auction-1".to_string(),
+            slots: vec![AdSlot {
+                id: "div-gpt-top".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "test-publisher.com".to_string(),
+                page_url: Some("https://test-publisher.com".to_string()),
+            },
+            user: UserInfo {
+                id: "synthetic-id".to_string(),
+                fresh_id: "fresh-id".to_string(),
+                consent: Some(ConsentContext::default()),
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn make_bid(slot_id: &str, bidder: &str, price: Option<f64>) -> Bid {
+        Bid {
+            slot_id: slot_id.to_string(),
+            price,
+            currency: "USD".to_string(),
+            creative: Some("<div>Ad</div>".to_string()),
+            adomain: Some(vec!["advertiser.example".to_string()]),
+            bidder: bidder.to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_result(bid: Bid) -> OrchestrationResult {
+        OrchestrationResult {
+            provider_responses: vec![AuctionResponse {
+                provider: "prebid".to_string(),
+                bids: vec![bid.clone()],
+                status: BidStatus::Success,
+                response_time_ms: 42,
+                metadata: HashMap::new(),
+            }],
+            mediator_response: None,
+            winning_bids: HashMap::from([(bid.slot_id.clone(), bid)]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn response_json(mut response: Response) -> JsonValue {
+        serde_json::from_slice(&response.take_body_bytes()).expect("should parse JSON response")
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_maps_banner_units_bidders_context_and_request_metadata() {
+        let mut settings = create_test_settings();
+        settings.auction.allowed_context_keys = HashSet::from([
+            "segments".to_string(),
+            "lockr_id".to_string(),
+            "count".to_string(),
+            "unsupported".to_string(),
+        ]);
+        let req = make_request();
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "div-gpt-top".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250], vec![728, 90]],
+                    }),
+                }),
+                bids: Some(vec![
+                    BidConfig {
+                        bidder: "appnexus".to_string(),
+                        params: json!({ "placementId": 123 }),
+                    },
+                    BidConfig {
+                        bidder: "rubicon".to_string(),
+                        params: json!({ "accountId": 456 }),
+                    },
+                ]),
+            }],
+            config: Some(json!({
+                "segments": ["seg-a", "seg-b"],
+                "lockr_id": "lockr-123",
+                "count": 2,
+                "unsupported": { "nested": true },
+                "blocked": "drop-me"
+            })),
+        };
+
+        let services = noop_services();
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            "existing-ec-id",
+            None,
+        )
+        .expect("should convert banner request");
+
+        assert_eq!(auction_request.slots.len(), 1, "should create one slot");
+        let slot = &auction_request.slots[0];
+        assert_eq!(slot.id, "div-gpt-top", "should preserve ad unit code");
+        assert_eq!(
+            slot.formats,
+            vec![
+                AdFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: MediaType::Banner,
+                },
+                AdFormat {
+                    width: 728,
+                    height: 90,
+                    media_type: MediaType::Banner,
+                },
+            ],
+            "should convert banner sizes to formats"
+        );
+        assert_eq!(
+            slot.bidders.get("appnexus"),
+            Some(&json!({ "placementId": 123 })),
+            "should preserve bidder params"
+        );
+        assert_eq!(
+            slot.bidders.get("rubicon"),
+            Some(&json!({ "accountId": 456 })),
+            "should preserve all bidder params"
+        );
+        assert_eq!(
+            auction_request.publisher.domain, settings.publisher.domain,
+            "should copy publisher domain"
+        );
+        assert_eq!(
+            auction_request
+                .site
+                .as_ref()
+                .map(|site| site.domain.as_str()),
+            Some(settings.publisher.domain.as_str()),
+            "should create site metadata from settings"
+        );
+        assert_eq!(
+            auction_request.user.id, "existing-ec-id",
+            "should use caller-provided EC ID"
+        );
+        assert!(
+            !auction_request.user.fresh_id.is_empty(),
+            "should generate a fresh EC ID"
+        );
+        assert!(
+            auction_request.user.consent.is_some(),
+            "should preserve consent context"
+        );
+        assert_eq!(
+            auction_request
+                .device
+                .as_ref()
+                .and_then(|device| device.user_agent.as_deref()),
+            Some("Mozilla/5.0 test"),
+            "should copy user-agent into device info"
+        );
+        assert_eq!(
+            auction_request.context.get("segments"),
+            Some(&ContextValue::StringList(vec![
+                "seg-a".to_string(),
+                "seg-b".to_string()
+            ])),
+            "should keep allowed string-list context values"
+        );
+        assert_eq!(
+            auction_request.context.get("lockr_id"),
+            Some(&ContextValue::Text("lockr-123".to_string())),
+            "should keep allowed text context values"
+        );
+        assert_eq!(
+            auction_request.context.get("count"),
+            Some(&ContextValue::Number(2.0)),
+            "should keep allowed number context values"
+        );
+        assert!(
+            !auction_request.context.contains_key("unsupported"),
+            "should drop allowed keys with unsupported value types"
+        );
+        assert!(
+            !auction_request.context.contains_key("blocked"),
+            "should drop disallowed context keys"
+        );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_rejects_banner_sizes_that_are_not_width_height_pairs() {
+        let settings = create_test_settings();
+        let req = make_request();
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "div-gpt-top".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250, 1]],
+                    }),
+                }),
+                bids: None,
+            }],
+            config: None,
+        };
+
+        let services = noop_services();
+        let err = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            "existing-ec-id",
+            None,
+        )
+        .expect_err("should reject malformed banner size");
+
+        assert!(
+            format!("{err:?}").contains("Invalid banner size; expected [width, height]"),
+            "should explain invalid banner size"
+        );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_skips_units_without_banner_media() {
+        let settings = create_test_settings();
+        let req = make_request();
+        let body = AdRequest {
+            ad_units: vec![
+                AdUnit {
+                    code: "no-media".to_string(),
+                    media_types: None,
+                    bids: None,
+                },
+                AdUnit {
+                    code: "no-banner".to_string(),
+                    media_types: Some(MediaTypes { banner: None }),
+                    bids: None,
+                },
+            ],
+            config: None,
+        };
+
+        let services = noop_services();
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            "existing-ec-id",
+            None,
+        )
+        .expect("should skip unsupported media units");
+
+        assert!(
+            auction_request.slots.is_empty(),
+            "should only create slots for banner media"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_serializes_winning_bid_headers_and_orchestrator_ext() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert auction result to OpenRTB response");
+
+        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(
+            response.get_header_str(header::CONTENT_TYPE),
+            Some("application/json"),
+            "should set JSON content type"
+        );
+        assert_eq!(
+            response.get_header_str(HEADER_X_TS_EC),
+            Some("synthetic-id"),
+            "should set EC ID header"
+        );
+        assert_eq!(
+            response.get_header_str(HEADER_X_TS_EC_FRESH),
+            Some("fresh-id"),
+            "should set fresh EC ID header"
+        );
+
+        let json = response_json(response);
+        assert_eq!(json["id"], json!("auction-1"), "should preserve auction ID");
+        assert_eq!(
+            json["seatbid"][0]["seat"],
+            json!("appnexus"),
+            "should use bidder as seat"
+        );
+        let bid = &json["seatbid"][0]["bid"][0];
+        assert_eq!(bid["id"], json!("appnexus-div-gpt-top"));
+        assert_eq!(bid["impid"], json!("div-gpt-top"));
+        assert_eq!(bid["price"], json!(2.75));
+        assert_eq!(bid["adm"], json!("<div>Ad</div>"));
+        assert_eq!(bid["crid"], json!("appnexus-creative"));
+        assert_eq!(bid["w"], json!(300));
+        assert_eq!(bid["h"], json!(250));
+        assert_eq!(bid["adomain"], json!(["advertiser.example"]));
+        assert_eq!(
+            json["ext"]["orchestrator"]["strategy"],
+            json!("parallel_only"),
+            "should use default parallel-only strategy"
+        );
+        assert_eq!(json["ext"]["orchestrator"]["providers"], json!(1));
+        assert_eq!(json["ext"]["orchestrator"]["total_bids"], json!(1));
+        assert_eq!(json["ext"]["orchestrator"]["time_ms"], json!(50));
+        assert_eq!(
+            json["ext"]["orchestrator"]["provider_details"][0]["name"],
+            json!("prebid"),
+            "should include provider summary details"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_uses_parallel_mediation_when_mediator_configured() {
+        let mut settings = create_test_settings();
+        settings.auction.mediator = Some("adserver_mock".to_string());
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", Some(2.75)));
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert auction result to OpenRTB response");
+        let json = response_json(response);
+
+        assert_eq!(
+            json["ext"]["orchestrator"]["strategy"],
+            json!("parallel_mediation"),
+            "should use mediation strategy when mediator is configured"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_errors_when_winning_bid_has_no_price() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let result = make_result(make_bid("div-gpt-top", "appnexus", None));
+
+        let err = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect_err("should reject winning bid without decoded price");
+
+        assert!(
+            format!("{err:?}").contains("has no decoded price"),
+            "should explain missing decoded price"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_omits_out_of_range_dimensions() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.width = u32::MAX;
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert bid with out-of-range OpenRTB width");
+        let json = response_json(response);
+        let bid = &json["seatbid"][0]["bid"][0];
+
+        assert!(bid.get("w").is_none(), "should omit out-of-range width");
+        assert_eq!(bid["h"], json!(250), "should keep in-range height");
+    }
+}
