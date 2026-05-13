@@ -3,10 +3,16 @@ use std::sync::Arc;
 
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::StatusCode;
+use fastly::http::request::PendingRequest;
+use fastly::http::{header, StatusCode};
 use fastly::Request;
-use trusted_server_core::auction::build_orchestrator;
+use serde_json::json;
+use trusted_server_core::auction::{
+    build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
+    AuctionResponse,
+};
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -118,9 +124,44 @@ impl PlatformGeo for NoopGeo {
     }
 }
 
-fn create_test_settings() -> Settings {
-    let settings = Settings::from_toml(
-        r#"
+struct DisabledRouteProvider;
+
+impl AuctionProvider for DisabledRouteProvider {
+    fn provider_name(&self) -> &'static str {
+        "disabled-route"
+    }
+
+    fn request_bids(
+        &self,
+        _request: &AuctionRequest,
+        _context: &AuctionContext<'_>,
+    ) -> Result<PendingRequest, Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Auction {
+            message: "disabled route provider should not launch requests".to_string(),
+        }))
+    }
+
+    fn parse_response(
+        &self,
+        _response: fastly::Response,
+        _response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Auction {
+            message: "disabled route provider should not parse responses".to_string(),
+        }))
+    }
+
+    fn timeout_ms(&self) -> u32 {
+        2000
+    }
+
+    fn is_enabled(&self) -> bool {
+        false
+    }
+}
+
+fn base_route_settings_toml() -> &'static str {
+    r#"
             [[handlers]]
             path = "^/_ts/admin"
             username = "admin"
@@ -139,18 +180,32 @@ fn create_test_settings() -> Settings {
             enabled = false
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
+        "#
+}
 
+fn prebid_integration_toml() -> &'static str {
+    r#"
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
+        "#
+}
+
+fn create_test_settings() -> Settings {
+    let base = base_route_settings_toml();
+    let prebid = prebid_integration_toml();
+    let config = format!(
+        r#"{base}
+
+{prebid}
 
             [auction]
             enabled = true
             providers = ["prebid"]
             timeout_ms = 2000
         "#,
-    )
-    .expect("should parse adapter route test settings");
+    );
+    let settings = Settings::from_toml(&config).expect("should parse adapter route test settings");
 
     assert_eq!(
         JWKS_CONFIG_STORE_NAME, "jwks_store",
@@ -158,6 +213,32 @@ fn create_test_settings() -> Settings {
     );
 
     settings
+}
+
+fn create_auction_test_settings(providers: &str) -> Settings {
+    let base = base_route_settings_toml();
+    let prebid = prebid_integration_toml();
+    let config = format!(
+        r#"{base}
+
+{prebid}
+
+            [auction]
+            enabled = true
+            providers = {providers}
+            timeout_ms = 2000
+        "#,
+    );
+
+    Settings::from_toml(&config).expect("should parse adapter auction route test settings")
+}
+
+fn build_route_stack(settings: &Settings) -> (AuctionOrchestrator, IntegrationRegistry) {
+    let orchestrator = build_orchestrator(settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(settings).expect("should create integration registry");
+
+    (orchestrator, integration_registry)
 }
 
 fn test_runtime_services(req: &Request) -> RuntimeServices {
@@ -174,6 +255,54 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
             tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
         })
         .build()
+}
+
+fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
+    let (orchestrator, integration_registry) = build_route_stack(settings);
+
+    route_auction_with_stack(settings, &orchestrator, &integration_registry, body)
+}
+
+fn route_auction_with_stack(
+    settings: &Settings,
+    orchestrator: &AuctionOrchestrator,
+    integration_registry: &IntegrationRegistry,
+    body: impl Into<Vec<u8>>,
+) -> fastly::Response {
+    let partner_registry =
+        PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry");
+    let req = Request::post("https://test.com/auction")
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_body(body.into());
+    let services = test_runtime_services(&req);
+
+    futures::executor::block_on(route_request(
+        settings,
+        orchestrator,
+        integration_registry,
+        &partner_registry,
+        &services,
+        req,
+    ))
+    .expect("should route auction request")
+    .response
+    .expect("should buffer auction response in tests")
+}
+
+fn valid_banner_ad_unit_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "adUnits": [
+            {
+                "code": "div-gpt-ad-1",
+                "mediaTypes": {
+                    "banner": {
+                        "sizes": [[300, 250]]
+                    }
+                }
+            }
+        ]
+    }))
+    .expect("should serialize valid auction route test body")
 }
 
 #[test]
@@ -227,4 +356,82 @@ fn routes_use_request_local_consent() {
 
     // Routes no longer depend on a separate consent KV store. Live consent is
     // request-local, and EC lifecycle state uses the EC identity store only.
+}
+
+#[test]
+fn malformed_auction_json_returns_bad_request() {
+    let settings = create_auction_test_settings(r#"["prebid"]"#);
+
+    let mut response = route_auction(&settings, "{not-json");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject malformed JSON as a client request error"
+    );
+    assert!(
+        response.take_body_str().contains("Bad request"),
+        "should return a client-facing bad request message"
+    );
+}
+
+#[test]
+fn invalid_auction_banner_size_returns_bad_request() {
+    let settings = create_auction_test_settings(r#"["prebid"]"#);
+    let body = serde_json::to_vec(&json!({
+        "adUnits": [
+            {
+                "code": "div-gpt-ad-1",
+                "mediaTypes": {
+                    "banner": {
+                        "sizes": [[300]]
+                    }
+                }
+            }
+        ]
+    }))
+    .expect("should serialize invalid auction route test body");
+
+    let response = route_auction(&settings, body);
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "should reject semantically invalid banner sizes as a client request error"
+    );
+}
+
+#[test]
+fn auction_request_with_empty_provider_list_returns_bad_gateway() {
+    let settings = create_auction_test_settings("[]");
+
+    let response = route_auction(&settings, valid_banner_ad_unit_body());
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should surface no-provider orchestration failures as gateway errors"
+    );
+}
+
+#[test]
+fn auction_request_with_disabled_provider_returns_bad_gateway() {
+    let settings = create_auction_test_settings(r#"["disabled-route"]"#);
+    let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+    orchestrator.register_provider(Arc::new(DisabledRouteProvider));
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let response = route_auction_with_stack(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        valid_banner_ad_unit_body(),
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should map skipped-provider launch failures to gateway errors"
+    );
 }
