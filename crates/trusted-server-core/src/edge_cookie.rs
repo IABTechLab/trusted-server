@@ -179,7 +179,6 @@ pub fn get_or_generate_ec_id(
     get_or_generate_ec_id_from_http_request(settings, services, req)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
