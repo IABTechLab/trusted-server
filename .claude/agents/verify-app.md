@@ -19,13 +19,13 @@ cargo fmt --all -- --check
 ### 2. Clippy
 
 ```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy-fastly && cargo clippy-axum
 ```
 
 ### 3. Rust Tests
 
 ```bash
-cargo test --workspace
+cargo test-fastly && cargo test-axum
 ```
 
 ### 4. JS Tests

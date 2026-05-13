@@ -68,9 +68,10 @@ use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -299,9 +300,13 @@ impl DataDomeIntegration {
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .cloned();
-        let body = collect_body(backend_resp.response.into_body(), DATADOME_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read DataDome SDK response body"))?;
+        let body = collect_response_bounded(
+            backend_resp.response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            DATADOME_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read DataDome SDK response body"))?;
         let rewritten = self.rewrite_script_content(&String::from_utf8_lossy(&body));
 
         // Build response with caching headers
@@ -359,8 +364,7 @@ impl DataDomeIntegration {
         let request_body = if parts.method == Method::POST || parts.method == Method::PUT {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DATADOME_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error("DataDome API request body too large"))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

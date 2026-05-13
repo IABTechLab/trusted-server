@@ -108,7 +108,7 @@ For each changed file, evaluate:
 - Are new code paths tested?
 - Are edge cases covered (empty input, max values, error paths)?
 - If config-derived regex/pattern compilation changed: are invalid enabled-config startup failures and explicit `enabled = false` bypass cases both covered?
-- Rust tests: `cargo test --workspace`
+- Rust tests: `cargo test-fastly && cargo test-axum`
 - JS tests: `npx vitest run` in `crates/js/lib/`
 
 ### 5. Classify findings

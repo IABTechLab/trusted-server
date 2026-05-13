@@ -120,7 +120,7 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     let message = Arc::new(format!("{}\n", e.current_context().user_message()));
     let status = e.current_context().status_code();
 
-    let make = move |msg: Arc<String>| {
+    let make_handler = |msg: Arc<String>| {
         move |_ctx: RequestContext| {
             let body = edgezero_core::body::Body::from((*msg).clone());
             let mut resp = Response::new(body);
@@ -137,10 +137,10 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         .middleware(FinalizeResponseMiddleware::new(Arc::new(
             Settings::default(),
         )))
-        .get("/", make(Arc::clone(&message)))
-        .post("/", make(Arc::clone(&message)))
-        .get("/{*rest}", make(Arc::clone(&message)))
-        .post("/{*rest}", make(Arc::clone(&message)))
+        .get("/", make_handler(Arc::clone(&message)))
+        .post("/", make_handler(Arc::clone(&message)))
+        .get("/{*rest}", make_handler(Arc::clone(&message)))
+        .post("/{*rest}", make_handler(Arc::clone(&message)))
         .build()
 }
 
@@ -207,9 +207,6 @@ impl Hooks for TrustedServerApp {
             );
             Ok::<Response, EdgeError>(resp)
         };
-        let rotate_handler = admin_not_supported;
-        let deactivate_handler = admin_not_supported;
-
         // /auction
         let s = Arc::clone(&state);
         let auction_handler = move |ctx: RequestContext| {
@@ -355,8 +352,8 @@ impl Hooks for TrustedServerApp {
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
-            .post("/admin/keys/rotate", rotate_handler)
-            .post("/admin/keys/deactivate", deactivate_handler)
+            .post("/admin/keys/rotate", admin_not_supported)
+            .post("/admin/keys/deactivate", admin_not_supported)
             .post("/auction", auction_handler)
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)

@@ -1,6 +1,6 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
 //!
-//! Contains only the three functions used by the legacy `main()` entry point.
+//! Contains only the functions used by the legacy `main()` entry point.
 //! Relocated from `trusted-server-core` as part of removing all `fastly` crate
 //! imports from the core library.
 
@@ -68,6 +68,19 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
         }
     }
 
+    fastly_resp
+}
+
+/// Convert an [`HttpResponse`] into a `fastly::Response` without a body.
+///
+/// Use this when the caller will stream the body separately through
+/// [`fastly::Response::stream_to_client`].
+pub(crate) fn to_fastly_response_skeleton(resp: HttpResponse) -> fastly::Response {
+    let (parts, _body) = resp.into_parts();
+    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
+    for (name, value) in &parts.headers {
+        fastly_resp.append_header(name.as_str(), value.as_bytes());
+    }
     fastly_resp
 }
 

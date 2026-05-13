@@ -7,7 +7,7 @@ use http::{Request, Response};
 use crate::auction::formats::AdRequest;
 use crate::consent;
 use crate::cookies::handle_request_cookies;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::integrations::collect_body_bounded;
 use crate::platform::RuntimeServices;
@@ -41,11 +41,7 @@ pub async fn handle_auction(
     let (parts, body) = req.into_parts();
 
     // Parse request body — use a bounded read so streaming bodies cannot exhaust memory.
-    let body_bytes = collect_body_bounded(body, AUCTION_MAX_BODY_BYTES, "auction")
-        .await
-        .change_context(TrustedServerError::Auction {
-            message: "Failed to read auction request body".to_string(),
-        })?;
+    let body_bytes = collect_body_bounded(body, AUCTION_MAX_BODY_BYTES, "auction").await?;
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
@@ -60,12 +56,12 @@ pub async fn handle_auction(
 
     // Generate EC ID early so the consent pipeline can use it for
     // KV Store fallback/write operations.
-    let ec_id = get_or_generate_ec_id(settings, services, &http_req).change_context(
-        TrustedServerError::Auction {
+    let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &http_req)
+        .change_context(TrustedServerError::Auction {
             message: "Failed to generate EC ID".to_string(),
-        },
-    )?;
+        })?;
 
+    // Extract consent from request cookies, headers, and geo.
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = services
         .geo()
@@ -102,7 +98,6 @@ pub async fn handle_auction(
     let context = AuctionContext {
         settings,
         request: &http_req,
-        client_info: services.client_info(),
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
@@ -125,4 +120,37 @@ pub async fn handle_auction(
 
     // Convert to OpenRTB response format with inline creative HTML
     convert_to_openrtb_response(&result, settings, &auction_request)
+}
+
+#[cfg(test)]
+mod tests {
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{Method, Request as HttpRequest, StatusCode};
+
+    use crate::auction::build_orchestrator;
+    use crate::error::IntoHttpResponse;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::create_test_settings;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn auction_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let oversized = vec![b'x'; AUCTION_MAX_BODY_BYTES + 1];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://test.com/auction")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_auction(&settings, &orchestrator, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for auction body over limit"
+        );
+    }
 }

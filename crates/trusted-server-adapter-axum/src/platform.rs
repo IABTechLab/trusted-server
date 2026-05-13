@@ -184,7 +184,7 @@ impl PlatformGeo for AxumPlatformGeo {
 // PlatformHttpClient
 // ---------------------------------------------------------------------------
 
-type ResponseTriplet = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
+type SpawnedRequestResult = Result<(u16, Vec<(String, Vec<u8>)>, Vec<u8>), Report<PlatformError>>;
 
 /// Buffered response parts from a spawned outbound request.
 ///
@@ -193,7 +193,7 @@ type ResponseTriplet = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
 /// [`futures::future::select_all`].
 struct AxumPendingHandle {
     backend_name: String,
-    handle: tokio::task::JoinHandle<Result<ResponseTriplet, Report<PlatformError>>>,
+    handle: tokio::task::JoinHandle<SpawnedRequestResult>,
 }
 
 /// reqwest-backed HTTP client for the Axum dev server.
@@ -235,6 +235,7 @@ impl AxumPlatformHttpClient {
         match body {
             edgezero_core::body::Body::Once(bytes) => Ok(bytes.to_vec()),
             edgezero_core::body::Body::Stream(mut stream) => {
+                log::debug!("buffering Body::Stream into Vec<u8> for outbound request");
                 use futures::StreamExt as _;
                 let mut buf = Vec::new();
                 while let Some(chunk) = stream.next().await {

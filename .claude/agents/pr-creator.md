@@ -21,8 +21,8 @@ Before creating the PR, verify the branch is healthy:
 
 ```
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo clippy-fastly && cargo clippy-axum
+cargo test-fastly && cargo test-axum
 cd crates/js/lib && npx vitest run
 cd crates/js/lib && npm run format
 cd docs && npm run format

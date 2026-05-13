@@ -21,9 +21,10 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body, collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -147,9 +148,13 @@ impl LockrIntegration {
             ))));
         }
 
-        let sdk_body = collect_body(lockr_response.into_body(), LOCKR_INTEGRATION_ID)
-            .await
-            .change_context(Self::error("Failed to read Lockr SDK response body"))?;
+        let sdk_body = collect_response_bounded(
+            lockr_response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            LOCKR_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read Lockr SDK response body"))?;
         log::info!("Fetched Lockr SDK ({} bytes)", sdk_body.len());
 
         // TODO: Cache in KV store (future enhancement)
@@ -199,11 +204,10 @@ impl LockrIntegration {
 
         log::info!("Forwarding to Lockr API: {}", target_url);
 
-        let request_body = if matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+        let request_body = if method == Method::POST {
             let bytes =
                 collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, LOCKR_INTEGRATION_ID)
-                    .await
-                    .change_context(Self::error("Lockr API request body too large"))?;
+                    .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()

@@ -28,6 +28,8 @@ use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::platform::PlatformGeo;
 use trusted_server_core::settings::Settings;
 
+pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
+
 // ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
 // ---------------------------------------------------------------------------
@@ -40,7 +42,8 @@ use trusted_server_core::settings::Settings;
 ///
 /// Router-level 405/404 responses for unregistered HTTP methods (e.g. TRACE) bypass the
 /// middleware chain. Those are covered by a second call to [`apply_finalize_headers`] at
-/// the `main.rs` entry point, which is idempotent for normal requests.
+/// the `main.rs` entry point. Middleware-finalized responses carry
+/// [`HEADER_X_TS_FINALIZED`] so the entry point can skip duplicate finalization.
 ///
 /// # Header precedence
 ///
@@ -85,6 +88,9 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_FINALIZED, HeaderValue::from_static("1"));
 
         Ok(response)
     }
@@ -99,13 +105,15 @@ impl Middleware for FinalizeResponseMiddleware {
 /// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
-/// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
+/// - `Err(report)` → internal error; log and convert to an HTTP response via
+///   [`crate::app::http_error`] using the error's documented status code.
 ///
 /// # Errors
 ///
-/// When [`enforce_basic_auth`] returns an error report, converts it to a 500 HTTP
-/// response so that [`FinalizeResponseMiddleware`] can still inject standard TS
-/// headers before the response reaches the client.
+/// When [`enforce_basic_auth`] returns an error report, converts it to an HTTP
+/// response via [`crate::app::http_error`] (preserving the error's status code)
+/// so that [`FinalizeResponseMiddleware`] can still inject standard TS headers
+/// before the response reaches the client.
 pub struct AuthMiddleware {
     settings: Arc<Settings>,
 }
@@ -299,6 +307,29 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
             "should set X-Geo-Info-Available: false when geo returns None"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_marks_response_as_finalized() {
+        let settings = settings_with_response_headers(vec![]);
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should succeed");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-finalized")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "middleware-finalized responses should carry the entry-point sentinel"
         );
     }
 

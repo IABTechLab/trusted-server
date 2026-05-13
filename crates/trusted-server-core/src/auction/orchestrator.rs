@@ -145,7 +145,6 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
                 services: context.services,
@@ -319,7 +318,6 @@ impl AuctionOrchestrator {
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
                 services: context.services,
@@ -338,7 +336,15 @@ impl AuctionOrchestrator {
                     let request_backend_name = pending
                         .backend_name()
                         .map(str::to_string)
-                        .unwrap_or_else(|| backend_name.clone());
+                        .unwrap_or_else(|| {
+                            log::warn!(
+                                "Provider '{}' pending request returned no backend name; \
+                             using predicted name '{}'",
+                                provider.provider_name(),
+                                backend_name,
+                            );
+                            backend_name.clone()
+                        });
                     backend_to_provider.insert(
                         request_backend_name.clone(),
                         (provider.provider_name(), start_time, provider.as_ref()),
@@ -626,14 +632,6 @@ mod tests {
         AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
     };
 
-    // All-None ClientInfo used across tests that don't need real IP/TLS data.
-    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
-    // the temporary-lifetime issue that arises with &ClientInfo::default().
-    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
-        client_ip: None,
-        tls_protocol: None,
-        tls_cipher: None,
-    };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use std::collections::{HashMap, HashSet};
@@ -779,7 +777,7 @@ mod tests {
             .uri("https://test.com/test")
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
-        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
+        let context = create_test_auction_context(&settings, &req, 2000);
 
         let result = orchestrator
             .run_auction(&request, &context, &noop_services())
