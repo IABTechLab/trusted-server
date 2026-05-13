@@ -7,12 +7,16 @@ use fastly::http::request::PendingRequest;
 use fastly::http::{header, StatusCode};
 use fastly::Request;
 use serde_json::json;
+<<<<<<< HEAD
 use trusted_server_core::auction::{
     build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
     AuctionResponse,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
+=======
+use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+>>>>>>> 680579cf (Fail auction when no providers launch)
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,

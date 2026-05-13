@@ -384,6 +384,12 @@ impl AuctionOrchestrator {
             }
         }
 
+        if pending_requests.is_empty() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: "No provider requests launched".to_string(),
+            }));
+        }
+
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
         // lgtm[rust/cleartext-logging]
         // This info log reports request counts and timeout budget only; no secret settings are logged.
