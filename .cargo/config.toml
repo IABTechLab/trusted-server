@@ -19,7 +19,7 @@ test-cloudflare = ["test", "-p", "trusted-server-adapter-cloudflare"]
 check-cloudflare = ["check", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
 
 # Clippy — target-matched to avoid cross-target compile failures
-clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
+clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
 clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--", "-D", "warnings"]
 clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
