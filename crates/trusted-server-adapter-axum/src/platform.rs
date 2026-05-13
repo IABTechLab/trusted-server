@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -186,6 +187,44 @@ impl PlatformGeo for AxumPlatformGeo {
 
 type SpawnedRequestResult = Result<(u16, Vec<(String, Vec<u8>)>, Vec<u8>), Report<PlatformError>>;
 
+fn sanitized_response_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
+    let connection_tokens = connection_header_tokens(headers);
+
+    headers
+        .iter()
+        .filter(|(name, _)| !is_hop_by_hop_response_header(name, &connection_tokens))
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect()
+}
+
+fn connection_header_tokens(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(header_value_to_str)
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| HeaderName::from_bytes(token.as_bytes()).ok())
+        .collect()
+}
+
+fn header_value_to_str(value: &HeaderValue) -> Option<&str> {
+    value.to_str().ok()
+}
+
+fn is_hop_by_hop_response_header(name: &HeaderName, connection_tokens: &[HeaderName]) -> bool {
+    name == header::CONNECTION
+        || name == header::PROXY_AUTHENTICATE
+        || name == header::PROXY_AUTHORIZATION
+        || name == header::TE
+        || name == header::TRAILER
+        || name == header::TRANSFER_ENCODING
+        || name == header::UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+        || connection_tokens.iter().any(|token| token == name)
+}
+
 /// Buffered response parts from a spawned outbound request.
 ///
 /// Stored inside [`PlatformPendingRequest`] so that [`AxumPlatformHttpClient::select`]
@@ -277,8 +316,8 @@ impl AxumPlatformHttpClient {
 
         let status = resp.status().as_u16();
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
-        for (name, value) in resp.headers() {
-            edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
+        for (name, value) in sanitized_response_headers(resp.headers()) {
+            edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
         let resp_bytes = resp
             .bytes()
@@ -343,11 +382,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                     .attach(format!("outbound request to {uri} failed: {e}"))
             })?;
             let status = resp.status().as_u16();
-            let resp_headers: Vec<(String, Vec<u8>)> = resp
-                .headers()
-                .iter()
-                .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
-                .collect();
+            let resp_headers = sanitized_response_headers(resp.headers());
             let body = resp
                 .bytes()
                 .await
@@ -471,7 +506,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn config_store_reads_from_env_var() {
@@ -557,5 +594,86 @@ mod tests {
             .lookup(Some("127.0.0.1".parse().expect("should parse IP")))
             .expect("should not error");
         assert!(with_ip.is_none(), "should return None for any IP");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_strips_hop_by_hop_response_headers() {
+        let url = serve_raw_response(
+            b"HTTP/1.1 200 OK\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Connection: keep-alive, x-remove-me\r\n\
+              Keep-Alive: timeout=5\r\n\
+              X-Remove-Me: listed-by-connection\r\n\
+              X-Preserve-Me: application-header\r\n\
+              \r\n\
+              2\r\n\
+              ok\r\n\
+              0\r\n\
+              \r\n",
+        )
+        .await;
+
+        let request = edgezero_core::http::request_builder()
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let response = AxumPlatformHttpClient::new()
+            .send(PlatformHttpRequest::new(request, "test_backend"))
+            .await
+            .expect("should proxy raw response")
+            .response;
+
+        assert!(
+            response.headers().get(header::TRANSFER_ENCODING).is_none(),
+            "should strip transfer-encoding"
+        );
+        assert!(
+            response.headers().get(header::CONNECTION).is_none(),
+            "should strip connection"
+        );
+        assert!(
+            response.headers().get("keep-alive").is_none(),
+            "should strip keep-alive"
+        );
+        assert!(
+            response.headers().get("x-remove-me").is_none(),
+            "should strip headers named by connection"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-preserve-me")
+                .and_then(|value| value.to_str().ok()),
+            Some("application-header"),
+            "should preserve end-to-end headers"
+        );
+        assert_eq!(
+            response.into_body().into_bytes().as_ref(),
+            b"ok",
+            "should preserve decoded response body"
+        );
+    }
+
+    async fn serve_raw_response(response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind raw HTTP test server");
+        let addr = listener.local_addr().expect("should read local address");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("should accept request");
+            let mut request = [0; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("should read request");
+            stream
+                .write_all(response)
+                .await
+                .expect("should write response");
+        });
+
+        format!("http://{addr}/")
     }
 }
