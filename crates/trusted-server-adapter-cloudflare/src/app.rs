@@ -302,64 +302,50 @@ impl Hooks for TrustedServerApp {
             }
         };
 
+        // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
+        async fn dispatch(
+            state: Arc<AppState>,
+            ctx: RequestContext,
+            allow_tsjs: bool,
+        ) -> Result<Response, EdgeError> {
+            let services = build_per_request_services(&ctx);
+            let req = ctx.into_request();
+            let path = req.uri().path().to_owned();
+            let method = req.method().clone();
+
+            let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
+                handle_tsjs_dynamic(&req, &state.registry)
+            } else if state.registry.has_route(&method, &path) {
+                state
+                    .registry
+                    .handle_proxy(&method, &path, &state.settings, &services, req)
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(Report::new(TrustedServerError::BadRequest {
+                            message: format!("Unknown integration route: {path}"),
+                        }))
+                    })
+            } else {
+                handle_publisher_request(&state.settings, &state.registry, &services, req)
+                    .await
+                    .and_then(|pr| resolve_publisher_response(pr, &state.settings, &state.registry))
+            };
+
+            Ok(result.unwrap_or_else(|e| http_error(&e)))
+        }
+
         // GET /{*rest} — tsjs, integration proxy, or publisher fallback
         let s = Arc::clone(&state);
         let get_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
-
-                let result = if path.starts_with("/static/tsjs=") {
-                    handle_tsjs_dynamic(&req, &s.registry)
-                } else if s.registry.has_route(&method, &path) {
-                    s.registry
-                        .handle_proxy(&method, &path, &s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|| {
-                            Err(Report::new(TrustedServerError::BadRequest {
-                                message: format!("Unknown integration route: {path}"),
-                            }))
-                        })
-                } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req)
-                        .await
-                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
-                };
-
-                Ok(result.unwrap_or_else(|e| http_error(&e)))
-            }
+            dispatch(s, ctx, true)
         };
 
         // POST /{*rest} — integration proxy or publisher origin fallback
         let s = Arc::clone(&state);
         let post_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
-
-                let result = if s.registry.has_route(&method, &path) {
-                    s.registry
-                        .handle_proxy(&method, &path, &s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|| {
-                            Err(Report::new(TrustedServerError::BadRequest {
-                                message: format!("Unknown integration route: {path}"),
-                            }))
-                        })
-                } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req)
-                        .await
-                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
-                };
-
-                Ok(result.unwrap_or_else(|e| http_error(&e)))
-            }
+            dispatch(s, ctx, false)
         };
 
         RouterService::builder()

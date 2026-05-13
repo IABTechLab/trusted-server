@@ -184,6 +184,8 @@ impl PlatformGeo for AxumPlatformGeo {
 // PlatformHttpClient
 // ---------------------------------------------------------------------------
 
+type ResponseTriplet = (u16, Vec<(String, Vec<u8>)>, Vec<u8>);
+
 /// Buffered response parts from a spawned outbound request.
 ///
 /// Stored inside [`PlatformPendingRequest`] so that [`AxumPlatformHttpClient::select`]
@@ -191,9 +193,7 @@ impl PlatformGeo for AxumPlatformGeo {
 /// [`futures::future::select_all`].
 struct AxumPendingHandle {
     backend_name: String,
-    handle: tokio::task::JoinHandle<
-        Result<(u16, Vec<(String, Vec<u8>)>, Vec<u8>), Report<PlatformError>>,
-    >,
+    handle: tokio::task::JoinHandle<Result<ResponseTriplet, Report<PlatformError>>>,
 }
 
 /// reqwest-backed HTTP client for the Axum dev server.

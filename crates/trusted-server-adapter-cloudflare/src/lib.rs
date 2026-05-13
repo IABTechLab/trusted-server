@@ -3,7 +3,7 @@ pub mod middleware;
 pub mod platform;
 
 #[cfg(target_arch = "wasm32")]
-use worker::*;
+use worker::{Context, Env, Request, Response, Result, event};
 
 #[cfg(target_arch = "wasm32")]
 #[event(fetch)]
@@ -17,6 +17,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     .await
     {
         Ok(resp) => Ok(resp),
-        Err(e) => Response::error(format!("worker dispatch error: {e}"), 500),
+        Err(e) => {
+            log::error!("worker dispatch error: {e:?}");
+            Response::error("internal server error", 500)
+        }
     }
 }

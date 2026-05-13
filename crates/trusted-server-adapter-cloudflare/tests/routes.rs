@@ -41,15 +41,14 @@ async fn finalize_middleware_injects_geo_header() {
 }
 
 #[tokio::test]
-async fn auth_middleware_rejects_with_401_when_credentials_required() {
-    // If basic-auth is configured, AuthMiddleware must challenge unauthenticated
-    // requests before reaching the handler. Without AuthMiddleware wired, the
-    // handler runs unchallenged.
+async fn auth_middleware_runs_in_chain_for_protected_routes() {
+    // Verifies that AuthMiddleware is wired into the middleware chain for auction
+    // requests. Without it, FinalizeResponseMiddleware would still run but auth
+    // challenges would be skipped silently.
     //
-    // In CI the settings may not have basic_auth configured, in which case
-    // enforce_basic_auth returns Ok(None) and the handler runs normally (non-401).
-    // Either outcome is valid — this test guards against a panic or missing
-    // X-Geo-Info-Available header that would indicate the middleware chain broke.
+    // CI settings may not have basic_auth configured, so this test does not
+    // assert 401 — it asserts that both middleware layers ran (X-Geo-Info-Available
+    // present) and that the route is actually reached (status != 404).
     let router = TrustedServerApp::routes();
 
     let req = request_builder()

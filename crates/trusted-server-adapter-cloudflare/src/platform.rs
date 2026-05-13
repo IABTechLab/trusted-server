@@ -184,23 +184,17 @@ struct CloudflarePendingResponse {
 
 /// [`worker::Fetch`]-backed HTTP client for the Cloudflare Workers runtime.
 ///
-/// # Sequential fan-out and auction latency
+/// # Multi-provider auction limitation
 ///
-/// `send_async` eagerly awaits each request before returning, so parallel
-/// fan-out (e.g. auction DSP calls) becomes sequential: total latency is
-/// `sum(DSP_i)` rather than `max(DSP_i)`. With a 300 ms auction budget and
-/// three DSPs averaging 80 ms each, all three return in time; with five DSPs
-/// the last two may be cut off by the orchestrator's remaining-budget check.
+/// `send_async` eagerly awaits each request before returning. Multi-provider
+/// auctions (more than one DSP) are therefore not supported: `select` will
+/// return `PlatformError::HttpClient` when called with more than one pending
+/// request. Configure a single auction provider for Cloudflare Workers, or
+/// use the Fastly adapter for parallel DSP fan-out.
 ///
-/// Cloudflare Workers does support concurrent `fetch` calls via `Promise.all`,
-/// but the `?Send` bound on `PlatformHttpClient` prevents using `join!` across
-/// requests here. A future revision could implement true fan-out by spawning all
-/// futures inside `select` before polling, at the cost of a more complex
-/// implementation.
-///
-/// Individual fetch calls have no explicit timeout. The Workers runtime enforces
-/// a global CPU time limit per invocation (default 30 s wall-clock on paid plans)
-/// which acts as an implicit upper bound.
+/// Per-provider timeouts baked into the backend name are not enforced at the
+/// fetch layer; the Workers runtime's global CPU budget (~30 s on paid plans)
+/// is the only implicit deadline.
 #[cfg(target_arch = "wasm32")]
 pub struct CloudflareHttpClient;
 
@@ -226,11 +220,8 @@ impl CloudflareHttpClient {
         let body_bytes = match body {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
             edgezero_core::body::Body::Stream(_) => {
-                log::warn!(
-                    "CloudflareHttpClient: Body::Stream is not supported; \
-                     outbound request body will be empty"
-                );
-                vec![]
+                return Err(Report::new(PlatformError::HttpClient)
+                    .attach("streaming request bodies are not supported on Cloudflare Workers"));
             }
         };
 
@@ -302,7 +293,11 @@ impl PlatformHttpClient for CloudflareHttpClient {
             .collect();
         let body_bytes = match response.response.into_body() {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => vec![],
+            // execute() always buffers via resp.bytes().await → Body::Once, so
+            // this branch is unreachable in practice.
+            edgezero_core::body::Body::Stream(_) => {
+                unreachable!("CloudflareHttpClient::execute always returns Body::Once")
+            }
         };
 
         let pending = CloudflarePendingResponse {
@@ -323,17 +318,19 @@ impl PlatformHttpClient for CloudflareHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        // Warn when the orchestrator submitted more than one provider: send_async()
-        // executes eagerly, so those requests already ran sequentially rather than
-        // in parallel. Total auction latency is sum(DSP_i) instead of max(DSP_i).
+        // Cloudflare Workers does not support concurrent fetch calls through the
+        // ?Send PlatformHttpClient interface. send_async() executes each request
+        // eagerly, so multi-provider auctions accrue sum(DSP_i) latency instead
+        // of max(DSP_i) and per-provider timeouts baked into the backend name are
+        // not enforced. Reject multi-provider fan-out loudly rather than silently
+        // degrading the auction budget.
         if pending_requests.len() >= 2 {
-            log::warn!(
-                "CloudflareHttpClient: select() received {} pending requests; \
-                 send_async() runs each request eagerly so multi-provider auctions \
-                 degrade to sequential latency. Use the Fastly adapter for parallel \
-                 DSP fan-out.",
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "CloudflareHttpClient: multi-provider fan-out is not supported \
+                 ({} providers submitted). Configure a single auction provider \
+                 or use the Fastly adapter for parallel DSP fan-out.",
                 pending_requests.len()
-            );
+            )));
         }
 
         let ready_platform = pending_requests.remove(0);

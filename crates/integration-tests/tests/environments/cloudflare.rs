@@ -1,4 +1,6 @@
-use crate::common::runtime::{RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult};
+use crate::common::runtime::{
+    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
+};
 use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
@@ -18,9 +20,8 @@ use std::process::{Child, Command, Stdio};
 /// Set `CLOUDFLARE_WRANGLER_DIR` to override the default crate root path.
 pub struct CloudflareWorkers;
 
-/// Port wrangler dev binds to. Matches the Axum port; both run sequentially
-/// under `--test-threads=1` so the port is never double-allocated.
-const CLOUDFLARE_PORT: u16 = 8787;
+/// Fallback port when dynamic allocation fails.
+const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
 
 impl RuntimeEnvironment for CloudflareWorkers {
     fn id(&self) -> &'static str {
@@ -35,13 +36,43 @@ impl RuntimeEnvironment for CloudflareWorkers {
             "wrangler.toml"
         };
 
-        let mut child = Command::new("wrangler")
+        let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
+
+        #[cfg(unix)]
+        let child = {
+            use std::os::unix::process::CommandExt as _;
+            Command::new("wrangler")
+                .args([
+                    "dev",
+                    "--config",
+                    config,
+                    "--port",
+                    &port.to_string(),
+                    "--ip",
+                    "127.0.0.1",
+                ])
+                .current_dir(&wrangler_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .change_context(TestError::RuntimeSpawn)
+                .attach(format!(
+                    "Failed to spawn `wrangler dev` in {}. \
+                     Ensure wrangler is installed (`npm install -g wrangler`) \
+                     and the bundle is pre-built (`bash build.sh` in that directory).",
+                    wrangler_dir.display()
+                ))?
+        };
+
+        #[cfg(not(unix))]
+        let child = Command::new("wrangler")
             .args([
                 "dev",
                 "--config",
                 config,
                 "--port",
-                &CLOUDFLARE_PORT.to_string(),
+                &port.to_string(),
                 "--ip",
                 "127.0.0.1",
             ])
@@ -57,6 +88,7 @@ impl RuntimeEnvironment for CloudflareWorkers {
                 wrangler_dir.display()
             ))?;
 
+        let mut child = child;
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
@@ -69,11 +101,14 @@ impl RuntimeEnvironment for CloudflareWorkers {
         }
 
         let handle = CloudflareHandle { child };
-        let base_url = format!("http://127.0.0.1:{CLOUDFLARE_PORT}");
+        let base_url = format!("http://127.0.0.1:{port}");
 
         super::wait_for_ready(&base_url, self.health_check_path(), true)?;
 
-        Ok(RuntimeProcess { inner: Box::new(handle), base_url })
+        Ok(RuntimeProcess {
+            inner: Box::new(handle),
+            base_url,
+        })
     }
 
     fn health_check_path(&self) -> &str {
@@ -103,7 +138,21 @@ impl RuntimeProcessHandle for CloudflareHandle {}
 
 impl Drop for CloudflareHandle {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        #[cfg(unix)]
+        {
+            // wrangler dev spawns workerd as a grandchild. Killing only the
+            // parent leaves workerd orphaned, holding the port and fds until
+            // the OS runner cleanup pass. Signal the whole process group so
+            // both wrangler and workerd are terminated together.
+            let pgid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }

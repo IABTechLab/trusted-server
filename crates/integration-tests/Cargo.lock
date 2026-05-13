@@ -1220,6 +1220,7 @@ dependencies = [
  "derive_more 2.1.1",
  "env_logger",
  "error-stack",
+ "libc",
  "log",
  "reqwest",
  "scraper",

@@ -68,10 +68,10 @@ The server will be available at `http://localhost:8787`.
 
 **Environment variable conventions used by the Axum adapter:**
 
-| Purpose | Pattern | Example |
-|---------|---------|---------|
+| Purpose            | Pattern                               | Example                                                  |
+| ------------------ | ------------------------------------- | -------------------------------------------------------- |
 | Config store value | `TRUSTED_SERVER_CONFIG_{STORE}_{KEY}` | `TRUSTED_SERVER_CONFIG_SETTINGS_AD_SERVER_URL=https://…` |
-| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123` |
+| Secret store value | `TRUSTED_SERVER_SECRET_{STORE}_{KEY}` | `TRUSTED_SERVER_SECRET_KEYS_SIGNING_KEY=abc123`          |
 
 Store names and key names are uppercased with hyphens and dots replaced by underscores.
 
