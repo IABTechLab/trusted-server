@@ -213,6 +213,26 @@ mod tests {
 
     #[test]
     fn status_code_maps_each_error_variant_to_expected_http_response() {
+        // Compile-time guard: adding a TrustedServerError variant without
+        // updating this test will fail to compile.
+        let _exhaustive = |error: &TrustedServerError| match error {
+            TrustedServerError::BadRequest { .. }
+            | TrustedServerError::Configuration { .. }
+            | TrustedServerError::Auction { .. }
+            | TrustedServerError::Gam { .. }
+            | TrustedServerError::GdprConsent { .. }
+            | TrustedServerError::InvalidUtf8 { .. }
+            | TrustedServerError::InvalidHeaderValue { .. }
+            | TrustedServerError::KvStore { .. }
+            | TrustedServerError::Prebid { .. }
+            | TrustedServerError::Integration { .. }
+            | TrustedServerError::Proxy { .. }
+            | TrustedServerError::Forbidden { .. }
+            | TrustedServerError::AllowlistViolation { .. }
+            | TrustedServerError::Settings { .. }
+            | TrustedServerError::Ec { .. } => (),
+        };
+
         let cases = vec![
             (
                 TrustedServerError::BadRequest {
