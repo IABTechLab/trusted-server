@@ -28,6 +28,12 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
+    /// Maximum number of bytes buffered when the EdgeZero publisher fallback processes
+    /// a streaming response. When `None` (the default), buffering is unbounded and limited
+    /// only by the Wasm heap. Set to a byte limit to cap per-request allocation and return
+    /// a 500 when the processed body exceeds the cap.
+    #[serde(default)]
+    pub max_buffered_body_bytes: Option<usize>,
 }
 
 impl Publisher {
@@ -55,6 +61,7 @@ impl Publisher {
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
+    ///     max_buffered_body_bytes: None,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -1361,6 +1368,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -1370,6 +1378,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -1379,6 +1388,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -1388,6 +1398,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -1397,6 +1408,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -1406,6 +1418,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: None,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ mod route_tests;
 
 use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
-use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
+use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -223,18 +224,16 @@ fn apply_entry_point_finalize<F>(
 ) where
     F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
 {
-    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
-        None
-    } else {
-        lookup_geo(client_ip)
-    };
+    let geo_info = resolve_geo_for_response(response, client_ip, lookup_geo);
     apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
 /// Handles a request using the original Fastly-native entry point.
 ///
-/// Preserves identical semantics to the pre-PR14 `main()`. Called when
-/// the `edgezero_enabled` config flag is absent or `false`.
+/// Preserves identical semantics to the pre-PR14 `main()`. Called whenever
+/// the EdgeZero flag is disabled or cannot be read/parsed as enabled — that
+/// includes config-store open failures, key-read errors, missing keys, and
+/// any value other than the accepted `"true"` / `"1"` forms.
 ///
 /// The thin fastly<->http conversion layer (via `compat::from_fastly_request` /
 /// `compat::to_fastly_response`) lives here in the adapter crate. `compat.rs`
@@ -502,6 +501,41 @@ fn resolve_publisher_response(
     }
 }
 
+struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn resolve_publisher_response_buffered(
     publisher_response: PublisherResponse,
     settings: &Settings,
@@ -514,13 +548,35 @@ pub(crate) fn resolve_publisher_response_buffered(
             body,
             params,
         } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = match settings.publisher.max_buffered_body_bytes {
+                Some(limit) => {
+                    let mut output = BoundedWriter::new(limit);
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output.into_inner()
+                }
+                None => {
+                    let mut output = Vec::new();
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output
+                }
+            };
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
+                HeaderValue::from(bytes.len() as u64),
             );
-            *response.body_mut() = EdgeBody::from(output);
+            *response.body_mut() = EdgeBody::from(bytes);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {

@@ -19,6 +19,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderName, HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
+use std::net::IpAddr;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
@@ -77,15 +78,12 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
-        // Skip geo lookup for authentication rejections — the lookup is unnecessary for 401s.
-        let geo_info = if response.status() != StatusCode::UNAUTHORIZED {
-            self.geo.lookup(client_ip).unwrap_or_else(|e| {
+        let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
+            self.geo.lookup(ip).unwrap_or_else(|e| {
                 log::warn!("geo lookup failed: {e}");
                 None
             })
-        } else {
-            None
-        };
+        });
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
@@ -138,6 +136,33 @@ impl Middleware for AuthMiddleware {
         }
 
         next.run(ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared geo resolution helper
+// ---------------------------------------------------------------------------
+
+/// Resolves geo for a response, skipping the lookup for 401 responses.
+///
+/// Returns `None` for authentication rejections (401) without calling `lookup_geo`
+/// to avoid unnecessary work and exposing geo data to unauthenticated callers.
+/// All other responses call `lookup_geo` and return its result.
+///
+/// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
+/// in `main.rs` so the 401-skip rule is defined in one place.
+pub(crate) fn resolve_geo_for_response<F>(
+    response: &Response,
+    client_ip: Option<IpAddr>,
+    lookup_geo: F,
+) -> Option<GeoInfo>
+where
+    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
+{
+    if response.status() == StatusCode::UNAUTHORIZED {
+        None
+    } else {
+        lookup_geo(client_ip)
     }
 }
 

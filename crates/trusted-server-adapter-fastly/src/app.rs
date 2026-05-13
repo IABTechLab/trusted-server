@@ -37,7 +37,10 @@
 //!
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
-//! attach middleware — startup errors are returned without geo or TS headers.
+//! attach middleware. Startup-error responses may still receive entry-point
+//! finalization (geo and TS headers) when settings can be reloaded via
+//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
+//! fails, they are returned without geo or TS headers.
 
 use core::future::Future;
 use std::sync::Arc;
