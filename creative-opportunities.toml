@@ -38,3 +38,22 @@ slot_id = "aps-slot-homepage-header"
 [slot.providers.pbs.bidders]
 mocktioneer = { bid = 2.00 }
 criteo = { networkId = 123456, pubid = "123456" }
+
+[[slot]]
+id = "homepage_footer_ad"
+gam_unit_path = "/88059007/autoblog/homepage"
+div_id = "ad-fixed_bottom-0-_R_klubtak5lb_"
+page_patterns = ["/"]
+formats = [{ width = 728, height = 90 }]
+floor_price = 0.50
+
+[slot.targeting]
+pos = "btf"
+zone = "fixedBottom"
+
+[slot.providers.aps]
+slot_id = "aps-slot-homepage-footer"
+
+[slot.providers.pbs.bidders]
+mocktioneer = { bid = 1.50 }
+criteo = { networkId = 123456, pubid = "123456" }
