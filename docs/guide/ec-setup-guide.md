@@ -41,6 +41,7 @@ Required behavior assumptions:
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
 - Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup
+- `id` is the canonical key used for stored IDs and `x-ts-<id>`-style headers; `source_domain` only controls EID source matching during ingestion
 - Partner has `bidstream_enabled = true` if you want `user.ext.eids` in bidstream
 
 ## 2) Configure Demo Variables

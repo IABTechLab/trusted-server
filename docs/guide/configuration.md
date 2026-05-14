@@ -279,6 +279,10 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                | Array          | No       | Static partner registry entries                                         |
 
+::: tip Partner keying
+`id` is the partner namespace used for KV storage and response headers (`x-ts-<id>`). `source_domain` is only used to match incoming OpenRTB EID `source` values during ingestion.
+:::
+
 **Example**:
 
 ```toml
