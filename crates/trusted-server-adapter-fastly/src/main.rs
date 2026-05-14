@@ -160,11 +160,41 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
+    // Short-circuit the JA4 debug probe before app construction, mirroring
+    // legacy_main. Must run here because TLS/JA4 accessors are only available
+    // on FastlyRequest before conversion to edgezero types.
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+        match get_settings() {
+            Ok(settings) if settings.debug.ja4_endpoint_enabled => {
+                build_ja4_debug_response(&req).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
+
     let app = TrustedServerApp::build_app();
 
     // Strip client-spoofable forwarded headers before handing off to the
     // EdgeZero dispatcher, mirroring the sanitization done in legacy_main.
     compat::sanitize_fastly_forwarded_headers(&mut req);
+
+    // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+    // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+    // metadata here is authoritative. detect_request_scheme in http_util
+    // checks this header so scheme-sensitive logic (publisher URL rewriting,
+    // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
+    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
+        req.set_header("fastly-ssl", "1");
+    }
 
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();

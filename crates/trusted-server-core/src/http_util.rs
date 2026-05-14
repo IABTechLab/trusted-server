@@ -169,7 +169,7 @@ fn normalize_scheme(value: &str) -> Option<String> {
 /// 1. `ClientInfo` TLS fields populated at the adapter entry point (most reliable)
 /// 2. Forwarded header (RFC 7239)
 /// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (least reliable, can be spoofed)
+/// 4. Fastly-SSL header (trusted on EdgeZero path; can be spoofed on legacy path)
 /// 5. Default to HTTP
 fn detect_request_scheme(
     req: &Request<EdgeBody>,
@@ -210,7 +210,9 @@ fn detect_request_scheme(
         }
     }
 
-    // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
+    // 4. Check Fastly-SSL header. On the EdgeZero path this is injected from
+    //    authoritative Fastly TLS metadata after spoofable headers are stripped,
+    //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
     if let Some(ssl) = req.headers().get("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
             if ssl_str == "1" || ssl_str.to_lowercase() == "true" {

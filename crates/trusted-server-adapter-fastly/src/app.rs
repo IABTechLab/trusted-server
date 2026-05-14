@@ -7,8 +7,9 @@
 //! Builds the [`AppState`] once per Wasm instance.
 //!
 //! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. The `EdgeZero` path therefore preserves TLS
-//! metadata as `None` until the upstream adapter exposes those fields.
+//! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
+//! header after stripping client-spoofable headers, so [`detect_request_scheme`]
+//! in `http_util` can still derive the correct scheme for HTTPS traffic.
 //!
 //! # Route inventory
 //!
@@ -149,7 +150,8 @@ pub(crate) fn runtime_services_for_consent_route(
 ///
 /// Extracts the client IP address from the [`FastlyRequestContext`] extension
 /// inserted by `edgezero_adapter_fastly::dispatch`. TLS metadata is not
-/// available through the `EdgeZero` context so those fields are left empty.
+/// available through the `EdgeZero` context; scheme detection relies on the
+/// trusted `fastly-ssl` header injected by `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
 
