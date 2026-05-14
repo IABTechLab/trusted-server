@@ -1460,10 +1460,9 @@ pub async fn handle_page_bids(
         let timeout_ms = co_config
             .auction_timeout_ms
             .unwrap_or(settings.auction.timeout_ms);
-        let placeholder_req = fastly::Request::get("https://placeholder.invalid/");
         let auction_context = AuctionContext {
             settings,
-            request: &placeholder_req,
+            request: &req,
             client_info: services.client_info(),
             timeout_ms,
             provider_responses: None,

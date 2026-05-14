@@ -404,6 +404,16 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     }
 
     for (key, value) in &settings.response_headers {
+        // Never overwrite a privacy-critical Cache-Control header (private, no-store, etc.)
+        // that was set for per-user responses (HTML or page-bids).
+        if **key == header::CACHE_CONTROL
+            && response
+                .get_header(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("private"))
+        {
+            continue;
+        }
         response.set_header(key, value);
     }
 }
