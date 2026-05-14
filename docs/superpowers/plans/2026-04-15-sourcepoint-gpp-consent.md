@@ -14,19 +14,20 @@
 
 ## File Map
 
-| File | Action | Responsibility |
-|---|---|---|
-| `crates/trusted-server-core/src/consent/types.rs` | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
-| `crates/trusted-server-core/src/consent/gpp.rs` | Modify | Decode US sections, extract `sale_opt_out` |
-| `crates/trusted-server-core/src/consent/mod.rs` | Modify | Add GPP US branch in `allows_ec_creation()`, tests |
-| `crates/js/lib/src/integrations/sourcepoint/index.ts` | Create | localStorage auto-discovery, cookie mirroring |
-| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | Create | Vitest tests for cookie mirroring |
+| File                                                        | Action | Responsibility                                      |
+| ----------------------------------------------------------- | ------ | --------------------------------------------------- |
+| `crates/trusted-server-core/src/consent/types.rs`           | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
+| `crates/trusted-server-core/src/consent/gpp.rs`             | Modify | Decode US sections, extract `sale_opt_out`          |
+| `crates/trusted-server-core/src/consent/mod.rs`             | Modify | Add GPP US branch in `allows_ec_creation()`, tests  |
+| `crates/js/lib/src/integrations/sourcepoint/index.ts`       | Create | localStorage auto-discovery, cookie mirroring       |
+| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | Create | Vitest tests for cookie mirroring                   |
 
 ---
 
 ## Task 1: Add `us_sale_opt_out` field to `GppConsent`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/consent/types.rs:297-305`
 
 - [ ] **Step 1: Add the field**
@@ -105,6 +106,7 @@ git commit -m "Add us_sale_opt_out field to GppConsent"
 ## Task 2: Decode US sale opt-out from GPP sections
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/consent/gpp.rs`
 
 - [ ] **Step 1: Write the failing test for US sale opt-out extraction**
@@ -249,6 +251,7 @@ git commit -m "Decode US sale opt-out from GPP sections"
 ## Task 3: Add GPP US branch to `allows_ec_creation()`
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/consent/mod.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -443,6 +446,7 @@ git commit -m "Recognize GPP US sale opt-out in EC consent gating"
 ## Task 4: Create Sourcepoint JS integration
 
 **Files:**
+
 - Create: `crates/js/lib/src/integrations/sourcepoint/index.ts`
 
 - [ ] **Step 1: Write the test file first**
@@ -450,23 +454,24 @@ git commit -m "Recognize GPP US sale opt-out in EC consent gating"
 Create `crates/js/lib/test/integrations/sourcepoint/index.test.ts`:
 
 ```typescript
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { mirrorSourcepointConsent } from '../../../src/integrations/sourcepoint';
+import { mirrorSourcepointConsent } from '../../../src/integrations/sourcepoint'
 
 describe('integrations/sourcepoint', () => {
   beforeEach(() => {
     // Clear cookies and localStorage before each test.
     document.cookie.split(';').forEach((c) => {
-      const name = c.split('=')[0].trim();
-      if (name) document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
-    });
-    localStorage.clear();
-  });
+      const name = c.split('=')[0].trim()
+      if (name)
+        document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`
+    })
+    localStorage.clear()
+  })
 
   afterEach(() => {
-    localStorage.clear();
-  });
+    localStorage.clear()
+  })
 
   it('mirrors __gpp and __gpp_sid from _sp_user_consent_* localStorage', () => {
     const payload = {
@@ -474,15 +479,15 @@ describe('integrations/sourcepoint', () => {
         gppString: 'DBABLA~BVQqAAAAAgA.QA',
         applicableSections: [7],
       },
-    };
-    localStorage.setItem('_sp_user_consent_36026', JSON.stringify(payload));
+    }
+    localStorage.setItem('_sp_user_consent_36026', JSON.stringify(payload))
 
-    const result = mirrorSourcepointConsent();
+    const result = mirrorSourcepointConsent()
 
-    expect(result).toBe(true);
-    expect(document.cookie).toContain('__gpp=DBABLA~BVQqAAAAAgA.QA');
-    expect(document.cookie).toContain('__gpp_sid=7');
-  });
+    expect(result).toBe(true)
+    expect(document.cookie).toContain('__gpp=DBABLA~BVQqAAAAAgA.QA')
+    expect(document.cookie).toContain('__gpp_sid=7')
+  })
 
   it('handles multiple applicable sections', () => {
     const payload = {
@@ -490,41 +495,44 @@ describe('integrations/sourcepoint', () => {
         gppString: 'DBABLA~BVQqAAAAAgA.QA',
         applicableSections: [7, 8],
       },
-    };
-    localStorage.setItem('_sp_user_consent_99999', JSON.stringify(payload));
+    }
+    localStorage.setItem('_sp_user_consent_99999', JSON.stringify(payload))
 
-    mirrorSourcepointConsent();
+    mirrorSourcepointConsent()
 
-    expect(document.cookie).toContain('__gpp_sid=7,8');
-  });
+    expect(document.cookie).toContain('__gpp_sid=7,8')
+  })
 
   it('returns false when no _sp_user_consent_* key exists', () => {
-    localStorage.setItem('unrelated_key', 'value');
+    localStorage.setItem('unrelated_key', 'value')
 
-    const result = mirrorSourcepointConsent();
+    const result = mirrorSourcepointConsent()
 
-    expect(result).toBe(false);
-    expect(document.cookie).not.toContain('__gpp=');
-    expect(document.cookie).not.toContain('__gpp_sid=');
-  });
+    expect(result).toBe(false)
+    expect(document.cookie).not.toContain('__gpp=')
+    expect(document.cookie).not.toContain('__gpp_sid=')
+  })
 
   it('returns false for malformed JSON in localStorage', () => {
-    localStorage.setItem('_sp_user_consent_12345', 'not-json!!!');
+    localStorage.setItem('_sp_user_consent_12345', 'not-json!!!')
 
-    const result = mirrorSourcepointConsent();
+    const result = mirrorSourcepointConsent()
 
-    expect(result).toBe(false);
-    expect(document.cookie).not.toContain('__gpp=');
-  });
+    expect(result).toBe(false)
+    expect(document.cookie).not.toContain('__gpp=')
+  })
 
   it('returns false when gppData is missing from payload', () => {
-    localStorage.setItem('_sp_user_consent_12345', JSON.stringify({ otherField: true }));
+    localStorage.setItem(
+      '_sp_user_consent_12345',
+      JSON.stringify({ otherField: true })
+    )
 
-    const result = mirrorSourcepointConsent();
+    const result = mirrorSourcepointConsent()
 
-    expect(result).toBe(false);
-    expect(document.cookie).not.toContain('__gpp=');
-  });
+    expect(result).toBe(false)
+    expect(document.cookie).not.toContain('__gpp=')
+  })
 
   it('returns false when gppString is empty', () => {
     const payload = {
@@ -532,15 +540,15 @@ describe('integrations/sourcepoint', () => {
         gppString: '',
         applicableSections: [7],
       },
-    };
-    localStorage.setItem('_sp_user_consent_12345', JSON.stringify(payload));
+    }
+    localStorage.setItem('_sp_user_consent_12345', JSON.stringify(payload))
 
-    const result = mirrorSourcepointConsent();
+    const result = mirrorSourcepointConsent()
 
-    expect(result).toBe(false);
-    expect(document.cookie).not.toContain('__gpp=');
-  });
-});
+    expect(result).toBe(false)
+    expect(document.cookie).not.toContain('__gpp=')
+  })
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -553,39 +561,39 @@ Expected: FAIL — module `../../../src/integrations/sourcepoint` does not exist
 Create `crates/js/lib/src/integrations/sourcepoint/index.ts`:
 
 ```typescript
-import { log } from '../../core/log';
+import { log } from '../../core/log'
 
-const SP_CONSENT_PREFIX = '_sp_user_consent_';
+const SP_CONSENT_PREFIX = '_sp_user_consent_'
 
 interface SourcepointGppData {
-  gppString: string;
-  applicableSections: number[];
+  gppString: string
+  applicableSections: number[]
 }
 
 interface SourcepointConsentPayload {
-  gppData?: SourcepointGppData;
+  gppData?: SourcepointGppData
 }
 
 function findSourcepointConsent(): SourcepointConsentPayload | null {
   for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    if (!key?.startsWith(SP_CONSENT_PREFIX)) continue;
+    const key = localStorage.key(i)
+    if (!key?.startsWith(SP_CONSENT_PREFIX)) continue
 
-    const raw = localStorage.getItem(key);
-    if (!raw) continue;
+    const raw = localStorage.getItem(key)
+    if (!raw) continue
 
     try {
-      return JSON.parse(raw) as SourcepointConsentPayload;
+      return JSON.parse(raw) as SourcepointConsentPayload
     } catch {
-      log.debug('sourcepoint: failed to parse localStorage value', { key });
-      return null;
+      log.debug('sourcepoint: failed to parse localStorage value', { key })
+      return null
     }
   }
-  return null;
+  return null
 }
 
 function writeCookie(name: string, value: string): void {
-  document.cookie = `${name}=${encodeURIComponent(value)}; path=/; SameSite=Lax`;
+  document.cookie = `${name}=${encodeURIComponent(value)}; path=/; SameSite=Lax`
 }
 
 /// Reads Sourcepoint consent from localStorage and mirrors it into
@@ -594,40 +602,40 @@ function writeCookie(name: string, value: string): void {
 /// Returns `true` if cookies were written, `false` otherwise.
 export function mirrorSourcepointConsent(): boolean {
   if (typeof localStorage === 'undefined' || typeof document === 'undefined') {
-    return false;
+    return false
   }
 
-  const payload = findSourcepointConsent();
+  const payload = findSourcepointConsent()
   if (!payload?.gppData) {
-    log.debug('sourcepoint: no GPP data found in localStorage');
-    return false;
+    log.debug('sourcepoint: no GPP data found in localStorage')
+    return false
   }
 
-  const { gppString, applicableSections } = payload.gppData;
+  const { gppString, applicableSections } = payload.gppData
   if (!gppString) {
-    log.debug('sourcepoint: gppString is empty');
-    return false;
+    log.debug('sourcepoint: gppString is empty')
+    return false
   }
 
-  writeCookie('__gpp', gppString);
+  writeCookie('__gpp', gppString)
 
   if (Array.isArray(applicableSections) && applicableSections.length > 0) {
-    writeCookie('__gpp_sid', applicableSections.join(','));
+    writeCookie('__gpp_sid', applicableSections.join(','))
   }
 
   log.info('sourcepoint: mirrored GPP consent to cookies', {
     gppLength: gppString.length,
     sections: applicableSections,
-  });
+  })
 
-  return true;
+  return true
 }
 
 if (typeof window !== 'undefined') {
-  mirrorSourcepointConsent();
+  mirrorSourcepointConsent()
 }
 
-export default mirrorSourcepointConsent;
+export default mirrorSourcepointConsent
 ```
 
 - [ ] **Step 4: Run tests**

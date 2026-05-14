@@ -126,13 +126,13 @@ raise that as a separate consent-policy configuration change.
 
 ### 4. Files touched
 
-| File | Change |
-|---|---|
-| `crates/js/lib/src/integrations/sourcepoint/index.ts` | New — localStorage auto-discovery, cookie mirroring |
-| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | New — Vitest tests |
-| `crates/trusted-server-core/src/consent/types.rs` | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
-| `crates/trusted-server-core/src/consent/gpp.rs` | Add US section decoding, extract `sale_opt_out` |
-| `crates/trusted-server-core/src/consent/mod.rs` | Add GPP US branch in `allows_ec_creation()`, tests |
+| File                                                        | Change                                              |
+| ----------------------------------------------------------- | --------------------------------------------------- |
+| `crates/js/lib/src/integrations/sourcepoint/index.ts`       | New — localStorage auto-discovery, cookie mirroring |
+| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | New — Vitest tests                                  |
+| `crates/trusted-server-core/src/consent/types.rs`           | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
+| `crates/trusted-server-core/src/consent/gpp.rs`             | Add US section decoding, extract `sale_opt_out`     |
+| `crates/trusted-server-core/src/consent/mod.rs`             | Add GPP US branch in `allows_ec_creation()`, tests  |
 
 No config changes and no new crate dependencies. `IntegrationRegistry` includes
 `sourcepoint` in the JS-only always-shipped module list; the client-side marker
