@@ -45,7 +45,7 @@ fastly compute serve
 cargo fmt
 
 # Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy-fastly && cargo clippy-axum
 
 # Run all tests
 cargo test-fastly   # Fastly/WASM (requires Viceroy)

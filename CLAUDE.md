@@ -70,7 +70,7 @@ cargo test-axum    # Axum dev server adapter (native)
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy-fastly && cargo clippy-axum
 
 # Check compilation
 cargo check

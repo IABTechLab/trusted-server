@@ -3,7 +3,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -115,6 +115,18 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
+fn publisher_fallback_methods() -> [Method; 7] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ]
+}
+
 /// Returns a [`RouterService`] that responds to every route with the startup error.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     let message = Arc::new(format!("{}\n", e.current_context().user_message()));
@@ -133,15 +145,14 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         }
     };
 
-    RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::new(
-            Settings::default(),
-        )))
-        .get("/", make_handler(Arc::clone(&message)))
-        .post("/", make_handler(Arc::clone(&message)))
-        .get("/{*rest}", make_handler(Arc::clone(&message)))
-        .post("/{*rest}", make_handler(Arc::clone(&message)))
-        .build()
+    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+        Arc::new(Settings::default()),
+    ));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), make_handler(Arc::clone(&message)));
+        router = router.route("/{*rest}", method, make_handler(Arc::clone(&message)));
+    }
+    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -287,9 +298,12 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // GET /{*rest} — tsjs, integration proxy, or publisher fallback
+        // GET /static/tsjs= → JS bundle; all other paths → integration proxy or publisher fallback.
+        // A single handler covers all HTTP methods so HEAD/OPTIONS/PUT/PATCH/DELETE reach the
+        // publisher origin on both wildcard paths and non-primary methods on named routes,
+        // matching the Fastly adapter's publisher_fallback_methods parity.
         let s = Arc::clone(&state);
-        let get_fallback = move |ctx: RequestContext| {
+        let general_fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
@@ -297,7 +311,7 @@ impl Hooks for TrustedServerApp {
                 let path = req.uri().path().to_string();
                 let method = req.method().clone();
 
-                let result = if path.starts_with("/static/tsjs=") {
+                let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                     handle_tsjs_dynamic(&req, &s.registry)
                 } else if s.registry.has_route(&method, &path) {
                     s.registry
@@ -318,36 +332,21 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // POST /{*rest} — integration proxy or publisher origin fallback
-        let s = Arc::clone(&state);
-        let post_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
+        // Named routes paired with their primary methods. Non-primary methods are
+        // registered below as publisher fallback to match the Fastly adapter.
+        let named_routes: &[(&str, &[Method])] = &[
+            ("/.well-known/trusted-server.json", &[Method::GET]),
+            ("/verify-signature", &[Method::POST]),
+            ("/admin/keys/rotate", &[Method::POST]),
+            ("/admin/keys/deactivate", &[Method::POST]),
+            ("/auction", &[Method::POST]),
+            ("/first-party/proxy", &[Method::GET]),
+            ("/first-party/click", &[Method::GET]),
+            ("/first-party/sign", &[Method::GET, Method::POST]),
+            ("/first-party/proxy-rebuild", &[Method::POST]),
+        ];
 
-                let result = if s.registry.has_route(&method, &path) {
-                    s.registry
-                        .handle_proxy(&method, &path, &s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|| {
-                            Err(Report::new(TrustedServerError::BadRequest {
-                                message: format!("Unknown integration route: {path}"),
-                            }))
-                        })
-                } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req)
-                        .await
-                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
-                };
-
-                Ok(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        RouterService::builder()
+        let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
@@ -359,11 +358,21 @@ impl Hooks for TrustedServerApp {
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_get_handler)
             .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler)
-            .get("/", get_fallback.clone())
-            .post("/", post_fallback.clone())
-            .get("/{*rest}", get_fallback)
-            .post("/{*rest}", post_fallback)
-            .build()
+            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+
+        for (path, primary) in named_routes {
+            for method in publisher_fallback_methods() {
+                if !primary.contains(&method) {
+                    router = router.route(path, method, general_fallback.clone());
+                }
+            }
+        }
+
+        for method in publisher_fallback_methods() {
+            router = router.route("/", method.clone(), general_fallback.clone());
+            router = router.route("/{*rest}", method, general_fallback.clone());
+        }
+
+        router.build()
     }
 }
