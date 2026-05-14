@@ -76,7 +76,6 @@ pub async fn handle_auction(
         None
     };
     let consent_context = ec_context.consent().clone();
-    let geo = ec_context.geo_info().cloned();
 
     // Parse client-provided EIDs from the current request body. When the
     // current request does not include them, fall back to the persisted
@@ -92,15 +91,8 @@ pub async fn handle_auction(
     let eids = resolve_auction_eids(kv, registry, ec_context);
 
     // Convert tsjs request format to auction request
-    let mut auction_request = convert_tsjs_to_auction_request(
-        &body,
-        settings,
-        services,
-        &req,
-        consent_context,
-        ec_id,
-        geo,
-    )?;
+    let mut auction_request =
+        convert_tsjs_to_auction_request(&body, settings, &req, consent_context, ec_id)?;
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
@@ -117,7 +109,6 @@ pub async fn handle_auction(
     let context = AuctionContext {
         settings,
         request: &req,
-        client_info: &services.client_info,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
@@ -125,7 +116,7 @@ pub async fn handle_auction(
 
     // Run the auction
     let result = orchestrator
-        .run_auction(&auction_request, &context, services)
+        .run_auction(&auction_request, &context)
         .await
         .change_context(TrustedServerError::Auction {
             message: "Auction orchestration failed".to_string(),

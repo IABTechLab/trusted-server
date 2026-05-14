@@ -833,6 +833,10 @@ fn transform_prebid_response(
                             "track"
                         ));
                     }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -954,7 +958,7 @@ impl PrebidAuctionProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
-        request_info: RequestInfo,
+        _request_info: RequestInfo,
     ) -> OpenRtbRequest {
         let imps = request
             .slots
@@ -1168,7 +1172,7 @@ impl PrebidAuctionProvider {
 
         // Build ext object
         let http_req = compat::from_fastly_headers_ref(context.request);
-        let request_info = RequestInfo::from_request(&http_req, context.client_info);
+        let request_info = RequestInfo::from_request(&http_req, &context.services.client_info);
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (
@@ -1542,7 +1546,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         log::info!("Prebid: requesting bids for {} slots", request.slots.len());
 
         let http_req = compat::from_fastly_headers_ref(context.request);
-        let request_info = RequestInfo::from_request(&http_req, context.client_info);
+        let request_info = RequestInfo::from_request(&http_req, &context.services.client_info);
 
         // Create signer and compute signature if request signing is enabled
         let signer_with_signature =
@@ -1647,7 +1651,10 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.parse_response_inner(
             response,
             response_time_ms,
-            Some(&RequestInfo::from_request(context.request)),
+            Some(&{
+                let http_req = compat::from_fastly_headers_ref(context.request);
+                RequestInfo::from_request(&http_req, &context.services.client_info)
+            }),
         )
     }
 
@@ -1797,7 +1804,7 @@ mod tests {
 
     fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
         let http_req = compat::from_fastly_headers_ref(context.request);
-        RequestInfo::from_request(&http_req, context.client_info)
+        RequestInfo::from_request(&http_req, &context.services.client_info)
     }
 
     fn config_from_settings(
@@ -3291,7 +3298,12 @@ server_url = "https://prebid.example"
         let request = Request::get("https://pub.example/auction");
         let context = create_test_auction_context(&settings, &request);
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         let ext_eids = &serialized["user"]["ext"]["eids"];
@@ -3316,7 +3328,12 @@ server_url = "https://prebid.example"
         let request = Request::get("https://pub.example/auction");
         let context = create_test_auction_context(&settings, &request);
 
-        let openrtb = provider.to_openrtb(&auction_request, &context, None);
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
 
         let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
         assert!(

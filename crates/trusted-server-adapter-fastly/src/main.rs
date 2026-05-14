@@ -16,12 +16,11 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::partner::PartnerStore;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
+use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::sync_pixel::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
@@ -239,12 +238,11 @@ async fn route_request(
         let mut response = match enforce_basic_auth(settings, &auth_req) {
             Ok(Some(response)) => compat::to_fastly_response(response),
             Ok(None) => require_identity_graph(settings)
-                .and_then(|kv| {
-                    require_partner_store(settings).and_then(|partner_store| {
-                        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-                        handle_batch_sync(&kv, &partner_store, &limiter, req)
-                    })
+                .map(|kv| {
+                    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+                    handle_batch_sync(&kv, partner_registry, &limiter, req)
                 })
+                .and_then(|r| r)
                 .unwrap_or_else(|e| to_error_response(&e)),
             Err(e) => {
                 log::error!("Failed to evaluate basic auth: {:?}", e);
@@ -358,11 +356,8 @@ async fn route_request(
             )
         }
         (Method::GET, "/_ts/api/v1/identify") => (
-            require_identity_graph(settings).and_then(|kv| {
-                require_partner_store(settings).and_then(|partner_store| {
-                    handle_identify(settings, &kv, &partner_store, &req, &ec_context)
-                })
-            }),
+            require_identity_graph(settings)
+                .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context)),
             false,
         ),
         (Method::OPTIONS, "/_ts/api/v1/identify") => {

@@ -54,7 +54,8 @@ describe('Sourcepoint integration initialization', () => {
     await import('../../../src/integrations/sourcepoint/index');
 
     expect(guard.isGuardInstalled()).toBe(true);
-
+  });
+});
 
 const SOURCEPOINT_MARKER_COOKIE = '_ts_gpp_src';
 

@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
+use crate::platform::ClientInfo;
 use crate::settings::Settings;
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
@@ -464,6 +465,14 @@ mod tests {
         );
     }
 
+    fn default_client_info() -> ClientInfo {
+        ClientInfo {
+            client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
+        }
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let settings = crate::test_support::tests::create_test_settings();
@@ -534,7 +543,7 @@ mod tests {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "host", "test.example.com");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.host, "test.example.com",
             "Host should use Host header when forwarded headers are missing"
@@ -556,7 +565,7 @@ mod tests {
             "public.example.com, proxy.local",
         );
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.host, "public.example.com",
             "Host should prefer X-Forwarded-Host over Host"
@@ -569,7 +578,7 @@ mod tests {
         set_header(&mut req, "host", "test.example.com");
         set_header(&mut req, "x-forwarded-proto", "https, http");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.scheme, "https",
             "Scheme should prefer the first X-Forwarded-Proto value"
@@ -580,7 +589,7 @@ mod tests {
         set_header(&mut req, "host", "test.example.com");
         set_header(&mut req, "x-forwarded-proto", "http");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.scheme, "http",
             "Scheme should use the X-Forwarded-Proto value when present"
@@ -600,7 +609,7 @@ mod tests {
         set_header(&mut req, "x-forwarded-host", "proxy.local");
         set_header(&mut req, "x-forwarded-proto", "http");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.host, "public.example.com:443",
             "Host should prefer Forwarded host over X-Forwarded-Host"
@@ -616,7 +625,7 @@ mod tests {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "fastly-ssl", "1");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.scheme, "https",
             "Scheme should fall back to Fastly-SSL when other signals are missing"
@@ -632,7 +641,7 @@ mod tests {
         set_header(&mut req, "x-forwarded-host", "public.example.com");
         set_header(&mut req, "x-forwarded-proto", "https");
 
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
         assert_eq!(
             info.host, "public.example.com",
             "Host should use X-Forwarded-Host in chained proxy scenarios"
@@ -691,7 +700,7 @@ mod tests {
         set_header(&mut req, "x-forwarded-proto", "http");
 
         sanitize_forwarded_headers(&mut req);
-        let info = RequestInfo::from_request(&req);
+        let info = RequestInfo::from_request(&req, &default_client_info());
 
         assert_eq!(
             info.host, "legit.example.com",
