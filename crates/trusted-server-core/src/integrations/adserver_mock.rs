@@ -10,7 +10,7 @@ use fastly::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use validator::Validate;
 
@@ -88,16 +88,28 @@ impl IntegrationConfig for AdServerMockConfig {
 // Provider
 // ============================================================================
 
+/// Lookup index built from original SSP bids during `request_bids`, consumed
+/// during `parse_response` to restore `nurl`/`burl`/`ad_id` that the mock
+/// mediator endpoint does not echo back.
+///
+/// Keyed by `(provider_name, slot_id, bidder_name)`.
+type BidIndex = HashMap<(String, String, String), Bid>;
+
 /// Mock ad server mediator provider.
 pub struct AdServerMockProvider {
     config: AdServerMockConfig,
+    /// Bridges SSP bid metadata (nurl/burl/ad_id) from request_bids to parse_response.
+    bid_index: Mutex<Option<BidIndex>>,
 }
 
 impl AdServerMockProvider {
     /// Create a new mock ad server provider.
     #[must_use]
     pub fn new(config: AdServerMockConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            bid_index: Mutex::new(None),
+        }
     }
 
     /// Build the mediation endpoint URL, appending context values as query
@@ -212,8 +224,17 @@ impl AdServerMockProvider {
 
     /// Parse `OpenRTB` response from mediation endpoint.
     /// Mediation returns decoded prices for all bids (including APS bids that were encoded).
-    fn parse_mediation_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
-        // Parse OpenRTB response
+    ///
+    /// `bid_index` is the SSP-bid lookup built in `request_bids`. The mock mediator
+    /// does not echo `nurl`/`burl`/`ad_id` back, so they are restored from the index
+    /// using `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
+    /// field (`"{bidder}-creative"` format set during request construction).
+    fn parse_mediation_response(
+        &self,
+        json: &Json,
+        response_time_ms: u64,
+        bid_index: &BidIndex,
+    ) -> AuctionResponse {
         let empty_array = vec![];
         let seatbid = json["seatbid"].as_array().unwrap_or(&empty_array);
 
@@ -225,10 +246,18 @@ impl AdServerMockProvider {
             let bids = seat["bid"].as_array().unwrap_or(&empty_bids);
 
             for bid in bids {
-                // Mediation layer returns decoded prices for all bids
+                let slot_id = bid["impid"].as_str().unwrap_or("").to_string();
+
+                // Recover bidder name from crid ("{bidder}-creative") to look up the
+                // original SSP bid and restore nurl/burl/ad_id the mediator drops.
+                let crid = bid["crid"].as_str().unwrap_or("");
+                let bidder = crid.strip_suffix("-creative").unwrap_or("");
+                let key = (seat_name.to_string(), slot_id.clone(), bidder.to_string());
+                let original = bid_index.get(&key);
+
                 all_bids.push(Bid {
-                    slot_id: bid["impid"].as_str().unwrap_or("").to_string(),
-                    price: bid["price"].as_f64(), // Now properly decoded by mediation
+                    slot_id,
+                    price: bid["price"].as_f64(),
                     currency: "USD".to_string(),
                     creative: bid["adm"].as_str().map(String::from),
                     width: bid["w"].as_u64().unwrap_or(0) as u32,
@@ -239,9 +268,9 @@ impl AdServerMockProvider {
                             .filter_map(|v| v.as_str().map(String::from))
                             .collect()
                     }),
-                    nurl: None,
-                    burl: None,
-                    ad_id: None,
+                    nurl: original.and_then(|b| b.nurl.clone()),
+                    burl: original.and_then(|b| b.burl.clone()),
+                    ad_id: original.and_then(|b| b.ad_id.clone()),
                     metadata: HashMap::new(),
                 });
             }
@@ -273,6 +302,19 @@ impl AuctionProvider for AdServerMockProvider {
             request.slots.len(),
             bidder_responses.len()
         );
+
+        // Build bid index so parse_response can restore nurl/burl/ad_id from
+        // the original SSP bids (the mock mediator does not echo these fields).
+        let mut index = BidIndex::new();
+        for response in bidder_responses {
+            for bid in &response.bids {
+                index.insert(
+                    (response.provider.clone(), bid.slot_id.clone(), bid.bidder.clone()),
+                    bid.clone(),
+                );
+            }
+        }
+        *self.bid_index.lock().expect("should lock bid index") = Some(index);
 
         // Build mediation request
         let mediation_req = self
@@ -349,7 +391,15 @@ impl AuctionProvider for AdServerMockProvider {
 
         log::trace!("AdServer Mock response: {:?}", response_json);
 
-        let auction_response = self.parse_mediation_response(&response_json, response_time_ms);
+        let bid_index = self
+            .bid_index
+            .lock()
+            .expect("should lock bid index")
+            .take()
+            .unwrap_or_default();
+
+        let auction_response =
+            self.parse_mediation_response(&response_json, response_time_ms, &bid_index);
 
         log::info!(
             "AdServer Mock returned {} bids in {}ms",
@@ -571,7 +621,8 @@ mod tests {
             "cur": "USD"
         });
 
-        let auction_response = provider.parse_mediation_response(&mediation_response, 200);
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
 
         assert_eq!(auction_response.provider, "adserver_mock");
         assert_eq!(auction_response.status, BidStatus::Success);
@@ -597,7 +648,8 @@ mod tests {
             "cur": "USD"
         });
 
-        let auction_response = provider.parse_mediation_response(&mediation_response, 100);
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 100, &BidIndex::new());
 
         assert_eq!(auction_response.status, BidStatus::NoBid);
         assert_eq!(auction_response.bids.len(), 0);
@@ -791,7 +843,8 @@ mod tests {
             "cur": "USD"
         });
 
-        let auction_response = provider.parse_mediation_response(&mediation_response, 200);
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 200, &BidIndex::new());
 
         assert_eq!(auction_response.status, BidStatus::Success);
         assert_eq!(auction_response.bids.len(), 2);
