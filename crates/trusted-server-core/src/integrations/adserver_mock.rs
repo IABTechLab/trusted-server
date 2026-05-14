@@ -98,7 +98,7 @@ type BidIndex = HashMap<(String, String, String), Bid>;
 /// Mock ad server mediator provider.
 pub struct AdServerMockProvider {
     config: AdServerMockConfig,
-    /// Bridges SSP bid metadata (nurl/burl/ad_id) from request_bids to parse_response.
+    /// Bridges SSP bid metadata (`nurl`/`burl`/`ad_id`) from `request_bids` to `parse_response`.
     bid_index: Mutex<Option<BidIndex>>,
 }
 
