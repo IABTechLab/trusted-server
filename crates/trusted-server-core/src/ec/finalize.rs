@@ -8,7 +8,6 @@ use std::collections::HashSet;
 use fastly::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
-use crate::constants::HEADER_X_TS_EC;
 use crate::settings::Settings;
 
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
@@ -94,10 +93,8 @@ pub fn ec_finalize_response(
             }
         }
 
-        // Returning users keep the active EC visible for this response, but
-        // ordinary page views no longer refresh the browser cookie or KV TTL.
-        set_ec_header_on_response(ec_context, response);
-
+        // Ordinary returning-user page views no longer refresh the browser
+        // cookie, emit the EC header, or update KV TTL.
         return;
     }
 
@@ -116,25 +113,17 @@ pub fn ec_finalize_response(
         if let Some(cookie) = sharedid_cookie {
             ingest_sharedid_cookie(cookie, ec_id, graph, registry);
         }
-        set_ec_cookie_and_header_on_response(settings, ec_context, response);
+        set_ec_cookie_on_response(settings, ec_context, response);
     }
 }
 
-/// Sets the EC response header when an EC ID is available.
-pub fn set_ec_header_on_response(ec_context: &EcContext, response: &mut Response) {
-    if let Some(ec_id) = ec_context.ec_value() {
-        response.set_header(HEADER_X_TS_EC, ec_id);
-    }
-}
-
-/// Sets EC header + cookie on response when an EC ID is available.
-pub fn set_ec_cookie_and_header_on_response(
+/// Sets the EC cookie on response when an EC ID is available.
+pub fn set_ec_cookie_on_response(
     settings: &Settings,
     ec_context: &EcContext,
     response: &mut Response,
 ) {
     if let Some(ec_id) = ec_context.ec_value() {
-        response.set_header(HEADER_X_TS_EC, ec_id);
         set_ec_cookie(settings, response, ec_id);
     }
 }
@@ -443,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_returning_user_with_cookie_mismatch_sets_header_only() {
+    fn finalize_returning_user_with_cookie_mismatch_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ1");
         let cookie_ec = sample_ec_id("cook1e");
@@ -467,13 +456,10 @@ mod tests {
             &mut response,
         );
 
-        let header = response
-            .get_header("x-ts-ec")
-            .expect("mismatch should set x-ts-ec")
-            .to_str()
-            .expect("x-ts-ec should be utf-8");
-        assert_eq!(header, active_ec, "should set active EC on header");
-
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "returning user should not set x-ts-ec"
+        );
         assert!(
             response.get_header("set-cookie").is_none(),
             "returning user should not refresh or repair cookie"
@@ -481,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_returning_user_sets_header_without_refreshing_cookie() {
+    fn finalize_returning_user_sets_no_header_or_cookie() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("mtch01");
         let ec_context = make_context(
@@ -504,13 +490,10 @@ mod tests {
             &mut response,
         );
 
-        let header = response
-            .get_header("x-ts-ec")
-            .expect("returning user should set x-ts-ec")
-            .to_str()
-            .expect("x-ts-ec should be utf-8");
-        assert_eq!(header, ec_id, "header should contain active EC");
-
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "returning user should not set x-ts-ec"
+        );
         assert!(
             response.get_header("set-cookie").is_none(),
             "returning user should not refresh cookie"

@@ -31,7 +31,7 @@ sequenceDiagram
     participant KV as KV Store
 
     B->>TS: Request (ts-ec cookie + consent signals)
-    Note over TS: Phase 1: Pre-routing<br/>Read EC from cookie/header<br/>Build consent context<br/>Extract device signals
+    Note over TS: Phase 1: Pre-routing<br/>Read EC from cookie<br/>Build consent context<br/>Extract device signals
 
     alt First Visit (no EC cookie)
         Note over TS: Phase 2: Routing (organic only)<br/>generate_if_needed()
@@ -42,7 +42,7 @@ sequenceDiagram
     else Return Visit (EC cookie present)
         Note over TS: Phase 2: Routing<br/>EC exists — skip generation
         Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
-        TS-->>B: Response + x-ts-ec header<br/>(no cookie refresh)
+        TS-->>B: Response<br/>(no cookie refresh)
     end
 
     Note over TS,KV: Phase 4: Post-send (background)<br/>Dispatch pull-sync to partners
@@ -63,8 +63,8 @@ flowchart TD
     ExplicitWithdrawal -- "No" --> HeaderOnly
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
-    WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>Set x-ts-ec header only<br/>(no cookie or KV TTL refresh)"]
-    WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie + x-ts-ec header"]
+    WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>No cookie or KV TTL refresh"]
+    WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie"]
 ```
 
 When consent cannot be verified for the current request — for example, unknown jurisdiction or missing/undecodable consent signals in a regulated region — Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
@@ -249,8 +249,8 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 
 ## Runtime Behavior Notes
 
-- Returning requests with consent and an existing `ts-ec` receive an `x-ts-ec` response header only; ordinary page views do not refresh the EC cookie or KV TTL.
-- Newly generated ECs receive both `Set-Cookie: ts-ec=...` and `x-ts-ec`.
+- Returning requests with consent and an existing `ts-ec` do not refresh the EC cookie or KV TTL.
+- Newly generated ECs receive `Set-Cookie: ts-ec=...`.
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
 - `/_ts/api/v1/batch-sync` writes mappings into the EC identity graph. Mapping timestamps are retained for API compatibility but no longer order writes; valid mappings use idempotent last-write-wins semantics.

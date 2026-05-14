@@ -14,9 +14,7 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::{
-    HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
-};
+use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
@@ -315,10 +313,6 @@ pub fn convert_to_openrtb_response(
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_body(body_bytes);
 
-    if let Some(ref ec_id) = auction_request.user.id {
-        response.set_header(HEADER_X_TS_EC, ec_id);
-    }
-
     // Signal consent status independently of whether EIDs were resolved.
     // A user may have granted consent but have no partner syncs yet;
     // downstream clients rely on this header to know consent was verified.
@@ -346,9 +340,7 @@ mod tests {
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
-    use crate::constants::{
-        HEADER_X_TS_EC, HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED,
-    };
+    use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
     use crate::openrtb::{Eid, Uid};
 
     fn make_minimal_auction_request() -> AuctionRequest {
@@ -469,8 +461,8 @@ mod tests {
             "should omit x-ts-eids when no EIDs available"
         );
         assert!(
-            response.get_header(HEADER_X_TS_EC).is_some(),
-            "should keep x-ts-ec when a valid EC is present"
+            response.get_header("x-ts-ec").is_none(),
+            "should not emit x-ts-ec when a valid EC is present"
         );
     }
 
@@ -486,7 +478,7 @@ mod tests {
             .expect("should build response");
 
         assert!(
-            response.get_header(HEADER_X_TS_EC).is_none(),
+            response.get_header("x-ts-ec").is_none(),
             "should omit x-ts-ec when no EC ID is available"
         );
     }

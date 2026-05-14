@@ -1408,7 +1408,7 @@ mod tests {
             ),
         );
         let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
-        req.set_header(crate::constants::HEADER_X_TS_EC, &valid_ec_id);
+        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
 
         let resp = handle_first_party_click(&settings, req)
             .await

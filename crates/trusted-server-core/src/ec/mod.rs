@@ -3,7 +3,7 @@
 //! This module owns the EC lifecycle:
 //!
 //! 1. **Read** — [`EcContext::read_from_request`] extracts any existing EC ID
-//!    from headers/cookies, captures the client IP, and builds the consent
+//!    from cookies, captures the client IP, and builds the consent
 //!    context. This is called pre-routing on every request.
 //!
 //! 2. **Generate** — [`EcContext::generate_if_needed`] creates a new EC ID
@@ -63,7 +63,7 @@ use fastly::Request;
 
 use crate::compat;
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
+use crate::constants::COOKIE_TS_EC;
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
@@ -79,31 +79,20 @@ pub use generation::{
 };
 
 /// Parsed EC identity from an incoming request.
-///
-/// Separates the header-derived and cookie-derived EC values so callers
-/// can apply different policies (e.g. revocation targets the cookie value).
 struct RequestEc {
-    /// EC ID from the `X-ts-ec` header, if present.
-    header_ec: Option<String>,
     /// EC ID from the `ts-ec` cookie, if present.
     cookie_ec: Option<String>,
     /// The parsed cookie jar (retained for consent pipeline input).
     jar: Option<CookieJar>,
 }
 
-/// Parses EC identity from request headers and cookies in a single pass.
+/// Parses EC identity from request cookies in a single pass.
 ///
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 fn parse_ec_from_request(req: &Request) -> Result<RequestEc, Report<TrustedServerError>> {
     let http_req = compat::from_fastly_headers_ref(req);
-    let header_ec = http_req
-        .headers()
-        .get(HEADER_X_TS_EC)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|value| request_ec_id_if_allowed(value, "x-ts-ec header"));
-
     let jar = handle_request_cookies(&http_req)?;
     let cookie_ec = jar
         .as_ref()
@@ -111,11 +100,7 @@ fn parse_ec_from_request(req: &Request) -> Result<RequestEc, Report<TrustedServe
         .map(cookie::Cookie::value)
         .and_then(|value| request_ec_id_if_allowed(value, "ts-ec cookie"));
 
-    Ok(RequestEc {
-        header_ec,
-        cookie_ec,
-        jar,
-    })
+    Ok(RequestEc { cookie_ec, jar })
 }
 
 fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
@@ -129,22 +114,16 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
 
 /// Gets an existing EC ID from the request.
 ///
-/// Attempts to retrieve an existing EC ID from:
-/// 1. The `x-ts-ec` header
-/// 2. The `ts-ec` cookie
+/// Attempts to retrieve an existing EC ID from the `ts-ec` cookie.
 ///
-/// Returns `None` if neither source contains an EC ID.
+/// Returns `None` if the cookie does not contain a valid EC ID.
 ///
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
 pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<TrustedServerError>> {
     let parsed = parse_ec_from_request(req)?;
-    // Header takes precedence over cookie; malformed values are discarded.
-    let ec_id = parsed
-        .header_ec
-        .filter(|v| is_valid_ec_id(v))
-        .or_else(|| parsed.cookie_ec.filter(|v| is_valid_ec_id(v)));
+    let ec_id = parsed.cookie_ec.filter(|v| is_valid_ec_id(v));
     if let Some(ref id) = ec_id {
         log::trace!("Existing EC ID found: {}", log_id(id));
     }
@@ -185,7 +164,7 @@ impl EcContext {
     /// Reads EC state from an incoming request without generating a new ID.
     ///
     /// This is the first phase of the EC lifecycle. It:
-    /// - Checks the `X-ts-ec` header and `ts-ec` cookie for an existing EC ID
+    /// - Checks the `ts-ec` cookie for an existing EC ID
     /// - Captures the client IP (normalized) for later generation
     /// - Builds the full [`ConsentContext`] from cookies, headers, and geo
     ///
@@ -216,14 +195,7 @@ impl EcContext {
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
 
-        // Header takes precedence over cookie for the active EC value.
-        // Malformed values are discarded per §4.2: "If the header is
-        // present but malformed, it is discarded and the cookie value
-        // is used instead."
-        let ec_value = parsed
-            .header_ec
-            .filter(|v| is_valid_ec_id(v))
-            .or_else(|| parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v)));
+        let ec_value = parsed.cookie_ec.clone().filter(|v| is_valid_ec_id(v));
         let ec_was_present = ec_value.is_some();
 
         if let Some(ref id) = ec_value {
@@ -341,8 +313,8 @@ impl EcContext {
         self.cookie_ec_value.is_some()
     }
 
-    /// Returns whether an EC ID was found on the incoming request
-    /// (from header or cookie).
+    /// Returns whether an EC ID was found in the `ts-ec` cookie on the
+    /// incoming request.
     #[must_use]
     pub fn ec_was_present(&self) -> bool {
         self.ec_was_present
@@ -409,8 +381,7 @@ impl EcContext {
     ///
     /// When consent is withdrawn, this value is needed to identify the
     /// correct KV entry to tombstone. Returns `None` if no cookie was
-    /// present on the request. This always returns the cookie value,
-    /// even when the header took precedence for the active EC ID.
+    /// present on the request. This always returns the cookie value.
     #[must_use]
     pub fn existing_cookie_ec_id(&self) -> Option<&str> {
         self.cookie_ec_value.as_deref()
@@ -418,9 +389,6 @@ impl EcContext {
 
     /// Returns `true` when the request carried a cookie EC and the selected
     /// active EC differs from that cookie value.
-    ///
-    /// This captures the header-overrides-cookie case used during response
-    /// finalization to decide whether the browser cookie should be rewritten.
     #[must_use]
     pub fn cookie_differs_from_active_ec(&self) -> bool {
         matches!(
@@ -531,15 +499,15 @@ mod tests {
     }
 
     #[test]
-    fn read_from_request_with_header_ec() {
+    fn read_from_request_ignores_header_ec() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("a", "HdrEc1");
         let req = create_test_request(&[("x-ts-ec", &ec_id)]);
 
         let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
-        assert_eq!(ec.ec_value(), Some(ec_id.as_str()));
-        assert!(ec.ec_was_present(), "should detect EC from header");
+        assert!(ec.ec_value().is_none(), "should ignore EC from header");
+        assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
     }
@@ -560,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn read_from_request_header_takes_precedence_over_cookie() {
+    fn read_from_request_cookie_is_authoritative_when_header_present() {
         let settings = create_test_settings();
         let header_id = valid_ec_id("a", "Hdr001");
         let cookie_id = valid_ec_id("b", "Ck0001");
@@ -571,8 +539,8 @@ mod tests {
 
         assert_eq!(
             ec.ec_value(),
-            Some(header_id.as_str()),
-            "should prefer header over cookie"
+            Some(cookie_id.as_str()),
+            "should use cookie instead of header"
         );
         assert!(ec.cookie_was_present(), "should still detect cookie");
     }
@@ -590,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn read_from_request_discards_malformed_header_falls_back_to_cookie() {
+    fn read_from_request_uses_cookie_when_malformed_header_present() {
         let settings = create_test_settings();
         let cookie_id = valid_ec_id("c", "FbCk01");
         let cookie = format!("ts-ec={cookie_id}");
@@ -601,7 +569,7 @@ mod tests {
         assert_eq!(
             ec.ec_value(),
             Some(cookie_id.as_str()),
-            "should fall back to cookie when header is malformed"
+            "should use cookie when header is malformed"
         );
         assert!(ec.cookie_was_present(), "should detect cookie");
     }
@@ -631,7 +599,8 @@ mod tests {
     fn generate_if_needed_skips_when_ec_exists() {
         let settings = create_test_settings();
         let ec_id = valid_ec_id("d", "Exist1");
-        let req = create_test_request(&[("x-ts-ec", &ec_id)]);
+        let cookie = format!("ts-ec={ec_id}");
+        let req = create_test_request(&[("cookie", &cookie)]);
 
         let mut ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
         ec.generate_if_needed(&settings, None)
@@ -666,7 +635,7 @@ mod tests {
         let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
         assert!(
             ec.existing_cookie_ec_id().is_none(),
-            "should return None when EC came from header only"
+            "should return None when only header is present"
         );
 
         // With both header and cookie — should return cookie value
@@ -677,13 +646,13 @@ mod tests {
         let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
         assert_eq!(
             ec.ec_value(),
-            Some(header_ec2.as_str()),
-            "should use header as active EC"
+            Some(cookie_ec2.as_str()),
+            "should use cookie as active EC"
         );
         assert_eq!(
             ec.existing_cookie_ec_id(),
             Some(cookie_ec2.as_str()),
-            "should return cookie value for revocation even when header takes precedence"
+            "should return cookie value for revocation even when header is present"
         );
     }
 }

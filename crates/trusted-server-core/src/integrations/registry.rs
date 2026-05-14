@@ -654,8 +654,8 @@ impl IntegrationRegistry {
 
     /// Dispatch a proxy request when an integration handles the path.
     ///
-    /// This method sets request-side `x-ts-ec` for integration backends.
-    /// Response-side cookie/header mutation is centralized in EC finalize.
+    /// This method removes any caller-supplied `x-ts-ec` before proxying.
+    /// Response-side cookie mutation is centralized in EC finalize.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub async fn handle_proxy(
@@ -683,13 +683,8 @@ impl IntegrationRegistry {
                 );
             }
 
-            // Set EC ID header on the request so integrations can read it.
-            // Remove any caller-supplied invalid value rather than forwarding it.
-            if let Some(ec_id) = ec_context.ec_value() {
-                req.set_header(HEADER_X_TS_EC, ec_id);
-            } else {
-                req.remove_header(HEADER_X_TS_EC);
-            }
+            // Remove any caller-supplied EC header rather than forwarding it.
+            req.remove_header(HEADER_X_TS_EC);
 
             Some(proxy.handle(settings, req).await)
         } else {
@@ -1280,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_proxy_sets_ec_id_header_on_request() {
+    fn handle_proxy_removes_ec_id_header_on_request() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1292,10 +1287,10 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        // Provide an existing EC via header (client IP is unavailable in
-        // the test environment, so generation would fail).
+        let valid_ec_id = format!("{}.CkEc1", "a".repeat(64));
         let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
-        req.set_header("x-ts-ec", format!("{}.HdrEc1", "a".repeat(64)));
+        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
+        req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
@@ -1316,10 +1311,9 @@ mod tests {
 
         let response = response.unwrap();
 
-        // The x-ts-ec header should be set on outbound integration request.
         assert!(
-            response.get_header("x-echo-ts-ec").is_some(),
-            "should have x-ts-ec header on integration request"
+            response.get_header("x-echo-ts-ec").is_none(),
+            "should not have x-ts-ec header on integration request"
         );
     }
 
@@ -1360,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_proxy_keeps_request_ec_even_when_consent_denied() {
+    fn handle_proxy_removes_request_ec_header_even_when_consent_denied() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1390,10 +1384,9 @@ mod tests {
 
         let response = result.expect("proxy handle should succeed");
 
-        // The x-ts-ec request header is still set for integration request flow.
         assert!(
-            response.get_header("x-echo-ts-ec").is_some(),
-            "should still set x-ts-ec on integration request"
+            response.get_header("x-echo-ts-ec").is_none(),
+            "should not set x-ts-ec on integration request"
         );
     }
 
@@ -1410,9 +1403,11 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
+        let valid_ec_id = format!("{}.CkEc1", "a".repeat(64));
         let mut req =
             Request::post("https://test-publisher.com/integrations/test/ec").with_body("test body");
-        req.set_header("x-ts-ec", format!("{}.HdrEc1", "a".repeat(64)));
+        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
+        req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
@@ -1431,8 +1426,8 @@ mod tests {
 
         let response = response.unwrap();
         assert!(
-            response.get_header("x-echo-ts-ec").is_some(),
-            "POST integration request should include x-ts-ec"
+            response.get_header("x-echo-ts-ec").is_none(),
+            "POST integration request should not include x-ts-ec"
         );
     }
 

@@ -11,7 +11,7 @@
 //! - `HttpOnly` prevents client-side JS from reading the cookie via
 //!   `document.cookie`, providing XSS defense-in-depth. The identify
 //!   endpoint (`/_ts/api/v1/identify`) exposes the EC ID in its response
-//!   body and `x-ts-ec` header for legitimate JS use cases.
+//!   body for legitimate JS use cases.
 
 use std::borrow::Cow;
 

@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn revocation_targets_cookie_ec_id_not_header() {
+    fn request_ec_uses_cookie_not_header() {
         let settings = create_test_settings();
         let header_ec = format!("{}.HdrId1", "a".repeat(64));
         let cookie_ec = format!("{}.CkId01", "b".repeat(64));
@@ -1178,8 +1178,8 @@ mod tests {
 
         assert_eq!(
             ec_context.ec_value(),
-            Some(header_ec.as_str()),
-            "should resolve request EC ID from header precedence"
+            Some(cookie_ec.as_str()),
+            "should resolve request EC ID from cookie"
         );
         assert!(
             ec_context.cookie_was_present(),
@@ -1188,7 +1188,7 @@ mod tests {
         assert_eq!(
             ec_context.existing_cookie_ec_id(),
             Some(cookie_ec.as_str()),
-            "should return cookie EC value for revocation, not the header value"
+            "should return cookie EC value for revocation"
         );
     }
 

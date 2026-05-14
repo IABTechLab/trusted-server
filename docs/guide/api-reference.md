@@ -38,7 +38,7 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 **Response Headers:**
 
-- `x-ts-ec` - EC ID (`64hex.6alnum` format)
+No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
 
 **Use Cases:**
 
@@ -614,7 +614,7 @@ Proxies to configured endpoint with `user.id` populated with EC ID.
 
 **Response Headers:**
 
-- `x-ts-ec` - EC ID (`64hex.6alnum` format)
+No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
 
 ---
 

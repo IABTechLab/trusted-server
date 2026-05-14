@@ -163,10 +163,10 @@ curl -si -X POST "${TS_BASE_URL}/auction" \
 
 Check response headers:
 
-- `x-ts-ec`
 - `x-ts-ec-consent`
 - `x-ts-eids`
-  For returning users, ordinary page views should include `x-ts-ec` but should not refresh `Set-Cookie: ts-ec=...`. A `Set-Cookie` header is expected when the EC is newly generated.
+
+For returning users, ordinary page views should not refresh `Set-Cookie: ts-ec=...`. A `Set-Cookie` header is expected when the EC is newly generated.
 
 Decode `x-ts-eids`:
 

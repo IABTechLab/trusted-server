@@ -10,7 +10,6 @@ use url::Url;
 
 use super::auth::authenticate_bearer;
 use super::consent::ec_consent_granted;
-use crate::constants::HEADER_X_TS_EC;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
@@ -123,10 +122,7 @@ pub fn handle_identify(
         cluster_size,
     };
 
-    let mut response = json_response_with_origin(StatusCode::OK, &body, allowed_origin.as_deref())?;
-    response.set_header(HEADER_X_TS_EC, ec_id);
-
-    Ok(response)
+    json_response_with_origin(StatusCode::OK, &body, allowed_origin.as_deref())
 }
 
 /// Handles `OPTIONS /_ts/api/v1/identify` CORS preflight.
@@ -245,7 +241,7 @@ fn origin_authority_contains_uppercase_host(origin: &str) -> bool {
 fn apply_identify_cache_headers(mut response: Response) -> Response {
     response.set_header(header::CACHE_CONTROL, "no-store");
     response.set_header(header::PRAGMA, "no-cache");
-    response.set_header(header::VARY, "Origin, Authorization, X-ts-ec");
+    response.set_header(header::VARY, "Origin, Authorization");
     response
 }
 
@@ -260,12 +256,9 @@ fn apply_cors_headers(response: &mut Response, origin: &str) {
     response.set_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     response.set_header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true");
     response.set_header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS");
-    response.set_header(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "Authorization, X-ts-ec",
-    );
+    response.set_header(header::ACCESS_CONTROL_ALLOW_HEADERS, "Authorization");
     response.set_header(header::ACCESS_CONTROL_MAX_AGE, "600");
-    response.set_header(header::VARY, "Origin, Authorization, X-ts-ec");
+    response.set_header(header::VARY, "Origin, Authorization");
 }
 
 #[cfg(test)]
@@ -504,6 +497,10 @@ mod tests {
             .expect("should decode identify response JSON");
 
         assert_eq!(body["ec"], ec_id, "should echo EC in body");
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "should not emit x-ts-ec header"
+        );
         assert_eq!(body["partner_id"], "ssp_x", "should echo partner ID");
         assert_eq!(
             body["degraded"],
@@ -569,7 +566,7 @@ mod tests {
         );
         assert_eq!(
             response.get_header_str(header::VARY),
-            Some("Origin, Authorization, X-ts-ec"),
+            Some("Origin, Authorization"),
             "should vary on identity request inputs for browser-direct identify responses"
         );
     }
@@ -608,7 +605,7 @@ mod tests {
         assert_no_store(&response);
         assert_eq!(
             response.get_header_str(header::VARY),
-            Some("Origin, Authorization, X-ts-ec"),
+            Some("Origin, Authorization"),
             "should vary on identity request inputs for preflight"
         );
     }
