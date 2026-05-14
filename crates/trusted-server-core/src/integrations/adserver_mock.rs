@@ -309,7 +309,11 @@ impl AuctionProvider for AdServerMockProvider {
         for response in bidder_responses {
             for bid in &response.bids {
                 index.insert(
-                    (response.provider.clone(), bid.slot_id.clone(), bid.bidder.clone()),
+                    (
+                        response.provider.clone(),
+                        bid.slot_id.clone(),
+                        bid.bidder.clone(),
+                    ),
                     bid.clone(),
                 );
             }
