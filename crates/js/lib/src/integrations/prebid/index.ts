@@ -21,14 +21,18 @@ import 'prebid.js/modules/userId.js';
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
 // build time. See _adapters.generated.ts (written by build-all.mjs).
+// User ID submodules come from the deterministic attested preset in
+// user_id_modules.json. See _user_ids.generated.ts.
 // When a bidder is listed in `client_side_bidders` in trusted-server.toml,
 // the requestBids shim leaves its bids untouched and the corresponding
 // adapter handles them natively in the browser.
 import './_adapters.generated';
+import './_user_ids.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
+import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
@@ -57,6 +61,12 @@ interface InjectedPrebidConfig {
   clientSideBidders?: string[];
 }
 
+interface PrebidUserIdDiagnostics {
+  includedModules: string[];
+  configuredUserIdNames: string[];
+  missingConfiguredUserIdNames: string[];
+}
+
 /** Read server-injected config from window.__tsjs_prebid, if present. */
 export function getInjectedConfig(): InjectedPrebidConfig | undefined {
   if (typeof window !== 'undefined') {
@@ -79,6 +89,76 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
     }
   }
   return [...bidders];
+}
+
+function configuredUserIdNamesFromConfig(config: unknown): string[] {
+  const userIds = Array.isArray(config)
+    ? config
+    : config && typeof config === 'object'
+      ? ((
+          config as {
+            userSync?: { userIds?: Array<{ name?: unknown }> };
+            userIds?: Array<{ name?: unknown }>;
+          }
+        ).userSync?.userIds ?? (config as { userIds?: Array<{ name?: unknown }> }).userIds)
+      : undefined;
+
+  if (!Array.isArray(userIds)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      userIds
+        .map((entry) => entry?.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0)
+    ),
+  ].sort();
+}
+
+function readConfiguredUserIdNames(): string[] {
+  const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
+  if (typeof getConfig !== 'function') {
+    return [];
+  }
+
+  return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
+    configuredUserIdNamesFromConfig(getConfig())
+  );
+}
+
+function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
+  const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
+  const coveredConfigNames = new Set(
+    PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
+      DEFAULT_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+    ).flatMap((entry) => entry.configNames)
+  );
+  const missingConfiguredUserIdNames = configuredUserIdNames.filter(
+    (name) => !coveredConfigNames.has(name)
+  );
+
+  const diagnostics: PrebidUserIdDiagnostics = {
+    includedModules: [...DEFAULT_PREBID_USER_ID_MODULES],
+    configuredUserIdNames,
+    missingConfiguredUserIdNames,
+  };
+
+  if (typeof window !== 'undefined') {
+    const tsjsWindow = window as typeof window & {
+      __tsjs_prebid_diagnostics?: { userIdModules?: PrebidUserIdDiagnostics };
+    };
+    tsjsWindow.__tsjs_prebid_diagnostics = {
+      ...(tsjsWindow.__tsjs_prebid_diagnostics ?? {}),
+      userIdModules: diagnostics,
+    };
+  }
+
+  for (const name of missingConfiguredUserIdNames) {
+    log.warn(`[tsjs-prebid] configured User ID module "${name}" is not included in TSJS`);
+  }
+
+  return diagnostics;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +457,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // processQueue() must be called after all modules are loaded when using
   // prebid.js via NPM.
   pbjs.processQueue();
+  recordUserIdModuleDiagnostics();
 
   // Validate that every client-side bidder has its adapter registered.
   // Adapters self-register on import, so a missing adapter means the bidder
@@ -451,6 +532,8 @@ function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
 function syncPrebidEidsCookie(): void {
   try {
     if (typeof pbjs.getUserIdsAsEids !== 'function') {
+      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
+      clearPrebidEidsCookie();
       return;
     }
 

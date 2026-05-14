@@ -298,6 +298,57 @@ The build script (`build-all.mjs`) validates that each adapter exists in `prebid
 Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a rebuild with the adapter included in `TSJS_PREBID_ADAPTERS`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
 :::
 
+## User ID Modules
+
+Prebid.js can expose publisher-configured User ID Module output via
+`pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
+EIDs after auctions and forwards them to Trusted Server when they are available.
+
+User ID submodule inclusion is deterministic for attested builds. The module
+preset is checked in at
+`crates/js/lib/src/integrations/prebid/user_id_modules.json`, and
+`build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
+that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
+production builds so publisher-specific ID choices do not change the attested JS
+artifact.
+
+This is deliberate: Trusted Server replaces the publisher's Prebid.js bundle so
+we can install the `trustedServer` adapter and route auctions through `/auction`,
+but publishers often have custom or opaque Prebid builds. It is difficult to
+know every User ID submodule needed for a publisher before runtime, and making
+that list an environment-driven build input would produce different JS bytes per
+publisher. Those publisher-specific bundles would undermine deployment
+attestation because the trusted artifact hash would vary based on integration
+configuration rather than code changes. Keeping a broad, reviewed preset in
+source control makes the auction flow predictable while keeping the generated
+bundle stable across publishers.
+
+The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
+LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
+Unified ID / TDID. LiveIntent is imported through a local ESM shim because the
+public Prebid wrapper contains a CommonJS `require(...)` mode switch that is not
+safe for the TSJS IIFE bundle.
+
+Example EID source mapping:
+
+| EID source                                                        | Included module        |
+| ----------------------------------------------------------------- | ---------------------- |
+| `yahoo.com`                                                       | `connectIdSystem`      |
+| `criteo.com`                                                      | `criteoIdSystem`       |
+| `liveintent.com`, `bidswitch.net`, `openx.net`, `pubmatic.com`, … | `liveIntentIdSystem`   |
+| `pubcid.org`                                                      | `sharedIdSystem`       |
+| `adserver.org` with `rtiPartner = TDID`                           | `unifiedIdSystem`      |
+| `uidapi.com`                                                      | `uid2IdSystem`         |
+| `id5-sync.com`                                                    | `id5IdSystem`          |
+| `liveramp.com`                                                    | `identityLinkIdSystem` |
+
+For local experiments only, `TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE` can
+replace the preset. Do not use that override for trusted deployments because it
+changes the bundle hash.
+
+This is separate from `TSJS_PREBID_ADAPTERS`, which continues to control
+client-side bidder adapter modules.
+
 ## Identity Forwarding
 
 Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:

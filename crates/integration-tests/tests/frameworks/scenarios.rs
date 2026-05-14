@@ -500,16 +500,17 @@ impl EcScenario {
 /// US Privacy signal that explicitly allows storage in the default Viceroy
 /// integration-test geo (US-CA).
 const ALLOW_US_PRIVACY_COOKIE: &str = "1YNN";
-const SEEDED_EC_ID: &str =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
-
 fn allow_ec_generation(client: &EcTestClient) {
     client.set_cookie("us_privacy", ALLOW_US_PRIVACY_COOKIE);
 }
 
-fn use_seeded_ec(client: &EcTestClient) -> String {
-    client.set_cookie("ts-ec", SEEDED_EC_ID);
-    normalize_ec_id(SEEDED_EC_ID)
+fn seeded_ec_id(hex_digit: char, suffix: &str) -> String {
+    format!("{}.{suffix}", hex_digit.to_string().repeat(64))
+}
+
+fn use_seeded_ec(client: &EcTestClient, ec_id: &str) -> String {
+    client.set_cookie("ts-ec", ec_id);
+    normalize_ec_id(ec_id)
 }
 
 /// Full lifecycle: seeded EC → batch sync → identify (Bearer auth) with scoped UID.
@@ -518,7 +519,8 @@ fn use_seeded_ec(client: &EcTestClient) -> String {
 fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
-    let ec_id = use_seeded_ec(&client);
+    let seeded_ec_id = seeded_ec_id('a', "test01");
+    let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC full lifecycle: using seeded EC ID = {ec_id}");
 
     // 2. Batch sync writes partner UID (partner "inttest" is in config)
@@ -576,7 +578,8 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
 fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
-    let ec_id = use_seeded_ec(&client);
+    let seeded_ec_id = seeded_ec_id('b', "test02");
+    let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC consent withdrawal: using seeded EC = {ec_id}");
 
     // GPC overrides the allow cookie in US-CA, so this is an explicit
@@ -623,7 +626,8 @@ fn ec_identify_without_ec(base_url: &str) -> TestResult<()> {
 fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
-    let _ec_id = use_seeded_ec(&client);
+    let seeded_ec_id = seeded_ec_id('c', "test03");
+    let _ec_id = use_seeded_ec(&client, &seeded_ec_id);
 
     // Identify with GPC=1 — in the default US-CA test geo, GPC is an explicit
     // denial that must override the allow cookie. Per spec §11.4, consent is
@@ -647,7 +651,8 @@ fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
 fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
-    let ec_id = use_seeded_ec(&client);
+    let seeded_ec_id = seeded_ec_id('d', "test04");
+    let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC concurrent syncs: using seeded EC = {ec_id}");
 
     // Batch sync both partners (both are pre-configured in trusted-server.toml)
@@ -705,7 +710,8 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
 fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
-    let ec_id = use_seeded_ec(&client);
+    let seeded_ec_id = seeded_ec_id('e', "test05");
+    let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC batch sync happy path: using seeded ec_id = {ec_id}");
 
     // Batch sync writes a UID for this EC ID (partner "inttest" is in config)

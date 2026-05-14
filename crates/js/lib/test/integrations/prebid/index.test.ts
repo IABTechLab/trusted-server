@@ -6,9 +6,9 @@ const {
   mockProcessQueue,
   mockRequestBids,
   mockRegisterBidAdapter,
+  mockGetUserIdsAsEids,
   mockPbjs,
   mockGetBidAdapter,
-  mockGetUserIdsAsEids,
   mockAdapterManager,
 } = vi.hoisted(() => {
   const mockSetConfig = vi.fn();
@@ -16,7 +16,9 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
-  const mockGetUserIdsAsEids = vi.fn();
+  const mockGetUserIdsAsEids = vi.fn(
+    () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
+  );
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
@@ -33,9 +35,9 @@ const {
     mockProcessQueue,
     mockRequestBids,
     mockRegisterBidAdapter,
+    mockGetUserIdsAsEids,
     mockPbjs,
     mockGetBidAdapter,
-    mockGetUserIdsAsEids,
     mockAdapterManager,
   };
 });
@@ -51,8 +53,9 @@ vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
 vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// Mock the build-generated adapter imports (no-op in tests)
+// Mock the build-generated side-effect imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
+vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({}));
 
 import {
   collectBidders,

@@ -16,7 +16,7 @@ proxy_secret = "change-me-proxy-secret"
 
 [ec]
 passphrase = "local-dev-passphrase-32-bytes-min"
-ec_store = "ec_identity_store"
+ec_store = "ec_id_store"
 pull_sync_concurrency = 3
 # cluster_trust_threshold = 10   # Entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600    # Re-evaluate cluster_size after this many seconds
