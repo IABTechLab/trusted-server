@@ -20,7 +20,7 @@ use fastly::{Body, Request, Response};
 
 use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
 use crate::auction::types::{
-    AuctionContext, AuctionRequest, Bid, PublisherInfo, SiteInfo, UserInfo,
+    AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
 use crate::backend::BackendConfig;
 use crate::compat;
@@ -935,6 +935,7 @@ pub async fn handle_publisher_request(
             &request_info,
             &request_path,
             co_config,
+            req.get_header_str("user-agent"),
         );
         let auction_context = AuctionContext {
             settings,
@@ -1180,6 +1181,7 @@ pub(crate) fn build_auction_request(
     request_info: &crate::http_util::RequestInfo,
     request_path: &str,
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+    user_agent: Option<&str>,
 ) -> AuctionRequest {
     let slots = matched_slots
         .iter()
@@ -1201,7 +1203,11 @@ pub(crate) fn build_auction_request(
             fresh_id: ec_id.to_string(),
             consent: Some(consent_context.clone()),
         },
-        device: None,
+        device: user_agent.filter(|ua| !ua.is_empty()).map(|ua| DeviceInfo {
+            user_agent: Some(ua.to_string()),
+            ip: None,
+            geo: None,
+        }),
         site: Some(SiteInfo {
             domain: request_info.host.clone(),
             page: page_url,
@@ -1456,6 +1462,7 @@ pub async fn handle_page_bids(
             &request_info,
             &path_param,
             co_config,
+            req.get_header_str("user-agent"),
         );
         let timeout_ms = co_config
             .auction_timeout_ms
