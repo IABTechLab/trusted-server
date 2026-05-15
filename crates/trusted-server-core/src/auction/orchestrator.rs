@@ -542,7 +542,11 @@ impl AuctionOrchestrator {
         let starting_count = winning_bids.len();
         winning_bids.retain(|slot_id, bid| match floor_prices.get(slot_id) {
             Some(floor) => {
-                // Bids without price (e.g., APS) pass through - floor checked in mediation
+                // price=None means the SSP returned an encoded price (e.g. APS amznbid).
+                // In the parallel-only path this bid cannot yet be floor-checked; it passes
+                // through and will be decoded (and re-checked) by the mediation layer.
+                // In the mediation path, mediation decodes prices before calling this
+                // function, so any bid still carrying price=None is dropped upstream.
                 match bid.price {
                     Some(price) if price >= *floor => true,
                     Some(_) => {
@@ -554,7 +558,7 @@ impl AuctionOrchestrator {
                     }
                     None => {
                         log::debug!(
-                            "Passing bid with encoded price for slot '{}' - floor check deferred to mediation",
+                            "Passing encoded-price bid for slot '{}' - price not yet decoded",
                             slot_id
                         );
                         true
@@ -1303,6 +1307,81 @@ mod tests {
                 .price
                 .is_none(),
             "Price should still be None (not decoded yet)"
+        );
+    }
+
+    #[test]
+    fn test_apply_floor_prices_drops_decoded_aps_bid_below_floor() {
+        // After mediation decodes an APS bid, apply_floor_prices must enforce the
+        // slot floor on the resulting price=Some(x) value. This test simulates the
+        // state of a bid after mediator decoding: price is Some, amznbid is gone.
+        let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
+        let mut floor_prices = HashMap::new();
+        floor_prices.insert("atf".to_string(), 0.50);
+
+        let mut winning_bids = HashMap::new();
+        winning_bids.insert(
+            "atf".to_string(),
+            Bid {
+                slot_id: "atf".to_string(),
+                price: Some(0.30), // decoded APS price — below $0.50 floor
+                currency: "USD".to_string(),
+                creative: Some("<div>APS Ad</div>".to_string()),
+                adomain: None,
+                bidder: "aps".to_string(),
+                width: 300,
+                height: 250,
+                nurl: None,
+                burl: None,
+                ad_id: None,
+                metadata: HashMap::new(),
+            },
+        );
+
+        let filtered = orchestrator.apply_floor_prices(winning_bids, &floor_prices);
+
+        assert!(
+            filtered.is_empty(),
+            "Decoded APS bid below slot floor should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_apply_floor_prices_keeps_decoded_aps_bid_at_or_above_floor() {
+        let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
+        let mut floor_prices = HashMap::new();
+        floor_prices.insert("atf".to_string(), 0.50);
+
+        let mut winning_bids = HashMap::new();
+        winning_bids.insert(
+            "atf".to_string(),
+            Bid {
+                slot_id: "atf".to_string(),
+                price: Some(0.75), // decoded APS price — above floor
+                currency: "USD".to_string(),
+                creative: Some("<div>APS Ad</div>".to_string()),
+                adomain: None,
+                bidder: "aps".to_string(),
+                width: 300,
+                height: 250,
+                nurl: None,
+                burl: None,
+                ad_id: None,
+                metadata: HashMap::new(),
+            },
+        );
+
+        let filtered = orchestrator.apply_floor_prices(winning_bids, &floor_prices);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Decoded APS bid at or above floor should be kept"
+        );
+        assert_eq!(
+            filtered.get("atf").expect("atf should be present").price,
+            Some(0.75),
+            "Price should be preserved"
         );
     }
 }
