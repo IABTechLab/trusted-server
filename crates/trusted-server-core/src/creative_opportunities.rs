@@ -125,11 +125,6 @@ impl CreativeOpportunitySlot {
                 serde_json::json!({ "slotID": aps.slot_id }),
             );
         }
-        if let Some(ref pbs) = self.providers.pbs {
-            for (bidder_name, params) in &pbs.bidders {
-                bidders.insert(bidder_name.clone(), params.clone());
-            }
-        }
         AdSlot {
             id: self.id.clone(),
             formats: self
@@ -175,8 +170,6 @@ impl CreativeOpportunityFormat {
 pub struct SlotProviders {
     /// Amazon Publisher Services (APS/TAM) slot parameters.
     pub aps: Option<ApsSlotParams>,
-    /// Prebid Server (PBS) slot parameters.
-    pub pbs: Option<PbsSlotParams>,
 }
 
 /// APS-specific parameters for a slot.
@@ -184,24 +177,6 @@ pub struct SlotProviders {
 pub struct ApsSlotParams {
     /// The APS slot ID string used when making TAM bid requests.
     pub slot_id: String,
-}
-
-/// PBS-specific parameters for a slot.
-///
-/// Bidder params are sent inline to Prebid Server so bidder credentials
-/// stay in `creative-opportunities.toml` rather than in PBS stored requests.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PbsSlotParams {
-    /// Per-bidder params keyed by bidder name (must match PBS adapter name).
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// [slot.providers.pbs.bidders]
-    /// mocktioneer = { bid = 2.00 }
-    /// criteo = { networkId = 123456, pubid = "123456" }
-    /// ```
-    #[serde(default)]
-    pub bidders: HashMap<String, serde_json::Value>,
 }
 
 /// TOML file structure for creative opportunity slot definitions.
@@ -330,46 +305,6 @@ mod tests {
         assert_eq!(
             aps_params.get("slotID").and_then(|v| v.as_str()),
             Some("aps-slot-atf"),
-        );
-    }
-
-    #[test]
-    fn to_ad_slot_wires_pbs_bidder_params_into_bidders() {
-        let mut slot = make_slot("atf_sidebar_ad", vec!["/"]);
-        slot.providers.pbs = Some(PbsSlotParams {
-            bidders: [
-                (
-                    "mocktioneer".to_string(),
-                    serde_json::json!({ "bid": 2.00 }),
-                ),
-                (
-                    "criteo".to_string(),
-                    serde_json::json!({ "networkId": 123456, "pubid": "123456" }),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        });
-        let ad_slot = slot.to_ad_slot("88059007");
-        let mock_params = ad_slot
-            .bidders
-            .get("mocktioneer")
-            .expect("should have mocktioneer bidder");
-        assert_eq!(
-            mock_params.get("bid").and_then(serde_json::Value::as_f64),
-            Some(2.0),
-            "should wire mocktioneer bid param"
-        );
-        let criteo_params = ad_slot
-            .bidders
-            .get("criteo")
-            .expect("should have criteo bidder");
-        assert_eq!(
-            criteo_params
-                .get("networkId")
-                .and_then(serde_json::Value::as_i64),
-            Some(123456),
-            "should wire criteo networkId param"
         );
     }
 
