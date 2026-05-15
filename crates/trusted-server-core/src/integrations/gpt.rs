@@ -437,6 +437,19 @@ impl IntegrationHeadInjector for GptIntegration {
         GPT_INTEGRATION_ID
     }
 
+    /// Injects the `__tsAdInit` bootstrap script into `<head>`.
+    ///
+    /// ## Scroll / refresh handoff contract (Phase 1)
+    ///
+    /// `__tsAdInit` handles **initial render only**: it wires server-side bid
+    /// targeting into GPT slots and fires win beacons (`nurl`/`burl`) via
+    /// `slotRenderEnded`. It does **not** trigger refresh auctions or handle
+    /// GPT slot refresh events.
+    ///
+    /// Post-`window.load`, slim-Prebid takes over: it listens for GPT refresh
+    /// events, runs client-side auctions, and sets targeting for subsequent
+    /// impressions. SPA pushState navigation is also slim-Prebid's domain.
+    /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         vec![
             "<script>window.__tsjs_gpt_enabled=true;\

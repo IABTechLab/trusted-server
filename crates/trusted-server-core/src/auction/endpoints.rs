@@ -55,6 +55,20 @@ use super::AuctionOrchestrator;
 /// headers include `X-TS-EC` (the caller's Edge Cookie ID) and
 /// `X-TS-EC-Fresh` (a freshly generated ID for cookie renewal).
 ///
+/// ## Scroll, refresh, and SPA navigation
+///
+/// This endpoint is intended for **initial page render** and **programmatic
+/// callers** (e.g. slim-Prebid, native apps, server-to-server integrations).
+/// It is **not** the intended path for scroll or GPT refresh events.
+///
+/// In Phase 1, slim-Prebid owns scroll and refresh: it runs post-`window.load`,
+/// listens for GPT refresh events, and runs client-side auctions independently
+/// of this endpoint. SPAs that use pushState routing do not trigger TS page-level
+/// auctions — slim-Prebid handles those cases too.
+///
+/// A slot-template-aware refresh API (`POST /auction/refresh`) is deferred to a
+/// future phase and not designed here.
+///
 /// # Errors
 ///
 /// Returns an error if:
