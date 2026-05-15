@@ -16,11 +16,44 @@ use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_reques
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
 
-/// Handle auction request from /auction endpoint.
+/// Handle auction request from `POST /auction`.
 ///
-/// This is the main entry point for running header bidding auctions.
-/// It orchestrates bids from multiple providers (Prebid, APS, GAM, etc.) and returns
-/// the winning bids in `OpenRTB` format with creative HTML inline in the `adm` field.
+/// Accepts a JSON body matching [`AdRequest`][`super::formats::AdRequest`].
+/// The minimum valid request is:
+///
+/// ```json
+/// {
+///   "adUnits": [{
+///     "code": "atf_sidebar_ad",
+///     "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+///   }]
+/// }
+/// ```
+///
+/// ## Bidder params: inline vs. stored-request
+///
+/// Each ad unit's `bids` array is **optional**. When absent or empty the PBS
+/// integration falls back to a stored-request keyed by the unit's `code`
+/// field (`imp.ext.prebid.storedrequest = { id: "<code>" }`). A PBS stored
+/// request must therefore exist for every slot code that omits inline params.
+///
+/// When `bids` is supplied, each entry's `bidder`/`params` pair is forwarded
+/// directly as `imp.ext.prebid.bidder.<bidder>`.
+///
+/// ## Context passthrough (`config`)
+///
+/// The optional `config` object is filtered through
+/// [`auction.allowed_context_keys`][`crate::settings::AuctionConfig::allowed_context_keys`].
+/// Only keys listed there reach the auction providers (e.g. `"permutive_segments"`).
+/// All other keys are silently dropped. Values must be either strings or arrays of
+/// strings.
+///
+/// ## Response
+///
+/// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
+/// `adm` field after sanitisation and first-party URL rewriting. Response
+/// headers include `X-TS-EC` (the caller's Edge Cookie ID) and
+/// `X-TS-EC-Fresh` (a freshly generated ID for cookie renewal).
 ///
 /// # Errors
 ///
