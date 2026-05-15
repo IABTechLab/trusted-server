@@ -24,7 +24,7 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -401,7 +401,14 @@ async fn route_request(
         }
         (m, path) if integration_registry.has_route(&m, path) => {
             let result = integration_registry
-                .handle_proxy(&m, path, settings, kv_graph.as_ref(), &mut ec_context, req)
+                .handle_proxy(ProxyDispatchInput {
+                    method: &m,
+                    path,
+                    settings,
+                    kv: kv_graph.as_ref(),
+                    ec_context: &mut ec_context,
+                    req,
+                })
                 .await
                 .unwrap_or_else(|| {
                     Err(Report::new(TrustedServerError::BadRequest {
