@@ -2751,12 +2751,18 @@ mod tests {
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
 
             assert_eq!(
-                body["slots"].as_array().expect("slots should be array").len(),
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
                 0,
                 "empty slots file should produce zero injected slots"
             );
             assert_eq!(
-                body["bids"].as_object().expect("bids should be object").len(),
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
                 0,
                 "empty slots file should produce zero bids"
             );
@@ -2779,12 +2785,18 @@ mod tests {
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
 
             assert_eq!(
-                body["slots"].as_array().expect("slots should be array").len(),
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
                 0,
                 "non-matching URL should produce zero injected slots"
             );
             assert_eq!(
-                body["bids"].as_object().expect("bids should be object").len(),
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
                 0,
                 "non-matching URL should produce zero bids"
             );
