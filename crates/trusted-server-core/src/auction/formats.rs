@@ -206,6 +206,7 @@ pub fn convert_tsjs_to_auction_request(
             id: ec_id,
             fresh_id,
             consent: Some(consent),
+            eids: None,
         },
         device,
         site: Some(SiteInfo {

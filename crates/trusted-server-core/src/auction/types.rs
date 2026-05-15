@@ -90,6 +90,13 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
+    /// Extended User IDs parsed from the [`crate::constants::COOKIE_TS_EIDS`] cookie.
+    ///
+    /// Raw (un-gated) values from the browser; consent gating via
+    /// [`crate::consent::gate_eids_by_consent`] is applied in the provider
+    /// layer before any EID reaches a bid request.
+    #[serde(skip)]
+    pub eids: Option<Vec<crate::openrtb::Eid>>,
 }
 
 /// Device information from request.

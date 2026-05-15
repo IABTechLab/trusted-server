@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -13,7 +14,8 @@ use http::Request;
 use http::Response;
 
 use crate::constants::{
-    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EC, COOKIE_US_PRIVACY,
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EC, COOKIE_TS_EIDS,
+    COOKIE_US_PRIVACY,
 };
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -115,6 +117,35 @@ pub fn handle_request_cookies(
         None => {
             log::debug!("No cookie header found in request");
             Ok(None)
+        }
+    }
+}
+
+/// Parse Extended User IDs from the [`COOKIE_TS_EIDS`] cookie.
+///
+/// The cookie value is a standard-base64-encoded JSON array of
+/// [`crate::openrtb::Eid`] objects written by the Trusted Server JS SDK via
+/// `btoa(JSON.stringify(eids))`.
+///
+/// Returns `None` if the cookie is absent, base64-malformed, JSON-malformed,
+/// or the decoded array is empty. Parse failures are logged at `debug` level
+/// so operators can diagnose JS SDK / server mismatches.
+#[must_use]
+pub(crate) fn parse_ts_eids_cookie(jar: Option<&CookieJar>) -> Option<Vec<crate::openrtb::Eid>> {
+    let value = jar?.get(COOKIE_TS_EIDS)?.value().to_owned();
+    let decoded = match STANDARD.decode(&value) {
+        Ok(b) => b,
+        Err(e) => {
+            log::debug!("ts-eids cookie: base64 decode failed: {e}");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Vec<crate::openrtb::Eid>>(&decoded) {
+        Ok(eids) if !eids.is_empty() => Some(eids),
+        Ok(_) => None,
+        Err(e) => {
+            log::debug!("ts-eids cookie: JSON parse failed: {e}");
+            None
         }
     }
 }
@@ -758,5 +789,74 @@ mod tests {
         let header = "euconsent-v2=BOE=xyz; session=abc=123=def";
         let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
         assert_eq!(stripped, "session=abc=123=def");
+    }
+
+    fn make_jar_with(name: &str, value: &str) -> CookieJar {
+        parse_cookies_to_jar(&format!("{name}={value}"))
+    }
+
+    fn encode_eids(eids: &[serde_json::Value]) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD.encode(serde_json::to_string(eids).expect("should serialize eids"))
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_eids_for_valid_input() {
+        let encoded = encode_eids(&[serde_json::json!({
+            "source": "id5-sync.com",
+            "uids": [{"id": "abc123", "atype": 1}]
+        })]);
+        let jar = make_jar_with(COOKIE_TS_EIDS, &encoded);
+        let eids = parse_ts_eids_cookie(Some(&jar)).expect("should parse valid ts-eids cookie");
+        assert_eq!(eids.len(), 1, "should return one EID");
+        assert_eq!(eids[0].source, "id5-sync.com", "should preserve source");
+        assert_eq!(eids[0].uids[0].id, "abc123", "should preserve uid");
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_none_when_cookie_absent() {
+        let jar = CookieJar::new();
+        assert!(
+            parse_ts_eids_cookie(Some(&jar)).is_none(),
+            "should return None when cookie absent"
+        );
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_none_for_empty_array() {
+        let encoded = encode_eids(&[]);
+        let jar = make_jar_with(COOKIE_TS_EIDS, &encoded);
+        assert!(
+            parse_ts_eids_cookie(Some(&jar)).is_none(),
+            "should return None for empty EID array"
+        );
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_none_for_corrupt_base64() {
+        let jar = make_jar_with(COOKIE_TS_EIDS, "not!!valid!!base64");
+        assert!(
+            parse_ts_eids_cookie(Some(&jar)).is_none(),
+            "should return None for corrupt base64"
+        );
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_none_for_invalid_json() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let encoded = STANDARD.encode(b"this is not json");
+        let jar = make_jar_with(COOKIE_TS_EIDS, &encoded);
+        assert!(
+            parse_ts_eids_cookie(Some(&jar)).is_none(),
+            "should return None for invalid JSON"
+        );
+    }
+
+    #[test]
+    fn parse_ts_eids_cookie_returns_none_for_none_jar() {
+        assert!(
+            parse_ts_eids_cookie(None).is_none(),
+            "should return None when jar is None"
+        );
     }
 }

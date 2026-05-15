@@ -16,6 +16,7 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::compat;
+use crate::consent::gate_eids_by_consent;
 use crate::consent_config::ConsentForwardingMode;
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
@@ -1010,9 +1011,13 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs will be populated by identity providers; consent gating
-                // is applied via `gate_eids_by_consent` before they are set here.
-                eids: None,
+                // Use the full consent context regardless of `consent_forwarding` mode.
+                // EID transmission rights (TCF Purpose 1 + 4) are independent of
+                // whether consent strings travel in the OpenRTB body or cookies.
+                eids: gate_eids_by_consent(
+                    request.user.eids.clone(),
+                    request.user.consent.as_ref(),
+                ),
                 ec_fresh: Some(request.user.fresh_id.clone()),
             }
             .to_ext(),
@@ -1688,6 +1693,7 @@ mod tests {
                 id: "user-123".to_string(),
                 fresh_id: "fresh-456".to_string(),
                 consent: None,
+                eids: None,
             },
             device: None,
             site: None,
@@ -3178,6 +3184,7 @@ server_url = "https://prebid.example"
                 id: "synth-123".to_string(),
                 fresh_id: "fresh-456".to_string(),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("test-agent".to_string()),

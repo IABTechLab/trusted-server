@@ -719,6 +719,7 @@ mod tests {
                 id: "user-123".to_string(),
                 fresh_id: "fresh-456".to_string(),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("Mozilla/5.0".to_string()),
@@ -805,6 +806,7 @@ mod tests {
                 id: "user-1".to_string(),
                 fresh_id: "fresh-1".to_string(),
                 consent: None,
+                eids: None,
             },
             device: None,
             site: None,

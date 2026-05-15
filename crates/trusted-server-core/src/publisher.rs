@@ -26,7 +26,7 @@ use crate::backend::BackendConfig;
 use crate::compat;
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
-use crate::cookies::handle_request_cookies;
+use crate::cookies::{handle_request_cookies, parse_ts_eids_cookie};
 use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::http_util::{serve_static_with_etag, RequestInfo};
@@ -935,7 +935,7 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .expect("should be present when should_run_auction is true");
-        let auction_request = build_auction_request(
+        let mut auction_request = build_auction_request(
             &matched_slots,
             &ec_id,
             &consent_context,
@@ -944,6 +944,7 @@ pub async fn handle_publisher_request(
             co_config,
             req.get_header_str("user-agent"),
         );
+        auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
         let auction_context = AuctionContext {
             settings,
             request: &req,
@@ -1209,6 +1210,7 @@ pub(crate) fn build_auction_request(
             id: ec_id.to_string(),
             fresh_id: ec_id.to_string(),
             consent: Some(consent_context.clone()),
+            eids: None,
         },
         device: user_agent.filter(|ua| !ua.is_empty()).map(|ua| DeviceInfo {
             user_agent: Some(ua.to_string()),
@@ -1469,7 +1471,7 @@ pub async fn handle_page_bids(
     }
 
     let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
-        let auction_request = build_auction_request(
+        let mut auction_request = build_auction_request(
             &matched_slots,
             &ec_id,
             &consent_context,
@@ -1478,6 +1480,7 @@ pub async fn handle_page_bids(
             co_config,
             req.get_header_str("user-agent"),
         );
+        auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
         let timeout_ms = co_config
             .auction_timeout_ms
             .unwrap_or(settings.auction.timeout_ms);
