@@ -435,8 +435,7 @@ impl CustomScenario {
 ///
 /// These run against the Viceroy runtime directly without a frontend
 /// framework container — they exercise EC-specific endpoints
-/// (`/_ts/api/v1/sync`, `/_ts/api/v1/identify`,
-/// `/_ts/api/v1/batch-sync`, `/_ts/admin/v1/partners/register`).
+/// (`/_ts/api/v1/identify`, `/_ts/api/v1/batch-sync`).
 #[derive(Debug, Clone)]
 pub enum EcScenario {
     /// Seeded EC row → batch sync writes partner UID → identify (Bearer auth)
