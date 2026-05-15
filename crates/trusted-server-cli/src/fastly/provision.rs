@@ -158,7 +158,14 @@ pub fn plan_fastly_provisioning(
         .max_by_key(|version| version.number)
         .cloned()
         .ok_or_else(|| Report::new(CliError::Provisioning).attach("service has no versions"))?;
-    let existing_links = api.list_resource_links(service_id, latest_version.number)?;
+    let active_version = versions
+        .iter()
+        .find(|version| version.active)
+        .cloned()
+        .ok_or_else(|| {
+            Report::new(CliError::Provisioning).attach("service has no active version")
+        })?;
+    let existing_links = api.list_resource_links(service_id, active_version.number)?;
 
     let fastly_config = &validated.providers.fastly;
     let mut resources = vec![plan_app_config_resource(
@@ -203,19 +210,19 @@ pub fn plan_fastly_provisioning(
     }
 
     let requires_binding_change = binding_changes_required(&resources);
-    let clone_required = requires_binding_change && latest_version.locked;
+    let clone_required = requires_binding_change && active_version.locked;
     let actions = collect_actions(&resources);
 
     if clone_required {
         warnings.push(format!(
-            "latest service version {} is locked; apply will clone it before creating or updating bindings. If another operator creates a newer version before apply runs, rerun plan/apply to avoid cloning from a stale version",
-            latest_version.number
+            "active service version {} is locked; apply will clone it before creating or updating bindings. If another operator changes the active version before apply runs, rerun plan/apply to avoid cloning from a stale version",
+            active_version.number
         ));
     }
     if requires_binding_change {
         warnings.push(format!(
             "apply will activate service version {} after updating resource bindings",
-            latest_version.number
+            active_version.number
         ));
     }
 
@@ -225,9 +232,9 @@ pub fn plan_fastly_provisioning(
             config_path: validated.path.display().to_string(),
             service_version: ServiceVersionPlanJson {
                 latest_version: latest_version.number,
-                target_version: latest_version.number,
+                target_version: active_version.number,
                 clone_required,
-                clone_source_version: clone_required.then_some(latest_version.number),
+                clone_source_version: clone_required.then_some(active_version.number),
             },
             actions,
             warnings,
@@ -1577,6 +1584,87 @@ runtime_api_secret_store_name = "customer_api_keys"
                 "should describe the failed activation"
             );
         }
+    }
+
+    #[test]
+    fn plan_targets_active_version_when_newer_draft_exists() {
+        let api = MockFastlyApi {
+            versions: vec![
+                ServiceVersion {
+                    number: 10,
+                    active: true,
+                    locked: true,
+                },
+                ServiceVersion {
+                    number: 11,
+                    active: false,
+                    locked: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let validated = validated_config(false);
+
+        let plan = plan_fastly_provisioning(&api, &validated, "svc_123")
+            .expect("should plan provisioning");
+
+        assert_eq!(
+            plan.json.service_version.latest_version, 11,
+            "should still report the latest service version"
+        );
+        assert_eq!(
+            plan.json.service_version.target_version, 10,
+            "should target the active serving version"
+        );
+        assert_eq!(
+            plan.json.service_version.clone_source_version,
+            Some(10),
+            "should clone from the active serving version"
+        );
+        assert!(
+            plan.json.service_version.clone_required,
+            "should clone the locked active version before changing bindings"
+        );
+    }
+
+    #[test]
+    fn apply_clones_active_version_when_newer_draft_exists() {
+        let api = MockFastlyApi {
+            versions: vec![
+                ServiceVersion {
+                    number: 10,
+                    active: true,
+                    locked: true,
+                },
+                ServiceVersion {
+                    number: 11,
+                    active: false,
+                    locked: false,
+                },
+            ],
+            clone_result: Some(ServiceVersion {
+                number: 12,
+                active: false,
+                locked: false,
+            }),
+            ..Default::default()
+        };
+        let validated = validated_config(false);
+
+        let applied = apply_success(&api, &validated, None).expect("should apply provisioning");
+
+        assert_eq!(
+            applied.service_version.target_version, 12,
+            "should update the target to the cloned active version"
+        );
+        assert_eq!(
+            api.activated_versions
+                .lock()
+                .expect("should lock activated versions")
+                .as_slice(),
+            &[("svc_123".to_string(), 12)],
+            "should activate the clone, not the unrelated newer draft"
+        );
     }
 
     #[test]

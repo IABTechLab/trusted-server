@@ -11,7 +11,7 @@ use crate::error::CliError;
 use error_stack::Report;
 
 static GTM_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"GTM-[A-Z0-9]+$").expect("should compile GTM regex"));
+    LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]+\b").expect("should compile GTM regex"));
 
 pub fn analyze_collected_page(
     collected: &CollectedPage,
@@ -310,6 +310,47 @@ mod tests {
         assert_eq!(
             artifact.js_asset_count, 1,
             "should deduplicate identical script URLs"
+        );
+    }
+
+    #[test]
+    fn extract_gtm_container_id_reads_query_parameter_urls() {
+        let artifact = AuditArtifact {
+            audited_url: "https://publisher.example".to_string(),
+            page_title: None,
+            js_asset_count: 1,
+            third_party_asset_count: 1,
+            detected_integrations: Vec::new(),
+            assets: vec![AuditedAsset {
+                kind: "script".to_string(),
+                url: "https://www.googletagmanager.com/gtm.js?id=GTM-ABC123&l=dataLayer"
+                    .to_string(),
+                host: "www.googletagmanager.com".to_string(),
+                party: AssetParty::ThirdParty,
+                integration: Some("google_tag_manager".to_string()),
+            }],
+            warnings: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_gtm_container_id(&artifact).as_deref(),
+            Some("GTM-ABC123"),
+            "should extract GTM container IDs before query separators"
+        );
+    }
+
+    #[test]
+    fn detect_integrations_from_inline_script_reads_standard_gtm_snippet() {
+        let matches = detect_integrations_from_inline_script(
+            r#"(function(w,d,s,l,i){w[l]=w[l]||[];})(window,document,'script','dataLayer','GTM-ABC123');"#,
+        );
+
+        assert!(
+            matches.iter().any(
+                |(integration, evidence)| integration == "google_tag_manager"
+                    && evidence == "GTM-ABC123"
+            ),
+            "should detect GTM IDs followed by snippet punctuation"
         );
     }
 
