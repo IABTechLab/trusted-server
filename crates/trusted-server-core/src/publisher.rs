@@ -905,6 +905,13 @@ pub async fn handle_publisher_request(
     let should_run_auction =
         is_get && !is_prefetch && !is_bot && !matched_slots.is_empty() && consent_allows_auction;
 
+    if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
+        log::debug!(
+            "No creative opportunity slots matched path '{}' — skipping auction and injection",
+            request_path
+        );
+    }
+
     let auction_timeout_ms = settings
         .creative_opportunities
         .as_ref()
@@ -1453,6 +1460,13 @@ pub async fn handle_page_bids(
             .tcf
             .as_ref()
             .is_some_and(|tcf| tcf.has_purpose_consent(1));
+
+    if matched_slots.is_empty() {
+        log::debug!(
+            "No creative opportunity slots matched path '{}' — skipping auction",
+            path_param
+        );
+    }
 
     let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
         let auction_request = build_auction_request(
@@ -2670,6 +2684,109 @@ mod tests {
                 html_escape_for_script("para\u{2029}sep"),
                 "para\\u2029sep",
                 "should unicode-escape U+2029 paragraph separator"
+            );
+        }
+    }
+
+    mod page_bids_no_match_tests {
+        use super::super::*;
+        use crate::auction::AuctionOrchestrator;
+        use crate::creative_opportunities::{
+            CreativeOpportunitiesFile, CreativeOpportunityFormat, CreativeOpportunitySlot,
+        };
+        use crate::platform::test_support::noop_services;
+        use crate::test_support::tests::crate_test_settings_str;
+        use fastly::http::Method;
+        use fastly::Request;
+
+        fn settings_with_co() -> Settings {
+            let toml = format!(
+                "{}\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
+        }
+
+        fn file_with_article_slot() -> CreativeOpportunitiesFile {
+            CreativeOpportunitiesFile {
+                slots: vec![CreativeOpportunitySlot {
+                    id: "atf".to_string(),
+                    gam_unit_path: None,
+                    div_id: None,
+                    page_patterns: vec!["/20**".to_string()],
+                    formats: vec![CreativeOpportunityFormat {
+                        width: 300,
+                        height: 250,
+                        media_type: crate::auction::types::MediaType::Banner,
+                    }],
+                    floor_price: Some(0.50),
+                    targeting: Default::default(),
+                    providers: Default::default(),
+                }],
+            }
+        }
+
+        fn make_page_bids_request(path: &str) -> Request {
+            Request::new(
+                Method::GET,
+                format!("https://test-publisher.com/_ts/page-bids?path={path}"),
+            )
+        }
+
+        #[tokio::test]
+        async fn empty_slots_file_returns_empty_slots_and_bids() {
+            // Spec §8 kill-switch: creative-opportunities.toml with zero slots disables
+            // all server-side auction activity and injection.
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let slots_file = CreativeOpportunitiesFile { slots: vec![] };
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+                .await
+                .expect("should return ok response");
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+
+            assert_eq!(
+                body["slots"].as_array().expect("slots should be array").len(),
+                0,
+                "empty slots file should produce zero injected slots"
+            );
+            assert_eq!(
+                body["bids"].as_object().expect("bids should be object").len(),
+                0,
+                "empty slots file should produce zero bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn url_not_matching_any_pattern_returns_empty_response() {
+            // Slots exist but request path does not match — no auction, no injection.
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let slots_file = file_with_article_slot(); // slot matches /20** only
+            let req = make_page_bids_request("/about"); // does not match
+
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+                .await
+                .expect("should return ok response");
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+
+            assert_eq!(
+                body["slots"].as_array().expect("slots should be array").len(),
+                0,
+                "non-matching URL should produce zero injected slots"
+            );
+            assert_eq!(
+                body["bids"].as_object().expect("bids should be object").len(),
+                0,
+                "non-matching URL should produce zero bids"
             );
         }
     }
