@@ -1,6 +1,7 @@
 //! HTTP endpoint handlers for auction requests.
 
 use error_stack::{Report, ResultExt};
+use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use serde_json::Value as JsonValue;
 
@@ -27,6 +28,12 @@ const MAX_CLIENT_EID_SOURCES: usize = 64;
 const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
 const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 
+/// Maximum accepted JSON body size for `/auction`. Picked to comfortably fit
+/// the largest realistic Prebid-derived auction request (hundreds of ad units
+/// with EID arrays) while preventing an authenticated client from consuming
+/// arbitrary WASM linear memory.
+const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+
 /// Handle auction request from /auction endpoint.
 ///
 /// This is the main entry point for running header bidding auctions.
@@ -49,12 +56,24 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    // Parse request body
-    let body: AdRequest = serde_json::from_slice(&req.take_body_bytes()).change_context(
-        TrustedServerError::Auction {
+    // Reject oversized bodies before any allocation. The `Content-Length`
+    // pre-check stops well-behaved clients early; the post-read check defends
+    // against clients that lie about (or omit) the header.
+    let content_length_exceeded = req
+        .get_header_str("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
+    if content_length_exceeded {
+        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body_bytes = req.take_body_bytes();
+    if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
+        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+    let body: AdRequest =
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),
-        },
-    )?;
+        })?;
 
     log::info!(
         "Auction request received for {} ad units",
