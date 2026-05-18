@@ -20,7 +20,10 @@ impl PriceGranularity {
 
 #[must_use]
 pub fn price_bucket(cpm: f64, granularity: PriceGranularity) -> String {
-    if cpm <= 0.0 {
+    // Reject NaN / Inf early so the `(x * 100.0).floor() as u64` cast below
+    // can never see a non-finite value (the cast's behaviour for NaN/Inf is
+    // implementation-defined in Rust and "saturate to 0" only by convention).
+    if !cpm.is_finite() || cpm <= 0.0 {
         return "0.00".to_string();
     }
     match granularity {
@@ -124,5 +127,32 @@ mod tests {
             price_bucket(2.53, PriceGranularity::Auto),
             price_bucket(2.53, PriceGranularity::Dense)
         );
+    }
+
+    #[test]
+    fn non_finite_cpm_returns_zero_bucket() {
+        for granularity in [
+            PriceGranularity::Dense,
+            PriceGranularity::Low,
+            PriceGranularity::Medium,
+            PriceGranularity::High,
+            PriceGranularity::Auto,
+        ] {
+            assert_eq!(
+                price_bucket(f64::NAN, granularity),
+                "0.00",
+                "NaN cpm should bucket to 0.00 for granularity {granularity:?}"
+            );
+            assert_eq!(
+                price_bucket(f64::INFINITY, granularity),
+                "0.00",
+                "+Inf cpm should bucket to 0.00 for granularity {granularity:?}"
+            );
+            assert_eq!(
+                price_bucket(f64::NEG_INFINITY, granularity),
+                "0.00",
+                "-Inf cpm should bucket to 0.00 for granularity {granularity:?}"
+            );
+        }
     }
 }

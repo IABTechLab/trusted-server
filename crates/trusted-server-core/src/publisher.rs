@@ -566,7 +566,7 @@ pub(crate) fn write_bids_to_state(
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<RwLock<Option<String>>>,
 ) {
-    log::info!(
+    log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
@@ -1288,7 +1288,8 @@ pub(crate) fn build_bid_map(
 /// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
 /// raw `</script>` sequences inside the string.
 pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Value>) -> String {
-    let json = serde_json::to_string(bid_map).unwrap_or_else(|_| "{}".to_string());
+    let json = serde_json::to_string(bid_map)
+        .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
         "<script>window.__ts_bids=JSON.parse(\"{}\");if(typeof window.__tsAdInit===\"function\")window.__tsAdInit();</script>",
@@ -1328,7 +1329,8 @@ pub(crate) fn build_ad_slots_script(
             })
         })
         .collect();
-    let json = serde_json::to_string(&slots).unwrap_or_else(|_| "[]".to_string());
+    let json = serde_json::to_string(&slots)
+        .expect("serde_json::to_string of Vec<Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
         "<script>window.__ts_ad_slots=JSON.parse(\"{}\");</script>",
