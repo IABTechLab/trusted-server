@@ -1,4 +1,4 @@
-# `ts lint domains` — Design
+# `ts dev lint domains` — Design
 
 **Date:** 2026-05-18
 **Status:** Draft (revised after third review — pivoted to Rust / `ts` CLI)
@@ -51,7 +51,7 @@ spec begins until #669 is on `main`.
 A new top-level subcommand on the `ts` CLI:
 
 ```
-ts lint domains [--staged | --changed-vs <ref> | <paths>...]
+ts dev lint domains [--staged | --changed-vs <ref> | <paths>...]
                 [--format human|json] [--verbose]
 ```
 
@@ -59,10 +59,10 @@ Modes (mutually exclusive):
 
 | Invocation                           | Behavior                                                                                                                 |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `ts lint domains`                    | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.** |
-| `ts lint domains --staged`           | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported.                        |
-| `ts lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in `git diff $(git merge-base <ref> HEAD)..HEAD`.                           |
-| `ts lint domains path/...`           | Scans the listed files in full.                                                                                          |
+| `ts dev lint domains`                    | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.** |
+| `ts dev lint domains --staged`           | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported.                        |
+| `ts dev lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in `git diff $(git merge-base <ref> HEAD)..HEAD`.                           |
+| `ts dev lint domains path/...`           | Scans the listed files in full.                                                                                          |
 
 Output format defaults to `human`. `--format json` emits a structured
 report (see [Output Format](#output-format)).
@@ -82,39 +82,67 @@ specific exit codes, this subcommand follows the same pattern. The
 three exit-code semantics above are the **contract**, not the
 **implementation shape**.
 
-Why `lint` (not `check` or `audit`)?
+### Why `ts dev` as the parent?
 
-- `ts audit <url>` already exists for browser-based site audits.
-- `ts config validate` already exists for config validation.
-- `lint` is unambiguous and namespaces future lints (`ts lint deps`,
-  `ts lint imports`, etc.).
+`lint domains` and `install-hooks` are developer-workflow commands —
+they only matter when working on the codebase, not when operating a
+deployed Trusted Server. Grouping them under `dev` keeps the
+top-level `ts` surface focused on operator concerns (`config`,
+`auth`, `audit`, `provision`) and gives developer tooling a natural
+home for future additions (`ts dev lint deps`, `ts dev format`,
+`ts dev check`, etc.).
+
+Within `dev`, `lint` is itself a subcommand group (so future lints
+slot in as `ts dev lint <thing>`).
 
 ## Crate Layout
 
+PR #669 ships `ts dev` as a single-file leaf command
+(`crates/trusted-server-cli/src/dev.rs`, ~161 lines) that starts the
+local Fastly dev server. To host nested subcommands, that file is
+converted into a module directory:
+
 ```
 crates/trusted-server-cli/src/
-  lib.rs                          # add Lint subcommand to clap enum,
-                                  # dispatch to lint module
-  lint/
-    mod.rs                        # Lint subcommand enum + dispatch
-    domains.rs                    # this design's implementation
-    domains_tests.rs              # (or inline #[cfg(test)] mod tests)
+  lib.rs                          # add Commands::Dev(DevArgs) variant
+                                  # if not already present; dispatch
+                                  # to dev::run
+  dev/
+    mod.rs                        # Dev subcommand enum + dispatch.
+                                  # Includes the existing dev-server
+                                  # behavior as `ts dev serve` (or
+                                  # the equivalent name chosen during
+                                  # the refactor) so the PR #669
+                                  # functionality is preserved.
+    serve.rs                      # the existing dev.rs body moved
+                                  # under `ts dev serve`
+    install_hooks.rs              # `ts dev install-hooks`
+    lint/
+      mod.rs                      # Lint subsubcommand enum + dispatch
+      domains.rs                  # this design's implementation
 ```
 
 Existing code touched:
 
-- `crates/trusted-server-cli/src/lib.rs` — add `Commands::Lint(LintArgs)`
-  variant and dispatch arm. Following the pattern established by other
-  subcommands in #669 (Config, Dev, Auth, Audit, Provision).
-- `crates/trusted-server-cli/src/error.rs` — add a `LintError` variant
-  if needed for typed propagation. Otherwise reuse the crate's existing
-  `Report<CliError>` plumbing.
+- `crates/trusted-server-cli/src/lib.rs` — extend the existing
+  `Commands::Dev` variant so it owns a nested `DevCommand` enum
+  (subcommands: `Serve`, `Lint(LintCommand)`, `InstallHooks(...)`).
+- `crates/trusted-server-cli/src/dev.rs` → split into the directory
+  above. The existing dev-server function moves into `dev/serve.rs`
+  with its public API unchanged. **This is a CLI-surface change to
+  PR #669**: today's `ts dev` becomes `ts dev serve` (or whatever
+  subcommand name is chosen during the refactor). Since #669 has not
+  merged, this can be coordinated as part of the same review cycle
+  rather than as a follow-up that breaks released behavior.
+- `crates/trusted-server-cli/src/error.rs` — add `LintError` and
+  `InstallHooksError` variants if needed for typed propagation,
+  otherwise reuse the crate's existing `Report<CliError>` plumbing.
 
 No changes to `trusted-server-core` or `trusted-server-adapter-fastly`.
 
 ## Allowlist (Rust constants)
 
-Two arrays as `const &[&str]` at module top of `lint/domains.rs`.
+Two arrays as `const &[&str]` at module top of `dev/lint/domains.rs`.
 
 ### Exact-match hosts
 
@@ -276,7 +304,7 @@ high-signal and worth checking.
 - `dist/`
 - `.git/`
 - `.worktrees/`, `.claude/worktrees/`
-- `crates/trusted-server-cli/src/lint/domains.rs` itself (so the
+- `crates/trusted-server-cli/src/dev/lint/domains.rs` itself (so the
   module's own allowlist constants and doc comments cannot self-flag)
 
 **Note:** `**/fixtures/**` is **not** a blanket exclusion. Publisher-capture
@@ -291,7 +319,7 @@ including `.tsx`, `.ts`, `.json`, `next.config.mjs` — **are** scanned.
 ### Module structure
 
 ```rust
-// crates/trusted-server-cli/src/lint/domains.rs
+// crates/trusted-server-cli/src/dev/lint/domains.rs
 
 use core::error::Error;
 use std::path::PathBuf;
@@ -382,7 +410,7 @@ Notes:
   require an explicit feature flag in this gix version line.
 - No networking, credential helpers, or worktree mutation features
   are enabled — the linter only reads from the local repo and does
-  one targeted config write in `ts install-hooks`.
+  one targeted config write in `ts dev install-hooks`.
 - The exact feature names match the `gix` crate's documented features
   (`blob-diff`, `index`, `revision` — see docs.rs/gix). If a feature
   has been renamed in the version pinned at implementation time, the
@@ -643,7 +671,7 @@ Each path is read with `std::fs::read_to_string`, every line emitted.
 No git operations involved (the user named the files directly).
 
 **Explicit paths still honour the extension/path filter.** If a user
-runs `ts lint domains some.html`, the file is **skipped** and a
+runs `ts dev lint domains some.html`, the file is **skipped** and a
 warning is printed to stderr (`note: some.html is not in scanned
 extensions; skipping`). Rationale: the goal is consistent behavior
 across modes — a file that would not be scanned in the full-repo
@@ -659,11 +687,11 @@ trusted-server.toml:15: disallowed host 68.183.113.79
 
 2 disallowed hosts found in 2 files.
 To allow a new integration proxy, add it to EXACT_HOSTS in
-crates/trusted-server-cli/src/lint/domains.rs and document the
+crates/trusted-server-cli/src/dev/lint/domains.rs and document the
 integration in a comment.
 To suppress one line (e.g., security-test attacker hosts), append
 `// allow-domain: <host>` in a comment.
-Run `ts lint domains` (no args) for a full-repo audit.
+Run `ts dev lint domains` (no args) for a full-repo audit.
 ```
 
 ### Output Format (`json`)
@@ -696,20 +724,20 @@ integration) often do not inherit the shell's PATH, so a hook that
 just calls `ts` may fail to find the binary even when
 `cargo install_cli` has placed it in `~/.cargo/bin`. To avoid this:
 
-`ts install-hooks` captures the absolute path of the currently-running
+`ts dev install-hooks` captures the absolute path of the currently-running
 `ts` binary (via `std::env::current_exe()`) and writes that absolute
 path into the hook:
 
 ```sh
 #!/usr/bin/env bash
-# .githooks/pre-commit — installed by `ts install-hooks`. DO NOT EDIT.
+# .githooks/pre-commit — installed by `ts dev install-hooks`. DO NOT EDIT.
 # Generated <timestamp> from <ts_version>.
-exec "/Users/example/.cargo/bin/ts" lint domains --staged
+exec "/Users/example/.cargo/bin/ts" dev lint domains --staged
 ```
 
 If the user later rebuilds or moves the binary, re-running
-`ts install-hooks` regenerates the hook with the new absolute path.
-Without this, the fallback path `exec ts lint domains --staged`
+`ts dev install-hooks` regenerates the hook with the new absolute path.
+Without this, the fallback path `exec ts dev lint domains --staged`
 relying on PATH is brittle in GUI contexts.
 
 ### Hook installer (Rust subcommand)
@@ -719,7 +747,7 @@ no `git config` invocation from a script — install via a `ts`
 subcommand:
 
 ```
-ts install-hooks
+ts dev install-hooks
 ```
 
 This is a small Rust subcommand on the `ts` CLI that:
@@ -730,7 +758,7 @@ This is a small Rust subcommand on the `ts` CLI that:
 3. **Checks for an existing `.githooks/pre-commit`:**
    - **Absent:** writes the file fresh.
    - **Present, and the first three lines match the documented
-     header signature** (e.g., the `# Installed by `ts install-hooks`
+     header signature** (e.g., the `# Installed by `ts dev install-hooks`
      marker on a known line): overwrites silently. This is the
      managed-file case.
    - **Present, but content does not match the managed signature:**
@@ -807,9 +835,9 @@ pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
 fn render_hook(ts_path: &Path) -> String {
     format!(
         "#!/usr/bin/env bash\n\
-         # Installed by `ts install-hooks`. DO NOT EDIT.\n\
+         # Installed by `ts dev install-hooks`. DO NOT EDIT.\n\
          # ts-install-hooks: managed\n\
-         exec {:?} lint domains --staged\n",
+         exec {:?} dev lint domains --staged\n",
         ts_path,
     )
 }
@@ -825,7 +853,7 @@ signal `is_managed` uses to detect prior-installed hooks. Hand-written
 hooks won't have this marker, so they're treated as user content and
 preserved unless `--force` is passed.
 
-`ts install-hooks` is a one-time setup contributors run after cloning,
+`ts dev install-hooks` is a one-time setup contributors run after cloning,
 alongside `cargo install_cli`. Documented in CONTRIBUTING.md.
 
 ## Testing Strategy
@@ -834,7 +862,7 @@ Following the conventions established in PR #669: unit tests live under
 `#[cfg(test)] mod tests` in each module; end-to-end CLI tests use
 `assert_cmd` and `tempfile`.
 
-### Unit tests (in `lint/domains.rs`)
+### Unit tests (in `dev/lint/domains.rs`)
 
 Pure functions tested directly: `normalise_host`, `is_allowed`,
 `extract_hosts_from_line`, `parse_suppression_marker`.
@@ -943,7 +971,7 @@ and the index with `gix` APIs (no shell), runs the binary with
   integration proxy requires a code change + review. Acceptable given
   expected low churn.
 - **Existing violations are not addressed.** They remain until those
-  files are touched. The full-repo audit (`ts lint domains` no args) is
+  files are touched. The full-repo audit (`ts dev lint domains` no args) is
   **diagnostic-only** in Stage 1 — it will report many existing
   violations; that is expected, not a failure.
 - **Bare-string hostnames are not detected.** Config values like
@@ -970,11 +998,11 @@ and the index with `gix` APIs (no shell), runs the binary with
 ## Migration to CI
 
 **Stage 1 (this design):** Pre-commit hook calling
-`ts lint domains --staged`. Prevents _new_ violations. Full-repo audit
+`ts dev lint domains --staged`. Prevents _new_ violations. Full-repo audit
 available but diagnostic-only.
 
 **Stage 2:** GitHub Actions workflow runs
-`ts lint domains --changed-vs $GITHUB_BASE_REF` on every PR. Same
+`ts dev lint domains --changed-vs $GITHUB_BASE_REF` on every PR. Same
 delta-only enforcement, unbypassable. Requirements:
 
 - `actions/checkout@v4` with `fetch-depth: 0` (or explicit fetch of
@@ -989,9 +1017,15 @@ until Stages 1 and 2 are stable.
 
 ## Open Questions
 
-1. **Subcommand naming.** `ts lint domains` vs `ts check domains` vs
-   `ts audit domains`. Current pick: `ts lint domains`. Confirm before
-   implementation.
+1. **Subcommand naming.** `ts dev lint domains` (current pick) vs other
+   placements considered: top-level `ts lint domains`, top-level
+   `ts check domains`, under audit as `ts audit domains`. Current pick
+   nests under `dev` because both `lint` and `install-hooks` are
+   developer-workflow commands and don't belong on the operator-facing
+   top level. Confirm the existing PR #669 `ts dev` (single-file leaf
+   that starts the dev server) being refactored into a subcommand
+   group with `ts dev serve` for the existing behavior is acceptable
+   to the #669 reviewers.
 2. **`cdn.prebid.org` on allowlist vs converting `prebid.rs` tests to
    `.example`?** Current pick: allowlist. Revisit if rigorous
    separation is preferred.
@@ -1021,11 +1055,11 @@ until Stages 1 and 2 are stable.
    current at that point. Workspace consistency (matching any
    `gix` already pulled in transitively by other dependencies) takes
    precedence.
-9. **`ts install-hooks` clobber detection signature.** The
+9. **`ts dev install-hooks` clobber detection signature.** The
    `# ts-install-hooks: managed` marker on a known line is the
    detection heuristic. If a contributor wants a custom multi-hook
    chain, they keep their existing hook (we refuse to overwrite
-   without `--force`), and they must add an `exec ts lint domains
+   without `--force`), and they must add an `exec ts dev lint domains
    --staged` line manually. We could add a `--append-to-existing`
    mode later if demand surfaces.
 10. **`--force-scan` escape hatch for explicit paths.** Current pick:
