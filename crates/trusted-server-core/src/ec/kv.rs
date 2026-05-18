@@ -7,6 +7,7 @@
 //! (organic request paths) or propagate them (sync endpoints). See the
 //! per-operation error handling policy in the spec §7.5.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt};
@@ -17,6 +18,7 @@ use crate::error::TrustedServerError;
 use super::current_timestamp;
 use super::generation::ec_hash;
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
+use super::log_id;
 
 /// Maximum number of CAS retry attempts before giving up.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -49,7 +51,52 @@ pub enum UpsertResult {
     Unchanged,
 }
 
-use super::log_id;
+/// Partner UID update to apply to a KV identity graph entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartnerIdUpdate {
+    /// Partner namespace key in [`KvEntry::ids`].
+    pub(crate) partner_id: String,
+    /// Partner-scoped user ID value.
+    pub(crate) uid: String,
+}
+
+impl PartnerIdUpdate {
+    /// Creates a partner UID update.
+    pub(crate) fn new(partner_id: impl Into<String>, uid: impl Into<String>) -> Self {
+        Self {
+            partner_id: partner_id.into(),
+            uid: uid.into(),
+        }
+    }
+}
+
+fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
+    let mut latest_updates = BTreeMap::new();
+    for update in updates {
+        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+    }
+
+    let mut changed = false;
+    for (partner_id, uid) in latest_updates {
+        if entry
+            .ids
+            .get(partner_id)
+            .is_some_and(|existing| existing.uid == uid)
+        {
+            continue;
+        }
+
+        entry.ids.insert(
+            partner_id.to_owned(),
+            super::kv_types::KvPartnerId {
+                uid: uid.to_owned(),
+            },
+        );
+        changed = true;
+    }
+
+    changed
+}
 
 /// Wraps a Fastly KV Store for EC identity graph operations.
 ///
@@ -127,13 +174,21 @@ impl KvIdentityGraph {
     /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
     pub fn get(&self, ec_id: &str) -> Result<Option<(KvEntry, u64)>, Report<TrustedServerError>> {
         let store = self.open_store()?;
+        Self::lookup_entry(&store, &self.store_name, ec_id)
+    }
+
+    fn lookup_entry(
+        store: &KVStore,
+        store_name: &str,
+        ec_id: &str,
+    ) -> Result<Option<(KvEntry, u64)>, Report<TrustedServerError>> {
         let mut response = match store.lookup(ec_id) {
             Ok(resp) => resp,
             Err(fastly::kv_store::KVStoreError::ItemNotFound) => return Ok(None),
             Err(err) => {
                 return Err(
                     Report::new(err).change_context(TrustedServerError::KvStore {
-                        store_name: self.store_name.clone(),
+                        store_name: store_name.to_owned(),
                         message: format!("Failed to read key '{ec_id}'"),
                     }),
                 );
@@ -142,7 +197,7 @@ impl KvIdentityGraph {
 
         let generation = response.current_generation();
         let body_bytes = response.take_body_bytes();
-        let entry = Self::deserialize_entry(&self.store_name, ec_id, &body_bytes)?;
+        let entry = Self::deserialize_entry(store_name, ec_id, &body_bytes)?;
 
         Ok(Some((entry, generation)))
     }
@@ -358,6 +413,110 @@ impl KvIdentityGraph {
             store_name: self.store_name.clone(),
             message: format!(
                 "CAS conflict after {MAX_CAS_RETRIES} retries reviving tombstone for '{ec_id}'"
+            ),
+        }))
+    }
+
+    /// Atomically merges multiple partner IDs into the existing entry.
+    ///
+    /// Uses one read-modify-write operation for all updates so request-local
+    /// EID cookie ingestion does not perform a KV read per matched partner.
+    /// Duplicate partner IDs are collapsed with the last value winning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store error, missing root
+    /// entry, withdrawn root entry, or CAS exhaustion after
+    /// [`MAX_CAS_RETRIES`] attempts.
+    pub(crate) fn upsert_partner_ids(
+        &self,
+        ec_id: &str,
+        updates: &[PartnerIdUpdate],
+    ) -> Result<(), Report<TrustedServerError>> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let store = self.open_store()?;
+
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (mut entry, generation) = match Self::lookup_entry(&store, &self.store_name, ec_id)?
+            {
+                Some(pair) => pair,
+                None => {
+                    log::info!(
+                        "upsert_partner_ids: no entry for '{}', rejecting {} partner updates",
+                        log_id(ec_id),
+                        updates.len(),
+                    );
+                    return Err(Report::new(TrustedServerError::KvStore {
+                        store_name: self.store_name.clone(),
+                        message: format!(
+                            "Cannot upsert {} partner IDs for missing key '{ec_id}'",
+                            updates.len(),
+                        ),
+                    }));
+                }
+            };
+
+            // Reject upserts on withdrawn entries — a late sync must not
+            // repopulate partner IDs after consent withdrawal.
+            if !entry.consent.ok {
+                log::info!(
+                    "upsert_partner_ids: entry for '{}' is a tombstone, rejecting {} partner updates",
+                    log_id(ec_id),
+                    updates.len(),
+                );
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!(
+                        "Cannot upsert {} partner IDs for withdrawn key '{ec_id}'",
+                        updates.len(),
+                    ),
+                }));
+            }
+
+            if !apply_partner_id_updates(&mut entry, updates) {
+                return Ok(());
+            }
+
+            let (body, meta_str) = Self::serialize_entry(&entry, &self.store_name)?;
+
+            match store
+                .build_insert()
+                .if_generation_match(generation)
+                .metadata(&meta_str)
+                .time_to_live(ENTRY_TTL)
+                .execute(ec_id, body.as_str())
+            {
+                Ok(()) => return Ok(()),
+                Err(fastly::kv_store::KVStoreError::ItemPreconditionFailed) => {
+                    log::debug!(
+                        "upsert_partner_ids: CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
+                        attempt + 1,
+                        log_id(ec_id),
+                    );
+                    // Retry immediately; sleeping here blocks the edge worker.
+                }
+                Err(err) => {
+                    return Err(
+                        Report::new(err).change_context(TrustedServerError::KvStore {
+                            store_name: self.store_name.clone(),
+                            message: format!(
+                                "Failed to upsert {} partner IDs for key '{ec_id}'",
+                                updates.len(),
+                            ),
+                        }),
+                    );
+                }
+            }
+        }
+
+        Err(Report::new(TrustedServerError::KvStore {
+            store_name: self.store_name.clone(),
+            message: format!(
+                "CAS conflict after {MAX_CAS_RETRIES} retries upserting {} partner IDs for '{ec_id}'",
+                updates.len(),
             ),
         }))
     }
@@ -808,6 +967,105 @@ mod tests {
             err_text.contains("Refusing to serialize invalid KV entry"),
             "should fail closed before serializing invalid KV writes"
         );
+    }
+
+    fn live_entry() -> KvEntry {
+        let mut entry = KvEntry::tombstone(1000);
+        entry.consent.ok = true;
+        entry
+    }
+
+    #[test]
+    fn apply_partner_id_updates_returns_unchanged_for_empty_updates() {
+        let mut entry = live_entry();
+
+        let changed = apply_partner_id_updates(&mut entry, &[]);
+
+        assert!(!changed, "should not change entry for empty updates");
+        assert!(entry.ids.is_empty(), "should not add partner IDs");
+    }
+
+    #[test]
+    fn apply_partner_id_updates_skips_matching_existing_uid() {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "uid-1".to_owned(),
+            },
+        );
+        let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(!changed, "should not change when UID already matches");
+        assert_eq!(entry.ids["ssp_x"].uid, "uid-1");
+    }
+
+    #[test]
+    fn apply_partner_id_updates_inserts_new_partner_uid() {
+        let mut entry = live_entry();
+        let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(changed, "should report changed entry");
+        assert_eq!(entry.ids["ssp_x"].uid, "uid-1");
+    }
+
+    #[test]
+    fn apply_partner_id_updates_overwrites_different_uid() {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "old-uid".to_owned(),
+            },
+        );
+        let updates = vec![PartnerIdUpdate::new("ssp_x", "new-uid")];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(changed, "should report changed entry");
+        assert_eq!(entry.ids["ssp_x"].uid, "new-uid");
+    }
+
+    #[test]
+    fn apply_partner_id_updates_applies_multiple_updates() {
+        let mut entry = live_entry();
+        let updates = vec![
+            PartnerIdUpdate::new("ssp_x", "uid-x"),
+            PartnerIdUpdate::new("ssp_y", "uid-y"),
+        ];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(changed, "should report changed entry");
+        assert_eq!(entry.ids["ssp_x"].uid, "uid-x");
+        assert_eq!(entry.ids["ssp_y"].uid, "uid-y");
+    }
+
+    #[test]
+    fn apply_partner_id_updates_uses_last_duplicate_value() {
+        let mut entry = live_entry();
+        entry.ids.insert(
+            "ssp_x".to_owned(),
+            crate::ec::kv_types::KvPartnerId {
+                uid: "original".to_owned(),
+            },
+        );
+        let updates = vec![
+            PartnerIdUpdate::new("ssp_x", "intermediate"),
+            PartnerIdUpdate::new("ssp_x", "original"),
+        ];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(
+            !changed,
+            "should not write when the final duplicate value matches existing state"
+        );
+        assert_eq!(entry.ids["ssp_x"].uid, "original");
     }
 
     #[test]

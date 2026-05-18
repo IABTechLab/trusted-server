@@ -14,7 +14,7 @@ use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
 use super::log_id;
-use super::prebid_eids::{ingest_prebid_eids, ingest_sharedid_cookie};
+use super::prebid_eids::ingest_eid_cookies;
 use super::registry::PartnerRegistry;
 use super::EcContext;
 
@@ -84,13 +84,7 @@ pub fn ec_finalize_response(
     // Returning user: consent is granted and EC came from request.
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
-            // Ingest Prebid EIDs from cookie if present.
-            if let Some(cookie) = eids_cookie {
-                ingest_prebid_eids(cookie, ec_id, graph, registry);
-            }
-            if let Some(cookie) = sharedid_cookie {
-                ingest_sharedid_cookie(cookie, ec_id, graph, registry);
-            }
+            ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
         }
 
         // Ordinary returning-user page views no longer refresh the browser
@@ -107,12 +101,7 @@ pub fn ec_finalize_response(
             return;
         };
 
-        if let Some(cookie) = eids_cookie {
-            ingest_prebid_eids(cookie, ec_id, graph, registry);
-        }
-        if let Some(cookie) = sharedid_cookie {
-            ingest_sharedid_cookie(cookie, ec_id, graph, registry);
-        }
+        ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
         set_ec_cookie_on_response(settings, ec_context, response);
     }
 }
