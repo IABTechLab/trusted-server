@@ -6,7 +6,7 @@ use fastly::{Request, Response};
 use crate::auction::formats::AdRequest;
 use crate::compat;
 use crate::consent;
-use crate::cookies::handle_request_cookies;
+use crate::cookies::{handle_request_cookies, parse_ts_eids_cookie};
 use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
@@ -125,8 +125,8 @@ pub async fn handle_auction(
             .map(|_| services.kv_store()),
     });
 
-    // Convert tsjs request format to auction request
-    let auction_request = convert_tsjs_to_auction_request(
+    // Convert tsjs request format to auction request.
+    let mut auction_request = convert_tsjs_to_auction_request(
         &body,
         settings,
         services,
@@ -135,6 +135,10 @@ pub async fn handle_auction(
         &ec_id,
         geo,
     )?;
+    // Forward Extended User IDs from the `ts-eids` cookie so programmatic
+    // callers (slim-Prebid, native apps) get parity with the publisher /
+    // page-bids paths, both of which already do this.
+    auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
 
     // Create auction context
     let context = AuctionContext {
