@@ -212,7 +212,7 @@ impl core::error::Error for MyError {}
 ## Other guidelines
 
 - Use only example or fictional information in comments, tests, docs, examples,
-  and similar non-runtime materials.
+  and similar non-runtime materials. (eg. for urls use: example.com domains only)
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
