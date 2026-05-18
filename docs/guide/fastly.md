@@ -98,7 +98,7 @@ Note the store IDs - you'll need them for your `trusted-server.toml` configurati
 
 Edge Cookie flows require one KV store:
 
-- Identity graph store (`ec_store`) - EC identity graph, partner IDs, minimal consent metadata, and withdrawal tombstones
+- Identity graph store (`ec_store`) - EC identity graph, source-domain keyed partner UIDs, minimal consent metadata, and withdrawal tombstones
 
 Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
 

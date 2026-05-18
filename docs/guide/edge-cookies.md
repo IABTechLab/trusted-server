@@ -104,7 +104,7 @@ flowchart TD
 - **Non-regulated**: EC always allowed.
 - **Unknown**: Fail-closed when jurisdiction cannot be determined.
 
-The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, partner IDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
+The `ec_identity_store` KV store is the only EC lifecycle store. It holds identity graph state, source-domain keyed partner UIDs, a minimal consent snapshot used for EC entry metadata, and withdrawal tombstones. Consent interpretation for each request remains based on the live request signals listed above.
 
 ## Partner Sync Channels
 
@@ -171,7 +171,7 @@ sequenceDiagram
     alt Pull sync seeds partner UID
         TS->>DSP: Background pull sync request<br/>(EC ID + consent context)
         DSP-->>TS: Partner UID for EC
-        TS->>KV: Upsert ids[partner_id] = UID
+        TS->>KV: Upsert ids[source_domain] = UID
     else Prebid sync seeds browser EIDs
         B->>B: Prebid User ID modules resolve IDs
         B->>TSJS: getUserIdsAsEids()
@@ -183,7 +183,7 @@ sequenceDiagram
     Note over B,TS: Prebid-routed auction
     B->>B: getUserIdsAsEids() for current auction
     B->>TS: POST /auction<br/>adUnits + eids[] + ts-ec cookie
-    TS->>KV: Resolve EC-backed partner IDs
+    TS->>KV: Resolve EC-backed source-domain IDs
     KV-->>TS: Stored partner UIDs
     TS->>TS: Convert stored UIDs to EIDs<br/>Merge + dedupe with request eids[]<br/>Apply consent gating
     TS->>PS: OpenRTB request<br/>user.ext.eids = merged EID set

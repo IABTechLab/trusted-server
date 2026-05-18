@@ -71,7 +71,7 @@ Returns EC identity plus the authenticated partner's UID and EID for the current
   "ec": "954d...e0c3.nZ1GxL",
   "consent": "ok",
   "degraded": false,
-  "partner_id": "mocktioneer",
+  "source_domain": "formally-vital-lion.edgecompute.app",
   "uid": "mock-user-123",
   "eid": {
     "source": "formally-vital-lion.edgecompute.app",

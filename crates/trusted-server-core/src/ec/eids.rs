@@ -1,8 +1,8 @@
 //! Shared EID resolution and formatting helpers.
 //!
-//! Used by both `/_ts/api/v1/identify` and `/auction` to resolve partner IDs from KV
-//! entries, convert them to `OpenRTB` EID structures, and build base64-encoded
-//! response headers.
+//! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
+//! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
+//! build base64-encoded response headers.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use error_stack::{Report, ResultExt};
@@ -16,34 +16,32 @@ use super::registry::PartnerRegistry;
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
 pub const MAX_EIDS_HEADER_BYTES: usize = 4096;
 
-/// A partner ID resolved from a KV entry against the partner registry.
+/// A source-domain keyed ID resolved from a KV entry against the partner registry.
 ///
 /// Only includes partners with `bidstream_enabled = true` and a non-empty UID.
 pub struct ResolvedPartnerId {
-    /// Partner namespace key (e.g. `"liveramp"`).
-    pub partner_id: String,
+    /// The partner's identity source domain and EC KV `ids` key.
+    pub source_domain: String,
     /// The synced user ID value.
     pub uid: String,
-    /// The partner's identity source domain (e.g. `"liveramp.com"`).
-    pub source_domain: String,
     /// `OpenRTB` agent type for this partner's identifiers.
     pub openrtb_atype: u8,
 }
 
-/// Resolves partner IDs from a KV entry against the partner registry.
+/// Resolves source-domain keyed IDs from a KV entry against the partner registry.
 ///
 /// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
-/// sorted deterministically by partner ID.
+/// sorted deterministically by source domain.
 #[must_use]
 pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
 
-    for (partner_id, partner_uid) in &entry.ids {
+    for (source_domain, partner_uid) in &entry.ids {
         if partner_uid.uid.is_empty() {
             continue;
         }
 
-        let Some(partner) = registry.get(partner_id) else {
+        let Some(partner) = registry.get(source_domain) else {
             continue;
         };
         if !partner.bidstream_enabled {
@@ -51,14 +49,13 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
         }
 
         resolved.push(ResolvedPartnerId {
-            partner_id: partner_id.clone(),
-            uid: partner_uid.uid.clone(),
             source_domain: partner.source_domain.clone(),
+            uid: partner_uid.uid.clone(),
             openrtb_atype: partner.openrtb_atype,
         });
     }
 
-    resolved.sort_by(|a, b| a.partner_id.cmp(&b.partner_id));
+    resolved.sort_by(|a, b| a.source_domain.cmp(&b.source_domain));
     resolved
 }
 
@@ -151,14 +148,13 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
-    fn make_test_partner(id: &str, source_domain: &str) -> EcPartner {
+    fn make_test_partner(source_domain: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
+            name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("token-{id}-32-bytes-minimum-value")),
+            api_token: Redacted::new(format!("token-{source_domain}-32-bytes-minimum-value")),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -170,38 +166,38 @@ mod tests {
     }
 
     #[test]
-    fn resolve_partner_ids_sorts_by_partner_id() {
+    fn resolve_partner_ids_sorts_by_source_domain() {
         let partners = vec![
-            make_test_partner("zeta", "zeta.example.com"),
-            make_test_partner("alpha", "alpha.example.com"),
+            make_test_partner("zeta.example.com"),
+            make_test_partner("alpha.example.com"),
         ];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
         entry.ids.insert(
-            "zeta".to_owned(),
+            "zeta.example.com".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-z".to_owned(),
             },
         );
         entry.ids.insert(
-            "alpha".to_owned(),
+            "alpha.example.com".to_owned(),
             super::super::kv_types::KvPartnerId {
                 uid: "uid-a".to_owned(),
             },
         );
 
         let resolved = resolve_partner_ids(&registry, &entry);
-        let partner_ids: Vec<&str> = resolved
+        let source_domains: Vec<&str> = resolved
             .iter()
-            .map(|item| item.partner_id.as_str())
+            .map(|item| item.source_domain.as_str())
             .collect();
 
         assert_eq!(
-            partner_ids,
-            vec!["alpha", "zeta"],
-            "should sort deterministically by partner ID"
+            source_domains,
+            vec!["alpha.example.com", "zeta.example.com"],
+            "should sort deterministically by source domain"
         );
     }
 
@@ -209,13 +205,11 @@ mod tests {
     fn to_eids_maps_resolved_ids_correctly() {
         let resolved = vec![
             ResolvedPartnerId {
-                partner_id: "liveramp".to_owned(),
                 uid: "LR_xyz".to_owned(),
                 source_domain: "liveramp.com".to_owned(),
                 openrtb_atype: 3,
             },
             ResolvedPartnerId {
-                partner_id: "id5".to_owned(),
                 uid: "ID5_abc".to_owned(),
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
@@ -238,7 +232,6 @@ mod tests {
         let mut resolved = Vec::new();
         for idx in 0..64 {
             resolved.push(ResolvedPartnerId {
-                partner_id: format!("partner_{idx}"),
                 uid: format!("uid_{}", "x".repeat(100)),
                 source_domain: format!("partner-{idx}.example.com"),
                 openrtb_atype: 3,
@@ -258,7 +251,6 @@ mod tests {
     #[test]
     fn build_eids_header_fits_without_truncation() {
         let resolved = vec![ResolvedPartnerId {
-            partner_id: "ssp".to_owned(),
             uid: "u1".to_owned(),
             source_domain: "ssp.com".to_owned(),
             openrtb_atype: 3,

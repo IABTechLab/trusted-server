@@ -266,7 +266,7 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
 ### `[ec]`
 
@@ -280,7 +280,7 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 | `partners`                | Array          | No       | Static partner registry entries                                         |
 
 ::: tip Partner keying
-`id` is the partner namespace used for KV storage and response headers (`x-ts-<id>`). `source_domain` is only used to match incoming OpenRTB EID `source` values during ingestion.
+`source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
 :::
 
 **Example**:
@@ -291,7 +291,6 @@ passphrase = "replace-with-32-plus-byte-random-secret"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
-id = "mocktioneer"
 name = "Mocktioneer SSP"
 source_domain = "mocktioneer.example"
 api_token = "partner-api-token-32-bytes-minimum"

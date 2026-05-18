@@ -22,7 +22,6 @@ pull_sync_concurrency = 3
 # cluster_recheck_secs = 3600    # Re-evaluate cluster_size after this many seconds
 
 # [[ec.partners]]
-# id = "liveramp"
 # name = "LiveRamp"
 # source_domain = "liveramp.com"
 # openrtb_atype = 3
@@ -32,7 +31,6 @@ pull_sync_concurrency = 3
 # pull_sync_enabled = false
 
 [[ec.partners]]
-id = "sharedid"
 name = "Prebid SharedID"
 source_domain = "sharedid.org"
 openrtb_atype = 1
@@ -41,14 +39,12 @@ api_token = "sharedid-internal-token-32-bytes"
 
 # Integration test partners (used by crates/integration-tests)
 [[ec.partners]]
-id = "inttest"
 name = "Integration Test Partner"
 source_domain = "inttest.example.com"
 bidstream_enabled = true
 api_token = "inttest-api-key-1-32-bytes-minimum"
 
 [[ec.partners]]
-id = "inttest2"
 name = "Integration Test Partner 2"
 source_domain = "inttest2.example.com"
 bidstream_enabled = true

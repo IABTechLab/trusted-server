@@ -120,8 +120,8 @@ pub fn set_ec_cookie_on_response(
 /// Removes EC-specific response headers.
 ///
 /// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips dynamic
-/// `X-ts-<partner_id>` headers for registered partners. Other `x-ts-*` headers
-/// are intentionally preserved because they may be set by non-EC middleware.
+/// `X-ts-<source_domain>` headers for registered partners. Other `x-ts-*`
+/// headers are intentionally preserved because they may be set by non-EC middleware.
 fn clear_ec_headers_on_response(response: &mut Response, registry: Option<&PartnerRegistry>) {
     for header in EC_RESPONSE_HEADERS {
         response.remove_header(*header);
@@ -129,13 +129,13 @@ fn clear_ec_headers_on_response(response: &mut Response, registry: Option<&Partn
 
     if let Some(registry) = registry {
         for partner in registry.all() {
-            response.remove_header(partner_response_header(&partner.id).as_str());
+            response.remove_header(partner_response_header(&partner.source_domain).as_str());
         }
     }
 }
 
-fn partner_response_header(partner_id: &str) -> String {
-    format!("x-ts-{partner_id}")
+fn partner_response_header(source_domain: &str) -> String {
+    format!("x-ts-{source_domain}")
 }
 
 /// Clears EC cookie and removes EC-specific response headers.
@@ -224,14 +224,13 @@ mod tests {
         format!("{}.{suffix}", "a".repeat(64))
     }
 
-    fn make_partner(id: &str) -> EcPartner {
+    fn make_partner(source_domain: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
-            source_domain: format!("{id}.example.com"),
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("token-{id}-32-bytes-minimum-value")),
+            api_token: Redacted::new(format!("token-{source_domain}-32-bytes-minimum-value")),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -377,10 +376,10 @@ mod tests {
         let mut response = Response::new();
         response.set_header("x-ts-ec", "stale");
         response.set_header("x-ts-eids", "[]");
-        response.set_header("x-ts-ssp_x", "partner-uid-123");
+        response.set_header("x-ts-ssp.example.com", "partner-uid-123");
         response.set_header("x-ts-unrelated", "keep-me");
 
-        let partners = vec![make_partner("ssp_x")];
+        let partners = vec![make_partner("ssp.example.com")];
         let test_registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         ec_finalize_response(
             &settings,
@@ -401,7 +400,7 @@ mod tests {
             "withdrawal should clear x-ts-eids header"
         );
         assert!(
-            response.get_header("x-ts-ssp_x").is_none(),
+            response.get_header("x-ts-ssp.example.com").is_none(),
             "withdrawal should clear registered partner header"
         );
         assert_eq!(

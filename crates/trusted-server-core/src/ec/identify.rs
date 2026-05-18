@@ -76,7 +76,7 @@ pub fn handle_identify(
     match kv.get(ec_id) {
         Ok(Some((entry, generation))) => {
             // Extract only this partner's UID.
-            if let Some(partner_uid) = entry.ids.get(&partner.id) {
+            if let Some(partner_uid) = entry.ids.get(&partner.source_domain) {
                 if !partner_uid.uid.is_empty() {
                     uid = Some(partner_uid.uid.clone());
                 }
@@ -116,7 +116,7 @@ pub fn handle_identify(
         ec: ec_id.to_owned(),
         consent: "ok".to_owned(),
         degraded,
-        partner_id: partner.id.clone(),
+        source_domain: partner.source_domain.clone(),
         uid,
         eid,
         cluster_size,
@@ -153,7 +153,7 @@ struct IdentifyResponse {
     ec: String,
     consent: String,
     degraded: bool,
-    partner_id: String,
+    source_domain: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,11 +290,10 @@ mod tests {
         EcContext::new_for_test(ec_value.map(str::to_owned), consent)
     }
 
-    fn make_test_partner(id: &str, api_token: &str) -> EcPartner {
+    fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
-            source_domain: format!("{id}.example.com"),
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
             api_token: Redacted::new(api_token.to_owned()),
@@ -407,7 +406,7 @@ mod tests {
     fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", "Bearer wrong-token");
@@ -428,7 +427,7 @@ mod tests {
     fn handle_identify_denied_consent_returns_403() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
@@ -456,7 +455,7 @@ mod tests {
     fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
@@ -477,7 +476,7 @@ mod tests {
     fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
@@ -501,7 +500,10 @@ mod tests {
             response.get_header("x-ts-ec").is_none(),
             "should not emit x-ts-ec header"
         );
-        assert_eq!(body["partner_id"], "ssp_x", "should echo partner ID");
+        assert_eq!(
+            body["source_domain"], "ssp.example.com",
+            "should echo source domain"
+        );
         assert_eq!(
             body["degraded"],
             serde_json::Value::Bool(true),
@@ -521,7 +523,7 @@ mod tests {
     fn handle_identify_denies_mismatched_browser_origin() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
@@ -543,7 +545,7 @@ mod tests {
     fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
         let settings = create_test_settings();
         let kv = KvIdentityGraph::new("missing_store");
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.test-publisher.com/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));

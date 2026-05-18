@@ -225,13 +225,12 @@ impl DerefMut for IntegrationSettings {
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct EcPartner {
-    /// Unique partner identifier. Must match `^[a-z0-9_-]{1,32}$` and
-    /// not collide with reserved IDs (`ec`, `ts`, `eids`, etc.).
-    #[validate(custom(function = EcPartner::validate_id))]
-    pub id: String,
     /// Human-readable partner name.
     pub name: String,
     /// `OpenRTB` `source.domain` for EID entries (e.g. `"liveramp.com"`).
+    ///
+    /// This normalized domain is also the canonical EC KV `ids` map key.
+    #[validate(custom(function = EcPartner::validate_source_domain))]
     pub source_domain: String,
     /// `OpenRTB` `atype` value (typically 3).
     #[serde(
@@ -282,35 +281,52 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
-    const RESERVED_IDS: &[&str] = &[
-        "ec",
-        "eids",
-        "ec-consent",
-        "eids-truncated",
-        "synthetic",
-        "ts",
-        "version",
-        "env",
-    ];
-
-    /// Validates a partner ID for safe use in dynamic headers and cookies.
+    /// Validates a partner source domain for use as the canonical key.
     ///
     /// # Errors
     ///
-    /// Returns a validation error when `id` does not match the configured
-    /// lowercase identifier policy or collides with a reserved name.
-    pub fn validate_id(id: &str) -> Result<(), ValidationError> {
-        if id.is_empty() || id.len() > 32 {
-            return Err(ValidationError::new("invalid_partner_id_length"));
+    /// Returns a validation error when `source_domain` is not a plain hostname.
+    pub fn validate_source_domain(source_domain: &str) -> Result<(), ValidationError> {
+        let trimmed = source_domain.trim();
+        if trimmed.is_empty()
+            || trimmed != source_domain
+            || trimmed.len() > 255
+            || !trimmed.is_ascii()
+            || trimmed.contains("://")
+            || trimmed.contains('/')
+            || trimmed.contains(':')
+        {
+            return Err(ValidationError::new("invalid_source_domain"));
         }
-        if Self::RESERVED_IDS.contains(&id) {
-            return Err(ValidationError::new("reserved_partner_id"));
+
+        let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() || normalized.len() > 255 {
+            return Err(ValidationError::new("invalid_source_domain"));
         }
-        if !id.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
-        }) {
-            return Err(ValidationError::new("invalid_partner_id"));
+
+        for label in normalized.split('.') {
+            if label.is_empty() || label.len() > 63 {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
+            let bytes = label.as_bytes();
+            let Some(first) = bytes.first().copied() else {
+                return Err(ValidationError::new("invalid_source_domain"));
+            };
+            let Some(last) = bytes.last().copied() else {
+                return Err(ValidationError::new("invalid_source_domain"));
+            };
+            if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
+            if !bytes
+                .iter()
+                .copied()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
         }
+
         Ok(())
     }
 
@@ -1176,30 +1192,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_invalid_ec_partner_ids() {
-        for partner_id in [
-            "Upper",
-            "bad id",
-            "ec",
+    fn validate_rejects_invalid_ec_partner_source_domains() {
+        for source_domain in [
             "",
-            "abcdefghijklmnopqrstuvwxyzabcdefg",
+            " bad.example.com",
+            "https://bad.example.com",
+            "bad.example.com/path",
+            "bad.example.com:443",
+            "bad_domain.example.com",
         ] {
             let toml_str = format!(
                 r#"{}
                 [[ec.partners]]
-                id = "{}"
                 name = "Invalid Partner"
-                source_domain = "invalid.example.com"
+                source_domain = "{}"
                 api_token = "invalid-token"
                 "#,
                 crate_test_settings_str(),
-                partner_id,
+                source_domain,
             );
 
             let result = Settings::from_toml(&toml_str);
             assert!(
                 result.is_err(),
-                "should reject invalid partner ID {partner_id:?}"
+                "should reject invalid source_domain {source_domain:?}"
             );
         }
     }
@@ -1623,14 +1639,6 @@ mod tests {
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR
         );
-        let partner_0_id_key = format!(
-            "{}{}EC{}PARTNERS{}0{}ID",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
         let partner_0_name_key = format!(
             "{}{}EC{}PARTNERS{}0{}NAME",
             ENVIRONMENT_VARIABLE_PREFIX,
@@ -1665,14 +1673,6 @@ mod tests {
         );
         let partner_0_api_token_key = format!(
             "{}{}EC{}PARTNERS{}0{}API_TOKEN",
-            ENVIRONMENT_VARIABLE_PREFIX,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR,
-            ENVIRONMENT_VARIABLE_SEPARATOR
-        );
-        let partner_1_id_key = format!(
-            "{}{}EC{}PARTNERS{}1{}ID",
             ENVIRONMENT_VARIABLE_PREFIX,
             ENVIRONMENT_VARIABLE_SEPARATOR,
             ENVIRONMENT_VARIABLE_SEPARATOR,
@@ -1723,13 +1723,11 @@ mod tests {
         temp_env::with_vars(
             [
                 (origin_key, Some("https://origin.test-publisher.com")),
-                (partner_0_id_key, Some("envpartner0")),
                 (partner_0_name_key, Some("Env Partner 0")),
                 (partner_0_source_domain_key, Some("envpartner0.example.com")),
                 (partner_0_openrtb_atype_key, Some("1")),
                 (partner_0_bidstream_enabled_key, Some("true")),
                 (partner_0_api_token_key, Some("env-token-0")),
-                (partner_1_id_key, Some("envpartner1")),
                 (partner_1_name_key, Some("Env Partner 1")),
                 (partner_1_source_domain_key, Some("envpartner1.example.com")),
                 (partner_1_openrtb_atype_key, Some("3")),
@@ -1741,7 +1739,6 @@ mod tests {
                     .expect("Settings should load indexed EC partners from env");
 
                 assert_eq!(settings.ec.partners.len(), 2);
-                assert_eq!(settings.ec.partners[0].id, "envpartner0");
                 assert_eq!(settings.ec.partners[0].name, "Env Partner 0");
                 assert_eq!(
                     settings.ec.partners[0].source_domain,
@@ -1750,7 +1747,6 @@ mod tests {
                 assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
                 assert!(settings.ec.partners[0].bidstream_enabled);
                 assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
-                assert_eq!(settings.ec.partners[1].id, "envpartner1");
                 assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
                 assert_eq!(
                     settings.ec.partners[1].source_domain,

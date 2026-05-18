@@ -1,8 +1,8 @@
 //! In-memory partner registry built from `[[ec.partners]]` configuration.
 //!
-//! Replaces the KV-backed [`PartnerStore`](super::partner::PartnerStore) with
-//! a startup-validated, in-memory registry. Three `HashMap` indexes provide
-//! O(1) lookup by partner ID, API key hash, and source domain.
+//! Replaces the previous KV-backed partner store with a startup-validated,
+//! in-memory registry. `HashMap` indexes provide O(1)
+//! lookup by source domain and API key hash.
 
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 use crate::settings::EcPartner;
 
-use super::partner::{hash_api_key, validate_partner_id};
+use super::partner::{hash_api_key, normalize_partner_source_domain};
 
 /// Minimum length for inbound partner Bearer API tokens.
 pub const MIN_API_TOKEN_LENGTH: usize = 32;
@@ -20,11 +20,9 @@ pub const MIN_API_TOKEN_LENGTH: usize = 32;
 /// Runtime-ready partner configuration with precomputed API key hash.
 #[derive(Debug, Clone)]
 pub struct PartnerConfig {
-    /// Unique partner identifier.
-    pub id: String,
     /// Human-readable partner name.
     pub name: String,
-    /// `OpenRTB` `source.domain` for EID entries.
+    /// Canonical `OpenRTB` EID source domain and EC KV `ids` key.
     pub source_domain: String,
     /// `OpenRTB` `atype` value.
     pub openrtb_atype: u8,
@@ -51,17 +49,15 @@ pub struct PartnerConfig {
     pub ts_pull_token: Option<Redacted<String>>,
 }
 
-/// In-memory partner registry with O(1) lookups by ID, API key hash,
-/// and source domain.
+/// In-memory partner registry with O(1) lookups by source domain and API key hash.
 ///
 /// Built once at startup from `[[ec.partners]]` in `trusted-server.toml`.
-/// All validation (ID format, duplicate detection, pull sync consistency)
-/// happens during construction.
+/// All validation (source-domain format, duplicate detection, API token
+/// uniqueness, pull sync consistency) happens during construction.
 #[derive(Debug, Clone)]
 pub struct PartnerRegistry {
-    by_id: HashMap<String, PartnerConfig>,
+    by_source_domain: HashMap<String, PartnerConfig>,
     by_api_key_hash: HashMap<String, String>,
-    by_source_domain: HashMap<String, String>,
 }
 
 impl PartnerRegistry {
@@ -70,71 +66,68 @@ impl PartnerRegistry {
     /// # Errors
     ///
     /// Returns [`TrustedServerError::Configuration`] if any partner has an
-    /// invalid ID, duplicate ID, duplicate API token hash, duplicate source
-    /// domain, or invalid pull sync configuration.
+    /// invalid source domain, duplicate source domain, duplicate API token hash,
+    /// or invalid pull sync configuration.
     pub fn from_config(partners: &[EcPartner]) -> Result<Self, Report<TrustedServerError>> {
-        let mut by_id = HashMap::with_capacity(partners.len());
-        let mut by_api_key_hash = HashMap::with_capacity(partners.len());
         let mut by_source_domain = HashMap::with_capacity(partners.len());
+        let mut by_api_key_hash = HashMap::with_capacity(partners.len());
 
         for partner in partners {
-            validate_partner_id(&partner.id).map_err(|msg| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("ec.partners: {msg}"),
-                })
-            })?;
+            let normalized_source = normalize_partner_source_domain(&partner.source_domain)
+                .map_err(|msg| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("ec.partners: {msg}"),
+                    })
+                })?;
 
-            if by_id.contains_key(&partner.id) {
+            if by_source_domain.contains_key(&normalized_source) {
                 return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!("ec.partners: duplicate partner ID '{}'", partner.id),
+                    message: format!(
+                        "ec.partners: duplicate source_domain '{}'",
+                        normalized_source
+                    ),
                 }));
             }
 
-            validate_api_token(&partner.id, partner.api_token.expose())?;
+            validate_api_token(&normalized_source, partner.api_token.expose())?;
 
             let api_key_hash = hash_api_key(partner.api_token.expose());
 
             if by_api_key_hash.contains_key(&api_key_hash) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "ec.partners: partner '{}' has an API token that collides \
+                        "ec.partners: source_domain '{}' has an API token that collides \
                          with another partner's token hash",
-                        partner.id
+                        normalized_source
                     ),
                 }));
             }
 
-            let normalized_source = partner.source_domain.to_ascii_lowercase();
-            if by_source_domain.contains_key(&normalized_source) {
-                return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "ec.partners: duplicate source_domain '{}' (partner '{}')",
-                        partner.source_domain, partner.id
-                    ),
-                }));
-            }
-
-            let config = build_partner_config(partner, &api_key_hash)?;
+            let config = build_partner_config(partner, &normalized_source, &api_key_hash);
 
             validate_rate_limits(&config).change_context(TrustedServerError::Configuration {
-                message: format!("ec.partners: invalid rate limits for '{}'", partner.id),
+                message: format!(
+                    "ec.partners: invalid rate limits for '{}'",
+                    config.source_domain
+                ),
             })?;
 
             if config.pull_sync_enabled {
                 validate_pull_sync(&config).change_context(TrustedServerError::Configuration {
-                    message: format!("ec.partners: pull sync config invalid for '{}'", partner.id),
+                    message: format!(
+                        "ec.partners: pull sync config invalid for '{}'",
+                        config.source_domain
+                    ),
                 })?;
             }
 
-            by_api_key_hash.insert(api_key_hash, partner.id.clone());
-            by_source_domain.insert(normalized_source, partner.id.clone());
-            by_id.insert(partner.id.clone(), config);
+            by_api_key_hash.insert(api_key_hash, normalized_source.clone());
+            by_source_domain.insert(normalized_source, config);
         }
 
         Ok(Self {
-            by_id,
-            by_api_key_hash,
             by_source_domain,
+            by_api_key_hash,
         })
     }
 
@@ -142,16 +135,16 @@ impl PartnerRegistry {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            by_id: HashMap::new(),
-            by_api_key_hash: HashMap::new(),
             by_source_domain: HashMap::new(),
+            by_api_key_hash: HashMap::new(),
         }
     }
 
-    /// Looks up a partner by ID.
+    /// Looks up a partner by canonical source domain.
     #[must_use]
-    pub fn get(&self, partner_id: &str) -> Option<&PartnerConfig> {
-        self.by_id.get(partner_id)
+    pub fn get(&self, source_domain: &str) -> Option<&PartnerConfig> {
+        let normalized = normalize_partner_source_domain(source_domain).ok()?;
+        self.by_source_domain.get(&normalized)
     }
 
     /// Looks up a partner by the SHA-256 hex hash of their API token.
@@ -159,21 +152,19 @@ impl PartnerRegistry {
     pub fn find_by_api_key_hash(&self, hash: &str) -> Option<&PartnerConfig> {
         self.by_api_key_hash
             .get(hash)
-            .and_then(|id| self.by_id.get(id))
+            .and_then(|source_domain| self.by_source_domain.get(source_domain))
     }
 
-    /// Looks up a partner by their `source_domain` (case-insensitive).
+    /// Looks up a partner by their `source_domain`.
     #[must_use]
     pub fn find_by_source_domain(&self, domain: &str) -> Option<&PartnerConfig> {
-        self.by_source_domain
-            .get(&domain.to_ascii_lowercase())
-            .and_then(|id| self.by_id.get(id))
+        self.get(domain)
     }
 
     /// Returns all partners with `pull_sync_enabled = true`.
     #[must_use]
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
-        self.by_id
+        self.by_source_domain
             .values()
             .filter(|p| p.pull_sync_enabled)
             .collect()
@@ -182,35 +173,40 @@ impl PartnerRegistry {
     /// Returns an iterator over all configured partners.
     ///
     /// Iteration order is unspecified; callers that need determinism should
-    /// sort by partner ID before consuming the results.
+    /// sort by source domain before consuming the results.
     pub fn all(&self) -> impl Iterator<Item = &PartnerConfig> {
-        self.by_id.values()
+        self.by_source_domain.values()
     }
 
     /// Returns the number of configured partners.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.by_source_domain.len()
     }
 
     /// Returns `true` if no partners are configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.by_source_domain.is_empty()
     }
 }
 
-fn validate_api_token(partner_id: &str, api_token: &str) -> Result<(), Report<TrustedServerError>> {
+fn validate_api_token(
+    source_domain: &str,
+    api_token: &str,
+) -> Result<(), Report<TrustedServerError>> {
     if api_token.trim().is_empty() {
         return Err(Report::new(TrustedServerError::Configuration {
-            message: format!("ec.partners: partner '{partner_id}' api_token must not be empty"),
+            message: format!(
+                "ec.partners: source_domain '{source_domain}' api_token must not be empty"
+            ),
         }));
     }
 
     if api_token.len() < MIN_API_TOKEN_LENGTH {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!(
-                "ec.partners: partner '{partner_id}' api_token must be at least {MIN_API_TOKEN_LENGTH} bytes"
+                "ec.partners: source_domain '{source_domain}' api_token must be at least {MIN_API_TOKEN_LENGTH} bytes"
             ),
         }));
     }
@@ -220,12 +216,12 @@ fn validate_api_token(partner_id: &str, api_token: &str) -> Result<(), Report<Tr
 
 fn build_partner_config(
     partner: &EcPartner,
+    normalized_source: &str,
     api_key_hash: &str,
-) -> Result<PartnerConfig, Report<TrustedServerError>> {
-    Ok(PartnerConfig {
-        id: partner.id.clone(),
+) -> PartnerConfig {
+    PartnerConfig {
         name: partner.name.clone(),
-        source_domain: partner.source_domain.clone(),
+        source_domain: normalized_source.to_owned(),
         openrtb_atype: partner.openrtb_atype,
         bidstream_enabled: partner.bidstream_enabled,
         api_key_hash: api_key_hash.to_owned(),
@@ -236,7 +232,7 @@ fn build_partner_config(
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
         ts_pull_token: partner.ts_pull_token.clone(),
-    })
+    }
 }
 
 fn validate_rate_limits(config: &PartnerConfig) -> Result<(), Report<TrustedServerError>> {
@@ -322,10 +318,9 @@ mod tests {
         format!("{label}-api-token-32-bytes-minimum")
     }
 
-    fn make_partner(id: &str, source_domain: &str, api_token: &str) -> EcPartner {
+    fn make_partner(source_domain: &str, api_token: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
+            name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: false,
@@ -347,16 +342,12 @@ mod tests {
     }
 
     #[test]
-    fn lookup_by_id_returns_configured_partner() {
-        let partners = vec![make_partner(
-            "ssp_x",
-            "ssp.example.com",
-            &valid_api_token("token-a"),
-        )];
+    fn lookup_by_source_domain_returns_configured_partner() {
+        let partners = vec![make_partner("ssp.example.com", &valid_api_token("token-a"))];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
-        let found = registry.get("ssp_x");
-        assert!(found.is_some(), "should find partner by ID");
+        let found = registry.get("ssp.example.com");
+        assert!(found.is_some(), "should find partner by source domain");
         assert_eq!(
             found.expect("should exist").source_domain,
             "ssp.example.com",
@@ -367,7 +358,6 @@ mod tests {
     #[test]
     fn lookup_by_api_key_hash_returns_partner() {
         let partners = vec![make_partner(
-            "ssp_x",
             "ssp.example.com",
             &valid_api_token("my-secret"),
         )];
@@ -377,17 +367,16 @@ mod tests {
         let found = registry.find_by_api_key_hash(&hash);
         assert!(found.is_some(), "should find partner by API key hash");
         assert_eq!(
-            found.expect("should exist").id,
-            "ssp_x",
-            "should match partner ID"
+            found.expect("should exist").source_domain,
+            "ssp.example.com",
+            "should match source domain"
         );
     }
 
     #[test]
-    fn lookup_by_source_domain_is_case_insensitive() {
+    fn lookup_by_source_domain_normalizes_input() {
         let partners = vec![make_partner(
-            "ssp_x",
-            "SSP.Example.Com",
+            "SSP.Example.Com.",
             &valid_api_token("token-a"),
         )];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -395,56 +384,45 @@ mod tests {
         let found = registry.find_by_source_domain("ssp.example.com");
         assert!(
             found.is_some(),
-            "should find partner by lowercase source domain"
+            "should find partner by normalized source domain"
+        );
+        assert_eq!(
+            found.expect("should exist").source_domain,
+            "ssp.example.com",
+            "should store normalized source domain"
         );
     }
 
     #[test]
-    fn duplicate_partner_id_is_rejected() {
+    fn duplicate_source_domain_is_rejected_after_normalization() {
         let partners = vec![
-            make_partner("ssp_x", "a.com", &valid_api_token("token-a")),
-            make_partner("ssp_x", "b.com", &valid_api_token("token-b")),
-        ];
-        let result = PartnerRegistry::from_config(&partners);
-        assert!(result.is_err(), "should reject duplicate partner ID");
-    }
-
-    #[test]
-    fn duplicate_source_domain_is_rejected() {
-        let partners = vec![
-            make_partner("ssp_a", "same.com", &valid_api_token("token-a")),
-            make_partner("ssp_b", "same.com", &valid_api_token("token-b")),
+            make_partner("same.com", &valid_api_token("token-a")),
+            make_partner("SAME.com.", &valid_api_token("token-b")),
         ];
         let result = PartnerRegistry::from_config(&partners);
         assert!(result.is_err(), "should reject duplicate source domain");
     }
 
     #[test]
-    fn reserved_partner_id_is_rejected() {
+    fn invalid_source_domain_is_rejected() {
         let partners = vec![make_partner(
-            "ec",
-            "ec.example.com",
+            "https://ssp.example.com",
             &valid_api_token("token-a"),
         )];
         let result = PartnerRegistry::from_config(&partners);
-        assert!(result.is_err(), "should reject reserved partner ID 'ec'");
+        assert!(result.is_err(), "should reject invalid source domain");
     }
 
     #[test]
     fn pull_enabled_partners_filters_correctly() {
-        let mut pull_partner =
-            make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
+        let mut pull_partner = make_partner("pull.example.com", &valid_api_token("token-p"));
         pull_partner.pull_sync_enabled = true;
         pull_partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         pull_partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
         pull_partner.ts_pull_token = Some(Redacted::new("outbound-token".to_owned()));
 
         let partners = vec![
-            make_partner(
-                "no_pull",
-                "nopull.example.com",
-                &valid_api_token("token-np"),
-            ),
+            make_partner("nopull.example.com", &valid_api_token("token-np")),
             pull_partner,
         ];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -456,7 +434,7 @@ mod tests {
             "should have exactly one pull-enabled partner"
         );
         assert_eq!(
-            pull_enabled[0].id, "puller",
+            pull_enabled[0].source_domain, "pull.example.com",
             "should be the correct partner"
         );
         assert_eq!(
@@ -472,7 +450,7 @@ mod tests {
 
     #[test]
     fn partner_debug_output_redacts_pull_token() {
-        let mut partner = make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
+        let mut partner = make_partner("pull.example.com", &valid_api_token("token-p"));
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];
@@ -480,7 +458,7 @@ mod tests {
 
         let registry = PartnerRegistry::from_config(&[partner]).expect("should build registry");
         let configured = registry
-            .get("puller")
+            .get("pull.example.com")
             .expect("should find configured partner");
 
         let debug_output = format!("{configured:?}");
@@ -496,7 +474,7 @@ mod tests {
 
     #[test]
     fn empty_api_token_is_rejected() {
-        let partner = make_partner("ssp_x", "ssp.example.com", "   ");
+        let partner = make_partner("ssp.example.com", "   ");
 
         let result = PartnerRegistry::from_config(&[partner]);
         assert!(result.is_err(), "should reject empty api_token");
@@ -504,7 +482,7 @@ mod tests {
 
     #[test]
     fn short_api_token_is_rejected() {
-        let partner = make_partner("ssp_x", "ssp.example.com", "short-token");
+        let partner = make_partner("ssp.example.com", "short-token");
 
         let result = PartnerRegistry::from_config(&[partner]);
         assert!(result.is_err(), "should reject short api_token");
@@ -513,18 +491,18 @@ mod tests {
     #[test]
     fn api_token_at_minimum_length_is_accepted() {
         let token = "x".repeat(MIN_API_TOKEN_LENGTH);
-        let partners = vec![make_partner("ssp_x", "ssp.example.com", &token)];
+        let partners = vec![make_partner("ssp.example.com", &token)];
 
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         assert!(
-            registry.get("ssp_x").is_some(),
+            registry.get("ssp.example.com").is_some(),
             "should accept minimum-length token"
         );
     }
 
     #[test]
     fn zero_batch_rate_limit_is_rejected() {
-        let mut partner = make_partner("ssp_x", "ssp.example.com", &valid_api_token("token-a"));
+        let mut partner = make_partner("ssp.example.com", &valid_api_token("token-a"));
         partner.batch_rate_limit = 0;
 
         let result = PartnerRegistry::from_config(&[partner]);
@@ -533,7 +511,7 @@ mod tests {
 
     #[test]
     fn zero_pull_sync_rate_limit_is_rejected() {
-        let mut partner = make_partner("puller", "pull.example.com", &valid_api_token("token-p"));
+        let mut partner = make_partner("pull.example.com", &valid_api_token("token-p"));
         partner.pull_sync_enabled = true;
         partner.pull_sync_url = Some("https://pull.example.com/sync".to_owned());
         partner.pull_sync_allowed_domains = vec!["pull.example.com".to_owned()];

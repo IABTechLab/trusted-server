@@ -200,14 +200,14 @@ fn collect_prebid_eid_updates(
         // skipping malformed candidates instead of dropping the whole source.
         let Some(uid) = first_valid_uid(&eid.uids) else {
             log::debug!(
-                "Prebid EIDs: no valid uid for partner '{}' from source '{}'",
-                partner.id,
+                "Prebid EIDs: no valid uid for source_domain '{}' from source '{}'",
+                partner.source_domain,
                 eid.source,
             );
             continue;
         };
 
-        updates.push(PartnerIdUpdate::new(&partner.id, &uid.id));
+        updates.push(PartnerIdUpdate::new(&partner.source_domain, &uid.id));
     }
 
     updates
@@ -272,7 +272,7 @@ fn collect_sharedid_update(
         return None;
     };
 
-    Some(PartnerIdUpdate::new(&partner.id, cookie_value))
+    Some(PartnerIdUpdate::new(&partner.source_domain, cookie_value))
 }
 
 fn eids_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
@@ -373,14 +373,13 @@ mod tests {
         }
     }
 
-    fn make_test_partner(id: &str, source_domain: &str) -> EcPartner {
+    fn make_test_partner(_id: &str, source_domain: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
+            name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
-            api_token: Redacted::new(format!("token-{id}-32-bytes-minimum-value")),
+            api_token: Redacted::new(format!("token-{source_domain}-32-bytes-minimum-value")),
             batch_rate_limit: EcPartner::default_batch_rate_limit(),
             pull_sync_enabled: false,
             pull_sync_url: None,
@@ -546,8 +545,8 @@ mod tests {
         let updates = collect_prebid_eid_updates(&cookie, &registry);
 
         assert_eq!(updates.len(), 2, "should collect both partner matches");
-        assert_eq!(updates[0], PartnerIdUpdate::new("id5", "ID5_abc"));
-        assert_eq!(updates[1], PartnerIdUpdate::new("liveramp", "LR_xyz"));
+        assert_eq!(updates[0], PartnerIdUpdate::new("id5-sync.com", "ID5_abc"));
+        assert_eq!(updates[1], PartnerIdUpdate::new("liveramp.com", "LR_xyz"));
     }
 
     #[test]
@@ -581,7 +580,10 @@ mod tests {
 
         let updates = collect_prebid_eid_updates(&cookie, &registry);
 
-        assert_eq!(updates, vec![PartnerIdUpdate::new("id5", "ID5_valid")]);
+        assert_eq!(
+            updates,
+            vec![PartnerIdUpdate::new("id5-sync.com", "ID5_valid")]
+        );
     }
 
     #[test]
@@ -591,15 +593,18 @@ mod tests {
         let update = collect_sharedid_update(" shared-cookie-id ", &registry)
             .expect("should collect sharedId update");
 
-        assert_eq!(update, PartnerIdUpdate::new("sharedid", "shared-cookie-id"));
+        assert_eq!(
+            update,
+            PartnerIdUpdate::new("sharedid.org", "shared-cookie-id")
+        );
     }
 
     #[test]
     fn dedupe_partner_updates_uses_last_partner_value() {
         let updates = vec![
-            PartnerIdUpdate::new("sharedid", "prebid-shared"),
-            PartnerIdUpdate::new("id5", "id5-uid"),
-            PartnerIdUpdate::new("sharedid", "cookie-shared"),
+            PartnerIdUpdate::new("sharedid.org", "prebid-shared"),
+            PartnerIdUpdate::new("id5-sync.com", "id5-uid"),
+            PartnerIdUpdate::new("sharedid.org", "cookie-shared"),
         ];
 
         let deduped = dedupe_partner_updates(updates);
@@ -608,8 +613,8 @@ mod tests {
         assert_eq!(
             deduped,
             vec![
-                PartnerIdUpdate::new("id5", "id5-uid"),
-                PartnerIdUpdate::new("sharedid", "cookie-shared"),
+                PartnerIdUpdate::new("id5-sync.com", "id5-uid"),
+                PartnerIdUpdate::new("sharedid.org", "cookie-shared"),
             ],
             "should keep the last value for duplicate partners"
         );
@@ -639,11 +644,11 @@ mod tests {
         let calls = writer.calls.borrow();
         assert_eq!(calls.len(), 1, "should perform one bulk writer call");
         assert_eq!(calls[0].len(), 3, "should write all updates in one batch");
-        assert_eq!(calls[0][0], PartnerIdUpdate::new("id5", "ID5_abc"));
-        assert_eq!(calls[0][1], PartnerIdUpdate::new("liveramp", "LR_xyz"));
+        assert_eq!(calls[0][0], PartnerIdUpdate::new("id5-sync.com", "ID5_abc"));
+        assert_eq!(calls[0][1], PartnerIdUpdate::new("liveramp.com", "LR_xyz"));
         assert_eq!(
             calls[0][2],
-            PartnerIdUpdate::new("sharedid", "shared-cookie-id")
+            PartnerIdUpdate::new("sharedid.org", "shared-cookie-id")
         );
     }
 
@@ -667,8 +672,8 @@ mod tests {
         assert_eq!(calls.len(), 1, "should perform one bulk writer call");
         assert_eq!(
             calls[0],
-            vec![PartnerIdUpdate::new("sharedid", "cookie-shared")],
-            "should apply sharedId cookie after Prebid EIDs for duplicate partner IDs"
+            vec![PartnerIdUpdate::new("sharedid.org", "cookie-shared")],
+            "should apply sharedId cookie after Prebid EIDs for duplicate source domains"
         );
     }
 

@@ -42,11 +42,10 @@ mod tests {
 
     const VALID_API_TOKEN: &str = "auth-test-token-32-bytes-minimum";
 
-    fn make_test_partner(id: &str, api_token: &str) -> EcPartner {
+    fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
-            source_domain: format!("{id}.example.com"),
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
             api_token: Redacted::new(api_token.to_owned()),
@@ -99,12 +98,15 @@ mod tests {
 
     #[test]
     fn authenticate_bearer_returns_matching_partner_for_valid_token() {
-        let partners = vec![make_test_partner("ssp_x", VALID_API_TOKEN)];
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut req = Request::new("GET", "https://edge.example.com/_ts/api/v1/identify");
         req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
 
         let result = authenticate_bearer(&registry, &req).expect("should authenticate partner");
-        assert_eq!(result.id, "ssp_x", "should return the matching partner");
+        assert_eq!(
+            result.source_domain, "ssp.example.com",
+            "should return the matching partner"
+        );
     }
 }

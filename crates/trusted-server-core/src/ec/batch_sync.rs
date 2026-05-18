@@ -118,7 +118,7 @@ fn handle_batch_sync_with_writer(
     };
 
     // 2. Rate limit (per-partner, per-minute via batch_rate_limit)
-    let rate_key = format!("batch:{}", partner.id);
+    let rate_key = format!("batch:{}", partner.source_domain);
     if rate_limiter.exceeded_per_minute(&rate_key, partner.batch_rate_limit)? {
         return Ok(error_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -153,7 +153,7 @@ fn handle_batch_sync_with_writer(
     }
 
     // 4. Process mappings with per-item validation and rejection reasons.
-    let (accepted, errors) = process_mappings(writer, &partner.id, &body.mappings);
+    let (accepted, errors) = process_mappings(writer, &partner.source_domain, &body.mappings);
 
     let rejected = errors.len();
     let status = if rejected > 0 {
@@ -330,11 +330,10 @@ mod tests {
         }
     }
 
-    fn make_test_partner(id: &str, api_token: &str) -> EcPartner {
+    fn make_test_partner(source_domain: &str, api_token: &str) -> EcPartner {
         EcPartner {
-            id: id.to_owned(),
-            name: format!("Partner {id}"),
-            source_domain: format!("{id}.example.com"),
+            name: format!("Partner {source_domain}"),
+            source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
             bidstream_enabled: true,
             api_token: Redacted::new(api_token.to_owned()),
@@ -357,7 +356,7 @@ mod tests {
 
     fn test_registry() -> PartnerRegistry {
         let partners = vec![make_test_partner(
-            "ssp_x",
+            "ssp.example.com",
             "test-token-32-bytes-minimum-value",
         )];
         PartnerRegistry::from_config(&partners).expect("should build registry")

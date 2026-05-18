@@ -13,7 +13,7 @@ use crate::settings::Settings;
 ///
 /// This filters out all headers listed in [`INTERNAL_HEADERS`] **and** any header
 /// matching the `x-ts-` prefix (case-insensitive) to prevent leaking internal
-/// identity, geo-enrichment, debugging data, and dynamic `X-ts-<partner_id>`
+/// identity, geo-enrichment, debugging data, and dynamic `X-ts-<source_domain>`
 /// headers to downstream third-party services. Integrations that forward custom
 /// headers should use this utility instead of manually iterating over header names.
 pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>) {
@@ -738,7 +738,7 @@ mod tests {
         set_header(&mut req, "X-Custom-2", "value2");
         set_header(&mut req, "x-ts-ec", "should not copy");
         set_header(&mut req, "x-geo-country", "US");
-        // Dynamic partner header (x-ts-<partner_id>).
+        // Dynamic partner header (x-ts-<source_domain>).
         set_header(&mut req, "x-ts-ssp_x", "partner-uid-123");
         set_header(&mut req, "x-ts-liveramp", "lr-uid-456");
 
@@ -775,11 +775,11 @@ mod tests {
         );
         assert!(
             target.headers().get("x-ts-ssp_x").is_none(),
-            "Should filter dynamic x-ts-<partner_id> headers"
+            "Should filter dynamic x-ts-<source_domain> headers"
         );
         assert!(
             target.headers().get("x-ts-liveramp").is_none(),
-            "Should filter dynamic x-ts-<partner_id> headers"
+            "Should filter dynamic x-ts-<source_domain> headers"
         );
     }
 

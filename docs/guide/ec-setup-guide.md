@@ -27,7 +27,6 @@ passphrase = "replace-with-32-plus-byte-random-secret"
 ec_store = "ec_identity_store"
 
 [[ec.partners]]
-id = "mocktioneer"
 name = "Mocktioneer SSP"
 source_domain = "formally-vital-lion.edgecompute.app"
 api_token = "test-batch-sync-key-2026"
@@ -38,10 +37,10 @@ Required behavior assumptions:
 
 - `passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
-- `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, partner IDs, and withdrawal tombstones
+- `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones
 - Live consent is interpreted from request cookies, headers, geolocation, and policy defaults rather than a separate consent KV store
 - Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup
-- `id` is the canonical key used for stored IDs and `x-ts-<id>`-style headers; `source_domain` only controls EID source matching during ingestion
+- `source_domain` is the canonical key used for stored IDs and controls EID source matching during ingestion
 - Partner has `bidstream_enabled = true` if you want `user.ext.eids` in bidstream
 
 ## 2) Configure Demo Variables
@@ -50,7 +49,7 @@ Required behavior assumptions:
 TS_BASE_URL="https://getpurpose.ai"
 MOCK_SSP_URL="https://formally-vital-lion.edgecompute.app"
 
-PARTNER_ID="mocktioneer"
+PARTNER_SOURCE_DOMAIN="formally-vital-lion.edgecompute.app"
 PARTNER_NAME="Mocktioneer SSP"
 PARTNER_API_KEY="test-batch-sync-key-2026"
 
@@ -67,7 +66,6 @@ Partners are configured in `trusted-server.toml` and loaded at startup:
 
 ```toml
 [[ec.partners]]
-id = "mocktioneer"
 name = "Mocktioneer SSP"
 source_domain = "formally-vital-lion.edgecompute.app"
 api_token = "test-batch-sync-key-2026"
@@ -140,7 +138,7 @@ Expected shape:
   "ec": "<ec-id>",
   "consent": "ok",
   "degraded": false,
-  "partner_id": "mocktioneer",
+  "source_domain": "formally-vital-lion.edgecompute.app",
   "uid": "mock-user-123",
   "eid": {
     "source": "formally-vital-lion.edgecompute.app",

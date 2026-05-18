@@ -42,7 +42,7 @@ impl PullSyncContext {
 }
 
 struct InFlightPull {
-    partner_id: String,
+    source_domain: String,
     pending: PendingRequest,
 }
 
@@ -94,9 +94,9 @@ pub fn dispatch_pull_sync(
 
     let mut pull_partners = registry.pull_enabled_partners();
 
-    // Sort by ID for deterministic ordering, then apply a rotating hourly
-    // offset so that different partners get dispatch priority (§10.3).
-    pull_partners.sort_by(|a, b| a.id.cmp(&b.id));
+    // Sort by source domain for deterministic ordering, then apply a rotating
+    // hourly offset so that different partners get dispatch priority (§10.3).
+    pull_partners.sort_by(|a, b| a.source_domain.cmp(&b.source_domain));
 
     log::debug!(
         "Pull sync: {} pull-enabled partners after filtering",
@@ -125,12 +125,12 @@ pub fn dispatch_pull_sync(
             continue;
         };
 
-        let rate_key = pull_rate_limit_key(&partner.id, context.ec_id());
+        let rate_key = pull_rate_limit_key(&partner.source_domain, context.ec_id());
         match rate_limiter.exceeded(&rate_key, partner.pull_sync_rate_limit) {
             Ok(true) => {
                 log::debug!(
                     "Pull sync: rate-limited partner '{}' for ec_id '{}'",
-                    partner.id,
+                    partner.source_domain,
                     super::log_id(context.ec_id())
                 );
                 continue;
@@ -139,7 +139,7 @@ pub fn dispatch_pull_sync(
             Err(err) => {
                 log::warn!(
                     "Pull sync: failed to read rate limit for partner '{}': {err:?}",
-                    partner.id
+                    partner.source_domain
                 );
                 continue;
             }
@@ -148,7 +148,7 @@ pub fn dispatch_pull_sync(
         let Some(token) = partner.ts_pull_token.as_ref() else {
             log::warn!(
                 "Pull sync: partner '{}' enabled but missing ts_pull_token",
-                partner.id
+                partner.source_domain
             );
             continue;
         };
@@ -163,7 +163,7 @@ pub fn dispatch_pull_sync(
                 Err(err) => {
                     log::warn!(
                         "Pull sync: failed to resolve backend for partner '{}': {err:?}",
-                        partner.id
+                        partner.source_domain
                     );
                     continue;
                 }
@@ -174,14 +174,14 @@ pub fn dispatch_pull_sync(
             Err(err) => {
                 log::warn!(
                     "Pull sync: failed to dispatch partner '{}': {err:?}",
-                    partner.id
+                    partner.source_domain
                 );
                 continue;
             }
         };
 
         in_flight.push(InFlightPull {
-            partner_id: partner.id.clone(),
+            source_domain: partner.source_domain.clone(),
             pending,
         });
 
@@ -195,7 +195,7 @@ pub fn dispatch_pull_sync(
 
 fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>) -> bool {
     kv_entry
-        .and_then(|entry| entry.ids.get(&partner.id))
+        .and_then(|entry| entry.ids.get(&partner.source_domain))
         .is_none()
 }
 
@@ -206,7 +206,7 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
         Err(err) => {
             log::error!(
                 "Pull sync: partner '{}' has invalid pull_sync_url '{}': {err}",
-                partner.id,
+                partner.source_domain,
                 pull_sync_url
             );
             return None;
@@ -216,7 +216,7 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     if parsed.scheme() != "https" {
         log::error!(
             "Pull sync: partner '{}' pull_sync_url must use HTTPS, got scheme '{}'",
-            partner.id,
+            partner.source_domain,
             parsed.scheme()
         );
         return None;
@@ -225,7 +225,7 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     let Some(hostname) = parsed.host_str() else {
         log::error!(
             "Pull sync: partner '{}' pull_sync_url has no hostname: {}",
-            partner.id,
+            partner.source_domain,
             pull_sync_url
         );
         return None;
@@ -240,7 +240,7 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     }) {
         log::error!(
             "Pull sync: partner '{}' URL host '{}' not in pull_sync_allowed_domains",
-            partner.id,
+            partner.source_domain,
             hostname
         );
         return None;
@@ -254,13 +254,13 @@ fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
     base_url
 }
 
-fn pull_rate_limit_key(partner_id: &str, ec_id: &str) -> String {
-    format!("pull:{partner_id}:{}", ec_hash(ec_id))
+fn pull_rate_limit_key(source_domain: &str, ec_id: &str) -> String {
+    format!("pull:{source_domain}:{}", ec_hash(ec_id))
 }
 
 fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFlightPull>) {
     for pending in in_flight.drain(..) {
-        let partner_id = pending.partner_id;
+        let source_domain = pending.source_domain;
         // The Fastly SDK version used by this crate exposes only blocking
         // `PendingRequest::wait()` for a single pending request. Pull sync runs
         // after `send_to_client()` and relies on the platform compute cap for
@@ -270,20 +270,20 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
             Err(err) => {
                 log::warn!(
                     "Pull sync: request failed for partner '{}': {err:?}",
-                    partner_id
+                    source_domain
                 );
                 continue;
             }
         };
 
-        let Some(uid) = extract_pull_uid(response, &partner_id) else {
+        let Some(uid) = extract_pull_uid(response, &source_domain) else {
             continue;
         };
 
-        if let Err(err) = kv.upsert_partner_id(ec_id, &partner_id, &uid) {
+        if let Err(err) = kv.upsert_partner_id(ec_id, &source_domain, &uid) {
             log::warn!(
                 "Pull sync: failed to upsert partner '{}' for ec_id '{}': {err:?}",
-                partner_id,
+                source_domain,
                 super::log_id(ec_id)
             );
         }
@@ -296,7 +296,7 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
 /// This prevents a misbehaving partner from exhausting WASM memory.
 const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024;
 
-fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id: &str) -> bool {
+fn response_content_length_exceeds_limit(response: &fastly::Response, source_domain: &str) -> bool {
     let Some(value) = response.get_header(header::CONTENT_LENGTH) else {
         return false;
     };
@@ -304,7 +304,7 @@ fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id
     let Some(value) = value.to_str().ok() else {
         log::warn!(
             "Pull sync: partner '{}' returned invalid Content-Length header, rejecting",
-            partner_id
+            source_domain
         );
         return true;
     };
@@ -312,7 +312,7 @@ fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id
     let Ok(length) = value.parse::<usize>() else {
         log::warn!(
             "Pull sync: partner '{}' returned malformed Content-Length header, rejecting",
-            partner_id
+            source_domain
         );
         return true;
     };
@@ -320,7 +320,7 @@ fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id
     if length > MAX_PULL_RESPONSE_BYTES {
         log::warn!(
             "Pull sync: partner '{}' returned oversized Content-Length ({} bytes), rejecting",
-            partner_id,
+            source_domain,
             length
         );
         return true;
@@ -329,13 +329,13 @@ fn response_content_length_exceeds_limit(response: &fastly::Response, partner_id
     false
 }
 
-fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<String> {
+fn extract_pull_uid(mut response: fastly::Response, source_domain: &str) -> Option<String> {
     let status = response.get_status();
 
     if status == StatusCode::NOT_FOUND {
         log::debug!(
             "Pull sync: partner '{}' returned 404, treating as no-op",
-            partner_id
+            source_domain
         );
         return None;
     }
@@ -343,13 +343,13 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
     if !status.is_success() {
         log::warn!(
             "Pull sync: partner '{}' returned non-success status {}",
-            partner_id,
+            source_domain,
             status
         );
         return None;
     }
 
-    if response_content_length_exceeds_limit(&response, partner_id) {
+    if response_content_length_exceeds_limit(&response, source_domain) {
         return None;
     }
 
@@ -357,7 +357,7 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
     if body.len() > MAX_PULL_RESPONSE_BYTES {
         log::warn!(
             "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",
-            partner_id,
+            source_domain,
             body.len()
         );
         return None;
@@ -367,7 +367,7 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
         Err(err) => {
             log::warn!(
                 "Pull sync: partner '{}' returned invalid JSON body: {err}",
-                partner_id
+                source_domain
             );
             return None;
         }
@@ -380,14 +380,14 @@ fn extract_pull_uid(mut response: fastly::Response, partner_id: &str) -> Option<
         None => {
             log::debug!(
                 "Pull sync: partner '{}' returned null/empty uid, treating as no-op",
-                partner_id
+                source_domain
             );
             None
         }
         Some(ref value) if value.len() > MAX_UID_LENGTH => {
             log::warn!(
                 "Pull sync: partner '{}' returned uid exceeding {} bytes (got {}), rejecting",
-                partner_id,
+                source_domain,
                 MAX_UID_LENGTH,
                 value.len()
             );
@@ -406,7 +406,6 @@ mod tests {
 
     fn pull_partner(ttl_sec: u64) -> PartnerConfig {
         PartnerConfig {
-            id: "ssp_x".to_owned(),
             name: "SSP X".to_owned(),
             api_key_hash: "deadbeef".to_owned(),
             bidstream_enabled: true,
@@ -469,7 +468,7 @@ mod tests {
     #[test]
     fn partner_is_not_eligible_when_already_present() {
         let partner = pull_partner(3600);
-        let entry = KvEntry::minimal("ssp_x", "uid-1", 1000);
+        let entry = KvEntry::minimal("ssp.example.com", "uid-1", 1000);
 
         assert!(
             !is_partner_pull_eligible(&partner, Some(&entry)),
@@ -533,8 +532,8 @@ mod tests {
         let first_ec_id = format!("{}.ABC123", "a".repeat(64));
         let second_ec_id = format!("{}.XYZ789", "a".repeat(64));
 
-        let first_key = pull_rate_limit_key("ssp_x", &first_ec_id);
-        let second_key = pull_rate_limit_key("ssp_x", &second_ec_id);
+        let first_key = pull_rate_limit_key("ssp.example.com", &first_ec_id);
+        let second_key = pull_rate_limit_key("ssp.example.com", &second_ec_id);
 
         assert_eq!(
             first_key, second_key,
@@ -542,8 +541,8 @@ mod tests {
         );
         assert_eq!(
             first_key,
-            format!("pull:ssp_x:{}", "a".repeat(64)),
-            "should key pull-sync rate limiting by partner ID and EC hash"
+            format!("pull:ssp.example.com:{}", "a".repeat(64)),
+            "should key pull-sync rate limiting by source domain and EC hash"
         );
     }
 
@@ -551,7 +550,7 @@ mod tests {
     fn extract_pull_uid_treats_404_as_noop() {
         let response = fastly::Response::from_status(StatusCode::NOT_FOUND);
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert!(uid.is_none(), "should treat 404 as no-op");
     }
 
@@ -559,7 +558,7 @@ mod tests {
     fn extract_pull_uid_treats_uid_null_as_noop() {
         let response = fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":null}");
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert!(uid.is_none(), "should treat uid=null as no-op");
     }
 
@@ -569,7 +568,7 @@ mod tests {
         let body = format!("{{\"uid\":\"{long_uid}\"}}");
         let response = fastly::Response::from_status(StatusCode::OK).with_body(body);
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert!(uid.is_none(), "should reject uid exceeding 512 bytes");
     }
 
@@ -578,7 +577,7 @@ mod tests {
         let response =
             fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":\"abc123\"}");
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert_eq!(
             uid.as_deref(),
             Some("abc123"),
@@ -595,7 +594,7 @@ mod tests {
             )
             .with_body("{\"uid\":\"abc123\"}");
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert!(
             uid.is_none(),
             "should reject oversized Content-Length before parsing body"
@@ -607,7 +606,7 @@ mod tests {
         let response =
             fastly::Response::from_status(StatusCode::OK).with_body("{\"uid\":\"abc123\"}");
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert_eq!(
             uid.as_deref(),
             Some("abc123"),
@@ -620,14 +619,14 @@ mod tests {
         let body = format!("{{\"uid\":\"{}\"}}", "x".repeat(MAX_PULL_RESPONSE_BYTES));
         let response = fastly::Response::from_status(StatusCode::OK).with_body(body);
 
-        let uid = extract_pull_uid(response, "ssp_x");
+        let uid = extract_pull_uid(response, "ssp.example.com");
         assert!(uid.is_none(), "should reject body larger than limit");
     }
 
     #[test]
     fn rotating_offset_distributes_partners_across_hours() {
-        // Simulate 3 partners sorted by ID: alpha, beta, gamma.
-        let ids = vec!["alpha", "beta", "gamma"];
+        // Simulate 3 partners sorted by source domain: alpha, beta, gamma.
+        let ids = vec!["alpha.example.com", "beta.example.com", "gamma.example.com"];
 
         // Hour 0: offset = 0 % 3 = 0 → [alpha, beta, gamma]
         let ts_h0: u64 = 100; // within hour 0
@@ -651,7 +650,7 @@ mod tests {
         rotated.rotate_left(offset_h1);
         assert_eq!(
             rotated,
-            vec!["beta", "gamma", "alpha"],
+            vec!["beta.example.com", "gamma.example.com", "alpha.example.com"],
             "hour 1 rotation should move beta to front"
         );
     }

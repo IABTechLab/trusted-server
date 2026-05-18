@@ -548,14 +548,14 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let json = assert_json_response(identify(&client, "inttest-api-key-1-32-bytes-minimum")?, 200)
         .attach("EC full lifecycle: identify after batch sync")?;
 
-    let partner_id = json.get("partner_id").and_then(|v| v.as_str());
-    if partner_id != Some("inttest") {
+    let source_domain = json.get("source_domain").and_then(|v| v.as_str());
+    if source_domain != Some("inttest.example.com") {
         return Err(Report::new(TestError::JsonFieldMismatch {
-            field: "partner_id".to_owned(),
+            field: "source_domain".to_owned(),
         })
         .attach(format!(
-            "expected partner_id 'inttest', got {:?}; body: {json}",
-            partner_id
+            "expected source_domain 'inttest.example.com', got {:?}; body: {json}",
+            source_domain
         )));
     }
 

@@ -372,7 +372,7 @@ sequenceDiagram
 
     B->>B: User ID modules resolve EIDs
     B->>T: POST /auction\n(adUnits + current-request eids)
-    T->>K: Resolve EC-backed partner IDs
+    T->>K: Resolve EC-backed source-domain IDs
     K-->>T: KV-derived EIDs
     T->>T: Merge + dedupe client + KV EIDs
     T->>T: Apply consent gating
