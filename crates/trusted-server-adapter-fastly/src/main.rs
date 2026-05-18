@@ -55,9 +55,10 @@ const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opport
 static SLOTS_FILE: std::sync::LazyLock<
     trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
 > = std::sync::LazyLock::new(|| {
-    match toml::from_str::<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile>(
-        CREATIVE_OPPORTUNITIES_TOML,
-    ) {
+    let mut file = match toml::from_str::<
+        trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
+    >(CREATIVE_OPPORTUNITIES_TOML)
+    {
         Ok(file) => file,
         Err(err) => {
             log::error!(
@@ -67,7 +68,11 @@ static SLOTS_FILE: std::sync::LazyLock<
             );
             trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default()
         }
-    }
+    };
+    // Pre-compile glob patterns once so per-request `matches_path` doesn't
+    // re-invoke `Pattern::new` on every page hit.
+    file.compile();
+    file
 });
 
 /// Entry point for the Fastly Compute program.

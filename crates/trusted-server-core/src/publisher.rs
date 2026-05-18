@@ -575,6 +575,32 @@ fn make_collect_context<'a>(
     }
 }
 
+/// Well-known crawler User-Agent fragments. Best-effort: an attacker can
+/// trivially spoof their UA, so this is for opt-out signalling to honest
+/// crawlers (preventing SSP auctions burning partner quota on their behalf),
+/// not security.
+pub(crate) const BOT_USER_AGENT_FRAGMENTS: &[&str] =
+    &["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"];
+
+/// Returns true when the request's User-Agent matches any well-known crawler
+/// fragment in [`BOT_USER_AGENT_FRAGMENTS`].
+pub(crate) fn is_bot_user_agent(req: &Request) -> bool {
+    let ua = req.get_header_str("user-agent").unwrap_or("");
+    BOT_USER_AGENT_FRAGMENTS
+        .iter()
+        .any(|frag| ua.contains(frag))
+}
+
+/// Returns true when the request advertises itself as a prefetch via either
+/// the standard `Sec-Purpose` or the legacy `Purpose` header.
+pub(crate) fn is_prefetch_request(req: &Request) -> bool {
+    req.get_header_str("sec-purpose")
+        .is_some_and(|v| v.contains("prefetch"))
+        || req
+            .get_header_str("purpose")
+            .is_some_and(|v| v.contains("prefetch"))
+}
+
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
@@ -902,17 +928,8 @@ pub async fn handle_publisher_request(
     let request_path = req.get_path().to_string();
     let is_get = req.get_method() == fastly::http::Method::GET;
 
-    let is_prefetch = req
-        .get_header_str("sec-purpose")
-        .is_some_and(|v| v.contains("prefetch"))
-        || req
-            .get_header_str("purpose")
-            .is_some_and(|v| v.contains("prefetch"));
-
-    let user_agent = req.get_header_str("user-agent").unwrap_or("");
-    let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
-        .iter()
-        .any(|bot| user_agent.contains(bot));
+    let is_prefetch = is_prefetch_request(&req);
+    let is_bot = is_bot_user_agent(&req);
 
     let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
         crate::creative_opportunities::match_slots(&slots_file.slots, &request_path)
@@ -960,14 +977,9 @@ pub async fn handle_publisher_request(
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
     // can be mutated and sent to origin immediately after.
     let dispatched_auction = if should_run_auction {
-        let co_config = settings
-            .creative_opportunities
-            .as_ref()
-            .expect("should be present when should_run_auction is true");
         let slots_ctx = MatchedSlotsContext {
             matched_slots: &matched_slots,
             request_path: &request_path,
-            co_config,
         };
         let mut auction_request = build_auction_request(
             &slots_ctx,
@@ -1197,12 +1209,11 @@ pub async fn handle_publisher_request(
 /// Bundle of the per-request creative-opportunity inputs that travel together.
 ///
 /// Extracted so `build_auction_request` stays under the project's
-/// 7-argument cap (`matched_slots` + `request_path` + `co_config` all live
-/// for the same request scope and are passed together everywhere).
+/// 7-argument cap (`matched_slots` + `request_path` live for the same
+/// request scope and are passed together everywhere).
 pub(crate) struct MatchedSlotsContext<'a> {
     pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
     pub request_path: &'a str,
-    pub co_config: &'a crate::creative_opportunities::CreativeOpportunitiesConfig,
 }
 
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
@@ -1216,7 +1227,7 @@ pub(crate) fn build_auction_request(
     let slots = slots_ctx
         .matched_slots
         .iter()
-        .map(|s| s.to_ad_slot(&slots_ctx.co_config.gam_network_id))
+        .map(crate::creative_opportunities::CreativeOpportunitySlot::to_ad_slot)
         .collect();
     let page_url = format!(
         "{}://{}{}",
@@ -1491,16 +1502,8 @@ pub async fn handle_page_bids(
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
     // navigations and known crawler UA scans, burning partner request quota.
-    let is_prefetch = req
-        .get_header_str("sec-purpose")
-        .is_some_and(|v| v.contains("prefetch"))
-        || req
-            .get_header_str("purpose")
-            .is_some_and(|v| v.contains("prefetch"));
-    let user_agent = req.get_header_str("user-agent").unwrap_or("");
-    let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
-        .iter()
-        .any(|bot| user_agent.contains(bot));
+    let is_prefetch = is_prefetch_request(&req);
+    let is_bot = is_bot_user_agent(&req);
 
     if matched_slots.is_empty() {
         log::debug!(
@@ -1521,7 +1524,6 @@ pub async fn handle_page_bids(
             let slots_ctx = MatchedSlotsContext {
                 matched_slots: &matched_slots,
                 request_path: &path_param,
-                co_config,
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
@@ -2557,6 +2559,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 providers: Default::default(),
+                compiled_patterns: Vec::new(),
             }
         }
 
@@ -2775,6 +2778,7 @@ mod tests {
                     floor_price: Some(0.50),
                     targeting: Default::default(),
                     providers: Default::default(),
+                    compiled_patterns: Vec::new(),
                 }],
             }
         }
