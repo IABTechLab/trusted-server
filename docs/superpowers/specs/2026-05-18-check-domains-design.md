@@ -185,7 +185,16 @@ The host equals one of these **or** ends with `.` + one of these.
 Exact-match. Allowed in every scanned file (no docs-vs-code split).
 These are well-known documentation and spec sources that appear as
 markdown link targets, `///` doc-comment URLs, `#` config comments,
-etc. Curated by scanning the current `.md` files.
+etc.
+
+**The table below is the seed list curated from a sampling of current
+`.md` files. It is expected to be incomplete on first pass.** The
+Stage 1 cleanup workstream (see
+[Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan)) drives the
+actual final list by running the full-repo audit, sorting hosts by
+frequency, and triaging each into one of: add to `REFERENCE_HOSTS`,
+add to integration `EXACT_HOSTS`, rewrite to a reserved host, or
+suppress per-line.
 
 | Category                | Hosts                                                                                          |
 | ----------------------- | ---------------------------------------------------------------------------------------------- |
@@ -348,15 +357,19 @@ including inside fenced blocks.
 ### Always excluded (paths)
 
 - `Cargo.lock`
-- `*-lock.json` (matches `package-lock.json`, `pnpm-lock.json`). **This
-  is a supply-chain trade-off, not just dependency noise.** The current
-  `package-lock.json` files contain `registry.npmjs.org`,
-  `funding`/`sponsor` URLs, and many transitive package-repository
-  URLs. Excluding lockfiles means a malicious or unreviewed registry
-  URL added to a lockfile would not be flagged. Mitigated by the fact
-  that lockfile changes are themselves a high-signal review surface
-  (PR reviewers should already inspect lockfile diffs). Revisit if a
-  real incident occurs.
+- Lockfiles by **exact basename** (not glob): `package-lock.json`,
+  `pnpm-lock.yaml`, `pnpm-lock.json`, `yarn.lock`,
+  `npm-shrinkwrap.json`. Listing each by name avoids the bug where
+  a `*-lock.json` glob would miss `pnpm-lock.yaml` while `.yaml` is
+  in the scanned extensions. **This is a supply-chain trade-off,
+  not just dependency noise.** The current `package-lock.json`
+  files contain `registry.npmjs.org`, `funding`/`sponsor` URLs, and
+  many transitive package-repository URLs. Excluding lockfiles
+  means a malicious or unreviewed registry URL added to a lockfile
+  would not be flagged. Mitigated by the fact that lockfile changes
+  are themselves a high-signal review surface (PR reviewers should
+  already inspect lockfile diffs). Revisit if a real incident
+  occurs.
 - `node_modules/` (any depth)
 - `target/`
 - `dist/`
@@ -483,30 +496,46 @@ the match.
 **Absolute URL regex:**
 
 ```
-(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.\-]+)
+(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)
 ```
 
-- `[A-Za-z0-9.\-]+` greedily captures the host; matching stops at the
-  first character outside the class (e.g., `/`, `:`, `?`, `"`, `>`).
+- The non-IPv6 host branch `[A-Za-z0-9][A-Za-z0-9.\-]*` requires the
+  host to **start with an alphanumeric** character. This rejects
+  placeholder noise like `https://...` (which the earlier
+  `[A-Za-z0-9.\-]+` would have matched, producing the bogus host
+  `...`). A leading `-` or `.` is rejected by the same rule; that's
+  fine, both are invalid per RFC 1035 anyway.
+- Greedy match stops at the first character outside the class
+  (e.g., `/`, `:`, `?`, `"`, `>`).
 - Bracketed IPv6 is captured as `[…]`; surrounding brackets stripped
   in normalisation.
 
 **Protocol-relative URL regex:**
 
 ```
-(?i)(?:^|[\s"'(=<>])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
+(?i)(?:^|[\s"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
 ```
 
-- The non-capturing group `(?:^|[\s"'(=<>])` requires a boundary
-  character (start-of-line, whitespace, quote, paren, `=`, `<`, `>`)
-  before the `//`. Prevents matching the `//` in `// comment text` or
-  in `http://foo` (where `//` is preceded by `:`).
-- The host capture `[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}` requires
-  at least one dot followed by a TLD-like suffix — filters out
-  comment dividers like `// foo bar` and `// 1.2`.
+- The non-capturing group `(?:^|[\s"'(=<>{,\[\]` + backtick + `])`
+  requires a boundary character before the `//`: start-of-line,
+  whitespace, quote (`"` or `'`), paren `(`, `=`, `<`, `>`, `{`,
+  `,`, `[`, `]`, or backtick (template literal). Backtick covers
+  JavaScript/TypeScript template literals
+  (`` `//cdn.example.com/${path}` ``); `{`, `[`, `,` cover
+  JSON / TS object literals where a URL string follows a key.
+- **Why not `:`?** `:` deliberately excluded — `http://foo.com` has
+  `//` preceded by `:` (the URL scheme separator). Adding `:` to the
+  boundary class would cause the protocol-relative regex to also
+  match the host portion of every absolute URL, double-flagging.
+- Prevents matching `// comment text` (the `//` is at column 0 or
+  preceded by code, but the trailing TLD constraint also filters
+  out comment dividers like `// foo bar`).
+- The host capture `[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}`
+  requires at least one dot followed by a TLD-like suffix and a
+  leading alphanumeric character.
 - **Known limitation**: back-to-back protocol-relative URLs without a
-  separator (`//foo.com//bar.com`) would miss the second one because
-  the engine continues from `/bar.com` with no boundary char. Accepted
+  separator (`//foo.com//bar.com`) miss the second one because the
+  engine continues from `/bar.com` with no boundary char. Accepted
   for v1; no real-world occurrence.
 
 ### Suppression marker regex
@@ -521,6 +550,25 @@ documented in [Per-Line Suppression](#per-line-suppression)):
 The `(?:^|\s)` anchor is what closes the URL-content bypass (see
 [Bypass-resistance](#per-line-suppression)). Any implementation must
 use this exact regex; do not introduce a second variant elsewhere.
+
+**Captured-group handling.** The host capture
+`([A-Za-z0-9.\-:\[\],\s]+?)` includes `\s` (whitespace) because hosts
+may be comma-separated with surrounding spaces, and an HTML-comment
+marker like `<!-- allow-domain: test.com -->` has a space before
+`-->` that the lazy quantifier will pull into the capture. The
+implementation **must**:
+
+1. Take the captured string.
+2. Split on `,`.
+3. Trim each resulting segment of leading/trailing whitespace
+   (including any spaces the lazy quantifier picked up before
+   `-->`).
+4. Drop empty segments.
+5. Lowercase each remaining host for comparison.
+
+Tests exercise both `<!-- allow-domain: test.com -->` (with the
+trailing space before `-->`) and
+`// allow-domain: test.com, other.com` (multi-host with spaces).
 
 ### Host normalisation
 
@@ -879,11 +927,10 @@ pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
         std::fs::set_permissions(&hook_path, perms)?;
     }
 
-    // gix config write: set core.hooksPath = .githooks (local repo config).
-    let mut config = repo.config_snapshot_mut();
-    config.set_raw_value(&"core.hooksPath", ".githooks")
-        .change_context(InstallHooksError::ConfigWrite)?;
-    config.commit().change_context(InstallHooksError::ConfigWrite)?;
+    // Persistent local-repo config write: set core.hooksPath = .githooks
+    // in <repo>/.git/config. See "Persisting core.hooksPath" below for
+    // the concrete file-level write plan via the gix-config crate.
+    set_local_config_value(&repo, "core", None, "hooksPath", ".githooks")?;
 
     println!(
         "Installed: pre-commit hook → {} (calls {})",
@@ -898,8 +945,8 @@ fn render_hook(ts_path: &Path) -> String {
         "#!/usr/bin/env bash\n\
          # Installed by `ts dev install-hooks`. DO NOT EDIT.\n\
          # ts-install-hooks: managed\n\
-         exec {:?} dev lint domains --staged\n",
-        ts_path,
+         exec {} dev lint domains --staged\n",
+        shell_quote(&ts_path.to_string_lossy()),
     )
 }
 
@@ -913,6 +960,90 @@ The `# ts-install-hooks: managed` marker on a known line is the
 signal `is_managed` uses to detect prior-installed hooks. Hand-written
 hooks won't have this marker, so they're treated as user content and
 preserved unless `--force` is passed.
+
+#### Shell-safe path quoting in the hook
+
+`render_hook` writes the hook script's `exec` line. `Path::display()`
+and `format!("{:?}", path)` are **not** shell-safe — paths containing
+spaces, `$`, backticks, single quotes, or backslashes would break
+the hook or silently misbehave (and on some systems open a command
+injection through the install-time path).
+
+The implementation uses POSIX-shell single-quote escaping, which is
+trivial and bulletproof — single quotes inside the wrapper are
+escaped as `'\''`:
+
+```rust
+fn shell_quote(s: &str) -> String {
+    // POSIX single-quote escaping: wrap in '...', and any embedded
+    // single quote becomes '\''  (close, escaped-quote, reopen).
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+```
+
+Tests cover paths containing: spaces (`/Users/Alice Q/.cargo/bin/ts`),
+single quotes (`/path/with'quote/ts`), `$` (`/opt/$HOME/ts`),
+backticks, backslashes (on Windows-style installer outputs).
+
+#### Persisting `core.hooksPath`
+
+`gix::Repository::config_snapshot_mut()` modifies an in-memory
+snapshot; persisting back to `<repo>/.git/config` is not a single
+stable call in current `gix`. The plan is to write the file directly
+using the `gix-config` crate's file-level API:
+
+```rust
+fn set_local_config_value(
+    repo: &gix::Repository,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+    value: &str,
+) -> Result<(), Report<InstallHooksError>> {
+    use gix_config::File;
+    let config_path = repo.path().join("config"); // <repo>/.git/config
+
+    // Read existing file. If missing, start with an empty File.
+    let mut file = match File::from_path_no_includes(
+        config_path.clone(),
+        gix_config::Source::Local,
+    ) {
+        Ok(f) => f,
+        Err(_) => File::default(),
+    };
+
+    // Set the value in the requested section/subsection/key.
+    file.set_raw_value_by(section, subsection, key, value.as_bytes())
+        .change_context(InstallHooksError::ConfigWrite)?;
+
+    // Serialize and write back atomically (write to a temp file in
+    // the same directory, then rename).
+    let serialized = file.to_bstring();
+    write_atomic(&config_path, serialized.as_slice())
+        .change_context(InstallHooksError::ConfigWrite)?;
+    Ok(())
+}
+```
+
+`write_atomic` is a small helper that writes to `config.tmp.<rand>`
+then `rename`s to `config` (atomic on the same filesystem). This
+matches git's own behavior of never leaving a partially-written
+`.git/config`.
+
+This replaces the earlier sketch using `config_snapshot_mut` /
+`commit()` which is in-memory only. The `gix-config` file-write
+path is the documented stable way to durably modify a local repo's
+git config without subprocess.
 
 `ts dev install-hooks` is a one-time setup contributors run after cloning,
 alongside `cargo install_cli`. Documented in CONTRIBUTING.md.
@@ -977,6 +1108,23 @@ on the collected `DiffLine` values.
 20. **Wrong host in marker** —
     `https://evil.com // allow-domain: other.com` → `evil.com` flagged;
     stderr warning notes `other.com` was listed but did not match.
+20a. **Placeholder URL with malformed host** —
+    `https://...` in a Markdown placeholder must NOT extract host
+    `...` (the regex requires an alphanumeric first character).
+    Asserts the URL is silently skipped (it is not a real URL).
+20b. **Template-literal protocol-relative URL** —
+    `` `//cdn.example.evil/${path}` `` (JS/TS template literal)
+    flagged as `cdn.example.evil`. Asserts backtick boundary works.
+20c. **JSON object value with protocol-relative URL** —
+    `{"src": "//cdn.example.evil/x"}` flagged. Asserts `{` and `,`
+    boundary characters work for JSON contexts.
+20d. **Suppression marker with trailing whitespace before `-->`** —
+    `<!-- allow-domain: test.com   -->` correctly trims the host
+    (captured group ends with spaces, but split+trim yields
+    `["test.com"]`).
+20e. **Suppression marker with multi-host whitespace** —
+    `// allow-domain: a.com ,  b.com , c.com` correctly yields
+    `["a.com", "b.com", "c.com"]`.
 
 ### `--staged` mode cases (`assert_cmd` end-to-end)
 
@@ -1094,11 +1242,79 @@ and the index with `gix` APIs (no shell), runs the binary with
   (`blob-diff`, `revision`, `index`, `config`). Acceptable because the
   alternative (shelling to `git`) was rejected as a hard requirement.
 
+## Stage 1 Doc Cleanup Plan
+
+Bringing `.md` into scope means the current docs have many
+non-allowlisted hosts that need triage. The full-repo audit
+(`ts dev lint domains` with no args) is diagnostic-only in Stage 1
+precisely so this cleanup can happen incrementally — but it is a
+**committed workstream**, not "incidental noise we'll get to."
+
+### Verified disallowed hosts in current `.md` files
+
+A grep against the current `docs/` and root-level Markdown surfaces
+these example categories (representative, not exhaustive — the
+implementation runs the full audit and produces the complete list):
+
+| Host                                     | Category                                | Resolution                                                                  |
+| ---------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------- |
+| `aps.amazon.com`                         | Real Amazon doc/product page            | Add to `REFERENCE_HOSTS` if linked repeatedly, otherwise suppress per-line  |
+| `api.lockr.io`                           | Legitimate lockr integration endpoint   | Add to integration `EXACT_HOSTS` (lockr) — verify it is actually proxied |
+| `krk.kargo.com`                          | Kargo bidder host                       | Verify if proxied; add to integration list OR rewrite illustrative usage to `.example` |
+| `sync.ssp.com`, `ec.publisher.com`, `tracker.com`, `advertiser.com`, `cdn.com`, `short.link`, `redirect1.com`, `redirect2.com`, `final.com`, `new-server.com`, `publisher.com`, `partner.com`, `web.prebidwrapper.com`, `prebid-server.com`, `your-server.com` | Illustrative placeholders in `docs/guide/creative-processing.md`, `docs/guide/first-party-proxy.md`, etc. | **Rewrite to RFC 2606 reserved hosts** (`tracker.example.com`, `advertiser.example.com`, `cdn.example.com`, `short.example`, etc.) |
+| `formally-vital-lion.edgecompute.app`    | One-off Fastly Compute test URL         | Suppress per-line where it appears |
+| `getpurpose.ai`                          | Test site in PR #669 reviewer instructions | Rewrite to `example.com` or suppress |
+| `192.168.1.1`                            | RFC 1918 private IP example             | Rewrite to a reserved host or `127.0.0.1` |
+
+### Cleanup policy
+
+1. **Strongly prefer rewriting illustrative example hosts to RFC 2606
+   reserved names** (`*.example.com`, `*.example.net`, `*.example.org`,
+   `*.example`, `*.test`, `*.invalid`, `*.localhost`). This is the
+   default for placeholder URLs in tutorials, prose, and code
+   snippets. It is also the answer to the
+   "multi-line fenced-code-block suppression" pain point — the linter
+   has no block-level suppression mechanism (intentional: keeps the
+   tool simple), so multi-line examples that would otherwise need
+   one marker per line should be rewritten to reserved hosts instead.
+2. **Add legitimate integration / vendor hosts to the appropriate
+   allowlist** when they appear in multiple files and have a real
+   integration backing them (e.g., `api.lockr.io`).
+3. **Suppress per-line only for true one-offs** — security write-ups
+   referencing a CVE-relevant domain, attacker placeholders in
+   security tests (`evil.com`), single citations of an external
+   resource. Suppressing 20 illustrative occurrences of a placeholder
+   is a smell — rewrite to reserved instead.
+
+### Cleanup execution
+
+The cleanup PR(s) land **after** the linter ships (Stage 1) but
+**before** Stage 2 (CI gate on changed lines), so contributors get
+the protection of the local hook immediately while the doc cleanup
+happens in parallel without blocking the main release.
+
+Suggested execution order:
+
+1. Land the linter and pre-commit hook (this design).
+2. Run `ts dev lint domains | sort | uniq -c | sort -rn` to produce a
+   frequency-ordered violation report.
+3. Triage the top ~80% of violations into the three categories above.
+4. Submit cleanup PRs grouped by file (so each PR is reviewable):
+   `docs/guide/creative-processing.md`,
+   `docs/guide/first-party-proxy.md`,
+   `docs/guide/api-reference.md`,
+   etc.
+5. Each cleanup PR runs the linter's `--changed-vs main` mode as a
+   self-check.
+6. Once the audit is clean (or down to a small known list), enable
+   Stage 2 CI.
+
 ## Migration to CI
 
-**Stage 1 (this design):** Pre-commit hook calling
-`ts dev lint domains --staged`. Prevents _new_ violations. Full-repo audit
-available but diagnostic-only.
+**Stage 1 (this design + the cleanup workstream above):** Pre-commit
+hook calling `ts dev lint domains --staged`. Prevents _new_
+violations. Full-repo audit available but diagnostic-only; the doc
+cleanup runs in parallel.
 
 **Stage 2:** GitHub Actions workflow runs
 `ts dev lint domains --changed-vs $GITHUB_BASE_REF` on every PR. Same
@@ -1116,15 +1332,17 @@ until Stages 1 and 2 are stable.
 
 ## Open Questions
 
-1. **Subcommand naming.** `ts dev lint domains` (current pick) vs other
-   placements considered: top-level `ts lint domains`, top-level
-   `ts check domains`, under audit as `ts audit domains`. Current pick
-   nests under `dev` because both `lint` and `install-hooks` are
-   developer-workflow commands and don't belong on the operator-facing
-   top level. Confirm the existing PR #669 `ts dev` (single-file leaf
-   that starts the dev server) being refactored into a subcommand
-   group with `ts dev serve` for the existing behavior is acceptable
-   to the #669 reviewers.
+1. **Subcommand naming — RESOLVED.** Decided: `ts dev lint domains`
+   and `ts dev install-hooks`. Both `lint` and `install-hooks` are
+   developer-workflow commands and belong under `dev`, not on the
+   operator-facing top level. This requires refactoring the existing
+   PR #669 `ts dev` (single-file leaf that starts the dev server)
+   into a subcommand group, with `ts dev serve` for the existing
+   behavior. Since #669 hasn't merged, the refactor can be
+   coordinated as part of the same review cycle. The earlier
+   review's suggestion to keep `ts lint domains` top-level was
+   explicitly rejected by the spec owner — `dev` parent is the
+   chosen shape.
 2. **`cdn.prebid.org` on allowlist vs converting `prebid.rs` tests to
    `.example`?** Current pick: allowlist. Revisit if rigorous
    separation is preferred.
