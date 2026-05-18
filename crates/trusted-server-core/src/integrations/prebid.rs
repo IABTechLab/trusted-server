@@ -3,12 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64, Engine};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, Method, StatusCode, Url};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as Json};
+use serde_json::Value as Json;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -803,88 +802,6 @@ fn non_empty_override_object(
     Ok(value.clone())
 }
 
-fn transform_prebid_response(
-    response: &mut Json,
-    request_host: &str,
-    request_scheme: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    if let Some(seatbids) = response["seatbid"].as_array_mut() {
-        for seatbid in seatbids {
-            if let Some(bids) = seatbid["bid"].as_array_mut() {
-                for bid in bids {
-                    if let Some(adm) = bid["adm"].as_str() {
-                        bid["adm"] = json!(rewrite_ad_markup(adm, request_host, request_scheme));
-                    }
-
-                    if let Some(nurl) = bid["nurl"].as_str() {
-                        bid["nurl"] = json!(make_first_party_proxy_url(
-                            nurl,
-                            request_host,
-                            request_scheme,
-                            "track"
-                        ));
-                    }
-
-                    if let Some(burl) = bid["burl"].as_str() {
-                        bid["burl"] = json!(make_first_party_proxy_url(
-                            burl,
-                            request_host,
-                            request_scheme,
-                            "track"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_ad_markup(markup: &str, request_host: &str, request_scheme: &str) -> String {
-    let mut content = markup.to_string();
-    let cdn_patterns = [
-        ("https://cdn.adsrvr.org", "adsrvr"),
-        ("https://ib.adnxs.com", "adnxs"),
-        ("https://rtb.openx.net", "openx"),
-        ("https://as.casalemedia.com", "casale"),
-        ("https://eus.rubiconproject.com", "rubicon"),
-    ];
-
-    for (cdn_url, cdn_name) in cdn_patterns {
-        if content.contains(cdn_url) {
-            let proxy_base = format!(
-                "{}://{}/ad-proxy/{}",
-                request_scheme, request_host, cdn_name
-            );
-            content = content.replace(cdn_url, &proxy_base);
-        }
-    }
-
-    content = content.replace(
-        "//cdn.adsrvr.org",
-        &format!("//{}/ad-proxy/adsrvr", request_host),
-    );
-    content = content.replace(
-        "//ib.adnxs.com",
-        &format!("//{}/ad-proxy/adnxs", request_host),
-    );
-    content
-}
-
-fn make_first_party_proxy_url(
-    third_party_url: &str,
-    request_host: &str,
-    request_scheme: &str,
-    proxy_type: &str,
-) -> String {
-    let encoded = BASE64.encode(third_party_url.as_bytes());
-    format!(
-        "{}://{}/ad-proxy/{}/{}",
-        request_scheme, request_host, proxy_type, encoded
-    )
-}
-
 /// Copies browser headers to the outgoing Prebid Server request.
 ///
 /// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
@@ -1458,7 +1375,6 @@ impl PrebidAuctionProvider {
         &self,
         mut response: fastly::Response,
         response_time_ms: u64,
-        request_info: Option<&RequestInfo>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Parse response
         let body_bytes = response.take_body_bytes();
@@ -1478,7 +1394,7 @@ impl PrebidAuctionProvider {
             return Ok(AuctionResponse::error("prebid", response_time_ms));
         }
 
-        let mut response_json: Json =
+        let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Prebid {
                 message: "Failed to parse Prebid response".to_string(),
             })?;
@@ -1492,32 +1408,6 @@ impl PrebidAuctionProvider {
                     log::warn!("Prebid: failed to serialize response for logging: {e}");
                 }
             }
-        }
-
-        let response_request_host = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_host"))
-            .and_then(|value| value.as_str());
-        let response_request_scheme = response_json
-            .get("ext")
-            .and_then(|ext| ext.get("trusted_server"))
-            .and_then(|trusted_server| trusted_server.get("request_scheme"))
-            .and_then(|value| value.as_str());
-
-        let request_host = response_request_host
-            .map(str::to_owned)
-            .or_else(|| request_info.map(|info| info.host.clone()))
-            .unwrap_or_default();
-        let request_scheme = response_request_scheme
-            .map(str::to_owned)
-            .or_else(|| request_info.map(|info| info.scheme.clone()))
-            .unwrap_or_else(|| "https".to_owned());
-
-        if request_host.is_empty() {
-            log::warn!("Prebid response missing request host; skipping URL rewrites");
-        } else {
-            transform_prebid_response(&mut response_json, &request_host, &request_scheme)?;
         }
 
         let mut auction_response = self.parse_openrtb_response(&response_json, response_time_ms);
@@ -1639,23 +1529,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         response: fastly::Response,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        self.parse_response_inner(response, response_time_ms, None)
-    }
-
-    fn parse_response_with_context(
-        &self,
-        response: fastly::Response,
-        response_time_ms: u64,
-        context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        self.parse_response_inner(
-            response,
-            response_time_ms,
-            Some(&{
-                let http_req = compat::from_fastly_headers_ref(context.request);
-                RequestInfo::from_request(&http_req, &context.services.client_info)
-            }),
-        )
+        self.parse_response_inner(response, response_time_ms)
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -1999,100 +1873,6 @@ passphrase = "test-secret-key-32-bytes-minimum"
         assert!(
             processed.contains("tsjs-prebid.min.js"),
             "Deferred prebid bundle should be injected"
-        );
-    }
-
-    #[test]
-    fn transform_prebid_response_rewrites_creatives_and_tracking() {
-        let mut response = json!({
-            "seatbid": [{
-                "bid": [{
-                    "adm": r#"<img src="https://cdn.adsrvr.org/pixel.png">"#,
-                    "nurl": "https://notify.example/win",
-                    "burl": "https://notify.example/bill"
-                }]
-            }]
-        });
-
-        transform_prebid_response(&mut response, "pub.example", "https")
-            .expect("should rewrite response");
-
-        let rewritten_adm = response["seatbid"][0]["bid"][0]["adm"]
-            .as_str()
-            .expect("adm should be string");
-        assert!(
-            rewritten_adm.contains("/ad-proxy/adsrvr"),
-            "creative markup should proxy CDN urls"
-        );
-
-        for url_field in ["nurl", "burl"] {
-            let value = response["seatbid"][0]["bid"][0][url_field]
-                .as_str()
-                .expect("should get tracking URL");
-            assert!(
-                value.contains("/ad-proxy/track/"),
-                "tracking URLs should be proxied"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_response_uses_request_context_when_pbs_does_not_echo_trusted_server_ext() {
-        let provider = PrebidAuctionProvider::new(base_config());
-        let settings = make_settings();
-        let mut req = Request::new("POST", "https://pub.example/auction");
-        req.set_header(header::HOST, "pub.example");
-        req.set_header("fastly-ssl", "1");
-        let context = create_test_auction_context(&settings, &req);
-        let response_body = json!({
-            "id": "auction-123",
-            "seatbid": [{
-                "seat": "exampleBidder",
-                "bid": [{
-                    "impid": "slot-1",
-                    "price": 1.23,
-                    "adm": r#"<img src="https://cdn.adsrvr.org/pixel.png">"#,
-                    "w": 300,
-                    "h": 250
-                }]
-            }]
-        });
-        let response = Response::from_status(StatusCode::OK)
-            .with_body(serde_json::to_vec(&response_body).expect("should serialize response"));
-
-        let parsed = provider
-            .parse_response_with_context(response, 10, &context)
-            .expect("should parse response");
-
-        let creative = parsed.bids[0]
-            .creative
-            .as_deref()
-            .expect("should keep creative");
-        assert!(
-            creative.contains("https://pub.example/ad-proxy/adsrvr"),
-            "should rewrite using local request host when PBS omits ext.trusted_server"
-        );
-    }
-
-    #[test]
-    fn make_first_party_proxy_url_base64_encodes_target() {
-        let url = "https://cdn.example/path?x=1";
-        let rewritten = make_first_party_proxy_url(url, "pub.example", "https", "track");
-        assert!(
-            rewritten.starts_with("https://pub.example/ad-proxy/track/"),
-            "proxy prefix should be applied"
-        );
-
-        let encoded = rewritten
-            .split("/ad-proxy/track/")
-            .nth(1)
-            .expect("should have encoded payload after proxy prefix");
-        let decoded = BASE64
-            .decode(encoded.as_bytes())
-            .expect("should decode base64 proxy payload");
-        assert_eq!(
-            String::from_utf8(decoded).expect("should be valid UTF-8"),
-            url
         );
     }
 
