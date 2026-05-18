@@ -32,24 +32,34 @@ spec begins until #669 is on `main`.
 
 ## Implementation Readiness
 
-**Status today: not ready to start in this checkout.** `main` has no
-`crates/trusted-server-cli` directory, no `ts` binary, no
-`cargo install_cli` alias, and no host-target CI lane. Starting the
-linter now would force the implementer to reinvent or duplicate
-PR #669's surface, which is exactly the coupling the prerequisite
-section above warns against.
+**Status today: ready to start *only on a branch stacked on PR #669*.**
+A plain `main` checkout has no `crates/trusted-server-cli`, no `ts`
+binary, no `cargo install_cli` alias, and no host-target CI lane —
+starting there would force the implementer to reinvent or duplicate
+PR #669's surface. Implementation must happen on a branch whose base
+includes #669.
 
-**Start conditions** (all must be true):
+**Two acceptable execution paths:**
 
-1. PR #669 is merged to `main`, and the `crates/trusted-server-cli`
-   crate is present at the head of `main`.
+1. **Wait for #669 to merge to `main`.** Then start implementation on
+   a branch off `main`. Simplest history; lowest coordination cost.
+2. **Stack on `origin/feature/ts-cli` (PR #669's branch) now.**
+   Create the implementation branch off `feature/ts-cli`. The branch
+   carries PR #669's commits as ancestors; once #669 merges, rebase
+   onto `main` (the rebase is a no-op for the ancestors). Faster to
+   start; requires re-syncing if #669 force-pushes.
+
+**Start conditions** (all must be true on whichever base is chosen):
+
+1. `crates/trusted-server-cli` exists at the branch base — verify
+   with `ls crates/trusted-server-cli/src/`.
 2. The PR #669 `ts dev` subcommand-group refactor (today's leaf
    becomes `ts dev serve`) has been agreed with the #669 reviewers
    — either as part of #669 itself or as a clearly-scoped follow-up
    that does not block #669 from landing.
-3. The chosen `gix` version line resolves against the workspace's
-   transitive dep graph without forcing duplicates (verify with
-   `cargo tree -p gix` after adding the dependency).
+3. The chosen `gix` + `gix-config` version pair resolves against the
+   workspace's transitive dep graph without forcing duplicates
+   (verify with `cargo tree -p gix -p gix-config`).
 
 **Suggested first-implementation order** (front-loads the riskiest
 API assumptions, matches reviewer guidance):
@@ -888,19 +898,34 @@ tree**, the two can disagree. Cases the implementation must handle
 explicitly:
 
 1. **Tracked but absent from the working tree** (`rm file` without
-   `git rm`, or a partial checkout): `std::fs::metadata` returns
+   `git rm`, or a partial checkout): `symlink_metadata` returns
    `NotFound`. Skip with a stderr warning naming the path. Do not
    fail — the user may be mid-task.
-2. **Symlink** (`std::fs::symlink_metadata().file_type().is_symlink()`):
+2. **Symlink** (`symlink_metadata().file_type().is_symlink()`):
    skip with a stderr warning ("symlink not followed"). Rationale:
    following symlinks would (a) potentially escape the repo
    (`/etc/passwd`), (b) double-scan if the target is also tracked,
    and (c) is rarely what a linter wants. If a real use case
-   appears, add `--follow-symlinks` later.
-3. **Broken symlink:** caught by case 1 (`NotFound` on the
-   resolved target).
-4. **Non-regular file** (FIFO, socket, device): skip with a stderr
+   appears, add `--follow-symlinks` later. **Broken symlinks fall
+   into this case** — `symlink_metadata` returns information about
+   the link itself, not the (missing) target, so `is_symlink()` is
+   `true` and the entry is skipped here. (If we used
+   `std::fs::metadata` instead, a broken symlink would yield
+   `NotFound`; we deliberately use `symlink_metadata` to keep
+   symlink detection independent of target reachability.)
+3. **Non-regular file** (FIFO, socket, device): skip with a stderr
    warning. Almost never in a real repo, but defensive.
+4. **Non-UTF-8 path component**: `gix` returns path entries as
+   `BString` (byte strings). On Unix, a byte sequence that is not
+   valid UTF-8 is still a valid path; on Windows, paths must be
+   convertible to UTF-16 and arbitrary bytes are not accepted.
+   For consistency and simplicity, the linter **skips non-UTF-8
+   entries with a stderr warning** on all platforms in v1. The
+   working-tree-content read is therefore safe to perform on a
+   `PathBuf` built from validated UTF-8 only. (A future v2 could
+   add Unix-only lossless handling via
+   `std::os::unix::ffi::OsStringExt::from_vec` if real repos hit
+   this; not expected for trusted-server.)
 5. **Binary file** (`std::fs::read_to_string` returns
    `InvalidData`): skip with a stderr warning. The extension
    filter already excludes most binaries, but a `.json` file with
@@ -918,7 +943,15 @@ fn full_repo_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let mut out = Vec::new();
     for entry in index.entries() {
         let rel_path = entry.path(&index);  // BString
-        let path = work_dir.join(/* lossy utf8 of rel_path */);
+        // Skip non-UTF-8 paths with a warning (see case 4 above).
+        let rel_str = match std::str::from_utf8(rel_path.as_ref()) {
+            Ok(s) => s,
+            Err(_) => {
+                warn_skip_bytes(rel_path.as_ref(), "non-UTF-8 path");
+                continue;
+            }
+        };
+        let path = work_dir.join(rel_str);
         if !path_is_scanned(&rel_path) { continue; }
         // See "Handling tracked-but-missing files and symlinks" above.
         let meta = match std::fs::symlink_metadata(&path) {
@@ -1095,10 +1128,12 @@ pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
         .attach_printable("re-run with --force to overwrite (existing hook is backed up)"));
     }
     if hook_path.exists() && force {
-        let backup = hook_path.with_extension(format!(
-            "bak.{}",
-            chrono::Utc::now().timestamp()
-        ));
+        // Backup timestamp via std::time, no chrono dependency needed.
+        let ts_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = hook_path.with_extension(format!("bak.{ts_secs}"));
         std::fs::rename(&hook_path, &backup)
             .change_context(InstallHooksError::WriteHook)?;
     }
