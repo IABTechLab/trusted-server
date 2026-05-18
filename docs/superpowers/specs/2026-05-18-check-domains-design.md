@@ -30,6 +30,58 @@ This design **depends on PR #669** (`Add the Trusted Server CLI`, branch
 command-surface conventions this design extends. None of the work in this
 spec begins until #669 is on `main`.
 
+## Implementation Readiness
+
+**Status today: not ready to start in this checkout.** `main` has no
+`crates/trusted-server-cli` directory, no `ts` binary, no
+`cargo install_cli` alias, and no host-target CI lane. Starting the
+linter now would force the implementer to reinvent or duplicate
+PR #669's surface, which is exactly the coupling the prerequisite
+section above warns against.
+
+**Start conditions** (all must be true):
+
+1. PR #669 is merged to `main`, and the `crates/trusted-server-cli`
+   crate is present at the head of `main`.
+2. The PR #669 `ts dev` subcommand-group refactor (today's leaf
+   becomes `ts dev serve`) has been agreed with the #669 reviewers
+   — either as part of #669 itself or as a clearly-scoped follow-up
+   that does not block #669 from landing.
+3. The chosen `gix` version line resolves against the workspace's
+   transitive dep graph without forcing duplicates (verify with
+   `cargo tree -p gix` after adding the dependency).
+
+**Suggested first-implementation order** (front-loads the riskiest
+API assumptions, matches reviewer guidance):
+
+1. **Spike — gix feasibility.** In a throwaway branch off `main`
+   (post-#669), pin `gix` and `gix-config`, write three integration
+   tests that drive the conceptual operations end-to-end against a
+   `tempfile`-built repo: (a) staged blob diff with new-side line
+   numbers; (b) merge-base + tree-vs-tree blob diff; (c) durable
+   `core.hooksPath` write via `gix-config::File`. The spike's
+   acceptance gate is "these three tests pass deterministically."
+   Pin the concrete `gix` entry points used here, then update
+   Open Question 5 in this spec to reflect the chosen names.
+2. **URL extraction + allowlist + suppression.** Pure-function
+   layer, fully unit-testable without `gix`. Implement against the
+   regex / allowlist / marker grammar in this spec; cover every
+   test case enumerated in [Testing Strategy](#testing-strategy)
+   that does not require git.
+3. **CLI wiring.** Add the `Commands::Dev` subcommand-group
+   skeleton (preserving the existing `serve` subcommand wholesale),
+   then add `dev lint domains` dispatching to the function from
+   step 2 plus the diff collectors from step 1.
+4. **`dev install-hooks`.** Wires steps 1 and 2 together for the
+   config write + hook file write + shell-escape path.
+5. **End-to-end `assert_cmd` tests** matching `Testing Strategy`.
+6. **Stage 1 doc cleanup** (separate PR series — see
+   [Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan)).
+
+If start conditions aren't satisfied when this design is up for
+implementation, the answer is "wait for #669," not "build a parallel
+CLI surface."
+
 ## Non-Goals
 
 - No CI gate in v1. The pre-commit hook is the only enforcement mechanism.
@@ -345,14 +397,31 @@ files contain are handled by an explicit
 [`REFERENCE_HOSTS`](#reference-hosts-exact-match-allowed-in-every-scanned-file)
 list (see Allowlist below) rather than by excluding the file type.
 
-**Fenced code blocks are scanned, not skipped.** The repo's docs and
-spec files include config snippets and `curl`/shell examples, which
-are exactly the places an accidental real host can land. The linter
-treats fenced blocks like any other content; if a snippet must
-reference a disallowed host (e.g., a CVE write-up using a real
-attacker domain), use the per-line suppression marker — the HTML
-comment form `<!-- allow-domain: <host> -->` works inside Markdown
-including inside fenced blocks.
+**Fenced code blocks are scanned, not skipped.** The repo's docs
+and spec files include config snippets and `curl`/shell examples,
+which are exactly the places an accidental real host can land. The
+linter treats fenced blocks like any other content.
+
+**Suppression inside fenced blocks: use the language's native
+comment syntax, not HTML comments.** A line like
+`<!-- allow-domain: foo -->` inside a ```` ```bash ```` fence is
+displayed to readers as a literal HTML comment in their shell
+example — confusing and misleading. The linter's marker regex
+accepts several comment introducers; pick the one that matches the
+fenced block's language:
+
+| Fence language       | Use this marker form                |
+| -------------------- | ----------------------------------- |
+| `bash`, `sh`, `toml` | `# allow-domain: <host>`            |
+| `rust`, `ts`, `js`   | `// allow-domain: <host>`           |
+| HTML (or no fence)   | `<!-- allow-domain: <host> -->`     |
+
+**Strongly prefer rewriting the example to a reserved host instead
+of suppressing** — see [Stage 1 Doc Cleanup
+Plan](#stage-1-doc-cleanup-plan). Per-line suppression is for true
+one-offs (security write-ups citing a real CVE host, etc.). HTML
+comments are reserved for **prose** Markdown contexts outside
+fenced code blocks.
 
 ### Always excluded (paths)
 
@@ -471,21 +540,28 @@ gix = { version = "0.66", default-features = false, features = [
     "index",       # read the git index for staged-vs-HEAD diffs
     "revision",    # merge-base computation (gix-revision)
 ] }
+gix-config = "0.40"   # direct File-level read/write of <repo>/.git/config
+                      # for ts dev install-hooks (see "Persisting
+                      # core.hooksPath" below)
 regex = "1"
 ```
 
 Notes:
 
-- `config` reading and writing is part of `gix`'s default surface
-  exposed via `Repository::config_snapshot` / `_mut` and does not
-  require an explicit feature flag in this gix version line.
+- `gix-config` is pulled in **explicitly** for the durable
+  `<repo>/.git/config` write performed by `ts dev install-hooks`.
+  `gix::Repository::config_snapshot_mut()` only modifies an
+  in-memory snapshot and is not the persistence path; the hook
+  installer therefore uses `gix-config::File` directly. Do not
+  rely on `config_snapshot/_mut` for persistence.
 - No networking, credential helpers, or worktree mutation features
   are enabled — the linter only reads from the local repo and does
   one targeted config write in `ts dev install-hooks`.
 - The exact feature names match the `gix` crate's documented features
   (`blob-diff`, `index`, `revision` — see docs.rs/gix). If a feature
-  has been renamed in the version pinned at implementation time, the
-  closest documented equivalent is used.
+  has been renamed or split in the version pinned at implementation
+  time, the closest documented equivalent is used and the change is
+  flagged in the implementation PR.
 
 ### URL extraction (without lookahead)
 
@@ -696,11 +772,7 @@ merge-base tree:
 fn changed_vs_added_lines(reference: &str) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
     let head_id = repo.head_id().change_context(DomainsLintError::OpenRepo)?;
-    let base_id = repo
-        .find_reference(reference)
-        .change_context_lazy(|| DomainsLintError::Reference(reference.into()))?
-        .into_fully_peeled_id()
-        .change_context_lazy(|| DomainsLintError::Reference(reference.into()))?;
+    let base_id = resolve_base_ref(&repo, reference)?;
     let merge_base = repo
         .merge_base(base_id, head_id)
         .change_context_lazy(|| DomainsLintError::MergeBase { base: reference.into() })?;
@@ -715,14 +787,39 @@ fn changed_vs_added_lines(reference: &str) -> Result<Vec<DiffLine>, Report<Domai
 }
 ```
 
+#### Base-ref resolution order
+
+In CI, `$GITHUB_BASE_REF` is typically a bare branch name like
+`main`. On a freshly-cloned PR working tree, `main` often **does
+not exist as a local ref** — only `origin/main` (a remote-tracking
+ref) does. A naive `repo.find_reference("main")` would fail.
+
+`resolve_base_ref(repo, reference)` tries the following candidates
+in order and returns the first one that resolves to an object id:
+
+1. `<reference>` exactly (works when the caller passes e.g.
+   `refs/remotes/origin/main` directly).
+2. `refs/heads/<reference>` (local branch).
+3. `refs/remotes/origin/<reference>` (remote-tracking branch — the
+   common CI case where `<reference> == "main"`).
+4. `refs/tags/<reference>` (tag — covers release-gate use).
+
+If none resolve, the linter exits **2** with a message naming all
+four candidates that were tried, so the CI failure mode is
+diagnosable from log output alone.
+
 **CI requirements (documented when Stage 2 lands):**
 
-- `actions/checkout@v4` with `fetch-depth: 0` so that the base
-  ref is locally reachable from the working clone. Without it,
-  `find_reference` or `merge_base` returns an error and the linter
-  exits 2 with a clear message.
-- For fork PRs, the base ref must be fetched (`fetch-depth: 0` covers
-  this in `actions/checkout@v4`).
+- `actions/checkout@v4` with `fetch-depth: 0` so the base ref and
+  the full PR-branch history are reachable. Without it, `gix`
+  cannot compute a merge-base on a shallow clone and the linter
+  exits 2.
+- Pass the base ref as a bare branch name (`main`) — the
+  resolution order above handles the `origin/<ref>` lookup. Callers
+  may also pass `origin/main` or `refs/remotes/origin/main`
+  directly if they prefer to be explicit.
+- For fork PRs, the base ref must still be present in the local
+  clone. `actions/checkout@v4 fetch-depth: 0` covers this.
 - **No `git` binary required on the runner.** `gix` reads the
   on-disk repo directly.
 
@@ -749,6 +846,34 @@ appears.
 Untracked files are intentionally skipped — they cannot land in a
 commit, and scanning them would falsely flag scratch/tmp files.
 
+#### Handling tracked-but-missing files and symlinks
+
+Because we enumerate the **index** and then read the **working
+tree**, the two can disagree. Cases the implementation must handle
+explicitly:
+
+1. **Tracked but absent from the working tree** (`rm file` without
+   `git rm`, or a partial checkout): `std::fs::metadata` returns
+   `NotFound`. Skip with a stderr warning naming the path. Do not
+   fail — the user may be mid-task.
+2. **Symlink** (`std::fs::symlink_metadata().file_type().is_symlink()`):
+   skip with a stderr warning ("symlink not followed"). Rationale:
+   following symlinks would (a) potentially escape the repo
+   (`/etc/passwd`), (b) double-scan if the target is also tracked,
+   and (c) is rarely what a linter wants. If a real use case
+   appears, add `--follow-symlinks` later.
+3. **Broken symlink:** caught by case 1 (`NotFound` on the
+   resolved target).
+4. **Non-regular file** (FIFO, socket, device): skip with a stderr
+   warning. Almost never in a real repo, but defensive.
+5. **Binary file** (`std::fs::read_to_string` returns
+   `InvalidData`): skip with a stderr warning. The extension
+   filter already excludes most binaries, but a `.json` file with
+   embedded NULs (rare) would hit this.
+
+All five cases are warnings, not errors — the audit continues to
+the next entry. Exit code reflects only the violation count.
+
 ```rust
 fn full_repo_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
@@ -760,8 +885,35 @@ fn full_repo_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
         let rel_path = entry.path(&index);  // BString
         let path = work_dir.join(/* lossy utf8 of rel_path */);
         if !path_is_scanned(&rel_path) { continue; }
-        let content = std::fs::read_to_string(&path)
-            .change_context_lazy(|| DomainsLintError::ReadFile(path.clone()))?;
+        // See "Handling tracked-but-missing files and symlinks" above.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn_skip(&path, "tracked but missing from working tree");
+                continue;
+            }
+            Err(e) => {
+                warn_skip(&path, &format!("metadata error: {e}"));
+                continue;
+            }
+        };
+        if meta.file_type().is_symlink() {
+            warn_skip(&path, "symlink not followed");
+            continue;
+        }
+        if !meta.file_type().is_file() {
+            warn_skip(&path, "non-regular file");
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn_skip(&path, "binary content");
+                continue;
+            }
+            Err(e) => return Err(Report::new(DomainsLintError::ReadFile(path.clone()))
+                .attach_printable(e.to_string())),
+        };
         for (i, line) in content.lines().enumerate() {
             out.push(DiffLine {
                 path: rel_path.into(),
@@ -1346,45 +1498,37 @@ until Stages 1 and 2 are stable.
 2. **`cdn.prebid.org` on allowlist vs converting `prebid.rs` tests to
    `.example`?** Current pick: allowlist. Revisit if rigorous
    separation is preferred.
-3. **Reference-doc hosts and subdomains.** `github.com` is exact-only,
-   meaning `docs.github.com` (sometimes appears in `.github/workflows`)
-   would have to be added explicitly. Currently not added; line-level
-   suppression covers occasional uses.
-4. **Stage 1 cleanup expectations.** Do we ship with existing
+3. **Stage 1 cleanup expectations.** Do we ship with existing
    violations intact and clean them incrementally as files are
    touched, or open a follow-up cleanup PR? Current pick: ship
-   without cleanup; cleanup is a separate workstream.
-5. **Boilerplate `package.json` URLs.** `crates/integration-tests/fixtures/frameworks/nextjs/`
-   contains `opencollective.com`, `tidelift.com`, `registry.npmjs.org`.
-   Allowlist them, suppress per-line, or rewrite to `.example`?
-   Current pick: suppress per-line since these are non-recurring
-   boilerplate.
-6. **Suppression marker syntax** — `allow-domain: host` vs
+   without cleanup; cleanup is a separate workstream tracked in
+   [Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan).
+4. **Suppression marker syntax** — `allow-domain: host` vs
    `// allowed-domain: host` vs other forms. Current pick:
    `allow-domain: host`, comment-anchored, host-validated.
-7. **Exact `gix` API entry points for index-vs-tree and tree-vs-tree
+5. **Exact `gix` API entry points for index-vs-tree and tree-vs-tree
    diff walking.** Marked as prototype-required in the implementation
    section; pinned during first implementation pass against the
    selected `gix` version. Spec commits to the conceptual operations,
    not the concrete function names.
-8. **`gix` version pin.** The spec uses `0.66` as an example; the
+6. **`gix` version pin.** The spec uses `0.66` as an example; the
    actual pin happens at implementation time with the `gix` version
    current at that point. Workspace consistency (matching any
    `gix` already pulled in transitively by other dependencies) takes
    precedence.
-9. **`ts dev install-hooks` clobber detection signature.** The
+7. **`ts dev install-hooks` clobber detection signature.** The
    `# ts-install-hooks: managed` marker on a known line is the
    detection heuristic. If a contributor wants a custom multi-hook
    chain, they keep their existing hook (we refuse to overwrite
    without `--force`), and they must add an `exec ts dev lint domains
    --staged` line manually. We could add a `--append-to-existing`
    mode later if demand surfaces.
-10. **`--force-scan` escape hatch for explicit paths.** Current pick:
-    explicit paths honour the extension filter (skipped + warning if
-    extension is excluded). If real workflows need to scan a one-off
-    `.html` file, add `--force-scan` later.
-11. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
-    currently reads working-tree content. If a stable, commit-state
-    audit is needed later (e.g., a release gate at a tag), add an
-    `--at <rev>` mode that scans blob content from that revision's
-    tree. Deferred until real demand appears.
+8. **`--force-scan` escape hatch for explicit paths.** Current pick:
+   explicit paths honour the extension filter (skipped + warning if
+   extension is excluded). If real workflows need to scan a one-off
+   `.html` file, add `--force-scan` later.
+9. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
+   currently reads working-tree content. If a stable, commit-state
+   audit is needed later (e.g., a release gate at a tag), add an
+   `--at <rev>` mode that scans blob content from that revision's
+   tree. Deferred until real demand appears.
