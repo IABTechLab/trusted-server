@@ -53,10 +53,11 @@ includes #669.
 
 1. `crates/trusted-server-cli` exists at the branch base — verify
    with `ls crates/trusted-server-cli/src/`.
-2. The PR #669 `ts dev` subcommand-group refactor (today's leaf
-   becomes `ts dev serve`) has been agreed with the #669 reviewers
-   — either as part of #669 itself or as a clearly-scoped follow-up
-   that does not block #669 from landing.
+2. This PR owns the `ts dev` subcommand-group refactor: today's
+   `ts dev` leaf becomes `ts dev serve`, and the same PR adds
+   `ts dev lint domains` and `ts dev install-hooks`. Do not defer
+   this refactor to a later cleanup PR — without it, the command
+   surface described here does not exist.
 3. The chosen `gix` + `gix-config` version pair resolves against the
    workspace's transitive dep graph without forcing duplicates
    (verify with `cargo tree -p gix -p gix-config`).
@@ -64,14 +65,16 @@ includes #669.
 **Suggested first-implementation order** (front-loads the riskiest
 API assumptions, matches reviewer guidance):
 
-1. **Spike — gix feasibility.** In a throwaway branch off `main`
-   (post-#669), pin a matched `gix` + `gix-config` release-family
-   pair (verify via `cargo tree -p gix -p gix-config` that no
-   duplicate versions land in the lock file), then write three
-   integration tests that drive the conceptual operations end-to-end
-   against a `tempfile`-built repo: (a) staged blob diff with
-   new-side line numbers; (b) merge-base + tree-vs-tree blob diff;
-   (c) durable `core.hooksPath` write via `gix-config::File`.
+1. **Spike — gix feasibility.** In a throwaway branch off the chosen
+   #669-containing base (either `main` after #669 merges or the
+   stacked `feature/ts-cli` base), pin a matched `gix` +
+   `gix-config` release-family pair (verify via
+   `cargo tree -p gix -p gix-config` that no duplicate versions land
+   in the lock file), then write three integration tests that drive
+   the conceptual operations end-to-end against a `tempfile`-built
+   repo: (a) staged blob diff with new-side line numbers; (b)
+   merge-base + tree-vs-tree blob diff; (c) durable `core.hooksPath`
+   write via `gix-config::File`.
 
    **Spike acceptance gate** — all of the following:
    - The three tests pass deterministically on a clean run.
@@ -194,10 +197,9 @@ crates/trusted-server-cli/src/
   dev/
     mod.rs                        # Dev subcommand enum + dispatch.
                                   # Includes the existing dev-server
-                                  # behavior as `ts dev serve` (or
-                                  # the equivalent name chosen during
-                                  # the refactor) so the PR #669
-                                  # functionality is preserved.
+                                  # behavior as `ts dev serve` so
+                                  # the PR #669 functionality is
+                                  # preserved under the new group.
     serve.rs                      # the existing dev.rs body moved
                                   # under `ts dev serve`
     install_hooks.rs              # `ts dev install-hooks`
@@ -213,11 +215,10 @@ Existing code touched:
   (subcommands: `Serve`, `Lint(LintCommand)`, `InstallHooks(...)`).
 - `crates/trusted-server-cli/src/dev.rs` → split into the directory
   above. The existing dev-server function moves into `dev/serve.rs`
-  with its public API unchanged. **This is a CLI-surface change to
-  PR #669**: today's `ts dev` becomes `ts dev serve` (or whatever
-  subcommand name is chosen during the refactor). Since #669 has not
-  merged, this can be coordinated as part of the same review cycle
-  rather than as a follow-up that breaks released behavior.
+  with its public API unchanged. **This PR must make the CLI-surface
+  change**: today's `ts dev` becomes `ts dev serve`. This is not a
+  follow-up task; `ts dev lint domains` and `ts dev install-hooks`
+  cannot be added cleanly while `ts dev` remains a leaf command.
 - `crates/trusted-server-cli/src/error.rs` — add `LintError` and
   `InstallHooksError` variants if needed for typed propagation,
   otherwise reuse the crate's existing `Report<CliError>` plumbing.
@@ -1447,16 +1448,19 @@ and the index with `gix` APIs (no shell), runs the binary with
   `cookie_domain = "test-publisher.com"` are out of scope.
 - **HTML/CSS/Dockerfile blind spot.** Accepted; not mitigated by other
   code paths.
-- **Non-UTF-8 filenames** are lossy-converted for display and emit a
-  stderr warning. `gix` preserves them as `BString` internally so
-  scanning works correctly; only the printed `path:line` output is
-  affected.
+- **Non-UTF-8 filenames** are skipped in full-repo / explicit-path
+  working-tree reads with a stderr warning. `gix` preserves diff paths
+  as `BString` internally, but v1 intentionally avoids platform-specific
+  lossless path reconstruction from arbitrary bytes.
 - **Back-to-back protocol-relative URLs without a separator**
   (`//a.com//b.com`) miss the second host. No real-world occurrence in
   this repo.
-- **PR #669 hard prerequisite.** This work cannot start until #669
-  merges. If #669 stalls, this design needs revisiting (alternative:
-  ship as a standalone `trusted-server-lint` crate).
+- **PR #669 hard prerequisite.** This work requires a base that already
+  contains #669's CLI crate and host-target CI lane. The implementation
+  may either wait for #669 to merge to `main` or stack on PR #669's
+  branch; if #669 stalls without a stackable branch, this design needs
+  revisiting (alternative: ship as a standalone `trusted-server-lint`
+  crate).
 - **New top-level dependency: `gix`.** Pulls in ~15 sub-crates
   (gix-diff, gix-revision, gix-index, gix-config, etc.). Adds
   meaningful compile time to the host-target CLI build. Mitigation:
@@ -1559,16 +1563,15 @@ here as historical context with the rationale, so future readers can
 see *why* each decision went the way it did rather than re-opening
 the question.
 
-1. **Subcommand naming.** `ts dev lint domains` and
+1. **Subcommand naming and ownership.** `ts dev lint domains` and
    `ts dev install-hooks`. Both `lint` and `install-hooks` are
    developer-workflow commands and belong under `dev`, not on the
    operator-facing top level (`config`, `auth`, `audit`,
-   `provision`). This requires refactoring the existing PR #669
-   `ts dev` (single-file leaf that starts the dev server) into a
-   subcommand group, with `ts dev serve` for the existing behavior.
-   The earlier review's suggestion to keep `ts lint domains`
-   top-level was explicitly rejected by the spec owner — `dev`
-   parent is the chosen shape.
+   `provision`). This PR owns the required refactor of the existing
+   PR #669 `ts dev` leaf into a subcommand group, with `ts dev serve`
+   for the existing behavior. The earlier review's suggestion to keep
+   `ts lint domains` top-level was explicitly rejected by the spec
+   owner — `dev` parent is the chosen shape.
 2. **`cdn.prebid.org` on the integration allowlist** (rather than
    rewriting the `prebid.rs` test code to `.example`). The tests
    verify rewriting of real-world Prebid CDN URLs; converting them
