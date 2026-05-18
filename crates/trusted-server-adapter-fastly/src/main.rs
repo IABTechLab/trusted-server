@@ -52,23 +52,23 @@ const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opport
 /// authoring mistake; this fallback exists so a CI-bypassed binary patch or a
 /// future schema change can't take the entire fleet down with a per-request
 /// panic.
-static SLOTS_FILE:
-    std::sync::LazyLock<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile> =
-    std::sync::LazyLock::new(|| {
-        match toml::from_str::<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile>(
-            CREATIVE_OPPORTUNITIES_TOML,
-        ) {
-            Ok(file) => file,
-            Err(err) => {
-                log::error!(
-                    "creative-opportunities.toml failed to parse at startup; \
+static SLOTS_FILE: std::sync::LazyLock<
+    trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
+> = std::sync::LazyLock::new(|| {
+    match toml::from_str::<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile>(
+        CREATIVE_OPPORTUNITIES_TOML,
+    ) {
+        Ok(file) => file,
+        Err(err) => {
+            log::error!(
+                "creative-opportunities.toml failed to parse at startup; \
                      falling back to an empty slots file (server-side ad-slot \
                      templates disabled): {err}"
-                );
-                trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default()
-            }
+            );
+            trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default()
         }
-    });
+    }
+});
 
 /// Entry point for the Fastly Compute program.
 ///

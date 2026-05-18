@@ -1150,7 +1150,8 @@ pub async fn handle_publisher_request(
             // Unlike the Stream path, the body is fully buffered first — collect auction
             // now so bids are available when the </body> handler fires.
             if let Some(dispatched) = dispatched_auction {
-                let placeholder = fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
+                let placeholder =
+                    fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                 let result = orchestrator
                     .collect_dispatched_auction(
                         dispatched,
@@ -1515,48 +1516,45 @@ pub async fn handle_page_bids(
         );
     }
 
-    let winning_bids = if !matched_slots.is_empty()
-        && consent_allows_auction
-        && !is_bot
-        && !is_prefetch
-    {
-        let slots_ctx = MatchedSlotsContext {
-            matched_slots: &matched_slots,
-            request_path: &path_param,
-            co_config,
-        };
-        let mut auction_request = build_auction_request(
-            &slots_ctx,
-            &ec_id,
-            &consent_context,
-            &request_info,
-            req.get_header_str("user-agent"),
-        );
-        auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
-        let timeout_ms = co_config
-            .auction_timeout_ms
-            .unwrap_or(settings.auction.timeout_ms);
-        let auction_context = AuctionContext {
-            settings,
-            request: &req,
-            client_info: services.client_info(),
-            timeout_ms,
-            provider_responses: None,
-            services,
-        };
-        match orchestrator
-            .run_auction(&auction_request, &auction_context, services)
-            .await
-        {
-            Ok(result) => result.winning_bids,
-            Err(e) => {
-                log::warn!("page-bids auction failed: {e:?}");
-                std::collections::HashMap::new()
+    let winning_bids =
+        if !matched_slots.is_empty() && consent_allows_auction && !is_bot && !is_prefetch {
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &matched_slots,
+                request_path: &path_param,
+                co_config,
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                &ec_id,
+                &consent_context,
+                &request_info,
+                req.get_header_str("user-agent"),
+            );
+            auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
+            let timeout_ms = co_config
+                .auction_timeout_ms
+                .unwrap_or(settings.auction.timeout_ms);
+            let auction_context = AuctionContext {
+                settings,
+                request: &req,
+                client_info: services.client_info(),
+                timeout_ms,
+                provider_responses: None,
+                services,
+            };
+            match orchestrator
+                .run_auction(&auction_request, &auction_context, services)
+                .await
+            {
+                Ok(result) => result.winning_bids,
+                Err(e) => {
+                    log::warn!("page-bids auction failed: {e:?}");
+                    std::collections::HashMap::new()
+                }
             }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let bid_map = build_bid_map(&winning_bids, co_config.price_granularity);
 
