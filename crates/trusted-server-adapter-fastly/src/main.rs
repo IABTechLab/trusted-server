@@ -42,6 +42,34 @@ use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore}
 
 const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opportunities.toml");
 
+/// Parses the embedded `creative-opportunities.toml` at most once per Wasm
+/// instance.
+///
+/// On parse failure, logs an error and falls back to an empty
+/// [`CreativeOpportunitiesFile`] — i.e. the documented "feature disabled"
+/// state — instead of panicking the request hot path. The build-time
+/// validator in `crates/trusted-server-core/build.rs` catches every realistic
+/// authoring mistake; this fallback exists so a CI-bypassed binary patch or a
+/// future schema change can't take the entire fleet down with a per-request
+/// panic.
+static SLOTS_FILE:
+    std::sync::LazyLock<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile> =
+    std::sync::LazyLock::new(|| {
+        match toml::from_str::<trusted_server_core::creative_opportunities::CreativeOpportunitiesFile>(
+            CREATIVE_OPPORTUNITIES_TOML,
+        ) {
+            Ok(file) => file,
+            Err(err) => {
+                log::error!(
+                    "creative-opportunities.toml failed to parse at startup; \
+                     falling back to an empty slots file (server-side ad-slot \
+                     templates disabled): {err}"
+                );
+                trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default()
+            }
+        }
+    });
+
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `Request::from_client()` instead of
@@ -94,9 +122,7 @@ fn main() {
         }
     };
 
-    let slots_file: trusted_server_core::creative_opportunities::CreativeOpportunitiesFile =
-        toml::from_str(CREATIVE_OPPORTUNITIES_TOML)
-            .expect("should parse creative-opportunities.toml");
+    let slots_file = &*SLOTS_FILE;
 
     let integration_registry = match IntegrationRegistry::new(&settings) {
         Ok(r) => r,
@@ -121,7 +147,7 @@ fn main() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
-        &slots_file,
+        slots_file,
         req,
     )) {
         response.send_to_client();

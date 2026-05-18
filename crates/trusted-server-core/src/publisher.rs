@@ -1465,14 +1465,39 @@ pub async fn handle_page_bids(
             .as_ref()
             .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
+    // Same bot / prefetch guards the publisher path uses — without them this
+    // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
+    // navigations and known crawler UA scans, burning partner request quota.
+    let is_prefetch = req
+        .get_header_str("sec-purpose")
+        .is_some_and(|v| v.contains("prefetch"))
+        || req
+            .get_header_str("purpose")
+            .is_some_and(|v| v.contains("prefetch"));
+    let user_agent = req.get_header_str("user-agent").unwrap_or("");
+    let is_bot = ["Googlebot", "Bingbot", "AhrefsBot", "SemrushBot", "DotBot"]
+        .iter()
+        .any(|bot| user_agent.contains(bot));
+
     if matched_slots.is_empty() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction",
             path_param
         );
+    } else if is_bot || is_prefetch {
+        log::debug!(
+            "page-bids: skipping auction for path '{}' (is_bot={}, is_prefetch={})",
+            path_param,
+            is_bot,
+            is_prefetch
+        );
     }
 
-    let winning_bids = if !matched_slots.is_empty() && consent_allows_auction {
+    let winning_bids = if !matched_slots.is_empty()
+        && consent_allows_auction
+        && !is_bot
+        && !is_prefetch
+    {
         let mut auction_request = build_auction_request(
             &matched_slots,
             &ec_id,
@@ -2770,6 +2795,79 @@ mod tests {
                     .len(),
                 0,
                 "empty slots file should produce zero bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn bot_user_agent_returns_slots_but_no_bids() {
+            // Crawlers should get slot definitions (so HTML structure is unchanged)
+            // but the server must not burn SSP request quota running a real auction
+            // for them. Same gate the publisher path applies.
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let slots_file = file_with_article_slot();
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
+
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+                .await
+                .expect("should return ok response");
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                1,
+                "bot request should still get slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "bot request must not run an auction (no SSP cost burned for crawlers)"
+            );
+        }
+
+        #[tokio::test]
+        async fn prefetch_request_returns_slots_but_no_bids() {
+            // Navigations triggered by Sec-Purpose=prefetch should not fire real
+            // SSP auctions — the user has not yet visited the page.
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let services = noop_services();
+            let slots_file = file_with_article_slot();
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.set_header("sec-purpose", "prefetch");
+
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+                .await
+                .expect("should return ok response");
+
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                1,
+                "prefetch request should still get slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "prefetch request must not run an auction"
             );
         }
 
