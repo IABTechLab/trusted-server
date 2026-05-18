@@ -183,11 +183,14 @@ indistinguishable.
    repo, missing base ref, no working tree, gix-config write fails,
    filesystem permission errors at install-hooks time) as
    `CliError::EnvironmentError`.
-3. The lint module wraps violation reporting as `Ok(())` — violations
-   are an *expected outcome*, not an error. To trigger exit code `1`
-   for violations, the module returns a sentinel
-   `CliError::ViolationsFound { count }` variant (zero-cost — the
-   error body just carries the count for the error message).
+3. When the scan finds violations, the lint module **returns
+   `Err(CliError::ViolationsFound { count })`**. This is a
+   semantically-meaningful "error" — it carries the violation count
+   for the message and surfaces through the same `run()` dispatch
+   that maps `CliError::Cancelled` to exit 130. Pick one model: in
+   this spec, violations propagate as `Err`, not `Ok(())`. The
+   match arm in step 4 is what distinguishes a "violations found"
+   exit from an environment-error exit.
 4. `lib.rs::run()` pattern-matches:
 
    ```rust
@@ -636,6 +639,12 @@ Notes:
   `cargo tree -p gix -p gix-config` that no duplicate versions
   appear, and **updates this dependency table** with the pinned
   numbers as part of step 1's deliverable.
+- **Release blocker.** This spec is not implementation-complete
+  until the `<pin-during-spike>` / `<must-match-the-gix-release-family>`
+  placeholders above are replaced with concrete pinned versions by
+  the spike PR. The Implementation Readiness section's spike step
+  is the only acceptable mechanism for replacing them; downstream
+  PRs should not invent their own pins.
 - `gix-config` is pulled in **explicitly** for the durable
   `<repo>/.git/config` write performed by `ts dev install-hooks`.
   `gix::Repository::config_snapshot_mut()` only modifies an
@@ -1043,10 +1052,9 @@ Each path the user named is processed individually. Two layered
 behaviors that differ from full-repo mode:
 
 **Policy filters (extension, path-exclusion, symlink, non-regular,
-binary, non-UTF-8) behave the same as full-repo: warn and skip.**
-The reason is consistency — a file that would not be scanned in the
-full-repo audit must not be scanned when named explicitly either.
-Specifically:
+binary) behave the same as full-repo: warn and skip.** The reason
+is consistency — a file that would not be scanned in the full-repo
+audit must not be scanned when named explicitly either. Specifically:
 
 - Path matches an always-excluded location (`node_modules/`,
   `.worktrees/`, lockfile basename, etc.): warn and skip.
@@ -1054,9 +1062,21 @@ Specifically:
   warn and skip with `note: <path> is not in scanned extensions;
   skipping`. The deferred `--force-scan path/...` escape hatch
   remains an Open Question.
-- Symlink, non-regular file, non-UTF-8 path component, binary
-  content (`InvalidData`): warn and skip per the
+- Symlink, non-regular file, binary content (`InvalidData`):
+  warn and skip per the
   [full-repo handling table](#handling-tracked-but-missing-files-and-symlinks).
+
+**Note on non-UTF-8 paths.** The non-UTF-8 handling described in
+the full-repo section applies to **git/index-derived `BString`
+paths** (full-repo, `--staged`, `--changed-vs` modes), where the
+linter has to convert bytes back into an OS path. Explicit-path
+mode receives an OS-supplied `PathBuf` from clap (which on Unix is
+an `OsString` byte sequence that may not be UTF-8 but is already a
+valid OS path) and passes it directly to the filesystem APIs — no
+conversion step, no detection step. If the user explicitly named a
+path that the OS accepts, the linter reads it; the non-UTF-8
+classification is best-effort only and primarily applies to paths
+the linter discovered via git.
 
 **Access failures on a user-named path are hard errors, not
 warnings.** Differing from full-repo here is intentional: if the
@@ -1179,25 +1199,51 @@ This is a small Rust subcommand on the `ts` CLI that:
 1. Opens the repo via `gix::open(".")`.
 2. Resolves the absolute path of the current `ts` executable via
    `std::env::current_exe()`.
-3. **Checks for an existing `.githooks/pre-commit`:**
+3. **Preflight: read the existing local `core.hooksPath`** (via
+   `gix-config::File`):
+   - **Unset, empty, or already `.githooks`:** proceed. Idempotent
+     re-run on an existing installation is a no-op for this check.
+   - **Set to a different path** (`hooks`, `.husky`, `.cargo-husky`,
+     anything else): **refuse unless `--force`**. The user likely
+     has another hook chain (husky, cargo-husky, lefthook, a
+     hand-rolled `hooks/` directory). Silently rewriting their
+     `core.hooksPath` would disable that chain. Message:
+     ```
+     ts dev install-hooks: refusing to override existing core.hooksPath
+       current: hooks
+       would set: .githooks
+     This would disable your existing hook chain. Choose one of:
+       1. Re-run with --force (your existing core.hooksPath value is
+          printed above; you can restore it later with
+          `git config --local core.hooksPath hooks`).
+       2. Manually add `exec <path-to-ts> dev lint domains --staged`
+          to your existing pre-commit hook chain. The absolute path
+          for this binary is: <ts_path>
+     ```
+     Exit code: 2 (environment error per the exit-code contract —
+     this is a configuration conflict, not a violation).
+4. **Checks for an existing `.githooks/pre-commit`:**
    - **Absent:** writes the file fresh.
-   - **Present, and the first three lines match the documented
-     header signature** (e.g., the `# Installed by `ts dev install-hooks`
-     marker on a known line): overwrites silently. This is the
+   - **Present, and contains the `# ts-install-hooks: managed`
+     marker on a known line:** overwrites silently. This is the
      managed-file case.
-   - **Present, but content does not match the managed signature:**
+   - **Present, but content does not match the managed marker:**
      refuses to overwrite. Prints the path of the existing hook,
      suggests `--force` to overwrite or merging the contents
      manually. Exits non-zero. Rationale: the user may have
      hand-edited a custom hook (lint chain, secret scan, etc.); we
      never silently clobber.
-4. With `--force`, the existing hook is renamed to
-   `.githooks/pre-commit.bak.<timestamp>` and a fresh hook written.
-5. Sets the executable bit via `std::fs::Permissions` /
+5. With `--force`, the existing hook (if any) is renamed to
+   `.githooks/pre-commit.bak.<timestamp>` before writing fresh, and
+   the existing `core.hooksPath` value (if it pointed elsewhere) is
+   printed in the success message so the user can restore it later.
+6. Sets the executable bit via `std::fs::Permissions` /
    `set_permissions` (Unix `0o755`).
-6. Sets `core.hooksPath = .githooks` in the local repo config via
-   `gix`'s config-writing API (no subprocess).
-7. Prints a confirmation message including the embedded binary path.
+7. Sets `core.hooksPath = .githooks` in the local repo config via
+   the `gix-config::File` write path described under "Persisting
+   `core.hooksPath`" below (no subprocess).
+8. Prints a confirmation message including the embedded binary path
+   and (under `--force`) any displaced previous `core.hooksPath`.
 
 Pseudocode (managed-file overwrite policy elided for brevity; see
 above):
@@ -1210,6 +1256,22 @@ pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
         .ok_or_else(|| Report::new(InstallHooksError::NoWorkdir))?;
     let ts_path = std::env::current_exe()
         .change_context(InstallHooksError::CurrentExe)?;
+
+    // Preflight: refuse to clobber a foreign core.hooksPath.
+    let existing_hooks_path = read_local_config_value(
+        &repo, "core", None, "hooksPath",
+    )?;
+    let displaced_hooks_path = match existing_hooks_path.as_deref() {
+        None | Some("") | Some(".githooks") => None,   // safe to proceed
+        Some(other) if !force => {
+            return Err(Report::new(InstallHooksError::ForeignHooksPath {
+                current: other.to_string(),
+                proposed: ".githooks".to_string(),
+            })
+            .attach_printable("re-run with --force to override; existing value will be printed for manual restoration"));
+        }
+        Some(other) => Some(other.to_string()),        // --force; remember to surface
+    };
 
     let hooks_dir = work_dir.join(".githooks");
     let hook_path = hooks_dir.join("pre-commit");
@@ -1254,6 +1316,12 @@ pub fn install_hooks(force: bool) -> Result<(), Report<InstallHooksError>> {
         hook_path.display(),
         ts_path.display(),
     );
+    if let Some(prev) = displaced_hooks_path {
+        eprintln!(
+            "note: previous core.hooksPath was '{prev}'. \
+             To restore: git config --local core.hooksPath {prev}"
+        );
+    }
     Ok(())
 }
 
@@ -1349,6 +1417,30 @@ fn set_local_config_value(
     write_atomic(&config_path, serialized.as_slice())
         .change_context(InstallHooksError::ConfigWrite)?;
     Ok(())
+}
+
+/// Read a single value from the local repo config. Returns Ok(None)
+/// if the file or key is absent (i.e., never set). Used by the
+/// install-hooks preflight to detect a foreign `core.hooksPath`.
+fn read_local_config_value(
+    repo: &gix::Repository,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Result<Option<String>, Report<InstallHooksError>> {
+    use gix_config::File;
+    let config_path = repo.path().join("config");
+    let file = match File::from_path_no_includes(
+        config_path,
+        gix_config::Source::Local,
+    ) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    Ok(file
+        .raw_value_by(section, subsection, key)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 ```
 
@@ -1629,8 +1721,19 @@ happens in parallel without blocking the main release.
 Suggested execution order:
 
 1. Land the linter and pre-commit hook (this design).
-2. Run `ts dev lint domains | sort | uniq -c | sort -rn` to produce a
-   frequency-ordered violation report.
+2. Produce a frequency-ordered host report. The human output
+   includes file paths and summary lines, so naive `sort | uniq -c`
+   over the human format counts *lines*, not hosts. Use the JSON
+   output and a small parser:
+
+   ```sh
+   ts dev lint domains --format json \
+     | jq -r '.violations[].host' \
+     | sort | uniq -c | sort -rn
+   ```
+
+   This gives `<count>  <host>` lines sorted by frequency, which
+   feeds the triage in step 3.
 3. Triage the top ~80% of violations into the three categories above.
 4. Submit cleanup PRs grouped by file (so each PR is reviewable):
    `docs/guide/creative-processing.md`,
