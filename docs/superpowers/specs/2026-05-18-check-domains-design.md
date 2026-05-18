@@ -55,14 +55,36 @@ section above warns against.
 API assumptions, matches reviewer guidance):
 
 1. **Spike — gix feasibility.** In a throwaway branch off `main`
-   (post-#669), pin `gix` and `gix-config`, write three integration
-   tests that drive the conceptual operations end-to-end against a
-   `tempfile`-built repo: (a) staged blob diff with new-side line
-   numbers; (b) merge-base + tree-vs-tree blob diff; (c) durable
-   `core.hooksPath` write via `gix-config::File`. The spike's
-   acceptance gate is "these three tests pass deterministically."
-   Pin the concrete `gix` entry points used here, then update
-   Open Question 5 in this spec to reflect the chosen names.
+   (post-#669), pin a matched `gix` + `gix-config` release-family
+   pair (verify via `cargo tree -p gix -p gix-config` that no
+   duplicate versions land in the lock file), then write three
+   integration tests that drive the conceptual operations end-to-end
+   against a `tempfile`-built repo: (a) staged blob diff with
+   new-side line numbers; (b) merge-base + tree-vs-tree blob diff;
+   (c) durable `core.hooksPath` write via `gix-config::File`.
+
+   **Spike acceptance gate** — all of the following:
+   - The three tests pass deterministically on a clean run.
+   - `cargo tree -p gix -p gix-config` shows exactly one version
+     of each, no `(*)` duplicate-version markers in the dep graph.
+   - The chosen `gix` entry points for index-vs-tree / tree-vs-tree
+     walking and blob diff are pinned in test source (no
+     placeholder names).
+
+   **Spike deliverables back into this spec** (single PR alongside
+   the spike code):
+   - Update the version pins in
+     [Cargo dependencies](#cargo-dependencies) with the chosen
+     numbers and a short comment naming the release family.
+     Replacing the `<pin-during-spike>` placeholders is part of the
+     spike's definition-of-done, not a follow-up.
+   - Update Open Questions to reflect the chosen `gix` API entry
+     points (Open Q5) and the pinned version (Open Q6).
+   - Update the "prototype-required" callout in
+     [Line collection: --staged mode (gitoxide)](#line-collection---staged-mode-gitoxide)
+     to name the chosen entry points instead of the placeholder
+     `index_vs_tree_changes` / `tree_vs_tree_changes` /
+     `blob_diff_added_hunks` helpers.
 2. **URL extraction + allowlist + suppression.** Pure-function
    layer, fully unit-testable without `gix`. Implement against the
    regex / allowlist / marker grammar in this spec; cover every
@@ -535,19 +557,32 @@ Add to `crates/trusted-server-cli/Cargo.toml`:
 
 ```toml
 [dependencies]
-gix = { version = "0.66", default-features = false, features = [
+gix = { version = "<pin-during-spike>", default-features = false, features = [
     "blob-diff",   # blob-level line diffs (gix-diff)
     "index",       # read the git index for staged-vs-HEAD diffs
     "revision",    # merge-base computation (gix-revision)
 ] }
-gix-config = "0.40"   # direct File-level read/write of <repo>/.git/config
-                      # for ts dev install-hooks (see "Persisting
-                      # core.hooksPath" below)
+gix-config = "<must-match-the-gix-release-family>"
+              # direct File-level read/write of <repo>/.git/config
+              # for ts dev install-hooks (see "Persisting
+              # core.hooksPath" below)
 regex = "1"
 ```
 
 Notes:
 
+- **Version pinning is deferred to the gix feasibility spike (see
+  [Implementation Readiness](#implementation-readiness)).** Do not
+  hardcode `gix = "0.66"` / `gix-config = "0.40"` based on this
+  spec alone — gitoxide companion crates evolve together and the
+  release-family pairing matters. For example, the `gix 0.66`
+  release line shipped with `gix-config 0.39.x`, not `0.40`, so the
+  combination written here would cause cargo to pull two
+  incompatible versions of `gix-config` into the tree. The spike
+  pins both crates against the same release family, verifies with
+  `cargo tree -p gix -p gix-config` that no duplicate versions
+  appear, and **updates this dependency table** with the pinned
+  numbers as part of step 1's deliverable.
 - `gix-config` is pulled in **explicitly** for the durable
   `<repo>/.git/config` write performed by `ts dev install-hooks`.
   `gix::Repository::config_snapshot_mut()` only modifies an
@@ -559,9 +594,9 @@ Notes:
   one targeted config write in `ts dev install-hooks`.
 - The exact feature names match the `gix` crate's documented features
   (`blob-diff`, `index`, `revision` — see docs.rs/gix). If a feature
-  has been renamed or split in the version pinned at implementation
-  time, the closest documented equivalent is used and the change is
-  flagged in the implementation PR.
+  has been renamed or split in the version the spike selects, the
+  closest documented equivalent is used and the change is flagged
+  in the implementation PR.
 
 ### URL extraction (without lookahead)
 
@@ -1482,53 +1517,72 @@ and add full-repo audit as a CI gate, or (b) snapshot a baseline file
 and run full-repo audit with baseline subtraction. Choice deferred
 until Stages 1 and 2 are stable.
 
+## Resolved Decisions
+
+Settled choices that the implementer should not re-litigate. Kept
+here as historical context with the rationale, so future readers can
+see *why* each decision went the way it did rather than re-opening
+the question.
+
+1. **Subcommand naming.** `ts dev lint domains` and
+   `ts dev install-hooks`. Both `lint` and `install-hooks` are
+   developer-workflow commands and belong under `dev`, not on the
+   operator-facing top level (`config`, `auth`, `audit`,
+   `provision`). This requires refactoring the existing PR #669
+   `ts dev` (single-file leaf that starts the dev server) into a
+   subcommand group, with `ts dev serve` for the existing behavior.
+   The earlier review's suggestion to keep `ts lint domains`
+   top-level was explicitly rejected by the spec owner — `dev`
+   parent is the chosen shape.
+2. **`cdn.prebid.org` on the integration allowlist** (rather than
+   rewriting the `prebid.rs` test code to `.example`). The tests
+   verify rewriting of real-world Prebid CDN URLs; converting them
+   to reserved hosts would weaken the test's intent.
+3. **Stage 1 ships without a full cleanup of existing violations.**
+   Existing violations are cleaned incrementally as files are
+   touched, with the dedicated workstream tracked in
+   [Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan). The
+   linter ships now; the doc audit happens in parallel.
+4. **Suppression marker syntax: `allow-domain: <host>`,
+   comment-anchored, host-validated.** Alternatives considered:
+   bare `allow-domain` without a host (rejected — bypassable via
+   URL paths), `allowed-domain:` (rejected — verbose without
+   benefit), block-level suppression markers (rejected — adds
+   state tracking and complexity; rewriting to reserved hosts
+   covers the multi-line case).
+5. **`ts dev install-hooks` clobber-detection signature.** The
+   `# ts-install-hooks: managed` marker on a known line is the
+   detection heuristic. Unmanaged hooks are refused without
+   `--force`. A `--append-to-existing` mode is left for later if
+   demand surfaces.
+6. **`--force-scan` escape hatch for explicit paths is NOT in
+   v1.** Explicit paths honour the extension filter (skipped with
+   stderr warning). Adding `--force-scan` is deferred until a real
+   workflow needs it.
+
 ## Open Questions
 
-1. **Subcommand naming — RESOLVED.** Decided: `ts dev lint domains`
-   and `ts dev install-hooks`. Both `lint` and `install-hooks` are
-   developer-workflow commands and belong under `dev`, not on the
-   operator-facing top level. This requires refactoring the existing
-   PR #669 `ts dev` (single-file leaf that starts the dev server)
-   into a subcommand group, with `ts dev serve` for the existing
-   behavior. Since #669 hasn't merged, the refactor can be
-   coordinated as part of the same review cycle. The earlier
-   review's suggestion to keep `ts lint domains` top-level was
-   explicitly rejected by the spec owner — `dev` parent is the
-   chosen shape.
-2. **`cdn.prebid.org` on allowlist vs converting `prebid.rs` tests to
-   `.example`?** Current pick: allowlist. Revisit if rigorous
-   separation is preferred.
-3. **Stage 1 cleanup expectations.** Do we ship with existing
-   violations intact and clean them incrementally as files are
-   touched, or open a follow-up cleanup PR? Current pick: ship
-   without cleanup; cleanup is a separate workstream tracked in
-   [Stage 1 Doc Cleanup Plan](#stage-1-doc-cleanup-plan).
-4. **Suppression marker syntax** — `allow-domain: host` vs
-   `// allowed-domain: host` vs other forms. Current pick:
-   `allow-domain: host`, comment-anchored, host-validated.
-5. **Exact `gix` API entry points for index-vs-tree and tree-vs-tree
-   diff walking.** Marked as prototype-required in the implementation
-   section; pinned during first implementation pass against the
-   selected `gix` version. Spec commits to the conceptual operations,
-   not the concrete function names.
-6. **`gix` version pin.** The spec uses `0.66` as an example; the
-   actual pin happens at implementation time with the `gix` version
-   current at that point. Workspace consistency (matching any
-   `gix` already pulled in transitively by other dependencies) takes
-   precedence.
-7. **`ts dev install-hooks` clobber detection signature.** The
-   `# ts-install-hooks: managed` marker on a known line is the
-   detection heuristic. If a contributor wants a custom multi-hook
-   chain, they keep their existing hook (we refuse to overwrite
-   without `--force`), and they must add an `exec ts dev lint domains
-   --staged` line manually. We could add a `--append-to-existing`
-   mode later if demand surfaces.
-8. **`--force-scan` escape hatch for explicit paths.** Current pick:
-   explicit paths honour the extension filter (skipped + warning if
-   extension is excluded). If real workflows need to scan a one-off
-   `.html` file, add `--force-scan` later.
-9. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
-   currently reads working-tree content. If a stable, commit-state
-   audit is needed later (e.g., a release gate at a tag), add an
-   `--at <rev>` mode that scans blob content from that revision's
-   tree. Deferred until real demand appears.
+Genuine unresolved items the implementer must close during
+implementation.
+
+1. **Exact `gix` API entry points for index-vs-tree and
+   tree-vs-tree diff walking, and for blob diff with new-side line
+   numbers.** Marked as prototype-required in the
+   [Line collection: --staged mode](#line-collection---staged-mode-gitoxide)
+   section. Pinned by the gix feasibility spike
+   (see [Implementation Readiness](#implementation-readiness)
+   step 1). The spec commits to the conceptual operations, not
+   concrete function names.
+2. **`gix` and `gix-config` version pins.** Both are deliberately
+   left as placeholders in [Cargo dependencies](#cargo-dependencies)
+   because (a) gitoxide companion crates must come from the same
+   release family and (b) workspace consistency with any `gix`
+   pulled in transitively takes precedence. The feasibility spike
+   chooses the pair, verifies with `cargo tree -p gix -p gix-config`,
+   and updates the dependency table.
+3. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
+   currently reads working-tree content (current local edits
+   included). If a release-gate use case appears that needs an
+   "at a tagged commit" view, add an `--at <rev>` mode that scans
+   blob content from that revision's tree. Deferred until real
+   demand surfaces; not part of v1.
