@@ -142,41 +142,76 @@ No changes to `trusted-server-core` or `trusted-server-adapter-fastly`.
 
 ## Allowlist (Rust constants)
 
-Two arrays as `const &[&str]` at module top of `dev/lint/domains.rs`.
+Three arrays as `const &[&str]` at module top of `dev/lint/domains.rs`:
+`EXACT_HOSTS` (integration proxies + loopback), `SUBDOMAIN_HOSTS`
+(allow `*.host`), and `REFERENCE_HOSTS` (well-known doc/spec
+sources, exact-match, allowed everywhere). The split keeps the
+security review for each group focused: integration-proxy additions
+need vendor justification; reference-host additions just need "is this
+a legitimate documentation source we link to repeatedly?"
 
-### Exact-match hosts
+### Exact-match hosts (`EXACT_HOSTS`)
 
-The host must equal one of these exactly. Subdomains are **not** allowed
+Integration proxies and loopback. Subdomains are **not** allowed
 (e.g., `anything.api.privacy-center.org` is disallowed).
 
-| Category                                             | Hosts                                                                                                        |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Loopback                                             | `127.0.0.1`, `::1`, `localhost`                                                                              |
-| Integration proxies (didomi)                         | `api.privacy-center.org`, `sdk.privacy-center.org`                                                           |
-| Integration proxies (sourcepoint)                    | `cdn.privacy-mgmt.com`                                                                                       |
-| Integration proxies (lockr)                          | `aim.loc.kr`, `identity.loc.kr`                                                                              |
-| Integration proxies (datadome)                       | `js.datadome.co`, `api-js.datadome.co`                                                                       |
-| Integration proxies (aps / Amazon)                   | `aax.amazon-adsystem.com`, `aax-events.amazon-adsystem.com`                                                  |
-| Integration proxies (permutive)                      | `api.permutive.com`, `secure-signals.permutive.app`, `cdn.permutive.com`                                     |
-| Integration proxies (Google Tag Manager / Analytics) | `www.googletagmanager.com`, `www.google-analytics.com`, `analytics.google.com`                               |
-| Integration proxies (adserver mock)                  | `securepubads.g.doubleclick.net`, `origin-mocktioneer.cdintel.com`                                           |
-| Integration proxies (Prebid CDN)                     | `cdn.prebid.org`                                                                                             |
-| Integration proxies (Fastly platform)                | `api.fastly.com`                                                                                             |
-| Reference / doc links                                | `github.com`, `docs.rs`, `crates.io`, `iabeurope.github.io`, `doc.rust-lang.org`, `www.w3.org`, `schema.org` |
+| Category                                             | Hosts                                                                          |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Loopback                                             | `127.0.0.1`, `::1`, `localhost`                                                |
+| Integration proxies (didomi)                         | `api.privacy-center.org`, `sdk.privacy-center.org`                             |
+| Integration proxies (sourcepoint)                    | `cdn.privacy-mgmt.com`                                                         |
+| Integration proxies (lockr)                          | `aim.loc.kr`, `identity.loc.kr`                                                |
+| Integration proxies (datadome)                       | `js.datadome.co`, `api-js.datadome.co`                                         |
+| Integration proxies (aps / Amazon)                   | `aax.amazon-adsystem.com`, `aax-events.amazon-adsystem.com`                    |
+| Integration proxies (permutive)                      | `api.permutive.com`, `secure-signals.permutive.app`, `cdn.permutive.com`       |
+| Integration proxies (Google Tag Manager / Analytics) | `www.googletagmanager.com`, `www.google-analytics.com`, `analytics.google.com` |
+| Integration proxies (adserver mock)                  | `securepubads.g.doubleclick.net`, `origin-mocktioneer.cdintel.com`             |
+| Integration proxies (Prebid CDN)                     | `cdn.prebid.org`                                                               |
+| Integration proxies (Fastly platform)                | `api.fastly.com`                                                               |
 
-### Subdomain-permitting hosts
+### Subdomain-permitting hosts (`SUBDOMAIN_HOSTS`)
 
 The host equals one of these **or** ends with `.` + one of these.
 
 | Host                 | Allows                                              | Why subdomain matching                                                                                                                                                                                |
 | -------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `example.com`        | `example.com`, `foo.example.com`, `a.b.example.com` | IANA reserved; arbitrary subdomains expected in test fixtures                                                                                                                                         |
+| `example.com`        | `example.com`, `foo.example.com`, `a.b.example.com` | IANA RFC 2606 reserved; arbitrary subdomains expected in test fixtures and docs                                                                                                                       |
+| `example.net`        | `example.net`, `assets.example.net`, etc.           | IANA RFC 2606 reserved; appears in real docs (`https://assets.example.net`)                                                                                                                           |
+| `example.org`        | `example.org`, `*.example.org`                      | IANA RFC 2606 reserved                                                                                                                                                                                |
 | `edge.permutive.app` | `edge.permutive.app`, `<org>.edge.permutive.app`    | Permutive constructs the host as `{organization_id}.edge.permutive.app` at runtime (see `crates/trusted-server-core/src/integrations/permutive.rs:93`); subdomains are vendor-controlled per customer |
 
-### The `.example` TLD rule
+### Reference / doc hosts (`REFERENCE_HOSTS`)
 
-Any host ending in `.example` is allowed (IANA RFC 2606). Hard-coded
-suffix check, not a list entry.
+Exact-match. Allowed in every scanned file (no docs-vs-code split).
+These are well-known documentation and spec sources that appear as
+markdown link targets, `///` doc-comment URLs, `#` config comments,
+etc. Curated by scanning the current `.md` files.
+
+| Category                | Hosts                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| Git / GitHub            | `github.com`, `docs.github.com`, `help.github.com`, `token.actions.githubusercontent.com`      |
+| Git commit conventions  | `chris.beams.io`                                                                               |
+| Rust                    | `docs.rs`, `doc.rust-lang.org`, `crates.io`                                                    |
+| Web / W3C standards     | `www.w3.org`, `schema.org`                                                                     |
+| Versioning / changelogs | `semver.org`, `keepachangelog.com`                                                             |
+| IAB Tech Lab            | `iab.com`, `iabtechlab.com`, `iabtechlab.github.io`, `iabeurope.github.io`                     |
+| Specs (supply chain)    | `in-toto.io`, `rslstandard.org`                                                                |
+| Specs (other)           | `webassembly.org`                                                                              |
+| Fastly docs             | `www.fastly.com`, `developer.fastly.com`, `manage.fastly.com`                                  |
+| Cloudflare docs         | `developers.cloudflare.com`                                                                    |
+| Vendor docs             | `docs.datadome.co`, `docs.prebid.org`                                                          |
+| Tooling docs            | `vitepress.dev`, `playwright.dev`, `testcontainers.com`, `grafana.com`                         |
+
+One-off references not on this list (e.g., a single arxiv.org link in
+a security spec) should use the per-line suppression marker —
+inflating `REFERENCE_HOSTS` with single-use entries defeats its review
+purpose.
+
+### IANA-reserved TLD rule
+
+Any host ending in `.example`, `.test`, `.invalid`, or `.localhost`
+is allowed (IANA RFC 2606 reserves these TLDs for documentation,
+testing, and special use). Hard-coded suffix check, not list entries.
 
 ### Matching summary
 
@@ -184,11 +219,15 @@ suffix check, not a list entry.
 | ----------------------------------- | ----------------------------------------- |
 | `example.com`                       | yes (subdomain-list)                      |
 | `foo.example.com`                   | yes (subdomain-list)                      |
+| `assets.example.net`                | yes (subdomain-list)                      |
 | `example.com.evil.com`              | **no** (not a subdomain of `example.com`) |
 | `api.fastly.com`                    | yes (exact)                               |
 | `v2.api.fastly.com`                 | **no** (exact-only)                       |
-| `testlight.example`                 | yes (`.example` TLD rule)                 |
+| `developer.fastly.com`              | yes (reference)                           |
+| `testlight.example`                 | yes (reserved TLD rule)                   |
+| `something.test`                    | yes (reserved TLD rule)                   |
 | `127.0.0.1`                         | yes (exact)                               |
+| `192.168.1.1`                       | **no** (RFC 1918 private IP, not loopback) |
 | `1.2.3.4`                           | no                                        |
 | `[::1]` → `::1` after bracket strip | yes (exact)                               |
 
@@ -196,23 +235,39 @@ Matching is case-insensitive on the host after lowercasing.
 
 ### Allowlist Maintenance Policy
 
-The allowlist is a security-relevant artifact. Adding an entry requires:
+All three arrays are security-relevant artifacts. Different bars
+apply:
 
-1. **Vendor + integration**: the entry must correspond to a named
-   integration or a well-known reference/doc host. No personal
-   preferences, no test domains, no speculative entries.
+**`EXACT_HOSTS` (integration proxies + loopback):**
+
+1. **Vendor + integration**: must correspond to a named integration
+   in the registry. No personal preferences, no test domains, no
+   speculative entries.
 2. **Justification in a `//`-comment** above the entry, naming the
-   integration and role.
+   integration and role (e.g., `// didomi: config endpoint`).
 3. **Narrowest workable host**: prefer the subdomain
    (`api.privacy-center.org`) over the apex (`privacy-center.org`).
-4. **Exact by default**: new vendor entries go into
-   `EXACT_HOSTS`. Move to `SUBDOMAIN_HOSTS` only when the vendor uses
-   multiple subdomains in real traffic and we accept trusting all of
-   them.
-5. **Source-code reference hosts are allowed everywhere** (not split
-   between docs and code).
+4. **Exact by default**: only move to `SUBDOMAIN_HOSTS` when the
+   vendor uses multiple subdomains in real traffic and we accept
+   trusting all of them.
 
-Changes to either array must be reviewed as part of the PR.
+**`SUBDOMAIN_HOSTS`:**
+
+1. Same vendor-justification bar as `EXACT_HOSTS`.
+2. **Plus** an explicit comment naming *why* subdomain matching is
+   needed (runtime host construction, vendor-controlled subdomain
+   sharding, etc.).
+
+**`REFERENCE_HOSTS`:**
+
+1. Host must be a **legitimate documentation or specification source**
+   that we link to in multiple places. One-off references use
+   per-line suppression instead — inflating `REFERENCE_HOSTS` with
+   single-use entries defeats its review purpose.
+2. **Justification in a `//`-comment** naming the category
+   (e.g., `// IAB Tech Lab spec source`).
+
+Changes to any array must be reviewed as part of the PR.
 
 ### Per-Line Suppression
 
@@ -271,21 +326,24 @@ upstream = "https://evil.com"  # allow-domain: evil.com
 ### File extensions scanned
 
 `.rs`, `.ts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.toml`, `.yml`, `.yaml`,
-`.json`, plus any file matching `.env*`.
+`.json`, `.md`, plus any file matching `.env*`.
 
-**`.md` is intentionally NOT scanned.** Markdown documentation files
-(`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, everything under
-`docs/`) routinely contain hundreds of legitimate third-party
-reference links — `docs.github.com`, `www.fastly.com`,
-`developer.fastly.com`, `manage.fastly.com`, `vitepress.dev`,
-`keepachangelog.com`, `semver.org`, `grafana.com`, `docs.prebid.org`,
-and many more, all verified present in the current repo. Doc-link
-hygiene is a different problem with different rules (broken-link
-checking, etc.) and is out of scope for this linter. The doc-link
-allowlist (`github.com`, `docs.rs`, `crates.io`, …) is still applied
-to in-code reference URLs that appear in `///` doc comments inside
-`.rs` files and `#` comments inside `.toml` files — that surface is
-high-signal and worth checking.
+**`.md` is scanned.** Markdown documentation files (`README.md`,
+`CHANGELOG.md`, `CONTRIBUTING.md`, everything under `docs/`) are real
+publishing surfaces and accidental hardcoded third-party hosts there
+matter as much as in source. The legitimate reference links those
+files contain are handled by an explicit
+[`REFERENCE_HOSTS`](#reference-hosts-exact-match-allowed-in-every-scanned-file)
+list (see Allowlist below) rather than by excluding the file type.
+
+**Fenced code blocks are scanned, not skipped.** The repo's docs and
+spec files include config snippets and `curl`/shell examples, which
+are exactly the places an accidental real host can land. The linter
+treats fenced blocks like any other content; if a snippet must
+reference a disallowed host (e.g., a CVE write-up using a real
+attacker domain), use the per-line suppression marker — the HTML
+comment form `<!-- allow-domain: <host> -->` works inside Markdown
+including inside fenced blocks.
 
 ### Always excluded (paths)
 
@@ -476,10 +534,13 @@ fn normalise_host(raw: &str) -> String {
 ### Allow check
 
 ```rust
+const RESERVED_TLDS: &[&str] = &[".example", ".test", ".invalid", ".localhost"];
+
 fn is_allowed(host: &str, suppressed_on_line: &HashSet<String>) -> bool {
     if suppressed_on_line.contains(host) { return true; }
-    if host.ends_with(".example") { return true; }
+    if RESERVED_TLDS.iter().any(|t| host.ends_with(t)) { return true; }
     if EXACT_HOSTS.iter().any(|e| host == *e) { return true; }
+    if REFERENCE_HOSTS.iter().any(|e| host == *e) { return true; }
     if SUBDOMAIN_HOSTS.iter().any(|e| {
         host == *e || host.ends_with(&format!(".{}", e))
     }) { return true; }
@@ -878,7 +939,9 @@ on the collected `DiffLine` values.
    `https://api.privacy-center.org`, `http://127.0.0.1:8080`,
    `https://github.com/x/y`.
 2. Subdomain-list rule — `https://foo.example.com` allowed.
-3. `.example` TLD — `https://testlight.example` allowed.
+3. **Reserved TLDs** — `https://testlight.example`,
+   `https://something.test`, `https://thing.invalid`,
+   `https://my.localhost` all allowed.
 4. Bracketed IPv6 loopback — `http://[::1]:8080` allowed.
 5. Uppercase host — `HTTPS://Example.COM/path` allowed.
 6. Quoted / trailing punctuation — `"https://example.com",`,
@@ -947,18 +1010,54 @@ and the index with `gix` APIs (no shell), runs the binary with
     fixture with `https://test.com` → reported.
 34. `package-lock.json` → ignored.
 
+### Markdown-specific cases
+
+35. **Allowed reference link in normal Markdown** —
+    `[the Fastly docs](https://developer.fastly.com/learning)` in a
+    `.md` file → no violation (covered by `REFERENCE_HOSTS`).
+36. **Disallowed Markdown link target** —
+    `[bad](https://test.com)` → flagged as `test.com` at the
+    correct line.
+37. **Autolink form** — `<https://test.com>` flagged; the angle
+    brackets are wrapping, not part of the URL.
+38. **HTML comment suppression in Markdown** —
+    a line containing `https://test.com` followed by
+    `<!-- allow-domain: test.com -->` → suppressed; same line with a
+    wrong-host marker `<!-- allow-domain: other.com -->` → flagged
+    with the stderr warning.
+39. **Multiple links on one line** —
+    `see [a](https://github.com/x) and [b](https://test.com)` →
+    one violation reported (`test.com`).
+40. **Fenced code block — disallowed** —
+    a triple-backtick block containing
+    `curl https://test.com/foo` is scanned and reported. Documents
+    that fenced blocks are NOT skipped; per-line suppression
+    (`<!-- allow-domain: test.com -->` outside the fence on the
+    same logical line is impractical) requires either an inline HTML
+    comment in the code-block language's comment syntax (e.g.,
+    `# allow-domain: test.com` for shell) or rewriting the example
+    to use `.example`.
+41. **Fenced code block — allowed reference** —
+    triple-backtick block referencing `https://docs.rs/clap` → no
+    violation.
+42. **Reference list at end of Markdown** — link-reference syntax
+    `[1]: https://test.com` is scanned (the URL is still extracted
+    by the absolute-URL regex regardless of Markdown semantics).
+43. **Image link** —
+    `![alt](https://test.com/img.png)` flagged.
+
 ### Environment cases
 
-35. **Not inside a git repo** — `gix::open` fails →
+44. **Not inside a git repo** — `gix::open` fails →
     exits 2 with `DomainsLintError::OpenRepo` and a clear message.
-36. **Bare repo / no working tree** — `gix::open` succeeds but
+45. **Bare repo / no working tree** — `gix::open` succeeds but
     `repo.work_dir()` is `None` (only relevant for the full-repo
     mode that reads working-tree files) → exits 2 with a clear
     message.
-37. **No git binary on PATH at all** — the linter still works
+46. **No git binary on PATH at all** — the linter still works
     end-to-end (verified by running the binary under `env -i PATH=""`,
     confirming `gix` is self-contained).
-38. Run unit tests under `cargo test --package trusted-server-cli`
+47. Run unit tests under `cargo test --package trusted-server-cli`
     on the host target (matches PR #669's split CI lanes).
 
 ## Trade-offs
