@@ -456,10 +456,16 @@ impl ApsAuctionProvider {
                 aps_response.contextual.slots.len()
             );
 
-            let slot_map = self
-                .slot_id_map
-                .lock()
-                .expect("should lock APS slot id map");
+            // Take the map by value so it does not linger on the provider
+            // across requests if the Fastly Compute runtime ever reuses Wasm
+            // instances. Today each request gets its own instance so this is
+            // belt-and-suspenders; tomorrow it may not be.
+            let slot_map = std::mem::take(
+                &mut *self
+                    .slot_id_map
+                    .lock()
+                    .expect("should lock APS slot id map"),
+            );
             for slot in aps_response.contextual.slots {
                 match self.parse_aps_slot(&slot) {
                     Ok(mut bid) => {
