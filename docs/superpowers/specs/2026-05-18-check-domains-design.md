@@ -24,11 +24,21 @@ as plain strings (e.g., `cookie_domain = "test-publisher.com"`,
 ## Prerequisite
 
 This design **depends on PR #669** (`Add the Trusted Server CLI`, branch
-`feature/ts-cli`) being merged first. PR #669 introduces the
-`crates/trusted-server-cli` crate, the `ts` binary, the
-`cargo install_cli` alias, the host-target CI lane, and the clap
-command-surface conventions this design extends. None of the work in this
-spec begins until #669 is on `main`.
+`feature/ts-cli`). PR #669 introduces the `crates/trusted-server-cli`
+crate, the `ts` binary, the `cargo install_cli` alias, the host-target
+CI lane, and the clap command-surface conventions this design extends.
+
+**Required base for any implementation work:** a branch whose ancestry
+contains PR #669. Two acceptable bases:
+
+- `main`, after #669 has merged, **or**
+- `origin/feature/ts-cli` directly (stacked on PR #669's branch), with
+  a rebase onto `main` once #669 merges.
+
+A plain `main` checkout that *predates* #669's merge cannot host this
+implementation — the CLI surface this design extends does not exist
+there. See [Implementation Readiness](#implementation-readiness) for
+the full start-condition checklist.
 
 ## Implementation Readiness
 
@@ -148,7 +158,7 @@ Modes (mutually exclusive):
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `ts dev lint domains`                    | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.** |
 | `ts dev lint domains --staged`           | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported.                        |
-| `ts dev lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in `git diff $(git merge-base <ref> HEAD)..HEAD`.                           |
+| `ts dev lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in the diff **equivalent to** `git diff $(git merge-base <ref> HEAD)..HEAD` — computed via gitoxide, not by shelling out. |
 | `ts dev lint domains path/...`           | Scans the listed files in full.                                                                                          |
 
 Output format defaults to `human`. `--format json` emits a structured
@@ -157,17 +167,49 @@ report (see [Output Format](#output-format)).
 Exit codes: `0` no violations; `1` violations found; `2` usage or
 environment error.
 
-**Exit-code wiring defers to PR #669's convention.** The sketch
-function signature shown later in this spec —
-`fn run(...) -> Result<i32, Report<DomainsLintError>>` — is
-illustrative, not prescriptive. The actual command function will match
-whatever pattern `trusted-server-cli` uses for the other subcommands
-(`config validate`, `audit`, `provision fastly plan`, etc.) introduced
-in PR #669. If that crate centralizes exit handling in `main()` via a
-`Result<(), Report<CliError>>` shape and maps specific errors to
-specific exit codes, this subcommand follows the same pattern. The
-three exit-code semantics above are the **contract**, not the
-**implementation shape**.
+**Required change to existing CLI exit-code mapping.** PR #669's
+`crates/trusted-server-cli/src/lib.rs::run()` currently maps every
+non-`CliError::Cancelled` error to `ExitCode::from(1)`. That collapses
+the violation-vs-environment-error distinction this contract requires
+— in CI, a failed git open and a real violation would be
+indistinguishable.
+
+**This PR therefore must extend the existing `CliError` and `run()`:**
+
+1. Add a `CliError::EnvironmentError` variant (name TBD; could be
+   `EnvIo` or similar to match the crate's existing naming) that
+   carries the underlying `Report` as context.
+2. The lint module wraps env-class errors (gix open fails, no git
+   repo, missing base ref, no working tree, gix-config write fails,
+   filesystem permission errors at install-hooks time) as
+   `CliError::EnvironmentError`.
+3. The lint module wraps violation reporting as `Ok(())` — violations
+   are an *expected outcome*, not an error. To trigger exit code `1`
+   for violations, the module returns a sentinel
+   `CliError::ViolationsFound { count }` variant (zero-cost — the
+   error body just carries the count for the error message).
+4. `lib.rs::run()` pattern-matches:
+
+   ```rust
+   match execute() {
+       Ok(()) => ExitCode::SUCCESS,
+       Err(error) => match error.current_context() {
+           CliError::Cancelled => ExitCode::from(130),
+           CliError::ViolationsFound { .. } => ExitCode::from(1),
+           CliError::EnvironmentError => ExitCode::from(2),
+           // … all other existing variants map to 1 unchanged
+           _ => ExitCode::from(1),
+       },
+   }
+   ```
+
+The two new variants and the dispatch arm are part of this PR's
+scope, not a follow-up. The sketch function signature shown later in
+this spec — `fn run(...) -> Result<i32, Report<DomainsLintError>>`
+— is illustrative; the production shape returns
+`Result<(), Report<CliError>>` matching the existing convention,
+with the exit code emerging from the `current_context()` match
+above.
 
 ### Why `ts dev` as the parent?
 
@@ -997,17 +1039,69 @@ fn full_repo_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
 
 ### Line collection: explicit paths
 
-Each path is read with `std::fs::read_to_string`, every line emitted.
-No git operations involved (the user named the files directly).
+Each path the user named is processed individually. Two layered
+behaviors that differ from full-repo mode:
 
-**Explicit paths still honour the extension/path filter.** If a user
-runs `ts dev lint domains some.html`, the file is **skipped** and a
-warning is printed to stderr (`note: some.html is not in scanned
-extensions; skipping`). Rationale: the goal is consistent behavior
-across modes — a file that would not be scanned in the full-repo
-audit must not be scanned when named explicitly either. The override
-escape hatch, if it becomes needed, is `--force-scan path/...`;
-deferred until a real need surfaces.
+**Policy filters (extension, path-exclusion, symlink, non-regular,
+binary, non-UTF-8) behave the same as full-repo: warn and skip.**
+The reason is consistency — a file that would not be scanned in the
+full-repo audit must not be scanned when named explicitly either.
+Specifically:
+
+- Path matches an always-excluded location (`node_modules/`,
+  `.worktrees/`, lockfile basename, etc.): warn and skip.
+- Extension not in the scanned set (`.html`, `.css`, etc.):
+  warn and skip with `note: <path> is not in scanned extensions;
+  skipping`. The deferred `--force-scan path/...` escape hatch
+  remains an Open Question.
+- Symlink, non-regular file, non-UTF-8 path component, binary
+  content (`InvalidData`): warn and skip per the
+  [full-repo handling table](#handling-tracked-but-missing-files-and-symlinks).
+
+**Access failures on a user-named path are hard errors, not
+warnings.** Differing from full-repo here is intentional: if the
+user typed `ts dev lint domains some/file.rs` and `some/file.rs`
+does not exist or cannot be read for permissions reasons, that is
+almost certainly a typo or a real environment problem the user
+should know about — not the "tracked-but-missing during a sweep"
+case full-repo handles silently. Treatment:
+
+- `NotFound`: exit `2` with `CliError::EnvironmentError`, message
+  `path not found: <path>`. No partial-success — if any explicit
+  path fails to open, no violations are reported.
+- `PermissionDenied` or other `io::Error`: same, with the
+  underlying error in the message.
+
+```rust
+fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let mut out = Vec::new();
+    for path in paths {
+        // Policy filters first (warn-and-skip).
+        if !path_is_scanned_named(path) { continue; }
+        let meta = std::fs::symlink_metadata(path)
+            .change_context_lazy(|| DomainsLintError::ReadFile(path.clone()))?;
+        if meta.file_type().is_symlink() { warn_skip(path, "symlink not followed"); continue; }
+        if !meta.file_type().is_file() { warn_skip(path, "non-regular file"); continue; }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn_skip(path, "binary content"); continue;
+            }
+            Err(e) => return Err(Report::new(DomainsLintError::ReadFile(path.clone()))
+                .attach_printable(e.to_string())),
+        };
+        for (i, line) in content.lines().enumerate() {
+            out.push(DiffLine { path: path.clone(), line_no: i + 1, content: line.into() });
+        }
+    }
+    Ok(out)
+}
+```
+
+The hard-vs-soft split is documented as the user contract:
+explicit paths are "I told you to look at this file"; full-repo is
+"sweep over everything the index claims exists." Different intent,
+different error behavior.
 
 ### Output Format (`human`)
 
@@ -1448,6 +1542,19 @@ and the index with `gix` APIs (no shell), runs the binary with
   `cookie_domain = "test-publisher.com"` are out of scope.
 - **HTML/CSS/Dockerfile blind spot.** Accepted; not mitigated by other
   code paths.
+- **`REFERENCE_HOSTS` are allowed in every scanned file, including
+  production source.** This is intentional. A production `.rs`
+  change that introduces `let x = "https://github.com/...";` will
+  pass the linter. The alternative — restricting reference hosts
+  to comment-only contexts (`///` in `.rs`, `#` in `.toml`,
+  `<!-- -->` in `.md`) — would require a comment-aware tokenizer
+  per language and was rejected as over-engineering for a small
+  risk surface. Code review catches stray reference URLs that
+  matter; the linter's purpose is preventing test-pollution and
+  unvetted *integration* endpoints, not policing every documentation
+  link. If a real incident shows production code routinely embedding
+  reference URLs as runtime values, revisit with a per-context
+  policy.
 - **Non-UTF-8 filenames** are skipped in full-repo / explicit-path
   working-tree reads with a stderr warning. `gix` preserves diff paths
   as `BString` internally, but v1 intentionally avoids platform-specific
