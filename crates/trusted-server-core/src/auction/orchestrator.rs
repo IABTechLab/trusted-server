@@ -869,7 +869,14 @@ impl AuctionOrchestrator {
                         remaining,
                         mediator.timeout_ms(),
                     );
-                    let placeholder = fastly::Request::get("https://placeholder.invalid/");
+                    // The mediator runs on the collect path. See the doc-comment on
+                    // `AuctionContext::request`: the real client request was already
+                    // consumed by `send_async` during dispatch, so we substitute a
+                    // canonical placeholder URL. Any future mediator that needs real
+                    // client headers must snapshot them at dispatch time onto
+                    // `DispatchedAuction` rather than reading `context.request` here.
+                    let placeholder =
+                        fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: &placeholder,

@@ -115,6 +115,29 @@ pub struct SiteInfo {
 }
 
 /// Context passed to auction providers.
+///
+/// # The `request` field is path-dependent
+///
+/// `request` carries the **real downstream client request** in the dispatch
+/// path ([`AuctionOrchestrator::run_auction`][run] and
+/// [`dispatch_auction`][dispatch]). Providers there can read client headers
+/// (DNT, User-Agent, cookies, X-* customs) directly off it.
+///
+/// In the **collect path** ([`collect_dispatched_auction`][collect]) the
+/// mediator is invoked with a synthetic placeholder request
+/// (`https://placeholder.invalid/`), because the real client request has
+/// already been consumed by `send_async` during dispatch and the host pipeline
+/// can't lend it across the `.await`. **Mediators must not depend on reading
+/// client state from `context.request`** — the placeholder has none of the
+/// real headers. If a future mediator needs that data, snapshot it into a new
+/// field on this struct at dispatch time and stash it on the
+/// [`DispatchedAuction`] token so collect can attach it to the mediator's
+/// context. See <https://github.com/IABTechLab/trusted-server/issues/680>
+/// (P2-1) for the open follow-up.
+///
+/// [run]: crate::auction::AuctionOrchestrator::run_auction
+/// [dispatch]: crate::auction::AuctionOrchestrator::dispatch_auction
+/// [collect]: crate::auction::AuctionOrchestrator::collect_dispatched_auction
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request,
@@ -126,6 +149,12 @@ pub struct AuctionContext<'a> {
     /// Platform services (config store, secret store, etc.) for use by providers.
     pub services: &'a RuntimeServices,
 }
+
+/// URL used by the orchestrator when invoking a mediator from the collect
+/// path. Providers can `debug_assert` against this value to catch a mediator
+/// that has accidentally started depending on `context.request` carrying real
+/// client headers.
+pub const MEDIATOR_PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
 
 /// Response from a single auction provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]

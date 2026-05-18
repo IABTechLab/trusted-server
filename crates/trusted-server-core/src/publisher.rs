@@ -499,7 +499,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     if !is_html {
         // Non-HTML: collect auction first, then stream.  There is no </body>
         // to hold, so delaying the entire body until collection is acceptable.
-        let placeholder = Request::get("https://placeholder.invalid/");
+        let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
         let result = orchestrator
             .collect_dispatched_auction(
                 dispatched,
@@ -546,16 +546,25 @@ pub async fn stream_publisher_body_async<W: Write>(
     .await
 }
 
-/// Build a minimal [`AuctionContext`] for the mediator call in collection.
+/// Build a minimal [`AuctionContext`] for the collect phase.
 ///
-/// The `request` field is a short-lived placeholder (providers use it only for
-/// header extraction; the placeholder is functionally equivalent to the original
-/// since `req` was already consumed by `send_async` before dispatch).
+/// See [`AuctionContext::request`]: the orchestrator's collect path runs
+/// after `send_async` has already consumed the real client request, so this
+/// context carries a synthetic placeholder. The orchestrator itself
+/// instantiates a fresh placeholder when it actually invokes a mediator —
+/// this argument is plumbing for the (presently unused) case where the
+/// orchestrator needs the caller's request shape.
 fn make_collect_context<'a>(
     settings: &'a Settings,
     services: &'a RuntimeServices,
     placeholder: &'a Request,
 ) -> AuctionContext<'a> {
+    debug_assert_eq!(
+        placeholder.get_url_str(),
+        crate::auction::types::MEDIATOR_PLACEHOLDER_URL,
+        "make_collect_context must be given the canonical placeholder; \
+         callers must not forward a real client request through the collect path"
+    );
     AuctionContext {
         settings,
         request: placeholder,
@@ -706,7 +715,7 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 // Collect the auction before feeding it to lol_html so that
                 // the </body> handler sees populated ad_bids_state.
                 log::info!("one_behind_loop: EOF — collecting dispatched auction");
-                let placeholder = Request::get("https://placeholder.invalid/");
+                let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                 let collect_ctx = make_collect_context(settings, services, &placeholder);
                 let result = orchestrator
                     .collect_dispatched_auction(dispatched, services, &collect_ctx)
@@ -1141,7 +1150,7 @@ pub async fn handle_publisher_request(
             // Unlike the Stream path, the body is fully buffered first — collect auction
             // now so bids are available when the </body> handler fires.
             if let Some(dispatched) = dispatched_auction {
-                let placeholder = fastly::Request::get("https://placeholder.invalid/");
+                let placeholder = fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                 let result = orchestrator
                     .collect_dispatched_auction(
                         dispatched,
