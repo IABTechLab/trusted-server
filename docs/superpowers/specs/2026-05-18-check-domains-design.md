@@ -1,109 +1,226 @@
-# `check-domains` Pre-Commit Linter — Design
+# `ts lint domains` — Design
 
 **Date:** 2026-05-18
-**Status:** Draft (revised after first review)
+**Status:** Draft (revised after third review — pivoted to Rust / `ts` CLI)
 
 ## Goal
 
-Fail commits that introduce new URLs to non-allowlisted domains in source,
-config, or documentation files. Catches accidental test-pollution domains
-(e.g., `test.com`, `partner.com`, `new.com`) and hardcoded third-party
-endpoints that have not been vetted as integration proxies.
+Fail commits that introduce new **URL hosts** (extracted from `http(s)://`
+and protocol-relative `//host/` URLs) that are not on an explicit
+allowlist, across source, config, and documentation files. Catches
+accidental test-pollution domains (e.g., `test.com`, `partner.com`,
+`new.com`) and hardcoded third-party endpoints that have not been vetted
+as integration proxies.
 
 Enforces the rule: **production code, tests, and config may only reference
 `example.com` (and its subdomains), loopback addresses, an explicit list of
-integration-proxy endpoints, or a small set of reference/doc-link domains.**
+integration-proxy endpoints, or a small set of reference/doc-link hosts.**
+
+The term **URL host** (not "domain") is used throughout because the linter
+only inspects the host portion of an extracted URL. Bare hostnames written
+as plain strings (e.g., `cookie_domain = "test-publisher.com"`,
+`exclude_domains = ["foo.com"]`) are **not** detected.
+
+## Prerequisite
+
+This design **depends on PR #669** (`Add the Trusted Server CLI`, branch
+`feature/ts-cli`) being merged first. PR #669 introduces the
+`crates/trusted-server-cli` crate, the `ts` binary, the
+`cargo install_cli` alias, the host-target CI lane, and the clap
+command-surface conventions this design extends. None of the work in this
+spec begins until #669 is on `main`.
 
 ## Non-Goals
 
 - No CI gate in v1. The pre-commit hook is the only enforcement mechanism.
-  See the [Migration to CI](#migration-to-ci) section for the explicit path
-  to enabling CI later.
+  See [Migration to CI](#migration-to-ci).
 - No baseline file. Existing violations are tolerated; the linter is scoped
   to new lines.
 - No autofix.
-- No detection of bare hostnames without an `http(s)://` or `//` prefix
-  (e.g., a string literal `"foo.example.com"` is not scanned).
-- No HTML/CSS/Dockerfile scanning. Publisher-capture HTML fixtures contain
-  hundreds of legitimate third-party URLs (Facebook, typekit, ad networks)
-  that are out of scope for an allowlist policy.
+- No detection of bare hostnames without an `http(s)://` or `//` prefix.
+- No HTML, CSS, or Dockerfile scanning. **Accepted blind spot**: a
+  disallowed URL added to a publisher-capture HTML fixture, a CSS
+  `url(...)`, or a Dockerfile `FROM`/`RUN curl` line will not be
+  detected. HTML fixtures at
+  `crates/trusted-server-core/src/integrations/*/fixtures/*.html` contain
+  hundreds of legitimate captured third-party URLs that cannot reasonably
+  be allowlisted.
 
-## Allowlist
+## CLI Surface
 
-Maintained as a constant array near the top of `scripts/check-domains.sh`.
+A new top-level subcommand on the `ts` CLI:
+
+```
+ts lint domains [--staged | --changed-vs <ref> | <paths>...]
+                [--format human|json] [--verbose]
+```
+
+Modes (mutually exclusive):
+
+| Invocation | Behavior |
+|---|---|
+| `ts lint domains` | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.** |
+| `ts lint domains --staged` | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported. |
+| `ts lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in `git diff $(git merge-base <ref> HEAD)..HEAD`. |
+| `ts lint domains path/...` | Scans the listed files in full. |
+
+Output format defaults to `human`. `--format json` emits a structured
+report (see [Output Format](#output-format)).
+
+Exit codes: `0` no violations; `1` violations found; `2` usage or
+environment error.
+
+Why `lint` (not `check` or `audit`)?
+- `ts audit <url>` already exists for browser-based site audits.
+- `ts config validate` already exists for config validation.
+- `lint` is unambiguous and namespaces future lints (`ts lint deps`,
+  `ts lint imports`, etc.).
+
+## Crate Layout
+
+```
+crates/trusted-server-cli/src/
+  lib.rs                          # add Lint subcommand to clap enum,
+                                  # dispatch to lint module
+  lint/
+    mod.rs                        # Lint subcommand enum + dispatch
+    domains.rs                    # this design's implementation
+    domains_tests.rs              # (or inline #[cfg(test)] mod tests)
+```
+
+Existing code touched:
+- `crates/trusted-server-cli/src/lib.rs` — add `Commands::Lint(LintArgs)`
+  variant and dispatch arm. Following the pattern established by other
+  subcommands in #669 (Config, Dev, Auth, Audit, Provision).
+- `crates/trusted-server-cli/src/error.rs` — add a `LintError` variant
+  if needed for typed propagation. Otherwise reuse the crate's existing
+  `Report<CliError>` plumbing.
+
+No changes to `trusted-server-core` or `trusted-server-adapter-fastly`.
+
+## Allowlist (Rust constants)
+
+Two arrays as `const &[&str]` at module top of `lint/domains.rs`.
+
+### Exact-match hosts
+
+The host must equal one of these exactly. Subdomains are **not** allowed
+(e.g., `anything.api.privacy-center.org` is disallowed).
 
 | Category | Hosts |
 |---|---|
-| Example TLDs (IANA RFC 2606) | `example.com` + any subdomain; any `*.example` host (e.g., `testlight.example`) |
 | Loopback | `127.0.0.1`, `::1`, `localhost` |
 | Integration proxies (didomi) | `api.privacy-center.org`, `sdk.privacy-center.org` |
 | Integration proxies (sourcepoint) | `cdn.privacy-mgmt.com` |
-| Integration proxies (lockr) | `aim.loc.kr` |
+| Integration proxies (lockr) | `aim.loc.kr`, `identity.loc.kr` |
 | Integration proxies (datadome) | `js.datadome.co`, `api-js.datadome.co` |
 | Integration proxies (aps / Amazon) | `aax.amazon-adsystem.com`, `aax-events.amazon-adsystem.com` |
+| Integration proxies (permutive) | `api.permutive.com`, `secure-signals.permutive.app` |
 | Integration proxies (Google Tag Manager / Analytics) | `www.googletagmanager.com`, `www.google-analytics.com`, `analytics.google.com` |
 | Integration proxies (adserver mock) | `securepubads.g.doubleclick.net`, `origin-mocktioneer.cdintel.com` |
+| Integration proxies (Prebid CDN) | `cdn.prebid.org` |
 | Integration proxies (Fastly platform) | `api.fastly.com` |
-| Reference/doc links | `github.com`, `docs.rs`, `crates.io`, `iabeurope.github.io`, `doc.rust-lang.org`, `www.w3.org`, `schema.org` |
+| Reference / doc links | `github.com`, `docs.rs`, `crates.io`, `iabeurope.github.io`, `doc.rust-lang.org`, `www.w3.org`, `schema.org` |
 
-Matching is **case-insensitive**. For each allowlist entry `E`, a host `H`
-matches if `H == E` **or** `H` ends with `.E` (i.e., is a subdomain of `E`).
+### Subdomain-permitting hosts
 
-Worked examples:
+The host equals one of these **or** ends with `.` + one of these.
 
-| Allowlist entry | Allows | Does NOT allow |
-|---|---|---|
-| `example.com` | `example.com`, `foo.example.com`, `a.b.example.com` | `notexample.com`, `example.com.evil.com`, `example.org` |
-| `api.fastly.com` | `api.fastly.com`, `v2.api.fastly.com` | `other.fastly.com`, `fastly.com` |
+| Host | Allows |
+|---|---|
+| `example.com` | `example.com`, `foo.example.com`, `a.b.example.com` |
 
-The `.example` TLD is handled as a separate hard-coded suffix rule (matches
-any host ending in `.example`), not a list entry.
+### The `.example` TLD rule
+
+Any host ending in `.example` is allowed (IANA RFC 2606). Hard-coded
+suffix check, not a list entry.
+
+### Matching summary
+
+| Host | Allowed? |
+|---|---|
+| `example.com` | yes (subdomain-list) |
+| `foo.example.com` | yes (subdomain-list) |
+| `example.com.evil.com` | **no** (not a subdomain of `example.com`) |
+| `api.fastly.com` | yes (exact) |
+| `v2.api.fastly.com` | **no** (exact-only) |
+| `testlight.example` | yes (`.example` TLD rule) |
+| `127.0.0.1` | yes (exact) |
+| `1.2.3.4` | no |
+| `[::1]` → `::1` after bracket strip | yes (exact) |
+
+Matching is case-insensitive on the host after lowercasing.
 
 ### Allowlist Maintenance Policy
 
 The allowlist is a security-relevant artifact. Adding an entry requires:
 
-1. **Vendor + integration**: the entry must correspond to a named integration
-   (didomi, sourcepoint, lockr, etc.) or a well-known reference/doc host. No
-   personal preferences, no test domains, no "we'll need this later" entries.
-2. **Justification in the comment**: each entry has a trailing comment naming
-   the integration and the role (`# didomi config endpoint`,
-   `# Fastly management API`).
-3. **Narrowest workable host**: prefer the specific subdomain
-   (`api.privacy-center.org`) over the apex (`privacy-center.org`). The
-   subdomain rule means listing `privacy-center.org` would allow *every*
-   subdomain.
-4. **Source-code reference hosts are allowed everywhere** (not split between
-   docs and code). Listing `github.com` allows it in `.rs`, `.md`, `.toml`
-   alike — splitting by file type is more complexity than it's worth.
+1. **Vendor + integration**: the entry must correspond to a named
+   integration or a well-known reference/doc host. No personal
+   preferences, no test domains, no speculative entries.
+2. **Justification in a `//`-comment** above the entry, naming the
+   integration and role.
+3. **Narrowest workable host**: prefer the subdomain
+   (`api.privacy-center.org`) over the apex (`privacy-center.org`).
+4. **Exact by default**: new vendor entries go into
+   `EXACT_HOSTS`. Move to `SUBDOMAIN_HOSTS` only when the vendor uses
+   multiple subdomains in real traffic and we accept trusting all of
+   them.
+5. **Source-code reference hosts are allowed everywhere** (not split
+   between docs and code).
 
-Changes to `ALLOWED_HOSTS` must be reviewed as part of the PR; reviewers
-should verify the integration actually exists in the registry and the host
-is the one being proxied/called.
+Changes to either array must be reviewed as part of the PR.
 
 ### Per-Line Suppression
 
-Some legitimate uses are not part of any integration — most notably security
-tests that use `evil.com` and similar attacker-controlled placeholders
-(real example: `crates/trusted-server-core/src/integrations/google_tag_manager.rs:838`).
-To allow these without polluting the global allowlist, the linter
-recognizes the literal token `allow-domain` anywhere on the same source
-line:
+Some legitimate uses are not part of any integration — most notably
+security tests using attacker-controlled placeholders. Real example:
+`crates/trusted-server-core/src/integrations/google_tag_manager.rs:838`
+contains `"https://evil.com/?redirect=https://www.google-analytics.com/collect"`.
+
+The linter recognizes a **comment-anchored, host-named** marker:
 
 ```rust
-let attacker = "https://evil.com/path"; // allow-domain
+let attacker = "https://evil.com/path"; // allow-domain: evil.com
 ```
 
 ```toml
-upstream = "https://evil.com"  # allow-domain
+upstream = "https://evil.com"  # allow-domain: evil.com
 ```
 
-The marker is comment-syntax-agnostic — any occurrence of the substring
-`allow-domain` on the line suppresses all disallowed domains on that line.
-The marker is intentionally non-specific (no host listed) to keep the
-scanner simple; reviewers verify the line's intent at PR time. If misuse
-becomes a problem, future versions can require `allow-domain: evil.com`
-with named hosts.
+```html
+<!-- allow-domain: evil.com -->
+```
+
+**Marker grammar (Rust regex):**
+
+```
+(?im)(?:^|\s)(?://|\#|<!--|\*\s)\s*allow-domain:\s*([A-Za-z0-9.\-:\[\],\s]+?)(?:-->|$)
+```
+
+- The comment introducer (`//`, `#`, `<!--`, or `*` followed by
+  whitespace for jsdoc/block-comment continuation) must be **preceded
+  by start-of-line or whitespace**. This is what makes the marker
+  bypass-resistant.
+- Captures a comma-separated host list.
+- Each listed host must **actually match a violation on that line**;
+  if a listed host does not appear among the line's violations, a
+  warning is emitted (stderr) but the suppression for matched hosts
+  still applies.
+- A violation host that is **not** in the listed set is reported
+  normally.
+
+**Bypass-resistance:**
+- `fetch("https://evil.com/allow-domain")` — `allow-domain` substring is
+  inside a URL path, not after a comment introducer → no suppression.
+- `fetch("https://evil.com//allow-domain: evil.com")` — the second `//`
+  is preceded by `m` (from `.com`), not whitespace or start-of-line, so
+  the marker anchor fails to match → no suppression.
+- `https://allow-domain:8080/path` — pathological URL with literal host
+  `allow-domain`: the `//` is preceded by `:` (scheme separator), not
+  whitespace or start-of-line → no suppression. (The host
+  `allow-domain` itself would be flagged as disallowed in the normal
+  path.)
 
 ## Scope
 
@@ -120,247 +237,602 @@ with named hosts.
 - `target/`
 - `dist/`
 - `.git/`
-- `.worktrees/`, `.claude/worktrees/` (temporary git worktrees with
-  duplicated content)
-- `**/fixtures/**` (real-world publisher captures and test fixtures
-  containing third-party URLs)
-- `scripts/check-domains.sh` itself (so the script's own allowlist comments
-  cannot self-flag)
+- `.worktrees/`, `.claude/worktrees/`
+- `crates/trusted-server-cli/src/lint/domains.rs` itself (so the
+  module's own allowlist constants and doc comments cannot self-flag)
 
-## Components
+**Note:** `**/fixtures/**` is **not** a blanket exclusion. Publisher-capture
+HTML fixtures under
+`crates/trusted-server-core/src/integrations/*/fixtures/*.html` are
+already skipped because `.html` is not in the scanned extension list.
+Source files under `crates/integration-tests/fixtures/frameworks/*` —
+including `.tsx`, `.ts`, `.json`, `next.config.mjs` — **are** scanned.
 
-### 1. `scripts/check-domains.sh`
+## Implementation
 
-The linter. Modes:
+### Module structure
 
-| Invocation | Behavior |
-|---|---|
-| `scripts/check-domains.sh` | Full-repo audit. Walks tracked files matching the extension filter and scans every line. |
-| `scripts/check-domains.sh --staged` | Pre-commit mode. Scans only added lines (`^+` lines) in `git diff --cached`. Existing violations are not reported. |
-| `scripts/check-domains.sh path/...` | Scans the listed files in full. |
+```rust
+// crates/trusted-server-cli/src/lint/domains.rs
 
-Exit codes: `0` if no violations; `1` if any violations.
+use core::error::Error;
+use std::path::PathBuf;
 
-### 2. `.githooks/pre-commit`
+use derive_more::Display;
+use error_stack::{Report, ResultExt};
+use regex::Regex;
 
-```sh
-#!/usr/bin/env bash
-exec "$(git rev-parse --show-toplevel)/scripts/check-domains.sh" --staged
-```
+// gix = "gitoxide": pure-Rust git implementation. No external git binary
+// required; no subprocess; typed diff/merge-base/index APIs.
+use gix;
 
-### 3. `scripts/install-hooks.sh`
+/// Hosts that must match exactly. Subdomains are NOT allowed.
+const EXACT_HOSTS: &[&str] = &[
+    // Loopback
+    "127.0.0.1",
+    "::1",
+    "localhost",
+    // didomi
+    "api.privacy-center.org",
+    "sdk.privacy-center.org",
+    // ... etc.
+];
 
-```sh
-#!/usr/bin/env bash
-set -euo pipefail
-git config core.hooksPath .githooks
-echo "Installed: git hooks now run from .githooks/"
-```
+/// Hosts that match exactly OR via subdomain (`*.host`).
+const SUBDOMAIN_HOSTS: &[&str] = &[
+    "example.com",
+];
 
-### 4. `CONTRIBUTING.md` addition
-
-Short subsection under a "Local setup" heading explaining the one-time
-install command and what the hook checks for.
-
-## Detection Logic
-
-For each line under inspection:
-
-1. If the line contains a suppression marker (`// allow-domain` or
-   `# allow-domain`), skip URL extraction on that line.
-2. Extract URL tokens with **two** regexes (case-insensitive):
-   - **Absolute**: `https?://(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9.\-]+)` —
-     matches `https://example.com`, `http://[::1]:8080`,
-     `https://1.2.3.4`.
-   - **Protocol-relative**: `(?:^|[\s"'(=<>])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})(?=[\s"')/<>?#])` —
-     matches `//www.googletagmanager.com/gtm.js` and similar. The leading
-     boundary character requirement (whitespace, quote, paren, `=`, `<`,
-     `>`) prevents matching `// foo bar.example` style code comments. The
-     trailing lookahead ensures a recognisable URL delimiter follows.
-3. For each match, strip to bare host:
-   - Drop scheme, port, path, query, fragment.
-   - For bracketed IPv6, strip the surrounding `[ ]` before normalisation.
-4. Lowercase the host.
-5. **Allow** if any of:
-   - Host equals an allowlist entry (exact match).
-   - Host ends with `.` followed by an allowlist entry (subdomain match).
-   - Host ends with `.example` (reserved TLD rule).
-6. Otherwise, emit a violation line.
-
-Raw IPv4/IPv6 literals that are not loopback (e.g., `68.183.113.79` in
-`trusted-server.toml`) are treated as disallowed hosts and reported.
-
-## `--staged` Mode Implementation
-
-To scan only added lines while preserving file paths and line numbers, the
-script pipes `git diff --cached -U0 --diff-filter=ACMR` into awk that
-tracks the post-image line number from each `@@` hunk header and
-normalises the file path from the `+++ ` line:
-
-```awk
-/^\+\+\+ / {
-  raw = substr($0, 7)
-  if (raw == "/dev/null") { file = ""; next }      # file deletion
-  # Strip git's "b/" prefix from new-side path. Quoted paths
-  # (filenames with spaces / special chars) are not supported in v1;
-  # they appear as `"b/path with spaces"` and would need C-style
-  # unescaping. Documented as a known limitation.
-  if (substr(raw, 1, 2) == "b/") raw = substr(raw, 3)
-  file = raw
-  next
+#[derive(Debug, Display)]
+pub enum DomainsLintError {
+    #[display("failed to open git repository")]
+    OpenRepo,
+    #[display("failed to read git index")]
+    Index,
+    #[display("failed to compute diff")]
+    Diff,
+    #[display("failed to resolve reference `{_0}`")]
+    Reference(String),
+    #[display("failed to compute merge-base of `{base}` and HEAD")]
+    MergeBase { base: String },
+    #[display("failed to read file `{_0}`")]
+    ReadFile(PathBuf),
+    #[display("invalid mode combination")]
+    InvalidMode,
 }
-/^@@/ { match($0, /\+([0-9]+)/, a); ln = a[1] - 1; next }
-/^\+/ { ln++; if (file != "") print file ":" ln ":" substr($0, 2); next }
-/^ /  { ln++; next }
-/^-/  { next }
+impl Error for DomainsLintError {}
+
+pub struct DomainsLintArgs {
+    pub mode: LintMode,
+    pub format: OutputFormat,
+    pub verbose: bool,
+}
+
+pub enum LintMode {
+    Staged,
+    ChangedVs(String),
+    Paths(Vec<PathBuf>),
+    FullRepo,
+}
+
+pub fn run(args: DomainsLintArgs) -> Result<i32, Report<DomainsLintError>> {
+    let lines = collect_lines(&args.mode)?;
+    let violations = scan_lines(&lines);
+    emit_report(&violations, args.format);
+    Ok(if violations.is_empty() { 0 } else { 1 })
+}
 ```
 
-Each emitted `path:line:content` line is then passed through the URL
-extraction and allowlist check. The extension/path filter is applied to
-`file` before printing.
+### Cargo dependencies
 
-To handle quoted/escaped paths defensively, the script runs
-`git -c core.quotepath=false diff --cached ...` so non-ASCII paths are not
-quoted (paths containing literal spaces still emit a warning rather than a
-silent miss).
+Add to `crates/trusted-server-cli/Cargo.toml`:
 
-## Output Format
-
-```
-crates/trusted-server-core/src/foo.rs:42: disallowed domain test.com
-trusted-server.toml:15: disallowed domain 68.183.113.79
-
-2 disallowed domains found in 2 files.
-To allow a new integration proxy, add it to ALLOWED_HOSTS in scripts/check-domains.sh.
-To suppress one line (e.g., security-test attacker domains), append `// allow-domain`.
-Run `scripts/check-domains.sh` (no args) for a full-repo audit.
+```toml
+[dependencies]
+gix = { version = "0.66", default-features = false, features = [
+    "blob-diff",         # blob-level line diffs with hunks
+    "revision",          # merge-base computation
+    "index",             # staged-vs-HEAD comparison
+    "worktree-mutation", # not needed; placeholder — refine during impl
+] }
+regex = "1"
 ```
 
-When clean: no output, exit 0.
+Exact feature flags will be tightened during implementation to minimise
+compile time. The goal is a slim `gix` build (no networking, no
+credential helpers — just local repo / index / diff / revision APIs).
 
-## Setup Flow for Contributors
+### URL extraction (without lookahead)
+
+Rust's standard `regex` crate does not support lookahead. The patterns
+are designed to work without it — host character classes naturally bound
+the match.
+
+**Absolute URL regex:**
+```
+(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.\-]+)
+```
+- `[A-Za-z0-9.\-]+` greedily captures the host; matching stops at the
+  first character outside the class (e.g., `/`, `:`, `?`, `"`, `>`).
+- Bracketed IPv6 is captured as `[…]`; surrounding brackets stripped
+  in normalisation.
+
+**Protocol-relative URL regex:**
+```
+(?i)(?:^|[\s"'(=<>])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
+```
+- The non-capturing group `(?:^|[\s"'(=<>])` requires a boundary
+  character (start-of-line, whitespace, quote, paren, `=`, `<`, `>`)
+  before the `//`. Prevents matching the `//` in `// comment text` or
+  in `http://foo` (where `//` is preceded by `:`).
+- The host capture `[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}` requires
+  at least one dot followed by a TLD-like suffix — filters out
+  comment dividers like `// foo bar` and `// 1.2`.
+- **Known limitation**: back-to-back protocol-relative URLs without a
+  separator (`//foo.com//bar.com`) would miss the second one because
+  the engine continues from `/bar.com` with no boundary char. Accepted
+  for v1; no real-world occurrence.
+
+### Suppression marker regex
 
 ```
-git clone ...
-./scripts/install-hooks.sh   # one-time per clone
+(?im)(?://|\#|<!--|\s\*\s)\s*allow-domain:\s*([A-Za-z0-9.\-:\[\],\s]+?)(?:-->|$)
 ```
 
-After that, every `git commit` runs the linter against staged changes.
-Bypass with `git commit --no-verify` (intentional escape hatch; see
-[Migration to CI](#migration-to-ci)).
+### Host normalisation
+
+```rust
+fn normalise_host(raw: &str) -> String {
+    let trimmed = raw.trim_start_matches('[').trim_end_matches(']');
+    trimmed.to_lowercase()
+}
+```
+
+### Allow check
+
+```rust
+fn is_allowed(host: &str, suppressed_on_line: &HashSet<String>) -> bool {
+    if suppressed_on_line.contains(host) { return true; }
+    if host.ends_with(".example") { return true; }
+    if EXACT_HOSTS.iter().any(|e| host == *e) { return true; }
+    if SUBDOMAIN_HOSTS.iter().any(|e| {
+        host == *e || host.ends_with(&format!(".{}", e))
+    }) { return true; }
+    false
+}
+```
+
+### Line collection: `--staged` mode (gitoxide)
+
+**No subprocess. No `git` binary on PATH required.** All git operations
+go through `gix` APIs.
+
+The flow:
+
+1. Open the repo: `gix::open(".")`.
+2. Resolve the HEAD tree.
+3. Resolve the index (the staging area).
+4. Compute the tree-vs-index changes — this is the set of files with
+   staged modifications, additions, renames, or deletions.
+5. For each `Modified` / `Added` / `Renamed` change:
+   - Load the **old blob** from the HEAD tree (empty for additions).
+   - Load the **new blob** from the index.
+   - Run a **blob diff** using `gix-diff::blob` (which wraps
+     `imara-diff`, the Myers diff implementation `gix` uses
+     internally).
+   - Walk the resulting hunks; for each hunk's **post-image (new) line
+     range**, emit `DiffLine { path, line_no, content }` for each added
+     line.
+6. Skip `Deleted` changes (deletions cannot introduce a violation).
+7. Apply the extension/path filter to the *post-image path* before
+   loading blobs (cheap filter, avoids unnecessary diffing).
+
+Sketch:
+
+```rust
+fn staged_added_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
+    let head_tree = repo
+        .head_commit()
+        .change_context(DomainsLintError::OpenRepo)?
+        .tree()
+        .change_context(DomainsLintError::OpenRepo)?;
+    let index = repo.index().change_context(DomainsLintError::Index)?;
+
+    let mut out = Vec::new();
+    // Iterate index-vs-tree changes (gix API: `gix::diff` / `gix::index::diff`).
+    // For each (old_path, new_path, change_kind) where new_path passes
+    // the extension/path filter:
+    for change in index_vs_tree_changes(&repo, &head_tree, &index)? {
+        let DiffEntry { new_path, old_blob, new_blob, .. } = change;
+        if !path_is_scanned(&new_path) { continue; }
+        let hunks = blob_diff_added_hunks(old_blob.as_deref(), new_blob.as_deref())
+            .change_context(DomainsLintError::Diff)?;
+        for hunk in hunks {
+            for (line_no, content) in hunk.added_lines {
+                out.push(DiffLine { path: new_path.clone(), line_no, content });
+            }
+        }
+    }
+    Ok(out)
+}
+```
+
+`blob_diff_added_hunks` is a thin wrapper around `gix-diff::blob::diff`
+that yields `(post_image_line_no, content)` for `Change::Insertion` and
+the inserted side of `Change::Replacement` hunks.
+
+**Why this is better than shelling out:**
+- No `git` binary on PATH required.
+- No diff-text parsing — line numbers and content come from typed
+  hunk structs.
+- No locale / quote-path / `b/` prefix / `/dev/null` edge cases.
+- Renamed files are handled by `gix`'s change-detection (provides both
+  old and new path).
+- Filenames with spaces or non-UTF8 characters: `gix` paths are
+  `BString` (byte strings). The script lossy-converts to UTF-8 for
+  output and emits a stderr warning for non-UTF-8 paths.
+
+### Line collection: `--changed-vs <ref>` mode (gitoxide)
+
+Same blob-diff machinery, but the two trees are HEAD's tree and the
+merge-base tree:
+
+```rust
+fn changed_vs_added_lines(reference: &str) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
+    let head_id = repo.head_id().change_context(DomainsLintError::OpenRepo)?;
+    let base_id = repo
+        .find_reference(reference)
+        .change_context_lazy(|| DomainsLintError::Reference(reference.into()))?
+        .into_fully_peeled_id()
+        .change_context_lazy(|| DomainsLintError::Reference(reference.into()))?;
+    let merge_base = repo
+        .merge_base(base_id, head_id)
+        .change_context_lazy(|| DomainsLintError::MergeBase { base: reference.into() })?;
+    let base_tree = repo.find_commit(merge_base)?.tree()?;
+    let head_tree = repo.find_commit(head_id)?.tree()?;
+
+    let mut out = Vec::new();
+    for change in tree_vs_tree_changes(&repo, &base_tree, &head_tree)? {
+        // same as staged: extension filter → blob diff → added-line hunks
+    }
+    Ok(out)
+}
+```
+
+**CI requirements (documented when Stage 2 lands):**
+- `actions/checkout@v4` with `fetch-depth: 0` so that the base
+  ref is locally reachable from the working clone. Without it,
+  `find_reference` or `merge_base` returns an error and the linter
+  exits 2 with a clear message.
+- For fork PRs, the base ref must be fetched (`fetch-depth: 0` covers
+  this in `actions/checkout@v4`).
+- **No `git` binary required on the runner.** `gix` reads the
+  on-disk repo directly.
+
+### Line collection: full-repo and explicit paths (gitoxide)
+
+Full-repo audit: iterate the **index** to enumerate tracked files (the
+index respects what `git add` would; equivalent to `git ls-files` but
+via `gix::index::State::entries()`). For each entry whose path passes
+the extension/path filter, read the working-tree file from disk and
+scan every line. Untracked files are intentionally skipped — they
+cannot land in a commit.
+
+```rust
+fn full_repo_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
+    let index = repo.index().change_context(DomainsLintError::Index)?;
+    let work_dir = repo.work_dir().ok_or_else(|| Report::new(DomainsLintError::OpenRepo))?;
+
+    let mut out = Vec::new();
+    for entry in index.entries() {
+        let rel_path = entry.path(&index);  // BString
+        let path = work_dir.join(/* lossy utf8 of rel_path */);
+        if !path_is_scanned(&rel_path) { continue; }
+        let content = std::fs::read_to_string(&path)
+            .change_context_lazy(|| DomainsLintError::ReadFile(path.clone()))?;
+        for (i, line) in content.lines().enumerate() {
+            out.push(DiffLine {
+                path: rel_path.into(),
+                line_no: i + 1,
+                content: line.into(),
+            });
+        }
+    }
+    Ok(out)
+}
+```
+
+Explicit paths: each path is read with `std::fs::read_to_string`, every
+line emitted. No git operations involved (the user named the files
+directly).
+
+### Output Format (`human`)
+
+```
+crates/trusted-server-core/src/foo.rs:42: disallowed host test.com
+trusted-server.toml:15: disallowed host 68.183.113.79
+
+2 disallowed hosts found in 2 files.
+To allow a new integration proxy, add it to EXACT_HOSTS in
+crates/trusted-server-cli/src/lint/domains.rs and document the
+integration in a comment.
+To suppress one line (e.g., security-test attacker hosts), append
+`// allow-domain: <host>` in a comment.
+Run `ts lint domains` (no args) for a full-repo audit.
+```
+
+### Output Format (`json`)
+
+```json
+{
+  "violations": [
+    {
+      "path": "crates/trusted-server-core/src/foo.rs",
+      "line": 42,
+      "host": "test.com",
+      "url": "https://test.com/path"
+    }
+  ],
+  "count": 1,
+  "files_affected": 1
+}
+```
+
+### Pre-commit hook
+
+Git invokes the hook as an executable file; the hook itself is
+necessarily an OS-executable artifact (this is git's hook contract,
+not "shelling out from Rust"). The hook is a minimal one-liner that
+runs the `ts` binary:
+
+```sh
+#!/usr/bin/env bash
+# .githooks/pre-commit — installed by `ts install-hooks`. DO NOT EDIT.
+exec ts lint domains --staged
+```
+
+The hook is intentionally tiny and contains no logic. If `ts` is not
+on PATH, `exec` returns a non-zero status and the commit is blocked
+with a clear message from the shell.
+
+### Hook installer (Rust subcommand)
+
+To keep the workflow Rust-only — no shell scripts in `scripts/`,
+no `git config` invocation from a script — install via a `ts`
+subcommand:
+
+```
+ts install-hooks
+```
+
+This is a small Rust subcommand on the `ts` CLI that:
+
+1. Opens the repo via `gix::open(".")`.
+2. Writes `.githooks/pre-commit` with the one-line content above.
+   Sets the executable bit via `std::fs::Permissions` /
+   `set_permissions`.
+3. Sets `core.hooksPath = .githooks` in the repo config via
+   `gix`'s config-writing API (no subprocess).
+4. Prints a confirmation message.
+
+Pseudocode:
+
+```rust
+pub fn install_hooks() -> Result<(), Report<InstallHooksError>> {
+    let repo = gix::open(".")
+        .change_context(InstallHooksError::OpenRepo)?;
+    let work_dir = repo.work_dir()
+        .ok_or_else(|| Report::new(InstallHooksError::NoWorkdir))?;
+
+    let hooks_dir = work_dir.join(".githooks");
+    std::fs::create_dir_all(&hooks_dir)
+        .change_context(InstallHooksError::WriteHook)?;
+    let hook_path = hooks_dir.join("pre-commit");
+    std::fs::write(&hook_path, PRE_COMMIT_HOOK_CONTENT)
+        .change_context(InstallHooksError::WriteHook)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms)?;
+    }
+
+    // gix config: set core.hooksPath = .githooks (local repo config).
+    let mut config = repo.config_snapshot_mut();
+    config.set_raw_value(&"core.hooksPath", ".githooks")
+        .change_context(InstallHooksError::ConfigWrite)?;
+    config.commit().change_context(InstallHooksError::ConfigWrite)?;
+
+    println!("Installed: pre-commit hook → .githooks/pre-commit");
+    Ok(())
+}
+
+const PRE_COMMIT_HOOK_CONTENT: &str = "\
+#!/usr/bin/env bash
+# Installed by `ts install-hooks`. DO NOT EDIT.
+exec ts lint domains --staged
+";
+```
+
+`ts install-hooks` is a one-time setup contributors run after cloning,
+alongside `cargo install_cli`. Documented in CONTRIBUTING.md.
 
 ## Testing Strategy
 
-A small `scripts/check-domains.test.sh` exercises the linter end-to-end.
+Following the conventions established in PR #669: unit tests live under
+`#[cfg(test)] mod tests` in each module; end-to-end CLI tests use
+`assert_cmd` and `tempfile`.
 
-### Allowed-host cases (must pass clean)
+### Unit tests (in `lint/domains.rs`)
 
-1. **Plain allowed hosts** — `https://example.com`,
-   `https://foo.example.com`, `https://api.privacy-center.org`,
-   `http://127.0.0.1:8080`, `https://github.com/x/y`.
-2. **Subdomain rule** — `https://api.fastly.com` allowed.
-3. **`.example` TLD** — `https://testlight.example` allowed.
-4. **Bracketed IPv6 loopback** — `http://[::1]:8080` allowed.
-5. **Uppercase host** — `HTTPS://Example.COM/path` allowed.
-6. **Quoted / trailing punctuation** — `"https://example.com",`,
-   `(https://example.com)`, `<https://example.com>` all parse cleanly to
-   `example.com`.
-7. **Multiple URLs on one line** — `see [a](https://github.com/a) and
-   [b](https://example.com/b)` → no violations.
-8. **Protocol-relative allowed** — `//www.googletagmanager.com/gtm.js`
-   allowed.
-9. **Suppression marker** — line with `https://evil.com  // allow-domain`
-   passes.
+Pure functions tested directly: `normalise_host`, `is_allowed`,
+`extract_hosts_from_line`, `parse_suppression_marker`.
 
-### Disallowed-host cases (must fail with the expected hosts reported)
+Diff-collection functions (`staged_added_lines`,
+`changed_vs_added_lines`, `full_repo_lines`) are exercised via
+end-to-end tests that build a real temp git repo with `gix` and assert
+on the collected `DiffLine` values.
 
-10. **Plain disallowed hosts** — `https://test.com`, `https://partner.com`,
+### Allowed-host cases
+
+1. Plain allowed hosts — `https://example.com`, `https://foo.example.com`,
+   `https://api.privacy-center.org`, `http://127.0.0.1:8080`,
+   `https://github.com/x/y`.
+2. Subdomain-list rule — `https://foo.example.com` allowed.
+3. `.example` TLD — `https://testlight.example` allowed.
+4. Bracketed IPv6 loopback — `http://[::1]:8080` allowed.
+5. Uppercase host — `HTTPS://Example.COM/path` allowed.
+6. Quoted / trailing punctuation — `"https://example.com",`,
+   `(https://example.com)`, `<https://example.com>` parse cleanly.
+7. Multiple URLs on one line, all allowed — no violations.
+8. Protocol-relative allowed — `//www.googletagmanager.com/gtm.js`.
+9. Legitimate suppression — `// allow-domain: evil.com` passes when host
+   matches.
+10. Multi-host suppression — `// allow-domain: evil.com, bad.org`.
+11. Block-comment / jsdoc suppression — ` * see https://evil.com — allow-domain: evil.com`.
+
+### Disallowed-host cases
+
+12. Plain disallowed hosts — `https://test.com`, `https://partner.com`,
     `https://1.2.3.4` → 3 violations.
-11. **Subdomain-attack lookalike** — `https://example.com.evil.com` →
-    flagged as `example.com.evil.com` (must NOT be allowed by the
-    `example.com` rule).
-12. **Non-loopback IPv6** — `http://[2001:db8::1]/` flagged.
-13. **Protocol-relative disallowed** — `//cdn.example.evil/foo` flagged.
-14. **Multiple disallowed on one line** —
-    `<a href="https://test.com">x</a><a href="https://partner.com">y</a>`
-    → 2 violations on the same line.
+13. Subdomain-attack lookalike — `https://example.com.evil.com` flagged.
+14. Exact-only subdomain attempt — `https://anything.api.privacy-center.org`
+    flagged.
+15. Non-loopback IPv6 — `http://[2001:db8::1]/` flagged as `2001:db8::1`.
+16. Protocol-relative disallowed — `//cdn.example.evil/foo` flagged.
+17. Multiple disallowed on one line — both reported.
+18. **Bypass attempt via URL content** —
+    `fetch("https://evil.com/allow-domain")` → flagged.
+19. **Bypass attempt via URL-path comment-lookalike** —
+    `fetch("https://evil.com/x//allow-domain: evil.com")` → flagged.
+20. **Wrong host in marker** —
+    `https://evil.com // allow-domain: other.com` → `evil.com` flagged;
+    stderr warning notes `other.com` was listed but did not match.
 
-### `--staged` mode cases
+### `--staged` mode cases (`assert_cmd` end-to-end)
 
-15. **New violation in staged change** — temp repo, stage a file
-    containing `https://test.com` → fails with correct `path:line`.
-16. **Existing violation, unrelated staged change** — pre-commit a file
-    with `https://test.com`, then stage an unrelated change in the same
-    file → passes (only added lines scanned).
-17. **Renamed file** — rename `a.rs` → `b.rs` with no content change →
-    no spurious violations; with an added violation line → reported as
-    `b.rs:N`.
-18. **File deletion** — staged deletion of a file containing a disallowed
-    URL → no violations (deletion is not an addition).
-19. **Filename with spaces** — staged file `dir/with spaces.rs` containing
-    `https://test.com` → reported (test that the awk doesn't silently
-    drop the file). If unsupported, must emit a clear warning, not pass
-    silently.
+Each test sets up a temp git repo using `gix::init`, populates blobs
+and the index with `gix` APIs (no shell), runs the binary with
+`assert_cmd`, asserts exit code and stdout/stderr.
 
-### Path-exclusion cases
+21. New violation in staged change → exits 1 with correct `path:line`.
+22. Existing violation, unrelated staged change → exits 0.
+23. Renamed file with added violation → reported at new path.
+24. File deletion of a file containing disallowed URL → exits 0.
+25. Filename with spaces or non-ASCII characters — handled correctly
+    by `gix` (no quoting layer to fight with); reported normally.
+    Non-UTF-8 path component emits a stderr warning but the host is
+    still flagged.
+26. Multiple hunks in one file — all added lines reported correctly.
 
-20. **`node_modules/`** — file under `node_modules/foo.js` with
-    `https://test.com` is ignored.
-21. **`**/fixtures/**`** — file under
-    `crates/trusted-server-core/src/integrations/nextjs/fixtures/x.html`
-    is ignored.
-22. **`.worktrees/`** — file under `.worktrees/x/y.rs` is ignored.
+### `--changed-vs` mode cases
 
-Run as `scripts/check-domains.test.sh`; exit non-zero on any failure.
+27. Two commits on a branch, second adds a violation → reported.
+28. Merge-base correctly computed when branch is behind base.
+29. Missing remote ref → exits 2 with clear message.
+
+### Path-exclusion and inclusion cases
+
+30. `node_modules/foo.js` with `https://test.com` → ignored.
+31. `.worktrees/x/y.rs` → ignored.
+32. `*.html` extension → ignored regardless of path.
+33. **Proves the `**/fixtures/**` blanket exclusion was removed**:
+    `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx`
+    fixture with `https://test.com` → reported.
+34. `package-lock.json` → ignored.
+
+### Environment cases
+
+35. **Not inside a git repo** — `gix::open` fails →
+    exits 2 with `DomainsLintError::OpenRepo` and a clear message.
+36. **Bare repo / no working tree** — `gix::open` succeeds but
+    `repo.work_dir()` is `None` (only relevant for the full-repo
+    mode that reads working-tree files) → exits 2 with a clear
+    message.
+37. **No git binary on PATH at all** — the linter still works
+    end-to-end (verified by running the binary under `env -i PATH=""`,
+    confirming `gix` is self-contained).
+38. Run unit tests under `cargo test --package trusted-server-cli`
+    on the host target (matches PR #669's split CI lanes).
 
 ## Trade-offs
 
 - **Pre-commit-only enforcement is bypassable.** `git commit --no-verify`
-  skips the hook. Closing this gap requires the migration plan below.
-- **`--staged` mode misses violations introduced via rebase/merge** that do
-  not go through `git commit`. Acceptable for v1; CI follow-up catches them.
-- **Inline allowlist requires editing the script** to add a new integration
-  proxy. Acceptable given expected low churn; switching to a config file is
-  trivial later.
-- **Existing violations are not addressed.** They will remain until those
-  files are touched. Acceptable because the goal is to prevent regression,
-  not force an immediate cleanup.
-- **HTML/CSS/Dockerfile not scanned.** Real-world publisher HTML fixtures
-  contain third-party URLs that cannot reasonably be allowlisted. The risk
-  is that disallowed domains could land in those files without detection;
-  mitigated by the fact that the integration code reading those fixtures
-  is already covered.
-- **Per-line `allow-domain` marker is host-agnostic.** A line marked
-  `allow-domain` suppresses *any* disallowed host on that line. This is
-  intentional to keep the scanner simple; reviewers verify intent at PR
-  time. If misuse becomes a problem, future versions can require
-  `allow-domain: evil.com` with named hosts.
-- **Filenames with spaces in `--staged` mode are not fully supported.**
-  Git escapes them in diff output; v1 emits a warning rather than a silent
-  miss.
+  skips the hook. Closed by the migration plan.
+- **`--staged` mode misses violations introduced via rebase/merge** that
+  don't go through `git commit`. CI follow-up catches them.
+- **Inline allowlist requires editing the Rust source.** Each new
+  integration proxy requires a code change + review. Acceptable given
+  expected low churn.
+- **Existing violations are not addressed.** They remain until those
+  files are touched. The full-repo audit (`ts lint domains` no args) is
+  **diagnostic-only** in Stage 1 — it will report many existing
+  violations; that is expected, not a failure.
+- **Bare-string hostnames are not detected.** Config values like
+  `cookie_domain = "test-publisher.com"` are out of scope.
+- **HTML/CSS/Dockerfile blind spot.** Accepted; not mitigated by other
+  code paths.
+- **Non-UTF-8 filenames** are lossy-converted for display and emit a
+  stderr warning. `gix` preserves them as `BString` internally so
+  scanning works correctly; only the printed `path:line` output is
+  affected.
+- **Back-to-back protocol-relative URLs without a separator**
+  (`//a.com//b.com`) miss the second host. No real-world occurrence in
+  this repo.
+- **PR #669 hard prerequisite.** This work cannot start until #669
+  merges. If #669 stalls, this design needs revisiting (alternative:
+  ship as a standalone `trusted-server-lint` crate).
+- **New top-level dependency: `gix`.** Pulls in ~15 sub-crates
+  (gix-diff, gix-revision, gix-index, gix-config, etc.). Adds
+  meaningful compile time to the host-target CLI build. Mitigation:
+  use `default-features = false` and enable only the needed features
+  (`blob-diff`, `revision`, `index`, `config`). Acceptable because the
+  alternative (shelling to `git`) was rejected as a hard requirement.
 
 ## Migration to CI
 
-The pre-commit hook is bypassable and machine-specific. To make this rule
-authoritatively enforced, a CI gate is required. The migration is
-**deliberately staged** because turning on a full-repo audit today would
-fail on the ~30 existing violations:
+**Stage 1 (this design):** Pre-commit hook calling
+`ts lint domains --staged`. Prevents *new* violations. Full-repo audit
+available but diagnostic-only.
 
-**Stage 1 (this design):** Pre-commit hook with `--staged` mode. Prevents
-*new* violations.
+**Stage 2:** GitHub Actions workflow runs
+`ts lint domains --changed-vs $GITHUB_BASE_REF` on every PR. Same
+delta-only enforcement, unbypassable. Requirements:
+- `actions/checkout@v4` with `fetch-depth: 0` (or explicit fetch of
+  `$GITHUB_BASE_REF`).
+- Reuse the host-target CI lane introduced by PR #669 (since `ts`
+  binary is host-target only).
 
-**Stage 2:** Add a CI workflow that runs `scripts/check-domains.sh
---changed-vs origin/main` — scanning only lines added relative to the PR
-base. Same enforcement model as the local hook, but unbypassable per PR.
-Requires implementing the `--changed-vs <ref>` mode (small extension of
-`--staged`; same awk parser, different diff command).
-
-**Stage 3 (optional):** Either (a) clean the existing violations and add a
-full-repo audit as a CI gate, or (b) snapshot a baseline file
-(`scripts/.allowed-domains-baseline`) and run the full-repo audit with
-baseline subtraction. Stage 3 is not committed-to in this design; the
-decision can be made after Stages 1 and 2 are stable.
+**Stage 3 (optional, deferred):** Either (a) clean existing violations
+and add full-repo audit as a CI gate, or (b) snapshot a baseline file
+and run full-repo audit with baseline subtraction. Choice deferred
+until Stages 1 and 2 are stable.
 
 ## Open Questions
 
-None.
+1. **Subcommand naming.** `ts lint domains` vs `ts check domains` vs
+   `ts audit domains`. Current pick: `ts lint domains`. Confirm before
+   implementation.
+2. **`cdn.prebid.org` on allowlist vs converting `prebid.rs` tests to
+   `.example`?** Current pick: allowlist. Revisit if rigorous
+   separation is preferred.
+3. **Reference-doc hosts and subdomains.** `github.com` is exact-only,
+   meaning `docs.github.com` (sometimes appears in `.github/workflows`)
+   would have to be added explicitly. Currently not added; line-level
+   suppression covers occasional uses.
+4. **Stage 1 cleanup expectations.** Do we ship with existing
+   violations intact and clean them incrementally as files are
+   touched, or open a follow-up cleanup PR? Current pick: ship
+   without cleanup; cleanup is a separate workstream.
+5. **Boilerplate `package.json` URLs.** `crates/integration-tests/fixtures/frameworks/nextjs/`
+   contains `opencollective.com`, `tidelift.com`, `registry.npmjs.org`.
+   Allowlist them, suppress per-line, or rewrite to `.example`?
+   Current pick: suppress per-line since these are non-recurring
+   boilerplate.
+6. **Suppression marker syntax** — `allow-domain: host` vs
+   `// allowed-domain: host` vs other forms. Current pick:
+   `allow-domain: host`, comment-anchored, host-validated.
