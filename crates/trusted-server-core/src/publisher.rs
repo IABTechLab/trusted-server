@@ -262,26 +262,32 @@ fn process_response_streaming<W: Write>(
     Ok(())
 }
 
-/// Create a unified HTML stream processor
+/// Create a unified HTML stream processor.
+///
+/// Builds the config via [`HtmlProcessorConfig::from_settings`] and then
+/// layers the auction-hold streaming fields on top via
+/// [`HtmlProcessorConfig::with_ad_state`], so the canonical builder stays the
+/// single source of truth: a future field added to `from_settings` is
+/// inherited here automatically.
 fn create_html_stream_processor(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
-    _settings: &Settings,
+    settings: &Settings,
     integration_registry: &IntegrationRegistry,
     ad_slots_script: Option<String>,
     ad_bids_state: Arc<RwLock<Option<String>>>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
-    let config = HtmlProcessorConfig {
-        origin_host: origin_host.to_string(),
-        request_host: request_host.to_string(),
-        request_scheme: request_scheme.to_string(),
-        integrations: integration_registry.clone(),
-        ad_slots_script,
-        ad_bids_state,
-    };
+    let config = HtmlProcessorConfig::from_settings(
+        settings,
+        integration_registry,
+        origin_host,
+        request_host,
+        request_scheme,
+    )
+    .with_ad_state(ad_slots_script, ad_bids_state);
 
     Ok(create_html_processor(config))
 }
@@ -576,6 +582,40 @@ pub(crate) fn write_bids_to_state(
     *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
 }
 
+/// Prepend an HTML comment summarising the auction result onto the shared
+/// `ad_bids_state` so it lands directly before the injected bids `<script>`.
+///
+/// `path_label` differentiates the streaming-with-auction-hold path (`stream`)
+/// from the buffered path (`buffered`) in the resulting `<!-- ts-debug: -->`
+/// marker so on-page debugging can tell which code path produced the bids.
+pub(crate) fn prepend_auction_debug_comment(
+    path_label: &str,
+    result: &crate::auction::orchestrator::OrchestrationResult,
+    ad_bids_state: &Arc<RwLock<Option<String>>>,
+) {
+    let ssp_count = result.provider_responses.len();
+    let mediator_info = match &result.mediator_response {
+        Some(r) => format!("ok({}_bids)", r.bids.len()),
+        None => "none".to_string(),
+    };
+    let debug_comment = format!(
+        "<!-- ts-debug: path={path_label} ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
+        result.winning_bids.len(),
+        result.total_time_ms,
+    );
+    let mut state = ad_bids_state
+        .write()
+        .expect("should write bid state for debug");
+    match &mut *state {
+        Some(script) => {
+            *script = format!("{debug_comment}\n{script}");
+        }
+        None => {
+            *state = Some(debug_comment);
+        }
+    }
+}
+
 /// Bundles the auction-collection dependencies passed through the streaming helpers.
 struct AuctionCollectCtx<'a> {
     dispatched: DispatchedAuction,
@@ -678,27 +718,7 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
 
                 if settings.debug.auction_html_comment {
-                    let ssp_count = result.provider_responses.len();
-                    let mediator_info = match &result.mediator_response {
-                        Some(r) => format!("ok({}_bids)", r.bids.len()),
-                        None => "none".to_string(),
-                    };
-                    let debug_comment = format!(
-                        "<!-- ts-debug: path=stream ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
-                        result.winning_bids.len(),
-                        result.total_time_ms,
-                    );
-                    let mut state = ad_bids_state
-                        .write()
-                        .expect("should write bid state for debug");
-                    match &mut *state {
-                        Some(script) => {
-                            *script = format!("{debug_comment}\n{script}");
-                        }
-                        None => {
-                            *state = Some(debug_comment);
-                        }
-                    }
+                    prepend_auction_debug_comment("stream", &result, ad_bids_state);
                 }
 
                 // Process the held last chunk (not is_last — finalization is separate).
@@ -935,13 +955,16 @@ pub async fn handle_publisher_request(
             .creative_opportunities
             .as_ref()
             .expect("should be present when should_run_auction is true");
+        let slots_ctx = MatchedSlotsContext {
+            matched_slots: &matched_slots,
+            request_path: &request_path,
+            co_config,
+        };
         let mut auction_request = build_auction_request(
-            &matched_slots,
+            &slots_ctx,
             &ec_id,
             &consent_context,
             &request_info,
-            &request_path,
-            co_config,
             req.get_header_str("user-agent"),
         );
         auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
@@ -1133,27 +1156,7 @@ pub async fn handle_publisher_request(
                 write_bids_to_state(&result.winning_bids, price_granularity, &ad_bids_state);
 
                 if settings.debug.auction_html_comment {
-                    let ssp_count = result.provider_responses.len();
-                    let mediator_info = match &result.mediator_response {
-                        Some(r) => format!("ok({}_bids)", r.bids.len()),
-                        None => "none".to_string(),
-                    };
-                    let debug_comment = format!(
-                        "<!-- ts-debug: path=buffered ssp={ssp_count} mediator={mediator_info} winning={} time={}ms -->",
-                        result.winning_bids.len(),
-                        result.total_time_ms,
-                    );
-                    let mut state = ad_bids_state
-                        .write()
-                        .expect("should write bid state for debug");
-                    match &mut *state {
-                        Some(script) => {
-                            *script = format!("{debug_comment}\n{script}");
-                        }
-                        None => {
-                            *state = Some(debug_comment);
-                        }
-                    }
+                    prepend_auction_debug_comment("buffered", &result, &ad_bids_state);
                 }
             }
 
@@ -1181,23 +1184,33 @@ pub async fn handle_publisher_request(
     }
 }
 
+/// Bundle of the per-request creative-opportunity inputs that travel together.
+///
+/// Extracted so `build_auction_request` stays under the project's
+/// 7-argument cap (`matched_slots` + `request_path` + `co_config` all live
+/// for the same request scope and are passed together everywhere).
+pub(crate) struct MatchedSlotsContext<'a> {
+    pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
+    pub request_path: &'a str,
+    pub co_config: &'a crate::creative_opportunities::CreativeOpportunitiesConfig,
+}
+
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
 pub(crate) fn build_auction_request(
-    matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    slots_ctx: &MatchedSlotsContext<'_>,
     ec_id: &str,
     consent_context: &crate::consent::ConsentContext,
     request_info: &crate::http_util::RequestInfo,
-    request_path: &str,
-    co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
     user_agent: Option<&str>,
 ) -> AuctionRequest {
-    let slots = matched_slots
+    let slots = slots_ctx
+        .matched_slots
         .iter()
-        .map(|s| s.to_ad_slot(&co_config.gam_network_id))
+        .map(|s| s.to_ad_slot(&slots_ctx.co_config.gam_network_id))
         .collect();
     let page_url = format!(
         "{}://{}{}",
-        request_info.scheme, request_info.host, request_path
+        request_info.scheme, request_info.host, slots_ctx.request_path
     );
     AuctionRequest {
         id: format!("ts-{}", ec_id),
@@ -1498,13 +1511,16 @@ pub async fn handle_page_bids(
         && !is_bot
         && !is_prefetch
     {
+        let slots_ctx = MatchedSlotsContext {
+            matched_slots: &matched_slots,
+            request_path: &path_param,
+            co_config,
+        };
         let mut auction_request = build_auction_request(
-            &matched_slots,
+            &slots_ctx,
             &ec_id,
             &consent_context,
             &request_info,
-            &path_param,
-            co_config,
             req.get_header_str("user-agent"),
         );
         auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());

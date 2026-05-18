@@ -167,6 +167,24 @@ impl HtmlProcessorConfig {
             ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
+
+    /// Attach the streaming-auction `<script>` payloads to a config built via
+    /// [`HtmlProcessorConfig::from_settings`].
+    ///
+    /// Callers that drive the auction-hold streaming path use this rather than
+    /// constructing [`HtmlProcessorConfig`] inline so the canonical
+    /// [`from_settings`](Self::from_settings) builder stays the single source of
+    /// truth: future fields added there are inherited automatically.
+    #[must_use]
+    pub fn with_ad_state(
+        mut self,
+        ad_slots_script: Option<String>,
+        ad_bids_state: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    ) -> Self {
+        self.ad_slots_script = ad_slots_script;
+        self.ad_bids_state = ad_bids_state;
+        self
+    }
 }
 
 /// Create an HTML processor with URL replacement and integration hooks.
