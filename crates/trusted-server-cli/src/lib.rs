@@ -37,7 +37,10 @@ enum Command {
         command: ConfigCommand,
     },
     Audit(AuditArgs),
-    Dev(DevArgs),
+    Dev {
+        #[command(subcommand)]
+        command: dev::DevCommand,
+    },
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -83,18 +86,6 @@ struct AuditArgs {
     no_config: bool,
     #[arg(long)]
     force: bool,
-}
-
-#[derive(Debug, Args)]
-struct DevArgs {
-    #[arg(long, short = 'a', default_value = "fastly")]
-    adapter: dev::Adapter,
-    #[arg(long)]
-    config: Option<PathBuf>,
-    #[arg(long, default_value = "local")]
-    env: String,
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    passthrough: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -181,7 +172,7 @@ fn execute() -> Result<(), Report<CliError>> {
     match cli.command {
         Command::Config { command } => run_config(command),
         Command::Audit(args) => run_audit(&args),
-        Command::Dev(args) => run_dev(&args),
+        Command::Dev { command } => run_dev(command),
         Command::Auth { command } => run_auth(command),
         Command::Provision { command } => run_provision(command),
     }
@@ -278,7 +269,13 @@ fn run_audit(args: &AuditArgs) -> Result<(), Report<CliError>> {
     ))
 }
 
-fn run_dev(args: &DevArgs) -> Result<(), Report<CliError>> {
+fn run_dev(command: dev::DevCommand) -> Result<(), Report<CliError>> {
+    match command {
+        dev::DevCommand::Serve(args) => run_dev_serve(&args),
+    }
+}
+
+fn run_dev_serve(args: &dev::ServeArgs) -> Result<(), Report<CliError>> {
     let validated = config::load_validated_config(args.config.as_deref())?;
     let status = dev::run_dev_command(args.adapter, &validated, &args.env, &args.passthrough)?;
     if status.success() {
