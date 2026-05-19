@@ -8,7 +8,7 @@ use crate::config::ValidatedConfig;
 use crate::error::CliError;
 
 pub const FASTLY_LOCAL_MANIFEST: &str = "fastly.local.toml";
-const EMBEDDED_FASTLY_TEMPLATE: &str = include_str!("../../../fastly.toml");
+const EMBEDDED_FASTLY_TEMPLATE: &str = include_str!("../../../../fastly.toml");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Adapter {
