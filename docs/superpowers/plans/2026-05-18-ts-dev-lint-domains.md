@@ -349,6 +349,17 @@ spec §'Cargo dependencies'. Feasibility spike tests follow."
 
 ### Task 2.2: Spike test 1 — staged blob diff with new-side line numbers
 
+**All spike-test commit helpers must use a fixed author/committer
+signature**, not rely on the host's `user.name` / `user.email` git
+config. A clean CI runner or fresh dev machine without global git
+identity would otherwise fail the spike with "please tell me who
+you are." The Phase 4 `test_support` module (Task 4.0) documents
+the same requirement and pins a `test_signature()` helper; the
+spike helpers in Tasks 2.2 / 2.3 should pin an equivalent fixed
+signature locally. When the spike succeeds, the same constant can
+be reused from `test_support` once that module exists in Phase 4.
+
+
 **Files:**
 - Create: `crates/trusted-server-cli/tests/spike_gix_staged_diff.rs`
 
@@ -2037,6 +2048,8 @@ Signature: `pub(crate) fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<D
 - [ ] **Step 1: Write failing tests** for the extension and path-exclusion filter:
   - `foo.rs` → scanned.
   - `foo.html` → not scanned.
+  - `foo.css` → not scanned.
+  - `Dockerfile` → not scanned (no scanned extension matches).
   - `node_modules/foo.js` → not scanned (path exclusion).
   - `.worktrees/x/y.rs` → not scanned.
   - `package-lock.json` → not scanned.
@@ -2045,6 +2058,14 @@ Signature: `pub(crate) fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<D
   - `.env.dev` → scanned (matches `.env*`).
   - `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx` → scanned (proves the **/fixtures/** blanket exclusion was removed).
   - `crates/trusted-server-cli/src/dev/lint/domains.rs` → NOT scanned (self-exclude).
+  - **Markdown coverage (spec §"File extensions scanned" mandates `.md` is in scope):**
+    - `README.md` → scanned.
+    - `CHANGELOG.md` → scanned.
+    - `CONTRIBUTING.md` → scanned.
+    - `docs/guide/onboarding.md` → scanned.
+    - `docs/superpowers/specs/2026-05-18-check-domains-design.md` → scanned (spec itself is in scope).
+    - `foo.markdown` → NOT scanned (only `.md` is in the extension list, not `.markdown`).
+    - `foo.MD` → NOT scanned (case-sensitive extension match per Rust conventions; if a contributor uses uppercase, they get a warning at scan time, not a silent skip — document this as a known limitation if `.MD` files appear in real PRs).
 
 - [ ] **Step 2: Verify failure.**
 
@@ -2153,6 +2174,14 @@ pub struct DomainsArgs {
     /// Output format. Default: human.
     #[arg(long, value_enum, default_value = "human")]
     pub format: OutputFormat,
+
+    /// Verbose: print per-file scan progress on stderr (number of
+    /// lines scanned per file, number of suppressed hosts per line).
+    /// Off by default; useful for debugging "why was X not flagged"
+    /// or "is this file being scanned at all". Has no effect on
+    /// exit code or violation count.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -2258,7 +2287,25 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
     };
 
     let mut violations: Vec<FileViolation> = Vec::new();
+    let mut last_verbose_path: Option<std::path::PathBuf> = None;
+    let mut verbose_line_count: usize = 0;
     for line in lines {
+        if args.verbose {
+            // Tally per-file line counts for the end-of-file summary.
+            match &last_verbose_path {
+                Some(prev) if prev == &line.path => verbose_line_count += 1,
+                _ => {
+                    if let Some(prev) = last_verbose_path.take() {
+                        crate::output::write_stderr_line(format!(
+                            "scanned {} lines in {}",
+                            verbose_line_count, prev.display()
+                        ))?;
+                    }
+                    last_verbose_path = Some(line.path.clone());
+                    verbose_line_count = 1;
+                }
+            }
+        }
         let outcome = scan_line(&line.content);
         for unused in outcome.unused_suppressions {
             crate::output::write_stderr_line(format!(
@@ -2274,6 +2321,13 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
                 url_excerpt: line.content.clone(),
             });
         }
+    }
+    if let Some(prev) = last_verbose_path {
+        // Flush the last file's tally.
+        crate::output::write_stderr_line(format!(
+            "scanned {} lines in {}",
+            verbose_line_count, prev.display()
+        ))?;
     }
 
     match args.format {
@@ -2360,10 +2414,36 @@ use `write_stderr_line(format!(...))`, not `eprintln!`.
 Run: `cargo check --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"`
 Expected: PASS.
 
-- [ ] **Step 3: Smoke-test against the existing repo**
+- [ ] **Step 3: Smoke-test in a throwaway tempdir, NOT the working repo**
 
-Run: `cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev lint domains --staged`
-Expected: exits 0 (assuming no staged changes). Then stage a file with `https://test.com` and re-run; expected exit 1 with the violation printed.
+Building and running `ts dev lint domains --staged` directly in the
+working checkout would (a) require staging a `https://test.com`
+fixture file in this repo — easy to forget to revert — and (b)
+report on the existing Stage 1 doc violations, drowning the
+smoke-test output in noise. Use a throwaway tempdir instead:
+
+```sh
+TMPREPO="$(mktemp -d)"
+( cd "$TMPREPO" && git init -q && \
+  git config user.name 'smoke' && git config user.email 'smoke@example.com' && \
+  echo 'fn ok() {}' > ok.rs && git add ok.rs && git commit -q -m initial && \
+  echo 'let bad = "https://test.com";' > bad.rs && git add bad.rs )
+TS_BIN="$(cargo build --quiet --package trusted-server-cli \
+  --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  --message-format=json 2>/dev/null \
+  | jq -r 'select(.executable != null and (.target.name == "ts")) | .executable' | tail -1)"
+( cd "$TMPREPO" && "$TS_BIN" dev lint domains --staged ) ; rc=$?
+echo "exit: $rc"
+rm -rf "$TMPREPO"
+```
+
+Expected: prints `bad.rs:1: disallowed host test.com` (and the
+summary lines) to stdout, then `exit: 1`. Clean exit code, no
+artifacts left in the working repo.
+
+If `jq` is unavailable, run `ts dev lint domains --staged` from the
+already-installed `ts` binary (post `cargo install_cli`) instead of
+extracting the path from `cargo build --message-format=json`.
 
 - [ ] **Step 4: Commit**
 
@@ -2533,6 +2613,24 @@ predicates = "3"
 - [ ] Implement each case as a `#[test]` in `crates/trusted-server-cli/tests/lint_domains_cli.rs`. Each test builds a tempdir repo, invokes `Command::cargo_bin("ts").args(["dev", "lint", "domains", "--staged"]).current_dir(&tempdir)`, asserts on exit code + stdout + stderr.
 
 - [ ] Each case gets its own task step: write failing test → verify failure → confirm production code already passes it → commit.
+
+- [ ] **Spec case 25 (non-UTF-8 staged path) requires an explicit stderr assertion** in addition to the exit-code and stdout checks. The inline Task 4.1 test proves the path is not skipped; the Phase 7 E2E test must additionally assert that stderr contains the lossy-path warning string (`"staged path is not valid UTF-8; displaying lossy:"` or whatever exact phrasing Task 4.1's implementation lands on). Example assertion using `predicates`:
+
+  ```rust
+  use predicates::prelude::*;
+  // ... build a tempdir repo, stage a file with a 0xff byte in the
+  // name containing https://test.com ...
+  Command::cargo_bin("ts")
+      .expect("should find ts binary")
+      .args(["dev", "lint", "domains", "--staged"])
+      .current_dir(&tempdir)
+      .assert()
+      .code(1)
+      .stdout(predicate::str::contains("disallowed host test.com"))
+      .stderr(predicate::str::contains("not valid UTF-8"));
+  ```
+
+  This locks the staged non-UTF-8 reporting contract at the E2E layer so a future refactor cannot silently start skipping these paths.
 
 ### Task 7.3: End-to-end tests for `--changed-vs` mode (spec cases 27–29)
 
