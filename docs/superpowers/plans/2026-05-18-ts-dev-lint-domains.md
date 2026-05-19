@@ -202,7 +202,7 @@ fn run_dev(command: dev::DevCommand) -> Result<(), Report<CliError>> {
 }
 
 fn run_dev_serve(args: &dev::ServeArgs) -> Result<(), Report<CliError>> {
-    let validated = config::load_and_validate(args.config.as_deref())?;
+    let validated = config::load_validated_config(args.config.as_deref())?;
     let status = dev::run_dev_command(args.adapter, &validated, &args.env, &args.passthrough)?;
     if status.success() {
         Ok(())
@@ -329,22 +329,22 @@ use tempfile::tempdir;
 
 #[test]
 fn staged_blob_diff_yields_new_side_line_numbers() {
-    let temp = tempdir().expect("temp dir");
+    let temp = tempdir().expect("should create tempdir");
     let repo_path = temp.path();
-    let repo = gix::init(repo_path).expect("gix init");
+    let repo = gix::init(repo_path).expect("should init gix repo");
 
     // Commit 1: a file with three lines.
     let file = repo_path.join("a.txt");
-    fs::write(&file, "alpha\nbeta\ngamma\n").expect("write");
+    fs::write(&file, "alpha\nbeta\ngamma\n").expect("should write initial file");
     let commit1 = gix_test_util::commit_all(&repo, "initial");
 
     // Stage a modification adding a new line at position 2.
-    fs::write(&file, "alpha\nNEW LINE\nbeta\ngamma\n").expect("write");
+    fs::write(&file, "alpha\nNEW LINE\nbeta\ngamma\n").expect("should write modification");
     gix_test_util::stage_all(&repo);
 
     // Call the conceptual operation: enumerate index-vs-HEAD changes,
     // and for each modified blob produce hunks with new-side line numbers.
-    let hunks = gix_test_util::staged_blob_hunks(&repo).expect("staged hunks");
+    let hunks = gix_test_util::staged_blob_hunks(&repo).expect("should collect staged hunks");
 
     // We expect exactly one added line at new-side line 2 with content "NEW LINE".
     let added: Vec<(String, usize, String)> = hunks
@@ -451,23 +451,24 @@ use tempfile::tempdir;
 
 #[test]
 fn merge_base_then_tree_diff_yields_added_lines() {
-    let temp = tempdir().expect("temp dir");
+    let temp = tempdir().expect("should create tempdir");
     let repo_path = temp.path();
-    let repo = gix::init(repo_path).expect("gix init");
+    let repo = gix::init(repo_path).expect("should init gix repo");
 
     // main: commit a single line on a branch named "main".
     let file = repo_path.join("a.txt");
-    fs::write(&file, "one\n").expect("write");
+    fs::write(&file, "one\n").expect("should write base file");
     let _base = spike_helpers::commit_all_as_branch(&repo, "main", "first");
 
     // feature: branch off main, add another line.
     spike_helpers::create_and_checkout_branch(&repo, "feature");
-    fs::write(&file, "one\ntwo\n").expect("write");
+    fs::write(&file, "one\ntwo\n").expect("should write feature-branch change");
     let _head = spike_helpers::commit_all(&repo, "second");
 
     // Conceptual operation: merge-base("main", HEAD) then diff the
     // merge-base tree against HEAD tree.
-    let added = spike_helpers::changed_vs_ref(&repo, "main").expect("changed_vs");
+    let added = spike_helpers::changed_vs_ref(&repo, "main")
+        .expect("should compute changed-vs added lines");
 
     assert_eq!(
         added,
@@ -557,9 +558,9 @@ use tempfile::tempdir;
 
 #[test]
 fn write_core_hooks_path_via_gix_config_persists_to_disk() {
-    let temp = tempdir().expect("temp dir");
+    let temp = tempdir().expect("should create tempdir");
     let repo_path = temp.path();
-    let _repo = gix::init(repo_path).expect("gix init");
+    let _repo = gix::init(repo_path).expect("should init gix repo");
 
     spike_helpers::set_local_config_value(
         repo_path,
@@ -568,7 +569,7 @@ fn write_core_hooks_path_via_gix_config_persists_to_disk() {
         "hooksPath",
         ".githooks",
     )
-    .expect("write succeeded");
+    .expect("should write core.hooksPath via gix-config");
 
     // Read via gix-config and confirm.
     let value = spike_helpers::read_local_config_value(
@@ -577,13 +578,13 @@ fn write_core_hooks_path_via_gix_config_persists_to_disk() {
         None,
         "hooksPath",
     )
-    .expect("read");
+    .expect("should read core.hooksPath back");
     assert_eq!(value.as_deref(), Some(".githooks"));
 
     // Sanity: reading directly off disk should show the section
     // and key in canonical format.
     let on_disk = fs::read_to_string(repo_path.join(".git/config"))
-        .expect("read .git/config");
+        .expect("should read .git/config from disk");
     assert!(
         on_disk.contains("[core]") && on_disk.contains("hooksPath"),
         "should contain core/hooksPath: {on_disk:?}"
@@ -592,9 +593,9 @@ fn write_core_hooks_path_via_gix_config_persists_to_disk() {
 
 #[test]
 fn read_local_config_value_returns_none_when_unset() {
-    let temp = tempdir().expect("temp dir");
+    let temp = tempdir().expect("should create tempdir");
     let repo_path = temp.path();
-    let _repo = gix::init(repo_path).expect("gix init");
+    let _repo = gix::init(repo_path).expect("should init gix repo");
 
     let value = spike_helpers::read_local_config_value(
         repo_path,
@@ -602,7 +603,7 @@ fn read_local_config_value_returns_none_when_unset() {
         None,
         "hooksPath",
     )
-    .expect("read");
+    .expect("should read core.hooksPath (returning None)");
     assert!(value.is_none(), "unset value reads as None: {value:?}");
 }
 
@@ -1108,7 +1109,7 @@ fn absolute_url_regex() -> &'static Regex {
         // (?i) case-insensitive; host must start with alphanumeric to
         // reject placeholders like https://...
         Regex::new(r"(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
-            .expect("absolute URL regex compiles")
+            .expect("should compile absolute URL regex")
     })
 }
 
@@ -1228,7 +1229,7 @@ fn protocol_relative_regex() -> &'static Regex {
         Regex::new(
             r"(?i)(?:^|[\s\"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})",
         )
-        .expect("protocol-relative URL regex compiles")
+        .expect("should compile protocol-relative URL regex")
     })
 }
 
@@ -1338,7 +1339,7 @@ fn suppression_marker_regex() -> &'static Regex {
         Regex::new(
             r"(?im)(?:^|\s)(?://|\#|<!--|\*\s)\s*allow-domain:\s*([A-Za-z0-9.\-:\[\],\s]+?)(?:-->|$)",
         )
-        .expect("suppression marker regex compiles")
+        .expect("should compile suppression marker regex")
     })
 }
 
@@ -1585,47 +1586,151 @@ Spec §"Line collection: --staged mode", §"Line collection: --changed-vs", §"L
 
 Each task in this phase pulls the gix entry points from the Phase 2 spike tests and wraps them in production helpers under `dev/lint/domains.rs`. Re-read the spike test bodies before implementing.
 
+**Tests live as inline `#[cfg(test)] mod tests` blocks inside `dev/lint/domains.rs`, NOT as files under `crates/trusted-server-cli/tests/`.** Reason: `lib.rs` declares `mod dev;` (private), so integration tests under `tests/` cannot reach `trusted_server_cli::dev::lint::domains::staged_added_lines` or any other path inside the crate. Inline tests get full access to the private/`pub(crate)` items. End-to-end binary-level tests (Phase 7) belong in `tests/` because they call `Command::cargo_bin("ts")`.
+
+A shared helper module for git-repo fixtures lives at `dev/lint/test_support.rs` and is gated `#[cfg(test)]`. Copy the `commit_all` / `stage_all` / branch helpers proven in the Phase 2 spike tests into it (the spike tests stay where they are; this file is the production-quality version of those helpers).
+
+### Task 4.0: Extract git-fixture helpers into a shared `test_support` module
+
+**Files:**
+- Create: `crates/trusted-server-cli/src/dev/lint/test_support.rs`
+- Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
+
+- [ ] **Step 1: Create `dev/lint/test_support.rs`**
+
+Lift the helper functions from `tests/spike_gix_staged_diff.rs` and `tests/spike_gix_changed_vs.rs` (the production-quality versions, not the `unimplemented!()` shells). Signatures:
+
+```rust
+#![cfg(test)]
+
+use std::path::Path;
+
+use gix::ObjectId;
+
+pub(crate) fn init_repo(path: &Path) -> gix::Repository { /* ... */ }
+pub(crate) fn commit_all(repo: &gix::Repository, msg: &str) -> ObjectId { /* ... */ }
+pub(crate) fn stage_all(repo: &gix::Repository) { /* ... */ }
+pub(crate) fn create_and_checkout_branch(repo: &gix::Repository, branch: &str) { /* ... */ }
+pub(crate) fn commit_all_as_branch(repo: &gix::Repository, branch: &str, msg: &str) -> ObjectId { /* ... */ }
+```
+
+- [ ] **Step 2: Wire the module**
+
+In `dev/lint/mod.rs`, add:
+
+```rust
+#[cfg(test)]
+pub(crate) mod test_support;
+```
+
+- [ ] **Step 3: Verify it compiles**
+
+Run: `cargo check --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --tests`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/trusted-server-cli/src/dev/lint/test_support.rs crates/trusted-server-cli/src/dev/lint/mod.rs
+git commit -m "Add dev/lint/test_support: shared git fixtures for module tests
+
+Lifts the working gix helper bodies from tests/spike_gix_*.rs into
+a #[cfg(test)] pub(crate) module that the inline #[cfg(test)] mod
+tests blocks in domains.rs (Phase 4) can use. The spike tests
+themselves stay in tests/ and continue to drive their unimplemented
+stubs through the pinned implementations."
+```
+
 ### Task 4.1: `staged_added_lines` (TDD)
 
-- [ ] **Step 1: Write failing test**
+**Files:**
+- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
-Create `crates/trusted-server-cli/tests/lint_staged_e2e.rs`. The test builds a tempdir repo via `gix::init`, commits a file, stages a modification, and asserts the returned `DiffLine` matches expectations. Use the helpers proven in `tests/spike_gix_staged_diff.rs` for the setup — copy `commit_all` / `stage_all` into a `tests/common/git_fixtures.rs` if you want to share. Call the production entry point `trusted_server_cli::dev::lint::domains::staged_added_lines(repo_path)`.
+- [ ] **Step 1: Write a failing inline test inside `dev/lint/domains.rs`**
 
-- [ ] **Step 2: Run to verify it fails** (with `unresolved import` or `function not found`).
+In the existing `#[cfg(test)] mod tests` block (the same one with the URL extraction and scan_line tests), append:
+
+```rust
+mod staged_added_lines_tests {
+    use super::*;
+    use crate::dev::lint::test_support;
+
+    #[test]
+    fn reports_added_line_with_new_side_line_number() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("a.txt"), "alpha\nbeta\ngamma\n")
+            .expect("should write initial file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        std::fs::write(temp.path().join("a.txt"), "alpha\nNEW LINE\nbeta\ngamma\n")
+            .expect("should write modification");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let added: Vec<_> = lines
+            .iter()
+            .map(|l| (l.path.to_string_lossy().into_owned(), l.line_no, l.content.clone()))
+            .collect();
+
+        assert_eq!(added, vec![("a.txt".to_string(), 2, "NEW LINE".to_string())]);
+    }
+}
+```
+
+- [ ] **Step 2: Run to verify failure** (function doesn't exist yet)
+
+Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- staged_added_lines_tests`
+Expected: FAIL with `cannot find function staged_added_lines in this scope`.
 
 - [ ] **Step 3: Implement `staged_added_lines` in `dev/lint/domains.rs`**
 
 Function signature:
 
 ```rust
-pub struct DiffLine {
+#[derive(Debug)]
+pub(crate) struct DiffLine {
     pub path: std::path::PathBuf,
     pub line_no: usize,
     pub content: String,
 }
 
-pub fn staged_added_lines(
+pub(crate) fn staged_added_lines(
     repo_path: &std::path::Path,
 ) -> Result<Vec<DiffLine>, error_stack::Report<DomainsLintError>>
 ```
 
 Body: open repo, get HEAD tree, get index, run index-vs-tree diff using the entry points pinned in Phase 2 step 2.3, filter changed paths through `path_is_scanned()` (Task 4.5 dependency — define a stub returning `true` for now and refine later), run blob diff per changed entry, collect added-line hunks. Mirror the spec sketch.
 
+`pub(crate)` (not `pub`) is appropriate — the function is exercised through inline tests and the in-crate `domains::run` caller; no external API surface.
+
 - [ ] **Step 4: Run to verify pass.**
+
+Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- staged_added_lines_tests`
+Expected: PASS.
 
 - [ ] **Step 5: Commit.**
 
 ### Task 4.2: `changed_vs_added_lines` with base-ref resolution (TDD)
 
-- [ ] **Step 1: Write failing test**
+**Files:**
+- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
-In `crates/trusted-server-cli/tests/lint_changed_vs_e2e.rs`, build a two-branch tempdir repo: `main` with a base commit, `feature` with an additional commit adding a violation. Assert that `changed_vs_added_lines(repo, "main")` reports only the lines from the feature commit.
+- [ ] **Step 1: Write failing inline tests**
 
-Add a second test case for ref-resolution fallback: in the same repo, delete the local `main` ref and add a `refs/remotes/origin/main` pointing at the same commit. Assert that `changed_vs_added_lines(repo, "main")` still resolves correctly via the fallback order.
+In the same module-level test mod, append a new `mod changed_vs_tests { ... }` with two cases:
+
+1. Two-branch fixture (`main` with base commit, `feature` with an additional commit adding `https://test.com` to a file). Assert `changed_vs_added_lines(repo_path, "main")` returns exactly one `DiffLine` with the new content.
+2. Ref-resolution fallback: rename the local `main` ref to `refs/remotes/origin/main` (use gix to manipulate refs in the fixture) and assert `changed_vs_added_lines(repo_path, "main")` still resolves and returns the same result via the fallback chain.
+
+Use `tempfile::tempdir().expect("should create tempdir")` and the `test_support` helpers; every `expect()` message follows the `should ...` convention.
 
 - [ ] **Step 2: Verify failure.**
 
 - [ ] **Step 3: Implement `changed_vs_added_lines`** in `dev/lint/domains.rs`. Pull merge-base + tree-vs-tree from Phase 2 step 2.3. Include the `resolve_base_ref` helper that tries the four candidates from the spec (`<ref>`, `refs/heads/<ref>`, `refs/remotes/origin/<ref>`, `refs/tags/<ref>`) in order and returns the first match.
+
+Signature: `pub(crate) fn changed_vs_added_lines(repo_path: &Path, reference: &str) -> Result<Vec<DiffLine>, Report<DomainsLintError>>`
 
 - [ ] **Step 4: Verify pass.**
 
@@ -1633,18 +1738,25 @@ Add a second test case for ref-resolution fallback: in the same repo, delete the
 
 ### Task 4.3: `full_repo_lines` with edge-case handling (TDD)
 
-- [ ] **Step 1: Write failing tests** for each of the five edge cases in spec §"Handling tracked-but-missing files and symlinks":
+**Files:**
+- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+
+- [ ] **Step 1: Write failing inline tests** (`mod full_repo_tests`) for each of the five edge cases in spec §"Handling tracked-but-missing files and symlinks":
   1. Tracked-but-missing file → warns and skips.
   2. Symlink → warns and skips ("symlink not followed").
-  3. Non-regular file (mkfifo if available, otherwise skip on platforms that don't support it).
-  4. Non-UTF-8 path component (Unix-only — create via `OsStr::from_bytes(&[0xff])`).
-  5. Binary file (`.json` with embedded NUL).
+  3. Non-regular file (`#[cfg(unix)]` — mkfifo via `nix` or shell-equivalent; if too painful, gate this case behind `#[cfg(feature = "fifo-test")]` and skip in CI).
+  4. Non-UTF-8 path component (Unix-only — create via `std::os::unix::ffi::OsStrExt::from_bytes(&[0xff, 0xfe])`).
+  5. Binary file (`.json` with embedded NUL — write `b"{\"x\": \0null}"`).
 
-Each test asserts the audit proceeds to the next entry; exit-equivalent behavior is the absence of a violation and the presence of a stderr warning.
+Each test asserts the audit proceeds to the next entry; the function returns `Ok(Vec<DiffLine>)` with no entries for the skipped file. (Test the stderr warning indirectly by ensuring no violation is reported for the problematic path; full stderr-capture tests happen in Phase 7 via `assert_cmd`.)
+
+Use `expect("should ...")` throughout.
 
 - [ ] **Step 2: Verify failure.**
 
-- [ ] **Step 3: Implement `full_repo_lines`** per the spec pseudocode. Includes the `warn_skip` and `warn_skip_bytes` helpers (simple `eprintln!` calls with a consistent prefix).
+- [ ] **Step 3: Implement `full_repo_lines`** per the spec pseudocode. Includes the `warn_skip` and `warn_skip_bytes` helpers which use `crate::output::write_stderr_line` (not raw `eprintln!`) for consistency with the rest of the CLI.
+
+Signature: `pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLine>, Report<DomainsLintError>>`
 
 - [ ] **Step 4: Verify pass.**
 
@@ -1652,17 +1764,22 @@ Each test asserts the audit proceeds to the next entry; exit-equivalent behavior
 
 ### Task 4.4: `explicit_path_lines` with the soft/hard split (TDD)
 
-- [ ] **Step 1: Write failing tests:**
+**Files:**
+- Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
+
+- [ ] **Step 1: Write failing inline tests** (`mod explicit_path_tests`):
   1. Existing valid file → reports violations from it normally.
-  2. Path with an excluded extension (`.html`) → warns and skips.
+  2. Path with an excluded extension (`.html`) → warns and skips, returns empty `Vec`.
   3. Path under `node_modules/` → warns and skips.
   4. Symlink → warns and skips.
-  5. Missing path (typo) → returns `Err(EnvironmentError)` with `path not found`. The test asserts the error is the right variant via `error.current_context()`.
-  6. Permission-denied path (use a `chmod 000` tempfile if Unix) → returns `Err(EnvironmentError)`.
+  5. Missing path (typo) → returns `Err(...)` whose `current_context()` is `DomainsLintError::PathNotFound`.
+  6. Permission-denied path (`#[cfg(unix)]` only — use `chmod 000` on a tempfile) → returns `Err(DomainsLintError::PermissionDenied)`.
 
 - [ ] **Step 2: Verify failure.**
 
-- [ ] **Step 3: Implement `explicit_path_lines`** per the spec pseudocode. Policy filters use `warn_skip`; access failures return `Err`.
+- [ ] **Step 3: Implement `explicit_path_lines`** per the spec pseudocode. Policy filters use `warn_skip`; access failures return `Err`. Map `io::ErrorKind::NotFound` → `DomainsLintError::PathNotFound`, `io::ErrorKind::PermissionDenied` → `DomainsLintError::PermissionDenied`.
+
+Signature: `pub(crate) fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<DiffLine>, Report<DomainsLintError>>`
 
 - [ ] **Step 4: Verify pass.**
 
@@ -1906,8 +2023,8 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
     }
 
     match args.format {
-        crate::dev::lint::OutputFormat::Human => emit_human(&violations),
-        crate::dev::lint::OutputFormat::Json => emit_json(&violations),
+        crate::dev::lint::OutputFormat::Human => emit_human(&violations)?,
+        crate::dev::lint::OutputFormat::Json => emit_json(&violations)?,
     }
 
     if violations.is_empty() {
@@ -1928,31 +2045,43 @@ pub struct FileViolation {
     pub url_excerpt: String,
 }
 
-fn emit_human(violations: &[FileViolation]) {
+fn emit_human(violations: &[FileViolation])
+    -> Result<(), error_stack::Report<crate::error::CliError>>
+{
+    use crate::output::write_stdout_line;
+
     for v in violations {
-        println!("{}:{}: disallowed host {}", v.path.display(), v.line, v.host);
+        write_stdout_line(format!(
+            "{}:{}: disallowed host {}",
+            v.path.display(), v.line, v.host
+        ))?;
     }
     if !violations.is_empty() {
         let files: std::collections::BTreeSet<_> = violations.iter().map(|v| &v.path).collect();
-        println!();
-        println!(
+        write_stdout_line("")?;
+        write_stdout_line(format!(
             "{} disallowed host(s) found in {} file(s).",
             violations.len(),
             files.len()
-        );
-        println!(
+        ))?;
+        write_stdout_line(
             "To allow a new integration proxy, add it to EXACT_HOSTS in \
              crates/trusted-server-cli/src/dev/lint/domains.rs."
-        );
-        println!(
+        )?;
+        write_stdout_line(
             "To suppress one line (e.g., security tests), append \
              `// allow-domain: <host>` in a comment."
-        );
-        println!("Run `ts dev lint domains` (no args) for a full-repo audit.");
+        )?;
+        write_stdout_line("Run `ts dev lint domains` (no args) for a full-repo audit.")?;
     }
+    Ok(())
 }
 
-fn emit_json(violations: &[FileViolation]) {
+fn emit_json(violations: &[FileViolation])
+    -> Result<(), error_stack::Report<crate::error::CliError>>
+{
+    use crate::output::write_json;
+
     let files_affected: std::collections::BTreeSet<_> =
         violations.iter().map(|v| &v.path).collect();
     let report = serde_json::json!({
@@ -1960,9 +2089,17 @@ fn emit_json(violations: &[FileViolation]) {
         "count": violations.len(),
         "files_affected": files_affected.len(),
     });
-    println!("{}", serde_json::to_string(&report).expect("should serialize"));
+    write_json(&report)
 }
 ```
+
+**No raw `println!` / `eprintln!` in production code.** The workspace
+lints under `-D warnings` may not flag `println!` directly, but the
+CLI's convention (see `crates/trusted-server-cli/src/config.rs`) is
+to route all stdout through `crate::output::write_stdout_line` /
+`write_json` and stderr through `write_stderr_line`. This applies
+to the `warn_skip` / `warn_skip_bytes` helpers in Phase 4 as well —
+use `write_stderr_line(format!(...))`, not `eprintln!`.
 
 - [ ] **Step 2: Verify the workspace builds**
 
@@ -2022,7 +2159,7 @@ Spec §"Pre-commit hook", §"Hook installer (Rust subcommand)", and §"Persistin
 
 ### Task 6.3: `write_atomic` helper (TDD)
 
-- [ ] **Step 1: Write failing test:** in a tempdir, call `write_atomic(path, b"hello")`; assert `fs::read(path).unwrap() == b"hello"`; assert no `path.tmp.*` file remains.
+- [ ] **Step 1: Write failing test:** in a tempdir, call `write_atomic(path, b"hello")`; assert `fs::read(path).expect("should read written file") == b"hello"`; assert no `path.tmp.*` file remains in the directory. **Do not use `.unwrap()`** — workspace clippy denies `unwrap_used`.
 
 - [ ] **Step 2: Verify failure.**
 
@@ -2187,9 +2324,16 @@ To bypass the hook for a single commit: `git commit --no-verify`.
 
 ### Task 9.1: Run all CI gates locally
 
+CLAUDE.md splits clippy and test into separate wasm-runtime and
+host-target CLI lanes (per PR #669's CI changes). Use the split
+commands; **do NOT use the older single `cargo clippy --workspace`
+form** — it doesn't match what CI runs and will give a misleading
+green when the host-target CLI has warnings.
+
 - [ ] `cargo fmt --all -- --check` → PASS
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` → PASS
-- [ ] `cargo test --workspace --exclude trusted-server-cli` → PASS (wasm-target lane)
+- [ ] `cargo clippy --workspace --exclude trusted-server-cli --all-targets --all-features -- -D warnings` → PASS (wasm-runtime lane)
+- [ ] `cargo clippy --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" --all-targets -- -D warnings` → PASS (host-target CLI lane)
+- [ ] `cargo test --workspace --exclude trusted-server-cli` → PASS (wasm-runtime lane)
 - [ ] `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"` → PASS (host-target lane, including the new lint module + spike + end-to-end tests)
 - [ ] `cd crates/js/lib && npx vitest run` → PASS (unchanged)
 - [ ] `cd crates/js/lib && npm run format` → PASS (unchanged)
