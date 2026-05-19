@@ -264,6 +264,26 @@ Existing code touched:
   change**: today's `ts dev` becomes `ts dev serve`. This is not a
   follow-up task; `ts dev lint domains` and `ts dev install-hooks`
   cannot be added cleanly while `ts dev` remains a leaf command.
+
+  **`ts dev serve` must preserve every flag and behavior of today's
+  `ts dev` leaf**, byte-for-byte from a user's perspective:
+
+  | Existing `ts dev` flag                                  | `ts dev serve` requirement |
+  | ------------------------------------------------------- | -------------------------- |
+  | `--adapter / -a` (default `fastly`)                     | Same default, same enum    |
+  | `--config` (`Option<PathBuf>`)                          | Preserved unchanged        |
+  | `--env` (default `local`)                               | Preserved unchanged        |
+  | Trailing `passthrough` args (`trailing_var_arg = true`, `allow_hyphen_values = true`) | Preserved unchanged — the `serve` subcommand still forwards everything after the recognized flags to the underlying runner |
+
+  In other words: any shell invocation that works today as
+  `ts dev --adapter=fastly --config=... --env=local -- --extra ...`
+  must work tomorrow as `ts dev serve --adapter=fastly
+  --config=... --env=local -- --extra ...` with identical effect.
+  The refactor is a structural rename, not a behavior change.
+  Verification: an end-to-end test asserts that
+  `ts dev serve --help` lists the same flags as today's
+  `ts dev --help`, and that trailing-arg passthrough still reaches
+  the runner.
 - `crates/trusted-server-cli/src/error.rs` — add `LintError` and
   `InstallHooksError` variants if needed for typed propagation,
   otherwise reuse the crate's existing `Report<CliError>` plumbing.
@@ -1547,8 +1567,23 @@ and the index with `gix` APIs (no shell), runs the binary with
 24. File deletion of a file containing disallowed URL → exits 0.
 25. Filename with spaces or non-ASCII characters — handled correctly
     by `gix` (no quoting layer to fight with); reported normally.
-    Non-UTF-8 path component emits a stderr warning but the host is
-    still flagged.
+    **Non-UTF-8 path component in a staged diff: reported normally
+    with a stderr warning that the path is being displayed
+    lossy-UTF-8.** This intentionally differs from
+    [full-repo mode](#handling-tracked-but-missing-files-and-symlinks)
+    (case 4), which skips non-UTF-8 entries. The reason: a staged
+    diff is built from blob ids and tree entries, so the host
+    extraction happens against blob content regardless of how the
+    path renders for display. Skipping a staged change just because
+    its path bytes are not valid UTF-8 would silently hide a
+    violation the user is actively trying to commit — exactly the
+    opposite of what `--staged` mode exists for. Full-repo mode,
+    by contrast, has no commit-intent signal and the working-tree
+    `read_to_string` path is simpler to keep consistent by
+    skipping.
+
+    Implementers: do not generalize the full-repo non-UTF-8 skip
+    rule to `--staged` / `--changed-vs` modes.
 26. Multiple hunks in one file — all added lines reported correctly.
 
 ### `--changed-vs` mode cases
@@ -1734,6 +1769,18 @@ Suggested execution order:
 
    This gives `<count>  <host>` lines sorted by frequency, which
    feeds the triage in step 3.
+
+   **Requires `jq`** (Homebrew: `brew install jq`; most CI runners
+   already have it). If `jq` is not available locally, a
+   no-extra-tool alternative until a built-in `--summary hosts`
+   mode is added (deferred Open Question):
+
+   ```sh
+   ts dev lint domains --format json \
+     | python3 -c 'import json,sys,collections; d=json.load(sys.stdin); \
+                    c=collections.Counter(v["host"] for v in d["violations"]); \
+                    [print(f"{n:6d} {h}") for h,n in c.most_common()]'
+   ```
 3. Triage the top ~80% of violations into the three categories above.
 4. Submit cleanup PRs grouped by file (so each PR is reviewable):
    `docs/guide/creative-processing.md`,
