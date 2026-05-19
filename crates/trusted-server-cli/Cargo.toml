@@ -42,6 +42,10 @@ gix = { version = "0.83", default-features = false, features = [
     "index",
     "revision",
     "sha1",
+    # Production runtime does not need tree-editor, but the
+    # feasibility spike + Phase 4 unit tests construct fixture
+    # repos via gix-only APIs and need it. Keep enabled.
+    "tree-editor",
 ] }
 gix-config = "0.56"
 
