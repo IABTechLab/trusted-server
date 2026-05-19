@@ -42,6 +42,7 @@ pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
@@ -56,6 +57,8 @@ const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
 
 /// GPP section ID for EU TCF v2.
 const GPP_SECTION_ID_TCF_EU_V2: u16 = 2;
+
+static MISSING_GEO_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Inputs to the consent processing pipeline.
 ///
@@ -93,6 +96,10 @@ pub struct ConsentPipelineInput<'a> {
 pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
     let signals = extract_consent_signals(input.jar, input.req);
     log_consent_signals(&signals);
+
+    if input.geo.is_none() {
+        log_missing_geo_warning_once();
+    }
 
     // In proxy mode, skip decoding entirely.
     if input.config.mode == ConsentMode::Proxy {
@@ -560,6 +567,17 @@ fn log_consent_signals(signals: &RawConsentSignals) {
     }
 }
 
+/// Logs a one-time warning when request geolocation is unavailable.
+fn log_missing_geo_warning_once() {
+    if MISSING_GEO_WARNING_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    log::warn!(
+        "Geo lookup returned no data; consent jurisdiction will be unknown and EC creation will fail closed"
+    );
+}
+
 /// Derives a human-readable status label for a decoded signal.
 ///
 /// Returns `"present"` when decoded data exists, `"decode-failed"` when only
@@ -707,6 +725,29 @@ mod tests {
             }),
             ..ConsentContext::default()
         }
+    }
+
+    #[test]
+    fn missing_geo_keeps_unknown_jurisdiction_and_blocks_ec_creation() {
+        let req = build_request();
+        let config = ConsentConfig::default();
+
+        let ctx = build_consent_context(&ConsentPipelineInput {
+            jar: None,
+            req: &req,
+            config: &config,
+            geo: None,
+        });
+
+        assert_eq!(
+            ctx.jurisdiction,
+            Jurisdiction::Unknown,
+            "missing geo should keep jurisdiction unknown"
+        );
+        assert!(
+            !allows_ec_creation(&ctx),
+            "missing geo should keep EC creation fail-closed"
+        );
     }
 
     #[test]
