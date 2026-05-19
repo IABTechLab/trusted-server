@@ -32,6 +32,18 @@ trusted-server-core = { workspace = true }
 url = { workspace = true }
 keyring = { workspace = true }
 uuid = { workspace = true }
+# `ts dev lint domains` and `ts dev install-hooks` (spec
+# docs/superpowers/specs/2026-05-18-check-domains-design.md).
+# Versions chosen during the Phase 2 feasibility spike; verified
+# via `cargo tree -p gix -p gix-config` that no duplicate
+# versions land in the lock file.
+gix = { version = "0.83", default-features = false, features = [
+    "blob-diff",
+    "index",
+    "revision",
+    "sha1",
+] }
+gix-config = "0.56"
 
 [dev-dependencies]
 temp-env = { workspace = true }
