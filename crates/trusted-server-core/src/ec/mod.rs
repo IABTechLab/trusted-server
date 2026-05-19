@@ -334,7 +334,7 @@ impl EcContext {
 
     /// Returns a mutable reference to the consent context.
     ///
-    /// Used by `/_ts/api/v1/sync` to apply query-param fallback consent for the current
+    /// Allows handlers to apply query-param fallback consent for the current
     /// request only when pre-routing consent extraction produced an empty
     /// context.
     pub fn consent_mut(&mut self) -> &mut ConsentContext {

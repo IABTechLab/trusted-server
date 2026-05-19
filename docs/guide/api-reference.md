@@ -76,9 +76,14 @@ Returns EC identity plus the authenticated partner's UID and EID for the current
   "eid": {
     "source": "formally-vital-lion.edgecompute.app",
     "uids": [{ "id": "mock-user-123", "atype": 3 }]
-  }
+  },
+  "cluster_size": 3
 }
 ```
+
+`uid`, `eid`, and `cluster_size` are optional and omitted when unavailable
+(e.g. no partner UID synced yet, KV read degraded, or cluster size not
+re-evaluated within the recheck window).
 
 ---
 

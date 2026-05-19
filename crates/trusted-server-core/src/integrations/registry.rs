@@ -539,6 +539,20 @@ impl IntegrationMetadata {
     }
 }
 
+/// Inputs to [`IntegrationRegistry::handle_proxy`].
+///
+/// Bundled into a struct so the dispatch surface stays within the project's
+/// 7-argument cap; `ec_context` and `req` participate in the borrow so the
+/// whole thing shares one lifetime.
+pub struct ProxyDispatchInput<'a> {
+    pub method: &'a Method,
+    pub path: &'a str,
+    pub settings: &'a Settings,
+    pub kv: Option<&'a KvIdentityGraph>,
+    pub ec_context: &'a mut EcContext,
+    pub req: Request,
+}
+
 /// In-memory registry of integrations discovered from settings.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
@@ -656,17 +670,19 @@ impl IntegrationRegistry {
     ///
     /// This method removes any caller-supplied `x-ts-ec` before proxying.
     /// Response-side cookie mutation is centralized in EC finalize.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub async fn handle_proxy(
         &self,
-        method: &Method,
-        path: &str,
-        settings: &Settings,
-        kv: Option<&KvIdentityGraph>,
-        ec_context: &mut EcContext,
-        mut req: Request,
+        input: ProxyDispatchInput<'_>,
     ) -> Option<Result<Response, Report<TrustedServerError>>> {
+        let ProxyDispatchInput {
+            method,
+            path,
+            settings,
+            kv,
+            ec_context,
+            mut req,
+        } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
@@ -1295,14 +1311,14 @@ mod tests {
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
         // Call handle_proxy (uses futures executor in test environment)
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            None,
-            &mut ec_context,
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
             req,
-        ));
+        }));
 
         // Should have matched and returned a response
         assert!(result.is_some(), "should find route and handle request");
@@ -1335,14 +1351,14 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            None,
-            &mut ec_context,
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
             req,
-        ))
+        }))
         .expect("should handle proxy request");
 
         let response = result.expect("handler should succeed");
@@ -1372,14 +1388,14 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            None,
-            &mut ec_context,
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
             req,
-        ))
+        }))
         .expect("should handle proxy request");
 
         let response = result.expect("proxy handle should succeed");
@@ -1411,14 +1427,14 @@ mod tests {
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::POST,
-            "/integrations/test/ec",
-            &settings,
-            None,
-            &mut ec_context,
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
             req,
-        ));
+        }));
 
         assert!(result.is_some(), "Should find POST route");
         let response = result.unwrap();
