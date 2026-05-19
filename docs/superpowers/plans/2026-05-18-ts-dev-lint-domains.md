@@ -888,6 +888,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "playwright.dev",
     "testcontainers.com",
     "grafana.com",
+    "docsearch.algolia.com",
 ];
 
 /// IANA RFC 2606 reserved TLDs. Any host ending in one of these is allowed.
@@ -913,8 +914,26 @@ pub enum DomainsLintError {
     PermissionDenied(std::path::PathBuf),
     #[display("invalid mode combination")]
     InvalidMode,
+    /// Failure writing a warning to stderr (broken pipe, etc.).
+    /// Used by the in-module `warn` helper so collectors can call
+    /// `crate::output::write_stderr_line` and still return
+    /// `Report<DomainsLintError>` consistently.
+    #[display("I/O error writing warning to stderr")]
+    WriteWarning,
 }
 impl Error for DomainsLintError {}
+
+/// In-module warning helper. Wraps the CLI's `write_stderr_line`
+/// (which returns `Report<CliError>`) so that callers inside
+/// `domains` can stay on `Report<DomainsLintError>` without
+/// inventing custom `?` conversions at every call site.
+fn warn(msg: impl Into<String>)
+    -> Result<(), error_stack::Report<DomainsLintError>>
+{
+    use error_stack::ResultExt;
+    crate::output::write_stderr_line(msg.into())
+        .change_context(DomainsLintError::WriteWarning)
+}
 ```
 
 - [ ] **Step 3: Add `lint` to `dev/mod.rs`**
@@ -1660,13 +1679,27 @@ mod scan_line_tests {
         let out = scan_line("see https://example.com");
         assert!(out.unused_suppressions.is_empty());
     }
+
+    #[test]
+    fn unused_warning_fires_for_already_allowed_listed_host() {
+        // Spec §"Per-Line Suppression": listed host must match a
+        // VIOLATION, not just an extracted host. example.com is
+        // extracted but is already allowed → would never have been
+        // a violation → the marker entry was unnecessary → warn.
+        let out = scan_line("see https://example.com // allow-domain: example.com");
+        assert!(out.violations.is_empty(), "example.com is already allowed");
+        assert_eq!(
+            out.unused_suppressions, vec!["example.com"],
+            "marker listed an already-allowed host; it suppresses nothing"
+        );
+    }
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev::lint::domains::scan_line_tests`
-Expected: 10 FAIL (one per `#[test]`).
+Expected: 11 FAIL (one per `#[test]`).
 
 - [ ] **Step 3: Implement**
 
@@ -1676,14 +1709,27 @@ pub fn scan_line(line: &str) -> LineScanOutcome {
     let mut hosts = extract_absolute_hosts(line);
     hosts.extend(extract_protocol_relative_hosts(line));
 
-    // Compute "unused" — hosts the marker listed that do not appear
-    // on the line at all.
-    let extracted_set: std::collections::HashSet<&String> = hosts.iter().collect();
+    // Compute the set of hosts that WOULD be flagged WITHOUT any
+    // suppression — i.e., extracted hosts that fail the allowlist
+    // check when the suppression set is empty. Per spec
+    // §"Per-Line Suppression": the allow-domain marker's job is to
+    // suppress violations. A listed host that wasn't going to be a
+    // violation anyway (already allowed, or not extracted at all)
+    // is "unused" and warrants the stderr warning.
+    let empty_suppression: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let disallowed_without_suppression: std::collections::HashSet<&String> = hosts
+        .iter()
+        .filter(|h| !is_allowed(h, &empty_suppression))
+        .collect();
+
     let mut unused: Vec<String> = suppression
         .suppressed
         .iter()
         .filter(|listed| {
-            !extracted_set.iter().any(|h| h.as_str() == listed.as_str())
+            !disallowed_without_suppression
+                .iter()
+                .any(|h| h.as_str() == listed.as_str())
         })
         .cloned()
         .collect();
@@ -1705,7 +1751,7 @@ pub fn scan_line(line: &str) -> LineScanOutcome {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev::lint::domains::scan_line_tests`
-Expected: 10 PASS.
+Expected: 11 PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1716,13 +1762,14 @@ git commit -m "Add scan_line returning violations + unused-suppression report
 Composes parse_suppression_marker + extract_absolute_hosts +
 extract_protocol_relative_hosts + is_allowed. The LineScanOutcome
 struct carries both the violation list AND the 'unused suppression'
-list per spec §'Per-Line Suppression' — listed hosts that do not
-match any extracted host on the line are surfaced for the caller to
-emit as stderr warnings. Ten tests cover: allowed-pass,
+list per spec §'Per-Line Suppression' — listed hosts that would
+not have been a violation in the first place (already allowed, or
+not extracted at all) are surfaced for the caller to emit as
+stderr warnings. Eleven tests cover: allowed-pass,
 disallowed-report, single-host suppression match, wrong-host
 warning, multi-host full-match, multi-host partial-match warning,
 jsdoc/* form, multi-violation-per-line, URL-content bypass attempt,
-and the no-marker no-warning case."
+no-marker-no-warning, and the already-allowed-host-listed case."
 ```
 
 ---
@@ -1954,7 +2001,10 @@ let (path, was_lossy) = match std::str::from_utf8(raw_bytes) {
     }
 };
 if was_lossy {
-    crate::output::write_stderr_line(format!(
+    // `warn` is the in-module helper defined alongside
+    // DomainsLintError; it returns Report<DomainsLintError> so the
+    // `?` here flows correctly out of staged_added_lines.
+    warn(format!(
         "warning: staged path is not valid UTF-8; displaying lossy: {}",
         path.display()
     ))?;
@@ -2012,7 +2062,7 @@ Use `expect("should ...")` throughout.
 
 - [ ] **Step 2: Verify failure.**
 
-- [ ] **Step 3: Implement `full_repo_lines`** per the spec pseudocode. Includes the `warn_skip` and `warn_skip_bytes` helpers which use `crate::output::write_stderr_line` (not raw `eprintln!`) for consistency with the rest of the CLI.
+- [ ] **Step 3: Implement `full_repo_lines`** per the spec pseudocode. The `warn_skip(path, reason)` / `warn_skip_bytes(bytes, reason)` helpers wrap the in-module `warn` helper (defined alongside `DomainsLintError`), which itself wraps `crate::output::write_stderr_line` with `change_context(DomainsLintError::WriteWarning)`. Do NOT call `write_stderr_line` directly — the type would not unify with `Report<DomainsLintError>` and the `?` operator would fail to compile.
 
 Signature: `pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLine>, Report<DomainsLintError>>`
 
@@ -2047,16 +2097,23 @@ Signature: `pub(crate) fn explicit_path_lines(paths: &[PathBuf]) -> Result<Vec<D
 
 - [ ] **Step 1: Write failing tests** for the extension and path-exclusion filter:
   - `foo.rs` → scanned.
-  - `foo.html` → not scanned.
-  - `foo.css` → not scanned.
-  - `Dockerfile` → not scanned (no scanned extension matches).
+  - `foo.html` → **scanned** (extension list now includes `.html`).
+  - `foo.css` → **scanned** (extension list now includes `.css`).
+  - `Dockerfile` → **scanned** (matched by exact basename).
+  - `Dockerfile.prod` → **scanned** (matched by `Dockerfile.*` pattern).
+  - `crates/trusted-server-core/src/integrations/nextjs/fixtures/inlined-data-escaped.html` → **NOT scanned** (publisher-fixture path exclusion — spec §"Always excluded (paths)").
+  - `crates/trusted-server-core/src/integrations/google_tag_manager/fixtures/captured.html` → **NOT scanned** (same publisher-fixture rule, different integration).
+  - `crates/trusted-server-core/src/html_processor.test.html` → **scanned** (NOT under a `/fixtures/` directory; this is our own test fixture, not a publisher capture).
+  - `crates/js/lib/src/core/templates/iframe.html` → **scanned** (our own template).
   - `node_modules/foo.js` → not scanned (path exclusion).
   - `.worktrees/x/y.rs` → not scanned.
   - `package-lock.json` → not scanned.
   - `pnpm-lock.yaml` → not scanned (exact basename match).
   - `Cargo.lock` → not scanned.
   - `.env.dev` → scanned (matches `.env*`).
-  - `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx` → scanned (proves the **/fixtures/** blanket exclusion was removed).
+  - `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx` → scanned (proves the **/fixtures/** blanket exclusion was removed; only the narrow `crates/trusted-server-core/src/integrations/**/fixtures/**` path is excluded).
+  - `crates/integration-tests/fixtures/frameworks/nextjs/Dockerfile` → **scanned** (Dockerfile matched by basename; this fixture path is NOT the excluded publisher-capture path).
+  - `crates/integration-tests/fixtures/frameworks/wordpress/Dockerfile` → **scanned** (same reasoning).
   - `crates/trusted-server-cli/src/dev/lint/domains.rs` → NOT scanned (self-exclude).
   - **Markdown coverage (spec §"File extensions scanned" mandates `.md` is in scope):**
     - `README.md` → scanned.
@@ -2099,6 +2156,16 @@ Add to the enum in `error.rs`:
 
 - [ ] **Step 2: Update `lib.rs::run()` to map them**
 
+The existing implementation prints `format_report(&error)` for
+EVERY error, then maps the exit code. That model collapses two
+different user experiences: a real failure (`EnvironmentError`,
+`Configuration`, etc.) deserves the error-stack dump, but
+`ViolationsFound` and `Cancelled` should not — the violation
+report itself is already on stdout (or JSON), and Cancelled is a
+benign user signal. Printing `format_report` for `ViolationsFound`
+would write the linter's normal output AND an error-stack message
+on stderr, doubling the noise.
+
 Replace the existing `match` body in `run()` with:
 
 ```rust
@@ -2106,18 +2173,27 @@ Replace the existing `match` body in `run()` with:
 pub fn run() -> ExitCode {
     match execute() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let _ = write_stderr_line(format_report(&error));
-            match error.current_context() {
-                CliError::Cancelled => ExitCode::from(130),
-                CliError::ViolationsFound { .. } => ExitCode::from(1),
-                CliError::EnvironmentError => ExitCode::from(2),
-                _ => ExitCode::from(1),
+        Err(error) => match error.current_context() {
+            CliError::Cancelled => ExitCode::from(130),
+            CliError::ViolationsFound { .. } => ExitCode::from(1),
+            CliError::EnvironmentError => {
+                let _ = write_stderr_line(format_report(&error));
+                ExitCode::from(2)
+            }
+            _ => {
+                let _ = write_stderr_line(format_report(&error));
+                ExitCode::from(1)
             }
         }
     }
 }
 ```
+
+Only the "real failure" branches print the error-stack report;
+`ViolationsFound` and `Cancelled` exit silently (the violation
+list and the cancellation are conveyed elsewhere). Matches the
+spec's Output Format section, which shows the violation report
+itself as the user-visible output.
 
 - [ ] **Step 3: Build and verify existing tests still pass**
 
@@ -2245,7 +2321,7 @@ Run: `cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^
 Expected: lists `domains` as a subcommand.
 
 Run: `cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev lint domains --help`
-Expected: lists `--staged`, `--changed-vs`, `--format`, plus the trailing `[PATH]...` arg.
+Expected: lists `--staged`, `--changed-vs`, `--format`, `--verbose`, plus the trailing `[PATH]...` arg.
 
 - [ ] **Step 4: Commit**
 
@@ -2405,9 +2481,13 @@ fn emit_json(violations: &[FileViolation])
 lints under `-D warnings` may not flag `println!` directly, but the
 CLI's convention (see `crates/trusted-server-cli/src/config.rs`) is
 to route all stdout through `crate::output::write_stdout_line` /
-`write_json` and stderr through `write_stderr_line`. This applies
-to the `warn_skip` / `warn_skip_bytes` helpers in Phase 4 as well —
-use `write_stderr_line(format!(...))`, not `eprintln!`.
+`write_json` and stderr through `write_stderr_line`. In
+`domains::run` the return type is `Report<CliError>` so
+`write_stderr_line(...)?` works directly. In the Phase 4
+collectors (which return `Report<DomainsLintError>`), use the
+in-module `warn(msg)` helper instead — it wraps
+`write_stderr_line` with `change_context(DomainsLintError::WriteWarning)`
+so the `?` operator type-checks.
 
 - [ ] **Step 2: Verify the workspace builds**
 

@@ -135,13 +135,15 @@ CLI surface."
   to new lines.
 - No autofix.
 - No detection of bare hostnames without an `http(s)://` or `//` prefix.
-- No HTML, CSS, or Dockerfile scanning. **Accepted blind spot**: a
-  disallowed URL added to a publisher-capture HTML fixture, a CSS
-  `url(...)`, or a Dockerfile `FROM`/`RUN curl` line will not be
-  detected. HTML fixtures at
-  `crates/trusted-server-core/src/integrations/*/fixtures/*.html` contain
-  hundreds of legitimate captured third-party URLs that cannot reasonably
-  be allowlisted.
+- **Publisher-capture HTML fixtures are excluded by path** —
+  specifically the `crates/trusted-server-core/src/integrations/**/fixtures/**`
+  tree, which contains real-world captured publisher pages used as
+  test fixtures for the HTML processor. Those files have hundreds
+  of legitimate third-party URLs (Facebook, typekit, ad networks)
+  that cannot reasonably be allowlisted; trying would either
+  drown the linter in noise or force a giant allowlist that
+  defeats its review purpose. **Other HTML, CSS, and Dockerfile
+  files are scanned** (see [File extensions scanned](#file-extensions-scanned)).
 
 ## CLI Surface
 
@@ -359,7 +361,7 @@ suppress per-line.
 | Fastly docs             | `www.fastly.com`, `developer.fastly.com`, `manage.fastly.com`                                  |
 | Cloudflare docs         | `developers.cloudflare.com`                                                                    |
 | Vendor docs             | `docs.datadome.co`, `docs.prebid.org`                                                          |
-| Tooling docs            | `vitepress.dev`, `playwright.dev`, `testcontainers.com`, `grafana.com`                         |
+| Tooling docs            | `vitepress.dev`, `playwright.dev`, `testcontainers.com`, `grafana.com`, `docsearch.algolia.com` |
 
 One-off references not on this list (e.g., a single arxiv.org link in
 a security spec) should use the per-line suppression marker —
@@ -485,7 +487,12 @@ upstream = "https://evil.com"  # allow-domain: evil.com
 ### File extensions scanned
 
 `.rs`, `.ts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.toml`, `.yml`, `.yaml`,
-`.json`, `.md`, plus any file matching `.env*`.
+`.json`, `.md`, `.css`, `.html`, plus any file matching `.env*`.
+
+Plus the special-case files matched by exact basename (these have no
+extension):
+
+- `Dockerfile`, `Dockerfile.*` (e.g., `Dockerfile.prod`)
 
 **`.md` is scanned.** Markdown documentation files (`README.md`,
 `CHANGELOG.md`, `CONTRIBUTING.md`, everything under `docs/`) are real
@@ -544,13 +551,19 @@ fenced code blocks.
 - `.worktrees/`, `.claude/worktrees/`
 - `crates/trusted-server-cli/src/dev/lint/domains.rs` itself (so the
   module's own allowlist constants and doc comments cannot self-flag)
+- **`crates/trusted-server-core/src/integrations/**/fixtures/**` —
+  publisher-capture HTML/JS fixtures.** Real-world snapshots used as
+  test inputs for the HTML processor; they contain hundreds of
+  legitimate third-party URLs that cannot reasonably be
+  allowlisted. This is a narrow path exclusion, NOT the older
+  too-broad `**/fixtures/**` rule (that earlier draft would have
+  hidden the integration-test app source under
+  `crates/integration-tests/fixtures/frameworks/nextjs/app/*.tsx`,
+  which we deliberately scan).
 
-**Note:** `**/fixtures/**` is **not** a blanket exclusion. Publisher-capture
-HTML fixtures under
-`crates/trusted-server-core/src/integrations/*/fixtures/*.html` are
-already skipped because `.html` is not in the scanned extension list.
-Source files under `crates/integration-tests/fixtures/frameworks/*` —
-including `.tsx`, `.ts`, `.json`, `next.config.mjs` — **are** scanned.
+**Source files under `crates/integration-tests/fixtures/frameworks/*` —
+including `.tsx`, `.ts`, `.json`, `next.config.mjs`, `Dockerfile` —
+ARE scanned.** Only the publisher-capture path above is excluded.
 
 ## Implementation
 
@@ -1596,7 +1609,11 @@ and the index with `gix` APIs (no shell), runs the binary with
 
 30. `node_modules/foo.js` with `https://test.com` → ignored.
 31. `.worktrees/x/y.rs` → ignored.
-32. `*.html` extension → ignored regardless of path.
+32. `*.html` extension → scanned. Files under
+    `crates/trusted-server-core/src/integrations/**/fixtures/**` are
+    skipped by path; other `.html` files (e.g.,
+    `crates/trusted-server-core/src/html_processor.test.html`) are
+    scanned normally.
 33. **Proves the `**/fixtures/**` blanket exclusion was removed**:
     `crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx`
     fixture with `https://test.com` → reported.
