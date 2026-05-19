@@ -2252,10 +2252,9 @@ pub struct DomainsArgs {
     pub format: OutputFormat,
 
     /// Verbose: print per-file scan progress on stderr (number of
-    /// lines scanned per file, number of suppressed hosts per line).
-    /// Off by default; useful for debugging "why was X not flagged"
-    /// or "is this file being scanned at all". Has no effect on
-    /// exit code or violation count.
+    /// lines scanned per file). Off by default; useful for
+    /// debugging "is this file being scanned at all". Has no
+    /// effect on exit code or violation count.
     #[arg(long)]
     pub verbose: bool,
 }
