@@ -221,13 +221,53 @@ fn run_dev_serve(args: &dev::ServeArgs) -> Result<(), Report<CliError>> {
 Run: `cargo check --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')"`
 Expected: PASS.
 
-- [ ] **Step 4: Verify the `dev serve --help` output matches the captured baseline**
+- [ ] **Step 4: Verify the `dev serve --help` output preserves the flag contract**
 
-Run: `cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev serve --help 2>&1 > /tmp/ts-dev-serve-help-after.txt`
+A byte-for-byte diff against the captured baseline is too brittle —
+clap may legitimately reformat headings or the `Usage:` line when
+the command moves from a leaf to a child of a subcommand group.
+The contract we care about is **flag preservation**, not
+help-text identity. Capture the new help text and assert on each
+required surface:
 
-Run: `diff <(sed 's/Usage: ts dev/Usage: ts dev serve/' /tmp/ts-dev-help-before.txt) /tmp/ts-dev-serve-help-after.txt`
+```sh
+cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  -- dev serve --help > /tmp/ts-dev-serve-help-after.txt 2>&1
 
-Expected: no output (files identical apart from the `Usage:` line, which legitimately gained the `serve` token). If there is any other difference — a flag missing, a default changed, the passthrough description gone — fix `ServeArgs` until the diff is clean.
+# Each flag from the baseline must still be advertised, with the
+# same default value where applicable.
+grep -q -- '--adapter' /tmp/ts-dev-serve-help-after.txt
+grep -q -- '-a' /tmp/ts-dev-serve-help-after.txt
+grep -q -E 'default[^]]*fastly' /tmp/ts-dev-serve-help-after.txt
+grep -q -- '--config' /tmp/ts-dev-serve-help-after.txt
+grep -q -- '--env' /tmp/ts-dev-serve-help-after.txt
+grep -q -E 'default[^]]*local' /tmp/ts-dev-serve-help-after.txt
+# Trailing passthrough is usually rendered as '[PASSTHROUGH]...' or
+# similar; the presence of an ellipsis after the positional name is
+# the contract:
+grep -q -E '\[.*\]\.\.\.' /tmp/ts-dev-serve-help-after.txt
+```
+
+All seven greps must exit 0. If any fail, the refactor lost a flag
+— fix `ServeArgs` before continuing. Keep the captured baseline
+(`/tmp/ts-dev-help-before.txt`) around so you can eyeball-diff if a
+grep fails.
+
+Functional verification (more important than help-text shape):
+
+```sh
+# Trailing args still reach the runner. Use --skip-build so the
+# runner doesn't actually try to launch fastly; the failure mode
+# should be the documented "no Wasm binary" message, not a
+# clap-parse error.
+cargo run --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  -- dev serve --adapter=fastly --env=local -- --skip-build 2>&1 \
+  | grep -q -- '--skip-build was passed'
+```
+
+Expected: the grep finds the runner's diagnostic, proving the
+passthrough arg reached `run_fastly_dev`. If clap rejects the args
+or the passthrough is lost, the refactor is broken.
 
 - [ ] **Step 5: Verify `ts dev --help` now shows a subcommand list**
 
@@ -1460,6 +1500,14 @@ substring; pathological host literally named 'allow-domain')."
 **Files:**
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
+`scan_line` returns **two** things: the violations and an
+"unused suppression" report. Per spec §"Per-Line Suppression":
+"Each host listed must actually match a violation on that line; if a
+listed host does not appear among the line's violations, a warning
+is emitted (stderr) but the suppression for matched hosts still
+applies." The unused list is what the caller emits as the stderr
+warning.
+
 - [ ] **Step 1: Write failing tests**
 
 Append:
@@ -1471,10 +1519,22 @@ pub struct LineViolation {
     pub host: String,
 }
 
-/// Scan one source line; return all disallowed hosts (after applying
-/// the line's suppression marker, if any).
-pub fn scan_line(line: &str) -> Vec<LineViolation> {
-    todo!("collect absolute + protocol-relative hosts, apply suppression, filter via is_allowed")
+/// Result of scanning one source line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LineScanOutcome {
+    pub violations: Vec<LineViolation>,
+    /// Hosts that the line's `allow-domain:` marker listed but that
+    /// did not appear among the extracted hosts. Caller emits these
+    /// as a stderr warning ("listed in allow-domain marker but no
+    /// matching host on the line").
+    pub unused_suppressions: Vec<String>,
+}
+
+/// Scan one source line; return violations and any unused
+/// suppression-marker entries.
+pub fn scan_line(line: &str) -> LineScanOutcome {
+    todo!("collect absolute + protocol-relative hosts, apply suppression, \
+           filter via is_allowed, compute unused = listed - extracted")
 }
 
 #[cfg(test)]
@@ -1482,7 +1542,13 @@ mod scan_line_tests {
     use super::*;
 
     fn hosts(line: &str) -> Vec<String> {
-        scan_line(line).into_iter().map(|v| v.host).collect()
+        scan_line(line).violations.into_iter().map(|v| v.host).collect()
+    }
+
+    fn unused(line: &str) -> Vec<String> {
+        let mut u = scan_line(line).unused_suppressions;
+        u.sort();
+        u
     }
 
     #[test]
@@ -1508,15 +1574,54 @@ mod scan_line_tests {
 
     #[test]
     fn suppression_with_correct_host_passes() {
-        assert!(hosts("https://evil.com // allow-domain: evil.com").is_empty());
+        let out = scan_line("https://evil.com // allow-domain: evil.com");
+        assert!(out.violations.is_empty());
+        assert!(out.unused_suppressions.is_empty());
     }
 
     #[test]
-    fn suppression_with_wrong_host_still_reports() {
+    fn suppression_with_wrong_host_still_reports_and_warns() {
+        let out = scan_line("https://evil.com // allow-domain: other.com");
         assert_eq!(
-            hosts("https://evil.com // allow-domain: other.com"),
+            out.violations.into_iter().map(|v| v.host).collect::<Vec<_>>(),
             vec!["evil.com"]
         );
+        assert_eq!(
+            out.unused_suppressions, vec!["other.com"],
+            "other.com was listed but never appeared on the line"
+        );
+    }
+
+    #[test]
+    fn multi_host_suppression_applied_to_violations() {
+        // Spec §"Per-line suppression" — multiple comma-separated
+        // hosts; all are suppressed when they match extracted hosts.
+        let out = scan_line(
+            "x = \"https://evil.com\"; y = \"https://bad.org\"; \
+             // allow-domain: evil.com, bad.org"
+        );
+        assert!(out.violations.is_empty(), "both hosts should be suppressed: {out:?}");
+        assert!(out.unused_suppressions.is_empty());
+    }
+
+    #[test]
+    fn multi_host_suppression_partial_match_warns_for_unused() {
+        // evil.com matches; ghost.com does not appear on the line.
+        let out = scan_line("\"https://evil.com\" // allow-domain: evil.com, ghost.com");
+        assert!(out.violations.is_empty(), "evil.com should be suppressed");
+        assert_eq!(out.unused_suppressions, vec!["ghost.com"]);
+    }
+
+    #[test]
+    fn jsdoc_star_suppression_form() {
+        // Spec §"Marker grammar" — '*' followed by whitespace is one
+        // of the four supported comment-introducer branches.
+        // Format: a jsdoc/block-comment continuation line where the
+        // marker is adjacent to '* '.
+        let out = scan_line(
+            " * fetch(\"https://evil.com\") * allow-domain: evil.com"
+        );
+        assert!(out.violations.is_empty(), "jsdoc-style suppression should apply: {out:?}");
     }
 
     #[test]
@@ -1536,46 +1641,77 @@ mod scan_line_tests {
             vec!["evil.com"]
         );
     }
+
+    #[test]
+    fn unused_warning_only_when_marker_present() {
+        // No marker → no unused warning, even though "other.com" does
+        // not appear in any line we scanned.
+        let out = scan_line("see https://example.com");
+        assert!(out.unused_suppressions.is_empty());
+    }
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev::lint::domains::scan_line_tests`
-Expected: 6 FAIL.
+Expected: 10 FAIL (one per `#[test]`).
 
 - [ ] **Step 3: Implement**
 
 ```rust
-pub fn scan_line(line: &str) -> Vec<LineViolation> {
+pub fn scan_line(line: &str) -> LineScanOutcome {
     let suppression = parse_suppression_marker(line);
     let mut hosts = extract_absolute_hosts(line);
     hosts.extend(extract_protocol_relative_hosts(line));
-    hosts
+
+    // Compute "unused" — hosts the marker listed that do not appear
+    // on the line at all.
+    let extracted_set: std::collections::HashSet<&String> = hosts.iter().collect();
+    let mut unused: Vec<String> = suppression
+        .suppressed
+        .iter()
+        .filter(|listed| {
+            !extracted_set.iter().any(|h| h.as_str() == listed.as_str())
+        })
+        .cloned()
+        .collect();
+    unused.sort();
+
+    let violations = hosts
         .into_iter()
         .filter(|h| !is_allowed(h, &suppression.suppressed))
         .map(|host| LineViolation { host })
-        .collect()
+        .collect();
+
+    LineScanOutcome {
+        violations,
+        unused_suppressions: unused,
+    }
 }
 ```
 
 - [ ] **Step 4: Run to verify pass**
 
 Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- dev::lint::domains::scan_line_tests`
-Expected: 6 PASS.
+Expected: 10 PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/trusted-server-cli/src/dev/lint/domains.rs
-git commit -m "Add scan_line — the pure-function core of the linter
+git commit -m "Add scan_line returning violations + unused-suppression report
 
 Composes parse_suppression_marker + extract_absolute_hosts +
-extract_protocol_relative_hosts + is_allowed. Six tests cover the
-allowed-pass case, the disallowed-report case, suppression with
-correct vs wrong host listed, multiple disallowed on one line, and
-the URL-content bypass attempt. From here the remaining work is
-plumbing — diff collection, CLI dispatch, and end-to-end tests."
+extract_protocol_relative_hosts + is_allowed. The LineScanOutcome
+struct carries both the violation list AND the 'unused suppression'
+list per spec §'Per-Line Suppression' — listed hosts that do not
+match any extracted host on the line are surfaced for the caller to
+emit as stderr warnings. Ten tests cover: allowed-pass,
+disallowed-report, single-host suppression match, wrong-host
+warning, multi-host full-match, multi-host partial-match warning,
+jsdoc/* form, multi-violation-per-line, URL-content bypass attempt,
+and the no-marker no-warning case."
 ```
 
 ---
@@ -1596,6 +1732,14 @@ A shared helper module for git-repo fixtures lives at `dev/lint/test_support.rs`
 - Create: `crates/trusted-server-cli/src/dev/lint/test_support.rs`
 - Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
 
+**Critical: helper commits MUST set explicit author/committer
+signatures, not rely on ambient git config.** A clean test
+environment (CI runner, container, fresh machine without
+`user.name` / `user.email` set globally) will fail with "please tell
+me who you are" or produce nondeterministic timestamps. Pin a fixed
+signature in the helpers so tests are deterministic and don't depend
+on the host's git config.
+
 - [ ] **Step 1: Create `dev/lint/test_support.rs`**
 
 Lift the helper functions from `tests/spike_gix_staged_diff.rs` and `tests/spike_gix_changed_vs.rs` (the production-quality versions, not the `unimplemented!()` shells). Signatures:
@@ -1607,12 +1751,31 @@ use std::path::Path;
 
 use gix::ObjectId;
 
+/// Fixed test signature used for all helper commits — avoids
+/// dependence on ambient `user.name` / `user.email` config and
+/// keeps commit hashes stable across runs.
+pub(crate) fn test_signature() -> gix::actor::SignatureRef<'static> {
+    gix::actor::SignatureRef {
+        name: "ts dev lint tests".into(),
+        email: "tests@example.com".into(),
+        time: gix::date::Time::new(1_700_000_000, 0).into(),
+    }
+}
+
 pub(crate) fn init_repo(path: &Path) -> gix::Repository { /* ... */ }
 pub(crate) fn commit_all(repo: &gix::Repository, msg: &str) -> ObjectId { /* ... */ }
 pub(crate) fn stage_all(repo: &gix::Repository) { /* ... */ }
 pub(crate) fn create_and_checkout_branch(repo: &gix::Repository, branch: &str) { /* ... */ }
 pub(crate) fn commit_all_as_branch(repo: &gix::Repository, branch: &str, msg: &str) -> ObjectId { /* ... */ }
 ```
+
+`commit_all` and `commit_all_as_branch` MUST pass `test_signature()`
+(or equivalent) as both author and committer when calling gix's
+commit-creation API — do not let gix fall back to environment /
+git-config lookups. If the pinned gix version's exact SignatureRef
+shape differs from the sketch above, adjust the helper to whatever
+the pinned API requires, but the fixed-signature principle is
+non-negotiable.
 
 - [ ] **Step 2: Wire the module**
 
@@ -1646,6 +1809,29 @@ stubs through the pinned implementations."
 **Files:**
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
+**Path representation for staged diffs.** `gix` returns diff entry
+paths as `BString` (byte strings). `DiffLine::path` is a `PathBuf`,
+which on Unix is an `OsString` byte container — so byte sequences
+that are not valid UTF-8 are still valid paths there. The
+implementation must:
+
+- For valid UTF-8 paths: convert directly via `std::str::from_utf8`
+  → `PathBuf`. Normal path.
+- For non-UTF-8 paths in `--staged` mode (per spec test 25 and
+  spec §"Note on non-UTF-8 paths"): **report normally with a stderr
+  warning that the path is being displayed lossy-UTF-8.** This
+  intentionally differs from full-repo mode (case 4 in spec
+  §"Handling tracked-but-missing files and symlinks"), which
+  skips non-UTF-8 entries. Construct the `PathBuf` via
+  `String::from_utf8_lossy` (replacement chars in the display name
+  are acceptable — host extraction runs against blob content, not
+  the path) and emit a stderr warning via
+  `crate::output::write_stderr_line` naming the lossy path.
+
+This applies to `--changed-vs` mode as well (same blob-content
+scanning model). Full-repo mode is the only place we skip — see
+Task 4.3.
+
 - [ ] **Step 1: Write a failing inline test inside `dev/lint/domains.rs`**
 
 In the existing `#[cfg(test)] mod tests` block (the same one with the URL extraction and scan_line tests), append:
@@ -1676,6 +1862,47 @@ mod staged_added_lines_tests {
 
         assert_eq!(added, vec![("a.txt".to_string(), 2, "NEW LINE".to_string())]);
     }
+
+    /// Spec test case 25: staged scan must NOT skip non-UTF-8 paths
+    /// (full-repo mode skips them; staged reports lossy + warning).
+    #[cfg(unix)]
+    #[test]
+    fn reports_non_utf8_staged_path_lossy() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+
+        // Initial commit so HEAD exists.
+        std::fs::write(temp.path().join("readme.txt"), "hi\n")
+            .expect("should write readme");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        // Add a file with a non-UTF-8 component, containing a
+        // disallowed URL.
+        let non_utf8_name = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f, 0x2e, 0x72, 0x73]); // f, o, 0xff, o, ., r, s
+        let bad_file = temp.path().join(non_utf8_name);
+        std::fs::write(&bad_file, "let x = \"https://test.com\";\n")
+            .expect("should write non-utf8-named file");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path())
+            .expect("should collect staged lines even with non-UTF-8 path");
+        // Expect exactly one DiffLine for the bad file's added line.
+        // The path displays with a replacement char, but the line is
+        // reported (NOT skipped).
+        let added_lines: Vec<_> = lines.iter().collect();
+        assert!(
+            !added_lines.is_empty(),
+            "non-UTF-8 staged paths must be reported, not skipped"
+        );
+        // The content must be the original added line, byte-faithful.
+        assert!(
+            added_lines.iter().any(|l| l.content.contains("https://test.com")),
+            "must surface the URL for scanning: {added_lines:?}"
+        );
+    }
 }
 ```
 
@@ -1691,6 +1918,8 @@ Function signature:
 ```rust
 #[derive(Debug)]
 pub(crate) struct DiffLine {
+    /// Path for display and reporting. Built via `String::from_utf8_lossy`
+    /// for non-UTF-8 sources (see Task 4.1 notes on path representation).
     pub path: std::path::PathBuf,
     pub line_no: usize,
     pub content: String,
@@ -1701,14 +1930,32 @@ pub(crate) fn staged_added_lines(
 ) -> Result<Vec<DiffLine>, error_stack::Report<DomainsLintError>>
 ```
 
-Body: open repo, get HEAD tree, get index, run index-vs-tree diff using the entry points pinned in Phase 2 step 2.3, filter changed paths through `path_is_scanned()` (Task 4.5 dependency — define a stub returning `true` for now and refine later), run blob diff per changed entry, collect added-line hunks. Mirror the spec sketch.
+Body: open repo, get HEAD tree, get index, run index-vs-tree diff using the entry points pinned in Phase 2 step 2.3, filter changed paths through `path_is_scanned()` (Task 4.5 dependency — define a stub returning `true` for now and refine later), run blob diff per changed entry, collect added-line hunks.
+
+Path conversion: for each gix `BString` entry path,
+
+```rust
+let (path, was_lossy) = match std::str::from_utf8(raw_bytes) {
+    Ok(s) => (std::path::PathBuf::from(s), false),
+    Err(_) => {
+        let lossy = String::from_utf8_lossy(raw_bytes).into_owned();
+        (std::path::PathBuf::from(&lossy), true)
+    }
+};
+if was_lossy {
+    crate::output::write_stderr_line(format!(
+        "warning: staged path is not valid UTF-8; displaying lossy: {}",
+        path.display()
+    ))?;
+}
+```
 
 `pub(crate)` (not `pub`) is appropriate — the function is exercised through inline tests and the in-crate `domains::run` caller; no external API surface.
 
 - [ ] **Step 4: Run to verify pass.**
 
 Run: `cargo test --package trusted-server-cli --target "$(rustc -vV | sed -n 's/^host: //p')" -- staged_added_lines_tests`
-Expected: PASS.
+Expected: PASS (both the normal case and the non-UTF-8 case).
 
 - [ ] **Step 5: Commit.**
 
@@ -2012,7 +2259,14 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
 
     let mut violations: Vec<FileViolation> = Vec::new();
     for line in lines {
-        for v in scan_line(&line.content) {
+        let outcome = scan_line(&line.content);
+        for unused in outcome.unused_suppressions {
+            crate::output::write_stderr_line(format!(
+                "warning: {}:{}: allow-domain marker listed `{}` but it does not appear on the line",
+                line.path.display(), line.line_no, unused
+            ))?;
+        }
+        for v in outcome.violations {
             violations.push(FileViolation {
                 path: line.path.clone(),
                 line: line.line_no,
@@ -2239,7 +2493,21 @@ Expected: shows `--force`.
 
 - [ ] **Step 5: Smoke-test in a tempdir repo end-to-end**
 
-Run a shell sequence: create a tempdir, `cd`, `gix init` (or use the cargo binary path via `git init` for the smoke test), invoke `ts dev install-hooks`. Verify `.githooks/pre-commit` exists, is executable, and contains the expected `exec` line. Verify `core.hooksPath` is set to `.githooks` in `.git/config`.
+Run:
+
+```sh
+mkdir -p /tmp/ts-install-hooks-smoke && cd /tmp/ts-install-hooks-smoke
+git init
+ts dev install-hooks
+test -x .githooks/pre-commit && grep -q 'ts-install-hooks: managed' .githooks/pre-commit
+grep -A1 'hooksPath' .git/config
+```
+
+Expected: hook file exists, is executable, contains the
+`# ts-install-hooks: managed` marker; `.git/config` shows
+`hooksPath = .githooks` under `[core]`. (`git init` is intentional —
+`gix` is a Rust crate dependency, not a shell command the
+contributor can rely on having installed.)
 
 - [ ] **Step 6: Commit.**
 
@@ -2341,17 +2609,39 @@ green when the host-target CLI has warnings.
 
 ### Task 9.2: Self-dogfood the linter
 
+**Exit-code expectations.** The linter is designed to find existing
+violations in this repo (the Stage 1 cleanup target). Both commands
+below are **expected to exit `1`** — this is not a failure of the
+linter, it is the linter doing its job. Do not abort the
+verification step on a non-zero exit here. The commands below are
+written defensively for `set -e` / `pipefail` shells.
+
 - [ ] **Step 1: Run `ts dev lint domains` against this very branch**
 
-Run: `ts dev lint domains` (no args) at the repo root.
+Run:
 
-Expected: a list of existing violations (the Stage 1 cleanup target). Verify the output looks reasonable. **This is expected to find many violations** — they're tracked in Stage 1 Doc Cleanup Plan, not blockers for shipping this PR.
+```sh
+ts dev lint domains || rc=$?
+echo "exit code: ${rc:-0}"
+```
+
+Expected: a list of existing violations on stdout, and `exit code: 1` printed at the end. **`exit 1` is the success condition for this step.** The output should look reasonable (well-formed `path:line:` lines). The violations themselves go into the Stage 1 Doc Cleanup Plan, not into this PR.
 
 - [ ] **Step 2: Run the frequency report from the spec**
 
-Run: `ts dev lint domains --format json | jq -r '.violations[].host' | sort | uniq -c | sort -rn | head -30`
+The JSON pipeline below uses `|| true` on the linter so the pipe
+doesn't abort under `set -e` / `pipefail` when the linter exits 1
+(by design — see Step 1).
 
-Expected: a host-frequency table. File the top entries into the Stage 1 Doc Cleanup Plan as a follow-up issue.
+```sh
+(ts dev lint domains --format json || true) \
+  | jq -r '.violations[].host' \
+  | sort | uniq -c | sort -rn | head -30
+```
+
+Expected: a host-frequency table, top entries first. File the top entries into the Stage 1 Doc Cleanup Plan as a follow-up issue.
+
+If `jq` is not installed, use the python3 alternative from spec §"Stage 1 Doc Cleanup Plan" — same `(... || true) | …` wrapping applies.
 
 ### Task 9.3: Push and open the PR
 
