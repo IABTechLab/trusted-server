@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+pub mod lint;
 pub mod serve;
 
 // Re-export what `lib.rs` consumes via `crate::dev::*`. Other public
