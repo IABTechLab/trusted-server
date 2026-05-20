@@ -534,6 +534,9 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
+    // 2× accounts for the injected tsjs script tag plus URL attribute rewrites.
+    const MAX_GROWTH_FACTOR: f64 = 2.0;
+
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
@@ -1294,8 +1297,8 @@ mod tests {
         let growth_factor = output_size as f64 / input_size as f64;
 
         assert!(
-            growth_factor < 2.0,
-            "processed HTML must not grow by more than 2×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+            growth_factor < MAX_GROWTH_FACTOR,
+            "processed HTML must not grow by more than {MAX_GROWTH_FACTOR}×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
         );
     }
 }
