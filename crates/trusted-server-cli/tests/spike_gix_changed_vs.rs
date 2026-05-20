@@ -1,7 +1,7 @@
 //! Spike: prove that gix can compute a merge-base between two refs
 //! and then run a tree-vs-tree diff with the same blob-diff
 //! machinery the staged path uses. Locks in the API for
-//! changed_vs_added_lines() in Phase 4.
+//! `changed_vs_added_lines()` in Phase 4.
 //!
 //! No shell, no `git` binary. All operations via gix.
 
@@ -118,7 +118,7 @@ fn update_head_to(repo: &gix::Repository, ref_name: &str) {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: BString::from("checkout feature").into(),
+                message: BString::from("checkout feature"),
             },
             expected: PreviousValue::Any,
             new: Target::Symbolic(full),

@@ -1,14 +1,13 @@
 //! Spike: prove that gix can give us per-blob hunk information for
 //! files staged in the index relative to the HEAD tree, with new-side
 //! line numbers. Once this test passes, the chosen entry points are
-//! pinned for the staged_added_lines() implementation in Phase 4.
+//! pinned for the `staged_added_lines()` implementation in Phase 4.
 //!
 //! No shell, no `git` binary anywhere. Fixture setup uses gix
-//! exclusively: write_blob + edit_tree + commit_as for the HEAD
-//! commit; gix::index::State for the staged index.
+//! exclusively: `write_blob` + `edit_tree` + `commit_as` for the HEAD
+//! commit; `gix::index::State` for the staged index.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use gix::ObjectId;
 use gix::bstr::BString;
@@ -197,7 +196,3 @@ fn added_line_indices(before: &str, after: &str) -> Vec<(usize, String)> {
     }
     out
 }
-
-// silence unused-imports warning if Path isn't used after refactor
-#[allow(dead_code)]
-const _: fn(&Path) = |_| {};

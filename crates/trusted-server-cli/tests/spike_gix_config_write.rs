@@ -1,10 +1,10 @@
-//! Spike: prove that gix-config::File can read and write
-//! <repo>/.git/config so that `ts dev install-hooks` can persist
-//! core.hooksPath without a subprocess. Locks the read/write APIs
+//! Spike: prove that `gix-config::File` can read and write
+//! `<repo>/.git/config` so that `ts dev install-hooks` can persist
+//! `core.hooksPath` without a subprocess. Locks the read/write APIs
 //! for Phase 6.
 //!
-//! No shell, no `git` binary. The repo is created via gix::init;
-//! the config file is read and written via gix-config::File.
+//! No shell, no `git` binary. The repo is created via `gix::init`;
+//! the config file is read and written via `gix-config::File`.
 
 use std::fs;
 use std::path::Path;
