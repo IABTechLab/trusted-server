@@ -344,3 +344,87 @@ async fn auction_endpoint_does_not_require_auth() {
         "/auction must not apply admin basic-auth gate"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Admin key route full path coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_rotate_key_auth_fail_returns_401() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin/keys/rotate without credentials must return 401"
+    );
+}
+
+#[tokio::test]
+async fn admin_deactivate_key_auth_fail_returns_401() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/deactivate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin/keys/deactivate without credentials must return 401"
+    );
+}
+
+#[tokio::test]
+async fn admin_rotate_key_validation_fail_returns_non_5xx() {
+    use base64::Engine as _;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:admin-pass");
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Basic {creds}"))
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    let status = resp.status().as_u16();
+    assert!(
+        (400..500).contains(&status),
+        "admin/keys/rotate with malformed body must return 4xx: got {status}"
+    );
+}
+
+#[tokio::test]
+async fn admin_rotate_key_storage_fail_does_not_panic() {
+    use base64::Engine as _;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:admin-pass");
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Basic {creds}"))
+        .body(edgezero_core::body::Body::from(
+            r#"{"keyId":"test-key-id"}"#,
+        ))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    let status = resp.status().as_u16();
+    assert_ne!(
+        status, 404,
+        "admin/keys/rotate must not 404 when authenticated"
+    );
+    assert!(
+        status >= 400,
+        "admin/keys/rotate storage-fail must return error status: got {status}"
+    );
+}
