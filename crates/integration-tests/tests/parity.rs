@@ -137,10 +137,10 @@ async fn discovery_route_body_is_json_parity() {
         let resp = svc
             .ready()
             .await
-            .expect("ready")
+            .expect("should be ready")
             .call(req)
             .await
-            .expect("respond");
+            .expect("should respond");
         let status = resp.status().as_u16();
         let body = resp
             .into_body()
@@ -222,17 +222,15 @@ async fn admin_rotate_unauthenticated_parity() {
         "Cloudflare must return 401 for unauthenticated admin route"
     );
 
-    if cf_status == 401 {
-        let cf_www_auth = cf_headers
-            .get("www-authenticate")
-            .expect("should have www-authenticate header on 401")
-            .to_str()
-            .expect("should be valid UTF-8");
-        assert!(
-            cf_www_auth.starts_with("Basic realm="),
-            "Cloudflare 401 WWW-Authenticate must be Basic scheme: {cf_www_auth:?}"
-        );
-    }
+    let cf_www_auth = cf_headers
+        .get("www-authenticate")
+        .expect("should have www-authenticate header on 401")
+        .to_str()
+        .expect("should be valid UTF-8");
+    assert!(
+        cf_www_auth.starts_with("Basic realm="),
+        "Cloudflare 401 WWW-Authenticate must be Basic scheme: {cf_www_auth:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
