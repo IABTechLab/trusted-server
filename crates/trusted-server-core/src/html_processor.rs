@@ -1185,4 +1185,117 @@ mod tests {
             "should contain post-processor mutation"
         );
     }
+
+    #[test]
+    fn golden_script_tag_injected_at_head_start() {
+        // The trusted-server script tag must be the FIRST child of <head>.
+        // Any drift in injection position breaks the page initialization order.
+        let html = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Test</title></head>
+<body><p>Hello</p></body>
+</html>"#;
+
+        let config = create_test_config();
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
+
+        let head_pos = output_str.find("<head>").expect("should contain <head>");
+        let script_pos = output_str
+            .find("<script")
+            .expect("should inject script tag");
+
+        assert!(
+            script_pos > head_pos,
+            "script tag must appear after <head> opening: head_pos={head_pos}, script_pos={script_pos}"
+        );
+
+        // No other elements between <head> and the script tag
+        let between = &output_str[head_pos + "<head>".len()..script_pos];
+        let trimmed = between.trim();
+        assert!(
+            trimmed.is_empty(),
+            "script tag must be first child of <head>, found content before it: {trimmed:?}"
+        );
+    }
+
+    #[test]
+    fn golden_url_rewriting_replaces_origin_in_href() {
+        // href attributes pointing at origin domain must be rewritten to proxy host.
+        let origin = "https://origin.test-publisher.com";
+        let html = format!(
+            r#"<!DOCTYPE html><html><head></head><body>
+        <a href="{origin}/page">Link</a>
+        <img src="{origin}/img.png">
+        </body></html>"#
+        );
+
+        let request_host = "proxy.test-publisher.com";
+        let config = HtmlProcessorConfig {
+            origin_host: "origin.test-publisher.com".to_string(),
+            request_host: request_host.to_string(),
+            request_scheme: "https".to_string(),
+            integrations: IntegrationRegistry::default(),
+        };
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
+
+        assert!(
+            !output_str.contains("origin.test-publisher.com"),
+            "origin host must not appear in rewritten HTML"
+        );
+        assert!(
+            output_str.contains(request_host),
+            "proxy host must appear in rewritten HTML"
+        );
+    }
+
+    #[test]
+    fn golden_integration_script_is_not_double_injected() {
+        // Integration scripts from the registry must appear exactly once.
+        let html = r#"<!DOCTYPE html>
+<html><head></head><body><p>Content</p></body></html>"#;
+
+        let config = create_test_config();
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+        let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
+
+        let script_count = output_str.matches("/static/tsjs=").count();
+        assert_eq!(
+            script_count, 1,
+            "script tag must appear exactly once, found {script_count} occurrences"
+        );
+    }
+
+    #[test]
+    fn response_size_does_not_grow_disproportionately() {
+        // Processing must not expand HTML by more than 2× (accounts for injected
+        // script tag + URL rewrites). Disproportionate growth indicates a bug
+        // (e.g., double-processing, buffer leak).
+        let html = include_str!("html_processor.test.html");
+        let input_size = html.len();
+
+        let config = create_test_config();
+        let mut processor = create_html_processor(config);
+        let output = processor
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process HTML");
+
+        let output_size = output.len();
+        let growth_factor = output_size as f64 / input_size as f64;
+
+        assert!(
+            growth_factor < 2.0,
+            "processed HTML must not grow by more than 2×: input={input_size}B output={output_size}B factor={growth_factor:.2}"
+        );
+    }
 }
