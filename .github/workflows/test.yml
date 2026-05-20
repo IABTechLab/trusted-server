@@ -74,6 +74,9 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Run HTML processor benchmarks (smoke)
+        run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
+
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
@@ -100,6 +103,26 @@ jobs:
 
       - name: Run Cloudflare adapter tests (native host)
         run: cargo test-cloudflare
+
+  test-parity:
+    name: cargo test (cross-adapter parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Run cross-adapter parity tests
+        run: cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity
 
   test-typescript:
     name: vitest
