@@ -125,6 +125,9 @@ jobs:
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity
 
+      - name: Clippy (parity test crate)
+        run: cargo clippy --manifest-path crates/integration-tests/Cargo.toml -- -D warnings
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
