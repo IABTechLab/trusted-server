@@ -247,3 +247,44 @@ pub trait PlatformHttpClient: Send + Sync {
         self.select(vec![pending]).await?.ready
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Error-correlation interim scope (before EdgeZero #213)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn platform_response_default_has_no_backend_name() {
+        // On Axum/Cloudflare noop clients return PlatformResponse::new(response)
+        // with no backend_name. Core logic must not panic when backend_name is None.
+        let response = edgezero_core::http::response_builder()
+            .status(200)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let resp = PlatformResponse::new(response);
+        // PlatformResponse has a public field, not a method.
+        // PlatformPendingRequest has backend_name() method; PlatformResponse does not.
+        assert_eq!(
+            resp.backend_name, None,
+            "PlatformResponse without backend_name must have None field"
+        );
+    }
+
+    #[test]
+    fn platform_response_with_backend_name_is_some() {
+        // On Fastly, responses carry backend_name for error correlation.
+        let response = edgezero_core::http::response_builder()
+            .status(200)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let resp = PlatformResponse::new(response).with_backend_name("prebid-backend");
+        assert_eq!(
+            resp.backend_name.as_deref(),
+            Some("prebid-backend"),
+            "with_backend_name must set backend_name field"
+        );
+    }
+}
