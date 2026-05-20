@@ -46,6 +46,10 @@ fn main() {
 
     // Only write when content changes to avoid unnecessary recompilation.
     let dest_path = Path::new(TRUSTED_SERVER_OUTPUT_CONFIG_PATH);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|_| panic!("Failed to create directory for {dest_path:?}"));
+    }
     let current = fs::read_to_string(dest_path).unwrap_or_default();
     if current != merged_toml {
         fs::write(dest_path, merged_toml)
