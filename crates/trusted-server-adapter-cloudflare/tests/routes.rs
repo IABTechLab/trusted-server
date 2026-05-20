@@ -384,4 +384,3 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         "admin/keys/deactivate without credentials must return 401"
     );
 }
-
