@@ -75,39 +75,13 @@ includes #669.
 **Suggested first-implementation order** (front-loads the riskiest
 API assumptions, matches reviewer guidance):
 
-1. **Spike — gix feasibility.** In a throwaway branch off the chosen
-   #669-containing base (either `main` after #669 merges or the
-   stacked `feature/ts-cli` base), pin a matched `gix` +
-   `gix-config` release-family pair (verify via
-   `cargo tree -p gix -p gix-config` that no duplicate versions land
-   in the lock file), then write three integration tests that drive
-   the conceptual operations end-to-end against a `tempfile`-built
-   repo: (a) staged blob diff with new-side line numbers; (b)
-   merge-base + tree-vs-tree blob diff; (c) durable `core.hooksPath`
-   write via `gix-config::File`.
-
-   **Spike acceptance gate** — all of the following:
-   - The three tests pass deterministically on a clean run.
-   - `cargo tree -p gix -p gix-config` shows exactly one version
-     of each, no `(*)` duplicate-version markers in the dep graph.
-   - The chosen `gix` entry points for index-vs-tree / tree-vs-tree
-     walking and blob diff are pinned in test source (no
-     placeholder names).
-
-   **Spike deliverables back into this spec** (single PR alongside
-   the spike code):
-   - Update the version pins in
-     [Cargo dependencies](#cargo-dependencies) with the chosen
-     numbers and a short comment naming the release family.
-     Replacing the `<pin-during-spike>` placeholders is part of the
-     spike's definition-of-done, not a follow-up.
-   - Update Open Questions to reflect the chosen `gix` API entry
-     points (Open Q5) and the pinned version (Open Q6).
-   - Update the "prototype-required" callout in
-     [Line collection: --staged mode (gitoxide)](#line-collection---staged-mode-gitoxide)
-     to name the chosen entry points instead of the placeholder
-     `index_vs_tree_changes` / `tree_vs_tree_changes` /
-     `blob_diff_added_hunks` helpers.
+1. **Spike — gix feasibility — DONE.** Completed in Phase 2.
+   `gix = 0.83` + `gix-config = 0.56` pinned; three integration
+   tests (`crates/trusted-server-cli/tests/spike_gix_*.rs`) prove
+   staged blob diff, merge-base + tree diff, and durable
+   `core.hooksPath` write — all gix-only, no subprocess. The
+   resolved entry points are recorded in
+   [Resolved by the Phase 2 spike](#resolved-by-the-phase-2-spike).
 2. **URL extraction + allowlist + suppression.** Pure-function
    layer, fully unit-testable without `gix`. Implement against the
    regex / allowlist / marker grammar in this spec; cover every
@@ -646,38 +620,34 @@ Add to `crates/trusted-server-cli/Cargo.toml`:
 
 ```toml
 [dependencies]
-gix = { version = "<pin-during-spike>", default-features = false, features = [
-    "blob-diff",   # blob-level line diffs (gix-diff)
-    "index",       # read the git index for staged-vs-HEAD diffs
-    "revision",    # merge-base computation (gix-revision)
+gix = { version = "0.83", default-features = false, features = [
+    "blob-diff",     # blob-level line diffs (gix-diff / imara-diff)
+    "index",         # read the git index for staged-vs-HEAD diffs
+    "revision",      # merge-base computation (gix-revision)
+    "sha1",          # SHA backend — gix-hash refuses to compile without it
+    "tree-editor",   # Repository::edit_tree, used by test fixtures
 ] }
-gix-config = "<must-match-the-gix-release-family>"
-              # direct File-level read/write of <repo>/.git/config
-              # for ts dev install-hooks (see "Persisting
-              # core.hooksPath" below)
+gix-config = "0.56"   # direct File-level read/write of <repo>/.git/config
+                      # for ts dev install-hooks
 regex = "1"
 ```
 
 Notes:
 
-- **Version pinning is deferred to the gix feasibility spike (see
-  [Implementation Readiness](#implementation-readiness)).** Do not
-  hardcode `gix = "0.66"` / `gix-config = "0.40"` based on this
-  spec alone — gitoxide companion crates evolve together and the
-  release-family pairing matters. For example, the `gix 0.66`
-  release line shipped with `gix-config 0.39.x`, not `0.40`, so the
-  combination written here would cause cargo to pull two
-  incompatible versions of `gix-config` into the tree. The spike
-  pins both crates against the same release family, verifies with
-  `cargo tree -p gix -p gix-config` that no duplicate versions
-  appear, and **updates this dependency table** with the pinned
-  numbers as part of step 1's deliverable.
-- **Release blocker.** This spec is not implementation-complete
-  until the `<pin-during-spike>` / `<must-match-the-gix-release-family>`
-  placeholders above are replaced with concrete pinned versions by
-  the spike PR. The Implementation Readiness section's spike step
-  is the only acceptable mechanism for replacing them; downstream
-  PRs should not invent their own pins.
+- **Versions pinned by the Phase 2 feasibility spike: `gix = 0.83`,
+  `gix-config = 0.56`** (the same gitoxide release family — `gix
+  0.83` depends on `gix-config 0.56`). Verified with
+  `cargo tree -p gix -p gix-config --duplicates`: only an unrelated
+  `hashbrown` appears twice; `gix` and `gix-config` each resolve to
+  a single version.
+- **`sha1` feature is required.** With `default-features = false`,
+  `gix-hash` will not compile without a SHA backend and emits
+  `Please set either the sha1 or the sha256 feature flag`.
+- **`tree-editor` feature is required for test fixtures.** The
+  production runtime does not call `Repository::edit_tree`, but the
+  Phase 2 spike and Phase 4 unit tests build fixture repos entirely
+  through gix (write_blob + edit_tree + commit_as), and `edit_tree`
+  is gated behind `tree-editor`.
 - `gix-config` is pulled in **explicitly** for the durable
   `<repo>/.git/config` write performed by `ts dev install-hooks`.
   `gix::Repository::config_snapshot_mut()` only modifies an
@@ -831,55 +801,56 @@ Sketch (prototype-shaped — concrete `gix` API surface is identified
 during implementation; helper names below are placeholders):
 
 ```rust
-fn staged_added_lines() -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
+fn staged_added_lines(repo_path: &Path)
+    -> Result<Vec<DiffLine>, Report<DomainsLintError>>
+{
+    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
     let head_tree = repo
-        .head_commit()
-        .change_context(DomainsLintError::OpenRepo)?
-        .tree()
-        .change_context(DomainsLintError::OpenRepo)?;
+        .head_commit().change_context(DomainsLintError::OpenRepo)?
+        .tree_id().change_context(DomainsLintError::OpenRepo)?;
+    let head_tree = repo.find_tree(head_tree).change_context(DomainsLintError::OpenRepo)?;
     let index = repo.index().change_context(DomainsLintError::Index)?;
 
+    // Walk both sides into path -> blob_id maps.
+    let head_map = tree_blob_map(&head_tree)?;       // breadthfirst.files()
+    let index_map = index_blob_map(&index);          // entries() filtered to FILE
+
     let mut out = Vec::new();
-    // Iterate index-vs-tree changes.
-    for change in index_vs_tree_changes(&repo, &head_tree, &index)? {
-        let DiffEntry { new_path, old_blob, new_blob, .. } = change;
-        if !path_is_scanned(&new_path) { continue; }
-        let hunks = blob_diff_added_hunks(old_blob.as_deref(), new_blob.as_deref())
-            .change_context(DomainsLintError::Diff)?;
-        for hunk in hunks {
-            for (line_no, content) in hunk.added_lines {
-                out.push(DiffLine { path: new_path.clone(), line_no, content });
-            }
+    for (path, head_id, index_id) in classify_changes(&head_map, &index_map) {
+        if !path_is_scanned(&path) { continue; }
+        let old = head_id.map(|id| read_blob(&repo, id)).transpose()?;
+        let new = match index_id {
+            Some(id) => read_blob(&repo, id)?,
+            None => continue,            // deletion — no added lines
+        };
+        for (line_no, content) in added_lines(old.as_deref(), &new) {
+            out.push(DiffLine { path: path.clone(), line_no, content });
         }
     }
     Ok(out)
 }
 ```
 
-**The `gix` API surface for this is a prototype-required decision.**
-The conceptual operations the spec commits to are:
+**The `gix` API surface is RESOLVED by the Phase 2 spike** — see
+`crates/trusted-server-cli/tests/spike_gix_staged_diff.rs` for the
+reference implementation and the
+[Resolved by the Phase 2 spike](#resolved-by-the-phase-2-spike)
+section for the full entry-point list. The conceptual operations:
 
-1. Open the repository (concrete: `gix::open` / `gix::ThreadSafeRepository::open`).
-2. Resolve the HEAD commit's tree.
-3. Read the index.
-4. Compute the set of paths where the index differs from the HEAD
-   tree, with each path classified as Added / Modified / Renamed /
-   Deleted, and with access to both the old (HEAD) and new (index)
-   blob ids.
-5. Read each blob's content.
-6. Run a line-level diff and obtain hunks whose **new-side** line
-   range and content are accessible.
-
-The exact gix entry points for (4) and (6) — `gix::diff` /
-`gix::index::diff` / `gix::object::tree::diff` for the index-vs-tree
-walk; `gix::diff::blob` (which wraps `imara-diff`) for the blob diff —
-will be pinned during the first implementation pass, against the
-specific `gix` version selected. If the chosen surface area doesn't
-include one of these operations as a high-level helper, the helper
-will be implemented in-crate using the lower-level
-`gix-diff::*` building blocks. This is called out as a
-**prototype-required** step in the plan, not a free-hand assumption.
+1. Open the repository — `gix::open(path)`.
+2. Resolve the HEAD commit's tree — `repo.head_commit()?.tree_id()?`
+   then `repo.find_tree(id)?`.
+3. Read the index — `repo.index()?`.
+4. Walk the HEAD tree (`tree.traverse().breadthfirst.files()`) and
+   the index (`index.entries()`) into `path → blob_id` maps, then
+   compare the maps directly to classify Added / Modified / Deleted.
+   **No tree-vs-tree `Platform`/`for_each_to_obtain_tree` machinery
+   is used** — the direct map comparison is simpler and sidesteps
+   the index→tree conversion gix 0.83 does not expose cleanly.
+5. Read each blob's content — `repo.find_object(id)?.data`.
+6. Run a line-level diff — `gix::diff::blob::Diff::compute(
+   Algorithm::Myers, &InternedInput::new(old, new))`, then walk
+   each `hunk.after` range for new-side line numbers and content.
 
 **Why this is better than shelling out:**
 
@@ -899,19 +870,39 @@ Same blob-diff machinery, but the two trees are HEAD's tree and the
 merge-base tree:
 
 ```rust
-fn changed_vs_added_lines(reference: &str) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let repo = gix::open(".").change_context(DomainsLintError::OpenRepo)?;
-    let head_id = repo.head_id().change_context(DomainsLintError::OpenRepo)?;
+fn changed_vs_added_lines(repo_path: &Path, reference: &str)
+    -> Result<Vec<DiffLine>, Report<DomainsLintError>>
+{
+    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let head_id = repo.head_id().change_context(DomainsLintError::OpenRepo)?.detach();
     let base_id = resolve_base_ref(&repo, reference)?;
     let merge_base = repo
         .merge_base(base_id, head_id)
-        .change_context_lazy(|| DomainsLintError::MergeBase { base: reference.into() })?;
-    let base_tree = repo.find_commit(merge_base)?.tree()?;
-    let head_tree = repo.find_commit(head_id)?.tree()?;
+        .change_context_lazy(|| DomainsLintError::MergeBase { base: reference.into() })?
+        .detach();
+    let base_tree = repo.find_tree(
+        repo.find_commit(merge_base)?.tree_id()?.detach()
+    )?;
+    let head_tree = repo.find_tree(
+        repo.find_commit(head_id)?.tree_id()?.detach()
+    )?;
 
+    // Same map-comparison approach as staged_added_lines: walk both
+    // trees into path -> blob_id maps, classify, blob-diff each
+    // changed path. See the spike at tests/spike_gix_changed_vs.rs.
+    let base_map = tree_blob_map(&base_tree)?;
+    let head_map = tree_blob_map(&head_tree)?;
     let mut out = Vec::new();
-    for change in tree_vs_tree_changes(&repo, &base_tree, &head_tree)? {
-        // same as staged: extension filter → blob diff → added-line hunks
+    for (path, base_blob, head_blob) in classify_changes(&base_map, &head_map) {
+        if !path_is_scanned(&path) { continue; }
+        let old = base_blob.map(|id| read_blob(&repo, id)).transpose()?;
+        let new = match head_blob {
+            Some(id) => read_blob(&repo, id)?,
+            None => continue,
+        };
+        for (line_no, content) in added_lines(old.as_deref(), &new) {
+            out.push(DiffLine { path: path.clone(), line_no, content });
+        }
     }
     Ok(out)
 }
@@ -1872,27 +1863,58 @@ the question.
    stderr warning). Adding `--force-scan` is deferred until a real
    workflow needs it.
 
+## Resolved by the Phase 2 spike
+
+1. **`gix` API entry points — RESOLVED.** The Phase 2 feasibility
+   spike (`crates/trusted-server-cli/tests/spike_gix_*.rs`) pinned
+   the following gix 0.83 entry points:
+   - **Repo / objects:** `gix::open`, `gix::init`,
+     `Repository::write_blob`, `Repository::find_object` (→
+     `Object { data: Vec<u8>, .. }`), `Repository::find_tree`,
+     `Repository::find_commit`, `Repository::head_commit`,
+     `Repository::head_id`.
+   - **Tree construction (test fixtures):** `Repository::empty_tree`,
+     `Repository::edit_tree` + `Editor::upsert` + `Editor::write`,
+     `Repository::commit_as` (with `Signature::to_ref` +
+     `gix::date::parse::TimeBuf`).
+   - **Tree traversal:** `tree.traverse().breadthfirst.files()` →
+     `Vec<gix_traverse::tree::recorder::Entry { mode, filepath, oid }>`.
+     Filter to blobs with `EntryMode::is_blob()`.
+   - **Index:** `Repository::index()` → entries via
+     `state.entries()`, path via `entry.path(&state)`, blob id via
+     `entry.id`, file filter via
+     `entry.mode.contains(gix::index::entry::Mode::FILE)`. Building
+     a fixture index: `gix::index::State::new` +
+     `dangerously_push_entry` + `sort_entries` +
+     `gix::index::File::from_state` + `File::write`.
+   - **merge-base / refs:** `Repository::merge_base(base, head)`,
+     `Repository::find_reference` + `Reference::peel_to_id`
+     (`peel_to_id_in_place` is deprecated), `Repository::reference`
+     for branch creation, `Repository::edit_reference` with a
+     `Target::Symbolic` `RefEdit` for moving HEAD.
+   - **Blob line diff:** `gix::diff::blob::{Algorithm, Diff,
+     InternedInput}` — `Diff::compute(Algorithm::Myers, &input)`,
+     then `diff.hunks()`; each `Hunk.after` is the new-side token
+     (line) range.
+   - **No tree-vs-tree `Platform` machinery is used.** Both the
+     staged and `--changed-vs` collectors walk the two trees into
+     `path → blob_id` maps and compare directly — simpler than
+     `for_each_to_obtain_tree` and avoids the index→tree conversion
+     gix 0.83 does not expose cleanly.
+   - **gix-config:** `File::from_path_no_includes(path,
+     Source::Local)`, `File::set_raw_value` (dotted `AsKey` form —
+     avoids the `File<'event>` invariance that bites
+     `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
+2. **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
+   `gix-config = 0.56`, same gitoxide release family. See
+   [Cargo dependencies](#cargo-dependencies) for the full feature
+   set and rationale.
+
 ## Open Questions
 
-Genuine unresolved items the implementer must close during
-implementation.
+Genuine unresolved items, deferred beyond v1.
 
-1. **Exact `gix` API entry points for index-vs-tree and
-   tree-vs-tree diff walking, and for blob diff with new-side line
-   numbers.** Marked as prototype-required in the
-   [Line collection: --staged mode](#line-collection---staged-mode-gitoxide)
-   section. Pinned by the gix feasibility spike
-   (see [Implementation Readiness](#implementation-readiness)
-   step 1). The spec commits to the conceptual operations, not
-   concrete function names.
-2. **`gix` and `gix-config` version pins.** Both are deliberately
-   left as placeholders in [Cargo dependencies](#cargo-dependencies)
-   because (a) gitoxide companion crates must come from the same
-   release family and (b) workspace consistency with any `gix`
-   pulled in transitively takes precedence. The feasibility spike
-   chooses the pair, verifies with `cargo tree -p gix -p gix-config`,
-   and updates the dependency table.
-3. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
+1. **Stable-commit audit mode (`--at <rev>`).** Full-repo audit
    currently reads working-tree content (current local edits
    included). If a release-gate use case appears that needs an
    "at a tagged commit" view, add an `--at <rev>` mode that scans
