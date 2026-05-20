@@ -102,7 +102,11 @@ async fn verify_signature_is_routed() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/verify-signature must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/verify-signature must be routed"
+    );
 }
 
 #[tokio::test]
@@ -115,7 +119,11 @@ async fn admin_rotate_key_is_routed() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/admin/keys/rotate must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/admin/keys/rotate must be routed"
+    );
 }
 
 #[tokio::test]
@@ -128,7 +136,11 @@ async fn admin_deactivate_key_is_routed() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/admin/keys/deactivate must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/admin/keys/deactivate must be routed"
+    );
 }
 
 #[tokio::test]
@@ -155,7 +167,11 @@ async fn first_party_proxy_is_routed() {
     let resp = router.oneshot(req).await;
     // Handlers require valid outbound proxy settings; they may return 4xx/5xx in CI.
     // The assertion is routing only: the path must not fall through to the 404 not-found handler.
-    assert_ne!(resp.status().as_u16(), 404, "/first-party/proxy must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/proxy must be routed"
+    );
 }
 
 #[tokio::test]
@@ -167,7 +183,11 @@ async fn first_party_click_is_routed() {
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/first-party/click must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/click must be routed"
+    );
 }
 
 #[tokio::test]
@@ -179,7 +199,11 @@ async fn first_party_sign_get_is_routed() {
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "GET /first-party/sign must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "GET /first-party/sign must be routed"
+    );
 }
 
 #[tokio::test]
@@ -192,7 +216,11 @@ async fn first_party_sign_post_is_routed() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "POST /first-party/sign must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "POST /first-party/sign must be routed"
+    );
 }
 
 #[tokio::test]
@@ -205,5 +233,9 @@ async fn first_party_proxy_rebuild_is_routed() {
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
     let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/first-party/proxy-rebuild must be routed");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/proxy-rebuild must be routed"
+    );
 }
