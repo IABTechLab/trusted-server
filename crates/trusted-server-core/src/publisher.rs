@@ -10,6 +10,17 @@
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
+//!
+//! **Note on platform coupling:** This module is currently coupled to
+//! `fastly::Body`/`Request`/`Response` at its handler boundaries — the entry
+//! points ([`handle_publisher_request`], [`stream_publisher_body`]) still
+//! accept and return `fastly::Body` and `fastly::Response`. The streaming
+//! processor itself is generic: `process_response_streaming` writes into
+//! any [`Write`] (a `Vec<u8>` for buffered routes, a `StreamingBody` for the
+//! streaming route). The HTTP-type coupling will be addressed in the
+//! platform HTTP-type migration alongside all other
+//! `fastly::Request`/`Response`/`Body` migrations. It is not a
+//! content-rewriting concern.
 
 use std::io::Write;
 
