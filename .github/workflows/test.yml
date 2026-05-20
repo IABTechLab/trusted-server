@@ -75,6 +75,7 @@ jobs:
         run: cargo test-axum
 
       - name: Run HTML processor benchmarks (smoke)
+        # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
 
   test-cloudflare:
