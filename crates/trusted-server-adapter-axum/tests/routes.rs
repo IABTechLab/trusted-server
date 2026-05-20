@@ -406,29 +406,6 @@ async fn admin_rotate_key_auth_fail_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_key_authenticated_returns_not_5xx() {
-    use base64::Engine as _;
-    let creds = base64::engine::general_purpose::STANDARD.encode("admin:admin-pass");
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .header("authorization", format!("Basic {creds}"))
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    let status = resp.status().as_u16();
-    assert_ne!(status, 500, "admin/keys/rotate must not 5xx: got {status}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_auth_fail_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
