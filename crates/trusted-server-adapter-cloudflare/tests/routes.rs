@@ -349,6 +349,8 @@ async fn auction_endpoint_does_not_require_auth() {
 // Admin key route full path coverage
 // ---------------------------------------------------------------------------
 
+// Exercises the auth-fail path with a realistic key body (complements the
+// generic `admin_route_without_credentials_returns_401` above).
 #[tokio::test]
 async fn admin_rotate_key_auth_fail_returns_401() {
     let router = TrustedServerApp::routes();
@@ -424,7 +426,7 @@ async fn admin_rotate_key_storage_fail_does_not_panic() {
         "admin/keys/rotate must not 404 when authenticated"
     );
     assert!(
-        status >= 400,
-        "admin/keys/rotate storage-fail must return error status: got {status}"
+        (400..500).contains(&status),
+        "admin/keys/rotate storage-fail must return 4xx (not panic or 5xx): got {status}"
     );
 }

@@ -380,6 +380,8 @@ async fn admin_route_returns_non_404_non_5xx() {
 // Admin key route full path coverage
 // ---------------------------------------------------------------------------
 
+// Exercises the auth-fail path with a realistic key body (complements the
+// generic `admin_route_without_credentials_returns_401` above).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_auth_fail_returns_401() {
     let mut svc = make_service();
