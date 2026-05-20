@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use trusted_server_core::html_processor::{create_html_processor, HtmlProcessorConfig};
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::streaming_processor::StreamProcessor as _;
@@ -48,10 +48,9 @@ fn bench_html_processor(c: &mut Criterion) {
                 b.iter(|| {
                     let config = make_config();
                     let mut processor = create_html_processor(config);
-                    let result = processor
-                        .process_chunk(html.as_slice(), true)
-                        .expect("should process HTML");
-                    result
+                    processor
+                        .process_chunk(black_box(html.as_slice()), true)
+                        .expect("should process HTML")
                 });
             },
         );
