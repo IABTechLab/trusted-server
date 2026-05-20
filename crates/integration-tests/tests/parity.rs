@@ -146,7 +146,7 @@ async fn discovery_route_body_is_json_parity() {
             .into_body()
             .collect()
             .await
-            .expect("collect body")
+            .expect("should collect body")
             .to_bytes();
         (status, body)
     };
@@ -199,7 +199,7 @@ async fn admin_rotate_unauthenticated_parity() {
     // Both adapters must return 401 for unauthenticated admin requests.
     // The authenticated-path divergence (Axum→501 no-KV, CF→4xx no-KV)
     // is separate and not covered here.
-    let (axum_status, _) = axum_post_headers("/admin/keys/rotate", "{}").await;
+    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/rotate", "{}").await;
     let (cf_status, cf_headers) = cf_post_headers("/admin/keys/rotate", "{}").await;
 
     assert_eq!(
@@ -215,6 +215,10 @@ async fn admin_rotate_unauthenticated_parity() {
         "both adapters must return the same status for unauthenticated admin route"
     );
 
+    assert!(
+        axum_headers.contains_key("www-authenticate"),
+        "Axum 401 must include WWW-Authenticate header"
+    );
     let cf_www_auth = cf_headers
         .get("www-authenticate")
         .expect("should have www-authenticate header on 401")
@@ -223,6 +227,35 @@ async fn admin_rotate_unauthenticated_parity() {
     assert!(
         cf_www_auth.starts_with("Basic realm="),
         "Cloudflare 401 WWW-Authenticate must be Basic scheme: {cf_www_auth:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_deactivate_unauthenticated_parity() {
+    // Mirror of admin_rotate_unauthenticated_parity for the deactivate endpoint.
+    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/deactivate", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/admin/keys/deactivate", "{}").await;
+
+    assert_eq!(
+        axum_status, 401,
+        "Axum must return 401 for unauthenticated admin/keys/deactivate"
+    );
+    assert_eq!(
+        cf_status, 401,
+        "Cloudflare must return 401 for unauthenticated admin/keys/deactivate"
+    );
+    assert_eq!(
+        axum_status, cf_status,
+        "both adapters must return the same status for unauthenticated admin/keys/deactivate"
+    );
+
+    assert!(
+        axum_headers.contains_key("www-authenticate"),
+        "Axum 401 on admin/keys/deactivate must include WWW-Authenticate header"
+    );
+    assert!(
+        cf_headers.contains_key("www-authenticate"),
+        "Cloudflare 401 on admin/keys/deactivate must include WWW-Authenticate header"
     );
 }
 
@@ -267,7 +300,7 @@ async fn auction_not_challenged_by_auth_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cookie_behavior_note() {
+async fn publisher_proxy_fallback_parity() {
     // Cookie (Set-Cookie) parity for the publisher proxy requires a live origin.
     // Without an origin, both adapters return an error (4xx or 5xx). The parity
     // assertion is that Set-Cookie presence matches across adapters regardless of
