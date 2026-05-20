@@ -219,6 +219,136 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_route_without_credentials_returns_401() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(AxumBody::from("{}"))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin route must return 401 without credentials"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_route_without_credentials_includes_www_authenticate_header() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(AxumBody::from("{}"))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "should be 401 before checking header"
+    );
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "401 response must include WWW-Authenticate header"
+    );
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        www_auth.starts_with("Basic realm="),
+        "WWW-Authenticate must be Basic scheme, got: {www_auth}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_route_with_wrong_credentials_returns_401() {
+    use base64::Engine as _;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Basic {creds}"))
+        .body(AxumBody::from("{}"))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin route must reject wrong credentials with 401"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_endpoint_does_not_require_auth() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/.well-known/trusted-server.json")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        401,
+        "/.well-known/trusted-server.json must not require auth"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auction_endpoint_does_not_require_auth() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/auction")
+        .header("content-type", "application/json")
+        .body(AxumBody::from(r#"{"adUnits":[]}"#))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        401,
+        "/auction must not apply admin basic-auth gate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_returns_non_404_non_5xx() {
     let mut svc = make_service();
 

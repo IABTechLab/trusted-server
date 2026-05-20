@@ -29,6 +29,7 @@ trusted-server-core = { path = "../trusted-server-core" }
 
 [dev-dependencies]
 axum = "0.8"
+base64 = { workspace = true }
 temp-env = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 edgezero-core = { workspace = true }

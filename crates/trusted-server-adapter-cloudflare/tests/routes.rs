@@ -239,3 +239,107 @@ async fn first_party_proxy_rebuild_is_routed() {
         "/first-party/proxy-rebuild must be routed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Basic-auth parity tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_route_without_credentials_returns_401() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin route must return 401 without credentials"
+    );
+}
+
+#[tokio::test]
+async fn admin_route_without_credentials_includes_www_authenticate_header() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "should be 401 before checking header"
+    );
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "401 response must include WWW-Authenticate header"
+    );
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        www_auth.starts_with("Basic realm="),
+        "WWW-Authenticate must be Basic scheme, got: {www_auth}"
+    );
+}
+
+#[tokio::test]
+async fn admin_route_with_wrong_credentials_returns_401() {
+    use base64::Engine as _;
+    let creds = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Basic {creds}"))
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "admin route must reject wrong credentials with 401"
+    );
+}
+
+#[tokio::test]
+async fn discovery_endpoint_does_not_require_auth() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("GET")
+        .uri("/.well-known/trusted-server.json")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        401,
+        "/.well-known/trusted-server.json must not require auth"
+    );
+}
+
+#[tokio::test]
+async fn auction_endpoint_does_not_require_auth() {
+    let router = TrustedServerApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri("/auction")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from(r#"{"adUnits":[]}"#))
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        401,
+        "/auction must not apply admin basic-auth gate"
+    );
+}
