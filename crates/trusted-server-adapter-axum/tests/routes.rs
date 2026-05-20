@@ -215,7 +215,7 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 }
 
 // ---------------------------------------------------------------------------
-// Basic-auth gate test
+// Basic-auth parity tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -269,8 +269,9 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let www_auth = resp
         .headers()
         .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .expect("should have www-authenticate header")
+        .to_str()
+        .expect("should be valid UTF-8");
     assert!(
         www_auth.starts_with("Basic realm="),
         "WWW-Authenticate must be Basic scheme, got: {www_auth}"
