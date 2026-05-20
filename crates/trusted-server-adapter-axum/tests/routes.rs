@@ -427,3 +427,119 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         "admin/keys/deactivate without credentials must return 401"
     );
 }
+
+// ---------------------------------------------------------------------------
+// First-party route smoke tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_is_routed() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/first-party/proxy")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/proxy must be routed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_click_is_routed() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/first-party/click")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/click must be routed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_sign_get_is_routed() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/first-party/sign")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "GET /first-party/sign must be routed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_sign_post_is_routed() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/first-party/sign")
+        .header("content-type", "application/json")
+        .body(AxumBody::from("{}"))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "POST /first-party/sign must be routed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_rebuild_is_routed() {
+    let mut svc = make_service();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/first-party/proxy-rebuild")
+        .header("content-type", "application/json")
+        .body(AxumBody::from("{}"))
+        .expect("should build request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_ne!(
+        resp.status().as_u16(),
+        404,
+        "/first-party/proxy-rebuild must be routed"
+    );
+}
