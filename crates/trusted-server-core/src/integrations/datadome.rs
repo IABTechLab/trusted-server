@@ -42,7 +42,7 @@
 //!
 //! 1. **SDK Loading**: Browser requests `/integrations/datadome/tags.js`
 //! 2. **Proxy & Rewrite**: Trusted Server fetches from `js.datadome.co`, rewrites internal
-//!    URLs to first-party paths using [`DATADOME_URL_PATTERN`]
+//!    URLs to first-party paths using `DATADOME_URL_PATTERN`
 //! 3. **Signal Collection**: SDK sends signals to `/integrations/datadome/js/`
 //! 4. **Transparent Proxy**: Trusted Server forwards to `api-js.datadome.co`, returns response
 //!

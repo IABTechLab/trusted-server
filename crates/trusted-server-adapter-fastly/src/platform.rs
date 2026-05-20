@@ -19,9 +19,10 @@ use trusted_server_core::geo::geo_from_fastly;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
+    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
+    PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +177,127 @@ impl PlatformBackend for FastlyPlatformBackend {
 // FastlyPlatformHttpClient — helpers
 // ---------------------------------------------------------------------------
 
+fn fastly_image_optimizer_region(
+    region: &str,
+) -> Result<fastly::image_optimizer::ImageOptimizerRegion, Report<PlatformError>> {
+    use fastly::image_optimizer::ImageOptimizerRegion;
+
+    match region
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "us_east" | "us_east_1" => Ok(ImageOptimizerRegion::UsEast),
+        "us_central" | "us_central_1" => Ok(ImageOptimizerRegion::UsCentral),
+        "us_west" | "us_west_1" | "us_west_2" => Ok(ImageOptimizerRegion::UsWest),
+        "eu_central" | "eu_central_1" => Ok(ImageOptimizerRegion::EuCentral),
+        "eu_west" | "eu_west_1" => Ok(ImageOptimizerRegion::EuWest),
+        "asia" => Ok(ImageOptimizerRegion::Asia),
+        "australia" => Ok(ImageOptimizerRegion::Australia),
+        other => Err(Report::new(PlatformError::HttpClient)
+            .attach(format!("unsupported Image Optimizer region: {other}"))),
+    }
+}
+
+fn fastly_image_optimizer_format(
+    format: &str,
+) -> Result<fastly::image_optimizer::Format, Report<PlatformError>> {
+    use fastly::image_optimizer::Format;
+
+    match format.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(Format::Auto),
+        "avif" => Ok(Format::AVIF),
+        "gif" => Ok(Format::GIF),
+        "jpeg" | "jpg" => Ok(Format::JPEG),
+        "jxl" | "jpegxl" => Ok(Format::JPEGXL),
+        "mp4" => Ok(Format::MP4),
+        "png" => Ok(Format::PNG),
+        "webp" => Ok(Format::WebP),
+        other => Err(Report::new(PlatformError::HttpClient)
+            .attach(format!("unsupported Image Optimizer format: {other}"))),
+    }
+}
+
+fn fastly_resize_filter(
+    resize_filter: &str,
+) -> Result<fastly::image_optimizer::ResizeAlgorithm, Report<PlatformError>> {
+    use fastly::image_optimizer::ResizeAlgorithm;
+
+    match resize_filter.trim().to_ascii_lowercase().as_str() {
+        "nearest" => Ok(ResizeAlgorithm::Nearest),
+        "bilinear" => Ok(ResizeAlgorithm::Bilinear),
+        "bicubic" => Ok(ResizeAlgorithm::Bicubic),
+        "lanczos2" => Ok(ResizeAlgorithm::Lanczos2),
+        "lanczos3" => Ok(ResizeAlgorithm::Lanczos3),
+        other => Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "unsupported Image Optimizer resize filter: {other}"
+        ))),
+    }
+}
+
+fn fastly_crop(crop: &PlatformImageOptimizerCrop) -> fastly::image_optimizer::Crop {
+    use fastly::image_optimizer::{Area, Crop, CropMode, PointOrOffset, Position};
+
+    let position = match (crop.offset_x, crop.offset_y) {
+        (Some(x), Some(y)) => Some(Position {
+            x: Some(PointOrOffset::Offset(x)),
+            y: Some(PointOrOffset::Offset(y)),
+        }),
+        _ => None,
+    };
+    let mode = crop
+        .mode
+        .map(|PlatformImageOptimizerCropMode::Smart| CropMode::Smart);
+
+    Crop {
+        size: Area::AspectRatio((crop.width, crop.height)),
+        position,
+        mode,
+    }
+}
+
+fn apply_fastly_image_optimizer_params(
+    target: &mut fastly::image_optimizer::ImageOptimizerOptions,
+    params: PlatformImageOptimizerParams,
+) -> Result<(), Report<PlatformError>> {
+    use fastly::image_optimizer::PixelsOrPercentage;
+
+    if let Some(format) = params.format {
+        target.format = Some(fastly_image_optimizer_format(&format)?);
+    }
+    if let Some(quality) = params.quality {
+        target.quality = Some(quality);
+    }
+    if let Some(resize_filter) = params.resize_filter {
+        target.resize_filter = Some(fastly_resize_filter(&resize_filter)?);
+    }
+    if let Some(width) = params.width {
+        target.width = Some(PixelsOrPercentage::Pixels(width));
+    }
+    if let Some(height) = params.height {
+        target.height = Some(PixelsOrPercentage::Pixels(height));
+    }
+    if let Some(crop) = params.crop {
+        target.crop = Some(fastly_crop(&crop));
+    }
+
+    Ok(())
+}
+
+fn apply_fastly_image_optimizer(
+    req: &mut fastly::Request,
+    options: PlatformImageOptimizerOptions,
+) -> Result<(), Report<PlatformError>> {
+    let region = fastly_image_optimizer_region(&options.region)?;
+    let mut fastly_options = fastly::image_optimizer::ImageOptimizerOptions::from_region(region);
+    fastly_options.preserve_query_string_on_origin_request =
+        Some(options.preserve_query_string_on_origin_request);
+    apply_fastly_image_optimizer_params(&mut fastly_options, options.params)?;
+    req.set_image_optimizer(fastly_options);
+    Ok(())
+}
+
 /// Convert a platform-neutral [`edgezero_core::http::Request`] to a [`fastly::Request`].
 ///
 /// Only buffered `Body::Once` bodies are supported on this path.
@@ -228,11 +350,13 @@ fn fastly_response_to_platform(
 
 /// Fastly implementation of [`PlatformHttpClient`].
 ///
-/// - [`send`](PlatformHttpClient::send) — converts the platform request to a
-///   `fastly::Request`, calls `.send()`, and wraps the response.
-/// - [`send_async`](PlatformHttpClient::send_async) — same conversion but
-///   calls `.send_async()` and wraps the `fastly::PendingRequest`.
-/// - [`select`](PlatformHttpClient::select) — downcasts each
+/// - [`send`](PlatformHttpClient::send) converts the platform request to a
+///   `fastly::Request`, applies Image Optimizer metadata when present, calls
+///   `.send()`, and wraps the response.
+/// - [`send_async`](PlatformHttpClient::send_async) converts the request and
+///   calls `.send_async()`. It rejects Image Optimizer metadata because Fastly's
+///   async request path does not expose the IO attachment used by asset routes.
+/// - [`select`](PlatformHttpClient::select) downcasts each
 ///   [`PlatformPendingRequest`] back to `fastly::PendingRequest` and calls
 ///   `fastly::http::request::select()`.
 pub struct FastlyPlatformHttpClient;
@@ -244,7 +368,11 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let fastly_req = edge_request_to_fastly(request.request)?;
+        let image_optimizer = request.image_optimizer;
+        let mut fastly_req = edge_request_to_fastly(request.request)?;
+        if let Some(options) = image_optimizer {
+            apply_fastly_image_optimizer(&mut fastly_req, options)?;
+        }
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
@@ -256,6 +384,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("Image Optimizer is not supported with Fastly send_async"));
+        }
         let fastly_req = edge_request_to_fastly(request.request)?;
         let pending = fastly_req
             .send_async(&backend_name)
@@ -608,6 +740,29 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming request body"),
             "should describe the unsupported streaming body: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_async_rejects_image_optimizer_metadata() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("GET")
+            .uri("https://example.com/image.jpg")
+            .body(Body::empty())
+            .expect("should build test request");
+        let platform_request = PlatformHttpRequest::new(request, "nonexistent-backend")
+            .with_image_optimizer(PlatformImageOptimizerOptions::new(
+                "us_east",
+                PlatformImageOptimizerParams::default(),
+            ));
+
+        let err = futures::executor::block_on(client.send_async(platform_request))
+            .expect_err("should reject async Image Optimizer requests");
+
+        assert!(
+            format!("{err:?}").contains("Image Optimizer"),
+            "should explain unsupported async IO path: {err:?}"
         );
     }
 
