@@ -196,30 +196,23 @@ async fn verify_signature_route_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_unauthenticated_parity() {
-    // known divergence: Axum dev server returns 501 (store writes unsupported)
-    // while Cloudflare adapter returns 401 (auth middleware challenges first).
-    // Both must be non-404 and non-5xx; Cloudflare must carry WWW-Authenticate.
+    // Both adapters must return 401 for unauthenticated admin requests.
+    // The authenticated-path divergence (Axum→501 no-KV, CF→4xx no-KV)
+    // is separate and not covered here.
     let (axum_status, _) = axum_post_headers("/admin/keys/rotate", "{}").await;
     let (cf_status, cf_headers) = cf_post_headers("/admin/keys/rotate", "{}").await;
 
-    assert_ne!(axum_status, 404, "Axum /admin/keys/rotate must be routed");
-    assert_ne!(
-        cf_status, 404,
-        "Cloudflare /admin/keys/rotate must be routed"
+    assert_eq!(
+        axum_status, 401,
+        "Axum must return 401 for unauthenticated admin route"
     );
-    assert!(
-        axum_status < 500,
-        "Axum /admin/keys/rotate must not 5xx: {axum_status}"
-    );
-    assert!(
-        cf_status < 500,
-        "Cloudflare /admin/keys/rotate must not 5xx: {cf_status}"
-    );
-
-    // Cloudflare adapter has full auth middleware — must challenge with 401.
     assert_eq!(
         cf_status, 401,
         "Cloudflare must return 401 for unauthenticated admin route"
+    );
+    assert_eq!(
+        axum_status, cf_status,
+        "both adapters must return the same status for unauthenticated admin route"
     );
 
     let cf_www_auth = cf_headers
