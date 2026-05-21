@@ -169,3 +169,33 @@ fn warn(msg: impl Into<String>) -> Result<(), error_stack::Report<DomainsLintErr
     use error_stack::ResultExt as _;
     crate::output::write_stderr_line(msg.into()).change_context(DomainsLintError::WriteWarning)
 }
+
+/// Normalise an extracted URL host: strip bracketed-IPv6 `[ ]` and
+/// lowercase. Pure function; no I/O.
+fn normalise_host(raw: &str) -> String {
+    let trimmed = raw.trim_start_matches('[').trim_end_matches(']');
+    trimmed.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_lowercases() {
+        assert_eq!(normalise_host("EXAMPLE.COM"), "example.com");
+        assert_eq!(normalise_host("Foo.Example.Com"), "foo.example.com");
+    }
+
+    #[test]
+    fn normalise_strips_ipv6_brackets() {
+        assert_eq!(normalise_host("[::1]"), "::1");
+        assert_eq!(normalise_host("[2001:DB8::1]"), "2001:db8::1");
+    }
+
+    #[test]
+    fn normalise_passthrough_for_plain_hosts() {
+        assert_eq!(normalise_host("test.com"), "test.com");
+        assert_eq!(normalise_host("127.0.0.1"), "127.0.0.1");
+    }
+}
