@@ -853,18 +853,34 @@ pub(crate) fn staged_added_lines(
         }
     }
 
-    let mut all_paths: Vec<&BString> = index_map.keys().chain(head_map.keys()).collect();
+    collect_added_from_maps(&repo, &head_map, &index_map)
+}
+
+/// Walk two `path → blob_id` maps, classify each path, and blob-diff
+/// added/modified entries into [`DiffLine`]s.
+///
+/// Shared by [`staged_added_lines`] (HEAD-tree vs index) and
+/// [`changed_vs_added_lines`] (merge-base tree vs HEAD tree). Both
+/// modes scan blob content, so a non-UTF-8 path is reported lossy
+/// with a stderr warning rather than skipped (full-repo mode skips —
+/// see [`full_repo_lines`]).
+fn collect_added_from_maps(
+    repo: &gix::Repository,
+    old_map: &HashMap<BString, ObjectId>,
+    new_map: &HashMap<BString, ObjectId>,
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let mut all_paths: Vec<&BString> = new_map.keys().chain(old_map.keys()).collect();
     all_paths.sort();
     all_paths.dedup();
 
     let mut out = Vec::new();
     for raw_path in all_paths {
-        let head_id = head_map.get(raw_path);
-        let index_id = index_map.get(raw_path);
-        let (old_bytes, new_bytes) = match (head_id, index_id) {
-            (Some(h), Some(i)) if h == i => continue, // unchanged
-            (Some(h), Some(i)) => (Some(read_blob(&repo, *h)?), read_blob(&repo, *i)?),
-            (None, Some(i)) => (None, read_blob(&repo, *i)?),
+        let old_id = old_map.get(raw_path);
+        let new_id = new_map.get(raw_path);
+        let (old_bytes, new_bytes) = match (old_id, new_id) {
+            (Some(o), Some(n)) if o == n => continue, // unchanged
+            (Some(o), Some(n)) => (Some(read_blob(repo, *o)?), read_blob(repo, *n)?),
+            (None, Some(n)) => (None, read_blob(repo, *n)?),
             (Some(_), None) => continue, // deletion — no added lines
             (None, None) => continue,
         };
@@ -875,10 +891,10 @@ pub(crate) fn staged_added_lines(
             continue;
         }
         if was_lossy {
-            // Staged mode reports non-UTF-8 paths (unlike full-repo
-            // mode, which skips them) — see spec test 25.
+            // Staged / changed-vs modes report non-UTF-8 paths
+            // (unlike full-repo mode, which skips them) — spec test 25.
             warn(format!(
-                "warning: staged path is not valid UTF-8; displaying lossy: {}",
+                "warning: path is not valid UTF-8; displaying lossy: {}",
                 path.display()
             ))?;
         }
@@ -892,6 +908,78 @@ pub(crate) fn staged_added_lines(
         }
     }
     Ok(out)
+}
+
+/// Resolve a base reference to an object id, trying four candidate
+/// forms in order: the name as given, then `refs/heads/<name>`,
+/// `refs/remotes/origin/<name>`, and `refs/tags/<name>`.
+///
+/// # Errors
+///
+/// Returns [`DomainsLintError::Reference`] if no candidate resolves.
+fn resolve_base_ref(
+    repo: &gix::Repository,
+    reference: &str,
+) -> Result<ObjectId, Report<DomainsLintError>> {
+    let candidates = [
+        reference.to_string(),
+        format!("refs/heads/{reference}"),
+        format!("refs/remotes/origin/{reference}"),
+        format!("refs/tags/{reference}"),
+    ];
+    for candidate in &candidates {
+        if let Ok(mut r) = repo.find_reference(candidate.as_str())
+            && let Ok(id) = r.peel_to_id()
+        {
+            return Ok(id.detach());
+        }
+    }
+    Err(Report::new(DomainsLintError::Reference(reference.to_string())))
+}
+
+/// Collect added lines on `HEAD` relative to the merge-base of
+/// `reference` and `HEAD` — the CI/PR scan mode.
+///
+/// # Errors
+///
+/// Returns [`DomainsLintError`] if the repository cannot be opened,
+/// the base ref does not resolve, no merge-base exists, or a tree or
+/// blob cannot be read.
+pub(crate) fn changed_vs_added_lines(
+    repo_path: &Path,
+    reference: &str,
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let head_id = repo
+        .head_id()
+        .change_context(DomainsLintError::OpenRepo)?
+        .detach();
+    let base_id = resolve_base_ref(&repo, reference)?;
+    let merge_base = repo
+        .merge_base(base_id, head_id)
+        .change_context_lazy(|| DomainsLintError::MergeBase {
+            base: reference.to_string(),
+        })?
+        .detach();
+
+    let base_map = tree_blob_map(&commit_tree(&repo, merge_base)?)?;
+    let head_map = tree_blob_map(&commit_tree(&repo, head_id)?)?;
+    collect_added_from_maps(&repo, &base_map, &head_map)
+}
+
+/// Resolve a commit id to its tree object.
+fn commit_tree(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+) -> Result<gix::Tree<'_>, Report<DomainsLintError>> {
+    let tree_id = repo
+        .find_commit(commit_id)
+        .change_context(DomainsLintError::Diff)?
+        .tree_id()
+        .change_context(DomainsLintError::Diff)?
+        .detach();
+    repo.find_tree(tree_id)
+        .change_context(DomainsLintError::Diff)
 }
 
 #[cfg(test)]
@@ -962,5 +1050,98 @@ mod staged_added_lines_tests {
             lines.iter().any(|l| l.content.contains("https://test.com")),
             "must surface the URL for scanning: {lines:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod changed_vs_tests {
+    use super::*;
+    use crate::dev::lint::test_support;
+
+    /// Build a two-branch fixture: `main` with a base commit, then a
+    /// `feature` branch that adds a line containing a disallowed URL.
+    /// Returns the tempdir (kept alive by the caller).
+    fn two_branch_fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+
+        std::fs::write(temp.path().join("a.txt"), "let ok = 1;\n")
+            .expect("should write base file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "base");
+
+        test_support::create_and_checkout_branch(&repo, "feature");
+        std::fs::write(
+            temp.path().join("a.txt"),
+            "let ok = 1;\nlet bad = \"https://test.com\";\n",
+        )
+        .expect("should write feature change");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "feature change");
+
+        temp
+    }
+
+    #[test]
+    fn reports_lines_added_by_feature_branch() {
+        let temp = two_branch_fixture();
+        let lines = changed_vs_added_lines(temp.path(), "main")
+            .expect("should compute changed-vs added lines");
+        let added: Vec<_> = lines
+            .iter()
+            .map(|l| (l.line_no, l.content.clone()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![(2, "let bad = \"https://test.com\";".to_string())],
+            "should report only the line the feature branch added"
+        );
+    }
+
+    #[test]
+    fn resolves_via_remote_tracking_ref_fallback() {
+        let temp = two_branch_fixture();
+        let repo = gix::open(temp.path()).expect("should open repo");
+
+        // Move refs/heads/main → refs/remotes/origin/main so the
+        // bare name "main" only resolves via the fallback chain.
+        let main_id = repo
+            .find_reference("refs/heads/main")
+            .expect("refs/heads/main should exist")
+            .peel_to_id()
+            .expect("should peel main")
+            .detach();
+        repo.reference(
+            "refs/remotes/origin/main",
+            main_id,
+            gix::refs::transaction::PreviousValue::Any,
+            "seed remote-tracking ref",
+        )
+        .expect("should create remote-tracking ref");
+
+        use gix::refs::transaction::{Change, RefEdit, RefLog};
+        let delete = RefEdit {
+            change: Change::Delete {
+                expected: gix::refs::transaction::PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name: "refs/heads/main"
+                .try_into()
+                .expect("valid ref name"),
+            deref: false,
+        };
+        repo.edit_reference(delete)
+            .expect("should delete refs/heads/main");
+
+        // resolve_base_ref must now fall through to
+        // refs/remotes/origin/main.
+        let lines = changed_vs_added_lines(temp.path(), "main")
+            .expect("should resolve via remote-tracking fallback");
+        assert_eq!(
+            lines.len(),
+            1,
+            "fallback resolution should still find the feature change"
+        );
+        assert!(lines[0].content.contains("https://test.com"));
     }
 }
