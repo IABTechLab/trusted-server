@@ -12,7 +12,7 @@
 //! content-rewriting concern.
 
 use std::io::Write;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
@@ -38,6 +38,11 @@ use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 use crate::streaming_replacer::create_url_replacer;
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
+
+/// Read buffer size for streaming body processing and brotli internal buffers.
+/// Both the `Decompressor` and `CompressorWriter` use this value so all
+/// brotli I/O layers operate on consistently-sized chunks.
+const STREAM_CHUNK_SIZE: usize = 8192;
 
 fn restrict_accept_encoding(req: &mut Request) {
     // If the client sent no Accept-Encoding, leave the request unchanged so the
@@ -194,7 +199,7 @@ struct ProcessResponseParams<'a> {
     content_type: &'a str,
     integration_registry: &'a IntegrationRegistry,
     ad_slots_script: Option<&'a str>,
-    ad_bids_state: &'a Arc<RwLock<Option<String>>>,
+    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
 }
 
 /// Process response body through the streaming pipeline.
@@ -276,7 +281,7 @@ fn create_html_stream_processor(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     ad_slots_script: Option<String>,
-    ad_bids_state: Arc<RwLock<Option<String>>>,
+    ad_bids_state: Arc<Mutex<Option<String>>>,
 ) -> Result<impl StreamProcessor, Report<TrustedServerError>> {
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
 
@@ -418,7 +423,7 @@ pub struct OwnedProcessResponseParams {
     pub(crate) request_scheme: String,
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
-    pub(crate) ad_bids_state: Arc<RwLock<Option<String>>>,
+    pub(crate) ad_bids_state: Arc<Mutex<Option<String>>>,
     /// In-flight SSP bids dispatched before `pending_origin.wait()`.
     /// The streaming phase collects these and writes bids to `ad_bids_state`
     /// before processing the last body chunk, so `</body>` injection sees live bids.
@@ -605,7 +610,7 @@ pub(crate) fn is_prefetch_request(req: &Request) -> bool {
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
-    ad_bids_state: &Arc<RwLock<Option<String>>>,
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
@@ -614,7 +619,7 @@ pub(crate) fn write_bids_to_state(
     );
     let bid_map = build_bid_map(winning_bids, price_granularity);
     let bids_script = build_bids_script(&bid_map);
-    *ad_bids_state.write().expect("should write bid state") = Some(bids_script);
+    *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
 
 /// Prepend an HTML comment summarising the auction result onto the shared
@@ -626,7 +631,7 @@ pub(crate) fn write_bids_to_state(
 pub(crate) fn prepend_auction_debug_comment(
     path_label: &str,
     result: &crate::auction::orchestrator::OrchestrationResult,
-    ad_bids_state: &Arc<RwLock<Option<String>>>,
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
 ) {
     let ssp_count = result.provider_responses.len();
     let mediator_info = match &result.mediator_response {
@@ -639,8 +644,8 @@ pub(crate) fn prepend_auction_debug_comment(
         result.total_time_ms,
     );
     let mut state = ad_bids_state
-        .write()
-        .expect("should write bid state for debug");
+        .lock()
+        .expect("should lock bid state for debug");
     match &mut *state {
         Some(script) => {
             *script = format!("{debug_comment}\n{script}");
@@ -655,7 +660,7 @@ pub(crate) fn prepend_auction_debug_comment(
 struct AuctionCollectCtx<'a> {
     dispatched: DispatchedAuction,
     price_granularity: PriceGranularity,
-    ad_bids_state: &'a Arc<RwLock<Option<String>>>,
+    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     orchestrator: &'a AuctionOrchestrator,
     services: &'a RuntimeServices,
     settings: &'a Settings,
@@ -697,13 +702,14 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             Ok(())
         }
         Compression::Brotli => {
-            let decoder = Decompressor::new(body, 4096);
+            let decoder = Decompressor::new(body, STREAM_CHUNK_SIZE);
             let params = BrotliEncoderParams {
                 quality: 4,
                 lgwin: 22,
                 ..Default::default()
             };
-            let mut encoder = CompressorWriter::with_params(&mut *output, 4096, &params);
+            let mut encoder =
+                CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
             one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
             let _ = encoder.into_inner();
             Ok(())
@@ -730,8 +736,7 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         services,
         settings,
     } = ctx;
-    const CHUNK_SIZE: usize = 8192;
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
@@ -964,7 +969,7 @@ pub async fn handle_publisher_request(
         .and_then(|co| co.auction_timeout_ms)
         .unwrap_or(settings.auction.timeout_ms);
 
-    let ad_bids_state: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let ad_bids_state: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let price_granularity = settings
         .creative_opportunities
@@ -1281,13 +1286,20 @@ pub(crate) fn build_auction_request(
 /// All substitutions use `\uXXXX` form, which is valid inside both JSON strings
 /// and JS string literals. The result is always safe to write as `JSON.parse("…")`.
 fn html_escape_for_script(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003C")
-        .replace('>', "\\u003E")
-        .replace('&', "\\u0026")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '<' => out.push_str("\\u003C"),
+            '>' => out.push_str("\\u003E"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Build a price-bucketed bid map from winning bids.
@@ -2275,7 +2287,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/css".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(RwLock::new(None)),
+            ad_bids_state: Arc::new(Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -2320,7 +2332,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(RwLock::new(None)),
+            ad_bids_state: Arc::new(Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -2356,7 +2368,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(RwLock::new(None)),
+            ad_bids_state: Arc::new(Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -2459,7 +2471,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(RwLock::new(None)),
+            ad_bids_state: Arc::new(Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -2513,7 +2525,7 @@ mod tests {
             request_scheme: "https".to_string(),
             content_type: "text/html".to_string(),
             ad_slots_script: None,
-            ad_bids_state: Arc::new(RwLock::new(None)),
+            ad_bids_state: Arc::new(Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };

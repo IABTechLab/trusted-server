@@ -145,7 +145,7 @@ pub struct HtmlProcessorConfig {
     /// Shared auction result — written by auction task before HTML processing begins.
     /// Handler reads this in `el.on_end_tag()` on the body element.
     /// `None` means no auction ran; inject empty `__ts_bids = {}` as fallback.
-    pub ad_bids_state: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    pub ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl HtmlProcessorConfig {
@@ -164,7 +164,7 @@ impl HtmlProcessorConfig {
             request_scheme: request_scheme.to_string(),
             integrations: integrations.clone(),
             ad_slots_script: None,
-            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -179,7 +179,7 @@ impl HtmlProcessorConfig {
     pub fn with_ad_state(
         mut self,
         ad_slots_script: Option<String>,
-        ad_bids_state: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+        ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         self.ad_slots_script = ad_slots_script;
         self.ad_bids_state = ad_bids_state;
@@ -191,8 +191,8 @@ impl HtmlProcessorConfig {
 ///
 /// # Panics
 ///
-/// Panics if the `ad_bids_state` `RwLock` is poisoned. This cannot happen in
-/// normal operation since no code holds the write lock across a panic boundary.
+/// Panics if the `ad_bids_state` `Mutex` is poisoned. This cannot happen in
+/// normal operation since no code holds the lock across a panic boundary.
 #[must_use]
 pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcessor {
     let post_processors = config.integrations.html_post_processors();
@@ -333,7 +333,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
-                            let script_guard = state.read().expect("should read bid state");
+                            let script_guard = state.lock().expect("should lock bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
                                 None => r#"<script>window.__ts_bids=JSON.parse("{}");if(typeof window.__tsAdInit==="function")window.__tsAdInit();</script>"#
@@ -624,7 +624,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
-            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
             ad_slots_script: Some(
                 r#"<script>window.__ts_ad_slots=JSON.parse("[]");</script>"#.to_string(),
             ),
-            ad_bids_state: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1305,7 +1305,7 @@ mod tests {
     fn injects_ts_bids_before_body_close() {
         let bids_script =
             r#"<script>window.__ts_bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
-        let state = std::sync::Arc::new(std::sync::RwLock::new(Some(bids_script.to_string())));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1334,7 +1334,7 @@ mod tests {
     fn injects_ts_bids_only_once_with_multiple_body_elements() {
         let bids_script =
             r#"<script>window.__ts_bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
-        let state = std::sync::Arc::new(std::sync::RwLock::new(Some(bids_script.to_string())));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1360,7 +1360,7 @@ mod tests {
     fn injects_empty_ts_bids_when_slots_matched_but_auction_returned_nothing() {
         // Slots matched (ad_slots_script is Some) but auction task never wrote a result
         // (state is None) — e.g. auction timed out with zero bids. Fallback to {}.
-        let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -1385,7 +1385,7 @@ mod tests {
         // No slots matched this URL — ad_slots_script is None. __ts_bids must be
         // omitted entirely so the publisher's existing client-side GPT flow is
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
-        let state = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
