@@ -123,7 +123,10 @@ fn fnv1a_bucket(key: &str) -> u8 {
 /// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
 fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
-    debug_assert!(rollout_pct <= 100, "should be a value produced by read_rollout_pct");
+    debug_assert!(
+        rollout_pct <= 100,
+        "should be a value produced by read_rollout_pct"
+    );
     bucket < rollout_pct
 }
 
@@ -237,7 +240,9 @@ fn main() {
     let routing_key = match req.get_client_ip_addr() {
         Some(ip) => ip.to_string(),
         None => {
-            log::debug!("no client IP available, using empty routing key (deterministic bucket 61)");
+            log::debug!(
+                "no client IP available, using empty routing key (deterministic bucket 61)"
+            );
             String::new()
         }
     };
