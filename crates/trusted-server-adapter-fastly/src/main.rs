@@ -85,6 +85,45 @@ fn parse_edgezero_flag(value: &str) -> bool {
     v.eq_ignore_ascii_case("true") || v == "1"
 }
 
+/// Parses a rollout percentage string into a value in `0..=100`.
+///
+/// Accepts only integer strings in the range 0–100 (inclusive) after whitespace
+/// trimming. Returns `None` for anything else: non-integer, out-of-range,
+/// empty string.
+fn parse_rollout_pct(value: &str) -> Option<u8> {
+    let n: u16 = value.trim().parse().ok()?;
+    if n > 100 {
+        return None;
+    }
+    Some(n as u8)
+}
+
+/// Maps an arbitrary string to a deterministic bucket in `0..100`.
+///
+/// Uses FNV-1a (32-bit variant) to produce a uniform-enough distribution for
+/// canary traffic splitting without pulling in any hash crates. The same input
+/// always produces the same output across Rust versions because the algorithm
+/// is defined here, not delegated to `DefaultHasher`.
+fn fnv1a_bucket(key: &str) -> u8 {
+    const FNV_OFFSET: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % 100) as u8
+}
+
+/// Returns `true` if the given bucket should be routed to the EdgeZero path.
+///
+/// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
+/// When `rollout_pct = 0` no bucket ever routes to EdgeZero (instant rollback).
+/// When `rollout_pct = 100` every bucket routes to EdgeZero (full cutover).
+fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
+    bucket < rollout_pct
+}
+
 /// Opens the shared Fastly Config Store used by both the `EdgeZero` flag read and
 /// `EdgeZero` dispatch metadata.
 ///
@@ -587,6 +626,140 @@ mod tests {
             "should not parse whitespace-only"
         );
         assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
+    }
+
+    // ---------------------------------------------------------------------------
+    // parse_rollout_pct
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn parses_valid_rollout_percentages() {
+        assert_eq!(parse_rollout_pct("0"), Some(0), "should parse '0'");
+        assert_eq!(parse_rollout_pct("1"), Some(1), "should parse '1'");
+        assert_eq!(parse_rollout_pct("50"), Some(50), "should parse '50'");
+        assert_eq!(parse_rollout_pct("100"), Some(100), "should parse '100'");
+        assert_eq!(
+            parse_rollout_pct("  50  "),
+            Some(50),
+            "should trim whitespace"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rollout_percentages() {
+        assert_eq!(
+            parse_rollout_pct("101"),
+            None,
+            "should reject values above 100"
+        );
+        assert_eq!(
+            parse_rollout_pct(""),
+            None,
+            "should reject empty string"
+        );
+        assert_eq!(
+            parse_rollout_pct("abc"),
+            None,
+            "should reject non-integer"
+        );
+        assert_eq!(
+            parse_rollout_pct("-1"),
+            None,
+            "should reject negative value"
+        );
+        assert_eq!(
+            parse_rollout_pct("1.5"),
+            None,
+            "should reject decimal value"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // fnv1a_bucket
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn bucket_is_in_range_0_to_99() {
+        for key in &["1.2.3.4", "255.255.255.255", "::1", "", "unknown"] {
+            let b = fnv1a_bucket(key);
+            assert!(b < 100, "bucket must be 0..100 for key {key:?}, got {b}");
+        }
+    }
+
+    #[test]
+    fn bucket_is_deterministic() {
+        let key = "192.168.1.1";
+        assert_eq!(
+            fnv1a_bucket(key),
+            fnv1a_bucket(key),
+            "same key must produce the same bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_distributes_across_range() {
+        // Smoke-test that fnv1a_bucket produces a spread of values (not a constant).
+        // 256 distinct IP-like keys must produce at least 50 unique buckets.
+        let buckets: std::collections::HashSet<u8> = (0u16..=255)
+            .map(|i| fnv1a_bucket(&format!("10.0.0.{i}")))
+            .collect();
+        assert!(
+            buckets.len() > 50,
+            "fnv1a_bucket should distribute across buckets; got only {} unique values in 256 keys",
+            buckets.len()
+        );
+    }
+
+    #[test]
+    fn empty_key_bucket_is_valid() {
+        let b = fnv1a_bucket("");
+        assert!(b < 100, "empty key must still produce a valid bucket, got {b}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // canary_routes_to_edgezero
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn rollout_zero_routes_all_to_legacy() {
+        for bucket in 0u8..100 {
+            assert!(
+                !canary_routes_to_edgezero(bucket, 0),
+                "pct=0 should route all to legacy, bucket={bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_hundred_routes_all_to_edgezero() {
+        for bucket in 0u8..100 {
+            assert!(
+                canary_routes_to_edgezero(bucket, 100),
+                "pct=100 should route all to EdgeZero, bucket={bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_fifty_routes_exactly_half_of_bucket_space() {
+        let edgezero_count = (0u8..100)
+            .filter(|&b| canary_routes_to_edgezero(b, 50))
+            .count();
+        assert_eq!(
+            edgezero_count, 50,
+            "pct=50 should route exactly 50 out of 100 buckets to EdgeZero"
+        );
+    }
+
+    #[test]
+    fn rollout_one_routes_exactly_one_bucket() {
+        let edgezero_count = (0u8..100)
+            .filter(|&b| canary_routes_to_edgezero(b, 1))
+            .count();
+        assert_eq!(
+            edgezero_count, 1,
+            "pct=1 should route exactly 1 out of 100 buckets to EdgeZero"
+        );
     }
 
     #[test]
