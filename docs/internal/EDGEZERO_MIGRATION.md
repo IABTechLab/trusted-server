@@ -1,0 +1,139 @@
+# EdgeZero Migration Runbook
+
+Operational reference for the Fastly Compute EdgeZero canary rollout
+(issue [#500](https://github.com/IABTechLab/trusted-server/issues/500),
+epic [#480](https://github.com/IABTechLab/trusted-server/issues/480)).
+
+---
+
+## Config store keys
+
+Config store name: **`trusted_server_config`** (Fastly service config store)
+
+| Key                    | Type                 | Effect                                                                                                                            |
+| ---------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                      |
+| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"100"`. |
+
+**Routing logic:** `fnv1a_bucket(client_ip) < edgezero_rollout_pct` → EdgeZero, else legacy.
+Same client IP always gets the same bucket — routing is sticky per user.
+
+### Safe defaults / failure modes
+
+| Condition                                           | Effective behaviour   |
+| --------------------------------------------------- | --------------------- |
+| Config store unreachable                            | All legacy            |
+| `edgezero_enabled` unreadable                       | All legacy            |
+| `edgezero_rollout_pct` absent (but enabled=true)    | All EdgeZero (100%)   |
+| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy            |
+| `edgezero_rollout_pct = "0"`                        | All legacy (rollback) |
+
+> ⚠️ **Do NOT delete `edgezero_rollout_pct` while `edgezero_enabled = "true"`.** An absent key
+> is treated as 100 (full rollout) for backward compatibility. If you want to pause or roll back,
+> **set the value to `"0"`** — do not delete it.
+
+---
+
+## Canary progression
+
+> **Pre-condition:** All Phase 5 verification gates (PR18) passed.
+>
+> **Production key setup order (important):** Set `edgezero_rollout_pct = "0"` in the
+> production config store **before** setting `edgezero_enabled = "true"`. If you set
+> `edgezero_enabled` first and `edgezero_rollout_pct` is absent, the absent-key default
+> (100) kicks in immediately, routing all traffic to EdgeZero without a staged canary.
+
+### Pre-flight activation
+
+Before advancing any stage, activate the canary switch:
+
+1. Confirm `edgezero_rollout_pct = "0"` is already set in the production config store
+   (set it now if not — the pre-condition above explains why this must come first).
+2. Set `edgezero_enabled = "true"` in the production config store.
+3. Verify via log tailing that `routing request through legacy path (bucket=N, rollout_pct=0)`
+   appears — this confirms the flag is live and all traffic is still on the legacy path.
+
+### Stage 1 — 1%
+
+1. Set `edgezero_rollout_pct = "1"` in the production config store.
+2. Hold **30 minutes**.
+3. Check pass/fail thresholds (see below).
+4. If all green → advance to Stage 2. If any threshold breached → rollback.
+
+### Stage 2 — 10%
+
+1. Set `edgezero_rollout_pct = "10"`.
+2. Hold **2 hours** (same time-of-day window as the 7-day baseline).
+3. Check pass/fail thresholds.
+4. If all green → advance to Stage 3. If any threshold breached → rollback.
+
+### Stage 3 — 50%
+
+1. Set `edgezero_rollout_pct = "50"`.
+2. Hold **24 hours**.
+3. Check pass/fail thresholds. Pay particular attention to auction win-rate.
+4. If all green → advance to Stage 4. If any threshold breached → rollback.
+
+### Stage 4 — 100% (full cutover)
+
+1. Set `edgezero_rollout_pct = "100"`.
+2. Hold **48 hours** before decommissioning the legacy entry point.
+3. Confirm zero regressions across all metrics.
+4. Open legacy cleanup PR (removes `legacy_main()` and flag plumbing, see issue #495).
+
+---
+
+## Pass/fail thresholds
+
+**Baseline definition:** 7-day rolling average from production Fastly service
+metrics, sampled from the same time-of-day window as the canary observation
+period (to account for diurnal traffic patterns).
+
+| Metric           | Threshold                | Action if breached                     |
+| ---------------- | ------------------------ | -------------------------------------- |
+| Error rate (5xx) | > 0.1% above baseline    | **Immediate rollback**                 |
+| p95 latency      | > 15% above baseline     | Hold; rollback if no fix within 1 hour |
+| Auction win-rate | > 1% delta from baseline | Hold; investigate                      |
+| Timeout rate     | > 2× baseline            | **Immediate rollback**                 |
+
+> **Note on p95 threshold:** The spec §Cutover paragraph mentions ±10% as the Stage 2 hold-point
+> criterion; the threshold table at §Pass/fail thresholds says 15%. These two values are
+> inconsistent in the spec. This runbook adopts the threshold table (15%) as the governing
+> number because it applies uniformly across all stages. If ops adopts a stricter 10% target
+> at Stage 2, update this table accordingly.
+
+---
+
+## Rollback procedure
+
+Rollback is **immediate, no deploy required**.
+
+1. Set `edgezero_rollout_pct = "0"` in the production config store.
+   Traffic shifts back to legacy within seconds (next request per Wasm instance).
+2. Optionally set `edgezero_enabled = "false"` as belt-and-suspenders.
+3. Investigate root cause before re-advancing the canary.
+4. Keep the legacy entry point (`legacy_main()`) available until at least one
+   full release cycle after reaching 100% with zero regressions.
+
+---
+
+## Monitoring
+
+Fastly real-time stats dashboard. Key signals at each canary stage:
+
+- **Error rate:** `5xx / total_requests` by edge PoP
+- **Latency p95:** use log search for `routing request through EdgeZero path` to identify EdgeZero traffic (`x-edgezero-path` instrumentation header does not exist yet — follow-up task)
+- **Auction win-rate:** downstream SSP reporting, compare same-day prior week
+- **Timeout rate:** `504 / total_requests`
+
+> Log lines in Viceroy / Fastly log tailing:
+> `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
+> `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
+
+---
+
+## Reference
+
+- Spec: `docs/superpowers/specs/2026-03-19-edgezero-migration-design.md` §Cutover plan
+- Plan: `docs/superpowers/plans/2026-05-21-pr19-cutover-canary-rollout.md`
+- Legacy cleanup: issue [#495](https://github.com/IABTechLab/trusted-server/issues/495)
