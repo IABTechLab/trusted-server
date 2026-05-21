@@ -1145,3 +1145,178 @@ mod changed_vs_tests {
         assert!(lines[0].content.contains("https://test.com"));
     }
 }
+
+/// Emit a "skipping" warning for a path that is being excluded from
+/// a full-repo scan.
+fn warn_skip(path: &Path, reason: &str) -> Result<(), Report<DomainsLintError>> {
+    warn(format!("note: skipping {}: {reason}", path.display()))
+}
+
+/// Like [`warn_skip`] but for a raw byte path that is not valid UTF-8.
+fn warn_skip_bytes(bytes: &[u8], reason: &str) -> Result<(), Report<DomainsLintError>> {
+    warn(format!(
+        "note: skipping {}: {reason}",
+        String::from_utf8_lossy(bytes)
+    ))
+}
+
+/// Scan every line of every tracked file in the working tree —
+/// the full-repo audit mode.
+///
+/// Reads working-tree content (not committed blobs), so it reports
+/// the current local state including unstaged edits. Tracked files
+/// that are missing, symlinks, non-regular, non-UTF-8-named, or
+/// binary are skipped with a stderr warning.
+///
+/// # Errors
+///
+/// Returns [`DomainsLintError`] if the repository or its index
+/// cannot be opened, the repository has no work directory, or a
+/// scanned file fails to read for a reason other than binary
+/// content.
+pub(crate) fn full_repo_lines(
+    repo_path: &Path,
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+    let work_dir = repo
+        .workdir()
+        .ok_or_else(|| Report::new(DomainsLintError::OpenRepo))?
+        .to_path_buf();
+    let index = repo.index().change_context(DomainsLintError::Index)?;
+
+    let mut out = Vec::new();
+    for entry in index.entries() {
+        let raw = entry.path(&index);
+
+        // Case 4: non-UTF-8 path — skip (full-repo mode does not
+        // lossy-report; that is staged/changed-vs behavior).
+        let Ok(rel_str) = std::str::from_utf8(raw) else {
+            warn_skip_bytes(raw, "non-UTF-8 path")?;
+            continue;
+        };
+        if !path_is_scanned(rel_str) {
+            continue;
+        }
+
+        let path = work_dir.join(rel_str);
+        // Case 1: tracked but missing from the working tree.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn_skip(&path, "tracked but missing from working tree")?;
+                continue;
+            }
+            Err(e) => {
+                warn_skip(&path, &format!("metadata error: {e}"))?;
+                continue;
+            }
+        };
+        // Case 2: symlink — not followed.
+        if meta.file_type().is_symlink() {
+            warn_skip(&path, "symlink not followed")?;
+            continue;
+        }
+        // Case 3: non-regular file (FIFO, socket, device).
+        if !meta.file_type().is_file() {
+            warn_skip(&path, "non-regular file")?;
+            continue;
+        }
+        // Case 5: binary content.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn_skip(&path, "binary content")?;
+                continue;
+            }
+            Err(e) => {
+                return Err(Report::new(DomainsLintError::ReadFile(path.clone()))
+                    .attach_printable(e.to_string()));
+            }
+        };
+
+        for (i, line) in content.lines().enumerate() {
+            out.push(DiffLine {
+                path: PathBuf::from(rel_str),
+                line_no: i + 1,
+                content: line.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod full_repo_tests {
+    use super::*;
+    use crate::dev::lint::test_support;
+
+    /// A clean tracked file is scanned line-by-line.
+    #[test]
+    fn scans_tracked_file_lines() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n")
+            .expect("should write file");
+        test_support::stage_all(&repo);
+
+        let lines = full_repo_lines(temp.path()).expect("should scan repo");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// Case 1: a tracked file removed from the working tree is
+    /// skipped, not a hard error.
+    #[test]
+    fn skips_tracked_but_missing_file() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "kept\n").expect("should write a");
+        std::fs::write(temp.path().join("gone.rs"), "removed\n").expect("should write gone");
+        test_support::stage_all(&repo);
+        std::fs::remove_file(temp.path().join("gone.rs")).expect("should remove gone");
+
+        let lines = full_repo_lines(temp.path()).expect("should scan repo despite missing file");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["kept"], "missing file is skipped, kept file scanned");
+    }
+
+    /// Case 2: a tracked path that became a symlink is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlink() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("real.rs"), "real\n").expect("should write real");
+        std::fs::write(temp.path().join("link.rs"), "placeholder\n")
+            .expect("should write placeholder");
+        test_support::stage_all(&repo);
+
+        // Replace link.rs on disk with a symlink; the index entry
+        // stays a regular file.
+        std::fs::remove_file(temp.path().join("link.rs")).expect("should remove placeholder");
+        std::os::unix::fs::symlink("real.rs", temp.path().join("link.rs"))
+            .expect("should create symlink");
+
+        let lines = full_repo_lines(temp.path()).expect("should scan repo");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["real"], "symlink is skipped, real file scanned");
+    }
+
+    /// Case 5: a binary file is skipped, not a hard error.
+    #[test]
+    fn skips_binary_file() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("text.rs"), "hello\n").expect("should write text");
+        // 0xff 0xfe is not a valid UTF-8 sequence — read_to_string
+        // rejects it with ErrorKind::InvalidData. (A NUL byte would
+        // NOT work: NUL is valid UTF-8.)
+        std::fs::write(temp.path().join("data.json"), b"{\"x\":\xff\xfe}")
+            .expect("should write binary");
+        test_support::stage_all(&repo);
+
+        let lines = full_repo_lines(temp.path()).expect("should scan repo despite binary file");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["hello"], "binary file is skipped, text file scanned");
+    }
+}
