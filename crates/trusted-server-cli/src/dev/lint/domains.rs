@@ -442,3 +442,100 @@ mod protocol_relative_tests {
         assert!(extract_protocol_relative_hosts("// comment text").is_empty());
     }
 }
+
+/// Regex for the per-line suppression marker. The comment introducer
+/// (`//`, `#`, `<!--`, or `*` + whitespace) must be preceded by
+/// start-of-line or whitespace — this is what makes the marker
+/// bypass-resistant against `allow-domain` substrings inside URLs.
+fn suppression_marker_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"(?im)(?:^|\s)(?://|\#|<!--|\*\s)\s*allow-domain:\s*([A-Za-z0-9.\-:\[\],\s]+?)(?:-->|$)",
+        )
+        .expect("should compile suppression marker regex")
+    })
+}
+
+/// Result of parsing a line for a suppression marker.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LineSuppression {
+    /// Hosts listed in the marker (post-trim, lowercased).
+    pub suppressed: HashSet<String>,
+}
+
+/// Parse the `allow-domain:` marker on `line`, if present. Splits the
+/// captured host list on `,`, trims each entry, lowercases, and
+/// drops empties.
+fn parse_suppression_marker(line: &str) -> LineSuppression {
+    let mut out = LineSuppression::default();
+    let Some(caps) = suppression_marker_regex().captures(line) else {
+        return out;
+    };
+    let Some(m) = caps.get(1) else {
+        return out;
+    };
+    for host in m.as_str().split(',') {
+        let host = host.trim();
+        if !host.is_empty() {
+            out.suppressed.insert(host.to_lowercase());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod suppression_tests {
+    use super::*;
+
+    fn parse(line: &str) -> HashSet<String> {
+        parse_suppression_marker(line).suppressed
+    }
+
+    #[test]
+    fn single_host_after_slash_comment() {
+        let got = parse("let x = \"https://evil.com\"; // allow-domain: evil.com");
+        let expected: HashSet<String> = ["evil.com".to_string()].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn html_comment_form_with_trailing_space() {
+        // Captured group includes trailing space before --> ; trim handles it.
+        let got = parse("<!-- allow-domain: test.com   -->");
+        let expected: HashSet<String> = ["test.com".to_string()].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hash_comment_form() {
+        let got = parse("upstream = \"https://evil.com\"  # allow-domain: evil.com");
+        let expected: HashSet<String> = ["evil.com".to_string()].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn multi_host_with_whitespace() {
+        let got = parse("// allow-domain: a.com ,  b.com , c.com");
+        let expected: HashSet<String> = ["a.com", "b.com", "c.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn bypass_attempt_url_path_lookalike_not_suppressed() {
+        // 'allow-domain' inside a URL path is NOT a comment.
+        let got = parse("fetch(\"https://evil.com/allow-domain\")");
+        assert!(got.is_empty(), "URL-path content must not suppress: {got:?}");
+    }
+
+    #[test]
+    fn bypass_attempt_pathological_host_named_allow_domain() {
+        // https://allow-domain:8080/path — the // is preceded by ':',
+        // not whitespace/SOL, so the marker anchor fails.
+        let got = parse("let x = \"https://allow-domain:8080/path\";");
+        assert!(got.is_empty(), "pathological host must not suppress: {got:?}");
+    }
+}
