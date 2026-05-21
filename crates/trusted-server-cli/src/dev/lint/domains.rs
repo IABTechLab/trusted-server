@@ -4,8 +4,10 @@
 
 use core::error::Error;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use derive_more::Display;
+use regex::Regex;
 
 /// Integration proxies and loopback hosts that must match exactly.
 /// Subdomains are NOT allowed (e.g., `anything.api.privacy-center.org`
@@ -297,5 +299,74 @@ mod allow_check_tests {
         assert!(!is_allowed("test.com", &nothing_suppressed()));
         assert!(!is_allowed("1.2.3.4", &nothing_suppressed()));
         assert!(!is_allowed("192.168.1.1", &nothing_suppressed()));
+    }
+}
+
+/// Regex for absolute `http(s)://` URLs. Case-insensitive; the host
+/// must start with an alphanumeric character so placeholders like
+/// `https://...` are rejected.
+fn absolute_url_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
+            .expect("should compile absolute URL regex")
+    })
+}
+
+/// Extract and normalise every host from absolute URLs on `line`.
+fn extract_absolute_hosts(line: &str) -> Vec<String> {
+    absolute_url_regex()
+        .captures_iter(line)
+        .filter_map(|c| c.get(1).map(|m| normalise_host(m.as_str())))
+        .collect()
+}
+
+#[cfg(test)]
+mod absolute_url_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_plain() {
+        assert_eq!(
+            extract_absolute_hosts("see https://example.com/path here"),
+            vec!["example.com"]
+        );
+    }
+
+    #[test]
+    fn extracts_bracketed_ipv6() {
+        assert_eq!(extract_absolute_hosts("dial http://[::1]:8080/"), vec!["::1"]);
+    }
+
+    #[test]
+    fn extracts_uppercase_normalised() {
+        assert_eq!(
+            extract_absolute_hosts("HTTPS://Example.COM/x"),
+            vec!["example.com"]
+        );
+    }
+
+    #[test]
+    fn rejects_dots_only_placeholder() {
+        assert!(extract_absolute_hosts("see https://... for an example").is_empty());
+    }
+
+    #[test]
+    fn handles_punctuation_wrapping() {
+        for s in [
+            "\"https://example.com\",",
+            "(https://example.com)",
+            "<https://example.com>",
+        ] {
+            assert_eq!(extract_absolute_hosts(s), vec!["example.com"], "input: {s}");
+        }
+    }
+
+    #[test]
+    fn extracts_multiple_per_line() {
+        assert_eq!(
+            extract_absolute_hosts("see [a](https://github.com/x) and [b](https://example.com/y)"),
+            vec!["github.com", "example.com"]
+        );
     }
 }
