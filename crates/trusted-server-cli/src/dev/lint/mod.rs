@@ -4,3 +4,6 @@
 //! - `domains`: URL-host linter (this design).
 
 pub mod domains;
+
+#[cfg(test)]
+pub(crate) mod test_support;
