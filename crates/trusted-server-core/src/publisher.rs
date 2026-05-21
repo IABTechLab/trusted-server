@@ -989,6 +989,16 @@ pub async fn handle_publisher_request(
             req.get_header_str("user-agent"),
         );
         auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
+        let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
+        if client_ip.is_some() || geo.is_some() {
+            let device = auction_request.device.get_or_insert(DeviceInfo {
+                user_agent: None,
+                ip: None,
+                geo: None,
+            });
+            device.ip = client_ip;
+            device.geo = geo.clone();
+        }
         let auction_context = AuctionContext {
             settings,
             request: &req,
@@ -1533,6 +1543,16 @@ pub async fn handle_page_bids(
                 req.get_header_str("user-agent"),
             );
             auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
+            let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
+            if client_ip.is_some() || geo.is_some() {
+                let device = auction_request.device.get_or_insert(DeviceInfo {
+                    user_agent: None,
+                    ip: None,
+                    geo: None,
+                });
+                device.ip = client_ip;
+                device.geo = geo.clone();
+            }
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
