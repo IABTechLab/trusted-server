@@ -174,7 +174,12 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
                 0
             }
         },
-        Ok(None) => 100,
+        Ok(None) => {
+            log::warn!(
+                "edgezero_rollout_pct key absent, defaulting to 100 (full rollout — backward compat)"
+            );
+            100
+        }
         Err(e) => {
             log::warn!("failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)");
             0
