@@ -5,8 +5,9 @@
 //! `user.name` / `user.email` config and are deterministic across
 //! runs (clean CI machines included).
 
-#![cfg(test)]
 // Fixture helpers — not every inline test module uses every helper.
+// (The module is already `#[cfg(test)]`-gated at its declaration in
+// `mod.rs`, so no inner `#![cfg(test)]` is needed here.)
 #![allow(dead_code)]
 
 use std::fs;

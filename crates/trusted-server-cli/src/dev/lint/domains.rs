@@ -1055,12 +1055,12 @@ mod staged_added_lines_tests {
     fn reports_added_line_with_new_side_line_number() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("a.txt"), "alpha\nbeta\ngamma\n")
+        std::fs::write(temp.path().join("a.rs"), "alpha\nbeta\ngamma\n")
             .expect("should write initial file");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "initial");
 
-        std::fs::write(temp.path().join("a.txt"), "alpha\nNEW LINE\nbeta\ngamma\n")
+        std::fs::write(temp.path().join("a.rs"), "alpha\nNEW LINE\nbeta\ngamma\n")
             .expect("should write modification");
         test_support::stage_all(&repo);
 
@@ -1076,7 +1076,7 @@ mod staged_added_lines_tests {
             })
             .collect();
 
-        assert_eq!(added, vec![("a.txt".to_string(), 2, "NEW LINE".to_string())]);
+        assert_eq!(added, vec![("a.rs".to_string(), 2, "NEW LINE".to_string())]);
     }
 
     /// Spec test case 25: staged scan must NOT skip non-UTF-8 paths.
@@ -1129,14 +1129,14 @@ mod changed_vs_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        std::fs::write(temp.path().join("a.txt"), "let ok = 1;\n")
+        std::fs::write(temp.path().join("a.rs"), "let ok = 1;\n")
             .expect("should write base file");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "base");
 
         test_support::create_and_checkout_branch(&repo, "feature");
         std::fs::write(
-            temp.path().join("a.txt"),
+            temp.path().join("a.rs"),
             "let ok = 1;\nlet bad = \"https://test.com\";\n",
         )
         .expect("should write feature change");
@@ -1294,7 +1294,7 @@ pub(crate) fn full_repo_lines(
             }
             Err(e) => {
                 return Err(Report::new(DomainsLintError::ReadFile(path.clone()))
-                    .attach_printable(e.to_string()));
+                    .attach(e.to_string()));
             }
         };
 
@@ -1432,5 +1432,164 @@ mod path_is_scanned_tests {
         ] {
             assert!(!path_is_scanned(p), "should NOT be scanned: {p}");
         }
+    }
+}
+
+/// Scan explicitly-named paths in full.
+///
+/// Policy filters (extension/path exclusion, symlink, non-regular,
+/// binary content) warn and skip. Access failures on a user-named
+/// path are hard errors: a missing path or a permission failure
+/// almost always means a typo or a real environment problem the
+/// user should know about.
+///
+/// # Errors
+///
+/// Returns [`DomainsLintError::PathNotFound`] /
+/// [`DomainsLintError::PermissionDenied`] /
+/// [`DomainsLintError::ReadFile`] if a named path cannot be accessed.
+pub(crate) fn explicit_path_lines(
+    paths: &[PathBuf],
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let path_str = path.to_string_lossy();
+        if !path_is_scanned(&path_str) {
+            warn(format!(
+                "note: {} is not in scanned extensions or is excluded; skipping",
+                path.display()
+            ))?;
+            continue;
+        }
+
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => return Err(io_error_to_report(&e, path)),
+        };
+        if meta.file_type().is_symlink() {
+            warn_skip(path, "symlink not followed")?;
+            continue;
+        }
+        if !meta.file_type().is_file() {
+            warn_skip(path, "non-regular file")?;
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                warn_skip(path, "binary content")?;
+                continue;
+            }
+            Err(e) => return Err(io_error_to_report(&e, path)),
+        };
+
+        for (i, line) in content.lines().enumerate() {
+            out.push(DiffLine {
+                path: path.clone(),
+                line_no: i + 1,
+                content: line.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Map an [`std::io::Error`] on a user-named path to the matching
+/// [`DomainsLintError`] variant.
+fn io_error_to_report(err: &std::io::Error, path: &Path) -> Report<DomainsLintError> {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            Report::new(DomainsLintError::PathNotFound(path.to_path_buf()))
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            Report::new(DomainsLintError::PermissionDenied(path.to_path_buf()))
+        }
+        _ => Report::new(DomainsLintError::ReadFile(path.to_path_buf())).attach(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod explicit_path_tests {
+    use super::*;
+
+    #[test]
+    fn scans_a_valid_file() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let file = temp.path().join("a.rs");
+        std::fs::write(&file, "one\ntwo\n").expect("should write file");
+
+        let lines = explicit_path_lines(&[file]).expect("should scan named file");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(texts, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn skips_excluded_extension() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let file = temp.path().join("image.png");
+        std::fs::write(&file, "not really a png").expect("should write file");
+
+        let lines = explicit_path_lines(&[file]).expect("should skip excluded extension");
+        assert!(lines.is_empty(), "excluded extension yields no lines");
+    }
+
+    #[test]
+    fn skips_excluded_path() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let dir = temp.path().join("node_modules");
+        std::fs::create_dir(&dir).expect("should create node_modules");
+        let file = dir.join("pkg.js");
+        std::fs::write(&file, "let x = 1;\n").expect("should write file");
+
+        let lines = explicit_path_lines(&[file]).expect("should skip node_modules path");
+        assert!(lines.is_empty(), "node_modules path yields no lines");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlink() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let real = temp.path().join("real.rs");
+        std::fs::write(&real, "real\n").expect("should write real");
+        let link = temp.path().join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).expect("should create symlink");
+
+        let lines = explicit_path_lines(&[link]).expect("should skip symlink");
+        assert!(lines.is_empty(), "symlink yields no lines");
+    }
+
+    #[test]
+    fn missing_path_is_hard_error() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let missing = temp.path().join("nope.rs");
+
+        let err = explicit_path_lines(&[missing]).expect_err("missing path should error");
+        assert!(
+            matches!(err.current_context(), DomainsLintError::PathNotFound(_)),
+            "should be PathNotFound: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_is_hard_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let file = temp.path().join("secret.rs");
+        std::fs::write(&file, "secret\n").expect("should write file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
+            .expect("should chmod 000");
+
+        let result = explicit_path_lines(std::slice::from_ref(&file));
+        // Restore perms so the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644));
+
+        let err = result.expect_err("permission-denied path should error");
+        assert!(
+            matches!(err.current_context(), DomainsLintError::PermissionDenied(_)),
+            "should be PermissionDenied: {err:?}"
+        );
     }
 }
