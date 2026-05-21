@@ -121,6 +121,7 @@ fn fnv1a_bucket(key: &str) -> u8 {
 /// When `rollout_pct = 0` no bucket ever routes to EdgeZero (instant rollback).
 /// When `rollout_pct = 100` every bucket routes to EdgeZero (full cutover).
 fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
+    debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
     bucket < rollout_pct
 }
 
@@ -694,6 +695,13 @@ mod tests {
             fnv1a_bucket(key),
             "same key must produce the same bucket"
         );
+    }
+
+    #[test]
+    fn bucket_matches_known_fnv1a_vector() {
+        // FNV-1a 32-bit: XOR-then-multiply. Verified against reference implementation.
+        assert_eq!(fnv1a_bucket("1.2.3.4"), 85, "should match pinned FNV-1a vector");
+        assert_eq!(fnv1a_bucket(""), 61, "should match pinned FNV-1a vector for empty key");
     }
 
     #[test]
