@@ -2,6 +2,14 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-18-check-domains-design.md
 
+// The pure-function layer (allowlist constants, host extraction,
+// scan_line) and the DomainsLintError variants are exercised by the
+// inline #[cfg(test)] modules but are not yet reachable from a
+// non-test build. Phase 4 (diff collectors) and Phase 5
+// (domains::run + clap wiring) make them live; this allow is
+// removed in Phase 5.
+#![allow(dead_code)]
+
 use core::error::Error;
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -167,7 +175,6 @@ impl Error for DomainsLintError {}
 ///
 /// Returns [`DomainsLintError::WriteWarning`] if writing to stderr
 /// fails (e.g., a broken pipe).
-#[allow(dead_code)]
 fn warn(msg: impl Into<String>) -> Result<(), error_stack::Report<DomainsLintError>> {
     use error_stack::ResultExt as _;
     crate::output::write_stderr_line(msg.into()).change_context(DomainsLintError::WriteWarning)
@@ -215,10 +222,10 @@ fn is_allowed(host: &str, suppressed_on_line: &HashSet<String>) -> bool {
     if RESERVED_TLDS.iter().any(|t| host.ends_with(t)) {
         return true;
     }
-    if EXACT_HOSTS.iter().any(|e| host == *e) {
+    if EXACT_HOSTS.contains(&host) {
         return true;
     }
-    if REFERENCE_HOSTS.iter().any(|e| host == *e) {
+    if REFERENCE_HOSTS.contains(&host) {
         return true;
     }
     if SUBDOMAIN_HOSTS
@@ -519,7 +526,7 @@ mod suppression_tests {
         let got = parse("// allow-domain: a.com ,  b.com , c.com");
         let expected: HashSet<String> = ["a.com", "b.com", "c.com"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         assert_eq!(got, expected);
     }
@@ -537,5 +544,188 @@ mod suppression_tests {
         // not whitespace/SOL, so the marker anchor fails.
         let got = parse("let x = \"https://allow-domain:8080/path\";");
         assert!(got.is_empty(), "pathological host must not suppress: {got:?}");
+    }
+}
+
+/// One reported violation on a scanned line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LineViolation {
+    /// The disallowed host.
+    pub host: String,
+}
+
+/// Result of scanning one source line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LineScanOutcome {
+    /// Disallowed hosts found on the line (after suppression).
+    pub violations: Vec<LineViolation>,
+    /// Hosts the line's `allow-domain:` marker listed but that would
+    /// not have been a violation anyway. The caller emits these as a
+    /// stderr warning.
+    pub unused_suppressions: Vec<String>,
+}
+
+/// Scan one source line; return violations and any unused
+/// suppression-marker entries.
+///
+/// Composes [`parse_suppression_marker`], [`extract_absolute_hosts`],
+/// [`extract_protocol_relative_hosts`], and [`is_allowed`].
+pub fn scan_line(line: &str) -> LineScanOutcome {
+    let suppression = parse_suppression_marker(line);
+    let mut hosts = extract_absolute_hosts(line);
+    hosts.extend(extract_protocol_relative_hosts(line));
+
+    // Hosts that WOULD be flagged WITHOUT any suppression. A marker
+    // entry that does not match one of these is "unused" — it
+    // suppresses nothing and warrants a warning.
+    let empty_suppression: HashSet<String> = HashSet::new();
+    let disallowed_without_suppression: HashSet<&String> = hosts
+        .iter()
+        .filter(|h| !is_allowed(h, &empty_suppression))
+        .collect();
+
+    let mut unused: Vec<String> = suppression
+        .suppressed
+        .iter()
+        .filter(|listed| {
+            !disallowed_without_suppression
+                .iter()
+                .any(|h| h.as_str() == listed.as_str())
+        })
+        .cloned()
+        .collect();
+    unused.sort();
+
+    let violations = hosts
+        .into_iter()
+        .filter(|h| !is_allowed(h, &suppression.suppressed))
+        .map(|host| LineViolation { host })
+        .collect();
+
+    LineScanOutcome {
+        violations,
+        unused_suppressions: unused,
+    }
+}
+
+#[cfg(test)]
+mod scan_line_tests {
+    use super::*;
+
+    fn hosts(line: &str) -> Vec<String> {
+        scan_line(line)
+            .violations
+            .into_iter()
+            .map(|v| v.host)
+            .collect()
+    }
+
+    #[test]
+    fn allowed_passes_clean() {
+        for line in [
+            "see https://example.com",
+            "see https://foo.example.com",
+            "see https://api.privacy-center.org",
+            "dial http://127.0.0.1:8080/",
+            "see https://github.com/x/y",
+            "see https://testlight.example",
+            "//www.googletagmanager.com/gtm.js",
+        ] {
+            assert!(hosts(line).is_empty(), "should be clean: {line}");
+        }
+    }
+
+    #[test]
+    fn disallowed_reports() {
+        assert_eq!(hosts("see https://test.com"), vec!["test.com"]);
+        assert_eq!(hosts("see https://partner.com"), vec!["partner.com"]);
+    }
+
+    #[test]
+    fn suppression_with_correct_host_passes() {
+        let out = scan_line("https://evil.com // allow-domain: evil.com");
+        assert!(out.violations.is_empty());
+        assert!(out.unused_suppressions.is_empty());
+    }
+
+    #[test]
+    fn suppression_with_wrong_host_still_reports_and_warns() {
+        let out = scan_line("https://evil.com // allow-domain: other.com");
+        assert_eq!(
+            out.violations
+                .into_iter()
+                .map(|v| v.host)
+                .collect::<Vec<_>>(),
+            vec!["evil.com"]
+        );
+        assert_eq!(
+            out.unused_suppressions,
+            vec!["other.com"],
+            "other.com was listed but never appeared on the line"
+        );
+    }
+
+    #[test]
+    fn multi_host_suppression_applied_to_violations() {
+        let out = scan_line(
+            "x = \"https://evil.com\"; y = \"https://bad.org\"; \
+             // allow-domain: evil.com, bad.org",
+        );
+        assert!(
+            out.violations.is_empty(),
+            "both hosts should be suppressed: {out:?}"
+        );
+        assert!(out.unused_suppressions.is_empty());
+    }
+
+    #[test]
+    fn multi_host_suppression_partial_match_warns_for_unused() {
+        let out = scan_line("\"https://evil.com\" // allow-domain: evil.com, ghost.com");
+        assert!(out.violations.is_empty(), "evil.com should be suppressed");
+        assert_eq!(out.unused_suppressions, vec!["ghost.com"]);
+    }
+
+    #[test]
+    fn jsdoc_star_suppression_form() {
+        let out = scan_line(" * fetch(\"https://evil.com\") * allow-domain: evil.com");
+        assert!(
+            out.violations.is_empty(),
+            "jsdoc-style suppression should apply: {out:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_disallowed_on_one_line() {
+        let got = hosts("<a href=\"https://test.com\">x</a><a href=\"https://partner.com\">y</a>");
+        assert_eq!(got, vec!["test.com", "partner.com"]);
+    }
+
+    #[test]
+    fn bypass_attempt_reports() {
+        // fetch("https://evil.com/allow-domain") — substring inside URL,
+        // not a comment, so suppression does NOT apply.
+        assert_eq!(
+            hosts("fetch(\"https://evil.com/allow-domain\")"),
+            vec!["evil.com"]
+        );
+    }
+
+    #[test]
+    fn unused_warning_only_when_marker_present() {
+        let out = scan_line("see https://example.com");
+        assert!(out.unused_suppressions.is_empty());
+    }
+
+    #[test]
+    fn unused_warning_fires_for_already_allowed_listed_host() {
+        // example.com is extracted but already allowed → would never
+        // have been a violation → the marker entry was unnecessary.
+        let out = scan_line("see https://example.com // allow-domain: example.com");
+        assert!(out.violations.is_empty(), "example.com is already allowed");
+        assert_eq!(
+            out.unused_suppressions,
+            vec!["example.com"],
+            "marker listed an already-allowed host; it suppresses nothing"
+        );
     }
 }
