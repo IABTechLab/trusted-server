@@ -748,12 +748,76 @@ pub(crate) struct DiffLine {
     pub content: String,
 }
 
-/// Whether a repo-relative path should be scanned.
-///
-/// Stub implementation — replaced with the real extension /
-/// path-exclusion filter in Task 4.5.
-fn path_is_scanned(_rel_path: &str) -> bool {
-    true
+/// File extensions whose contents are scanned. See spec
+/// §"File extensions scanned".
+const SCANNED_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "mjs", "cjs", "toml", "yml", "yaml", "json", "md", "css", "html",
+];
+
+/// Lockfile basenames excluded by exact match. See spec
+/// §"Always excluded (paths)".
+const EXCLUDED_LOCKFILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "pnpm-lock.json",
+    "yarn.lock",
+    "npm-shrinkwrap.json",
+];
+
+/// Path components that exclude any path containing them.
+const EXCLUDED_DIR_COMPONENTS: &[&str] = &["node_modules", "target", "dist", ".git", ".worktrees"];
+
+/// The linter's own source file — excluded so its allowlist
+/// constants and doc comments cannot self-flag.
+const SELF_PATH: &str = "crates/trusted-server-cli/src/dev/lint/domains.rs";
+
+/// Whether a repo-relative path (using `/` separators) should be
+/// scanned. See spec §"File extensions scanned" and
+/// §"Always excluded (paths)".
+fn path_is_scanned(rel_path: &str) -> bool {
+    // Self-exclude.
+    if rel_path == SELF_PATH {
+        return false;
+    }
+    // Excluded directory components (whole-segment match).
+    let components: Vec<&str> = rel_path.split('/').collect();
+    if components
+        .iter()
+        .any(|c| EXCLUDED_DIR_COMPONENTS.contains(c))
+    {
+        return false;
+    }
+    // `.claude/worktrees/` — two-segment exclusion.
+    if components.windows(2).any(|w| w == [".claude", "worktrees"]) {
+        return false;
+    }
+    // Publisher-capture HTML fixtures: the narrow
+    // trusted-server-core/src/integrations/**/fixtures/** path.
+    if rel_path.contains("crates/trusted-server-core/src/integrations/")
+        && rel_path.contains("/fixtures/")
+    {
+        return false;
+    }
+
+    let basename = components.last().copied().unwrap_or("");
+    // Excluded lockfiles (exact basename).
+    if EXCLUDED_LOCKFILES.contains(&basename) {
+        return false;
+    }
+    // Dockerfile and Dockerfile.* are scanned (no extension).
+    if basename == "Dockerfile" || basename.starts_with("Dockerfile.") {
+        return true;
+    }
+    // `.env*` files are scanned.
+    if basename.starts_with(".env") {
+        return true;
+    }
+    // Otherwise scan by extension.
+    match basename.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => SCANNED_EXTENSIONS.contains(&ext),
+        _ => false,
+    }
 }
 
 /// Read a blob's bytes from the object database.
@@ -1318,5 +1382,55 @@ mod full_repo_tests {
         let lines = full_repo_lines(temp.path()).expect("should scan repo despite binary file");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
         assert_eq!(texts, vec!["hello"], "binary file is skipped, text file scanned");
+    }
+}
+
+#[cfg(test)]
+mod path_is_scanned_tests {
+    use super::*;
+
+    #[test]
+    fn scanned_paths() {
+        for p in [
+            "foo.rs",
+            "foo.html",
+            "foo.css",
+            "Dockerfile",
+            "Dockerfile.prod",
+            "crates/trusted-server-core/src/html_processor.test.html",
+            "crates/js/lib/src/core/templates/iframe.html",
+            ".env.dev",
+            "crates/integration-tests/fixtures/frameworks/nextjs/app/page.tsx",
+            "crates/integration-tests/fixtures/frameworks/nextjs/Dockerfile",
+            "crates/integration-tests/fixtures/frameworks/wordpress/Dockerfile",
+            "README.md",
+            "CHANGELOG.md",
+            "CONTRIBUTING.md",
+            "docs/guide/onboarding.md",
+            "docs/superpowers/specs/2026-05-18-check-domains-design.md",
+        ] {
+            assert!(path_is_scanned(p), "should be scanned: {p}");
+        }
+    }
+
+    #[test]
+    fn not_scanned_paths() {
+        for p in [
+            "crates/trusted-server-core/src/integrations/nextjs/fixtures/inlined-data-escaped.html",
+            "crates/trusted-server-core/src/integrations/google_tag_manager/fixtures/captured.html",
+            "node_modules/foo.js",
+            ".worktrees/x/y.rs",
+            ".claude/worktrees/x/y.rs",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "Cargo.lock",
+            "crates/trusted-server-cli/src/dev/lint/domains.rs",
+            "foo.markdown",
+            "foo.MD",
+            "target/debug/build.rs",
+            "image.png",
+        ] {
+            assert!(!path_is_scanned(p), "should NOT be scanned: {p}");
+        }
     }
 }
