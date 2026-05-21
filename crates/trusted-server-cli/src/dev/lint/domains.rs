@@ -12,14 +12,21 @@
 
 use core::error::Error;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::str::from_utf8;
 use std::sync::OnceLock;
 
 use derive_more::Display;
 use error_stack::{Report, ResultExt as _};
 use gix::ObjectId;
 use gix::bstr::BString;
+use gix::diff::blob::{Algorithm, Diff, InternedInput};
+use gix::index::entry::Mode as IndexEntryMode;
 use regex::Regex;
+
+use crate::output::write_stderr_line;
 
 /// Integration proxies and loopback hosts that must match exactly.
 /// Subdomains are NOT allowed (e.g., `anything.api.privacy-center.org`
@@ -147,13 +154,13 @@ pub enum DomainsLintError {
     },
     /// A file could not be read.
     #[display("failed to read file `{}`", _0.display())]
-    ReadFile(std::path::PathBuf),
+    ReadFile(PathBuf),
     /// An explicitly-named path does not exist.
     #[display("path not found: `{}`", _0.display())]
-    PathNotFound(std::path::PathBuf),
+    PathNotFound(PathBuf),
     /// An explicitly-named path could not be read for permission reasons.
     #[display("permission denied reading `{}`", _0.display())]
-    PermissionDenied(std::path::PathBuf),
+    PermissionDenied(PathBuf),
     /// More than one scan mode was requested at once.
     #[display("invalid mode combination")]
     InvalidMode,
@@ -179,9 +186,8 @@ impl Error for DomainsLintError {}
 ///
 /// Returns [`DomainsLintError::WriteWarning`] if writing to stderr
 /// fails (e.g., a broken pipe).
-fn warn(msg: impl Into<String>) -> Result<(), error_stack::Report<DomainsLintError>> {
-    use error_stack::ResultExt as _;
-    crate::output::write_stderr_line(msg.into()).change_context(DomainsLintError::WriteWarning)
+fn warn(msg: impl Into<String>) -> Result<(), Report<DomainsLintError>> {
+    write_stderr_line(msg.into()).change_context(DomainsLintError::WriteWarning)
 }
 
 /// Normalise an extracted URL host: strip bracketed-IPv6 `[ ]` and
@@ -848,8 +854,6 @@ fn tree_blob_map(tree: &gix::Tree<'_>) -> Result<HashMap<BString, ObjectId>, Rep
 ///
 /// Returns `(1-based line number, content)` for every inserted line.
 fn added_lines(old: Option<&[u8]>, new: &[u8]) -> Vec<(usize, String)> {
-    use gix::diff::blob::{Algorithm, Diff, InternedInput};
-
     let old_text = old
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
@@ -876,7 +880,7 @@ fn added_lines(old: Option<&[u8]>, new: &[u8]) -> Vec<(usize, String)> {
 /// Convert a raw byte path to a display `PathBuf`, lossy-decoding
 /// non-UTF-8 bytes. Returns `(path, was_lossy)`.
 fn bytes_to_pathbuf(raw: &[u8]) -> (PathBuf, bool) {
-    match std::str::from_utf8(raw) {
+    match from_utf8(raw) {
         Ok(s) => (PathBuf::from(s), false),
         Err(_) => {
             let lossy = String::from_utf8_lossy(raw).into_owned();
@@ -912,7 +916,7 @@ pub(crate) fn staged_added_lines(
     let index = repo.index().change_context(DomainsLintError::Index)?;
     let mut index_map: HashMap<BString, ObjectId> = HashMap::new();
     for entry in index.entries() {
-        if entry.mode.contains(gix::index::entry::Mode::FILE) {
+        if entry.mode.contains(IndexEntryMode::FILE) {
             index_map.insert(entry.path(&index).to_owned(), entry.id);
         }
     }
@@ -1055,12 +1059,12 @@ mod staged_added_lines_tests {
     fn reports_added_line_with_new_side_line_number() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "alpha\nbeta\ngamma\n")
+        fs::write(temp.path().join("a.rs"), "alpha\nbeta\ngamma\n")
             .expect("should write initial file");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "initial");
 
-        std::fs::write(temp.path().join("a.rs"), "alpha\nNEW LINE\nbeta\ngamma\n")
+        fs::write(temp.path().join("a.rs"), "alpha\nNEW LINE\nbeta\ngamma\n")
             .expect("should write modification");
         test_support::stage_all(&repo);
 
@@ -1092,7 +1096,7 @@ mod staged_added_lines_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        std::fs::write(temp.path().join("readme.txt"), "hi\n")
+        fs::write(temp.path().join("readme.txt"), "hi\n")
             .expect("should write readme");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "initial");
@@ -1100,7 +1104,7 @@ mod staged_added_lines_tests {
         let non_utf8_name =
             std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f, 0x2e, 0x72, 0x73]);
         let bad_file = temp.path().join(non_utf8_name);
-        std::fs::write(&bad_file, "let x = \"https://test.com\";\n")
+        fs::write(&bad_file, "let x = \"https://test.com\";\n")
             .expect("should write non-utf8-named file");
         test_support::stage_all(&repo);
 
@@ -1129,13 +1133,13 @@ mod changed_vs_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        std::fs::write(temp.path().join("a.rs"), "let ok = 1;\n")
+        fs::write(temp.path().join("a.rs"), "let ok = 1;\n")
             .expect("should write base file");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "base");
 
         test_support::create_and_checkout_branch(&repo, "feature");
-        std::fs::write(
+        fs::write(
             temp.path().join("a.rs"),
             "let ok = 1;\nlet bad = \"https://test.com\";\n",
         )
@@ -1254,7 +1258,7 @@ pub(crate) fn full_repo_lines(
 
         // Case 4: non-UTF-8 path — skip (full-repo mode does not
         // lossy-report; that is staged/changed-vs behavior).
-        let Ok(rel_str) = std::str::from_utf8(raw) else {
+        let Ok(rel_str) = from_utf8(raw) else {
             warn_skip_bytes(raw, "non-UTF-8 path")?;
             continue;
         };
@@ -1264,9 +1268,9 @@ pub(crate) fn full_repo_lines(
 
         let path = work_dir.join(rel_str);
         // Case 1: tracked but missing from the working tree.
-        let meta = match std::fs::symlink_metadata(&path) {
+        let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 warn_skip(&path, "tracked but missing from working tree")?;
                 continue;
             }
@@ -1286,9 +1290,9 @@ pub(crate) fn full_repo_lines(
             continue;
         }
         // Case 5: binary content.
-        let content = match std::fs::read_to_string(&path) {
+        let content = match fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
                 warn_skip(&path, "binary content")?;
                 continue;
             }
@@ -1319,7 +1323,7 @@ mod full_repo_tests {
     fn scans_tracked_file_lines() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n")
+        fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n")
             .expect("should write file");
         test_support::stage_all(&repo);
 
@@ -1334,10 +1338,10 @@ mod full_repo_tests {
     fn skips_tracked_but_missing_file() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("a.rs"), "kept\n").expect("should write a");
-        std::fs::write(temp.path().join("gone.rs"), "removed\n").expect("should write gone");
+        fs::write(temp.path().join("a.rs"), "kept\n").expect("should write a");
+        fs::write(temp.path().join("gone.rs"), "removed\n").expect("should write gone");
         test_support::stage_all(&repo);
-        std::fs::remove_file(temp.path().join("gone.rs")).expect("should remove gone");
+        fs::remove_file(temp.path().join("gone.rs")).expect("should remove gone");
 
         let lines = full_repo_lines(temp.path()).expect("should scan repo despite missing file");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
@@ -1350,14 +1354,14 @@ mod full_repo_tests {
     fn skips_symlink() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("real.rs"), "real\n").expect("should write real");
-        std::fs::write(temp.path().join("link.rs"), "placeholder\n")
+        fs::write(temp.path().join("real.rs"), "real\n").expect("should write real");
+        fs::write(temp.path().join("link.rs"), "placeholder\n")
             .expect("should write placeholder");
         test_support::stage_all(&repo);
 
         // Replace link.rs on disk with a symlink; the index entry
         // stays a regular file.
-        std::fs::remove_file(temp.path().join("link.rs")).expect("should remove placeholder");
+        fs::remove_file(temp.path().join("link.rs")).expect("should remove placeholder");
         std::os::unix::fs::symlink("real.rs", temp.path().join("link.rs"))
             .expect("should create symlink");
 
@@ -1371,11 +1375,11 @@ mod full_repo_tests {
     fn skips_binary_file() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        std::fs::write(temp.path().join("text.rs"), "hello\n").expect("should write text");
+        fs::write(temp.path().join("text.rs"), "hello\n").expect("should write text");
         // 0xff 0xfe is not a valid UTF-8 sequence — read_to_string
         // rejects it with ErrorKind::InvalidData. (A NUL byte would
         // NOT work: NUL is valid UTF-8.)
-        std::fs::write(temp.path().join("data.json"), b"{\"x\":\xff\xfe}")
+        fs::write(temp.path().join("data.json"), b"{\"x\":\xff\xfe}")
             .expect("should write binary");
         test_support::stage_all(&repo);
 
@@ -1462,7 +1466,7 @@ pub(crate) fn explicit_path_lines(
             continue;
         }
 
-        let meta = match std::fs::symlink_metadata(path) {
+        let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => return Err(io_error_to_report(&e, path)),
         };
@@ -1475,9 +1479,9 @@ pub(crate) fn explicit_path_lines(
             continue;
         }
 
-        let content = match std::fs::read_to_string(path) {
+        let content = match fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
                 warn_skip(path, "binary content")?;
                 continue;
             }
@@ -1495,14 +1499,14 @@ pub(crate) fn explicit_path_lines(
     Ok(out)
 }
 
-/// Map an [`std::io::Error`] on a user-named path to the matching
+/// Map an [`io::Error`] on a user-named path to the matching
 /// [`DomainsLintError`] variant.
-fn io_error_to_report(err: &std::io::Error, path: &Path) -> Report<DomainsLintError> {
+fn io_error_to_report(err: &io::Error, path: &Path) -> Report<DomainsLintError> {
     match err.kind() {
-        std::io::ErrorKind::NotFound => {
+        ErrorKind::NotFound => {
             Report::new(DomainsLintError::PathNotFound(path.to_path_buf()))
         }
-        std::io::ErrorKind::PermissionDenied => {
+        ErrorKind::PermissionDenied => {
             Report::new(DomainsLintError::PermissionDenied(path.to_path_buf()))
         }
         _ => Report::new(DomainsLintError::ReadFile(path.to_path_buf())).attach(err.to_string()),
@@ -1517,7 +1521,7 @@ mod explicit_path_tests {
     fn scans_a_valid_file() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let file = temp.path().join("a.rs");
-        std::fs::write(&file, "one\ntwo\n").expect("should write file");
+        fs::write(&file, "one\ntwo\n").expect("should write file");
 
         let lines = explicit_path_lines(&[file]).expect("should scan named file");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
@@ -1528,7 +1532,7 @@ mod explicit_path_tests {
     fn skips_excluded_extension() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let file = temp.path().join("image.png");
-        std::fs::write(&file, "not really a png").expect("should write file");
+        fs::write(&file, "not really a png").expect("should write file");
 
         let lines = explicit_path_lines(&[file]).expect("should skip excluded extension");
         assert!(lines.is_empty(), "excluded extension yields no lines");
@@ -1538,9 +1542,9 @@ mod explicit_path_tests {
     fn skips_excluded_path() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let dir = temp.path().join("node_modules");
-        std::fs::create_dir(&dir).expect("should create node_modules");
+        fs::create_dir(&dir).expect("should create node_modules");
         let file = dir.join("pkg.js");
-        std::fs::write(&file, "let x = 1;\n").expect("should write file");
+        fs::write(&file, "let x = 1;\n").expect("should write file");
 
         let lines = explicit_path_lines(&[file]).expect("should skip node_modules path");
         assert!(lines.is_empty(), "node_modules path yields no lines");
@@ -1551,7 +1555,7 @@ mod explicit_path_tests {
     fn skips_symlink() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let real = temp.path().join("real.rs");
-        std::fs::write(&real, "real\n").expect("should write real");
+        fs::write(&real, "real\n").expect("should write real");
         let link = temp.path().join("link.rs");
         std::os::unix::fs::symlink(&real, &link).expect("should create symlink");
 
@@ -1578,13 +1582,13 @@ mod explicit_path_tests {
 
         let temp = tempfile::tempdir().expect("should create tempdir");
         let file = temp.path().join("secret.rs");
-        std::fs::write(&file, "secret\n").expect("should write file");
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
+        fs::write(&file, "secret\n").expect("should write file");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000))
             .expect("should chmod 000");
 
         let result = explicit_path_lines(std::slice::from_ref(&file));
         // Restore perms so the tempdir can be cleaned up.
-        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o644));
 
         let err = result.expect_err("permission-denied path should error");
         assert!(
