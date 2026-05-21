@@ -3,6 +3,7 @@
 //! Design: docs/superpowers/specs/2026-05-18-check-domains-design.md
 
 use core::error::Error;
+use std::collections::HashSet;
 
 use derive_more::Display;
 
@@ -197,5 +198,104 @@ mod tests {
     fn normalise_passthrough_for_plain_hosts() {
         assert_eq!(normalise_host("test.com"), "test.com");
         assert_eq!(normalise_host("127.0.0.1"), "127.0.0.1");
+    }
+}
+
+/// Decide whether a normalised host is allowed.
+///
+/// Order: per-line suppression set, reserved-TLD suffix, exact match
+/// against [`EXACT_HOSTS`] and [`REFERENCE_HOSTS`], then the subdomain
+/// rule against [`SUBDOMAIN_HOSTS`].
+fn is_allowed(host: &str, suppressed_on_line: &HashSet<String>) -> bool {
+    if suppressed_on_line.contains(host) {
+        return true;
+    }
+    if RESERVED_TLDS.iter().any(|t| host.ends_with(t)) {
+        return true;
+    }
+    if EXACT_HOSTS.iter().any(|e| host == *e) {
+        return true;
+    }
+    if REFERENCE_HOSTS.iter().any(|e| host == *e) {
+        return true;
+    }
+    if SUBDOMAIN_HOSTS
+        .iter()
+        .any(|e| host == *e || host.ends_with(&format!(".{e}")))
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod allow_check_tests {
+    use super::*;
+
+    fn nothing_suppressed() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn exact_match_allows() {
+        assert!(is_allowed("api.fastly.com", &nothing_suppressed()));
+        assert!(is_allowed("127.0.0.1", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn exact_only_rejects_subdomain() {
+        // EXACT_HOSTS entries are exact-only: a subdomain of an
+        // exact host is NOT allowed.
+        assert!(!is_allowed("v2.api.fastly.com", &nothing_suppressed()));
+        assert!(!is_allowed(
+            "anything.api.privacy-center.org",
+            &nothing_suppressed()
+        ));
+    }
+
+    #[test]
+    fn subdomain_list_allows_apex_and_subdomains() {
+        assert!(is_allowed("example.com", &nothing_suppressed()));
+        assert!(is_allowed("foo.example.com", &nothing_suppressed()));
+        assert!(is_allowed("a.b.example.com", &nothing_suppressed()));
+        assert!(is_allowed("example.net", &nothing_suppressed()));
+        assert!(is_allowed("assets.example.net", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn lookalike_attack_rejected() {
+        // example.com.evil.com is not a subdomain of example.com.
+        assert!(!is_allowed("example.com.evil.com", &nothing_suppressed()));
+        assert!(!is_allowed("notexample.com", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn reserved_tld_allows() {
+        assert!(is_allowed("testlight.example", &nothing_suppressed()));
+        assert!(is_allowed("something.test", &nothing_suppressed()));
+        assert!(is_allowed("thing.invalid", &nothing_suppressed()));
+        assert!(is_allowed("my.localhost", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn reference_hosts_allowed_everywhere() {
+        assert!(is_allowed("github.com", &nothing_suppressed()));
+        assert!(is_allowed("docs.rs", &nothing_suppressed()));
+        // But NOT subdomains of REFERENCE_HOSTS (exact-match).
+        assert!(!is_allowed("other.github.com", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn suppression_set_allows() {
+        let mut suppressed = HashSet::new();
+        suppressed.insert("evil.com".to_string());
+        assert!(is_allowed("evil.com", &suppressed));
+    }
+
+    #[test]
+    fn rejects_unrelated_host() {
+        assert!(!is_allowed("test.com", &nothing_suppressed()));
+        assert!(!is_allowed("1.2.3.4", &nothing_suppressed()));
+        assert!(!is_allowed("192.168.1.1", &nothing_suppressed()));
     }
 }
