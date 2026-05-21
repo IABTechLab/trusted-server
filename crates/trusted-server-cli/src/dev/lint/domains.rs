@@ -11,10 +11,14 @@
 #![allow(dead_code)]
 
 use core::error::Error;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use derive_more::Display;
+use error_stack::{Report, ResultExt as _};
+use gix::ObjectId;
+use gix::bstr::BString;
 use regex::Regex;
 
 /// Integration proxies and loopback hosts that must match exactly.
@@ -726,6 +730,237 @@ mod scan_line_tests {
             out.unused_suppressions,
             vec!["example.com"],
             "marker listed an already-allowed host; it suppresses nothing"
+        );
+    }
+}
+
+// === Diff and path collectors (Phase 4) ===
+
+/// One added line collected from a diff or file scan.
+#[derive(Debug)]
+pub(crate) struct DiffLine {
+    /// Path for display and reporting. Built via
+    /// `String::from_utf8_lossy` for non-UTF-8 sources.
+    pub path: PathBuf,
+    /// 1-based line number within the new-side file.
+    pub line_no: usize,
+    /// The line's text content.
+    pub content: String,
+}
+
+/// Whether a repo-relative path should be scanned.
+///
+/// Stub implementation — replaced with the real extension /
+/// path-exclusion filter in Task 4.5.
+fn path_is_scanned(_rel_path: &str) -> bool {
+    true
+}
+
+/// Read a blob's bytes from the object database.
+fn read_blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, Report<DomainsLintError>> {
+    let obj = repo
+        .find_object(id)
+        .change_context(DomainsLintError::Diff)?;
+    Ok(obj.data.clone())
+}
+
+/// Walk a tree recursively into a `path → blob_id` map.
+fn tree_blob_map(tree: &gix::Tree<'_>) -> Result<HashMap<BString, ObjectId>, Report<DomainsLintError>> {
+    let mut map = HashMap::new();
+    let entries = tree
+        .traverse()
+        .breadthfirst
+        .files()
+        .change_context(DomainsLintError::Diff)?;
+    for entry in entries {
+        if entry.mode.is_blob() {
+            map.insert(entry.filepath, entry.oid);
+        }
+    }
+    Ok(map)
+}
+
+/// Compute the new-side added lines between two blob contents.
+///
+/// Returns `(1-based line number, content)` for every inserted line.
+fn added_lines(old: Option<&[u8]>, new: &[u8]) -> Vec<(usize, String)> {
+    use gix::diff::blob::{Algorithm, Diff, InternedInput};
+
+    let old_text = old
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let new_text = String::from_utf8_lossy(new).into_owned();
+
+    let input = InternedInput::new(old_text.as_str(), new_text.as_str());
+    let diff = Diff::compute(Algorithm::Myers, &input);
+
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    let mut out = Vec::new();
+    for hunk in diff.hunks() {
+        for token_idx in hunk.after.clone() {
+            let content = new_lines
+                .get(token_idx as usize)
+                .copied()
+                .unwrap_or("")
+                .to_string();
+            out.push((token_idx as usize + 1, content));
+        }
+    }
+    out
+}
+
+/// Convert a raw byte path to a display `PathBuf`, lossy-decoding
+/// non-UTF-8 bytes. Returns `(path, was_lossy)`.
+fn bytes_to_pathbuf(raw: &[u8]) -> (PathBuf, bool) {
+    match std::str::from_utf8(raw) {
+        Ok(s) => (PathBuf::from(s), false),
+        Err(_) => {
+            let lossy = String::from_utf8_lossy(raw).into_owned();
+            (PathBuf::from(&lossy), true)
+        }
+    }
+}
+
+/// Collect added lines staged in the index relative to the HEAD tree.
+///
+/// # Errors
+///
+/// Returns [`DomainsLintError`] if the repository, its index, or a
+/// blob cannot be read.
+pub(crate) fn staged_added_lines(
+    repo_path: &Path,
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
+
+    // HEAD tree → blob map. An empty repo (no commits) has no HEAD;
+    // treat that as an empty map (everything in the index is added).
+    let head_map: HashMap<BString, ObjectId> = match repo.head_commit() {
+        Ok(commit) => {
+            let tree_id = commit.tree_id().change_context(DomainsLintError::OpenRepo)?;
+            let tree = repo
+                .find_tree(tree_id)
+                .change_context(DomainsLintError::OpenRepo)?;
+            tree_blob_map(&tree)?
+        }
+        Err(_) => HashMap::new(),
+    };
+
+    let index = repo.index().change_context(DomainsLintError::Index)?;
+    let mut index_map: HashMap<BString, ObjectId> = HashMap::new();
+    for entry in index.entries() {
+        if entry.mode.contains(gix::index::entry::Mode::FILE) {
+            index_map.insert(entry.path(&index).to_owned(), entry.id);
+        }
+    }
+
+    let mut all_paths: Vec<&BString> = index_map.keys().chain(head_map.keys()).collect();
+    all_paths.sort();
+    all_paths.dedup();
+
+    let mut out = Vec::new();
+    for raw_path in all_paths {
+        let head_id = head_map.get(raw_path);
+        let index_id = index_map.get(raw_path);
+        let (old_bytes, new_bytes) = match (head_id, index_id) {
+            (Some(h), Some(i)) if h == i => continue, // unchanged
+            (Some(h), Some(i)) => (Some(read_blob(&repo, *h)?), read_blob(&repo, *i)?),
+            (None, Some(i)) => (None, read_blob(&repo, *i)?),
+            (Some(_), None) => continue, // deletion — no added lines
+            (None, None) => continue,
+        };
+
+        let (path, was_lossy) = bytes_to_pathbuf(raw_path);
+        let path_str = path.to_string_lossy();
+        if !path_is_scanned(&path_str) {
+            continue;
+        }
+        if was_lossy {
+            // Staged mode reports non-UTF-8 paths (unlike full-repo
+            // mode, which skips them) — see spec test 25.
+            warn(format!(
+                "warning: staged path is not valid UTF-8; displaying lossy: {}",
+                path.display()
+            ))?;
+        }
+
+        for (line_no, content) in added_lines(old_bytes.as_deref(), &new_bytes) {
+            out.push(DiffLine {
+                path: path.clone(),
+                line_no,
+                content,
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod staged_added_lines_tests {
+    use super::*;
+    use crate::dev::lint::test_support;
+
+    #[test]
+    fn reports_added_line_with_new_side_line_number() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        std::fs::write(temp.path().join("a.txt"), "alpha\nbeta\ngamma\n")
+            .expect("should write initial file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        std::fs::write(temp.path().join("a.txt"), "alpha\nNEW LINE\nbeta\ngamma\n")
+            .expect("should write modification");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let added: Vec<_> = lines
+            .iter()
+            .map(|l| {
+                (
+                    l.path.to_string_lossy().into_owned(),
+                    l.line_no,
+                    l.content.clone(),
+                )
+            })
+            .collect();
+
+        assert_eq!(added, vec![("a.txt".to_string(), 2, "NEW LINE".to_string())]);
+    }
+
+    /// Spec test case 25: staged scan must NOT skip non-UTF-8 paths.
+    ///
+    /// Gated to Linux: macOS (APFS/HFS+) rejects non-UTF-8 byte
+    /// sequences in filenames with `EILSEQ`, so the scenario cannot
+    /// be constructed there. Linux ext4/CI runners permit it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reports_non_utf8_staged_path_lossy() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+
+        std::fs::write(temp.path().join("readme.txt"), "hi\n")
+            .expect("should write readme");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        let non_utf8_name =
+            std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f, 0x2e, 0x72, 0x73]);
+        let bad_file = temp.path().join(non_utf8_name);
+        std::fs::write(&bad_file, "let x = \"https://test.com\";\n")
+            .expect("should write non-utf8-named file");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path())
+            .expect("should collect staged lines even with non-UTF-8 path");
+        assert!(
+            !lines.is_empty(),
+            "non-UTF-8 staged paths must be reported, not skipped"
+        );
+        assert!(
+            lines.iter().any(|l| l.content.contains("https://test.com")),
+            "must surface the URL for scanning: {lines:?}"
         );
     }
 }
