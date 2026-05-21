@@ -65,6 +65,18 @@ pub struct CreativeOpportunitySlot {
     /// Provider-specific slot identifiers.
     #[serde(default)]
     pub providers: SlotProviders,
+    /// Pre-compiled [`page_patterns`](Self::page_patterns) for hot-path matching.
+    ///
+    /// Populated by [`compile_patterns`](Self::compile_patterns) once at file
+    /// load time (see [`CreativeOpportunitiesFile::compile`]). When this is
+    /// empty, [`matches_path`](Self::matches_path) falls back to compiling on
+    /// every call so callers that build slots by hand (tests, legacy code)
+    /// still work.
+    ///
+    /// `pub(crate)` rather than private so cross-module test helpers in this
+    /// crate can construct slots via struct-literal syntax with an empty cache.
+    #[serde(skip, default)]
+    pub(crate) compiled_patterns: Vec<Pattern>,
 }
 
 impl CreativeOpportunitySlot {
@@ -79,6 +91,16 @@ impl CreativeOpportunitySlot {
     /// Patterns that cannot be compiled even after normalisation are silently skipped.
     #[must_use]
     pub fn matches_path(&self, path: &str) -> bool {
+        // Fast path: use the pre-compiled patterns when available so we don't
+        // re-run `Pattern::new` on every request. The vec is non-empty iff
+        // [`compile_patterns`](Self::compile_patterns) succeeded at load time
+        // and the slot has at least one pattern.
+        if !self.compiled_patterns.is_empty() {
+            return self.compiled_patterns.iter().any(|p| p.matches(path));
+        }
+
+        // Fallback for slots constructed by hand (tests, legacy callers that
+        // skip `compile_patterns`). Re-compiles on every call.
         self.page_patterns
             .iter()
             .any(|pattern| match Pattern::new(pattern) {
@@ -90,6 +112,28 @@ impl CreativeOpportunitySlot {
                         .unwrap_or(false)
                 }
             })
+    }
+
+    /// Compile [`page_patterns`](Self::page_patterns) into the
+    /// [`compiled_patterns`](Self::compiled_patterns) cache.
+    ///
+    /// Patterns that fail to compile (either directly or after the `**`→`*`
+    /// normalisation that [`matches_path`](Self::matches_path) does) are
+    /// silently skipped — the slot just becomes un-matchable, matching the
+    /// fallback behaviour.
+    ///
+    /// Idempotent: calling twice replaces the cache, so a slot list reloaded
+    /// at runtime won't accumulate stale patterns.
+    pub fn compile_patterns(&mut self) {
+        self.compiled_patterns = self
+            .page_patterns
+            .iter()
+            .filter_map(|pattern| {
+                Pattern::new(pattern)
+                    .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
+                    .ok()
+            })
+            .collect();
     }
 
     /// Returns the GAM ad unit path for this slot.
@@ -116,8 +160,7 @@ impl CreativeOpportunitySlot {
     /// Provider-specific params (e.g., APS `slotID`, PBS bidder params) are wired
     /// into the `bidders` map keyed by provider/bidder name.
     #[must_use]
-    pub fn to_ad_slot(&self, gam_network_id: &str) -> AdSlot {
-        let _ = gam_network_id;
+    pub fn to_ad_slot(&self) -> AdSlot {
         let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
         if let Some(ref aps) = self.providers.aps {
             bidders.insert(
@@ -187,6 +230,18 @@ pub struct CreativeOpportunitiesFile {
     pub slots: Vec<CreativeOpportunitySlot>,
 }
 
+impl CreativeOpportunitiesFile {
+    /// Pre-compile every slot's
+    /// [`page_patterns`](CreativeOpportunitySlot::page_patterns) so
+    /// [`matches_path`](CreativeOpportunitySlot::matches_path) runs without
+    /// re-invoking `Pattern::new` on every request. Call once after loading.
+    pub fn compile(&mut self) {
+        for slot in &mut self.slots {
+            slot.compile_patterns();
+        }
+    }
+}
+
 /// Validates that a slot ID contains only safe characters.
 ///
 /// Allowed characters: ASCII alphanumerics, underscores (`_`), and hyphens (`-`).
@@ -237,6 +292,49 @@ mod tests {
             floor_price: Some(0.50),
             targeting: Default::default(),
             providers: Default::default(),
+            compiled_patterns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compile_patterns_populates_cache_and_match_uses_it() {
+        let mut slot = make_slot("atf", vec!["/20**", "/about"]);
+        assert!(
+            slot.compiled_patterns.is_empty(),
+            "freshly-built slot should have no compiled patterns"
+        );
+        slot.compile_patterns();
+        assert_eq!(
+            slot.compiled_patterns.len(),
+            2,
+            "compile_patterns should populate one entry per page pattern"
+        );
+        assert!(
+            slot.matches_path("/2024/01/my-article/"),
+            "matches_path should hit the compiled-pattern fast path"
+        );
+        assert!(
+            slot.matches_path("/about"),
+            "matches_path should hit /about via the compiled cache"
+        );
+        assert!(
+            !slot.matches_path("/contact"),
+            "matches_path should reject paths that match nothing in the cache"
+        );
+    }
+
+    #[test]
+    fn file_compile_populates_every_slot() {
+        let mut file = CreativeOpportunitiesFile {
+            slots: vec![make_slot("a", vec!["/a/*"]), make_slot("b", vec!["/b/*"])],
+        };
+        file.compile();
+        for slot in &file.slots {
+            assert_eq!(
+                slot.compiled_patterns.len(),
+                1,
+                "every slot's patterns should be pre-compiled after file.compile()"
+            );
         }
     }
 
@@ -300,7 +398,7 @@ mod tests {
         slot.providers.aps = Some(ApsSlotParams {
             slot_id: "aps-slot-atf".to_string(),
         });
-        let ad_slot = slot.to_ad_slot("21765378893");
+        let ad_slot = slot.to_ad_slot();
         let aps_params = ad_slot.bidders.get("aps").expect("should have aps bidder");
         assert_eq!(
             aps_params.get("slotID").and_then(|v| v.as_str()),
@@ -311,7 +409,7 @@ mod tests {
     #[test]
     fn to_ad_slot_sets_floor_price_and_formats() {
         let slot = make_slot("atf", vec!["/"]);
-        let ad_slot = slot.to_ad_slot("21765378893");
+        let ad_slot = slot.to_ad_slot();
         assert_eq!(ad_slot.id, "atf");
         assert_eq!(ad_slot.floor_price, Some(0.50));
         assert_eq!(ad_slot.formats.len(), 1);

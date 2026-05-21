@@ -455,43 +455,20 @@ impl IntegrationHeadInjector for GptIntegration {
             "<script>window.__tsjs_gpt_enabled=true;\
              window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                 .to_string(),
-            concat!(
-                "<script>",
-                "window.__tsAdInit=function(){",
-                  "var slots=window.__ts_ad_slots||[];",
-                  "var bids=window.__ts_bids||{};",
-                  "var divToSlotId={};",
-                  "googletag.cmd.push(function(){",
-                    "slots.map(function(slot){",
-                      "var s=googletag.defineSlot(slot.gam_unit_path,slot.formats,slot.div_id);",
-                      "if(!s)return;",
-                      "s.addService(googletag.pubads());",
-                      "Object.entries(slot.targeting||{}).forEach(function(e){s.setTargeting(e[0],e[1]);});",
-                      "var b=bids[slot.id]||{};",
-                      "[\"hb_pb\",\"hb_bidder\",\"hb_adid\"].forEach(function(k){if(b[k])s.setTargeting(k,b[k]);});",
-                      "s.setTargeting(\"ts_initial\",\"1\");",
-                      "divToSlotId[slot.div_id]=slot.id;",
-                    "});",
-                    "googletag.pubads().enableSingleRequest();",
-                    "googletag.enableServices();",
-                    "googletag.pubads().addEventListener(\"slotRenderEnded\",function(ev){",
-                      "var divId=ev.slot.getSlotElementId();",
-                      "var slotId=divToSlotId[divId]||divId;",
-                      "var b=bids[slotId]||{};",
-                      "var ourBidWon=!ev.isEmpty&&b.hb_adid&&ev.slot.getTargeting(\"hb_adid\")[0]===b.hb_adid;",
-                      "if(ourBidWon){",
-                        "if(b.nurl)navigator.sendBeacon(b.nurl);",
-                        "if(b.burl)navigator.sendBeacon(b.burl);",
-                      "}",
-                    "});",
-                    "googletag.pubads().refresh();",
-                  "});",
-                "};",
-                "</script>"
-            ).to_string(),
+            format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
         ]
     }
 }
+
+/// Inline `window.__tsAdInit` bootstrap injected at `<head>` so the bids
+/// script at `</body>` can call it before the TSJS bundle has loaded.
+///
+/// The bundle's idempotent implementation in
+/// `crates/js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
+/// Both implementations guard the one-time-per-page setup with
+/// `window.__tsServicesEnabled` so neither double-enables services if the
+/// publisher's own init code also calls `googletag.enableServices()`.
+const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
 // Default value functions
 
@@ -1117,6 +1094,32 @@ mod tests {
         assert!(
             !combined.contains("__ts_request_id"),
             "must NOT reference request_id — no longer used"
+        );
+    }
+
+    #[test]
+    fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("__tsServicesEnabled"),
+            "should guard enableServices/enableSingleRequest with the __tsServicesEnabled flag"
+        );
+        assert!(
+            combined.contains("window.__tsAdInit"),
+            "should install __tsAdInit on window"
+        );
+        assert!(
+            !combined.contains("googletag.pubads().refresh()"),
+            "should never call unbounded refresh() — only refresh(newSlots)"
         );
     }
 

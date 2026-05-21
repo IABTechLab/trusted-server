@@ -164,10 +164,6 @@ pub struct PrebidIntegrationConfig {
     /// - `both` — consent in both cookies and body (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
-    /// When true, suppresses client-side nurl firing.
-    /// Use for PBS deployments that fire nurl internally.
-    #[serde(default)]
-    pub suppress_nurl: bool,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -1661,14 +1657,7 @@ mod tests {
             bid_param_overrides: HashMap::default(),
             bid_param_override_rules: Vec::new(),
             consent_forwarding: ConsentForwardingMode::Both,
-            suppress_nurl: false,
         }
-    }
-
-    #[test]
-    fn prebid_config_suppress_nurl_defaults_to_false() {
-        let config = base_config();
-        assert!(!config.suppress_nurl, "should not suppress nurl by default");
     }
 
     fn create_test_auction_request() -> AuctionRequest {

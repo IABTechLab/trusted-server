@@ -540,32 +540,29 @@ impl AuctionOrchestrator {
         }
 
         let starting_count = winning_bids.len();
-        winning_bids.retain(|slot_id, bid| match floor_prices.get(slot_id) {
-            Some(floor) => {
-                // price=None means the SSP returned an encoded price (e.g. APS amznbid).
-                // In the parallel-only path this bid cannot yet be floor-checked; it passes
-                // through and will be decoded (and re-checked) by the mediation layer.
-                // In the mediation path, mediation decodes prices before calling this
-                // function, so any bid still carrying price=None is dropped upstream.
-                match bid.price {
-                    Some(price) if price >= *floor => true,
-                    Some(_) => {
-                        log::info!(
-                            "Dropping winning bid below floor price for slot '{}'",
-                            slot_id
-                        );
-                        false
-                    }
-                    None => {
-                        log::debug!(
-                            "Passing encoded-price bid for slot '{}' - price not yet decoded",
-                            slot_id
-                        );
-                        true
-                    }
-                }
+        winning_bids.retain(|slot_id, bid| match (floor_prices.get(slot_id), bid.price) {
+            (Some(floor), Some(price)) if price >= *floor => true,
+            (Some(_), Some(_)) => {
+                log::info!(
+                    "Dropping winning bid below floor price for slot '{}'",
+                    slot_id
+                );
+                false
             }
-            None => true,
+            (_, None) => {
+                // Any caller that needs to keep an undecoded (encoded-price)
+                // bid must decode it *before* invoking this function — both
+                // `select_winning_bids` and the mediator path already do.
+                // Letting `None`-price bids through here would cause
+                // `winning_bids.len()` to overcount what `build_bid_map`
+                // downstream is willing to emit, so they get dropped instead.
+                log::debug!(
+                    "Dropping bid for slot '{}' - no decoded price (caller must decode before apply_floor_prices)",
+                    slot_id
+                );
+                false
+            }
+            (None, Some(_)) => true,
         });
 
         if winning_bids.len() != starting_count {
@@ -872,7 +869,14 @@ impl AuctionOrchestrator {
                         remaining,
                         mediator.timeout_ms(),
                     );
-                    let placeholder = fastly::Request::get("https://placeholder.invalid/");
+                    // The mediator runs on the collect path. See the doc-comment on
+                    // `AuctionContext::request`: the real client request was already
+                    // consumed by `send_async` during dispatch, so we substitute a
+                    // canonical placeholder URL. Any future mediator that needs real
+                    // client headers must snapshot them at dispatch time onto
+                    // `DispatchedAuction` rather than reading `context.request` here.
+                    let placeholder =
+                        fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: &placeholder,
@@ -1256,9 +1260,14 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_floor_prices_allows_none_prices_for_encoded_bids() {
-        // Test that bids with None prices (APS-style) pass through floor pricing
-        // This is correct behavior for parallel-only strategy where mediation happens later
+    fn test_apply_floor_prices_drops_bids_with_undecoded_price() {
+        // Bids that reach apply_floor_prices with `price=None` cannot have a
+        // floor compared against them — and they would not survive downstream
+        // (build_bid_map filters them) — so apply_floor_prices drops them so
+        // the count it reports matches what eventually ships to the client.
+        // Both production paths (select_winning_bids and the mediator filter)
+        // already decode/skip None prices before calling this function; this
+        // test pins the contract.
         let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
         let mut floor_prices = HashMap::new();
         floor_prices.insert("slot-1".to_string(), 1.00);
@@ -1268,7 +1277,7 @@ mod tests {
             "slot-1".to_string(),
             Bid {
                 slot_id: "slot-1".to_string(),
-                price: None, // APS bid with encoded price
+                price: None,
                 currency: "USD".to_string(),
                 creative: Some("<div>Ad</div>".to_string()),
                 adomain: None,
@@ -1289,25 +1298,15 @@ mod tests {
             },
         );
 
-        // Apply floor pricing - should pass through with None price
         let filtered = orchestrator.apply_floor_prices(winning_bids, &floor_prices);
 
-        assert_eq!(
-            filtered.len(),
-            1,
-            "APS bid with None price should pass through floor check"
+        assert!(
+            filtered.is_empty(),
+            "bid with None price should be dropped by apply_floor_prices"
         );
         assert!(
-            filtered.contains_key("slot-1"),
-            "Slot-1 should still be present"
-        );
-        assert!(
-            filtered
-                .get("slot-1")
-                .expect("slot-1 should be present")
-                .price
-                .is_none(),
-            "Price should still be None (not decoded yet)"
+            !filtered.contains_key("slot-1"),
+            "slot-1 should not survive when its bid has no decoded price"
         );
     }
 
