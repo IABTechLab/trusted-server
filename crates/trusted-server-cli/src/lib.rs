@@ -156,14 +156,22 @@ struct FastlyProvisionApplyArgs {
 pub fn run() -> ExitCode {
     match execute() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let _ = write_stderr_line(format_report(&error));
-            if matches!(error.current_context(), CliError::Cancelled) {
-                ExitCode::from(130)
-            } else {
+        // `ViolationsFound` and `Cancelled` exit without an
+        // error-stack dump: the violation report is already on
+        // stdout, and cancellation is a benign user signal. Real
+        // failures still print `format_report`.
+        Err(error) => match error.current_context() {
+            CliError::Cancelled => ExitCode::from(130),
+            CliError::ViolationsFound { .. } => ExitCode::from(1),
+            CliError::EnvironmentError => {
+                let _ = write_stderr_line(format_report(&error));
+                ExitCode::from(2)
+            }
+            _ => {
+                let _ = write_stderr_line(format_report(&error));
                 ExitCode::from(1)
             }
-        }
+        },
     }
 }
 

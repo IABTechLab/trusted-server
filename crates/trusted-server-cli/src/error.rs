@@ -22,6 +22,13 @@ pub enum CliError {
     Json,
     #[display("operation cancelled")]
     Cancelled,
+    #[display("environment error")]
+    EnvironmentError,
+    #[display("found {count} disallowed host(s)")]
+    ViolationsFound {
+        /// Number of disallowed hosts found across all scanned files.
+        count: usize,
+    },
 }
 
 impl Error for CliError {}
