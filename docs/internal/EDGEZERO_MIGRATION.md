@@ -109,7 +109,8 @@ period (to account for diurnal traffic patterns).
 Rollback is **immediate, no deploy required**.
 
 1. Set `edgezero_rollout_pct = "0"` in the production config store.
-   Traffic shifts back to legacy within seconds (next request per Wasm instance).
+   Traffic shifts back to legacy within a few seconds as the config store propagates
+   across edge PoPs; each Wasm instance picks up the change on its next request.
 2. Optionally set `edgezero_enabled = "false"` as belt-and-suspenders.
 3. Investigate root cause before re-advancing the canary.
 4. Keep the legacy entry point (`legacy_main()`) available until at least one

@@ -123,6 +123,7 @@ fn fnv1a_bucket(key: &str) -> u8 {
 /// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
 fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
+    debug_assert!(rollout_pct <= 100, "should be a value produced by read_rollout_pct");
     bucket < rollout_pct
 }
 
@@ -175,6 +176,9 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
             }
         },
         Ok(None) => {
+            // Fires per-request when key is absent and edgezero_enabled=true.
+            // At production scale this creates one warn per request until the key is set.
+            // Resolution: set edgezero_rollout_pct = "0" before setting edgezero_enabled = "true".
             log::warn!(
                 "edgezero_rollout_pct key absent, defaulting to 100 (full rollout — backward compat)"
             );
@@ -230,10 +234,13 @@ fn main() {
     }
 
     let rollout_pct = read_rollout_pct(&edgezero_config_store);
-    let routing_key = req
-        .get_client_ip_addr()
-        .map(|ip| ip.to_string())
-        .unwrap_or_default();
+    let routing_key = match req.get_client_ip_addr() {
+        Some(ip) => ip.to_string(),
+        None => {
+            log::debug!("no client IP available, using empty routing key (deterministic bucket 61)");
+            String::new()
+        }
+    };
     let bucket = fnv1a_bucket(&routing_key);
 
     if canary_routes_to_edgezero(bucket, rollout_pct) {
