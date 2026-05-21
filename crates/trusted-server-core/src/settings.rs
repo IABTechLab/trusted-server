@@ -727,7 +727,10 @@ impl S3SigV4AuthConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssetImageOptimizerConfig {
     /// Enables Image Optimizer for this route when the table is present.
-    #[serde(default = "default_asset_image_optimizer_enabled")]
+    #[serde(
+        default = "default_asset_image_optimizer_enabled",
+        deserialize_with = "bool_from_bool_or_str"
+    )]
     pub enabled: bool,
     /// Image Optimizer processing region.
     pub region: String,
@@ -961,7 +964,10 @@ pub enum MissingCropOffsetMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageOptimizerCropOffsetsConfig {
     /// Enable crop offset normalization.
-    #[serde(default = "default_asset_image_optimizer_enabled")]
+    #[serde(
+        default = "default_asset_image_optimizer_enabled",
+        deserialize_with = "bool_from_bool_or_str"
+    )]
     pub enabled: bool,
     /// Query parameter containing the x-axis offset.
     #[serde(default = "default_crop_offset_x_param")]
@@ -2040,6 +2046,23 @@ where
         JsonValue::Null => Ok(HashMap::new()),
         other => Err(serde::de::Error::custom(format!(
             "expected object or JSON string, got {other}",
+        ))),
+    }
+}
+
+pub(crate) fn bool_from_bool_or_str<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    match value {
+        JsonValue::Bool(value) => Ok(value),
+        JsonValue::String(value) => value
+            .trim()
+            .parse::<bool>()
+            .map_err(serde::de::Error::custom),
+        other => Err(serde::de::Error::custom(format!(
+            "expected bool or parseable bool string, got {other}"
         ))),
     }
 }
@@ -3571,6 +3594,114 @@ mod tests {
                 assert_eq!(config.secret_access_key, "secret_access_key");
             }
         }
+    }
+
+    #[test]
+    fn proxy_asset_route_image_optimizer_env_accepts_nested_bool_strings_and_arrays() {
+        let toml_str = crate_test_settings_str();
+        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
+        let vars = [
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}PREFIX"),
+                Some("/.image/"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}ORIGIN_URL"),
+                Some("https://bucket.s3.us-west-2.amazonaws.com"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}TYPE"),
+                Some("s3_sigv4"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}REGION"),
+                Some("us-west-2"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}AUTH{separator}ORIGIN_QUERY"),
+                Some("strip"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}ENABLED"),
+                Some("true"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}REGION"),
+                Some("us_west"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}PROXY{separator}ASSET_ROUTES{separator}0{separator}IMAGE_OPTIMIZER{separator}PROFILE_SET"),
+                Some("default_images"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}BASE_PARAMS"),
+                Some("quality=70&resize-filter=bicubic"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}DEFAULT_PROFILE"),
+                Some("w828"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W828"),
+                Some("format=auto&width=828"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}PROFILES{separator}W1536"),
+                Some("format=auto&width=1536"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}ALLOWED"),
+                Some("[\"1-1\",\"16-9\"]"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}ASPECT_RATIOS{separator}PROFILES"),
+                Some("[\"w828\",\"w1536\"]"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}ENABLED"),
+                Some("true"),
+            ),
+            (
+                format!("{ENVIRONMENT_VARIABLE_PREFIX}{separator}IMAGE_OPTIMIZER{separator}PROFILE_SETS{separator}DEFAULT_IMAGES{separator}CROP_OFFSETS{separator}BUCKETS"),
+                Some("[10,30,50,70,90]"),
+            ),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let settings = Settings::from_toml_and_env(&toml_str)
+                .expect("should parse image optimizer env overrides");
+            let route = settings
+                .asset_route_for_path("/.image/id/example.jpg")
+                .expect("should match image optimizer asset route");
+            assert!(route.image_optimizer_enabled());
+
+            let image_optimizer = route
+                .image_optimizer
+                .as_ref()
+                .expect("should configure image optimizer");
+            assert!(image_optimizer.enabled);
+            assert_eq!(image_optimizer.region, "us_west");
+            assert_eq!(image_optimizer.profile_set, "default_images");
+
+            let profile_set = settings
+                .image_optimizer
+                .profile_sets
+                .get("default_images")
+                .expect("should configure default image profiles");
+            assert_eq!(profile_set.profiles["w828"], "format=auto&width=828");
+            let aspect_ratios = profile_set
+                .aspect_ratios
+                .as_ref()
+                .expect("should configure aspect ratios");
+            assert_eq!(aspect_ratios.allowed, vec!["1-1", "16-9"]);
+            assert_eq!(aspect_ratios.profiles, vec!["w828", "w1536"]);
+            let crop_offsets = profile_set
+                .crop_offsets
+                .as_ref()
+                .expect("should configure crop offsets");
+            assert!(crop_offsets.enabled);
+            assert_eq!(crop_offsets.buckets, vec![10, 30, 50, 70, 90]);
+        });
     }
 
     #[test]
