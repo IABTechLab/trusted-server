@@ -53,6 +53,7 @@ use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
+const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
 ///
@@ -115,11 +116,11 @@ fn fnv1a_bucket(key: &str) -> u8 {
     (hash % 100) as u8
 }
 
-/// Returns `true` if the given bucket should be routed to the EdgeZero path.
+/// Returns `true` if the given bucket should be routed to the `EdgeZero` path.
 ///
 /// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
-/// When `rollout_pct = 0` no bucket ever routes to EdgeZero (instant rollback).
-/// When `rollout_pct = 100` every bucket routes to EdgeZero (full cutover).
+/// When `rollout_pct = 0` no bucket ever routes to `EdgeZero` (instant rollback).
+/// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
 fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
     bucket < rollout_pct
@@ -151,6 +152,34 @@ fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly:
         .get(EDGEZERO_ENABLED_KEY)
         .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
     Ok(value.as_deref().is_some_and(parse_edgezero_flag))
+}
+
+/// Reads `edgezero_rollout_pct` from the config store.
+///
+/// | Config store state              | Return value | Effect                     |
+/// |---------------------------------|--------------|----------------------------|
+/// | Key absent                      | `100`        | Full rollout (backward compat) |
+/// | Key present, valid 0–100        | parsed value | Partial or full rollout    |
+/// | Key present, invalid            | `0`          | All legacy (safe default)  |
+/// | Key read error                  | `0`          | All legacy (safe default)  |
+fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
+    match config_store.get(EDGEZERO_ROLLOUT_PCT_KEY) {
+        Ok(Some(value)) => match parse_rollout_pct(&value) {
+            Some(pct) => pct,
+            None => {
+                log::warn!(
+                    "invalid edgezero_rollout_pct value {:?}, defaulting to 0 (legacy path)",
+                    value
+                );
+                0
+            }
+        },
+        Ok(None) => 100,
+        Err(e) => {
+            log::warn!("failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)");
+            0
+        }
+    }
 }
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
@@ -186,14 +215,31 @@ fn main() {
         }
     };
 
-    if is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
+    if !is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
     }) {
-        log::debug!("routing request through EdgeZero path");
+        log::debug!("routing request through legacy path (edgezero_enabled=false)");
+        legacy_main(req);
+        return;
+    }
+
+    let rollout_pct = read_rollout_pct(&edgezero_config_store);
+    let routing_key = req
+        .get_client_ip_addr()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let bucket = fnv1a_bucket(&routing_key);
+
+    if canary_routes_to_edgezero(bucket, rollout_pct) {
+        log::debug!(
+            "routing request through EdgeZero path (bucket={bucket}, rollout_pct={rollout_pct})"
+        );
         edgezero_main(req, edgezero_config_store);
     } else {
-        log::debug!("routing request through legacy path");
+        log::debug!(
+            "routing request through legacy path (bucket={bucket}, rollout_pct={rollout_pct})"
+        );
         legacy_main(req);
     }
 }
@@ -653,16 +699,8 @@ mod tests {
             None,
             "should reject values above 100"
         );
-        assert_eq!(
-            parse_rollout_pct(""),
-            None,
-            "should reject empty string"
-        );
-        assert_eq!(
-            parse_rollout_pct("abc"),
-            None,
-            "should reject non-integer"
-        );
+        assert_eq!(parse_rollout_pct(""), None, "should reject empty string");
+        assert_eq!(parse_rollout_pct("abc"), None, "should reject non-integer");
         assert_eq!(
             parse_rollout_pct("-1"),
             None,
@@ -700,8 +738,16 @@ mod tests {
     #[test]
     fn bucket_matches_known_fnv1a_vector() {
         // FNV-1a 32-bit: XOR-then-multiply. Verified against reference implementation.
-        assert_eq!(fnv1a_bucket("1.2.3.4"), 85, "should match pinned FNV-1a vector");
-        assert_eq!(fnv1a_bucket(""), 61, "should match pinned FNV-1a vector for empty key");
+        assert_eq!(
+            fnv1a_bucket("1.2.3.4"),
+            85,
+            "should match pinned FNV-1a vector"
+        );
+        assert_eq!(
+            fnv1a_bucket(""),
+            61,
+            "should match pinned FNV-1a vector for empty key"
+        );
     }
 
     #[test]
@@ -721,7 +767,10 @@ mod tests {
     #[test]
     fn empty_key_bucket_is_valid() {
         let b = fnv1a_bucket("");
-        assert!(b < 100, "empty key must still produce a valid bucket, got {b}");
+        assert!(
+            b < 100,
+            "empty key must still produce a valid bucket, got {b}"
+        );
     }
 
     // ---------------------------------------------------------------------------
