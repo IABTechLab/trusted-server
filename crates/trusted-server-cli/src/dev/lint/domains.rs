@@ -370,3 +370,75 @@ mod absolute_url_tests {
         );
     }
 }
+
+/// Regex for protocol-relative `//host/...` URLs. The `//` must be
+/// preceded by a boundary character (start-of-line, whitespace,
+/// quote, paren, `=`, `<`, `>`, `{`, `,`, `[`, `]`, backtick) — but
+/// NOT `:`, which would double-match the `//` in an absolute URL.
+/// The host requires a dotted TLD-like suffix to filter out code
+/// comment dividers.
+fn protocol_relative_regex() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?i)(?:^|[\s"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})"#)
+            .expect("should compile protocol-relative URL regex")
+    })
+}
+
+/// Extract and normalise every host from protocol-relative URLs.
+fn extract_protocol_relative_hosts(line: &str) -> Vec<String> {
+    protocol_relative_regex()
+        .captures_iter(line)
+        .filter_map(|c| c.get(1).map(|m| normalise_host(m.as_str())))
+        .collect()
+}
+
+#[cfg(test)]
+mod protocol_relative_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_after_quote() {
+        assert_eq!(
+            extract_protocol_relative_hosts("src=\"//www.googletagmanager.com/gtm.js\""),
+            vec!["www.googletagmanager.com"]
+        );
+    }
+
+    #[test]
+    fn extracts_after_start_of_line() {
+        assert_eq!(
+            extract_protocol_relative_hosts("//cdn.example.evil/foo"),
+            vec!["cdn.example.evil"]
+        );
+    }
+
+    #[test]
+    fn extracts_template_literal_backtick() {
+        assert_eq!(
+            extract_protocol_relative_hosts("`//cdn.example.evil/${path}`"),
+            vec!["cdn.example.evil"]
+        );
+    }
+
+    #[test]
+    fn extracts_json_object_value() {
+        assert_eq!(
+            extract_protocol_relative_hosts("{\"src\": \"//cdn.example.evil/x\"}"),
+            vec!["cdn.example.evil"]
+        );
+    }
+
+    #[test]
+    fn does_not_match_colon_prefix() {
+        // http://foo.com — // is preceded by ':', NOT in the boundary class.
+        assert!(extract_protocol_relative_hosts("http://foo.com/x").is_empty());
+    }
+
+    #[test]
+    fn does_not_match_code_comment_divider() {
+        // The trailing TLD-like constraint (.{2,}) filters this out;
+        // "comment text" has no dotted-suffix.
+        assert!(extract_protocol_relative_hosts("// comment text").is_empty());
+    }
+}
