@@ -346,7 +346,10 @@ mod absolute_url_tests {
 
     #[test]
     fn extracts_bracketed_ipv6() {
-        assert_eq!(extract_absolute_hosts("dial http://[::1]:8080/"), vec!["::1"]);
+        assert_eq!(
+            extract_absolute_hosts("dial http://[::1]:8080/"),
+            vec!["::1"]
+        );
     }
 
     #[test]
@@ -539,7 +542,10 @@ mod suppression_tests {
     fn bypass_attempt_url_path_lookalike_not_suppressed() {
         // 'allow-domain' inside a URL path is NOT a comment.
         let got = parse("fetch(\"https://evil.com/allow-domain\")");
-        assert!(got.is_empty(), "URL-path content must not suppress: {got:?}");
+        assert!(
+            got.is_empty(),
+            "URL-path content must not suppress: {got:?}"
+        );
     }
 
     #[test]
@@ -547,7 +553,10 @@ mod suppression_tests {
         // https://allow-domain:8080/path — the // is preceded by ':',
         // not whitespace/SOL, so the marker anchor fails.
         let got = parse("let x = \"https://allow-domain:8080/path\";");
-        assert!(got.is_empty(), "pathological host must not suppress: {got:?}");
+        assert!(
+            got.is_empty(),
+            "pathological host must not suppress: {got:?}"
+        );
     }
 }
 
@@ -829,7 +838,9 @@ fn read_blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, Report<Dom
 }
 
 /// Walk a tree recursively into a `path → blob_id` map.
-fn tree_blob_map(tree: &gix::Tree<'_>) -> Result<HashMap<BString, ObjectId>, Report<DomainsLintError>> {
+fn tree_blob_map(
+    tree: &gix::Tree<'_>,
+) -> Result<HashMap<BString, ObjectId>, Report<DomainsLintError>> {
     let mut map = HashMap::new();
     let entries = tree
         .traverse()
@@ -898,7 +909,9 @@ pub(crate) fn staged_added_lines(
     // treat that as an empty map (everything in the index is added).
     let head_map: HashMap<BString, ObjectId> = match repo.head_commit() {
         Ok(commit) => {
-            let tree_id = commit.tree_id().change_context(DomainsLintError::OpenRepo)?;
+            let tree_id = commit
+                .tree_id()
+                .change_context(DomainsLintError::OpenRepo)?;
             let tree = repo
                 .find_tree(tree_id)
                 .change_context(DomainsLintError::OpenRepo)?;
@@ -996,7 +1009,9 @@ fn resolve_base_ref(
             return Ok(id.detach());
         }
     }
-    Err(Report::new(DomainsLintError::Reference(reference.to_string())))
+    Err(Report::new(DomainsLintError::Reference(
+        reference.to_string(),
+    )))
 }
 
 /// Collect added lines on `HEAD` relative to the merge-base of
@@ -1090,8 +1105,7 @@ mod staged_added_lines_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        fs::write(temp.path().join("readme.txt"), "hi\n")
-            .expect("should write readme");
+        fs::write(temp.path().join("readme.txt"), "hi\n").expect("should write readme");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "initial");
 
@@ -1127,8 +1141,7 @@ mod changed_vs_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        fs::write(temp.path().join("a.rs"), "let ok = 1;\n")
-            .expect("should write base file");
+        fs::write(temp.path().join("a.rs"), "let ok = 1;\n").expect("should write base file");
         test_support::stage_all(&repo);
         test_support::commit_all(&repo, "base");
 
@@ -1187,9 +1200,7 @@ mod changed_vs_tests {
                 expected: gix::refs::transaction::PreviousValue::Any,
                 log: RefLog::AndReference,
             },
-            name: "refs/heads/main"
-                .try_into()
-                .expect("valid ref name"),
+            name: "refs/heads/main".try_into().expect("valid ref name"),
             deref: false,
         };
         repo.edit_reference(delete)
@@ -1236,9 +1247,7 @@ fn warn_skip_bytes(bytes: &[u8], reason: &str) -> Result<(), Report<DomainsLintE
 /// cannot be opened, the repository has no work directory, or a
 /// scanned file fails to read for a reason other than binary
 /// content.
-pub(crate) fn full_repo_lines(
-    repo_path: &Path,
-) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
     let work_dir = repo
         .workdir()
@@ -1291,8 +1300,9 @@ pub(crate) fn full_repo_lines(
                 continue;
             }
             Err(e) => {
-                return Err(Report::new(DomainsLintError::ReadFile(path.clone()))
-                    .attach(e.to_string()));
+                return Err(
+                    Report::new(DomainsLintError::ReadFile(path.clone())).attach(e.to_string())
+                );
             }
         };
 
@@ -1317,8 +1327,7 @@ mod full_repo_tests {
     fn scans_tracked_file_lines() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n")
-            .expect("should write file");
+        fs::write(temp.path().join("a.rs"), "one\ntwo\nthree\n").expect("should write file");
         test_support::stage_all(&repo);
 
         let lines = full_repo_lines(temp.path()).expect("should scan repo");
@@ -1339,7 +1348,11 @@ mod full_repo_tests {
 
         let lines = full_repo_lines(temp.path()).expect("should scan repo despite missing file");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
-        assert_eq!(texts, vec!["kept"], "missing file is skipped, kept file scanned");
+        assert_eq!(
+            texts,
+            vec!["kept"],
+            "missing file is skipped, kept file scanned"
+        );
     }
 
     /// Case 2: a tracked path that became a symlink is skipped.
@@ -1349,8 +1362,7 @@ mod full_repo_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
         fs::write(temp.path().join("real.rs"), "real\n").expect("should write real");
-        fs::write(temp.path().join("link.rs"), "placeholder\n")
-            .expect("should write placeholder");
+        fs::write(temp.path().join("link.rs"), "placeholder\n").expect("should write placeholder");
         test_support::stage_all(&repo);
 
         // Replace link.rs on disk with a symlink; the index entry
@@ -1373,13 +1385,16 @@ mod full_repo_tests {
         // 0xff 0xfe is not a valid UTF-8 sequence — read_to_string
         // rejects it with ErrorKind::InvalidData. (A NUL byte would
         // NOT work: NUL is valid UTF-8.)
-        fs::write(temp.path().join("data.json"), b"{\"x\":\xff\xfe}")
-            .expect("should write binary");
+        fs::write(temp.path().join("data.json"), b"{\"x\":\xff\xfe}").expect("should write binary");
         test_support::stage_all(&repo);
 
         let lines = full_repo_lines(temp.path()).expect("should scan repo despite binary file");
         let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
-        assert_eq!(texts, vec!["hello"], "binary file is skipped, text file scanned");
+        assert_eq!(
+            texts,
+            vec!["hello"],
+            "binary file is skipped, text file scanned"
+        );
     }
 }
 
@@ -1497,9 +1512,7 @@ pub(crate) fn explicit_path_lines(
 /// [`DomainsLintError`] variant.
 fn io_error_to_report(err: &io::Error, path: &Path) -> Report<DomainsLintError> {
     match err.kind() {
-        ErrorKind::NotFound => {
-            Report::new(DomainsLintError::PathNotFound(path.to_path_buf()))
-        }
+        ErrorKind::NotFound => Report::new(DomainsLintError::PathNotFound(path.to_path_buf())),
         ErrorKind::PermissionDenied => {
             Report::new(DomainsLintError::PermissionDenied(path.to_path_buf()))
         }
@@ -1577,8 +1590,7 @@ mod explicit_path_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let file = temp.path().join("secret.rs");
         fs::write(&file, "secret\n").expect("should write file");
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o000))
-            .expect("should chmod 000");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("should chmod 000");
 
         let result = explicit_path_lines(std::slice::from_ref(&file));
         // Restore perms so the tempdir can be cleaned up.

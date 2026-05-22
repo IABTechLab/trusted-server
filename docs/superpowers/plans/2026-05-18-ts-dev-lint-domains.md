@@ -66,6 +66,7 @@ Spec §"Why `ts dev` as the parent?" and §"Crate Layout" — `ts dev serve` mus
 ### Task 1.1: Create `dev/` module skeleton, move `dev.rs` body to `dev/serve.rs`
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/src/dev/mod.rs`
 - Create: `crates/trusted-server-cli/src/dev/serve.rs`
 - Delete: `crates/trusted-server-cli/src/dev.rs`
@@ -126,6 +127,7 @@ clap-side change lands in the next commit."
 ### Task 1.2: Introduce `DevCommand` enum with `Serve` variant; rewire `lib.rs`
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/lib.rs` (lines around 40, 89, 184, 281)
 - Modify: `crates/trusted-server-cli/src/dev/mod.rs`
 
@@ -166,10 +168,13 @@ pub struct ServeArgs {
 In `crates/trusted-server-cli/src/lib.rs`:
 
 Find:
+
 ```rust
     Dev(DevArgs),
 ```
+
 Change to:
+
 ```rust
     Dev {
         #[command(subcommand)]
@@ -180,18 +185,23 @@ Change to:
 Find and delete the entire `struct DevArgs { ... }` block (lines ~89-99).
 
 Find:
+
 ```rust
         Command::Dev(args) => run_dev(&args),
 ```
+
 Change to:
+
 ```rust
         Command::Dev { command } => run_dev(command),
 ```
 
 Find:
+
 ```rust
 fn run_dev(args: &DevArgs) -> Result<(), Report<CliError>> {
 ```
+
 Change the entire function body to:
 
 ```rust
@@ -302,6 +312,7 @@ Spec §"Implementation Readiness" step 1 and §"Cargo dependencies". The spike's
 ### Task 2.1: Add the gix dependencies with provisional versions
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/Cargo.toml`
 
 - [ ] **Step 1: Find a matched release-family pair**
@@ -359,8 +370,8 @@ spike helpers in Tasks 2.2 / 2.3 should pin an equivalent fixed
 signature locally. When the spike succeeds, the same constant can
 be reused from `test_support` once that module exists in Phase 4.
 
-
 **Files:**
+
 - Create: `crates/trusted-server-cli/tests/spike_gix_staged_diff.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -486,6 +497,7 @@ batch is complete."
 ### Task 2.3: Spike test 2 — merge-base + tree-vs-tree blob diff
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/tests/spike_gix_changed_vs.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -594,6 +606,7 @@ staged spike."
 ### Task 2.4: Spike test 3 — durable `core.hooksPath` write via `gix-config::File`
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/tests/spike_gix_config_write.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -721,6 +734,7 @@ temp file + rename so a partial write never lands."
 ### Task 2.5: Update the spec with the pinned versions and entry points
 
 **Files:**
+
 - Modify: `docs/superpowers/specs/2026-05-18-check-domains-design.md`
 
 - [ ] **Step 1: Replace the version placeholders**
@@ -761,6 +775,7 @@ Spec §"Allowlist (Rust constants)", §"URL extraction (without lookahead)", §"
 ### Task 3.1: Create `dev/lint/` module skeleton + constants
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/src/dev/lint/mod.rs`
 - Create: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 - Modify: `crates/trusted-server-cli/src/dev/mod.rs`
@@ -964,6 +979,7 @@ parsing arrive in subsequent commits."
 ### Task 3.2: Implement `normalise_host` (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -1033,6 +1049,7 @@ lowercase, and pass-through cases. Pure function; no I/O."
 ### Task 3.3: Implement `is_allowed` (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -1163,6 +1180,7 @@ examples from spec §'Matching summary'."
 ### Task 3.4: Implement absolute-URL extraction (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -1283,6 +1301,7 @@ the malformed-host rejection from spec test 20a."
 ### Task 3.5: Implement protocol-relative URL extraction (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -1396,6 +1415,7 @@ by the scheme separator). Six tests cover the cases from spec
 ### Task 3.6: Implement suppression-marker parsing (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing tests**
@@ -1528,6 +1548,7 @@ substring; pathological host literally named 'allow-domain')."
 ### Task 3.7: Implement `scan_line` (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 `scan_line` returns **two** things: the violations and an
@@ -1787,6 +1808,7 @@ A shared helper module for git-repo fixtures lives at `dev/lint/test_support.rs`
 ### Task 4.0: Extract git-fixture helpers into a shared `test_support` module
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/src/dev/lint/test_support.rs`
 - Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
 
@@ -1865,6 +1887,7 @@ stubs through the pinned implementations."
 ### Task 4.1: `staged_added_lines` (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 **Path representation for staged diffs.** `gix` returns diff entry
@@ -2023,6 +2046,7 @@ Expected: PASS (both the normal case and the non-UTF-8 case).
 ### Task 4.2: `changed_vs_added_lines` with base-ref resolution (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests**
@@ -2047,6 +2071,7 @@ Signature: `pub(crate) fn changed_vs_added_lines(repo_path: &Path, reference: &s
 ### Task 4.3: `full_repo_lines` with edge-case handling (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests** (`mod full_repo_tests`) for each of the five edge cases in spec §"Handling tracked-but-missing files and symlinks":
@@ -2073,6 +2098,7 @@ Signature: `pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLi
 ### Task 4.4: `explicit_path_lines` with the soft/hard split (TDD)
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Write failing inline tests** (`mod explicit_path_tests`):
@@ -2141,6 +2167,7 @@ Spec §"CLI Surface" and §"Required change to existing CLI exit-code mapping".
 ### Task 5.1: Extend `CliError` with `EnvironmentError` and `ViolationsFound`
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/error.rs`
 
 - [ ] **Step 1: Add the two variants**
@@ -2215,6 +2242,7 @@ violation' from 'could not even run the scan' in CI logs."
 ### Task 5.2: Add `DevCommand::Lint` and `LintCommand::Domains` clap surface
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/mod.rs`
 - Modify: `crates/trusted-server-cli/src/dev/lint/mod.rs`
 
@@ -2337,6 +2365,7 @@ the CLI scaffolding so --help works end-to-end."
 ### Task 5.3: Implement `domains::run` mode dispatch + reporting
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/dev/lint/domains.rs`
 
 - [ ] **Step 1: Implement `domains::run`**
@@ -2736,7 +2765,7 @@ predicates = "3"
 
 - [ ] **Step 1: Add a "Local setup" subsection** documenting:
 
-```markdown
+````markdown
 ### Pre-commit URL-host linter (`ts dev lint domains`)
 
 One-time setup after cloning:
@@ -2745,6 +2774,7 @@ One-time setup after cloning:
 cargo install_cli      # builds and installs the `ts` binary
 ts dev install-hooks   # installs the pre-commit hook into .githooks/
 ```
+````
 
 After that, every `git commit` runs the linter against staged
 changes. If you have an existing `core.hooksPath` (husky,
@@ -2753,7 +2783,8 @@ without `--force`. See `docs/superpowers/specs/2026-05-18-check-domains-design.m
 for the full design.
 
 To bypass the hook for a single commit: `git commit --no-verify`.
-```
+
+````
 
 - [ ] **Step 2: Commit.**
 
@@ -2800,7 +2831,7 @@ Run:
 ```sh
 ts dev lint domains || rc=$?
 echo "exit code: ${rc:-0}"
-```
+````
 
 Expected: a list of existing violations on stdout, and `exit code: 1` printed at the end. **`exit 1` is the success condition for this step.** The output should look reasonable (well-formed `path:line:` lines). The violations themselves go into the Stage 1 Doc Cleanup Plan, not into this PR.
 
@@ -2838,7 +2869,7 @@ git push -u origin feature/check-domains-spec
 
 ## Notes for the implementer
 
-- Each phase's spec references are intentional — open the spec for the relevant section before writing code. The spec contains *why* in places where the plan only has *what*.
+- Each phase's spec references are intentional — open the spec for the relevant section before writing code. The spec contains _why_ in places where the plan only has _what_.
 - The Phase 2 spike is the riskiest part. If it fails — e.g., the chosen `gix` version doesn't expose a stable tree-vs-tree diff entry point — stop and re-pin against a different release before proceeding. The downstream phases all depend on those API choices.
 - `error-stack` usage follows the existing crate convention: `Report<CliError>` at the boundary, `change_context()` to map module-level errors. See PR #669's `config.rs` / `audit.rs` for examples.
 - Commit early and often. Each task step that says "commit" is a real commit; don't batch.

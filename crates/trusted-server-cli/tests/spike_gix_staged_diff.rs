@@ -60,11 +60,7 @@ fn test_signature() -> gix::actor::Signature {
     }
 }
 
-fn build_tree_with_file(
-    repo: &gix::Repository,
-    name: &str,
-    blob_id: ObjectId,
-) -> ObjectId {
+fn build_tree_with_file(repo: &gix::Repository, name: &str, blob_id: ObjectId) -> ObjectId {
     let empty_tree_id = repo.empty_tree().id;
     let mut editor = repo
         .edit_tree(empty_tree_id)

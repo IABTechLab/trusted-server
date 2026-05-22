@@ -35,14 +35,14 @@ contains PR #669. Two acceptable bases:
 - `origin/feature/ts-cli` directly (stacked on PR #669's branch), with
   a rebase onto `main` once #669 merges.
 
-A plain `main` checkout that *predates* #669's merge cannot host this
+A plain `main` checkout that _predates_ #669's merge cannot host this
 implementation — the CLI surface this design extends does not exist
 there. See [Implementation Readiness](#implementation-readiness) for
 the full start-condition checklist.
 
 ## Implementation Readiness
 
-**Status today: ready to start *only on a branch stacked on PR #669*.**
+**Status today: ready to start _only on a branch stacked on PR #669_.**
 A plain `main` checkout has no `crates/trusted-server-cli`, no `ts`
 binary, no `cargo install_cli` alias, and no host-target CI lane —
 starting there would force the implementer to reinvent or duplicate
@@ -130,12 +130,12 @@ ts dev lint domains [--staged | --changed-vs <ref> | <paths>...]
 
 Modes (mutually exclusive):
 
-| Invocation                           | Behavior                                                                                                                 |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `ts dev lint domains`                    | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.** |
-| `ts dev lint domains --staged`           | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported.                        |
+| Invocation                               | Behavior                                                                                                                                                               |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ts dev lint domains`                    | Full-repo audit. Walks tracked files matching the extension filter and scans every line. **Diagnostic only in Stage 1.**                                               |
+| `ts dev lint domains --staged`           | Pre-commit mode. Scans only added lines in `git diff --cached`. Existing violations not reported.                                                                      |
 | `ts dev lint domains --changed-vs <ref>` | CI/PR mode (Stage 2). Scans only added lines in the diff **equivalent to** `git diff $(git merge-base <ref> HEAD)..HEAD` — computed via gitoxide, not by shelling out. |
-| `ts dev lint domains path/...`           | Scans the listed files in full.                                                                                          |
+| `ts dev lint domains path/...`           | Scans the listed files in full.                                                                                                                                        |
 
 Output format defaults to `human`. `--format json` emits a structured
 report (see [Output Format](#output-format)).
@@ -244,22 +244,23 @@ Existing code touched:
   **`ts dev serve` must preserve every flag and behavior of today's
   `ts dev` leaf**, byte-for-byte from a user's perspective:
 
-  | Existing `ts dev` flag                                  | `ts dev serve` requirement |
-  | ------------------------------------------------------- | -------------------------- |
-  | `--adapter / -a` (default `fastly`)                     | Same default, same enum    |
-  | `--config` (`Option<PathBuf>`)                          | Preserved unchanged        |
-  | `--env` (default `local`)                               | Preserved unchanged        |
+  | Existing `ts dev` flag                                                                | `ts dev serve` requirement                                                                                                 |
+  | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+  | `--adapter / -a` (default `fastly`)                                                   | Same default, same enum                                                                                                    |
+  | `--config` (`Option<PathBuf>`)                                                        | Preserved unchanged                                                                                                        |
+  | `--env` (default `local`)                                                             | Preserved unchanged                                                                                                        |
   | Trailing `passthrough` args (`trailing_var_arg = true`, `allow_hyphen_values = true`) | Preserved unchanged — the `serve` subcommand still forwards everything after the recognized flags to the underlying runner |
 
   In other words: any shell invocation that works today as
   `ts dev --adapter=fastly --config=... --env=local -- --extra ...`
   must work tomorrow as `ts dev serve --adapter=fastly
-  --config=... --env=local -- --extra ...` with identical effect.
+--config=... --env=local -- --extra ...` with identical effect.
   The refactor is a structural rename, not a behavior change.
   Verification: an end-to-end test asserts that
   `ts dev serve --help` lists the same flags as today's
   `ts dev --help`, and that trailing-arg passthrough still reaches
   the runner.
+
 - `crates/trusted-server-cli/src/error.rs` — add `LintError` and
   `InstallHooksError` variants if needed for typed propagation,
   otherwise reuse the crate's existing `Report<CliError>` plumbing.
@@ -322,19 +323,19 @@ frequency, and triaging each into one of: add to `REFERENCE_HOSTS`,
 add to integration `EXACT_HOSTS`, rewrite to a reserved host, or
 suppress per-line.
 
-| Category                | Hosts                                                                                          |
-| ----------------------- | ---------------------------------------------------------------------------------------------- |
-| Git / GitHub            | `github.com`, `docs.github.com`, `help.github.com`, `token.actions.githubusercontent.com`      |
-| Git commit conventions  | `chris.beams.io`                                                                               |
-| Rust                    | `docs.rs`, `doc.rust-lang.org`, `crates.io`                                                    |
-| Web / W3C standards     | `www.w3.org`, `schema.org`                                                                     |
-| Versioning / changelogs | `semver.org`, `keepachangelog.com`                                                             |
-| IAB Tech Lab            | `iab.com`, `iabtechlab.com`, `iabtechlab.github.io`, `iabeurope.github.io`                     |
-| Specs (supply chain)    | `in-toto.io`, `rslstandard.org`                                                                |
-| Specs (other)           | `webassembly.org`                                                                              |
-| Fastly docs             | `www.fastly.com`, `developer.fastly.com`, `manage.fastly.com`                                  |
-| Cloudflare docs         | `developers.cloudflare.com`                                                                    |
-| Vendor docs             | `docs.datadome.co`, `docs.prebid.org`                                                          |
+| Category                | Hosts                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------------------- |
+| Git / GitHub            | `github.com`, `docs.github.com`, `help.github.com`, `token.actions.githubusercontent.com`       |
+| Git commit conventions  | `chris.beams.io`                                                                                |
+| Rust                    | `docs.rs`, `doc.rust-lang.org`, `crates.io`                                                     |
+| Web / W3C standards     | `www.w3.org`, `schema.org`                                                                      |
+| Versioning / changelogs | `semver.org`, `keepachangelog.com`                                                              |
+| IAB Tech Lab            | `iab.com`, `iabtechlab.com`, `iabtechlab.github.io`, `iabeurope.github.io`                      |
+| Specs (supply chain)    | `in-toto.io`, `rslstandard.org`                                                                 |
+| Specs (other)           | `webassembly.org`                                                                               |
+| Fastly docs             | `www.fastly.com`, `developer.fastly.com`, `manage.fastly.com`                                   |
+| Cloudflare docs         | `developers.cloudflare.com`                                                                     |
+| Vendor docs             | `docs.datadome.co`, `docs.prebid.org`                                                           |
 | Tooling docs            | `vitepress.dev`, `playwright.dev`, `testcontainers.com`, `grafana.com`, `docsearch.algolia.com` |
 
 One-off references not on this list (e.g., a single arxiv.org link in
@@ -350,21 +351,21 @@ testing, and special use). Hard-coded suffix check, not list entries.
 
 ### Matching summary
 
-| Host                                | Allowed?                                  |
-| ----------------------------------- | ----------------------------------------- |
-| `example.com`                       | yes (subdomain-list)                      |
-| `foo.example.com`                   | yes (subdomain-list)                      |
-| `assets.example.net`                | yes (subdomain-list)                      |
-| `example.com.evil.com`              | **no** (not a subdomain of `example.com`) |
-| `api.fastly.com`                    | yes (exact)                               |
-| `v2.api.fastly.com`                 | **no** (exact-only)                       |
-| `developer.fastly.com`              | yes (reference)                           |
-| `testlight.example`                 | yes (reserved TLD rule)                   |
-| `something.test`                    | yes (reserved TLD rule)                   |
-| `127.0.0.1`                         | yes (exact)                               |
+| Host                                | Allowed?                                   |
+| ----------------------------------- | ------------------------------------------ |
+| `example.com`                       | yes (subdomain-list)                       |
+| `foo.example.com`                   | yes (subdomain-list)                       |
+| `assets.example.net`                | yes (subdomain-list)                       |
+| `example.com.evil.com`              | **no** (not a subdomain of `example.com`)  |
+| `api.fastly.com`                    | yes (exact)                                |
+| `v2.api.fastly.com`                 | **no** (exact-only)                        |
+| `developer.fastly.com`              | yes (reference)                            |
+| `testlight.example`                 | yes (reserved TLD rule)                    |
+| `something.test`                    | yes (reserved TLD rule)                    |
+| `127.0.0.1`                         | yes (exact)                                |
 | `192.168.1.1`                       | **no** (RFC 1918 private IP, not loopback) |
-| `1.2.3.4`                           | no                                        |
-| `[::1]` → `::1` after bracket strip | yes (exact)                               |
+| `1.2.3.4`                           | no                                         |
+| `[::1]` → `::1` after bracket strip | yes (exact)                                |
 
 Matching is case-insensitive on the host after lowercasing.
 
@@ -389,7 +390,7 @@ apply:
 **`SUBDOMAIN_HOSTS`:**
 
 1. Same vendor-justification bar as `EXACT_HOSTS`.
-2. **Plus** an explicit comment naming *why* subdomain matching is
+2. **Plus** an explicit comment naming _why_ subdomain matching is
    needed (runtime host construction, vendor-controlled subdomain
    sharding, etc.).
 
@@ -483,17 +484,17 @@ linter treats fenced blocks like any other content.
 
 **Suppression inside fenced blocks: use the language's native
 comment syntax, not HTML comments.** A line like
-`<!-- allow-domain: foo -->` inside a ```` ```bash ```` fence is
+`<!-- allow-domain: foo -->` inside a ` ```bash ` fence is
 displayed to readers as a literal HTML comment in their shell
 example — confusing and misleading. The linter's marker regex
 accepts several comment introducers; pick the one that matches the
 fenced block's language:
 
-| Fence language       | Use this marker form                |
-| -------------------- | ----------------------------------- |
-| `bash`, `sh`, `toml` | `# allow-domain: <host>`            |
-| `rust`, `ts`, `js`   | `// allow-domain: <host>`           |
-| HTML (or no fence)   | `<!-- allow-domain: <host> -->`     |
+| Fence language       | Use this marker form            |
+| -------------------- | ------------------------------- |
+| `bash`, `sh`, `toml` | `# allow-domain: <host>`        |
+| `rust`, `ts`, `js`   | `// allow-domain: <host>`       |
+| HTML (or no fence)   | `<!-- allow-domain: <host> -->` |
 
 **Strongly prefer rewriting the example to a reserved host instead
 of suppressing** — see [Stage 1 Doc Cleanup
@@ -636,7 +637,7 @@ Notes:
 
 - **Versions pinned by the Phase 2 feasibility spike: `gix = 0.83`,
   `gix-config = 0.56`** (the same gitoxide release family — `gix
-  0.83` depends on `gix-config 0.56`). Verified with
+0.83` depends on `gix-config 0.56`). Verified with
   `cargo tree -p gix -p gix-config --duplicates`: only an unrelated
   `hashbrown` appears twice; `gix` and `gix-config` each resolve to
   a single version.
@@ -849,7 +850,7 @@ section for the full entry-point list. The conceptual operations:
    the index→tree conversion gix 0.83 does not expose cleanly.
 5. Read each blob's content — `repo.find_object(id)?.data`.
 6. Run a line-level diff — `gix::diff::blob::Diff::compute(
-   Algorithm::Myers, &InternedInput::new(old, new))`, then walk
+Algorithm::Myers, &InternedInput::new(old, new))`, then walk
    each `hunk.after` range for new-side line numbers and content.
 
 **Why this is better than shelling out:**
@@ -1084,7 +1085,7 @@ audit must not be scanned when named explicitly either. Specifically:
   `.worktrees/`, lockfile basename, etc.): warn and skip.
 - Extension not in the scanned set (`.html`, `.css`, etc.):
   warn and skip with `note: <path> is not in scanned extensions;
-  skipping`. The deferred `--force-scan path/...` escape hatch
+skipping`. The deferred `--force-scan path/...` escape hatch
   remains an Open Question.
 - Symlink, non-regular file, binary content (`InvalidData`):
   warn and skip per the
@@ -1541,21 +1542,21 @@ on the collected `DiffLine` values.
 20. **Wrong host in marker** —
     `https://evil.com // allow-domain: other.com` → `evil.com` flagged;
     stderr warning notes `other.com` was listed but did not match.
-20a. **Placeholder URL with malformed host** —
+    20a. **Placeholder URL with malformed host** —
     `https://...` in a Markdown placeholder must NOT extract host
     `...` (the regex requires an alphanumeric first character).
     Asserts the URL is silently skipped (it is not a real URL).
-20b. **Template-literal protocol-relative URL** —
+    20b. **Template-literal protocol-relative URL** —
     `` `//cdn.example.evil/${path}` `` (JS/TS template literal)
     flagged as `cdn.example.evil`. Asserts backtick boundary works.
-20c. **JSON object value with protocol-relative URL** —
+    20c. **JSON object value with protocol-relative URL** —
     `{"src": "//cdn.example.evil/x"}` flagged. Asserts `{` and `,`
     boundary characters work for JSON contexts.
-20d. **Suppression marker with trailing whitespace before `-->`** —
+    20d. **Suppression marker with trailing whitespace before `-->`** —
     `<!-- allow-domain: test.com   -->` correctly trims the host
     (captured group ends with spaces, but split+trim yields
     `["test.com"]`).
-20e. **Suppression marker with multi-host whitespace** —
+    20e. **Suppression marker with multi-host whitespace** —
     `// allow-domain: a.com ,  b.com , c.com` correctly yields
     `["a.com", "b.com", "c.com"]`.
 
@@ -1588,6 +1589,7 @@ and the index with `gix` APIs (no shell), runs the binary with
 
     Implementers: do not generalize the full-repo non-UTF-8 skip
     rule to `--staged` / `--changed-vs` modes.
+
 26. Multiple hunks in one file — all added lines reported correctly.
 
 ### `--changed-vs` mode cases
@@ -1686,7 +1688,7 @@ and the index with `gix` APIs (no shell), runs the binary with
   per language and was rejected as over-engineering for a small
   risk surface. Code review catches stray reference URLs that
   matter; the linter's purpose is preventing test-pollution and
-  unvetted *integration* endpoints, not policing every documentation
+  unvetted _integration_ endpoints, not policing every documentation
   link. If a real incident shows production code routinely embedding
   reference URLs as runtime values, revisit with a per-context
   policy.
@@ -1724,15 +1726,15 @@ A grep against the current `docs/` and root-level Markdown surfaces
 these example categories (representative, not exhaustive — the
 implementation runs the full audit and produces the complete list):
 
-| Host                                     | Category                                | Resolution                                                                  |
-| ---------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------- |
-| `aps.amazon.com`                         | Real Amazon doc/product page            | Add to `REFERENCE_HOSTS` if linked repeatedly, otherwise suppress per-line  |
-| `api.lockr.io`                           | Legitimate lockr integration endpoint   | Add to integration `EXACT_HOSTS` (lockr) — verify it is actually proxied |
-| `krk.kargo.com`                          | Kargo bidder host                       | Verify if proxied; add to integration list OR rewrite illustrative usage to `.example` |
+| Host                                                                                                                                                                                                                                                           | Category                                                                                                  | Resolution                                                                                                                         |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `aps.amazon.com`                                                                                                                                                                                                                                               | Real Amazon doc/product page                                                                              | Add to `REFERENCE_HOSTS` if linked repeatedly, otherwise suppress per-line                                                         |
+| `api.lockr.io`                                                                                                                                                                                                                                                 | Legitimate lockr integration endpoint                                                                     | Add to integration `EXACT_HOSTS` (lockr) — verify it is actually proxied                                                           |
+| `krk.kargo.com`                                                                                                                                                                                                                                                | Kargo bidder host                                                                                         | Verify if proxied; add to integration list OR rewrite illustrative usage to `.example`                                             |
 | `sync.ssp.com`, `ec.publisher.com`, `tracker.com`, `advertiser.com`, `cdn.com`, `short.link`, `redirect1.com`, `redirect2.com`, `final.com`, `new-server.com`, `publisher.com`, `partner.com`, `web.prebidwrapper.com`, `prebid-server.com`, `your-server.com` | Illustrative placeholders in `docs/guide/creative-processing.md`, `docs/guide/first-party-proxy.md`, etc. | **Rewrite to RFC 2606 reserved hosts** (`tracker.example.com`, `advertiser.example.com`, `cdn.example.com`, `short.example`, etc.) |
-| `formally-vital-lion.edgecompute.app`    | One-off Fastly Compute test URL         | Suppress per-line where it appears |
-| `getpurpose.ai`                          | Test site in PR #669 reviewer instructions | Rewrite to `example.com` or suppress |
-| `192.168.1.1`                            | RFC 1918 private IP example             | Rewrite to a reserved host or `127.0.0.1` |
+| `formally-vital-lion.edgecompute.app`                                                                                                                                                                                                                          | One-off Fastly Compute test URL                                                                           | Suppress per-line where it appears                                                                                                 |
+| `getpurpose.ai`                                                                                                                                                                                                                                                | Test site in PR #669 reviewer instructions                                                                | Rewrite to `example.com` or suppress                                                                                               |
+| `192.168.1.1`                                                                                                                                                                                                                                                  | RFC 1918 private IP example                                                                               | Rewrite to a reserved host or `127.0.0.1`                                                                                          |
 
 ### Cleanup policy
 
@@ -1766,7 +1768,7 @@ Suggested execution order:
 1. Land the linter and pre-commit hook (this design).
 2. Produce a frequency-ordered host report. The human output
    includes file paths and summary lines, so naive `sort | uniq -c`
-   over the human format counts *lines*, not hosts. Use the JSON
+   over the human format counts _lines_, not hosts. Use the JSON
    output and a small parser:
 
    ```sh
@@ -1789,6 +1791,7 @@ Suggested execution order:
                     c=collections.Counter(v["host"] for v in d["violations"]); \
                     [print(f"{n:6d} {h}") for h,n in c.most_common()]'
    ```
+
 3. Triage the top ~80% of violations into the three categories above.
 4. Submit cleanup PRs grouped by file (so each PR is reviewable):
    `docs/guide/creative-processing.md`,
@@ -1825,7 +1828,7 @@ until Stages 1 and 2 are stable.
 
 Settled choices that the implementer should not re-litigate. Kept
 here as historical context with the rationale, so future readers can
-see *why* each decision went the way it did rather than re-opening
+see _why_ each decision went the way it did rather than re-opening
 the question.
 
 1. **Subcommand naming and ownership.** `ts dev lint domains` and
@@ -1893,7 +1896,7 @@ the question.
      for branch creation, `Repository::edit_reference` with a
      `Target::Symbolic` `RefEdit` for moving HEAD.
    - **Blob line diff:** `gix::diff::blob::{Algorithm, Diff,
-     InternedInput}` — `Diff::compute(Algorithm::Myers, &input)`,
+InternedInput}` — `Diff::compute(Algorithm::Myers, &input)`,
      then `diff.hunks()`; each `Hunk.after` is the new-side token
      (line) range.
    - **No tree-vs-tree `Platform` machinery is used.** Both the
@@ -1902,7 +1905,7 @@ the question.
      `for_each_to_obtain_tree` and avoids the index→tree conversion
      gix 0.83 does not expose cleanly.
    - **gix-config:** `File::from_path_no_includes(path,
-     Source::Local)`, `File::set_raw_value` (dotted `AsKey` form —
+Source::Local)`, `File::set_raw_value` (dotted `AsKey` form —
      avoids the `File<'event>` invariance that bites
      `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
 2. **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,

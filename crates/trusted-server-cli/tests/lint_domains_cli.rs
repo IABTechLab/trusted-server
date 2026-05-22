@@ -54,7 +54,9 @@ fn staged_violation_exits_one_human() {
         .args(["dev", "lint", "domains", "--staged"])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("bad.rs:1: disallowed host test.com"))
+        .stdout(predicate::str::contains(
+            "bad.rs:1: disallowed host test.com",
+        ))
         .stdout(predicate::str::contains("1 disallowed host(s) found"));
 }
 
@@ -73,8 +75,8 @@ fn staged_violation_json_format() {
         .args(["dev", "lint", "domains", "--staged", "--format", "json"])
         .assert()
         .code(1);
-    let stdout = String::from_utf8(assert.get_output().stdout.clone())
-        .expect("stdout should be UTF-8");
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout should be UTF-8");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout should be valid JSON");
     assert_eq!(parsed["count"], 1);
@@ -109,11 +111,8 @@ fn staged_non_utf8_path_warns_and_reports() {
     let temp = repo_with_initial_commit();
     let repo = gix::open(temp.path()).expect("should reopen repo");
     let name = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0xff, 0x6f, 0x2e, 0x72, 0x73]);
-    std::fs::write(
-        temp.path().join(name),
-        "let bad = \"https://test.com\";\n",
-    )
-    .expect("should write non-utf8-named file");
+    std::fs::write(temp.path().join(name), "let bad = \"https://test.com\";\n")
+        .expect("should write non-utf8-named file");
     common::stage_all(&repo);
 
     ts_in(&temp)
@@ -215,7 +214,9 @@ fn markdown_disallowed_link_reported() {
         .args(["dev", "lint", "domains", "--staged"])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("doc.md:1: disallowed host test.com"));
+        .stdout(predicate::str::contains(
+            "doc.md:1: disallowed host test.com",
+        ));
 }
 
 #[test]

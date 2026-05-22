@@ -110,9 +110,7 @@ fn update_head_to(repo: &gix::Repository, ref_name: &str) {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::{FullName, Target};
 
-    let full: FullName = ref_name
-        .try_into()
-        .expect("should parse FullName from ref");
+    let full: FullName = ref_name.try_into().expect("should parse FullName from ref");
     let edit = RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -205,10 +203,7 @@ fn resolve_base_ref(
             return Ok(id.detach());
         }
     }
-    Err(format!(
-        "ref `{reference}` not found; tried: {candidates:?}"
-    )
-    .into())
+    Err(format!("ref `{reference}` not found; tried: {candidates:?}").into())
 }
 
 fn read_blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

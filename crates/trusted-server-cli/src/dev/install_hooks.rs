@@ -119,7 +119,10 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), Report<InstallHooksEr
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".ts-install-hooks.tmp.{}.{nanos}", std::process::id()));
+    let tmp = dir.join(format!(
+        ".ts-install-hooks.tmp.{}.{nanos}",
+        std::process::id()
+    ));
     fs::write(&tmp, content).change_context(InstallHooksError::WriteHook)?;
     fs::rename(&tmp, path).change_context(InstallHooksError::WriteHook)?;
     Ok(())
@@ -150,11 +153,13 @@ fn set_local_config_value(
     value: &str,
 ) -> Result<(), Report<InstallHooksError>> {
     let config_path = repo.git_dir().join("config");
-    let mut file =
-        match GixConfigFile::from_path_no_includes(config_path.clone(), gix_config::Source::Local) {
-            Ok(f) => f,
-            Err(_) => GixConfigFile::new(gix_config::file::Metadata::from(gix_config::Source::Local)),
-        };
+    let mut file = match GixConfigFile::from_path_no_includes(
+        config_path.clone(),
+        gix_config::Source::Local,
+    ) {
+        Ok(f) => f,
+        Err(_) => GixConfigFile::new(gix_config::file::Metadata::from(gix_config::Source::Local)),
+    };
     let value_bstr: &BStr = value.into();
     file.set_raw_value(dotted_key, value_bstr)
         .change_context(InstallHooksError::ConfigWrite)?;
@@ -351,8 +356,7 @@ mod config_tests {
     fn read_returns_none_when_unset() {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
-        let value =
-            read_local_config_value(&repo, "core.hooksPath").expect("should read config");
+        let value = read_local_config_value(&repo, "core.hooksPath").expect("should read config");
         assert!(value.is_none(), "unset key reads as None: {value:?}");
     }
 
@@ -361,14 +365,13 @@ mod config_tests {
         let temp = tempfile::tempdir().expect("should create tempdir");
         let repo = test_support::init_repo(temp.path());
 
-        set_local_config_value(&repo, "core.hooksPath", ".githooks")
-            .expect("should write config");
+        set_local_config_value(&repo, "core.hooksPath", ".githooks").expect("should write config");
         let value =
             read_local_config_value(&repo, "core.hooksPath").expect("should read config back");
         assert_eq!(value.as_deref(), Some(".githooks"));
 
-        let on_disk = fs::read_to_string(repo.git_dir().join("config"))
-            .expect("should read .git/config");
+        let on_disk =
+            fs::read_to_string(repo.git_dir().join("config")).expect("should read .git/config");
         assert!(
             on_disk.contains("[core]") && on_disk.contains("hooksPath"),
             "on-disk config should carry core/hooksPath: {on_disk}"
@@ -396,7 +399,10 @@ mod install_hooks_tests {
         let hook = temp.path().join(".githooks/pre-commit");
         assert!(hook.is_file(), "hook file should exist");
         let content = fs::read_to_string(&hook).expect("should read hook");
-        assert!(content.contains(MANAGED_MARKER), "hook should carry the marker");
+        assert!(
+            content.contains(MANAGED_MARKER),
+            "hook should carry the marker"
+        );
         assert!(
             content.contains("dev lint domains --staged"),
             "hook should exec the linter"
@@ -438,7 +444,10 @@ mod install_hooks_tests {
         let err = install_hooks(temp.path(), false)
             .expect_err("should refuse to clobber an unmanaged hook");
         assert!(
-            matches!(err.current_context(), InstallHooksError::WouldClobber { .. }),
+            matches!(
+                err.current_context(),
+                InstallHooksError::WouldClobber { .. }
+            ),
             "should be WouldClobber: {err:?}"
         );
     }
@@ -477,10 +486,13 @@ mod install_hooks_tests {
         set_local_config_value(&repo, "core.hooksPath", "hooks")
             .expect("should seed foreign hooksPath");
 
-        let err = install_hooks(temp.path(), false)
-            .expect_err("should refuse a foreign core.hooksPath");
+        let err =
+            install_hooks(temp.path(), false).expect_err("should refuse a foreign core.hooksPath");
         assert!(
-            matches!(err.current_context(), InstallHooksError::ForeignHooksPath { .. }),
+            matches!(
+                err.current_context(),
+                InstallHooksError::ForeignHooksPath { .. }
+            ),
             "should be ForeignHooksPath: {err:?}"
         );
     }
