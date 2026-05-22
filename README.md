@@ -60,6 +60,8 @@ cargo test_cli
 
 `ts audit` is host-only and currently expects a local Chrome/Chromium installation. It checks common PATH names and standard macOS app bundle locations.
 
+`ts dev lint domains` checks that source, config, and docs only reference vetted URL hosts; run `ts dev install-hooks` once after cloning to wire it in as a pre-commit hook. See [CONTRIBUTING.md](CONTRIBUTING.md#wrench-local-setup) for setup.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
 ## License
