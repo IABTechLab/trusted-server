@@ -50,5 +50,7 @@ gix = { version = "0.83", default-features = false, features = [
 gix-config = "0.56"
 
 [dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
 temp-env = { workspace = true }
 tempfile = { workspace = true }
