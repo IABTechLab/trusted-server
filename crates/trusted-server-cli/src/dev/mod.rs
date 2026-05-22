@@ -23,6 +23,12 @@ pub use serve::{Adapter, run_dev_command};
 pub enum DevCommand {
     /// Launch the local dev server (formerly `ts dev`).
     Serve(ServeArgs),
+    /// Linters for source, config, and documentation.
+    Lint {
+        /// The lint to run.
+        #[command(subcommand)]
+        command: lint::LintCommand,
+    },
 }
 
 /// Arguments for `ts dev serve`. Preserves byte-for-byte the flags

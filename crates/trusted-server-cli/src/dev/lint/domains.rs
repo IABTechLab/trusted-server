@@ -2,16 +2,9 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-18-check-domains-design.md
 
-// The pure-function layer (allowlist constants, host extraction,
-// scan_line) and the DomainsLintError variants are exercised by the
-// inline #[cfg(test)] modules but are not yet reachable from a
-// non-test build. Phase 4 (diff collectors) and Phase 5
-// (domains::run + clap wiring) make them live; this allow is
-// removed in Phase 5.
-#![allow(dead_code)]
-
 use core::error::Error;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -25,8 +18,12 @@ use gix::bstr::BString;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use gix::index::entry::Mode as IndexEntryMode;
 use regex::Regex;
+use serde::Serialize;
+use serde_json::json;
 
-use crate::output::write_stderr_line;
+use crate::dev::lint::{DomainsArgs, OutputFormat};
+use crate::error::CliError;
+use crate::output::{write_json, write_stderr_line, write_stdout_line};
 
 /// Integration proxies and loopback hosts that must match exactly.
 /// Subdomains are NOT allowed (e.g., `anything.api.privacy-center.org`
@@ -161,9 +158,6 @@ pub enum DomainsLintError {
     /// An explicitly-named path could not be read for permission reasons.
     #[display("permission denied reading `{}`", _0.display())]
     PermissionDenied(PathBuf),
-    /// More than one scan mode was requested at once.
-    #[display("invalid mode combination")]
-    InvalidMode,
     /// Failure writing a warning to stderr (broken pipe, etc.).
     ///
     /// Used by the in-module [`warn`] helper so collectors can call
@@ -1596,4 +1590,143 @@ mod explicit_path_tests {
             "should be PermissionDenied: {err:?}"
         );
     }
+}
+
+// === CLI entry point (Phase 5) ===
+
+/// One reported violation, with full file context for the report.
+#[derive(Debug, Serialize)]
+pub struct FileViolation {
+    /// Repo-relative path of the file.
+    pub path: PathBuf,
+    /// 1-based line number.
+    pub line: usize,
+    /// The disallowed host.
+    pub host: String,
+    /// The full line the host appeared on.
+    #[serde(rename = "url")]
+    pub url_excerpt: String,
+}
+
+/// Run `ts dev lint domains`.
+///
+/// Dispatches on the scan mode (`--staged`, `--changed-vs`, explicit
+/// paths, or full-repo), scans each collected line, and emits a
+/// human or JSON report.
+///
+/// # Errors
+///
+/// Returns [`CliError::EnvironmentError`] if a collector fails (e.g.,
+/// the repository cannot be opened), or [`CliError::ViolationsFound`]
+/// if any disallowed host is found.
+pub fn run(args: &DomainsArgs) -> Result<(), Report<CliError>> {
+    let cwd = env::current_dir().change_context(CliError::EnvironmentError)?;
+    let lines: Vec<DiffLine> = if args.staged {
+        staged_added_lines(&cwd).change_context(CliError::EnvironmentError)?
+    } else if let Some(reference) = &args.changed_vs {
+        changed_vs_added_lines(&cwd, reference).change_context(CliError::EnvironmentError)?
+    } else if args.paths.is_empty() {
+        full_repo_lines(&cwd).change_context(CliError::EnvironmentError)?
+    } else {
+        explicit_path_lines(&args.paths).change_context(CliError::EnvironmentError)?
+    };
+
+    let mut violations: Vec<FileViolation> = Vec::new();
+    let mut verbose_path: Option<PathBuf> = None;
+    let mut verbose_count: usize = 0;
+    for line in lines {
+        if args.verbose {
+            match &verbose_path {
+                Some(prev) if prev == &line.path => verbose_count += 1,
+                _ => {
+                    if let Some(prev) = verbose_path.take() {
+                        write_stderr_line(format!(
+                            "scanned {verbose_count} lines in {}",
+                            prev.display()
+                        ))?;
+                    }
+                    verbose_path = Some(line.path.clone());
+                    verbose_count = 1;
+                }
+            }
+        }
+
+        let outcome = scan_line(&line.content);
+        for unused in outcome.unused_suppressions {
+            write_stderr_line(format!(
+                "warning: {}:{}: allow-domain marker listed `{unused}` but it does not appear on the line",
+                line.path.display(),
+                line.line_no,
+            ))?;
+        }
+        for v in outcome.violations {
+            violations.push(FileViolation {
+                path: line.path.clone(),
+                line: line.line_no,
+                host: v.host,
+                url_excerpt: line.content.clone(),
+            });
+        }
+    }
+    if let Some(prev) = verbose_path {
+        write_stderr_line(format!(
+            "scanned {verbose_count} lines in {}",
+            prev.display()
+        ))?;
+    }
+
+    match args.format {
+        OutputFormat::Human => emit_human(&violations)?,
+        OutputFormat::Json => emit_json(&violations)?,
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(Report::new(CliError::ViolationsFound {
+            count: violations.len(),
+        }))
+    }
+}
+
+/// Emit the human-readable violation report on stdout.
+fn emit_human(violations: &[FileViolation]) -> Result<(), Report<CliError>> {
+    for v in violations {
+        write_stdout_line(format!(
+            "{}:{}: disallowed host {}",
+            v.path.display(),
+            v.line,
+            v.host
+        ))?;
+    }
+    if !violations.is_empty() {
+        let files: BTreeSet<&PathBuf> = violations.iter().map(|v| &v.path).collect();
+        write_stdout_line("")?;
+        write_stdout_line(format!(
+            "{} disallowed host(s) found in {} file(s).",
+            violations.len(),
+            files.len()
+        ))?;
+        write_stdout_line(
+            "To allow a new integration proxy, add it to EXACT_HOSTS in \
+             crates/trusted-server-cli/src/dev/lint/domains.rs.",
+        )?;
+        write_stdout_line(
+            "To suppress one line (e.g., security tests), append \
+             `// allow-domain: <host>` in a comment.",
+        )?;
+        write_stdout_line("Run `ts dev lint domains` (no args) for a full-repo audit.")?;
+    }
+    Ok(())
+}
+
+/// Emit the JSON violation report on stdout.
+fn emit_json(violations: &[FileViolation]) -> Result<(), Report<CliError>> {
+    let files_affected: BTreeSet<&PathBuf> = violations.iter().map(|v| &v.path).collect();
+    let report = json!({
+        "violations": violations,
+        "count": violations.len(),
+        "files_affected": files_affected.len(),
+    });
+    write_json(&report)
 }
