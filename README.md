@@ -22,8 +22,11 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
-# Build
-cargo build
+# Build Axum dev server (native)
+cargo build -p trusted-server-adapter-axum
+
+# Build Fastly adapter (WASM)
+cargo build -p trusted-server-adapter-fastly --target wasm32-wasip1
 
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly

@@ -258,6 +258,10 @@ impl AxumPlatformHttpClient {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(30))
+                // Disable automatic redirects: core proxy code enforces redirect
+                // limits and allowed_domains checks itself. Without this, reqwest
+                // would follow Location headers internally and bypass those checks.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("should build reqwest client"),
         }
@@ -437,21 +441,28 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })
             .collect();
 
-        let (status, headers, body) = result.map_err(|e| {
-            Report::new(PlatformError::HttpClient)
-                .attach(format!("auction request task failed: {e}"))
-        })??;
-
         let backend_name = backend_names[ready_idx].clone();
-        let mut builder = edgezero_core::http::response_builder().status(status);
-        for (name, value) in &headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(body))
-            .change_context(PlatformError::HttpClient)?;
 
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(backend_name));
+        // Map join panics and per-request errors into ready: Err(...) so that the
+        // auction orchestrator can log the failure and continue with remaining providers
+        // rather than treating one bad provider as a fatal select() failure.
+        let ready = result
+            .map_err(|e| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("auction request task panicked: {e}"))
+            })
+            .and_then(|inner| inner)
+            .and_then(|(status, headers, body)| {
+                let mut builder = edgezero_core::http::response_builder().status(status);
+                for (name, value) in &headers {
+                    builder = builder.header(name.as_str(), value.as_slice());
+                }
+                builder
+                    .body(edgezero_core::body::Body::from(body))
+                    .change_context(PlatformError::HttpClient)
+            })
+            .map(|edge_resp| PlatformResponse::new(edge_resp).with_backend_name(backend_name));
+
         Ok(PlatformSelectResult { ready, remaining })
     }
 }

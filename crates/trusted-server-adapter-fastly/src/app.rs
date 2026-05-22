@@ -58,7 +58,9 @@ use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -227,11 +229,7 @@ async fn dispatch_fallback(
     handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
         .await
         .and_then(|pub_response| {
-            crate::resolve_publisher_response_buffered(
-                pub_response,
-                &state.settings,
-                &state.registry,
-            )
+            buffer_publisher_response(pub_response, &state.settings, &state.registry)
         })
 }
 

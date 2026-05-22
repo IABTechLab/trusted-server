@@ -64,7 +64,8 @@ set -a && source .env && set +a
 cargo run -p trusted-server-adapter-axum
 ```
 
-The server will be available at `http://localhost:8787`.
+The server will be available at `http://localhost:8787`. Set `PORT=<port>` before
+`cargo run` to bind the dev server to a different local port.
 
 **Environment variable conventions used by the Axum adapter:**
 
@@ -82,7 +83,11 @@ Store names and key names are uppercased with hyphens and dots replaced by under
 ### Build the Project
 
 ```bash
-cargo build
+# Axum dev server (native)
+cargo build -p trusted-server-adapter-axum
+
+# Fastly adapter (WASM)
+cargo build -p trusted-server-adapter-fastly --target wasm32-wasip1
 ```
 
 ### Run Tests

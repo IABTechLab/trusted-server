@@ -394,21 +394,53 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
-/// Stream the publisher response body through the processing pipeline.
+/// Buffer a [`PublisherResponse`] into a single [`Response`].
 ///
-/// Called by the adapter after `stream_to_client()` has committed the
-/// response headers. Writes processed chunks directly to `output`.
-///
-/// This is `async` because it uses `services.http_client().send(...).await` rather
-/// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
-/// route handler in `block_on`, so behavior is equivalent — the change reflects the
-/// migration to the platform-agnostic HTTP client.
+/// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
+/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
+/// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Since headers are
-/// already committed, the caller should log the error and drop the
-/// `StreamingBody` (client sees a truncated response).
+/// Returns an error if the streaming pipeline fails to process the response body.
+pub fn buffer_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = Vec::new();
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(output.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(output);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+/// Stream the publisher response body through the processing pipeline.
+///
+/// Called by the adapter after `stream_to_client()` has committed the response
+/// headers. Writes processed chunks directly to `output`.
+///
+/// # Errors
+///
+/// Returns an error if processing fails mid-stream. Since headers are already
+/// committed, the caller should log the error and drop the `StreamingBody`
+/// (client sees a truncated response).
 pub fn stream_publisher_body<W: Write>(
     body: EdgeBody,
     output: &mut W,

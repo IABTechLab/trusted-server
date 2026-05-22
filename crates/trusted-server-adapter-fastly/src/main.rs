@@ -502,34 +502,6 @@ fn resolve_publisher_response(
     }
 }
 
-pub(crate) fn resolve_publisher_response_buffered(
-    publisher_response: PublisherResponse,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(output);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
-}
-
 /// Applies all standard response headers: geo, version, staging, and configured headers.
 ///
 /// Called from every response path (including auth early-returns) so that all
