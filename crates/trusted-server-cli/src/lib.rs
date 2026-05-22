@@ -281,6 +281,7 @@ fn run_dev(command: dev::DevCommand) -> Result<(), Report<CliError>> {
     match command {
         dev::DevCommand::Serve(args) => run_dev_serve(&args),
         dev::DevCommand::Lint { command } => dev::lint::run(command),
+        dev::DevCommand::InstallHooks(args) => dev::install_hooks::run(&args),
     }
 }
 

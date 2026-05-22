@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
+pub mod install_hooks;
 pub mod lint;
 pub mod serve;
 
@@ -29,6 +30,17 @@ pub enum DevCommand {
         #[command(subcommand)]
         command: lint::LintCommand,
     },
+    /// Install the pre-commit hook into this repo (one-time setup).
+    InstallHooks(InstallHooksArgs),
+}
+
+/// Arguments for `ts dev install-hooks`.
+#[derive(Debug, Args)]
+pub struct InstallHooksArgs {
+    /// Overwrite an existing unmanaged hook or a non-default
+    /// `core.hooksPath` (the displaced value is backed up / printed).
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `ts dev serve`. Preserves byte-for-byte the flags
