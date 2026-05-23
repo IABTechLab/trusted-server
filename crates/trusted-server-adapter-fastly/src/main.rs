@@ -169,13 +169,25 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
+    // Inject trusted TLS metadata as internal headers so build_per_request_services
+    // can populate ClientInfo.tls_protocol / tls_cipher. This must happen after
+    // sanitize_fastly_forwarded_headers to prevent clients from injecting these
+    // headers themselves. FastlyRequestContext only exposes client_ip, so headers
+    // are the only channel for TLS data across the dispatch boundary.
+    if let Some(proto) = req.get_tls_protocol() {
+        req.set_header("x-ts-tls-protocol", proto);
+    }
+    if let Some(cipher) = req.get_tls_cipher_openssl_name() {
+        req.set_header("x-ts-tls-cipher", cipher);
+    }
+
     // `run_app_with_config` and `run_app_with_logging` call `init_logger`
     // internally. A second `set_logger` call panics because our custom fern
     // logger is already initialised above. `dispatch_with_config_handle` skips logger
     // initialisation and injects the config store directly.
-    let mut response =
+    let mut fastly_response =
         match edgezero_adapter_fastly::dispatch_with_config_handle(&app, req, config_store) {
-            Ok(response) => compat::from_fastly_response(response),
+            Ok(response) => response,
             Err(e) => {
                 log::error!("EdgeZero dispatch failed: {e}");
                 FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -185,35 +197,35 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             }
         };
 
-    if !response_was_finalized_by_middleware(&mut response) {
-        // Apply finalize headers at the entry point so that router-level
-        // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
-        // verbs) carry TS/geo headers. Middleware-finalized responses are
-        // skipped here to avoid a second settings read and geo lookup on the
-        // normal registered-route path.
-        match get_settings() {
-            Ok(settings) => {
-                apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
-                    FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
-                        log::warn!("entry-point geo lookup failed: {e}");
-                        None
-                    })
+    // Middleware-finalized responses carry x-ts-finalized. Send them directly
+    // without the from_fastly_response → to_fastly_response round-trip, which
+    // would otherwise re-materialize the full response body in WASM heap via
+    // take_body_bytes() before sending it back out.
+    if fastly_response.get_header(HEADER_X_TS_FINALIZED).is_some() {
+        fastly_response.remove_header(HEADER_X_TS_FINALIZED);
+        fastly_response.send_to_client();
+        return;
+    }
+
+    // Apply finalize headers at the entry point so that router-level
+    // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
+    // verbs) carry TS/geo headers.
+    let mut response = compat::from_fastly_response(fastly_response);
+    match get_settings() {
+        Ok(settings) => {
+            apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
+                FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+                    log::warn!("entry-point geo lookup failed: {e}");
+                    None
                 })
-            }
-            Err(e) => {
-                log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
-            }
+            })
+        }
+        Err(e) => {
+            log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
         }
     }
 
     compat::to_fastly_response(response).send_to_client();
-}
-
-fn response_was_finalized_by_middleware(response: &mut HttpResponse) -> bool {
-    response
-        .headers_mut()
-        .remove(HEADER_X_TS_FINALIZED)
-        .is_some()
 }
 
 fn apply_entry_point_finalize<F>(
@@ -586,23 +598,6 @@ mod tests {
         assert!(
             health_response(&req).is_none(),
             "should only short-circuit /health"
-        );
-    }
-
-    #[test]
-    fn response_was_finalized_by_middleware_strips_sentinel() {
-        let mut response = HttpResponse::new(EdgeBody::empty());
-        response
-            .headers_mut()
-            .insert("x-ts-finalized", HeaderValue::from_static("1"));
-
-        assert!(
-            response_was_finalized_by_middleware(&mut response),
-            "should detect middleware-finalized responses"
-        );
-        assert!(
-            response.headers().get("x-ts-finalized").is_none(),
-            "sentinel should not be sent to clients"
         );
     }
 

@@ -6,9 +6,13 @@
 //! [`startup_error_router`] returns a bare router without middleware.
 //! Builds the [`AppState`] once per Wasm instance.
 //!
-//! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. The `EdgeZero` path therefore preserves TLS
-//! metadata as `None` until the upstream adapter exposes those fields.
+//! TLS protocol and cipher metadata is captured from the raw [`fastly::Request`]
+//! in `main.rs` before the request is consumed by `dispatch_with_config_handle`,
+//! then injected as trusted internal headers (`x-ts-tls-protocol`,
+//! `x-ts-tls-cipher`) after stripping client-spoofable forwarded headers.
+//! [`build_per_request_services`] reads those internal headers to populate
+//! [`ClientInfo`] so that [`crate::http_util::RequestInfo::from_request`] detects
+//! HTTPS correctly on the EdgeZero path.
 //!
 //! # Route inventory
 //!
@@ -146,11 +150,26 @@ pub(crate) fn runtime_services_for_consent_route(
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Extracts the client IP address from the [`FastlyRequestContext`] extension
-/// inserted by `edgezero_adapter_fastly::dispatch`. TLS metadata is not
-/// available through the `EdgeZero` context so those fields are left empty.
+/// Extracts the client IP from the [`FastlyRequestContext`] extension inserted by
+/// `edgezero_adapter_fastly::dispatch`. TLS protocol and cipher are read from the
+/// trusted internal headers `x-ts-tls-protocol` and `x-ts-tls-cipher` injected by
+/// `edgezero_main` in `main.rs` after stripping client-spoofable forwarded headers.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
+
+    let tls_protocol = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let tls_cipher = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-cipher")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
@@ -161,8 +180,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .geo(Arc::new(FastlyPlatformGeo))
         .client_info(ClientInfo {
             client_ip,
-            tls_protocol: None,
-            tls_cipher: None,
+            tls_protocol,
+            tls_cipher,
         })
         .build()
 }
@@ -499,13 +518,16 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_error_router, AppState, TrustedServerApp};
+    use super::{build_per_request_services, startup_error_router, AppState, TrustedServerApp};
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::params::PathParams;
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
@@ -574,6 +596,78 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
+    }
+
+    fn minimal_state() -> Arc<AppState> {
+        app_state_for_settings(
+            trusted_server_core::settings_data::get_settings().expect("should load test settings"),
+        )
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_per_request_services TLS header tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn build_per_request_services_reads_tls_protocol_from_internal_header() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .header("x-ts-tls-protocol", "TLSv1.3")
+            .body(Body::empty())
+            .expect("should build request with TLS header");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert_eq!(
+            services.client_info().tls_protocol.as_deref(),
+            Some("TLSv1.3"),
+            "should read TLS protocol from x-ts-tls-protocol header"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_reads_tls_cipher_from_internal_header() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .header("x-ts-tls-cipher", "ECDHE-RSA-AES256-GCM-SHA384")
+            .body(Body::empty())
+            .expect("should build request with TLS cipher header");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert_eq!(
+            services.client_info().tls_cipher.as_deref(),
+            Some("ECDHE-RSA-AES256-GCM-SHA384"),
+            "should read TLS cipher from x-ts-tls-cipher header"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_tls_none_when_headers_absent() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("should build request without TLS headers");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert!(
+            services.client_info().tls_protocol.is_none(),
+            "tls_protocol should be None when x-ts-tls-protocol header is absent"
+        );
+        assert!(
+            services.client_info().tls_cipher.is_none(),
+            "tls_cipher should be None when x-ts-tls-cipher header is absent"
+        );
     }
 
     #[test]
