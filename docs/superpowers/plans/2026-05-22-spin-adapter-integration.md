@@ -159,7 +159,8 @@ Modify:
 
 - `CLAUDE.md`
   - Add Spin build/check/test commands if this branch is intended to update contributor workflow docs.
-  - Keep this change small and command-only.
+  - Update lint guidance so Spin uses target-matched clippy commands instead of the old mixed-target monolithic workspace clippy command.
+  - Keep this change small and command-focused.
 
 ## Task 0: Branch, Worktree, and Baseline Setup
 
@@ -178,7 +179,7 @@ git branch --show-current
 git log --oneline -5
 ```
 
-Expected: current branch is the latest stacked EdgeZero branch that already contains the Axum, Cloudflare, and verification-gate work. If the current branch is not the intended stack tip, stop and ask which branch to base Spin on.
+Expected: current branch is the latest stacked EdgeZero branch that already contains the Axum, Cloudflare, and verification-gate work. If the current branch is already `feature/edgezero-pr19-spin-adapter`, treat the branch-creation step below as already satisfied and only use a worktree if the maintainer explicitly wants one. If the current branch is not the intended stack tip, stop and ask which branch to base Spin on.
 
 - [ ] **Step 2: Preserve this plan before creating a worktree**
 
@@ -222,7 +223,7 @@ git check-ignore -q .worktrees || git check-ignore -q worktrees
 
 Expected: PASS. If it fails, add the chosen directory to `.gitignore`, commit that `.gitignore` change separately, then continue.
 
-- [ ] **Step 5: Create the isolated branch**
+- [ ] **Step 5: Create or reuse the isolated branch**
 
 From the current stack tip, run one of the following.
 
@@ -245,10 +246,10 @@ cd .worktrees/feature-edgezero-pr19-spin-adapter
 Fallback if the maintainer asks not to use a worktree:
 
 ```bash
-git switch -c feature/edgezero-pr19-spin-adapter
+git switch feature/edgezero-pr19-spin-adapter 2>/dev/null || git switch -c feature/edgezero-pr19-spin-adapter
 ```
 
-If the branch name already exists, do not delete it. Use `git worktree list` and either reuse the existing worktree or ask for a new branch suffix.
+If the branch name already exists, do not delete it. Use `git worktree list` and either reuse the existing worktree, stay on the current branch if it is already checked out, or ask for a new branch suffix.
 
 - [ ] **Step 6: Capture a clean baseline**
 
@@ -342,6 +343,8 @@ Add:
 anyhow = "1"
 spin-sdk = { version = "5.2", default-features = false }
 ```
+
+Verify the existing workspace dependency block already includes `brotli` and `flate2`. They are required by the Spin adapter's EdgeZero-compatible outbound response decompression policy. If either is missing in the target branch, add it to `[workspace.dependencies]` using the same versions already used by `trusted-server-core`.
 
 - [ ] **Step 5: Update integration-test EdgeZero pins**
 
@@ -464,10 +467,12 @@ spin = ["edgezero-adapter-spin/spin"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+brotli = { workspace = true }
 bytes = { workspace = true }
 edgezero-adapter-spin = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
+flate2 = { workspace = true }
 log = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../js" }
@@ -732,6 +737,8 @@ Copy `crates/trusted-server-adapter-cloudflare/src/platform.rs` to Spin platform
 
 Remove all `worker`, `js_sys`, and Cloudflare header-specific logic. Keep generic no-op stores, no-op backend, config handle adapter, KV handle adapter, and the buffered HTTP-client shape.
 
+Before keeping copied test helpers, clean up Cloudflare test-only `unwrap()` calls. The new Spin crate must pass `cargo clippy-spin-native`, which runs all targets with workspace lints and denies `unwrap_used`. Replace copied test unwraps with `expect("should ...")`, `expect_err("should ...")`, or explicit assertions before adding Spin-specific tests.
+
 - [ ] **Step 2: Keep shared store handle adapters**
 
 Keep these adapters from Cloudflare mostly verbatim:
@@ -936,6 +943,15 @@ Mirror Cloudflare limitations:
 
 Do not use `edgezero_adapter_spin::SpinProxyClient` here. That type is for EdgeZero's proxy abstraction, while Trusted Server routes integrations and auctions through `trusted_server_core::platform::PlatformHttpClient`.
 
+Match `SpinProxyClient`'s response policy, though:
+
+- If upstream returns `content-encoding: gzip`, decompress with `flate2::read::GzDecoder`.
+- If upstream returns `content-encoding: br`, decompress with `brotli::Decompressor`.
+- Cap decompressed bodies at 64 MiB, matching EdgeZero's `MAX_DECOMPRESSED_SIZE`.
+- After successful gzip/br decompression, strip `content-encoding` and `content-length` before constructing the `PlatformResponse`.
+- For unsupported or absent encodings, preserve the body bytes and encoding headers unchanged.
+- If gzip/br decompression fails or exceeds the cap, return `Report::new(PlatformError::HttpClient)` with an attached message that names the failed encoding.
+
 Implementation details:
 
 - Convert `edgezero_core::http::Method` to `spin_sdk::http::Method`.
@@ -943,9 +959,9 @@ Implementation details:
 - Forward only UTF-8 header values; log and drop non-UTF-8 headers because Spin's WASI HTTP request builder expects string header values.
 - Buffer `Body::Once` directly.
 - Return a typed `PlatformError::HttpClient` for unsupported `Body::Stream` unless a local helper safely buffers it.
-- Build the EdgeZero response from Spin status, headers, and body bytes.
+- Build the EdgeZero response from Spin status, sanitized headers, and decompressed-or-raw body bytes according to the policy above.
 - Sanitize hop-by-hop response headers using the Axum helper pattern: strip `connection`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `keep-alive`, and any header named by `Connection`.
-- Audit Spin WASI HTTP body behavior for compressed upstream responses. If Spin returns decoded bytes, strip `content-encoding` and `content-length` like Cloudflare/EdgeZero Spin proxy. If Spin returns raw encoded bytes, preserve encoding headers. Document the chosen behavior in a short comment above the response conversion helper.
+- Document the compression policy in a short comment above the response conversion helper. This is a deliberate adapter-level match with EdgeZero Spin proxy behavior, not an open-ended runtime audit.
 - Preserve `backend_name` on both immediate and pending responses.
 
 Required response wrapper:
@@ -987,12 +1003,16 @@ If buffering is straightforward with existing EdgeZero helpers, use the local es
 
 - [ ] **Step 4: Add conversion-focused tests**
 
-Extract the response-header sanitization and compression-header decision into target-neutral helpers wherever possible. Add native unit tests for:
+Extract the response-header sanitization and gzip/br decompression policy into target-neutral helpers wherever possible. Add native unit tests for:
 
 - `transfer-encoding` is stripped.
 - a header named in `Connection` is stripped.
 - ordinary response headers are preserved.
-- `content-encoding` and `content-length` are stripped only when the body is decoded before Trusted Server sees it.
+- gzip body is decoded and `content-encoding` / `content-length` are stripped.
+- brotli body is decoded and `content-encoding` / `content-length` are stripped.
+- unsupported encodings preserve raw body bytes and encoding headers.
+- decompression failures return a typed `PlatformError::HttpClient`.
+- decompressed output over 64 MiB returns a typed `PlatformError::HttpClient`.
 
 Do not rely only on `cargo check-spin` for this behavior; compilation does not prove response semantics. If a portion must stay wasm-only because it directly touches Spin SDK types, keep the pure header/body policy in a target-neutral helper and test that helper. If this is impossible without changing production code shape too much, document the missing runtime validation as an explicit follow-up in the PR body.
 
@@ -1044,14 +1064,14 @@ Do not force `200` for routes whose success depends on request-signing config, K
 
 - [ ] **Step 3: Add exact 405 route coverage**
 
-Add at least one deterministic method-not-allowed assertion for an explicitly registered route. Start with `GET /verify-signature`, which is registered as a POST route in the Cloudflare structural model:
+Add at least one deterministic method-not-allowed assertion for an explicitly registered route. Use `PUT /verify-signature`, which is registered as a POST route in the Cloudflare structural model. Do not use `GET /verify-signature`: the app also registers GET catch-all publisher fallback routes, so a GET request may route through the fallback instead of producing router-level `405`.
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_signature_get_returns_405() {
+async fn verify_signature_put_returns_405() {
     let router = TrustedServerApp::routes();
     let req = request_builder()
-        .method("GET")
+        .method("PUT")
         .uri("/verify-signature")
         .body(edgezero_core::body::Body::empty())
         .expect("should build request");
@@ -1060,7 +1080,7 @@ async fn verify_signature_get_returns_405() {
     assert_eq!(
         resp.status().as_u16(),
         405,
-        "GET /verify-signature must return method-not-allowed, not route miss"
+        "PUT /verify-signature must return method-not-allowed, not route miss"
     );
 }
 ```
@@ -1401,7 +1421,22 @@ cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --featu
 spin up --from crates/trusted-server-adapter-spin
 ```
 
-- [ ] **Step 2: Update migration plan phase table**
+- [ ] **Step 2: Update CLAUDE.md lint guidance**
+
+Update the existing `Testing & Quality` / `Lint` guidance so it does not imply the mixed-target command is the required blocking gate after Spin is added. Keep the general command available only as an optional compatibility check, and document the target-matched blocking gate instead:
+
+```bash
+# Lint by adapter target
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-spin-native
+cargo clippy-spin-wasm
+```
+
+The rationale to preserve in prose: this workspace now has multiple wasm runtimes (`wasm32-wasip1` and `wasm32-unknown-unknown`) with runtime-specific SDKs, so adapter clippy must be target-matched.
+
+- [ ] **Step 3: Update migration plan phase table**
 
 If this branch owns planning docs, add a Phase 4 row after PR 17:
 
@@ -1432,9 +1467,10 @@ Expected: PASS.
 Run:
 
 ```bash
-cargo build --workspace
 cargo check
 cargo check -p trusted-server-adapter-fastly --target wasm32-wasip1
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+cargo check -p trusted-server-adapter-axum
 cargo check -p trusted-server-adapter-cloudflare
 cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
 cargo check -p trusted-server-adapter-spin
@@ -1443,6 +1479,8 @@ cargo check --manifest-path crates/integration-tests/Cargo.toml
 ```
 
 Expected: PASS.
+
+Do not use `cargo build --workspace` as a required gate for this branch. The workspace contains the Fastly adapter, which is only linkable for `wasm32-wasip1`; host workspace builds can fail at link time even when the target-matched adapter gates are healthy.
 
 Do not replace the target-matched clippy aliases with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; this workspace contains multiple wasm targets with different runtime SDKs. If a reviewer asks for the literal monolithic command from the original prompt, run it separately, record the result, and keep the target-matched aliases as the blocking gate unless the command is proven valid for the mixed-target workspace.
 
@@ -1569,6 +1607,7 @@ Include:
 - Adds separate EdgeZero and Spin runtime manifests.
 - Adds route/auth smoke tests and Spin CI gates.
 - Updates EdgeZero dependency revision for Spin adapter support.
+- Matches EdgeZero Spin proxy gzip/br response decompression behavior for Spin outbound HTTP.
 
 ## Known limitations
 
@@ -1581,9 +1620,10 @@ Include:
 ## Verification
 
 - `cargo fmt --all -- --check`
-- `cargo build --workspace`
 - `cargo check`
 - `cargo check -p trusted-server-adapter-fastly --target wasm32-wasip1`
+- `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
+- `cargo check -p trusted-server-adapter-axum`
 - `cargo check -p trusted-server-adapter-cloudflare`
 - `cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare`
 - `cargo check -p trusted-server-adapter-spin`
@@ -1592,6 +1632,7 @@ Include:
 - `cargo test-axum`
 - `cargo test-cloudflare`
 - `cargo test-spin`
+- `cargo test -p trusted-server-adapter-spin edgezero_manifest_loads_and_resolves_spin_stores`
 - `cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity`
 - `cargo test --manifest-path crates/integration-tests/Cargo.toml --no-run`
 - `cargo test-fastly`
@@ -1602,6 +1643,7 @@ Include:
 - `cargo clippy-spin-wasm`
 - `cargo clippy --manifest-path crates/integration-tests/Cargo.toml -- -D warnings`
 - `cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release`
+- Spin runtime smoke: `spin up --from crates/trusted-server-adapter-spin` plus discovery/admin curl checks, or `not run: Spin CLI unavailable`
 ```
 
 - [ ] **Step 4: Confirm stacked PR base**
@@ -1625,15 +1667,16 @@ Expected: If no PR exists yet, create it against the immediate predecessor branc
 - Spin config variables may not support all Trusted Server config key names, especially request-signing keys such as `current-kid`, `active-kids`, and key IDs. The MVP only guarantees route/auth smoke and wasm build unless runtime config key mapping is verified.
 - Spin KV TTL is unsupported in EdgeZero's current Spin KV adapter. Consent KV paths that require TTL may degrade on Spin.
 - Spin outbound HTTP fan-out should initially match Cloudflare's limitation: single-provider supported, multi-provider fan-out rejected loudly.
-- Spin outbound HTTP response header/compression behavior needs target-neutral unit coverage where possible; otherwise it must be called out as a runtime validation follow-up.
+- Spin outbound HTTP response decompression and header stripping must stay covered by target-neutral tests because wasm build checks do not prove response semantics.
 - Management writes for config and secrets are unsupported on Spin in this plan. Admin key routes must reject unauthenticated requests, but authenticated key rotation success is not in MVP scope unless product requirements change.
 - The Spin runtime smoke is optional because the Spin CLI may not be installed in every development environment. CI must still cover native tests and wasm compilation.
 
 ## Completion Criteria
 
 - `trusted-server-adapter-spin` exists as a workspace member, but not a default member.
-- `edgezero.toml` is validated by a native test and resolves the Spin KV label, config store, and secret enablement as expected.
 - Native host check and route tests pass.
+- Native manifest validation test proves `edgezero.toml` resolves the Spin KV label, config store, and secret enablement.
+- Native conversion tests cover Spin outbound response sanitization, gzip/br decompression, unsupported encoding preservation, decode failures, and decompressed-size limits.
 - `wasm32-wasip1` Spin check/build passes with `--features spin`.
 - Existing Fastly, Axum, and Cloudflare gates still pass.
 - `crates/integration-tests` parity tests include Spin and pass with aligned EdgeZero dependency revs.
