@@ -47,6 +47,11 @@
         divToSlotId[slot.div_id] = slot.id;
         newSlots.push(s);
       });
+      // Expose slot metadata on window so later calls (SPA navigation,
+      // the bundle's __tsAdInit) can destroy stale slots and the render
+      // listener can resolve slot IDs after navigation updates these maps.
+      window.__tsPrevGptSlots = newSlots;
+      window.__tsDivToSlotId = divToSlotId;
       // Guard the one-time-per-page setup so a follow-up call (e.g.
       // publisher's own init code or the bundle's `__tsAdInit` after
       // it overwrites this stub) doesn't double-enable services.
@@ -58,12 +63,18 @@
           .pubads()
           .addEventListener("slotRenderEnded", function (ev) {
             var divId = ev.slot.getSlotElementId();
-            var slotId = divToSlotId[divId] || divId;
+            // Read from window so SPA navigation updates are picked up;
+            // early-return for slots not managed by Trusted Server.
+            var slotId = (window.__tsDivToSlotId || {})[divId];
+            if (!slotId) return;
             var b = (window.__ts_bids || {})[slotId] || {};
+            // Prebid: verify the specific creative via hb_adid targeting.
+            // APS: no hb_adid — fire if any TS bidder is present and slot is non-empty.
             var ourBidWon =
               !ev.isEmpty &&
-              b.hb_adid &&
-              ev.slot.getTargeting("hb_adid")[0] === b.hb_adid;
+              (b.hb_adid
+                ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
+                : !!b.hb_bidder);
             if (ourBidWon) {
               if (b.nurl) navigator.sendBeacon(b.nurl);
               if (b.burl) navigator.sendBeacon(b.burl);

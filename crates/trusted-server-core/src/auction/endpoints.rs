@@ -61,10 +61,14 @@ use super::AuctionOrchestrator;
 /// callers** (e.g. slim-Prebid, native apps, server-to-server integrations).
 /// It is **not** the intended path for scroll or GPT refresh events.
 ///
-/// In Phase 1, slim-Prebid owns scroll and refresh: it runs post-`window.load`,
-/// listens for GPT refresh events, and runs client-side auctions independently
-/// of this endpoint. SPAs that use pushState routing do not trigger TS page-level
-/// auctions — slim-Prebid handles those cases too.
+/// **SPA navigation** is handled by `GET /__ts/page-bids`: the client-side SPA
+/// hook (`installSpaAuctionHook`) intercepts `pushState`/`replaceState`/`popstate`
+/// events and calls that endpoint to fetch fresh slots and bids for each new
+/// route, then invokes `window.__tsAdInit()` with the updated data.
+///
+/// **Scroll and GPT refresh** are owned by slim-Prebid in Phase 1: it runs
+/// post-`window.load`, listens for GPT refresh events, and runs client-side
+/// auctions independently of this endpoint.
 ///
 /// A slot-template-aware refresh API (`POST /auction/refresh`) is deferred to a
 /// future phase and not designed here.

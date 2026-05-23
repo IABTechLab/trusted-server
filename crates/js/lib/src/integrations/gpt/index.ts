@@ -396,4 +396,5 @@ if (typeof window !== 'undefined') {
 
   installTsAdInit();
   installSpaAuctionHook();
+  installSlimPrebidLoader();
 }

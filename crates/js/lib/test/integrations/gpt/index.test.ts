@@ -165,6 +165,57 @@ describe('GPT shim – patchCommandQueue', () => {
   });
 });
 
+describe('GPT – installSlimPrebidLoader', () => {
+  type SlimWindow = Window & { __tsjs_slim_prebid_url?: string };
+
+  afterEach(() => {
+    delete (window as SlimWindow).__tsjs_slim_prebid_url;
+  });
+
+  it('is a no-op when __tsjs_slim_prebid_url is not set', async () => {
+    const { installSlimPrebidLoader } = await import('../../../src/integrations/gpt/index');
+    const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+    installSlimPrebidLoader();
+    expect(addEventListenerSpy).not.toHaveBeenCalledWith('load', expect.any(Function));
+    addEventListenerSpy.mockRestore();
+  });
+
+  it('appends a deferred script tag when __tsjs_slim_prebid_url is set and load fires', async () => {
+    (window as SlimWindow).__tsjs_slim_prebid_url = 'https://cdn.example.com/slim-prebid.js';
+    const { installSlimPrebidLoader } = await import('../../../src/integrations/gpt/index');
+
+    installSlimPrebidLoader();
+
+    // Simulate the window load event.
+    window.dispatchEvent(new Event('load'));
+
+    const scripts = Array.from(document.querySelectorAll('script[defer]'));
+    const injected = scripts.find(
+      (s) => (s as HTMLScriptElement).src === 'https://cdn.example.com/slim-prebid.js'
+    );
+    expect(injected).toBeDefined();
+
+    // Clean up
+    injected?.parentNode?.removeChild(injected);
+  });
+
+  it('module init calls installSlimPrebidLoader — script injected when URL is preset', async () => {
+    vi.resetModules();
+    (window as SlimWindow).__tsjs_slim_prebid_url = 'https://cdn.example.com/slim-prebid-init.js';
+
+    await import('../../../src/integrations/gpt/index');
+    window.dispatchEvent(new Event('load'));
+
+    const scripts = Array.from(document.querySelectorAll('script[defer]'));
+    const injected = scripts.find(
+      (s) => (s as HTMLScriptElement).src === 'https://cdn.example.com/slim-prebid-init.js'
+    );
+    expect(injected).toBeDefined();
+
+    injected?.parentNode?.removeChild(injected);
+  });
+});
+
 describe('GPT shim – runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;
