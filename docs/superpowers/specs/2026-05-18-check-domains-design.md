@@ -1077,7 +1077,9 @@ audit must not be scanned when named explicitly either. Specifically:
 
 - Path matches an always-excluded location (`node_modules/`,
   `.worktrees/`, lockfile basename, etc.): warn and skip.
-- Extension not in the scanned set (`.html`, `.css`, etc.):
+- Extension not in the scanned set (`.png`, `.markdown`, `.sql`,
+  etc. — anything outside the
+  [list above](#file-extensions-scanned)):
   warn and skip with `note: <path> is not in scanned extensions;
 skipping`. The deferred `--force-scan path/...` escape hatch
   remains an Open Question.
@@ -1671,8 +1673,6 @@ and the index with `gix` APIs (no shell), runs the binary with
   violations; that is expected, not a failure.
 - **Bare-string hostnames are not detected.** Config values like
   `cookie_domain = "test-publisher.com"` are out of scope.
-- **HTML/CSS/Dockerfile blind spot.** Accepted; not mitigated by other
-  code paths.
 - **`REFERENCE_HOSTS` are allowed in every scanned file, including
   production source.** This is intentional. A production `.rs`
   change that introduces `let x = "https://github.com/...";` will
@@ -1896,26 +1896,26 @@ Deletion}` — pure renames (same blob, new path) yield no
     added lines; rename + edit diffs the matched old blob vs the
     new blob.
 
-               **Resolution note:** an earlier revision of this spec rejected
-               `Platform`/`for_each_to_obtain_tree` and prescribed a manual
-               map-walk. That approach silently broke renames: a renamed file
-               hit `(None, Some(new_id))` and was diffed against an empty
-               blob, reporting every line of the renamed file as added
-               (including pre-existing violations the author never touched).
-               The current spec uses the `Platform` API so rename detection
-               is correct by construction.
+                   **Resolution note:** an earlier revision of this spec rejected
+                   `Platform`/`for_each_to_obtain_tree` and prescribed a manual
+                   map-walk. That approach silently broke renames: a renamed file
+                   hit `(None, Some(new_id))` and was diffed against an empty
+                   blob, reporting every line of the renamed file as added
+                   (including pre-existing violations the author never touched).
+                   The current spec uses the `Platform` API so rename detection
+                   is correct by construction.
 
-               For staged mode, the index is first materialised as a tree
-               via `Repository::edit_tree` → per-entry `Editor::upsert(path,
+                   For staged mode, the index is first materialised as a tree
+                   via `Repository::edit_tree` → per-entry `Editor::upsert(path,
 
-          EntryKind::Blob, entry.id)`→`Editor::write()`, then the
-          same tree-vs-tree path serves both modes.
+              EntryKind::Blob, entry.id)`→`Editor::write()`, then the
+              same tree-vs-tree path serves both modes.
 
-        - **gix-config:** `File::from_path_no_includes(path,
+            - **gix-config:** `File::from_path_no_includes(path,
 
-    Source::Local)`, `File::set_raw_value`(dotted`AsKey`form —
-      avoids the`File<'event>`invariance that bites
-     `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
+        Source::Local)`, `File::set_raw_value`(dotted`AsKey`form —
+          avoids the`File<'event>`invariance that bites
+         `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
 
 2.  **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
     `gix-config = 0.56`, same gitoxide release family. See

@@ -2109,7 +2109,7 @@ Signature: `pub(crate) fn full_repo_lines(repo_path: &Path) -> Result<Vec<DiffLi
 
 - [ ] **Step 1: Write failing inline tests** (`mod explicit_path_tests`):
   1. Existing valid file → reports violations from it normally.
-  2. Path with an excluded extension (`.html`) → warns and skips, returns empty `Vec`.
+  2. Path with an excluded extension (`.png` — outside the [scanned-extensions list](2026-05-18-check-domains-design.md#file-extensions-scanned); `.html`/`.css` ARE scanned) → warns and skips, returns empty `Vec`.
   3. Path under `node_modules/` → warns and skips.
   4. Symlink → warns and skips.
   5. Missing path (typo) → returns `Err(...)` whose `current_context()` is `DomainsLintError::PathNotFound`.
