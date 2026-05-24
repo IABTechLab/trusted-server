@@ -6,6 +6,7 @@
 - [Writing Commit Messages](#memo-writing-commit-messages)
 - [Code Review](#white_check_mark-code-review)
 - [Coding Style](#nail_care-coding-style)
+- [Local Setup](#wrench-local-setup)
 - [Credits](#pray-credits)
 
 ## :repeat: Submitting Pull Requests
@@ -133,6 +134,37 @@ We use [error-stack](https://docs.rs/error-stack/latest/error_stack/) for error 
    ```
 3. **Attachments**: Use `.attach_printable("additional info")` to add debugging context without changing the error variant.
 4. **Consistency**: Avoid returning bare `TrustedServerError` unless absolutely necessary (e.g. implementing traits). Wrap them in `Report::new()`.
+
+## :wrench: Local Setup
+
+### Pre-commit URL-host linter (`ts dev lint domains`)
+
+`ts dev lint domains` checks that source, config, and documentation
+files only reference `example.com` (and other RFC 2606 reserved
+names), loopback addresses, vetted integration-proxy endpoints, or a
+small set of well-known documentation hosts. It is intended to run
+as a pre-commit hook so accidental third-party hosts never land in a
+commit.
+
+One-time setup after cloning:
+
+```bash
+cargo install_cli      # builds and installs the `ts` binary
+ts dev install-hooks   # installs the pre-commit hook into .githooks/
+```
+
+After that, every `git commit` runs the linter against staged
+changes. `ts dev install-hooks` writes `.githooks/pre-commit` and
+sets `core.hooksPath`; if you already have a `core.hooksPath`
+(husky, lefthook, etc.) it refuses to overwrite it without
+`--force`. To bypass the hook for a single commit, use
+`git commit --no-verify`.
+
+To audit the whole repository at once: `ts dev lint domains` (no
+arguments). To add a newly-vetted integration proxy to the
+allowlist, edit `EXACT_HOSTS` in
+`crates/trusted-server-cli/src/dev/lint/domains.rs`. The full design
+is in `docs/superpowers/specs/2026-05-18-check-domains-design.md`.
 
 ## :pray: Credits
 
