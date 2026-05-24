@@ -3,7 +3,9 @@
 //! Design: docs/superpowers/specs/2026-05-18-check-domains-design.md
 
 use core::error::Error;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use core::ops::ControlFlow;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -14,9 +16,11 @@ use std::sync::OnceLock;
 use derive_more::Display;
 use error_stack::{Report, ResultExt as _};
 use gix::ObjectId;
-use gix::bstr::BString;
+use gix::diff::Rewrites;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use gix::index::entry::Mode as IndexEntryMode;
+use gix::object::tree::EntryKind;
+use gix::object::tree::diff::Change;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
@@ -184,10 +188,13 @@ fn warn(msg: impl Into<String>) -> Result<(), Report<DomainsLintError>> {
     write_stderr_line(msg.into()).change_context(DomainsLintError::WriteWarning)
 }
 
-/// Normalise an extracted URL host: strip bracketed-IPv6 `[ ]` and
-/// lowercase. Pure function; no I/O.
+/// Normalise an extracted URL host: strip bracketed-IPv6 `[ ]`,
+/// drop any trailing FQDN dot, and lowercase. Pure function; no I/O.
 fn normalise_host(raw: &str) -> String {
-    let trimmed = raw.trim_start_matches('[').trim_end_matches(']');
+    let trimmed = raw
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
     trimmed.to_lowercase()
 }
 
@@ -211,6 +218,12 @@ mod tests {
     fn normalise_passthrough_for_plain_hosts() {
         assert_eq!(normalise_host("test.com"), "test.com");
         assert_eq!(normalise_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn normalise_trims_trailing_fqdn_dot() {
+        assert_eq!(normalise_host("example.com."), "example.com");
+        assert_eq!(normalise_host("Example.Com."), "example.com");
     }
 }
 
@@ -492,7 +505,7 @@ fn parse_suppression_marker(line: &str) -> LineSuppression {
     for host in m.as_str().split(',') {
         let host = host.trim();
         if !host.is_empty() {
-            out.suppressed.insert(host.to_lowercase());
+            out.suppressed.insert(normalise_host(host));
         }
     }
     out
@@ -558,6 +571,16 @@ mod suppression_tests {
             "pathological host must not suppress: {got:?}"
         );
     }
+
+    #[test]
+    fn bracketed_ipv6_marker_matches_extracted_host() {
+        // Extracted IPv6 hosts have their brackets stripped by
+        // `normalise_host`; the marker must apply the same
+        // normalisation so the entries match.
+        let got = parse("fetch(\"https://[2001:db8::1]/x\") // allow-domain: [2001:db8::1]");
+        let expected: HashSet<String> = ["2001:db8::1".to_string()].into_iter().collect();
+        assert_eq!(got, expected);
+    }
 }
 
 /// One reported violation on a scanned line.
@@ -587,6 +610,14 @@ pub fn scan_line(line: &str) -> LineScanOutcome {
     let suppression = parse_suppression_marker(line);
     let mut hosts = extract_absolute_hosts(line);
     hosts.extend(extract_protocol_relative_hosts(line));
+
+    // Deduplicate hosts while preserving first-occurrence order. An
+    // `href` and a visible URL on the same line for the same host
+    // should not be reported twice.
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        hosts.retain(|h| seen.insert(h.clone()));
+    }
 
     // Hosts that WOULD be flagged WITHOUT any suppression. A marker
     // entry that does not match one of these is "unused" — it
@@ -714,6 +745,14 @@ mod scan_line_tests {
     }
 
     #[test]
+    fn duplicate_host_on_one_line_reported_once() {
+        // An `href` plus the visible URL on the same line — the host
+        // appears twice but is one logical violation.
+        let got = hosts("<a href=\"https://test.com\">https://test.com</a>");
+        assert_eq!(got, vec!["test.com"]);
+    }
+
+    #[test]
     fn bypass_attempt_reports() {
         // fetch("https://evil.com/allow-domain") — substring inside URL,
         // not a comment, so suppression does NOT apply.
@@ -837,24 +876,6 @@ fn read_blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, Report<Dom
     Ok(obj.data.clone())
 }
 
-/// Walk a tree recursively into a `path → blob_id` map.
-fn tree_blob_map(
-    tree: &gix::Tree<'_>,
-) -> Result<HashMap<BString, ObjectId>, Report<DomainsLintError>> {
-    let mut map = HashMap::new();
-    let entries = tree
-        .traverse()
-        .breadthfirst
-        .files()
-        .change_context(DomainsLintError::Diff)?;
-    for entry in entries {
-        if entry.mode.is_blob() {
-            map.insert(entry.filepath, entry.oid);
-        }
-    }
-    Ok(map)
-}
-
 /// Compute the new-side added lines between two blob contents.
 ///
 /// Returns `(1-based line number, content)` for every inserted line.
@@ -905,84 +926,156 @@ pub(crate) fn staged_added_lines(
 ) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
     let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
 
-    // HEAD tree → blob map. An empty repo (no commits) has no HEAD;
-    // treat that as an empty map (everything in the index is added).
-    let head_map: HashMap<BString, ObjectId> = match repo.head_commit() {
+    // HEAD tree — or the empty tree on an unborn HEAD (fresh repo
+    // with no commits), in which case every staged file is genuinely
+    // added.
+    let head_tree = match repo.head_commit() {
         Ok(commit) => {
             let tree_id = commit
                 .tree_id()
-                .change_context(DomainsLintError::OpenRepo)?;
-            let tree = repo
-                .find_tree(tree_id)
-                .change_context(DomainsLintError::OpenRepo)?;
-            tree_blob_map(&tree)?
+                .change_context(DomainsLintError::OpenRepo)?
+                .detach();
+            repo.find_tree(tree_id)
+                .change_context(DomainsLintError::OpenRepo)?
         }
-        Err(_) => HashMap::new(),
+        Err(_) => repo.empty_tree(),
     };
 
-    let index = repo.index().change_context(DomainsLintError::Index)?;
-    let mut index_map: HashMap<BString, ObjectId> = HashMap::new();
-    for entry in index.entries() {
-        if entry.mode.contains(IndexEntryMode::FILE) {
-            index_map.insert(entry.path(&index).to_owned(), entry.id);
-        }
-    }
+    // Materialise the index as a tree so we can use the same tree-vs-
+    // tree diff machinery (with rename detection) as changed-vs mode.
+    let index_tree_id = write_index_to_tree(&repo)?;
+    let index_tree = repo
+        .find_tree(index_tree_id)
+        .change_context(DomainsLintError::Index)?;
 
-    collect_added_from_maps(&repo, &head_map, &index_map)
+    collect_added_from_trees(&repo, &head_tree, &index_tree)
 }
 
-/// Walk two `path → blob_id` maps, classify each path, and blob-diff
-/// added/modified entries into [`DiffLine`]s.
-///
-/// Shared by [`staged_added_lines`] (HEAD-tree vs index) and
-/// [`changed_vs_added_lines`] (merge-base tree vs HEAD tree). Both
-/// modes scan blob content, so a non-UTF-8 path is reported lossy
-/// with a stderr warning rather than skipped (full-repo mode skips —
-/// see [`full_repo_lines`]).
-fn collect_added_from_maps(
-    repo: &gix::Repository,
-    old_map: &HashMap<BString, ObjectId>,
-    new_map: &HashMap<BString, ObjectId>,
-) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
-    let mut all_paths: Vec<&BString> = new_map.keys().chain(old_map.keys()).collect();
-    all_paths.sort();
-    all_paths.dedup();
-
-    let mut out = Vec::new();
-    for raw_path in all_paths {
-        let old_id = old_map.get(raw_path);
-        let new_id = new_map.get(raw_path);
-        let (old_bytes, new_bytes) = match (old_id, new_id) {
-            (Some(o), Some(n)) if o == n => continue, // unchanged
-            (Some(o), Some(n)) => (Some(read_blob(repo, *o)?), read_blob(repo, *n)?),
-            (None, Some(n)) => (None, read_blob(repo, *n)?),
-            (Some(_), None) => continue, // deletion — no added lines
-            (None, None) => continue,
-        };
-
-        let (path, was_lossy) = bytes_to_pathbuf(raw_path);
-        let path_str = path.to_string_lossy();
-        if !path_is_scanned(&path_str) {
+/// Build an in-memory tree object from the current index and write it
+/// to the object database. The returned `ObjectId` can be loaded as a
+/// `gix::Tree` for tree-vs-tree diffing.
+fn write_index_to_tree(repo: &gix::Repository) -> Result<ObjectId, Report<DomainsLintError>> {
+    let index = repo.index().change_context(DomainsLintError::Index)?;
+    let empty_tree_id = repo.empty_tree().id;
+    let mut editor = repo
+        .edit_tree(empty_tree_id)
+        .change_context(DomainsLintError::Index)?;
+    for entry in index.entries() {
+        if !entry.mode.contains(IndexEntryMode::FILE) {
             continue;
         }
-        if was_lossy {
-            // Staged / changed-vs modes report non-UTF-8 paths
-            // (unlike full-repo mode, which skips them) — spec test 25.
-            warn(format!(
-                "warning: path is not valid UTF-8; displaying lossy: {}",
-                path.display()
-            ))?;
-        }
-
-        for (line_no, content) in added_lines(old_bytes.as_deref(), &new_bytes) {
-            out.push(DiffLine {
-                path: path.clone(),
-                line_no,
-                content,
-            });
-        }
+        let path = entry.path(&index);
+        editor
+            .upsert(path, EntryKind::Blob, entry.id)
+            .change_context(DomainsLintError::Index)?;
     }
-    Ok(out)
+    Ok(editor
+        .write()
+        .change_context(DomainsLintError::Index)?
+        .detach())
+}
+
+/// Diff `old_tree` against `new_tree` with rename tracking and return
+/// the added new-side lines for every Addition / Modification /
+/// Rename (true renames diff old-blob vs new-blob; pure renames thus
+/// add nothing). Copies and Deletions are skipped.
+///
+/// Shared by [`staged_added_lines`] (HEAD-tree vs index-tree) and
+/// [`changed_vs_added_lines`] (merge-base tree vs HEAD tree). Both
+/// modes report non-UTF-8 paths lossily with a stderr warning
+/// (full-repo mode skips them — see [`full_repo_lines`]).
+fn collect_added_from_trees(
+    repo: &gix::Repository,
+    old_tree: &gix::Tree<'_>,
+    new_tree: &gix::Tree<'_>,
+) -> Result<Vec<DiffLine>, Report<DomainsLintError>> {
+    // The gix tree-diff callback returns `Result<ControlFlow, E>` where
+    // `E: Into<Box<dyn Error + Send + Sync>>`. `Report<DomainsLintError>`
+    // does not satisfy that bound directly, so we capture the first
+    // failure in a `RefCell` and break out of the traversal.
+    let out: RefCell<Vec<DiffLine>> = RefCell::new(Vec::new());
+    let deferred: RefCell<Option<Report<DomainsLintError>>> = RefCell::new(None);
+
+    let mut platform = old_tree.changes().change_context(DomainsLintError::Diff)?;
+    platform.options(|opts| {
+        opts.track_rewrites(Some(Rewrites {
+            copies: None,
+            percentage: Some(0.5),
+            limit: 1000,
+            track_empty: false,
+        }));
+    });
+
+    let traverse = platform.for_each_to_obtain_tree::<std::convert::Infallible>(
+        new_tree,
+        |change: Change<'_, '_, '_>| {
+            let (raw_path, old_id, new_id) = match change {
+                Change::Addition { location, id, .. } => (location, None, id.detach()),
+                Change::Modification {
+                    location,
+                    previous_id,
+                    id,
+                    ..
+                } => (location, Some(previous_id.detach()), id.detach()),
+                Change::Rewrite {
+                    location,
+                    source_id,
+                    id,
+                    copy: false,
+                    ..
+                } => (location, Some(source_id.detach()), id.detach()),
+                Change::Rewrite { copy: true, .. } | Change::Deletion { .. } => {
+                    return Ok(ControlFlow::Continue(()));
+                }
+            };
+
+            let raw_bytes: &[u8] = raw_path.as_ref();
+            let (path, was_lossy) = bytes_to_pathbuf(raw_bytes);
+            let path_str = path.to_string_lossy();
+            if !path_is_scanned(&path_str) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if was_lossy
+                && let Err(e) = warn(format!(
+                    "warning: path is not valid UTF-8; displaying lossy: {}",
+                    path.display()
+                ))
+            {
+                *deferred.borrow_mut() = Some(e);
+                return Ok(ControlFlow::Break(()));
+            }
+
+            let old_bytes = match old_id.map(|id| read_blob(repo, id)).transpose() {
+                Ok(b) => b,
+                Err(e) => {
+                    *deferred.borrow_mut() = Some(e);
+                    return Ok(ControlFlow::Break(()));
+                }
+            };
+            let new_bytes = match read_blob(repo, new_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    *deferred.borrow_mut() = Some(e);
+                    return Ok(ControlFlow::Break(()));
+                }
+            };
+
+            let mut out_mut = out.borrow_mut();
+            for (line_no, content) in added_lines(old_bytes.as_deref(), &new_bytes) {
+                out_mut.push(DiffLine {
+                    path: path.clone(),
+                    line_no,
+                    content,
+                });
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    );
+    traverse.change_context(DomainsLintError::Diff)?;
+    if let Some(e) = deferred.into_inner() {
+        return Err(e);
+    }
+    Ok(out.into_inner())
 }
 
 /// Resolve a base reference to an object id, trying four candidate
@@ -1039,9 +1132,9 @@ pub(crate) fn changed_vs_added_lines(
         })?
         .detach();
 
-    let base_map = tree_blob_map(&commit_tree(&repo, merge_base)?)?;
-    let head_map = tree_blob_map(&commit_tree(&repo, head_id)?)?;
-    collect_added_from_maps(&repo, &base_map, &head_map)
+    let base_tree = commit_tree(&repo, merge_base)?;
+    let head_tree = commit_tree(&repo, head_id)?;
+    collect_added_from_trees(&repo, &base_tree, &head_tree)
 }
 
 /// Resolve a commit id to its tree object.
@@ -1090,6 +1183,157 @@ mod staged_added_lines_tests {
             .collect();
 
         assert_eq!(added, vec![("a.rs".to_string(), 2, "NEW LINE".to_string())]);
+    }
+
+    /// Regression for the rename bug: a pure rename (same blob OID,
+    /// new path) must NOT report every line of the file as added. The
+    /// previous map-walk implementation hit (None, Some(new)) for the
+    /// renamed path and diffed against an empty blob.
+    #[test]
+    fn pure_rename_yields_no_added_lines() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("old.rs"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write old file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        fs::remove_file(temp.path().join("old.rs")).expect("should remove old");
+        fs::write(
+            temp.path().join("new.rs"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write new file");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        assert!(
+            lines.is_empty(),
+            "pure rename should add no lines, got: {lines:?}"
+        );
+    }
+
+    /// A rename + edit reports ONLY the truly added lines, not every
+    /// line of the renamed file. Relies on gix similarity-based rename
+    /// detection pairing `old.rs` ↔ `new.rs`.
+    #[test]
+    fn rename_with_edit_reports_only_added_lines() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("old.rs"),
+            "fn shared() {}\nfn also_shared() {}\nfn third() {}\n",
+        )
+        .expect("should write old file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        fs::remove_file(temp.path().join("old.rs")).expect("should remove old");
+        fs::write(
+            temp.path().join("new.rs"),
+            "fn shared() {}\nfn also_shared() {}\nfn third() {}\nlet added = 1;\n",
+        )
+        .expect("should write new file");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(
+            texts,
+            vec!["let added = 1;"],
+            "rename+edit should report only the new line, got: {lines:?}"
+        );
+    }
+
+    /// A deletion adds no lines.
+    #[test]
+    fn deletion_yields_no_added_lines() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("doomed.rs"),
+            "let bad = \"https://test.com\";\n",
+        )
+        .expect("should write file");
+        fs::write(temp.path().join("keep.rs"), "let ok = 1;\n").expect("should write keep");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        fs::remove_file(temp.path().join("doomed.rs")).expect("should remove doomed");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        assert!(
+            lines.is_empty(),
+            "deletion should add no lines, got: {lines:?}"
+        );
+    }
+
+    /// Existing committed violations must NOT be reported as staged —
+    /// only the lines added in this staging round count.
+    #[test]
+    fn existing_committed_violation_with_unrelated_change_is_not_reported() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("legacy.rs"),
+            "let pre_existing = \"https://test.com\";\n",
+        )
+        .expect("should write legacy file");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "commit pre-existing violation");
+
+        // Stage an unrelated, clean change in a different file. The
+        // pre-existing violation in legacy.rs must not appear in the
+        // staged diff.
+        fs::write(temp.path().join("new.rs"), "let ok = 1;\n").expect("should write new");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let texts: Vec<_> = lines.iter().map(|l| l.content.clone()).collect();
+        assert_eq!(
+            texts,
+            vec!["let ok = 1;"],
+            "only the newly staged line should appear, got: {lines:?}"
+        );
+    }
+
+    /// Multiple non-contiguous added regions in the same file must all
+    /// be reported with correct new-side line numbers.
+    #[test]
+    fn multi_hunk_same_file_reports_each_added_line() {
+        let temp = tempfile::tempdir().expect("should create tempdir");
+        let repo = test_support::init_repo(temp.path());
+        fs::write(
+            temp.path().join("a.rs"),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+        )
+        .expect("should write initial");
+        test_support::stage_all(&repo);
+        test_support::commit_all(&repo, "initial");
+
+        // Insertion between alpha+beta (line 2) AND between delta+epsilon
+        // (line 6 after the first insertion). Two non-adjacent hunks.
+        fs::write(
+            temp.path().join("a.rs"),
+            "alpha\nNEW_EARLY\nbeta\ngamma\ndelta\nNEW_LATE\nepsilon\n",
+        )
+        .expect("should write multi-hunk modification");
+        test_support::stage_all(&repo);
+
+        let lines = staged_added_lines(temp.path()).expect("should collect staged lines");
+        let pairs: Vec<_> = lines
+            .iter()
+            .map(|l| (l.line_no, l.content.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(2, "NEW_EARLY".to_string()), (6, "NEW_LATE".to_string())],
+            "should report both hunks with correct new-side line numbers, got: {lines:?}"
+        );
     }
 
     /// Spec test case 25: staged scan must NOT skip non-UTF-8 paths.
@@ -1612,12 +1856,14 @@ pub struct FileViolation {
     /// Repo-relative path of the file.
     pub path: PathBuf,
     /// 1-based line number.
+    #[serde(rename = "line_no")]
     pub line: usize,
     /// The disallowed host.
     pub host: String,
-    /// The full line the host appeared on.
-    #[serde(rename = "url")]
-    pub url_excerpt: String,
+    /// The full text of the line the host appeared on (not just the
+    /// URL — there may be surrounding code or punctuation).
+    #[serde(rename = "line")]
+    pub line_excerpt: String,
 }
 
 /// Run `ts dev lint domains`.
@@ -1676,7 +1922,7 @@ pub fn run(args: &DomainsArgs) -> Result<(), Report<CliError>> {
                 path: line.path.clone(),
                 line: line.line_no,
                 host: v.host,
-                url_excerpt: line.content.clone(),
+                line_excerpt: line.content.clone(),
             });
         }
     }

@@ -4,6 +4,10 @@
 //! Commits use a fixed signature so they do not depend on ambient
 //! `user.name` / `user.email` config and are deterministic across
 //! runs (clean CI machines included).
+//!
+//! Keep in sync with `src/dev/lint/test_support.rs`. The split exists
+//! because integration tests under `tests/` cannot reach `pub(crate)`
+//! items in the crate.
 
 // Each integration-test file `mod common;`s this and uses a subset
 // of the helpers.
@@ -86,10 +90,25 @@ fn collect_files(
             let rel = path
                 .strip_prefix(work_dir)
                 .expect("file should be under work dir");
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            out.push((BString::from(rel_str.as_bytes()), oid));
+            out.push((rel_path_to_bstring(rel), oid));
         }
     }
+}
+
+/// Convert a working-tree-relative `Path` to a `BString` for an index
+/// entry. On Unix, preserves raw bytes verbatim so non-UTF-8 filenames
+/// reach gix unchanged (spec case 25). On Windows, falls back to a
+/// lossy UTF-8 conversion with backslash-to-slash normalisation.
+#[cfg(unix)]
+fn rel_path_to_bstring(rel: &Path) -> BString {
+    use std::os::unix::ffi::OsStrExt;
+    BString::from(rel.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn rel_path_to_bstring(rel: &Path) -> BString {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    BString::from(s.as_bytes())
 }
 
 /// Build a tree from the current index and commit it to `HEAD`,
