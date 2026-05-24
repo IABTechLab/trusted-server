@@ -329,10 +329,16 @@ mod allow_check_tests {
 /// Regex for absolute `http(s)://` URLs. Case-insensitive; the host
 /// must start with an alphanumeric character so placeholders like
 /// `https://...` are rejected.
+///
+/// `(?:[^/?\s#]+@)?` skips any RFC 3986 `userinfo@` prefix so the
+/// captured host is the real authority, not a deceiving `user@`
+/// part. Without this, `https://github.com@test.com/path` would
+/// extract the allowlisted `github.com` and miss the actual host
+/// `test.com`.
 fn absolute_url_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
+        Regex::new(r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
             .expect("should compile absolute URL regex")
     })
 }
@@ -396,19 +402,51 @@ mod absolute_url_tests {
             vec!["github.com", "example.com"]
         );
     }
+
+    /// Regression for the userinfo-bypass: an allowlisted host placed
+    /// in the userinfo position must not hide the real authority.
+    #[test]
+    fn userinfo_bypass_extracts_real_host() {
+        assert_eq!(
+            extract_absolute_hosts("fetch(\"https://github.com@test.com/path\")"),
+            vec!["test.com"]
+        );
+        // user:password@host form
+        assert_eq!(
+            extract_absolute_hosts("fetch(\"https://user:pw@evil.example/path\")"),
+            vec!["evil.example"]
+        );
+        // Multiple @ in userinfo — last @ is the authority boundary.
+        assert_eq!(
+            extract_absolute_hosts("fetch(\"https://a@b@c.evil/path\")"),
+            vec!["c.evil"]
+        );
+    }
+
+    #[test]
+    fn no_userinfo_still_works() {
+        assert_eq!(
+            extract_absolute_hosts("https://example.com:8080/path"),
+            vec!["example.com"]
+        );
+    }
 }
 
 /// Regex for protocol-relative `//host/...` URLs. The `//` must be
 /// preceded by a boundary character (start-of-line, whitespace,
 /// quote, paren, `=`, `<`, `>`, `{`, `,`, `[`, `]`, backtick) — but
 /// NOT `:`, which would double-match the `//` in an absolute URL.
-/// The host requires a dotted TLD-like suffix to filter out code
+/// `(?:[^/?\s#]+@)?` skips any RFC 3986 userinfo so a deceiving
+/// `//user@evil.com` pattern reports `evil.com`, not `user`. The
+/// host requires a dotted TLD-like suffix to filter out code
 /// comment dividers.
 fn protocol_relative_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|[\s"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})"#)
-            .expect("should compile protocol-relative URL regex")
+        Regex::new(
+            r#"(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})"#,
+        )
+        .expect("should compile protocol-relative URL regex")
     })
 }
 
@@ -467,6 +505,15 @@ mod protocol_relative_tests {
         // The trailing TLD-like constraint (.{2,}) filters this out;
         // "comment text" has no dotted-suffix.
         assert!(extract_protocol_relative_hosts("// comment text").is_empty());
+    }
+
+    /// Regression for the userinfo-bypass on protocol-relative URLs.
+    #[test]
+    fn userinfo_bypass_extracts_real_host() {
+        assert_eq!(
+            extract_protocol_relative_hosts("src=\"//github.com@evil.example/x\""),
+            vec!["evil.example"]
+        );
     }
 }
 
@@ -820,12 +867,18 @@ const EXCLUDED_DIR_COMPONENTS: &[&str] = &["node_modules", "target", "dist", ".g
 /// constants and doc comments cannot self-flag.
 const SELF_PATH: &str = "crates/trusted-server-cli/src/dev/lint/domains.rs";
 
-/// Whether a repo-relative path (using `/` separators) should be
-/// scanned. See spec §"File extensions scanned" and
-/// §"Always excluded (paths)".
+/// Whether a path should be scanned. Accepts either a repo-relative
+/// path (with `/` separators) or an absolute path; the
+/// `Path::ends_with` self-exclusion is component-aware so an
+/// explicit-mode invocation like `ts dev lint domains
+/// /abs/.../crates/trusted-server-cli/src/dev/lint/domains.rs` still
+/// skips the linter's own source file. See spec §"File extensions
+/// scanned" and §"Always excluded (paths)".
 fn path_is_scanned(rel_path: &str) -> bool {
-    // Self-exclude.
-    if rel_path == SELF_PATH {
+    // Self-exclude. `Path::ends_with` matches whole path components,
+    // so the suffix can be an absolute path or a repo-relative path
+    // without false positives (e.g., `barcrates/.../domains.rs`).
+    if Path::new(rel_path).ends_with(SELF_PATH) {
         return false;
     }
     // Excluded directory components (whole-segment match).
@@ -1689,6 +1742,22 @@ mod path_is_scanned_tests {
         ] {
             assert!(!path_is_scanned(p), "should NOT be scanned: {p}");
         }
+    }
+
+    /// An explicit absolute path pointing at the linter's own source
+    /// must still self-exclude — the bare-string check in the old
+    /// implementation only matched the repo-relative spelling.
+    #[test]
+    fn self_excludes_via_absolute_path_suffix() {
+        assert!(!path_is_scanned(
+            "/Users/anyone/checkout/crates/trusted-server-cli/src/dev/lint/domains.rs"
+        ));
+        // False-positive guard: a path that merely contains the
+        // suffix as a substring (no component boundary) must still
+        // be scanned.
+        assert!(path_is_scanned(
+            "crates/notrusted-server-cli/src/dev/lint/domains.rs"
+        ));
     }
 }
 

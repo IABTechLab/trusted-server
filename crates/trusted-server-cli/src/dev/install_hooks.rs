@@ -213,12 +213,14 @@ pub fn install_hooks(repo_path: &Path, force: bool) -> Result<(), Report<Install
         }));
     }
     // Under --force, back up any existing hook before replacing it.
+    // Nanosecond precision prevents two forced installs within the
+    // same second from clobbering each other's backup.
     if hook_path.exists() && force {
-        let secs = SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let backup = hook_path.with_extension(format!("bak.{secs}"));
+        let backup = hook_path.with_extension(format!("bak.{nanos}"));
         fs::rename(&hook_path, &backup).change_context(InstallHooksError::WriteHook)?;
     }
 

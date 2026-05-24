@@ -417,6 +417,160 @@ fn full_repo_reports_committed_violation() {
         .stdout(predicate::str::contains("disallowed host partner.com"));
 }
 
+/// Binary-level coverage for spec cases 30, 31, 32, 34: paths under
+/// `node_modules/`, `.worktrees/`, integrations fixtures, and known
+/// lockfiles must be skipped even when they contain a disallowed
+/// URL; one violation in a non-excluded file is still reported.
+#[test]
+fn full_repo_path_exclusions_are_skipped() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let repo = common::init_repo(temp.path());
+
+    let bad = "let bad = \"https://test.com\";\n";
+
+    // Excluded.
+    let nm = temp.path().join("node_modules");
+    std::fs::create_dir_all(&nm).expect("node_modules");
+    std::fs::write(nm.join("pkg.js"), bad).expect("write node_modules pkg.js");
+
+    let wt = temp.path().join(".worktrees/branch");
+    std::fs::create_dir_all(&wt).expect(".worktrees/branch");
+    std::fs::write(wt.join("a.rs"), bad).expect("write .worktrees a.rs");
+
+    let fixtures = temp
+        .path()
+        .join("crates/trusted-server-core/src/integrations/x/fixtures");
+    std::fs::create_dir_all(&fixtures).expect("fixtures dir");
+    std::fs::write(fixtures.join("captured.html"), bad).expect("write fixtures captured.html");
+
+    std::fs::write(temp.path().join("package-lock.json"), bad).expect("write lockfile");
+
+    // Reported (sole non-excluded file).
+    std::fs::write(temp.path().join("ok.rs"), bad).expect("write ok.rs");
+
+    common::stage_all(&repo);
+    common::commit_all(&repo, "seed mixed paths");
+
+    let assert = ts_in(&temp)
+        .args(["dev", "lint", "domains"])
+        .assert()
+        .code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    assert!(
+        stdout.contains("ok.rs:1: disallowed host test.com"),
+        "ok.rs should be reported: {stdout}"
+    );
+    assert!(
+        !stdout.contains("pkg.js")
+            && !stdout.contains(".worktrees")
+            && !stdout.contains("fixtures")
+            && !stdout.contains("package-lock.json"),
+        "excluded paths must not appear in the report: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 disallowed host(s) found"),
+        "summary should reflect exactly one violation: {stdout}"
+    );
+}
+
+/// Explicit absolute path pointing at the linter's own source file
+/// must still self-exclude — regression for the absolute-path
+/// bypass of `SELF_PATH`.
+#[test]
+fn explicit_absolute_path_to_self_skips() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let nested = temp.path().join("crates/trusted-server-cli/src/dev/lint");
+    std::fs::create_dir_all(&nested).expect("nested dir");
+    let self_clone = nested.join("domains.rs");
+    std::fs::write(&self_clone, "let bad = \"https://test.com\";\n")
+        .expect("write fake linter source");
+
+    let abs = self_clone
+        .canonicalize()
+        .expect("should canonicalize self-clone");
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", abs.to_str().expect("utf-8 path")])
+        .assert()
+        .code(0);
+}
+
+// === Markdown coverage (spec cases 36, 37, 39, 40, 42, 43) ===
+
+/// Spec case 37 (autolink), 42 (reference-link target), 43 (image
+/// link), 39 (multiple links on one line), 40 (fenced code block).
+/// One Markdown file exercises all five forms in one binary
+/// invocation.
+#[test]
+fn markdown_link_variants_all_reported() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("reopen repo");
+    let body = "\
+# Doc
+
+Autolink: <https://test.com>
+Inline: [bad](https://partner.com)
+Image: ![alt](https://test.com/img.png)
+Multi: see [a](https://github.com/x) and [b](https://test.com)
+
+```
+curl https://test.com/foo
+```
+
+[1]: https://test.com
+";
+    std::fs::write(temp.path().join("doc.md"), body).expect("write doc.md");
+    common::stage_all(&repo);
+
+    let assert = ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+
+    // Every line that carries a disallowed host is reported. We
+    // assert the *line numbers* match the file body exactly.
+    for needle in [
+        "doc.md:3: disallowed host test.com",    // autolink
+        "doc.md:4: disallowed host partner.com", // inline link
+        "doc.md:5: disallowed host test.com",    // image
+        "doc.md:6: disallowed host test.com",    // multi (github.com allowed, test.com flagged)
+        "doc.md:9: disallowed host test.com",    // fenced code block
+        "doc.md:12: disallowed host test.com",   // reference list
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "expected line `{needle}` in:\n{stdout}"
+        );
+    }
+}
+
+/// Spec case 38: an HTML-comment suppression marker on a Markdown
+/// line suppresses the violation; a wrong-host marker still flags
+/// the real host and emits a stderr "unused marker" warning.
+#[test]
+fn markdown_html_comment_suppression() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("reopen repo");
+    let body = "\
+ok: see [docs](https://test.com) <!-- allow-domain: test.com -->
+bad: see [docs](https://test.com) <!-- allow-domain: other.com -->
+";
+    std::fs::write(temp.path().join("doc.md"), body).expect("write doc.md");
+    common::stage_all(&repo);
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("doc.md:1: disallowed host test.com").not())
+        .stdout(predicate::str::contains(
+            "doc.md:2: disallowed host test.com",
+        ))
+        .stderr(predicate::str::contains(
+            "marker listed `other.com` but it does not appear",
+        ));
+}
+
 // === explicit-path mode ===
 
 #[test]
