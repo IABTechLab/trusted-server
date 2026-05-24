@@ -806,48 +806,40 @@ fn staged_added_lines(repo_path: &Path)
     -> Result<Vec<DiffLine>, Report<DomainsLintError>>
 {
     let repo = gix::open(repo_path).change_context(DomainsLintError::OpenRepo)?;
-    let head_tree = repo
-        .head_commit().change_context(DomainsLintError::OpenRepo)?
-        .tree_id().change_context(DomainsLintError::OpenRepo)?;
-    let head_tree = repo.find_tree(head_tree).change_context(DomainsLintError::OpenRepo)?;
-    let index = repo.index().change_context(DomainsLintError::Index)?;
-
-    // Walk both sides into path -> blob_id maps.
-    let head_map = tree_blob_map(&head_tree)?;       // breadthfirst.files()
-    let index_map = index_blob_map(&index);          // entries() filtered to FILE
-
-    let mut out = Vec::new();
-    for (path, head_id, index_id) in classify_changes(&head_map, &index_map) {
-        if !path_is_scanned(&path) { continue; }
-        let old = head_id.map(|id| read_blob(&repo, id)).transpose()?;
-        let new = match index_id {
-            Some(id) => read_blob(&repo, id)?,
-            None => continue,            // deletion — no added lines
-        };
-        for (line_no, content) in added_lines(old.as_deref(), &new) {
-            out.push(DiffLine { path: path.clone(), line_no, content });
-        }
-    }
-    Ok(out)
+    let head_tree = match repo.head_commit() {
+        Ok(c) => repo.find_tree(c.tree_id()?.detach())?,
+        Err(_) => repo.empty_tree(),                 // unborn HEAD
+    };
+    // Materialise the index as a tree so we can diff trees uniformly
+    // with rename detection enabled.
+    let index_tree_id = write_index_to_tree(&repo)?;
+    let index_tree = repo.find_tree(index_tree_id)?;
+    collect_added_from_trees(&repo, &head_tree, &index_tree)
 }
 ```
 
-**The `gix` API surface is RESOLVED by the Phase 2 spike** — see
-`crates/trusted-server-cli/tests/spike_gix_staged_diff.rs` for the
-reference implementation and the
-[Resolved by the Phase 2 spike](#resolved-by-the-phase-2-spike)
-section for the full entry-point list. The conceptual operations:
+**The `gix` API surface is RESOLVED by the implementation** — see
+`crates/trusted-server-cli/src/dev/lint/domains.rs` for
+`collect_added_from_trees` and `write_index_to_tree`. The conceptual
+operations:
 
 1. Open the repository — `gix::open(path)`.
 2. Resolve the HEAD commit's tree — `repo.head_commit()?.tree_id()?`
-   then `repo.find_tree(id)?`.
-3. Read the index — `repo.index()?`.
-4. Walk the HEAD tree (`tree.traverse().breadthfirst.files()`) and
-   the index (`index.entries()`) into `path → blob_id` maps, then
-   compare the maps directly to classify Added / Modified / Deleted.
-   **No tree-vs-tree `Platform`/`for_each_to_obtain_tree` machinery
-   is used** — the direct map comparison is simpler and sidesteps
-   the index→tree conversion gix 0.83 does not expose cleanly.
+   then `repo.find_tree(id)?`. On an unborn HEAD use
+   `repo.empty_tree()`.
+3. Materialise the index as a tree — iterate `index.entries()`
+   filtered to `Mode::FILE`, `editor.upsert(entry.path(&index),
+EntryKind::Blob, entry.id)` on `repo.edit_tree(empty)`, then
+   `editor.write()`. This lets the same tree-vs-tree machinery
+   serve both staged and `--changed-vs` modes.
+4. Run a tree-vs-tree diff with rename detection —
+   `old_tree.changes()?` →
+   `Platform::for_each_to_obtain_tree(&new_tree, callback)` with
+   `track_rewrites(Some(Rewrites { copies: None, percentage:
+Some(0.5), limit: 1000, track_empty: false }))`. The callback
+   matches `Change::{Addition, Modification, Rewrite, Deletion}` —
+   pure renames (same blob, new path) yield no added lines, and
+   rename + edit diffs the matched old blob vs the new blob.
 5. Read each blob's content — `repo.find_object(id)?.data`.
 6. Run a line-level diff — `gix::diff::blob::Diff::compute(
 Algorithm::Myers, &InternedInput::new(old, new))`, then walk
@@ -859,8 +851,10 @@ Algorithm::Myers, &InternedInput::new(old, new))`, then walk
 - No diff-text parsing — line numbers and content come from typed
   hunk structs.
 - No locale / quote-path / `b/` prefix / `/dev/null` edge cases.
-- Renamed files are handled by `gix`'s change-detection (provides both
-  old and new path).
+- Renamed files are handled by `gix`'s built-in rename detection
+  (`track_rewrites` on the tree-diff `Platform`) — pure renames
+  introduce no added lines; rename + edit reports only the truly new
+  lines.
 - Filenames with spaces or non-UTF8 characters: `gix` paths are
   `BString` (byte strings). The script lossy-converts to UTF-8 for
   output and emits a stderr warning for non-UTF-8 paths.
@@ -881,31 +875,12 @@ fn changed_vs_added_lines(repo_path: &Path, reference: &str)
         .merge_base(base_id, head_id)
         .change_context_lazy(|| DomainsLintError::MergeBase { base: reference.into() })?
         .detach();
-    let base_tree = repo.find_tree(
-        repo.find_commit(merge_base)?.tree_id()?.detach()
-    )?;
-    let head_tree = repo.find_tree(
-        repo.find_commit(head_id)?.tree_id()?.detach()
-    )?;
+    let base_tree = commit_tree(&repo, merge_base)?;
+    let head_tree = commit_tree(&repo, head_id)?;
 
-    // Same map-comparison approach as staged_added_lines: walk both
-    // trees into path -> blob_id maps, classify, blob-diff each
-    // changed path. See the spike at tests/spike_gix_changed_vs.rs.
-    let base_map = tree_blob_map(&base_tree)?;
-    let head_map = tree_blob_map(&head_tree)?;
-    let mut out = Vec::new();
-    for (path, base_blob, head_blob) in classify_changes(&base_map, &head_map) {
-        if !path_is_scanned(&path) { continue; }
-        let old = base_blob.map(|id| read_blob(&repo, id)).transpose()?;
-        let new = match head_blob {
-            Some(id) => read_blob(&repo, id)?,
-            None => continue,
-        };
-        for (line_no, content) in added_lines(old.as_deref(), &new) {
-            out.push(DiffLine { path: path.clone(), line_no, content });
-        }
-    }
-    Ok(out)
+    // Same tree-vs-tree diff with rename tracking as staged mode;
+    // the index is just swapped for the merge-base tree.
+    collect_added_from_trees(&repo, &base_tree, &head_tree)
 }
 ```
 
@@ -1170,9 +1145,9 @@ Run `ts dev lint domains` (no args) for a full-repo audit.
   "violations": [
     {
       "path": "crates/trusted-server-core/src/foo.rs",
-      "line": 42,
+      "line_no": 42,
       "host": "test.com",
-      "url": "https://test.com/path"
+      "line": "let x = \"https://test.com/path\";"
     }
   ],
   "count": 1,
@@ -1899,15 +1874,35 @@ the question.
 InternedInput}` — `Diff::compute(Algorithm::Myers, &input)`,
      then `diff.hunks()`; each `Hunk.after` is the new-side token
      (line) range.
-   - **No tree-vs-tree `Platform` machinery is used.** Both the
-     staged and `--changed-vs` collectors walk the two trees into
-     `path → blob_id` maps and compare directly — simpler than
-     `for_each_to_obtain_tree` and avoids the index→tree conversion
-     gix 0.83 does not expose cleanly.
+   - **Tree-vs-tree diff with rename detection.** Both the staged
+     and `--changed-vs` collectors call `old_tree.changes()` →
+     `Platform::for_each_to_obtain_tree(&new_tree, ...)` with
+     `track_rewrites(Some(Rewrites { copies: None, percentage:
+Some(0.5), limit: 1000, track_empty: false }))`. The callback
+     iterates `Change::{Addition, Modification, Rewrite,
+Deletion}` — pure renames (same blob, new path) yield no
+     added lines; rename + edit diffs the matched old blob vs the
+     new blob.
+
+     **Resolution note:** an earlier revision of this spec rejected
+     `Platform`/`for_each_to_obtain_tree` and prescribed a manual
+     map-walk. That approach silently broke renames: a renamed file
+     hit `(None, Some(new_id))` and was diffed against an empty
+     blob, reporting every line of the renamed file as added
+     (including pre-existing violations the author never touched).
+     The current spec uses the `Platform` API so rename detection
+     is correct by construction.
+
+     For staged mode, the index is first materialised as a tree
+     via `Repository::edit_tree` → per-entry `Editor::upsert(path,
+EntryKind::Blob, entry.id)` → `Editor::write()`, then the
+     same tree-vs-tree path serves both modes.
+
    - **gix-config:** `File::from_path_no_includes(path,
 Source::Local)`, `File::set_raw_value` (dotted `AsKey` form —
      avoids the `File<'event>` invariance that bites
      `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
+
 2. **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
    `gix-config = 0.56`, same gitoxide release family. See
    [Cargo dependencies](#cargo-dependencies) for the full feature

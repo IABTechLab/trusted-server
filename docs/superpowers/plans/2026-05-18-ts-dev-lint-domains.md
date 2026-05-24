@@ -2422,7 +2422,7 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
                 path: line.path.clone(),
                 line: line.line_no,
                 host: v.host,
-                url_excerpt: line.content.clone(),
+                line_excerpt: line.content.clone(),
             });
         }
     }
@@ -2451,10 +2451,11 @@ pub fn run(args: crate::dev::lint::DomainsArgs)
 #[derive(Debug, serde::Serialize)]
 pub struct FileViolation {
     pub path: std::path::PathBuf,
+    #[serde(rename = "line_no")]
     pub line: usize,
     pub host: String,
-    #[serde(rename = "url")]
-    pub url_excerpt: String,
+    #[serde(rename = "line")]
+    pub line_excerpt: String,
 }
 
 fn emit_human(violations: &[FileViolation])

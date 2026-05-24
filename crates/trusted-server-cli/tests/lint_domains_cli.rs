@@ -306,6 +306,79 @@ fn changed_vs_reports_feature_branch_lines() {
         .stdout(predicate::str::contains("disallowed host test.com"));
 }
 
+/// Spec case 28: when HEAD is behind the base ref, the merge-base
+/// is HEAD itself and the diff is empty — so no violations are
+/// reported even if the base ref has introduced one. This exercises
+/// the merge-base path with an "anti-symmetric" topology.
+#[test]
+fn changed_vs_branch_behind_base_reports_nothing() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let repo = common::init_repo(temp.path());
+
+    // Base: a single clean commit on `main`.
+    std::fs::write(temp.path().join("a.rs"), "let ok = 1;\n").expect("should write base");
+    common::stage_all(&repo);
+    common::commit_all(&repo, "base");
+
+    // Branch from `main` at the base commit (no further commits on
+    // the feature branch — HEAD is at the merge-base).
+    common::create_and_checkout_branch(&repo, "feature");
+
+    // Advance `main` past the merge-base with a commit that, if
+    // wrongly attributed to the feature branch, would be a
+    // violation. Then move HEAD back to `feature`.
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    use gix::refs::{FullName, Target};
+    let main_ref: FullName = "refs/heads/main".try_into().expect("valid ref name");
+    let head_edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: gix::bstr::BString::from("switch to main"),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(main_ref),
+        },
+        name: "HEAD".try_into().expect("HEAD"),
+        deref: false,
+    };
+    repo.edit_reference(head_edit)
+        .expect("should switch HEAD to main");
+    std::fs::write(
+        temp.path().join("a.rs"),
+        "let ok = 1;\nlet ahead = \"https://test.com\";\n",
+    )
+    .expect("should write main-ahead change");
+    common::stage_all(&repo);
+    common::commit_all(&repo, "main: ahead of feature");
+
+    // Move HEAD back to feature.
+    let feature_ref: FullName = "refs/heads/feature".try_into().expect("valid ref name");
+    let head_edit = RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: gix::bstr::BString::from("switch to feature"),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(feature_ref),
+        },
+        name: "HEAD".try_into().expect("HEAD"),
+        deref: false,
+    };
+    repo.edit_reference(head_edit)
+        .expect("should switch HEAD back to feature");
+
+    // `--changed-vs main`: merge-base(main, feature) == feature, so
+    // diff is empty. The `main`-introduced violation must NOT appear.
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--changed-vs", "main"])
+        .assert()
+        .code(0);
+}
+
 /// A `--changed-vs` ref that doesn't resolve in any of the four
 /// fallback locations is an environment error (exit 2), not a
 /// violation (exit 1).
