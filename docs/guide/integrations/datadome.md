@@ -65,7 +65,7 @@ If `rewrite_sdk` is enabled, Trusted Server will automatically rewrite any exist
 
 <!-- Becomes -->
 <script
-  src="https://your-domain.com/integrations/datadome/tags.js"
+  src="https://your-domain.example/integrations/datadome/tags.js"
   async
 ></script>
 ```
@@ -154,7 +154,7 @@ enabled = true
 Verify that signal collection routes are working:
 
 ```bash
-curl -X POST https://your-domain.com/integrations/datadome/js/check
+curl -X POST https://your-domain.example/integrations/datadome/js/check
 ```
 
 ### HTML Rewriting Not Working

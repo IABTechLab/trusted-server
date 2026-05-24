@@ -172,7 +172,7 @@ Partners can fetch and cache your public keys:
 ```javascript
 // Fetch discovery document
 const discovery = await fetch(
-  'https://your-domain/.well-known/trusted-server.json'
+  'https://your-domain.example/.well-known/trusted-server.json'
 ).then((r) => r.json())
 
 // Extract JWKS
@@ -333,7 +333,7 @@ Use the verification endpoint:
 SIGNATURE=$(sign-payload "test message")
 
 # Verify via API
-curl -X POST https://your-domain/verify-signature \
+curl -X POST https://your-domain.example/verify-signature \
   -H "Content-Type: application/json" \
   -d '{
     "payload": "test message",

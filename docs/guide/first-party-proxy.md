@@ -16,9 +16,9 @@ The First-Party Proxy system rewrites third-party URLs in ad creatives to route 
 
 ```mermaid
 flowchart TD
-  original["`Creative (Original) &lt;img src='tracker.com/pixel.gif' /&gt;`"]
-  rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.com/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
-  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.com<br/>4. Return response"]
+  original["`Creative (Original) &lt;img src='tracker.example/pixel.gif' /&gt;`"]
+  rewritten["Creative (Rewritten)<br/>&lt;img src='/first-party/proxy?<br/>tsurl=https://tracker.example/<br/>pixel.gif&amp;tstoken=abc123...' /&gt;"]
+  server["Trusted Server<br/>1. Validate tstoken<br/>2. Append ts-ec<br/>3. Proxy to tracker.example<br/>4. Return response"]
 
   original -->|Rewrite| rewritten -->|Browser Request| server
 ```
@@ -65,14 +65,14 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 Original URL:
 
 ```
-https://tracker.com/pixel.gif?campaign=123&uid=abc
+https://tracker.example/pixel.gif?campaign=123&uid=abc
 ```
 
 Signed proxy URL:
 
 ```
 /first-party/proxy?
-  tsurl=https://tracker.com/pixel.gif&
+  tsurl=https://tracker.example/pixel.gif&
   campaign=123&
   uid=abc&
   tstoken=HmacSha256Signature
@@ -81,7 +81,7 @@ Signed proxy URL:
 Final proxied request:
 
 ```
-https://tracker.com/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
+https://tracker.example/pixel.gif?campaign=123&uid=abc&ts-ec=xyz
 ```
 
 ### `/first-party/click` - Click Redirects
@@ -91,7 +91,7 @@ Handles click tracking with first-party redirects.
 **Request**:
 
 ```
-GET /first-party/click?tsurl=https://advertiser.com/landing&tstoken=signature
+GET /first-party/click?tsurl=https://advertiser.example/landing&tstoken=signature
 ```
 
 **Query Parameters**: Same as `/first-party/proxy`
@@ -115,7 +115,7 @@ Click URL in creative:
 ```html
 <a
   href="/first-party/click?
-  tsurl=https://advertiser.com/buy&
+  tsurl=https://advertiser.example/buy&
   product=widget&
   tstoken=signature"
 >
@@ -127,7 +127,7 @@ User clicks → Server responds:
 
 ```
 HTTP/1.1 302 Found
-Location: https://advertiser.com/buy?product=widget&ts-ec=xyz
+Location: https://advertiser.example/buy?product=widget&ts-ec=xyz
 ```
 
 ::: tip Click vs Proxy
@@ -278,12 +278,12 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 ```css
 /* Original */
 .banner {
-  background: url(https://cdn.com/bg.jpg);
+  background: url(https://cdn.example/bg.jpg);
 }
 
 /* Rewritten */
 .banner {
-  background: url(/first-party/proxy?tsurl=https://cdn.com/bg.jpg&tstoken=sig);
+  background: url(/first-party/proxy?tsurl=https://cdn.example/bg.jpg&tstoken=sig);
 }
 ```
 
@@ -306,7 +306,7 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 **Logging**:
 
 ```
-proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
+proxy: likely pixel detected size=43 url=https://tracker.example/p.gif
 ```
 
 ### Passthrough (Other Types)
@@ -343,8 +343,8 @@ The proxy automatically follows HTTP redirects:
 **Example Flow**:
 
 ```
-Request: /first-party/proxy?tsurl=https://short.link&tstoken=sig
-  → 302 to https://cdn.com/ad.html
+Request: /first-party/proxy?tsurl=https://short.example&tstoken=sig
+  → 302 to https://cdn.example/ad.html
   → 200 with HTML content
   → Rewrite HTML and return
 ```
@@ -365,11 +365,11 @@ When proxying, Trusted Server automatically appends the `ts-ec` parameter:
 
 ```
 Original request to proxy:
-  /first-party/proxy?tsurl=https://tracker.com/pixel.gif&tstoken=sig
+  /first-party/proxy?tsurl=https://tracker.example/pixel.gif&tstoken=sig
   Cookie: ts-ec=user123
 
 Proxied backend request:
-  https://tracker.com/pixel.gif?ts-ec=user123
+  https://tracker.example/pixel.gif?ts-ec=user123
 ```
 
 ### Redirect Propagation
@@ -377,12 +377,12 @@ Proxied backend request:
 EC IDs are re-applied on **every redirect hop**:
 
 ```
-/first-party/proxy?tsurl=https://redirect1.com&tstoken=sig
-  → https://redirect1.com?ts-ec=user123
-  → 302 to https://redirect2.com
-  → https://redirect2.com?ts-ec=user123
-  → 302 to https://final.com
-  → https://final.com?ts-ec=user123
+/first-party/proxy?tsurl=https://redirect1.example&tstoken=sig
+  → https://redirect1.example?ts-ec=user123
+  → 302 to https://redirect2.example
+  → https://redirect2.example?ts-ec=user123
+  → 302 to https://final.example
+  → https://final.example?ts-ec=user123
   → 200 response
 ```
 
@@ -393,14 +393,14 @@ This ensures downstream trackers receive consistent IDs even through redirect ch
 Click redirects also forward EC IDs:
 
 ```html
-<a href="/first-party/click?tsurl=https://advertiser.com&tstoken=sig"></a>
+<a href="/first-party/click?tsurl=https://advertiser.example&tstoken=sig"></a>
 ```
 
 User clicks → redirect includes ID:
 
 ```
 302 Found
-Location: https://advertiser.com?ts-ec=user123
+Location: https://advertiser.example?ts-ec=user123
 ```
 
 ::: tip Privacy Control
@@ -420,7 +420,7 @@ Configure proxy behavior in `trusted-server.toml`:
 ```toml
 [publisher]
 domain = "publisher.com"
-origin_url = "https://origin.publisher.com"
+origin_url = "https://origin.publisher.example"
 proxy_secret = "your-secure-random-secret"
 cookie_domain = ".publisher.com"  # For ts-ec cookies
 ```
@@ -432,7 +432,7 @@ Restrict which domains the proxy may redirect to via the `[proxy]` section:
 ```toml
 [proxy]
 allowed_domains = [
-  "tracker.com",           # Exact match
+  "tracker.example",           # Exact match
   "*.adserver.com",        # Wildcard: adserver.com and all subdomains
   "*.trusted-cdn.net",
 ]
@@ -442,10 +442,10 @@ allowed_domains = [
 
 **Wildcard matching**:
 
-| Pattern         | Matches                                             | Does not match     |
-| --------------- | --------------------------------------------------- | ------------------ |
-| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
-| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+| Pattern             | Matches                                                         | Does not match         |
+| ------------------- | --------------------------------------------------------------- | ---------------------- |
+| `tracker.example`   | `tracker.example`                                               | `sub.tracker.example`  |
+| `*.tracker.example` | `tracker.example`, `sub.tracker.example`, `a.b.tracker.example` | `evil-tracker.example` |
 
 - The `*` prefix matches the base domain and any subdomain at any depth.
 - Matching is case-insensitive; entries are normalized to lowercase on startup.
@@ -640,10 +640,10 @@ Signed URLs prevent injection attacks:
 
 ```
 Attacker tries:
-  /first-party/proxy?tsurl=https://evil.com&tstoken=forged
+  /first-party/proxy?tsurl=https://evil.example&tstoken=forged
 
 Trusted Server:
-  1. Computes expected token for https://evil.com
+  1. Computes expected token for https://evil.example
   2. Compares with provided token
   3. Rejects if mismatch (502 Bad Gateway)
 ```
@@ -670,8 +670,8 @@ Proxy requests emit detailed logs:
 
 ```
 proxy: origin response status=200 ct=text/html cl=1234 accept=text/html url=https://...
-proxy: likely pixel detected size=43 url=https://tracker.com/p.gif
-click: tsurl=https://advertiser.com had_params=true target=... referer=... ua=... tsid=...
+proxy: likely pixel detected size=43 url=https://tracker.example/p.gif
+click: tsurl=https://advertiser.example had_params=true target=... referer=... ua=... tsid=...
 ```
 
 ### Diagnostic Headers

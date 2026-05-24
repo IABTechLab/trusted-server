@@ -60,7 +60,7 @@ Missing required field: publisher.domain
 ```toml
 [publisher]
 domain = "your-publisher-domain.com"
-origin_url = "https://origin.your-publisher-domain.com"
+origin_url = "https://origin.your-publisher-domain.example"
 proxy_secret = "change-me-to-random-string"
 ```
 
@@ -203,7 +203,7 @@ Invalid tstoken signature
 
 ```bash
 # Test URL signing
-curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
+curl "https://edge.example.com/first-party/sign?url=https://external.example/pixel.gif"
 ```
 
 ---

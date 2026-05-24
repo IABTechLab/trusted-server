@@ -98,7 +98,7 @@ The proxy intercepts requests for the GTM library and modifies it on-the-fly. Th
 
 Analytics data (events, pageviews) normally sent to `google-analytics.com/collect` are now routed to:
 
-`https://your-server.com/integrations/google_tag_manager/collect`
+`https://your-server.example/integrations/google_tag_manager/collect`
 
 Trusted Server acts as a privacy-enhancing gateway. Client IP addresses are not forwarded to Google — Google sees only the edge server IP, not the actual user IP.
 

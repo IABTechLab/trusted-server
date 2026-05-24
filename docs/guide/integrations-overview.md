@@ -259,7 +259,7 @@ All integrations can be configured via environment variables:
 # Pattern: TRUSTED_SERVER__INTEGRATIONS__{INTEGRATION}__{SETTING}
 
 # Prebid
-TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://new-server.com"
+TRUSTED_SERVER__INTEGRATIONS__PREBID__SERVER_URL="https://new-server.example"
 TRUSTED_SERVER__INTEGRATIONS__PREBID__TIMEOUT_MS=2000
 
 # Next.js

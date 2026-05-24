@@ -225,7 +225,7 @@ APS returns bids in this format:
       "h": 90,
       "adomain": ["amazon.com"],
       "bidId": "bid-123",
-      "nurl": "https://win-notification.com",
+      "nurl": "https://win-notification.example",
       "targeting": {
         "amzniid": "user-id",
         "amznbid": "2.50"

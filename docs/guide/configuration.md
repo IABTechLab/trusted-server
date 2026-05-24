@@ -20,7 +20,7 @@ Create `trusted-server.toml` in your project root:
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+origin_url = "https://origin.publisher.example"
 proxy_secret = "your-secure-secret-here"
 
 [edge_cookie]
@@ -36,7 +36,7 @@ at runtime.
 ```bash
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
-export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
 export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
 ```
 
@@ -72,7 +72,7 @@ openssl rand -base64 32
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
-origin_url = "https://origin.publisher.com"
+origin_url = "https://origin.publisher.example"
 proxy_secret = "change-me-to-secure-value"
 
 [edge_cookie]
@@ -85,7 +85,7 @@ secret_store_id = "01GYYY"
 
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.com/openrtb2/auction"
+server_url = "https://prebid-server.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "appnexus", "openx"]
 client_side_bidders = ["rubicon"]
@@ -166,7 +166,7 @@ Core publisher settings for domain, origin, and proxy configuration.
 [publisher]
 domain = "publisher.com"
 cookie_domain = ".publisher.com"  # Includes subdomains
-origin_url = "https://origin.publisher.com"
+origin_url = "https://origin.publisher.example"
 proxy_secret = "change-me-to-secure-random-value"
 ```
 
@@ -175,7 +175,7 @@ proxy_secret = "change-me-to-secure-random-value"
 ```bash
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.example
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 ```
 
@@ -194,7 +194,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 - ✅ `publisher.com`
 - ✅ `www.publisher.com`
-- ❌ `https://publisher.com`
+- ❌ `https://publisher.example`
 - ❌ `publisher.com/path`
 
 #### `cookie_domain`
@@ -225,10 +225,10 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 **Format**: Full URL with protocol
 
-- ✅ `https://origin.publisher.com`
-- ✅ `https://origin.publisher.com:8080`
+- ✅ `https://origin.publisher.example`
+- ✅ `https://origin.publisher.example:8080`
 - ✅ `http://192.168.1.1:9000`
-- ❌ `origin.publisher.com` (missing protocol)
+- ❌ `origin.publisher.example` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
 
@@ -564,7 +564,7 @@ Matches:
 - ✅ `assets.cdn.example.com`
 - ✅ `images.cdn.example.com`
 - ✅ `cdn.example.com` (base domain)
-- ❌ `cdn.example.com.evil.com` (different domain)
+- ❌ `cdn.example.com.evil.example` (different domain)
 
 **Exact Patterns** (no `*`):
 
@@ -576,14 +576,14 @@ Matches:
 
 - ✅ `api.example.com`
 - ❌ `www.api.example.com`
-- ❌ `api.example.com.evil.com`
+- ❌ `api.example.com.evil.example`
 
 ### Use Cases
 
 **Trusted Partners**:
 
 ```toml
-exclude_domains = ["*.approved-cdn.com"]
+exclude_domains = ["*.approved-cdn.example"]
 ```
 
 **First-Party Resources**:
@@ -621,7 +621,7 @@ Controls first-party proxy security settings.
 ```toml
 [proxy]
 allowed_domains = [
-  "tracker.com",         # Exact match
+  "tracker.example",         # Exact match
   "*.adserver.com",      # Wildcard: adserver.com and all subdomains
   "*.trusted-cdn.net",
 ]
@@ -631,14 +631,14 @@ allowed_domains = [
 
 ```bash
 # JSON array
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.com","*.adserver.com"]'
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS='["tracker.example","*.adserver.com"]'
 
 # Indexed
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__0="tracker.example"
 TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS__1="*.adserver.com"
 
 # Comma-separated
-TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
+TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.example,*.adserver.com"
 ```
 
 ### Field Details
@@ -653,10 +653,10 @@ TRUSTED_SERVER__PROXY__ALLOWED_DOMAINS="tracker.com,*.adserver.com"
 
 **Pattern Matching**:
 
-| Pattern         | Matches                                             | Does not match     |
-| --------------- | --------------------------------------------------- | ------------------ |
-| `tracker.com`   | `tracker.com`                                       | `sub.tracker.com`  |
-| `*.tracker.com` | `tracker.com`, `sub.tracker.com`, `a.b.tracker.com` | `evil-tracker.com` |
+| Pattern             | Matches                                                         | Does not match         |
+| ------------------- | --------------------------------------------------------------- | ---------------------- |
+| `tracker.example`   | `tracker.example`                                               | `sub.tracker.example`  |
+| `*.tracker.example` | `tracker.example`, `sub.tracker.example`, `a.b.tracker.example` | `evil-tracker.example` |
 
 - `"example.com"` — exact match only.
 - `"*.example.com"` — matches the base domain and any subdomain at any depth.
@@ -961,7 +961,7 @@ proxy_secret = "dev-secret"
 
 ```bash
 # .env.staging
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://staging.publisher.example
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```
 

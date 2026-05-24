@@ -166,12 +166,12 @@ Trusted Server accounts for JavaScript escape sequences and UTF-8 byte counts:
 
 The rewrite logic handles multiple URL formats in RSC content:
 
-| Pattern              | Example                   | In RSC String             |
-| -------------------- | ------------------------- | ------------------------- |
-| Full HTTPS           | `https://host/path`       | `https://host/path`       |
-| Full HTTP            | `http://host/path`        | `http://host/path`        |
-| Protocol-relative    | `//host/path`             | `//host/path`             |
-| Bare host (boundary) | `origin.example.com/path` | `origin.example.com/path` |
+| Pattern              | Example                    | In RSC String              |
+| -------------------- | -------------------------- | -------------------------- |
+| Full HTTPS           | `https://example.com/path` | `https://example.com/path` |
+| Full HTTP            | `http://example.com/path`  | `http://example.com/path`  |
+| Protocol-relative    | `//host/path`              | `//host/path`              |
+| Bare host (boundary) | `origin.example.com/path`  | `origin.example.com/path`  |
 
 ### Implementation References
 

@@ -17,9 +17,9 @@ Creative processing transforms third-party ad creatives by rewriting URLs to go 
 ```
 ┌──────────────────────────────────────────────────────┐
 │  Original Creative HTML                              │
-│  <img src="https://tracker.com/pixel.gif">          │
-│  <iframe src="https://cdn.com/ad.html">             │
-│  <style> .bg { background: url(cdn.com/bg.jpg); }   │
+│  <img src="https://tracker.example/pixel.gif">          │
+│  <iframe src="https://cdn.example/ad.html">             │
+│  <style> .bg { background: url(cdn.example/bg.jpg); }   │
 └──────────────────────────────────────────────────────┘
                         ↓
 ┌──────────────────────────────────────────────────────┐
@@ -166,11 +166,11 @@ When `with_streaming()` is enabled in `ProxyRequestConfig`, HTML/CSS processing 
 
 ```html
 <!-- Original -->
-<iframe src="https://advertiser.com/creative.html"></iframe>
+<iframe src="https://advertiser.example/creative.html"></iframe>
 
 <!-- Rewritten -->
 <iframe
-  src="/first-party/proxy?tsurl=https://advertiser.com/creative.html&tstoken=sig"
+  src="/first-party/proxy?tsurl=https://advertiser.example/creative.html&tstoken=sig"
 ></iframe>
 ```
 
@@ -226,11 +226,11 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 
 ```html
 <!-- Original -->
-<a href="https://advertiser.com/product?id=123">Buy Now</a>
+<a href="https://advertiser.example/product?id=123">Buy Now</a>
 
 <!-- Rewritten -->
 <a
-  href="/first-party/click?tsurl=https://advertiser.com/product&id=123&tstoken=sig"
+  href="/first-party/click?tsurl=https://advertiser.example/product&id=123&tstoken=sig"
   >Buy Now</a
 >
 ```
@@ -435,18 +435,18 @@ Descriptors are preserved exactly as written:
 <!-- Original -->
 <img
   srcset="
-    https://cdn.com/small.jpg   480w,
-    https://cdn.com/medium.jpg  800w,
-    https://cdn.com/large.jpg  1200w
+    https://cdn.example/small.jpg   480w,
+    https://cdn.example/medium.jpg  800w,
+    https://cdn.example/large.jpg  1200w
   "
 />
 
 <!-- Rewritten -->
 <img
   srcset="
-    /first-party/proxy?tsurl=https://cdn.com/small.jpg&tstoken=sig1   480w,
-    /first-party/proxy?tsurl=https://cdn.com/medium.jpg&tstoken=sig2  800w,
-    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig3  1200w
+    /first-party/proxy?tsurl=https://cdn.example/small.jpg&tstoken=sig1   480w,
+    /first-party/proxy?tsurl=https://cdn.example/medium.jpg&tstoken=sig2  800w,
+    /first-party/proxy?tsurl=https://cdn.example/large.jpg&tstoken=sig3  1200w
   "
 />
 ```
@@ -457,13 +457,13 @@ Srcset can mix absolute and relative URLs:
 
 ```html
 <!-- Original -->
-<img srcset="/local/small.jpg 1x, https://cdn.com/large.jpg 2x" />
+<img srcset="/local/small.jpg 1x, https://cdn.example/large.jpg 2x" />
 
 <!-- Rewritten (only absolute URL) -->
 <img
   srcset="
-    /local/small.jpg                                               1x,
-    /first-party/proxy?tsurl=https://cdn.com/large.jpg&tstoken=sig 2x
+    /local/small.jpg                                                   1x,
+    /first-party/proxy?tsurl=https://cdn.example/large.jpg&tstoken=sig 2x
   "
 />
 ```
@@ -496,23 +496,23 @@ Common properties with `url()` values:
 
 ```css
 /* Background images */
-background: url(https://cdn.com/bg.jpg);
-background-image: url(https://cdn.com/pattern.png);
+background: url(https://cdn.example/bg.jpg);
+background-image: url(https://cdn.example/pattern.png);
 
 /* Borders */
-border-image: url(https://cdn.com/border.svg);
+border-image: url(https://cdn.example/border.svg);
 
 /* List styles */
-list-style-image: url(https://cdn.com/bullet.png);
+list-style-image: url(https://cdn.example/bullet.png);
 
 /* Cursors */
-cursor: url(https://cdn.com/cursor.cur), pointer;
+cursor: url(https://cdn.example/cursor.cur), pointer;
 
 /* Masks */
-mask-image: url(https://cdn.com/mask.svg);
+mask-image: url(https://cdn.example/mask.svg);
 
 /* Filters */
-filter: url(https://cdn.com/filter.svg#blur);
+filter: url(https://cdn.example/filter.svg#blur);
 ```
 
 **All `url()` occurrences are rewritten** regardless of property.
@@ -525,15 +525,16 @@ Properties can have multiple `url()` values:
 /* Original */
 .element {
   background:
-    url(https://cdn.com/top.png) top,
-    url(https://cdn.com/bottom.png) bottom;
+    url(https://cdn.example/top.png) top,
+    url(https://cdn.example/bottom.png) bottom;
 }
 
 /* Rewritten */
 .element {
   background:
-    url(/first-party/proxy?tsurl=https://cdn.com/top.png&tstoken=sig1) top,
-    url(/first-party/proxy?tsurl=https://cdn.com/bottom.png&tstoken=sig2) bottom;
+    url(/first-party/proxy?tsurl=https://cdn.example/top.png&tstoken=sig1) top,
+    url(/first-party/proxy?tsurl=https://cdn.example/bottom.png&tstoken=sig2)
+      bottom;
 }
 ```
 
@@ -574,7 +575,7 @@ Matches:
   ✅ assets.cdn.example.com
   ✅ images.cdn.example.com
   ❌ cdn.example.com (no subdomain)
-  ❌ cdn.example.com.evil.com (different domain)
+  ❌ cdn.example.com.evil.example (different domain)
 ```
 
 **Exact Patterns**: No `*` requires exact host match
@@ -584,7 +585,7 @@ Pattern: api.example.com
 Matches:
   ✅ api.example.com
   ❌ www.api.example.com
-  ❌ api.example.com.evil.com
+  ❌ api.example.com.evil.example
 ```
 
 ### Use Cases
@@ -592,7 +593,7 @@ Matches:
 **Trusted Partners**:
 
 ```toml
-exclude_domains = ["*.trusted-cdn.com"]
+exclude_domains = ["*.trusted-cdn.example"]
 ```
 
 Skip rewriting for partners already providing first-party scripts.
@@ -834,7 +835,7 @@ log::debug!("creative: skipped non-network scheme {}", url);
 3. Compare output
 
 ```rust
-let original = "<img src=\"https://tracker.com/pixel.gif\">";
+let original = "<img src=\"https://tracker.example/pixel.gif\">";
 let rewritten = rewrite_creative_html(&settings, original);
 assert!(rewritten.contains("/first-party/proxy"));
 ```

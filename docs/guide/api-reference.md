@@ -172,8 +172,8 @@ Click tracking redirect endpoint.
 **Example:**
 
 ```bash
-curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.com/landing&campaign=123&tstoken=xyz..."
-# → 302 Location: https://advertiser.com/landing?campaign=123&ts-ec=abc123
+curl -I "https://edge.example.com/first-party/click?tsurl=https://advertiser.example/landing&campaign=123&tstoken=xyz..."
+# → 302 Location: https://advertiser.example/landing?campaign=123&ts-ec=abc123
 ```
 
 ---
@@ -187,7 +187,7 @@ URL signing endpoint. Returns signed first-party proxy URL for a given target UR
 **GET Request:**
 
 ```bash
-curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.gif"
+curl "https://edge.example.com/first-party/sign?url=https://external.example/pixel.gif"
 ```
 
 **POST Request:**
@@ -195,14 +195,14 @@ curl "https://edge.example.com/first-party/sign?url=https://external.com/pixel.g
 ```bash
 curl -X POST https://edge.example.com/first-party/sign \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://external.com/pixel.gif"}'
+  -d '{"url":"https://external.example/pixel.gif"}'
 ```
 
 **Response:**
 
 ```json
 {
-  "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.com/pixel.gif&tstoken=abc123..."
+  "signed_url": "https://edge.example.com/first-party/proxy?tsurl=https://external.example/pixel.gif&tstoken=abc123..."
 }
 ```
 
@@ -222,7 +222,7 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 
 ```json
 {
-  "tsclick": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&tstoken=original...",
+  "tsclick": "https://edge.example.com/first-party/click?tsurl=https://advertiser.example&campaign=123&tstoken=original...",
   "add": {
     "utm_source": "banner"
   },
@@ -234,7 +234,7 @@ URL mutation recovery endpoint. Rebuilds signed proxy URL after creative JavaScr
 
 ```json
 {
-  "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.com&campaign=123&utm_source=banner&tstoken=new..."
+  "url": "https://edge.example.com/first-party/click?tsurl=https://advertiser.example&campaign=123&utm_source=banner&tstoken=new..."
 }
 ```
 

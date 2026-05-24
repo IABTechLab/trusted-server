@@ -82,7 +82,7 @@ Proxies Didomi SDK resources through first-party domain.
 
 ```
 Original: https://sdk.privacy-center.org/24cd1234/loader.js
-Proxied:  https://your-domain.com/integrations/didomi/consent/24cd1234/loader.js
+Proxied:  https://your-domain.example/integrations/didomi/consent/24cd1234/loader.js
 ```
 
 **Headers Forwarded**:
@@ -119,7 +119,7 @@ Proxies Didomi API requests (consent events, user preferences, etc.).
 
 ```
 Original: https://api.privacy-center.org/v1/events
-Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
+Proxied:  https://your-domain.example/integrations/didomi/consent/api/v1/events
 ```
 
 **Methods**: GET, POST, PUT, DELETE, OPTIONS
@@ -258,8 +258,8 @@ Ensure your Didomi organization ID is in the SDK path:
 Add DNS preconnect for faster loading:
 
 ```html
-<link rel="preconnect" href="https://your-domain.com" />
-<link rel="dns-prefetch" href="https://your-domain.com" />
+<link rel="preconnect" href="https://your-domain.example" />
+<link rel="dns-prefetch" href="https://your-domain.example" />
 ```
 
 ### 3. Cache SDK Responses
