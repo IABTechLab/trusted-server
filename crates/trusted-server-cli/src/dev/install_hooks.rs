@@ -129,16 +129,21 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), Report<InstallHooksEr
 }
 
 /// Read a single dotted-key value from the local repo config.
-/// Returns `Ok(None)` if the config file or key is absent.
+/// Returns `Ok(None)` if the config file is missing or the key is
+/// unset; propagates any other open/parse error (permission denied,
+/// malformed config) as [`InstallHooksError::ConfigWrite`] so the
+/// foreign-`core.hooksPath` preflight can't silently misread a
+/// real config and overwrite it.
 fn read_local_config_value(
     repo: &gix::Repository,
     dotted_key: &str,
 ) -> Result<Option<String>, Report<InstallHooksError>> {
     let config_path = repo.git_dir().join("config");
-    let file = match GixConfigFile::from_path_no_includes(config_path, gix_config::Source::Local) {
-        Ok(f) => f,
-        Err(_) => return Ok(None),
-    };
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let file = GixConfigFile::from_path_no_includes(config_path, gix_config::Source::Local)
+        .change_context(InstallHooksError::ConfigWrite)?;
     Ok(file
         .raw_value(dotted_key)
         .ok()

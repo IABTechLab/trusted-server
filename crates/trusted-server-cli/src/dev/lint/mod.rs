@@ -19,6 +19,11 @@ pub(crate) mod test_support;
 #[derive(Debug, Subcommand)]
 pub enum LintCommand {
     /// Lint URL hosts in source/config/docs.
+    ///
+    /// With no flags or paths, scans every tracked file's *working-tree*
+    /// content (includes unstaged edits, so a local audit may diverge
+    /// from CI on the same commit). Use `--changed-vs <ref>` for the
+    /// committed-state PR mode.
     Domains(DomainsArgs),
 }
 
@@ -34,7 +39,8 @@ pub struct DomainsArgs {
     pub changed_vs: Option<String>,
 
     /// Explicit paths to scan in full. Mutually exclusive with
-    /// `--staged` / `--changed-vs`.
+    /// `--staged` / `--changed-vs`. Unstaged content is read directly
+    /// from each named file.
     #[arg(value_name = "PATH", conflicts_with_all = ["staged", "changed_vs"])]
     pub paths: Vec<PathBuf>,
 
