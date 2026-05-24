@@ -673,9 +673,17 @@ the match.
 **Absolute URL regex:**
 
 ```
-(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)
+(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)
 ```
 
+- `(?:[^/?\s#]+@)?` is a non-capturing optional group that consumes
+  any RFC 3986 `userinfo@` prefix so the captured host is the real
+  authority. Without it, `https://github.com@test.com/path` would
+  extract the allowlisted `github.com` and miss the actual host
+  `test.com` — a real bypass for a security-relevant linter.
+  Multi-`@` userinfo is handled by regex backtracking: the engine
+  consumes as much as possible while still finding an `@` followed
+  by a valid host token.
 - The non-IPv6 host branch `[A-Za-z0-9][A-Za-z0-9.\-]*` requires the
   host to **start with an alphanumeric** character. This rejects
   placeholder noise like `https://...` (which the earlier
@@ -690,7 +698,7 @@ the match.
 **Protocol-relative URL regex:**
 
 ```
-(?i)(?:^|[\s"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
+(?i)(?:^|[\s"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})
 ```
 
 - The non-capturing group `(?:^|[\s"'(=<>{,\[\]` + backtick + `])`
@@ -700,6 +708,9 @@ the match.
   JavaScript/TypeScript template literals
   (`` `//cdn.example.com/${path}` ``); `{`, `[`, `,` cover
   JSON / TS object literals where a URL string follows a key.
+- `(?:[^/?\s#]+@)?` skips userinfo for the same bypass-prevention
+  reason as the absolute URL regex — `//github.com@evil.example/x`
+  reports `evil.example`, not `github.com`.
 - **Why not `:`?** `:` deliberately excluded — `http://foo.com` has
   `//` preceded by `:` (the URL scheme separator). Adding `:` to the
   boundary class would cause the protocol-relative regex to also
@@ -1843,70 +1854,71 @@ the question.
 
 ## Resolved by the Phase 2 spike
 
-1. **`gix` API entry points — RESOLVED.** The Phase 2 feasibility
-   spike (`crates/trusted-server-cli/tests/spike_gix_*.rs`) pinned
-   the following gix 0.83 entry points:
-   - **Repo / objects:** `gix::open`, `gix::init`,
-     `Repository::write_blob`, `Repository::find_object` (→
-     `Object { data: Vec<u8>, .. }`), `Repository::find_tree`,
-     `Repository::find_commit`, `Repository::head_commit`,
-     `Repository::head_id`.
-   - **Tree construction (test fixtures):** `Repository::empty_tree`,
-     `Repository::edit_tree` + `Editor::upsert` + `Editor::write`,
-     `Repository::commit_as` (with `Signature::to_ref` +
-     `gix::date::parse::TimeBuf`).
-   - **Tree traversal:** `tree.traverse().breadthfirst.files()` →
-     `Vec<gix_traverse::tree::recorder::Entry { mode, filepath, oid }>`.
-     Filter to blobs with `EntryMode::is_blob()`.
-   - **Index:** `Repository::index()` → entries via
-     `state.entries()`, path via `entry.path(&state)`, blob id via
-     `entry.id`, file filter via
-     `entry.mode.contains(gix::index::entry::Mode::FILE)`. Building
-     a fixture index: `gix::index::State::new` +
-     `dangerously_push_entry` + `sort_entries` +
-     `gix::index::File::from_state` + `File::write`.
-   - **merge-base / refs:** `Repository::merge_base(base, head)`,
-     `Repository::find_reference` + `Reference::peel_to_id`
-     (`peel_to_id_in_place` is deprecated), `Repository::reference`
-     for branch creation, `Repository::edit_reference` with a
-     `Target::Symbolic` `RefEdit` for moving HEAD.
-   - **Blob line diff:** `gix::diff::blob::{Algorithm, Diff,
+1.  **`gix` API entry points — RESOLVED.** The Phase 2 feasibility
+    spike (`crates/trusted-server-cli/tests/spike_gix_*.rs`) pinned
+    the following gix 0.83 entry points:
+    - **Repo / objects:** `gix::open`, `gix::init`,
+      `Repository::write_blob`, `Repository::find_object` (→
+      `Object { data: Vec<u8>, .. }`), `Repository::find_tree`,
+      `Repository::find_commit`, `Repository::head_commit`,
+      `Repository::head_id`.
+    - **Tree construction (test fixtures):** `Repository::empty_tree`,
+      `Repository::edit_tree` + `Editor::upsert` + `Editor::write`,
+      `Repository::commit_as` (with `Signature::to_ref` +
+      `gix::date::parse::TimeBuf`).
+    - **Tree traversal:** `tree.traverse().breadthfirst.files()` →
+      `Vec<gix_traverse::tree::recorder::Entry { mode, filepath, oid }>`.
+      Filter to blobs with `EntryMode::is_blob()`.
+    - **Index:** `Repository::index()` → entries via
+      `state.entries()`, path via `entry.path(&state)`, blob id via
+      `entry.id`, file filter via
+      `entry.mode.contains(gix::index::entry::Mode::FILE)`. Building
+      a fixture index: `gix::index::State::new` +
+      `dangerously_push_entry` + `sort_entries` +
+      `gix::index::File::from_state` + `File::write`.
+    - **merge-base / refs:** `Repository::merge_base(base, head)`,
+      `Repository::find_reference` + `Reference::peel_to_id`
+      (`peel_to_id_in_place` is deprecated), `Repository::reference`
+      for branch creation, `Repository::edit_reference` with a
+      `Target::Symbolic` `RefEdit` for moving HEAD.
+    - **Blob line diff:** `gix::diff::blob::{Algorithm, Diff,
 InternedInput}` — `Diff::compute(Algorithm::Myers, &input)`,
-     then `diff.hunks()`; each `Hunk.after` is the new-side token
-     (line) range.
-   - **Tree-vs-tree diff with rename detection.** Both the staged
-     and `--changed-vs` collectors call `old_tree.changes()` →
-     `Platform::for_each_to_obtain_tree(&new_tree, ...)` with
-     `track_rewrites(Some(Rewrites { copies: None, percentage:
+      then `diff.hunks()`; each `Hunk.after` is the new-side token
+      (line) range.
+    - **Tree-vs-tree diff with rename detection.** Both the staged
+      and `--changed-vs` collectors call `old_tree.changes()` →
+      `Platform::for_each_to_obtain_tree(&new_tree, ...)` with
+      `track_rewrites(Some(Rewrites { copies: None, percentage:
 Some(0.5), limit: 1000, track_empty: false }))`. The callback
-     iterates `Change::{Addition, Modification, Rewrite,
+      iterates `Change::{Addition, Modification, Rewrite,
 Deletion}` — pure renames (same blob, new path) yield no
-     added lines; rename + edit diffs the matched old blob vs the
-     new blob.
+      added lines; rename + edit diffs the matched old blob vs the
+      new blob.
 
-     **Resolution note:** an earlier revision of this spec rejected
-     `Platform`/`for_each_to_obtain_tree` and prescribed a manual
-     map-walk. That approach silently broke renames: a renamed file
-     hit `(None, Some(new_id))` and was diffed against an empty
-     blob, reporting every line of the renamed file as added
-     (including pre-existing violations the author never touched).
-     The current spec uses the `Platform` API so rename detection
-     is correct by construction.
+           **Resolution note:** an earlier revision of this spec rejected
+           `Platform`/`for_each_to_obtain_tree` and prescribed a manual
+           map-walk. That approach silently broke renames: a renamed file
+           hit `(None, Some(new_id))` and was diffed against an empty
+           blob, reporting every line of the renamed file as added
+           (including pre-existing violations the author never touched).
+           The current spec uses the `Platform` API so rename detection
+           is correct by construction.
 
-     For staged mode, the index is first materialised as a tree
-     via `Repository::edit_tree` → per-entry `Editor::upsert(path,
-EntryKind::Blob, entry.id)` → `Editor::write()`, then the
-     same tree-vs-tree path serves both modes.
+           For staged mode, the index is first materialised as a tree
+           via `Repository::edit_tree` → per-entry `Editor::upsert(path,
 
-   - **gix-config:** `File::from_path_no_includes(path,
+      EntryKind::Blob, entry.id)`→`Editor::write()`, then the
+      same tree-vs-tree path serves both modes.
+
+    - **gix-config:** `File::from_path_no_includes(path,
 Source::Local)`, `File::set_raw_value` (dotted `AsKey` form —
-     avoids the `File<'event>` invariance that bites
-     `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
+      avoids the `File<'event>` invariance that bites
+      `set_raw_value_by`), `File::raw_value`, `File::to_bstring`.
 
-2. **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
-   `gix-config = 0.56`, same gitoxide release family. See
-   [Cargo dependencies](#cargo-dependencies) for the full feature
-   set and rationale.
+2.  **`gix` / `gix-config` version pins — RESOLVED.** `gix = 0.83`,
+    `gix-config = 0.56`, same gitoxide release family. See
+    [Cargo dependencies](#cargo-dependencies) for the full feature
+    set and rationale.
 
 ## Open Questions
 

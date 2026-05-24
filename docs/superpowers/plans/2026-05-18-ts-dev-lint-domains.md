@@ -1196,8 +1196,12 @@ fn absolute_url_regex() -> &'static Regex {
     R.get_or_init(|| {
         // (?i) case-insensitive; host must start with alphanumeric to
         // reject placeholders like https://...
-        Regex::new(r"(?i)https?://(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)")
-            .expect("should compile absolute URL regex")
+        // (?:[^/?\s#]+@)? skips RFC 3986 userinfo so a deceiving
+        // https://github.com@test.com/path reports test.com.
+        Regex::new(
+            r"(?i)https?://(?:[^/?\s#]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9][A-Za-z0-9.\-]*)",
+        )
+        .expect("should compile absolute URL regex")
     })
 }
 
@@ -1315,8 +1319,10 @@ fn protocol_relative_regex() -> &'static Regex {
         // Boundary class: start-of-line, whitespace, quotes, paren,
         // =, <, >, {, [, ], comma, backtick. NOT colon (would
         // double-match absolute URLs).
+        // (?:[^/?\s#]+@)? skips userinfo for bypass prevention,
+        // same reason as the absolute URL regex.
         Regex::new(
-            r"(?i)(?:^|[\s\"'(=<>{,\[\]`])//([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})",
+            r"(?i)(?:^|[\s\"'(=<>{,\[\]`])//(?:[^/?\s#]+@)?([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})",
         )
         .expect("should compile protocol-relative URL regex")
     })

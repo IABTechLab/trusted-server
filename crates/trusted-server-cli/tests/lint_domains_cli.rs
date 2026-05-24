@@ -544,6 +544,97 @@ curl https://test.com/foo
     }
 }
 
+/// Spec case 32 (positive half): an `.html` file outside the
+/// integrations-fixtures exclusion is scanned normally.
+#[test]
+fn html_file_outside_fixtures_is_scanned() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let repo = common::init_repo(temp.path());
+
+    let nested = temp.path().join("crates/trusted-server-core/src");
+    std::fs::create_dir_all(&nested).expect("nested dir");
+    std::fs::write(
+        nested.join("html_processor.test.html"),
+        "<a href=\"https://test.com\">x</a>\n",
+    )
+    .expect("write html");
+
+    common::stage_all(&repo);
+    common::commit_all(&repo, "seed html");
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "html_processor.test.html:1: disallowed host test.com",
+        ));
+}
+
+/// Spec case 33: proves the `**/fixtures/**` blanket exclusion was
+/// removed. A `.tsx` file under
+/// `crates/integration-tests/fixtures/frameworks/nextjs/app/` IS
+/// scanned, even though it lives under a `fixtures` directory.
+#[test]
+fn integration_test_fixture_tsx_is_scanned() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    let repo = common::init_repo(temp.path());
+
+    let nested = temp
+        .path()
+        .join("crates/integration-tests/fixtures/frameworks/nextjs/app");
+    std::fs::create_dir_all(&nested).expect("nested dir");
+    std::fs::write(nested.join("page.tsx"), "fetch(\"https://test.com\");\n")
+        .expect("write page.tsx");
+
+    common::stage_all(&repo);
+    common::commit_all(&repo, "seed nextjs fixture");
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "page.tsx:1: disallowed host test.com",
+        ));
+}
+
+/// Spec case 41: a fenced code block in Markdown that references an
+/// allowlisted `REFERENCE_HOSTS` URL (`https://docs.rs/clap`) is
+/// not flagged.
+#[test]
+fn markdown_fenced_block_with_allowed_reference_passes() {
+    let temp = repo_with_initial_commit();
+    let repo = gix::open(temp.path()).expect("reopen repo");
+    let body = "\
+# Doc
+
+```
+cargo add clap  # see https://docs.rs/clap
+```
+";
+    std::fs::write(temp.path().join("doc.md"), body).expect("write doc.md");
+    common::stage_all(&repo);
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains", "--staged"])
+        .assert()
+        .code(0);
+}
+
+/// Spec case 45: a bare repo (no working tree) yields exit 2 in
+/// full-repo mode — there is no working tree to scan.
+#[test]
+fn full_repo_in_bare_repo_exits_two() {
+    let temp = tempfile::tempdir().expect("should create tempdir");
+    gix::init_bare(temp.path()).expect("should init bare repo");
+
+    ts_in(&temp)
+        .args(["dev", "lint", "domains"])
+        .assert()
+        .code(2);
+}
+
 /// Spec case 38: an HTML-comment suppression marker on a Markdown
 /// line suppresses the violation; a wrong-host marker still flags
 /// the real host and emits a stderr "unused marker" warning.
