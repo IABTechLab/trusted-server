@@ -515,6 +515,20 @@ mod protocol_relative_tests {
             vec!["evil.example"]
         );
     }
+
+    /// Documents an accepted limitation: a `//email@domain` token in
+    /// a code comment is indistinguishable from a protocol-relative
+    /// URL with userinfo, and so is reported. Preserving the
+    /// userinfo-bypass protection (above) is the higher-priority
+    /// constraint; users can suppress per-line with
+    /// `// allow-domain: domain.com` when the email is intentional.
+    #[test]
+    fn comment_style_email_is_flagged_by_design() {
+        assert_eq!(
+            extract_protocol_relative_hosts("//support@test.com"),
+            vec!["test.com"]
+        );
+    }
 }
 
 /// Regex for the per-line suppression marker. The comment introducer
