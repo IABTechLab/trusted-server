@@ -57,9 +57,11 @@ These decisions are finalized and reflected in this plan:
 6. **IntegrationProxy trait + all implementations change in one PR** — the
    trait has 8 production implementations (plus 2 test impls); splitting
    across PRs breaks compilation.
-7. **Rust CI must enforce workspace-wide gates** — required commands are
-   `cargo test --workspace`, `cargo clippy --workspace --all-targets
---all-features -- -D warnings`, and `cargo fmt --all -- --check`.
+7. **Rust CI must enforce target-matched gates** — the workspace contains
+   multiple adapter runtimes, so CI uses adapter-specific aliases/targets:
+   Fastly on `wasm32-wasip1` via Viceroy, Axum on native, Cloudflare on native
+   plus `wasm32-unknown-unknown`, Spin on native plus `wasm32-wasip1`, and
+   `cargo fmt --all -- --check`.
 8. **Follow EdgeZero crate naming convention** — `trusted-server-core`,
    `trusted-server-adapter-fastly`, `trusted-server-adapter-cloudflare`,
    `trusted-server-adapter-axum`.
@@ -519,9 +521,9 @@ Changes:
   commands, and any crate path references to reflect new names
 - Update `CONTRIBUTING.md` if crate references appear there
 - Update `.env.dev` if it references crate paths
-- Verify `cargo build --workspace`, `cargo test --workspace`, and
-  `cargo build --package trusted-server-adapter-fastly --target wasm32-wasip1`
-  all pass
+- Verify the target-matched Rust gates pass: Fastly wasm build/test,
+  adapter-native checks/tests where available, clippy aliases, and
+  `cargo fmt --all -- --check`
 
 Verify: `http` crate version compatibility between `fastly = "0.11.12"` and
 EdgeZero — both use `http` 1.x, so this is expected compatible. Confirm
@@ -540,7 +542,8 @@ Changes:
   1. A `#[cfg(test)]` unit test (in `platform/mod.rs`) that constructs
      a `RuntimeServices` instance from dummy impls — proving every
      concrete dummy can be boxed as `Box<dyn Trait + Send + Sync>` and
-     stored in the struct. Runs via `cargo test --workspace` on host.
+     stored in the struct. Runs via the target-matched test gate for the
+     crate under change.
   2. A non-test function-based static assertion (also in
      `platform/mod.rs`) that the compiler type-checks but never calls:
      ```rust
@@ -769,22 +772,28 @@ implementations produce identical behavior to the current direct SDK calls.
   developer workflow changes (e.g., new build targets, new test commands).
 - **Configuration:** Update `fastly.toml`, `trusted-server.toml`, `.env.dev`,
   or `Cargo.toml` workspace settings as needed.
-- **Per-PR build gates (all must pass before merge):**
+- **Per-PR build gates (all relevant commands must pass before merge):**
   ```bash
-  cargo build --workspace                                                      # host target (all crates)
-  cargo build --package trusted-server-adapter-fastly --target wasm32-wasip1   # Fastly deploy target
-  cargo test --workspace                                                       # all tests
-  cargo clippy --workspace --all-targets --all-features -- -D warnings         # lint (workspace-wide per Decision #7)
-  cargo fmt --all -- --check                                                   # format
+  cargo test-fastly                                                            # Fastly + core via Viceroy
+  cargo test-axum                                                              # Axum native
+  cargo test-cloudflare                                                        # Cloudflare native
+  cargo test-spin                                                              # Spin native
+  cargo clippy-fastly
+  cargo clippy-axum
+  cargo clippy-cloudflare
+  cargo clippy-spin-native
+  cargo clippy-spin-wasm
+  cargo fmt --all -- --check
   ```
-  The wasm build is required on every PR to ensure continuous deployability
-  to Fastly. A PR that passes host build but breaks wasm is not mergeable.
+  The target-matched wasm builds are required to ensure continuous
+  deployability to each edge runtime. A PR that passes native checks but
+  breaks its wasm target is not mergeable.
   Starting with PR 17 (Cloudflare adapter), add a second wasm gate:
   `cargo build --package trusted-server-adapter-cloudflare --target wasm32-unknown-unknown`.
   The Cloudflare adapter targets `wasm32-unknown-unknown` (not `wasm32-wasip1`)
   because Workers use a different WASI-less execution model.
-  The Cloudflare crate must also remain host-compilable so
-  `cargo build --workspace` and `cargo clippy --workspace` continue to pass.
+  The Cloudflare crate must also remain host-compilable so native
+  Cloudflare check/test/clippy gates continue to pass.
   Use `cfg`-gated entrypoint shims where needed for non-wasm builds.
 
 #### PR 3 — Extract config store behind trait
@@ -1368,8 +1377,7 @@ Changes:
   basic-auth gate tests
 - **CI updates (land with this PR):** add GitHub Actions build/test/lint
   jobs for `trusted-server-adapter-axum` (native target). Ensure
-  `cargo test --workspace` and `cargo clippy --workspace` cover the new
-  crate
+  `cargo test-axum` and `cargo clippy-axum` cover the new crate
 - Update `CLAUDE.md`: add Axum build/run commands, update workspace layout
 - Update root `Cargo.toml` workspace members
 
@@ -1409,6 +1417,43 @@ Changes:
   workspace layout
 - Update root `Cargo.toml` workspace members
 
+#### PR 19 — Add Fermyon Spin entry point
+
+**Blocked by:** PR 17 and the EdgeZero Spin adapter/stores merge
+**Files:** New `crates/trusted-server-adapter-spin/` crate
+
+Changes:
+
+- New crate with `edgezero-adapter-spin` dependency
+- Entry point using `#[http_component]` and
+  `edgezero_adapter_spin::run_app()` with a separate EdgeZero manifest
+- Same `Hooks::routes()` route wiring and middleware ordering as Cloudflare
+- Construct `RuntimeServices` with Spin-backed config/KV handles injected by
+  EdgeZero, a sync Spin variable secret adapter, null geo, and a conservative
+  Spin outbound HTTP client
+- Add separate `edgezero.toml` and `spin.toml` manifests. The EdgeZero
+  manifest is passed to `run_app`; the Spin runtime manifest is used by
+  `spin up` and deployment
+- Add route smoke tests, EdgeZero manifest validation, admin basic-auth gate
+  tests, deterministic method-not-allowed coverage, and native tests for the
+  outbound response header/decompression policy
+- Add Spin to the in-process parity suite beside Axum and Cloudflare
+- **CI updates (land with this PR):** add GitHub Actions jobs for
+  `trusted-server-adapter-spin` — native host check/tests plus explicit
+  `wasm32-wasip1` check/build with `--features spin`
+- **Known MVP limits:** Spin component variables are a flat namespace, so
+  request-signing reads use documented collision-free encoded variable names and
+  prefixed signing-key secret names. Authenticated request-signing rotation
+  success is not claimed until Spin write support is defined. Spin KV TTL is
+  unavailable in the current EdgeZero Spin KV adapter, so expiring consent KV
+  writes may degrade until a TTL strategy is added. Spin outbound HTTP mirrors
+  Cloudflare's conservative path: `send_async()` eagerly sends and `select()`
+  rejects multi-provider fan-out, so Spin should be configured with one auction
+  provider until native concurrent fan-out is added
+- Update `CLAUDE.md`: add Spin build/check/test commands and target-matched
+  clippy guidance
+- Update root `Cargo.toml` workspace members
+
 ### Phase 5: Verification, Cutover, and Rollback
 
 > **Non-blocking for migration execution.** Phases 0-4 are gated by per-PR
@@ -1423,7 +1468,7 @@ Changes:
   (`/static/tsjs=*`, `/.well-known/trusted-server.json`,
   `/verify-signature`, `/admin/keys/rotate`, `/admin/keys/deactivate`,
   `/auction`, `/first-party/*`, integration routes, and publisher fallback)
-- Cross-adapter behavior parity tests (Fastly vs Axum vs Cloudflare) for:
+- Cross-adapter behavior parity tests (Fastly vs Axum vs Cloudflare vs Spin) for:
   response status/body, required headers, cookie behavior, and request-signing
   responses
 - Explicit parity tests for admin key routes on Axum and Cloudflare (success,
@@ -1444,17 +1489,19 @@ Changes:
 - HTML rewriting golden tests for injection and integration rewriters
 - Performance regression checks for p95 latency and response size
 
-#### CI updates (scoped to PRs 16 and 17 — not Phase 5)
+#### CI updates (scoped to adapter-introduction PRs — not Phase 5)
 
 CI for new adapter crates lands **with the PRs that introduce them**,
-not as a separate Phase 5 deliverable. See PR 16 and PR 17 sections for
+not as a separate Phase 5 deliverable. See PR 16, PR 17, and PR 19 sections for
 specifics. Summary of what each PR adds:
 
 - **PR 16:** CI jobs for `trusted-server-adapter-axum` (native target)
 - **PR 17:** CI jobs for `trusted-server-adapter-cloudflare`
   (native + `wasm32-unknown-unknown` target)
-- Workspace-wide gates (`cargo test --workspace`, `cargo clippy --workspace`,
-  `cargo fmt --all`) already cover new crates once added to workspace members
+- **PR 19:** CI jobs for `trusted-server-adapter-spin`
+  (native + `wasm32-wasip1` target)
+- Target-matched adapter gates cover new crates once they are added to
+  workspace members. `cargo fmt --all -- --check` remains workspace-wide.
 - Existing JS format and test gates remain unchanged
 
 #### Cutover plan
@@ -1549,8 +1596,8 @@ Week 8:     TS PR 12.5 (thread RuntimeServices into integration/provider
 Week 9:     TS PRs 14-15 (entry point switch, remove fastly from core
             + delete compatibility adapter)
 
-Week 10:    TS PRs 16-17 (Axum dev server + admin routes,
-            Cloudflare entry point + admin routes)
+Week 10:    TS PRs 16-17 + 19 (Axum dev server + admin routes,
+            Cloudflare entry point + admin routes, Spin entry point)
 
 Week 11:    Phase 5 verification
             + canary + rollback drills
@@ -1600,26 +1647,27 @@ File issues (with TBD owners) before Phase 0 begins so the dependency
 graph is visible. Assign concrete owners during sprint planning — issues
 are not actionable until ownership is resolved.
 
-| PR      | Title                                                              | Blocked by                          | DoD (Definition of Done)                                                                                                                                                                                                                                                                                                             | Owner | Labels                 | Milestone |
-| ------- | ------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- | ---------------------- | --------- |
-| PR 1    | Rename crates and add EdgeZero workspace dependencies              | —                                   | All per-PR gates pass; `cargo doc` builds; CLAUDE.md updated                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-0      | Phase 0   |
-| PR 2    | Define platform traits, ClientInfo, PlatformError, RuntimeServices | PR 1                                | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send; ClientInfo struct defined                                                                                                                                                      | TBD   | edgezero, phase-0      | Phase 0   |
-| PR 3    | Split fastly_storage.rs + config store trait (read-only)           | PR 2                                | File split done; read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 4    | Secret store trait (read-only)                                     | PR 3                                | Read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 5    | KV store trait                                                     | PR 3                                | KV CRUD wired through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                                                             | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 6    | Backend + HTTP client traits                                       | PR 2                                | PlatformResponse with backend_name; send/send_async abstracted; per-PR gates                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 7    | Geo lookup + client info (extract-once)                            | PR 2                                | ClientInfo populated at entry; geo/client-info reads go through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                   | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 8    | Content rewriting trait (or verification)                          | PR 2                                | Platform-specific or agnostic outcome documented; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 9    | Wire signing to store write primitives                             | PR 4                                | api_client.rs deleted from core; management_api.rs in adapter; per-PR gates                                                                                                                                                                                                                                                          | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 10   | Abstract logging initialization                                    | PR 2                                | log-fastly in adapter only; core uses log macros; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1      | Phase 1   |
-| PR 11   | Utility layer type migration + compat adapter                      | PRs 3-10                            | Utilities use http types; compat.rs created; per-PR gates pass                                                                                                                                                                                                                                                                       | TBD   | edgezero, phase-2      | Phase 2   |
-| PR 12   | Handler layer type migration                                       | PR 11                               | Handlers use http types; conversion boundary in adapter main.rs; per-PR gates                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-2      | Phase 2   |
-| PR 12.5 | Thread RuntimeServices into integrations/providers                 | PR 12                               | All integration + provider traits accept &RuntimeServices; all callers thread it; no type changes; per-PR gates pass                                                                                                                                                                                                                 | TBD   | edgezero, phase-2      | Phase 2   |
-| PR 13   | Integration + provider layer type migration                        | PR 12.5                             | All 5 sub-slice checks pass; async request_bids; send/send_async migrated; per-PR gates pass                                                                                                                                                                                                                                         | TBD   | edgezero, phase-2      | Phase 2   |
-| PR 14   | Fastly entry point switch (dual-path with flag)                    | PR 13                               | Both paths compile; legacy cleanup issue filed; per-PR gates pass                                                                                                                                                                                                                                                                    | TBD   | edgezero, phase-3      | Phase 3   |
-| PR 15   | Remove fastly from core crate                                      | PR 14                               | Core has zero fastly/tokio imports; compat.rs deleted; tokio removed from core Cargo.toml; per-PR gates pass                                                                                                                                                                                                                         | TBD   | edgezero, phase-3      | Phase 3   |
-| PR 16   | Axum dev server entry point                                        | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; Axum CI jobs added; per-PR gates pass                                                                                                                                                                                                                              | TBD   | edgezero, phase-4      | Phase 4   |
-| PR 17   | Cloudflare entry point                                             | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; crate host-compilable (cfg-gated shims); Cloudflare CI jobs added (native + wasm32-unknown-unknown); per-PR gates pass                                                                                                                                             | TBD   | edgezero, phase-4      | Phase 4   |
-| —       | Phase 5: Verification gates                                        | PRs 16-17                           | Route parity all routes; cross-adapter behavior (status/body/headers/cookies/signing); admin key routes (success/auth-fail/validation-fail/storage-fail); basic-auth parity (401, WWW-Authenticate, path matching); auction async fan-out + error-correlation; HTML golden tests; p95 latency + response size regression checks pass | TBD   | edgezero, phase-5      | Phase 5   |
-| —       | Phase 5: Cutover and canary rollout                                | Phase 5: Verification gates         | Config flag live; canary at 1%→10%→50%→100% with hold points; rollback tested                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-5      | Phase 5   |
-| —       | Legacy entry point cleanup (post-cutover)                          | Phase 5: Cutover and canary rollout | legacy_main() and flag plumbing deleted; per-PR gates pass                                                                                                                                                                                                                                                                           | TBD   | edgezero, post-cutover | Phase 5   |
+| PR      | Title                                                              | Blocked by                          | DoD (Definition of Done)                                                                                                                                                                                                                                                                                                             | Owner | Labels                  | Milestone |
+| ------- | ------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- | ----------------------- | --------- |
+| PR 1    | Rename crates and add EdgeZero workspace dependencies              | —                                   | All per-PR gates pass; `cargo doc` builds; CLAUDE.md updated                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-0       | Phase 0   |
+| PR 2    | Define platform traits, ClientInfo, PlatformError, RuntimeServices | PR 1                                | Traits compile on host + wasm; object-safety static assertion + dummy RuntimeServices unit test pass; async_trait wired with target-conditional Send; ClientInfo struct defined                                                                                                                                                      | TBD   | edgezero, phase-0       | Phase 0   |
+| PR 3    | Split fastly_storage.rs + config store trait (read-only)           | PR 2                                | File split done; read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 4    | Secret store trait (read-only)                                     | PR 3                                | Read path wired; write stubs return error; per-PR gates pass                                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 5    | KV store trait                                                     | PR 3                                | KV CRUD wired through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                                                             | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 6    | Backend + HTTP client traits                                       | PR 2                                | PlatformResponse with backend_name; send/send_async abstracted; per-PR gates                                                                                                                                                                                                                                                         | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 7    | Geo lookup + client info (extract-once)                            | PR 2                                | ClientInfo populated at entry; geo/client-info reads go through RuntimeServices; per-PR gates pass                                                                                                                                                                                                                                   | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 8    | Content rewriting trait (or verification)                          | PR 2                                | Platform-specific or agnostic outcome documented; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 9    | Wire signing to store write primitives                             | PR 4                                | api_client.rs deleted from core; management_api.rs in adapter; per-PR gates                                                                                                                                                                                                                                                          | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 10   | Abstract logging initialization                                    | PR 2                                | log-fastly in adapter only; core uses log macros; per-PR gates pass                                                                                                                                                                                                                                                                  | TBD   | edgezero, phase-1       | Phase 1   |
+| PR 11   | Utility layer type migration + compat adapter                      | PRs 3-10                            | Utilities use http types; compat.rs created; per-PR gates pass                                                                                                                                                                                                                                                                       | TBD   | edgezero, phase-2       | Phase 2   |
+| PR 12   | Handler layer type migration                                       | PR 11                               | Handlers use http types; conversion boundary in adapter main.rs; per-PR gates                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-2       | Phase 2   |
+| PR 12.5 | Thread RuntimeServices into integrations/providers                 | PR 12                               | All integration + provider traits accept &RuntimeServices; all callers thread it; no type changes; per-PR gates pass                                                                                                                                                                                                                 | TBD   | edgezero, phase-2       | Phase 2   |
+| PR 13   | Integration + provider layer type migration                        | PR 12.5                             | All 5 sub-slice checks pass; async request_bids; send/send_async migrated; per-PR gates pass                                                                                                                                                                                                                                         | TBD   | edgezero, phase-2       | Phase 2   |
+| PR 14   | Fastly entry point switch (dual-path with flag)                    | PR 13                               | Both paths compile; legacy cleanup issue filed; per-PR gates pass                                                                                                                                                                                                                                                                    | TBD   | edgezero, phase-3       | Phase 3   |
+| PR 15   | Remove fastly from core crate                                      | PR 14                               | Core has zero fastly/tokio imports; compat.rs deleted; tokio removed from core Cargo.toml; per-PR gates pass                                                                                                                                                                                                                         | TBD   | edgezero, phase-3       | Phase 3   |
+| PR 16   | Axum dev server entry point                                        | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; Axum CI jobs added; per-PR gates pass                                                                                                                                                                                                                              | TBD   | edgezero, phase-4       | Phase 4   |
+| PR 17   | Cloudflare entry point                                             | PR 15                               | Route parity + basic-auth gate tests pass; admin key routes work; crate host-compilable (cfg-gated shims); Cloudflare CI jobs added (native + wasm32-unknown-unknown); per-PR gates pass                                                                                                                                             | TBD   | edgezero, phase-4       | Phase 4   |
+| PR 19   | Spin entry point                                                   | PR 17 + EdgeZero Spin stores        | Route parity + basic-auth gate tests pass; crate host-compilable; Spin wasm32-wasip1 check/build added; CI jobs added; known Spin config variable and KV TTL limitations documented                                                                                                                                                  | TBD   | edgezero, phase-4, spin | Phase 4   |
+| —       | Phase 5: Verification gates                                        | PRs 16-17 + PR 19                   | Route parity all routes; cross-adapter behavior (status/body/headers/cookies/signing); admin key routes (success/auth-fail/validation-fail/storage-fail); basic-auth parity (401, WWW-Authenticate, path matching); auction async fan-out + error-correlation; HTML golden tests; p95 latency + response size regression checks pass | TBD   | edgezero, phase-5       | Phase 5   |
+| —       | Phase 5: Cutover and canary rollout                                | Phase 5: Verification gates         | Config flag live; canary at 1%→10%→50%→100% with hold points; rollback tested                                                                                                                                                                                                                                                        | TBD   | edgezero, phase-5       | Phase 5   |
+| —       | Legacy entry point cleanup (post-cutover)                          | Phase 5: Cutover and canary rollout | legacy_main() and flag plumbing deleted; per-PR gates pass                                                                                                                                                                                                                                                                           | TBD   | edgezero, post-cutover  | Phase 5   |

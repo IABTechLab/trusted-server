@@ -181,8 +181,12 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
+            tls_cipher: req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_string),
         })
         .build()
 }

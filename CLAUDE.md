@@ -17,6 +17,7 @@ crates/
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
+  trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   js/            # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -31,7 +32,7 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 | Rust        | 1.91.1 (pinned in `rust-toolchain.toml`) |
 | WASM target | `wasm32-wasip1`                          |
 | Node        | LTS (for JS build)                       |
-| Viceroy     | Latest (Fastly local simulator)          |
+| Viceroy     | 0.16.5 (pinned in `.tool-versions`)      |
 
 ---
 
@@ -40,8 +41,8 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 ### Rust
 
 ```bash
-# Build
-cargo build
+# Check default workspace member
+cargo check
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -66,6 +67,21 @@ cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown
 
 # Test Cloudflare adapter (native host)
 cargo test-cloudflare
+
+# Check Spin adapter (native)
+cargo check -p trusted-server-adapter-spin
+
+# Check Spin adapter (WASM target)
+cargo check-spin
+
+# Test Spin adapter (native host)
+cargo test-spin
+
+# Production-style Spin WASM artifact used by crates/trusted-server-adapter-spin/spin.toml
+cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+# Optional local Spin runtime smoke, if the Spin CLI is installed
+spin up --from crates/trusted-server-adapter-spin
 ```
 
 ### Testing & Quality
@@ -76,11 +92,20 @@ cargo test-cloudflare
 cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
+cargo test-spin        # Spin adapter route tests (native host)
 
 # Format
 cargo fmt --all -- --check
 
-# Lint
+# Lint by adapter target
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-spin-native
+cargo clippy-spin-wasm
+
+# Optional compatibility check; target-matched clippy above is the blocking gate
+# because the workspace has multiple wasm runtimes and runtime-specific SDKs.
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Check compilation
@@ -102,7 +127,7 @@ cd crates/js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy          # Fastly local test runtime
+cargo install --git https://github.com/fastly/Viceroy --tag v0.16.5 viceroy
 ```
 
 ---
@@ -288,11 +313,12 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum`
-3. `cargo test-fastly && cargo test-axum`
-4. JS build and test (`cd crates/js/lib && npx vitest run`)
-5. JS format (`cd crates/js/lib && npm run format`)
-6. Docs format (`cd docs && npm run format`)
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-spin-native && cargo clippy-spin-wasm`
+3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+4. `cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity`
+5. JS build and test (`cd crates/js/lib && npx vitest run`)
+6. JS format (`cd crates/js/lib && npm run format`)
+7. Docs format (`cd docs && npm run format`)
 
 ---
 
@@ -302,7 +328,8 @@ Every PR must pass:
 2. **Get approval** — for non-trivial changes, present a plan first.
 3. **Implement incrementally** — small, testable changes. Every change should
    impact as little code as possible.
-4. **Test after every change** — `cargo test-fastly && cargo test-axum`.
+4. **Test after every change** — run the target-matched adapter test for the
+   code you changed; before PR handoff, run the full CI gate list above.
 5. **Explain as you go** — describe what you changed and why.
 6. **If blocked** — explain what's blocking and why.
 

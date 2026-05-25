@@ -1,5 +1,5 @@
 [package]
-name = "trusted-server-adapter-cloudflare"
+name = "trusted-server-adapter-spin"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -8,30 +8,29 @@ publish = false
 workspace = true
 
 [lib]
-name = "trusted_server_adapter_cloudflare"
+name = "trusted_server_adapter_spin"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-# Keep for explicit `cargo check --features cloudflare --target wasm32-unknown-unknown`
-cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
+spin = ["edgezero-adapter-spin/spin"]
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
+brotli = { workspace = true }
 bytes = { workspace = true }
-edgezero-adapter-cloudflare = { workspace = true }
+edgezero-adapter-spin = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
+flate2 = { workspace = true }
 log = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../js" }
-worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
-js-sys = { workspace = true }
-worker = { version = "0.8", default-features = false, features = ["http"] }
+spin-sdk = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

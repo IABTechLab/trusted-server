@@ -1,0 +1,44 @@
+spin_manifest_version = 2
+
+[application]
+name = "trusted-server-adapter-spin"
+version = "0.1.0"
+
+# EdgeZero's Spin config and secret stores read from Spin component variables.
+# The adapter encodes Trusted Server store keys into a Spin-safe, collision-free
+# variable name. Every generated name starts with "v_"; lowercase ASCII letters
+# and digits are kept as-is, while uppercase letters and punctuation are encoded
+# as "_hh" lowercase hex bytes.
+#
+# Request-signing config examples:
+#   "current-kid" -> v_current_2dkid
+#   "active-kids" -> v_active_2dkids
+#   "ts-2026-05-25" -> v_ts_2d2026_2d05_2d25
+#
+# Secret variables include the encoded store name to avoid collisions with
+# config variables in Spin's flat variable namespace:
+#   store "signing_keys", key "ts-2026-05-25"
+#   -> v_signing_5fkeys_v_ts_2d2026_2d05_2d25
+#
+# Operators enabling request_signing must declare and map one config variable
+# for each public JWK kid, plus one secret variable for each signing key.
+[variables]
+v_current_2dkid = { default = "" }
+v_active_2dkids = { default = "" }
+
+[[trigger.http]]
+route = "/..."
+component = "trusted-server"
+
+[component.trusted-server]
+source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
+allowed_outbound_hosts = ["https://*:*", "http://*:*"]
+key_value_stores = ["default"]
+
+[component.trusted-server.variables]
+v_current_2dkid = "{{ v_current_2dkid }}"
+v_active_2dkids = "{{ v_active_2dkids }}"
+
+[component.trusted-server.build]
+command = "cargo build --target wasm32-wasip1 --release -p trusted-server-adapter-spin --features spin"
+watch = ["src/**/*.rs", "Cargo.toml", "edgezero.toml", "spin.toml"]

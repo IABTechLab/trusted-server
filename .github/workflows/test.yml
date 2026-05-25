@@ -25,7 +25,7 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        # The pin matters because upstream Viceroy > v0.16.4 has bumped MSRV
+        # The pin matters because upstream Viceroy v0.17+ has bumped MSRV
         # beyond the rustc pin in `rust-toolchain.toml`.
         run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
@@ -104,6 +104,36 @@ jobs:
 
       - name: Run Cloudflare adapter tests (native host)
         run: cargo test-cloudflare
+
+  test-spin:
+    name: cargo check/build (spin native + wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain (native + wasm32-wasip1)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Check Spin adapter (native host)
+        run: cargo check -p trusted-server-adapter-spin
+
+      - name: Check Spin adapter (wasm32-wasip1)
+        run: cargo check-spin
+
+      - name: Build Spin adapter release WASM
+        run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+      - name: Run Spin adapter tests (native host)
+        run: cargo test-spin
 
   test-parity:
     name: cargo test (cross-adapter parity)

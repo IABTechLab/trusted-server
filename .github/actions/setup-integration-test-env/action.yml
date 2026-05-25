@@ -58,7 +58,7 @@ runs:
       if: ${{ inputs.install-viceroy == 'true' }}
       shell: bash
       # `.tool-versions` is the single source of truth for the Viceroy pin.
-      # The pin matters because upstream Viceroy > v0.16.4 has bumped MSRV
+      # The pin matters because upstream Viceroy v0.17+ has bumped MSRV
       # beyond the rustc pin in `rust-toolchain.toml`.
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
