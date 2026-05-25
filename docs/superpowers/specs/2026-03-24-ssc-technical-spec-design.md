@@ -811,16 +811,10 @@ impl KvIdentityGraph {
     /// generation marker. Retries up to `MAX_CAS_RETRIES` (3) times on
     /// generation conflict before returning `Err`.
     ///
-    /// If the key does not exist, creates a minimal live entry first:
-    /// `consent.ok = true`, `consent.tcf = None`, `consent.gpp = None`,
-    /// `created = now`, `geo.country = "ZZ"`, `geo.region = None`,
-    /// and `ids = { partner_id: ... }`.
-    ///
-    /// This recovery path is intentional: it materializes the graph later when
-    /// the initial best-effort `create_or_revive()` on EC generation failed.
-    /// Batch sync still performs its explicit existence/tombstone check before
-    /// calling this method, so `POST /_ts/api/v1/batch-sync` retains its `ec_id_not_found`
-    /// contract.
+    /// If the key does not exist, returns `Err` and intentionally fails
+    /// closed. Pull sync and Prebid EID ingestion log the rejection and retry
+    /// on a later qualifying request after the organic EC creation path has
+    /// materialized the root entry.
     ///
     /// # Arguments
     ///
@@ -854,10 +848,12 @@ impl KvIdentityGraph {
 
     /// Evaluates the network cluster size for an EC entry.
     ///
-    /// Returns a stored `cluster_size` without a list call when present. If
-    /// missing, calls `count_hash_prefix_keys()` and writes the result to
-    /// `entry.network` via CAS. Returns the cluster size for inclusion in
-    /// the `/_ts/api/v1/identify` response.
+    /// Returns a stored `cluster_size` without a list call when present on a
+    /// live entry. Tombstone entries (`consent.ok = false`) return `None`
+    /// without list or write-back so their 24-hour withdrawal TTL is not
+    /// extended. If missing on a live entry, calls `count_hash_prefix_keys()`
+    /// and writes the result to `entry.network` via CAS. Returns the cluster
+    /// size for inclusion in the `/_ts/api/v1/identify` response.
     pub fn evaluate_cluster(
         &self,
         ec_id: &str,
@@ -1452,7 +1448,7 @@ Any other non-200 response is treated as a transient failure. No retry. The next
 
 ### 10.5 KV write on success
 
-On a non-null `uid`: call `kv.upsert_partner_id(ec_id, partner_id, uid)`. If the root entry is missing, the upsert creates a minimal live entry first. If the same UID is already stored, the upsert skips the KV write. On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request while the partner UID remains missing.
+On a non-null `uid`: call `kv.upsert_partner_id(ec_id, partner_id, uid)`. If the root entry is missing, the upsert fails closed; pull sync logs `warn` and discards the result. If the same UID is already stored, the upsert skips the KV write. On KV failure: log `warn` and discard the result. Retry occurs on the next qualifying request while the partner UID remains missing.
 
 ---
 

@@ -526,9 +526,8 @@ impl KvIdentityGraph {
     /// Uses CAS (generation markers) to avoid clobbering concurrent writes
     /// from other partners. Retries up to [`MAX_CAS_RETRIES`] on conflict.
     ///
-    /// If the root entry does not exist (e.g. the initial `create_or_revive`
-    /// failed), creates a minimal live entry first — this is the recovery
-    /// path for best-effort EC creation misses.
+    /// If the root entry does not exist, returns an error. This method
+    /// intentionally fails closed to prevent phantom identity entries.
     ///
     /// # Errors
     ///
@@ -791,8 +790,10 @@ impl KvIdentityGraph {
 
     /// Evaluates the cluster size for an EC entry.
     ///
-    /// Returns the stored `cluster_size` when it has already been evaluated.
-    /// Otherwise, counts the number of keys sharing the same hash prefix via
+    /// Returns the stored `cluster_size` when it has already been evaluated
+    /// for a live entry. Tombstone entries return `None` without store I/O so
+    /// their 24-hour withdrawal TTL is not extended. Otherwise, counts the
+    /// number of keys sharing the same hash prefix via
     /// [`count_hash_prefix_keys`](Self::count_hash_prefix_keys) and writes the
     /// result back to the entry. The CAS write is best-effort — on conflict,
     /// the computed value is still returned.
@@ -806,6 +807,11 @@ impl KvIdentityGraph {
         entry: &KvEntry,
         generation: u64,
     ) -> Result<Option<u32>, Report<TrustedServerError>> {
+        if !entry.consent.ok {
+            log::trace!("evaluate_cluster: skipping tombstone entry");
+            return Ok(None);
+        }
+
         if let Some(cluster_size) = entry
             .network
             .as_ref()
@@ -1072,7 +1078,7 @@ mod tests {
     fn evaluate_cluster_returns_stored_value_without_store_io() {
         let kv = KvIdentityGraph::new("nonexistent_store_for_cluster_cache_test");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let mut entry = KvEntry::tombstone(1000);
+        let mut entry = live_entry();
         entry.network = Some(KvNetwork {
             cluster_size: Some(5),
         });
@@ -1085,6 +1091,22 @@ mod tests {
             cluster_size,
             Some(5),
             "should return stored cluster_size without re-listing keys"
+        );
+    }
+
+    #[test]
+    fn evaluate_cluster_skips_tombstone_without_store_io() {
+        let kv = KvIdentityGraph::new("nonexistent_store_for_tombstone_cluster_test");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let entry = KvEntry::tombstone(1000);
+
+        let cluster_size = kv
+            .evaluate_cluster(&ec_id, &entry, 0)
+            .expect("should not touch store for tombstone entries");
+
+        assert_eq!(
+            cluster_size, None,
+            "should not evaluate or write cluster_size for tombstones"
         );
     }
 }

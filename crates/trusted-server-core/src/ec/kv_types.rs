@@ -296,11 +296,10 @@ impl KvEntry {
         }
     }
 
-    /// Creates a minimal live entry for the recovery path.
+    /// Creates a minimal live entry.
     ///
-    /// Used by [`super::kv::KvIdentityGraph::upsert_partner_id`] when the
-    /// root KV entry is missing (e.g. the initial best-effort
-    /// `create_or_revive` failed on EC generation).
+    /// Used by tests and fixtures that need a valid live entry with one
+    /// partner UID and placeholder metadata.
     #[must_use]
     pub fn minimal(partner_id: &str, uid: &str, now: u64) -> Self {
         let mut ids = BTreeMap::new();

@@ -75,21 +75,28 @@ pub fn handle_identify(
 
     match kv.get(ec_id) {
         Ok(Some((entry, generation))) => {
-            // Extract only this partner's UID.
-            if let Some(partner_uid) = entry.ids.get(&partner.source_domain) {
-                if !partner_uid.uid.is_empty() {
-                    uid = Some(partner_uid.uid.clone());
+            if !entry.consent.ok {
+                // Tombstone entries preserve the withdrawal signal for 24 hours.
+                // Do not extract IDs or evaluate cluster size because that would
+                // write back with the live-entry TTL.
+                log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
+            } else {
+                // Extract only this partner's UID.
+                if let Some(partner_uid) = entry.ids.get(&partner.source_domain) {
+                    if !partner_uid.uid.is_empty() {
+                        uid = Some(partner_uid.uid.clone());
+                    }
                 }
-            }
 
-            // Evaluate cluster size lazily for identify responses. Existing
-            // stored cluster_size values are reused without a prefix-list call.
-            match kv.evaluate_cluster(ec_id, &entry, generation) {
-                Ok(size) => {
-                    cluster_size = size;
-                }
-                Err(err) => {
-                    log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
+                // Evaluate cluster size lazily for identify responses. Existing
+                // stored cluster_size values are reused without a prefix-list call.
+                match kv.evaluate_cluster(ec_id, &entry, generation) {
+                    Ok(size) => {
+                        cluster_size = size;
+                    }
+                    Err(err) => {
+                        log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
+                    }
                 }
             }
         }
