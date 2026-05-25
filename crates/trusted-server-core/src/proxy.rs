@@ -147,7 +147,7 @@ fn rebuild_response_with_body(
         if name == header::CONTENT_ENCODING && !preserve_encoding {
             continue;
         }
-        resp.set_header(name, value);
+        resp.append_header(name, value);
     }
     resp.set_header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     resp.set_body(body);
@@ -1167,8 +1167,8 @@ mod tests {
     use super::{
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS,
+        rebuild_response_with_body, reconstruct_and_validate_signed_target, redirect_is_permitted,
+        ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -1875,6 +1875,44 @@ mod tests {
             decompressed.contains("/first-party/proxy?tsurl="),
             "CSS should be rewritten: {}",
             decompressed
+        );
+    }
+
+    #[test]
+    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
+        let mut beresp = Response::from_status(StatusCode::OK);
+        beresp.append_header(header::SET_COOKIE, "first=1; Path=/; HttpOnly");
+        beresp.append_header(header::SET_COOKIE, "second=2; Path=/; Secure");
+        beresp.set_header(header::CONTENT_TYPE, "text/plain");
+        beresp.set_header(header::CONTENT_LENGTH, "999");
+
+        let rebuilt = rebuild_response_with_body(
+            &beresp,
+            "text/html; charset=utf-8",
+            b"rewritten".to_vec(),
+            false,
+        );
+
+        let set_cookie_values: Vec<&str> = rebuilt
+            .get_headers()
+            .filter(|(name, _)| *name == header::SET_COOKIE)
+            .map(|(_, value)| value.to_str().expect("should be valid Set-Cookie"))
+            .collect();
+        assert_eq!(
+            set_cookie_values,
+            vec!["first=1; Path=/; HttpOnly", "second=2; Path=/; Secure"],
+            "should preserve multiple Set-Cookie headers"
+        );
+        assert_eq!(
+            rebuilt
+                .get_header(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "should set rewritten Content-Type"
+        );
+        assert!(
+            rebuilt.get_header(header::CONTENT_LENGTH).is_none(),
+            "should not preserve stale Content-Length"
         );
     }
 

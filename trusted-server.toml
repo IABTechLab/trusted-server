@@ -30,25 +30,16 @@ pull_sync_concurrency = 3
 # batch_rate_limit = 60
 # pull_sync_enabled = false
 
-[[ec.partners]]
-name = "Prebid SharedID"
-source_domain = "sharedid.org"
-openrtb_atype = 1
-bidstream_enabled = true
-api_token = "sharedid-internal-token-32-bytes"
-
-# Integration test partners (used by crates/integration-tests)
-[[ec.partners]]
-name = "Integration Test Partner"
-source_domain = "inttest.example.com"
-bidstream_enabled = true
-api_token = "inttest-api-key-1-32-bytes-minimum"
-
-[[ec.partners]]
-name = "Integration Test Partner 2"
-source_domain = "inttest2.example.com"
-bidstream_enabled = true
-api_token = "inttest2-api-key-2-32-bytes-minimum"
+# Configure real partners via private build-time config or environment
+# overrides. Do not commit deployable partner API tokens in this placeholder
+# config; the integration-test partners are injected by test scripts.
+#
+# [[ec.partners]]
+# name = "Prebid SharedID"
+# source_domain = "sharedid.org"
+# openrtb_atype = 1
+# bidstream_enabled = true
+# api_token = "replace-with-partner-api-token-32-bytes-minimum"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex

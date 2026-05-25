@@ -7,6 +7,9 @@ use crate::common::runtime::{origin_port, TestError, TestResult};
 use error_stack::Report;
 use error_stack::ResultExt as _;
 
+const INTTEST_API_TOKEN: &str = "integration-test-token-alpha-32-bytes-ok";
+const INTTEST2_API_TOKEN: &str = "integration-test-token-bravo-32-bytes-ok";
+
 /// Standard test scenarios applicable to all frontend frameworks.
 ///
 /// Each scenario tests a core trusted-server behavior that should work
@@ -514,7 +517,7 @@ fn use_seeded_ec(client: &EcTestClient, ec_id: &str) -> String {
 
 /// Full lifecycle: seeded EC → batch sync → identify (Bearer auth) with scoped UID.
 ///
-/// Uses the `inttest` partner pre-configured in `trusted-server.toml`.
+/// Uses the `inttest` partner injected by the integration-test build.
 fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
@@ -522,13 +525,13 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC full lifecycle: using seeded EC ID = {ec_id}");
 
-    // 2. Batch sync writes partner UID (partner "inttest" is in config)
+    // 2. Batch sync writes partner UID (partner "inttest" is injected)
     let mappings = vec![BatchMapping {
         ec_id: ec_id.clone(),
         partner_uid: "user-uid-42".to_owned(),
         timestamp: 1_700_000_000,
     }];
-    let resp = batch_sync(&client, "inttest-api-key-1-32-bytes-minimum", &mappings)?;
+    let resp = batch_sync(&client, INTTEST_API_TOKEN, &mappings)?;
     let json = assert_json_response(resp, 200)
         .attach("EC full lifecycle: batch sync should return 200")?;
 
@@ -544,7 +547,7 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     }
 
     // 3. Identify with Bearer auth should return the synced UID
-    let json = assert_json_response(identify(&client, "inttest-api-key-1-32-bytes-minimum")?, 200)
+    let json = assert_json_response(identify(&client, INTTEST_API_TOKEN)?, 200)
         .attach("EC full lifecycle: identify after batch sync")?;
 
     let source_domain = json.get("source_domain").and_then(|v| v.as_str());
@@ -596,11 +599,11 @@ fn ec_consent_withdrawal(base_url: &str) -> TestResult<()> {
 
     // 3. With consent still granted and the EC cookie revoked, identify should
     // now report no EC present.
-    let resp = identify(&client, "inttest-api-key-1-32-bytes-minimum")?;
+    let resp = identify(&client, INTTEST_API_TOKEN)?;
     assert_status(&resp, 204).attach("identify should return 204 after cookie revocation")?;
 
     // 4. With GPC still asserted, identify should reflect consent denial.
-    let resp = identify_with_headers(&client, "inttest-api-key-1-32-bytes-minimum", &[("sec-gpc", "1")])?;
+    let resp = identify_with_headers(&client, INTTEST_API_TOKEN, &[("sec-gpc", "1")])?;
     assert_status(&resp, 403)
         .attach("identify with GPC should return 403 after consent withdrawal")?;
 
@@ -613,7 +616,7 @@ fn ec_identify_without_ec(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
 
-    let resp = identify(&client, "inttest-api-key-1-32-bytes-minimum")?;
+    let resp = identify(&client, INTTEST_API_TOKEN)?;
     assert_status(&resp, 204)
         .attach("identify without EC cookie should return 204 when consent is granted")?;
 
@@ -631,7 +634,7 @@ fn ec_identify_consent_denied(base_url: &str) -> TestResult<()> {
     // Identify with GPC=1 — in the default US-CA test geo, GPC is an explicit
     // denial that must override the allow cookie. Per spec §11.4, consent is
     // evaluated after Bearer auth, so this must be 403 Forbidden.
-    let resp = identify_with_headers(&client, "inttest-api-key-1-32-bytes-minimum", &[("sec-gpc", "1")])?;
+    let resp = identify_with_headers(&client, INTTEST_API_TOKEN, &[("sec-gpc", "1")])?;
 
     let status = resp.status().as_u16();
     if status != 403 {
@@ -654,13 +657,13 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
     let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC concurrent syncs: using seeded EC = {ec_id}");
 
-    // Batch sync both partners (both are pre-configured in trusted-server.toml)
+    // Batch sync both partners injected by the integration-test build.
     let mappings_a = vec![BatchMapping {
         ec_id: ec_id.clone(),
         partner_uid: "uid-a".to_owned(),
         timestamp: 1_700_000_000,
     }];
-    let resp = batch_sync(&client, "inttest-api-key-1-32-bytes-minimum", &mappings_a)?;
+    let resp = batch_sync(&client, INTTEST_API_TOKEN, &mappings_a)?;
     assert_json_response(resp, 200).attach("batch sync inttest should succeed")?;
 
     let mappings_b = vec![BatchMapping {
@@ -668,11 +671,11 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
         partner_uid: "uid-b".to_owned(),
         timestamp: 1_700_000_000,
     }];
-    let resp = batch_sync(&client, "inttest2-api-key-2-32-bytes-minimum", &mappings_b)?;
+    let resp = batch_sync(&client, INTTEST2_API_TOKEN, &mappings_b)?;
     assert_json_response(resp, 200).attach("batch sync inttest2 should succeed")?;
 
     // Identify as inttest → should see only inttest's UID
-    let json = assert_json_response(identify(&client, "inttest-api-key-1-32-bytes-minimum")?, 200)
+    let json = assert_json_response(identify(&client, INTTEST_API_TOKEN)?, 200)
         .attach("identify as inttest after dual sync")?;
     let uid = json.get("uid").and_then(|v| v.as_str());
     if uid != Some("uid-a") {
@@ -686,7 +689,7 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
     }
 
     // Identify as inttest2 → should see only inttest2's UID
-    let json = assert_json_response(identify(&client, "inttest2-api-key-2-32-bytes-minimum")?, 200)
+    let json = assert_json_response(identify(&client, INTTEST2_API_TOKEN)?, 200)
         .attach("identify as inttest2 after dual sync")?;
     let uid = json.get("uid").and_then(|v| v.as_str());
     if uid != Some("uid-b") {
@@ -705,7 +708,7 @@ fn ec_concurrent_partner_syncs(base_url: &str) -> TestResult<()> {
 
 /// Batch sync happy path: authenticated request writes UID, verify via identify.
 ///
-/// Uses the `inttest` partner pre-configured in `trusted-server.toml`.
+/// Uses the `inttest` partner injected by the integration-test build.
 fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let client = EcTestClient::new(base_url);
     allow_ec_generation(&client);
@@ -713,13 +716,13 @@ fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let ec_id = use_seeded_ec(&client, &seeded_ec_id);
     log::info!("EC batch sync happy path: using seeded ec_id = {ec_id}");
 
-    // Batch sync writes a UID for this EC ID (partner "inttest" is in config)
+    // Batch sync writes a UID for this EC ID (partner "inttest" is injected)
     let mappings = vec![BatchMapping {
         ec_id: ec_id.clone(),
         partner_uid: "batch-uid-99".to_owned(),
         timestamp: 1_700_000_000,
     }];
-    let resp = batch_sync(&client, "inttest-api-key-1-32-bytes-minimum", &mappings)?;
+    let resp = batch_sync(&client, INTTEST_API_TOKEN, &mappings)?;
     let json = assert_json_response(resp, 200).attach("batch sync should return 200")?;
 
     let accepted = json.get("accepted").and_then(|v| v.as_u64());
@@ -734,7 +737,7 @@ fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     }
 
     // Verify via identify (Bearer auth, scoped response)
-    let json = assert_json_response(identify(&client, "inttest-api-key-1-32-bytes-minimum")?, 200)
+    let json = assert_json_response(identify(&client, INTTEST_API_TOKEN)?, 200)
         .attach("identify after batch sync")?;
 
     let uid = json.get("uid").and_then(|v| v.as_str());

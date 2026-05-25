@@ -281,6 +281,25 @@ pub struct EcPartner {
 }
 
 impl EcPartner {
+    /// Known partner API token placeholders that must not be used in deployments.
+    pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
+        "partner-api-token-32-bytes-minimum",
+        "replace-with-partner-api-token-32-bytes-minimum",
+        "sharedid-internal-token-32-bytes",
+        "inttest-api-key-1-32-bytes-minimum",
+        "inttest2-api-key-2-32-bytes-minimum",
+    ];
+
+    /// Returns `true` if `api_token` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_api_token(api_token: &str) -> bool {
+        let token = api_token.trim();
+        Self::API_TOKEN_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(token))
+    }
+
     /// Validates a partner source domain for use as the canonical key.
     ///
     /// # Errors
@@ -755,13 +774,18 @@ impl Settings {
     /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
     /// fields still contain a placeholder value.
     pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
-        let mut insecure_fields: Vec<&str> = Vec::new();
+        let mut insecure_fields: Vec<String> = Vec::new();
 
         if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
-            insecure_fields.push("ec.passphrase");
+            insecure_fields.push("ec.passphrase".to_owned());
         }
         if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
-            insecure_fields.push("publisher.proxy_secret");
+            insecure_fields.push("publisher.proxy_secret".to_owned());
+        }
+        for partner in &self.ec.partners {
+            if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
+                insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
         }
 
         if insecure_fields.is_empty() {
@@ -1273,6 +1297,32 @@ mod tests {
         assert!(
             !Ec::is_placeholder_passphrase("test-secret-key-32-bytes-minimum"),
             "should accept non-placeholder passphrase"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_api_token_rejects_all_known_placeholders() {
+        for placeholder in EcPartner::API_TOKEN_PLACEHOLDERS {
+            assert!(
+                EcPartner::is_placeholder_api_token(placeholder),
+                "should detect placeholder api_token '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_api_token_is_case_insensitive() {
+        assert!(
+            EcPartner::is_placeholder_api_token("SHAREDID-INTERNAL-TOKEN-32-BYTES"),
+            "should detect case-insensitive placeholder api_token"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_api_token_accepts_non_placeholder() {
+        assert!(
+            !EcPartner::is_placeholder_api_token("production-partner-token-32-bytes-min"),
+            "should accept non-placeholder api_token"
         );
     }
 

@@ -78,6 +78,20 @@ mod tests {
         result
     }
 
+    fn toml_with_partner_api_token(api_token: &str) -> String {
+        format!(
+            r#"{}
+
+            [[ec.partners]]
+            name = "Unit Test Partner"
+            source_domain = "unit-test-partner.example.com"
+            api_token = "{}"
+            "#,
+            crate_test_settings_str(),
+            api_token
+        )
+    }
+
     #[test]
     fn rejects_placeholder_passphrase() {
         let toml = toml_with_secrets("trusted-server-placeholder-secret", "real-proxy-secret");
@@ -145,6 +159,29 @@ mod tests {
         settings
             .reject_placeholder_secrets()
             .expect("non-placeholder secrets should pass validation");
+    }
+
+    #[test]
+    fn rejects_placeholder_partner_api_token() {
+        let toml = toml_with_partner_api_token("sharedid-internal-token-32-bytes");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner api_token");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("ec.partners[unit-test-partner.example.com].api_token")),
+            "error should mention partner api_token, got: {root}"
+        );
+    }
+
+    #[test]
+    fn accepts_non_placeholder_partner_api_token() {
+        let toml = toml_with_partner_api_token("production-partner-token-32-bytes-min");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        settings
+            .reject_placeholder_secrets()
+            .expect("non-placeholder partner api_token should pass validation");
     }
 
     /// Smoke-test the full `get_settings()` pipeline (embedded bytes → UTF-8 →

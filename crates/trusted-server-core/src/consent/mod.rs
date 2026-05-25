@@ -473,9 +473,9 @@ pub fn gate_eids_by_consent<T>(
 ///   information on a device) must be explicitly consented. If no TCF data is
 ///   available under GDPR, consent is assumed absent and EC is blocked.
 /// - **US state privacy**: opt-out model — EC is allowed unless the user has
-///   explicitly opted out via the US Privacy string **or** Global Privacy
-///   Control. GPC is checked independently — it always blocks EC creation
-///   regardless of what the US Privacy string says.
+///   explicitly opted out via Global Privacy Control, GPP US sale opt-out, or
+///   the US Privacy string. Explicit US opt-out signals take precedence over
+///   TCF storage consent.
 /// - **Non-regulated**: EC is allowed (no consent requirement).
 /// - **Unknown**: fail-closed — jurisdiction cannot be determined so EC is
 ///   blocked as a precaution.
@@ -491,23 +491,34 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
         }
         jurisdiction::Jurisdiction::UsState(_) => {
             // GPC is an independent opt-out signal — it always blocks EC
-            // creation regardless of what the US Privacy string says.
+            // creation regardless of other consent signals.
             if ctx.gpc {
                 return false;
             }
-            // When a CMP uses TCF in the US (e.g. Didomi), respect the
-            // TCF Purpose 1 decision — this is an explicit opt-in signal.
-            // The Sourcepoint GPP design documents this precedence decision.
+            // Explicit US opt-out signals take precedence over TCF storage
+            // consent in US-state jurisdictions.
+            if ctx.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true) {
+                return false;
+            }
+            if ctx
+                .us_privacy
+                .as_ref()
+                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+            {
+                return false;
+            }
+            // When a CMP uses TCF in the US (e.g. Didomi), respect the TCF
+            // Purpose 1 decision if no explicit US opt-out signal is present.
             if let Some(tcf) = effective_tcf(ctx) {
                 return tcf.has_storage_consent();
             }
-            // Check GPP US section for sale opt-out.
+            // GPP US sale_opt_out=false is an explicit non-opt-out signal.
             if let Some(gpp) = &ctx.gpp {
                 if let Some(opted_out) = gpp.us_sale_opt_out {
                     return !opted_out;
                 }
             }
-            // Check US Privacy string for explicit opt-out.
+            // Check US Privacy string when no TCF decision is present.
             if let Some(usp) = &ctx.us_privacy {
                 return usp.opt_out_sale != PrivacyFlag::Yes;
             }
@@ -540,12 +551,20 @@ pub fn has_explicit_ec_withdrawal(ctx: &ConsentContext) -> bool {
             if ctx.gpc {
                 return true;
             }
+            if ctx.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true) {
+                return true;
+            }
+            if ctx
+                .us_privacy
+                .as_ref()
+                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+            {
+                return true;
+            }
             if let Some(tcf) = effective_tcf(ctx) {
                 return !tcf.has_storage_consent();
             }
-            ctx.us_privacy
-                .as_ref()
-                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+            false
         }
         jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => false,
     }
@@ -1145,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn ec_allowed_us_state_tcf_takes_priority_over_us_privacy() {
+    fn ec_blocked_us_state_us_privacy_opt_out_overrides_tcf() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             tcf: Some(make_tcf_with_storage(true)),
@@ -1158,8 +1177,12 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "TCF consent should take priority over US Privacy opt-out when both present"
+            !allows_ec_creation(&ctx),
+            "US Privacy opt-out should take priority over TCF consent"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "US Privacy opt-out should be treated as an explicit withdrawal"
         );
     }
 
@@ -1197,6 +1220,10 @@ mod tests {
             !allows_ec_creation(&ctx),
             "US state + GPP US sale_opt_out=true should block EC"
         );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPP US sale opt-out should be treated as an explicit withdrawal"
+        );
     }
 
     #[test]
@@ -1219,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn ec_us_state_tcf_takes_priority_over_gpp_us() {
+    fn ec_us_state_gpp_us_opt_out_overrides_tcf() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("TN".to_owned()),
             tcf: Some(make_tcf_with_storage(true)),
@@ -1232,13 +1259,17 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "TCF consent should take priority over GPP US opt-out"
+            !allows_ec_creation(&ctx),
+            "GPP US opt-out should take priority over TCF consent"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPP US opt-out should be treated as an explicit withdrawal"
         );
     }
 
     #[test]
-    fn ec_us_state_gpp_us_takes_priority_over_us_privacy() {
+    fn ec_us_state_us_privacy_opt_out_overrides_gpp_non_opt_out() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("TN".to_owned()),
             gpp: Some(GppConsent {
@@ -1256,8 +1287,12 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "GPP US should take priority over us_privacy opt-out"
+            !allows_ec_creation(&ctx),
+            "US Privacy opt-out should block EC even when GPP US has no sale opt-out"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "US Privacy opt-out should be treated as an explicit withdrawal"
         );
     }
 
