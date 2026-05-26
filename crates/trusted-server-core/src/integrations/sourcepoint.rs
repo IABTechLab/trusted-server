@@ -1073,9 +1073,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.prospecta.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.prospecta.com",
             document_state: &document_state,
         };
 
@@ -1136,9 +1136,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.prospecta.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.prospecta.com",
             document_state: &document_state,
         };
 
