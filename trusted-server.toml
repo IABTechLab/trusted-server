@@ -326,6 +326,19 @@ timeout_ms = 1000
 # IMPORTANT: This endpoint reflects TLS details that browser JS cannot normally read.
 # Disable after investigation is complete.
 # ja4_endpoint_enabled = false
+#
+# Enable the authenticated S3 object-listing debug endpoint at
+# GET /admin/debug/s3-objects. Requires the admin handler (for example path = "^/admin")
+# and reuses configured proxy.asset_routes that have auth.type = "s3_sigv4".
+# Query parameters:
+#   route_prefix        — optional proxy.asset_routes prefix; required only when
+#                         multiple S3-backed asset routes are configured
+#   prefix              — optional S3 key prefix to list from
+#   max_keys            — optional page size, defaults to 100 and caps at 1000
+#   continuation_token  — optional token returned by the previous page
+#   delimiter           — optional delimiter, usually /, to discover common prefixes
+# Disable after investigation is complete. The S3 IAM principal needs s3:ListBucket.
+# s3_list_endpoint_enabled = false
 
 # Map auction-request context keys to mediation URL query parameters.
 # Each key is a context key from the JS client; the value becomes the

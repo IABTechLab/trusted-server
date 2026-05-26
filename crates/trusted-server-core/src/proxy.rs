@@ -753,6 +753,503 @@ pub async fn handle_asset_proxy_request(
     Ok(response)
 }
 
+#[derive(Debug)]
+struct S3ListObjectsDebugQuery {
+    route_prefix: Option<String>,
+    prefix: String,
+    max_keys: u16,
+    continuation_token: Option<String>,
+    delimiter: Option<String>,
+}
+
+#[derive(Serialize)]
+struct S3ListObjectsDebugResponse {
+    route_prefix: String,
+    origin_url: String,
+    origin_host: String,
+    requested_prefix: String,
+    max_keys: u16,
+    delimiter: Option<String>,
+    objects: Vec<S3ListObjectsDebugObject>,
+    common_prefixes: Vec<String>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct S3ListObjectsDebugObject {
+    key: String,
+    size: Option<u64>,
+    last_modified: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedS3ListObjectsV2 {
+    objects: Vec<S3ListObjectsDebugObject>,
+    common_prefixes: Vec<String>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+const S3_LIST_OBJECTS_DEBUG_DEFAULT_MAX_KEYS: u16 = 100;
+const S3_LIST_OBJECTS_DEBUG_MAX_KEYS: u16 = 1000;
+
+/// List objects from a configured `S3` asset-route origin for admin debugging.
+///
+/// The endpoint is gated by `debug.s3_list_endpoint_enabled` and reuses the
+/// `S3` origin, region, and credentials from configured `proxy.asset_routes`.
+/// Query parameters:
+///
+/// - `route_prefix`: optional asset-route prefix selector. Required only when
+///   more than one `S3`-backed asset route is configured.
+/// - `prefix`: optional `S3` key prefix to list from.
+/// - `max_keys`: optional page size, default 100 and capped at 1000.
+/// - `continuation_token`: optional token from a previous response.
+/// - `delimiter`: optional `S3` delimiter, usually `/`, for prefix discovery.
+///
+/// # Errors
+///
+/// Returns an error if query validation fails, no suitable `S3` asset route can
+/// be selected, credentials cannot be read, signing/backend setup fails, the
+/// upstream `S3` request fails, or the successful `S3` XML response cannot be
+/// parsed/serialized.
+pub async fn handle_s3_list_objects_debug(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    if !settings.debug.s3_list_endpoint_enabled {
+        return Ok(Response::from_status(StatusCode::NOT_FOUND));
+    }
+
+    let query = parse_s3_list_objects_debug_query(&req)?;
+    let route = select_s3_list_objects_debug_route(settings, query.route_prefix.as_deref())?;
+    let target_url = build_s3_list_objects_v2_url(route, &query)?;
+    let origin_host = target_url.host_str().unwrap_or_default().to_string();
+    let upstream_response = send_s3_list_objects_v2_request(settings, services, route, &target_url)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to list S3 objects".to_string(),
+        })?;
+
+    let mut upstream_response = platform_response_to_fastly(upstream_response)?;
+    upstream_response.set_header(header::CACHE_CONTROL, "no-store, private");
+    if !upstream_response.get_status().is_success() {
+        return Ok(upstream_response);
+    }
+
+    let upstream_body = upstream_response.take_body_str();
+    let parsed = parse_s3_list_objects_v2_xml(&upstream_body)?;
+    let response = S3ListObjectsDebugResponse {
+        route_prefix: route.prefix.clone(),
+        origin_url: route.origin_url.clone(),
+        origin_host,
+        requested_prefix: query.prefix,
+        max_keys: query.max_keys,
+        delimiter: query.delimiter,
+        objects: parsed.objects,
+        common_prefixes: parsed.common_prefixes,
+        is_truncated: parsed.is_truncated,
+        next_continuation_token: parsed.next_continuation_token,
+    };
+    let body =
+        serde_json::to_string_pretty(&response).change_context(TrustedServerError::Proxy {
+            message: "failed to serialize S3 object listing debug response".to_string(),
+        })?;
+
+    Ok(Response::from_status(StatusCode::OK)
+        .with_header(header::CACHE_CONTROL, "no-store, private")
+        .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .with_body(body))
+}
+
+fn parse_s3_list_objects_debug_query(
+    req: &Request,
+) -> Result<S3ListObjectsDebugQuery, Report<TrustedServerError>> {
+    let parsed =
+        url::Url::parse(req.get_url_str()).change_context(TrustedServerError::BadRequest {
+            message: "invalid debug request URL".to_string(),
+        })?;
+
+    let mut route_prefix = None;
+    let mut prefix = String::new();
+    let mut max_keys = S3_LIST_OBJECTS_DEBUG_DEFAULT_MAX_KEYS;
+    let mut continuation_token = None;
+    let mut delimiter = None;
+
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "route_prefix" => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    route_prefix = Some(value.to_string());
+                }
+            }
+            "prefix" => prefix = value.into_owned(),
+            "max_keys" => max_keys = parse_s3_list_objects_max_keys(&value)?,
+            "continuation_token" => {
+                if !value.is_empty() {
+                    continuation_token = Some(value.into_owned());
+                }
+            }
+            "delimiter" => {
+                if !value.is_empty() {
+                    delimiter = Some(value.into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(S3ListObjectsDebugQuery {
+        route_prefix,
+        prefix,
+        max_keys,
+        continuation_token,
+        delimiter,
+    })
+}
+
+fn parse_s3_list_objects_max_keys(value: &str) -> Result<u16, Report<TrustedServerError>> {
+    let value = value.trim();
+    let max_keys = value.parse::<u16>().map_err(|err| {
+        Report::new(TrustedServerError::BadRequest {
+            message: format!("max_keys must be an integer from 1 to 1000: {err}"),
+        })
+    })?;
+
+    if max_keys == 0 || max_keys > S3_LIST_OBJECTS_DEBUG_MAX_KEYS {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "max_keys must be an integer from 1 to 1000".to_string(),
+        }));
+    }
+
+    Ok(max_keys)
+}
+
+fn select_s3_list_objects_debug_route<'a>(
+    settings: &'a Settings,
+    route_prefix: Option<&str>,
+) -> Result<&'a ProxyAssetRoute, Report<TrustedServerError>> {
+    if let Some(route_prefix) = route_prefix {
+        let route = settings
+            .proxy
+            .asset_routes
+            .iter()
+            .find(|route| route.prefix == route_prefix)
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::BadRequest {
+                    message: format!("no asset route found for route_prefix `{route_prefix}`"),
+                })
+            })?;
+
+        if route_uses_s3_sigv4_auth(route) {
+            return Ok(route);
+        }
+
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("asset route `{route_prefix}` is not configured with s3_sigv4 auth"),
+        }));
+    }
+
+    let s3_routes: Vec<&ProxyAssetRoute> = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .filter(|route| route_uses_s3_sigv4_auth(route))
+        .collect();
+
+    match s3_routes.as_slice() {
+        [] => Err(Report::new(TrustedServerError::BadRequest {
+            message: "no S3-backed asset routes are configured".to_string(),
+        })),
+        [route] => Ok(*route),
+        routes => {
+            let prefixes = routes
+                .iter()
+                .map(|route| route.prefix.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Report::new(TrustedServerError::BadRequest {
+                message: format!(
+                    "multiple S3-backed asset routes are configured; pass route_prefix as one of: {prefixes}"
+                ),
+            }))
+        }
+    }
+}
+
+fn route_uses_s3_sigv4_auth(route: &ProxyAssetRoute) -> bool {
+    matches!(&route.auth, Some(AssetOriginAuth::S3SigV4(_)))
+}
+
+fn build_s3_list_objects_v2_url(
+    route: &ProxyAssetRoute,
+    query: &S3ListObjectsDebugQuery,
+) -> Result<url::Url, Report<TrustedServerError>> {
+    let mut target_url =
+        url::Url::parse(&route.origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("invalid S3 asset route origin_url `{}`", route.origin_url),
+        })?;
+    target_url.set_path("/");
+    target_url.set_query(None);
+
+    let max_keys = query.max_keys.to_string();
+    {
+        let mut query_pairs = target_url.query_pairs_mut();
+        query_pairs.append_pair("list-type", "2");
+        query_pairs.append_pair("encoding-type", "url");
+        query_pairs.append_pair("max-keys", &max_keys);
+        if !query.prefix.is_empty() {
+            query_pairs.append_pair("prefix", &query.prefix);
+        }
+        if let Some(continuation_token) = &query.continuation_token {
+            query_pairs.append_pair("continuation-token", continuation_token);
+        }
+        if let Some(delimiter) = &query.delimiter {
+            query_pairs.append_pair("delimiter", delimiter);
+        }
+    }
+
+    Ok(target_url)
+}
+
+async fn send_s3_list_objects_v2_request(
+    settings: &Settings,
+    services: &RuntimeServices,
+    route: &ProxyAssetRoute,
+    target_url: &url::Url,
+) -> Result<PlatformResponse, Report<TrustedServerError>> {
+    let scheme = target_url.scheme();
+    let host = target_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in S3 debug target URL".to_string(),
+        })
+    })?;
+    let backend_name = services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port: target_url.port(),
+            certificate_check: settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "S3 debug backend registration failed".to_string(),
+        })?;
+
+    let auth = route.auth.as_ref().ok_or_else(|| {
+        Report::new(TrustedServerError::BadRequest {
+            message: format!(
+                "asset route `{}` is not configured with S3 auth",
+                route.prefix
+            ),
+        })
+    })?;
+    let mut outbound_headers = http::HeaderMap::new();
+    outbound_headers.insert(header::HOST, asset_origin_host_header(target_url)?);
+    apply_asset_origin_auth(
+        services,
+        &Method::GET,
+        target_url,
+        &mut outbound_headers,
+        auth,
+    )?;
+
+    let mut builder = edge_request_builder().method(Method::GET).uri(
+        target_url
+            .as_str()
+            .parse::<EdgeUri>()
+            .change_context(TrustedServerError::Proxy {
+                message: "invalid S3 debug target URL".to_string(),
+            })?,
+    );
+    for (name, value) in &outbound_headers {
+        builder = builder.header(name, value);
+    }
+
+    let edge_req =
+        builder
+            .body(EdgeBody::from(Vec::new()))
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to build S3 debug request".to_string(),
+            })?;
+
+    services
+        .http_client()
+        .send(PlatformHttpRequest::new(edge_req, backend_name))
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to send S3 debug request".to_string(),
+        })
+}
+
+fn parse_s3_list_objects_v2_xml(
+    xml: &str,
+) -> Result<ParsedS3ListObjectsV2, Report<TrustedServerError>> {
+    let encoding_type = xml_element_text(xml, "EncodingType", false)?;
+    let url_encoded = encoding_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("url"));
+    let is_truncated = xml_element_text(xml, "IsTruncated", false)?
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    let next_continuation_token =
+        xml_element_text(xml, "NextContinuationToken", false)?.filter(|value| !value.is_empty());
+
+    let mut objects = Vec::new();
+    for contents in xml_element_bodies(xml, "Contents")? {
+        let key = xml_element_text(contents, "Key", url_encoded)?.ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "S3 ListObjectsV2 Contents element is missing Key".to_string(),
+            })
+        })?;
+        let size = xml_element_text(contents, "Size", false)?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .change_context(TrustedServerError::Proxy {
+                        message: format!(
+                            "S3 ListObjectsV2 Contents element has invalid Size `{value}`"
+                        ),
+                    })
+            })
+            .transpose()?;
+        let last_modified = xml_element_text(contents, "LastModified", false)?;
+
+        objects.push(S3ListObjectsDebugObject {
+            key,
+            size,
+            last_modified,
+        });
+    }
+
+    let mut common_prefixes = Vec::new();
+    for common_prefix in xml_element_bodies(xml, "CommonPrefixes")? {
+        if let Some(prefix) = xml_element_text(common_prefix, "Prefix", url_encoded)? {
+            common_prefixes.push(prefix);
+        }
+    }
+
+    Ok(ParsedS3ListObjectsV2 {
+        objects,
+        common_prefixes,
+        is_truncated,
+        next_continuation_token,
+    })
+}
+
+fn xml_element_bodies<'a>(
+    xml: &'a str,
+    tag: &str,
+) -> Result<Vec<&'a str>, Report<TrustedServerError>> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut bodies = Vec::new();
+    let mut search_from = 0;
+
+    while let Some(open_offset) = xml[search_from..].find(&open) {
+        let body_start = search_from + open_offset + open.len();
+        let Some(close_offset) = xml[body_start..].find(&close) else {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!("S3 ListObjectsV2 XML has unclosed `{tag}` element"),
+            }));
+        };
+        let body_end = body_start + close_offset;
+        bodies.push(&xml[body_start..body_end]);
+        search_from = body_end + close.len();
+    }
+
+    Ok(bodies)
+}
+
+fn xml_element_text(
+    xml: &str,
+    tag: &str,
+    url_encoded: bool,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(body) = xml_element_bodies(xml, tag)?.into_iter().next() else {
+        return Ok(None);
+    };
+
+    decode_s3_xml_value(body, url_encoded).map(Some)
+}
+
+fn decode_s3_xml_value(
+    value: &str,
+    url_encoded: bool,
+) -> Result<String, Report<TrustedServerError>> {
+    let unescaped = decode_xml_entities(value)?;
+    if !url_encoded {
+        return Ok(unescaped);
+    }
+
+    urlencoding::decode(&unescaped)
+        .map(std::borrow::Cow::into_owned)
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to decode URL-encoded S3 ListObjectsV2 field".to_string(),
+        })
+}
+
+fn decode_xml_entities(value: &str) -> Result<String, Report<TrustedServerError>> {
+    if !value.contains('&') {
+        return Ok(value.to_string());
+    }
+
+    let mut decoded = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(entity_start) = rest.find('&') {
+        decoded.push_str(&rest[..entity_start]);
+        let after_ampersand = &rest[entity_start + 1..];
+        let Some(entity_end) = after_ampersand.find(';') else {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "S3 ListObjectsV2 XML contains an unterminated entity".to_string(),
+            }));
+        };
+        let entity = &after_ampersand[..entity_end];
+        let character = match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => decode_numeric_xml_entity(entity)?,
+        };
+        decoded.push(character);
+        rest = &after_ampersand[entity_end + 1..];
+    }
+    decoded.push_str(rest);
+
+    Ok(decoded)
+}
+
+fn decode_numeric_xml_entity(entity: &str) -> Result<char, Report<TrustedServerError>> {
+    let codepoint = if let Some(hex) = entity.strip_prefix("#x") {
+        u32::from_str_radix(hex, 16).map_err(|err| {
+            Report::new(TrustedServerError::Proxy {
+                message: format!("invalid XML numeric entity `&{entity};`: {err}"),
+            })
+        })?
+    } else if let Some(decimal) = entity.strip_prefix('#') {
+        decimal.parse::<u32>().map_err(|err| {
+            Report::new(TrustedServerError::Proxy {
+                message: format!("invalid XML numeric entity `&{entity};`: {err}"),
+            })
+        })?
+    } else {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: format!("unsupported XML entity `&{entity};`"),
+        }));
+    };
+
+    char::from_u32(codepoint).ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: format!("invalid XML codepoint `&{entity};`"),
+        })
+    })
+}
+
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
 fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
     let mut pairs: Vec<(String, String)> = url
@@ -1512,9 +2009,9 @@ mod tests {
     use super::{
         asset_origin_host_header, build_asset_proxy_target_url, handle_asset_proxy_request,
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-        handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS,
+        handle_first_party_proxy_sign, handle_s3_list_objects_debug, is_host_allowed,
+        proxy_request, rebuild_response_with_body, reconstruct_and_validate_signed_target,
+        redirect_is_permitted, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
@@ -2797,6 +3294,167 @@ mod tests {
             header_value("x-amz-content-sha256").as_deref(),
             Some("UNSIGNED-PAYLOAD"),
             "should use unsigned payload for read-only asset requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_s3_list_objects_debug_lists_single_s3_route() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(
+            200,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>examplebucket</Name>
+  <Prefix>images%2F</Prefix>
+  <EncodingType>url</EncodingType>
+  <MaxKeys>50</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>images%2Ffoo%26bar.jpg</Key>
+    <LastModified>2026-05-26T12:00:00.000Z</LastModified>
+    <Size>12345</Size>
+  </Contents>
+  <CommonPrefixes>
+    <Prefix>images%2Fnested%2F</Prefix>
+  </CommonPrefixes>
+</ListBucketResult>"#
+                .to_vec(),
+        );
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "access_key_id".to_string(),
+            b"AKIAIOSFODNN7EXAMPLE".to_vec(),
+        );
+        secrets.insert(
+            "secret_access_key".to_string(),
+            b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+        );
+        let services = build_services_with_secret_and_http_client(
+            HashMapSecretStore::new(secrets),
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+        );
+        let mut settings = create_test_settings();
+        settings.debug.s3_list_endpoint_enabled = true;
+        let mut route = ProxyAssetRoute::new(
+            "/.image/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: "s3-auth".to_string(),
+            access_key_id: "access_key_id".to_string(),
+            secret_access_key: "secret_access_key".to_string(),
+            session_token: None,
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes = vec![route];
+        let req = Request::new(
+            Method::GET,
+            "https://www.example.com/admin/debug/s3-objects?prefix=images/&delimiter=/&max_keys=50",
+        );
+
+        let mut response = handle_s3_list_objects_debug(&settings, &services, req)
+            .await
+            .expect("should list S3 objects for debug endpoint");
+
+        assert_eq!(
+            response.get_status(),
+            StatusCode::OK,
+            "should return a JSON object listing"
+        );
+        assert_eq!(
+            response.get_header_str(header::CACHE_CONTROL),
+            Some("no-store, private"),
+            "should prevent debug response caching"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.take_body_str())
+            .expect("should parse debug JSON response");
+        assert_eq!(body["route_prefix"], "/.image/");
+        assert_eq!(body["requested_prefix"], "images/");
+        assert_eq!(body["objects"][0]["key"], "images/foo&bar.jpg");
+        assert_eq!(body["objects"][0]["size"], 12345);
+        assert_eq!(body["common_prefixes"][0], "images/nested/");
+        assert_eq!(body["is_truncated"], false);
+
+        let uris = stub.recorded_request_uris();
+        assert_eq!(uris.len(), 1, "should send one S3 ListObjectsV2 request");
+        let upstream = url::Url::parse(&uris[0]).expect("should parse recorded upstream URI");
+        assert_eq!(
+            upstream.path(),
+            "/",
+            "should send ListObjectsV2 to the bucket root"
+        );
+        let pairs: HashMap<String, String> = upstream.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("list-type").map(String::as_str), Some("2"));
+        assert_eq!(pairs.get("encoding-type").map(String::as_str), Some("url"));
+        assert_eq!(pairs.get("prefix").map(String::as_str), Some("images/"));
+        assert_eq!(pairs.get("delimiter").map(String::as_str), Some("/"));
+        assert_eq!(pairs.get("max-keys").map(String::as_str), Some("50"));
+
+        let headers = stub.recorded_request_headers();
+        let sent = &headers[0];
+        let header_value = |name: &str| -> Option<String> {
+            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            header_value("host").as_deref(),
+            Some("examplebucket.s3.us-east-1.amazonaws.com"),
+            "should sign the request for the S3 origin host"
+        );
+        assert!(
+            header_value("authorization")
+                .as_deref()
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 Credential=")),
+            "should add a SigV4 Authorization header"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_s3_list_objects_debug_requires_route_prefix_for_multiple_s3_routes() {
+        let mut settings = create_test_settings();
+        settings.debug.s3_list_endpoint_enabled = true;
+        let mut first = ProxyAssetRoute::new(
+            "/.images/",
+            "https://firstbucket.s3.us-east-1.amazonaws.com",
+        );
+        first.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: "s3-auth".to_string(),
+            access_key_id: "access_key_id".to_string(),
+            secret_access_key: "secret_access_key".to_string(),
+            session_token: None,
+            origin_query: None,
+        }));
+        let mut second = ProxyAssetRoute::new(
+            "/.static/",
+            "https://secondbucket.s3.us-east-1.amazonaws.com",
+        );
+        second.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: "s3-auth".to_string(),
+            access_key_id: "access_key_id".to_string(),
+            secret_access_key: "secret_access_key".to_string(),
+            session_token: None,
+            origin_query: None,
+        }));
+        settings.proxy.asset_routes = vec![first, second];
+        let req = Request::new(
+            Method::GET,
+            "https://www.example.com/admin/debug/s3-objects?prefix=images/",
+        );
+
+        let err = handle_s3_list_objects_debug(&settings, &noop_services(), req)
+            .await
+            .expect_err("should require route_prefix when multiple S3 routes exist");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should reject ambiguous S3 route selection"
+        );
+        assert!(
+            format!("{err:?}").contains("multiple S3-backed asset routes"),
+            "should explain that route_prefix is required: {err:?}"
         );
     }
 

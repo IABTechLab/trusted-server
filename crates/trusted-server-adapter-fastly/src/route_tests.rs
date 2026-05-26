@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
@@ -256,6 +257,10 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
     )
 }
 
+fn admin_authorization_header() -> String {
+    format!("Basic {}", STANDARD.encode("admin:admin-pass"))
+}
+
 fn test_runtime_services_with_http_client(
     req: &Request,
     backend: Arc<dyn PlatformBackend>,
@@ -327,6 +332,66 @@ fn routes_use_request_local_consent() {
 
     // Routes no longer depend on a separate consent KV store. Live consent is
     // request-local, and EC lifecycle state uses the EC identity store only.
+}
+
+#[test]
+fn admin_s3_debug_requires_auth_even_when_disabled() {
+    let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/admin/debug/s3-objects");
+    let services = test_runtime_services(&req);
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route admin S3 debug request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::UNAUTHORIZED,
+        "should challenge unauthenticated S3 debug requests"
+    );
+}
+
+#[test]
+fn admin_s3_debug_disabled_returns_404_after_auth() {
+    let mut settings = create_test_settings();
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/admin/debug/s3-objects")
+        .with_header(header::AUTHORIZATION, admin_authorization_header());
+    let services = test_runtime_services(&req);
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route admin S3 debug request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::NOT_FOUND,
+        "should hide the S3 debug endpoint when the config flag is disabled"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CACHE_CONTROL),
+        Some("no-store, private"),
+        "should prevent configured response headers from making S3 debug responses cacheable"
+    );
 }
 
 #[test]

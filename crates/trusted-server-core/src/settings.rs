@@ -1569,6 +1569,13 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+    /// Expose the authenticated S3 object-listing debug endpoint at
+    /// `GET /admin/debug/s3-objects`.
+    ///
+    /// When `false` (the default), the endpoint returns 404 after admin
+    /// authentication succeeds. Enable only while investigating S3 object keys.
+    #[serde(default)]
+    pub s3_list_endpoint_enabled: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -1784,8 +1791,11 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
-        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/admin/debug/s3-objects",
+    ];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -4053,8 +4063,12 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate",],
-            "should report all admin endpoints as uncovered"
+            vec![
+                "/_ts/admin/keys/rotate",
+                "/_ts/admin/keys/deactivate",
+                "/admin/debug/s3-objects",
+            ],
+            "should report every admin endpoint as uncovered"
         );
     }
 
@@ -4087,8 +4101,8 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate"],
-            "should detect endpoints not covered by the rotate-only handler"
+            vec!["/_ts/admin/keys/deactivate", "/admin/debug/s3-objects"],
+            "should detect the admin endpoints not covered by the narrow handler"
         );
     }
 
