@@ -3,7 +3,7 @@
 
 [[slot]]
 id = "atf_sidebar_ad"
-gam_unit_path = "/88059007/autoblog/news"
+gam_unit_path = "/a/b/news"
 div_id = "ad-atf_sidebar-0-_r_2_"
 page_patterns = ["/20**", "/news/**"]
 formats = [{ width = 300, height = 250 }]
@@ -18,7 +18,7 @@ slot_id = "aps-slot-atf-sidebar"
 
 [[slot]]
 id = "homepage_header_ad"
-gam_unit_path = "/88059007/autoblog/homepage"
+gam_unit_path = "/a/b/homepage"
 div_id = "ad-header-0-_R_jpalubtak5lb_"
 page_patterns = ["/"]
 formats = [{ width = 970, height = 90 }, { width = 728, height = 90 }, { width = 970, height = 250 }]
@@ -33,7 +33,7 @@ slot_id = "aps-slot-homepage-header"
 
 [[slot]]
 id = "homepage_footer_ad"
-gam_unit_path = "/88059007/autoblog/homepage"
+gam_unit_path = "/a/b/homepage"
 div_id = "ad-fixed_bottom-0-_R_klubtak5lb_"
 page_patterns = ["/"]
 formats = [{ width = 728, height = 90 }]

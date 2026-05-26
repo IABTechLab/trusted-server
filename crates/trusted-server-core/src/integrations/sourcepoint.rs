@@ -1073,9 +1073,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.examnple.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.examnple.com",
             document_state: &document_state,
         };
 
