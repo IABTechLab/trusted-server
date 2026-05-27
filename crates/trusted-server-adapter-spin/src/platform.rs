@@ -143,10 +143,22 @@ fn spin_variable_name(
         return Err(Report::new(error_context).attach("Spin variable key must not be empty"));
     }
 
-    let mut out = String::with_capacity(key.len() + 2);
+    let mut chars = key.chars().peekable();
+    let digit_leading = chars.peek().is_some_and(char::is_ascii_digit);
+
+    // `v_` prefix + optional `n` for digit-leading keys + encoded body.
+    let mut out = String::with_capacity(key.len() + 2 + usize::from(digit_leading));
     out.push_str("v_");
 
-    for ch in key.chars() {
+    // Spin requires each _-separated word to start with an ASCII letter.
+    // If the key starts with a digit, prefix with 'n' so the first word is letter-led.
+    // `validate_kid` rejects digit-leading KIDs, so this branch is unreachable for
+    // all operator-supplied and system-generated keys; it is kept as a safety net.
+    if digit_leading {
+        out.push('n');
+    }
+
+    for ch in chars {
         match ch {
             'a'..='z' | '0'..='9' => out.push(ch),
             'A'..='Z' | '-' | '_' | '.' | ':' => {
@@ -165,6 +177,7 @@ fn spin_variable_name(
 
 fn push_spin_variable_escape(out: &mut String, byte: u8) {
     out.push('_');
+    out.push('x');
     out.push(SPIN_VARIABLE_HEX[(byte >> 4) as usize] as char);
     out.push(SPIN_VARIABLE_HEX[(byte & 0x0f) as usize] as char);
 }
@@ -344,6 +357,26 @@ where
 // SpinPlatformHttpClient — WASM target + spin feature only
 // ---------------------------------------------------------------------------
 
+/// Returns `true` for headers forbidden on WASI HTTP outbound requests.
+///
+/// WASI HTTP (wasi:http@0.2) forbids `host` on outgoing requests — the
+/// authority is conveyed separately via `OutgoingRequest::set_authority`.
+/// Hop-by-hop headers (`connection`, `keep-alive`, `transfer-encoding`,
+/// `upgrade`, `proxy-connection`) are HTTP/1.1 transport-layer concerns
+/// that must not appear in WASI HTTP requests.
+// Compiled for tests on native targets so unit tests can exercise the filter
+// without requiring wasm32; the only production call site is inside the
+// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` block below.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("proxy-connection")
+}
+
 /// Carries a completed response through `send_async` → `select`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 struct SpinPendingResponse {
@@ -375,6 +408,11 @@ impl SpinPlatformHttpClient {
             .uri(uri.clone());
 
         for (name, value) in request.request.headers() {
+            // WASI HTTP forbids these headers on outbound requests:
+            // `host` is conveyed via set_authority; hop-by-hop headers are HTTP/1.1 only.
+            if is_wasi_forbidden_outbound_header(name.as_str()) {
+                continue;
+            }
             match value.to_str() {
                 Ok(value) => {
                     builder.header(name.as_str(), value);
@@ -717,22 +755,22 @@ mod tests {
         assert_eq!(
             spin_variable_name("current-kid", PlatformError::ConfigStore)
                 .expect("should encode current kid key"),
-            "v_current_2dkid"
+            "v_current_x2dkid"
         );
         assert_eq!(
             spin_variable_name("active-kids", PlatformError::ConfigStore)
                 .expect("should encode active kids key"),
-            "v_active_2dkids"
+            "v_active_x2dkids"
         );
         assert_eq!(
             spin_variable_name("ts-2026-05-25", PlatformError::ConfigStore)
                 .expect("should encode generated kid"),
-            "v_ts_2d2026_2d05_2d25"
+            "v_ts_x2d2026_x2d05_x2d25"
         );
         assert_eq!(
             spin_variable_name("2026-key", PlatformError::ConfigStore)
                 .expect("should encode leading digits under the stable prefix"),
-            "v_2026_2dkey"
+            "v_n2026_x2dkey"
         );
     }
 
@@ -741,7 +779,7 @@ mod tests {
         assert_eq!(
             spin_secret_variable_name(&StoreName::from("signing_keys"), "ts-2026-05-25")
                 .expect("should encode secret variable name"),
-            "v_signing_5fkeys_v_ts_2d2026_2d05_2d25"
+            "v_signing_x5fkeys_v_ts_x2d2026_x2d05_x2d25"
         );
     }
 
@@ -936,5 +974,53 @@ mod tests {
             64 * 1024 * 1024,
             "production limit should match EdgeZero Spin proxy"
         );
+    }
+
+    #[test]
+    fn spin_variable_name_digit_prefix_aliasing_is_unreachable_for_valid_kids() {
+        // The `n`-prefix for digit-leading keys would alias with keys starting with
+        // 'n' + the same digit sequence (e.g. "1foo" and "n1foo" both → "v_n1foo").
+        // `validate_kid` rejects digit-leading KIDs, so this branch is only reachable
+        // if `spin_variable_name` is called directly with an invalid key.
+        let digit_leading = spin_variable_name("1foo", PlatformError::ConfigStore)
+            .expect("should encode digit-leading key");
+        let n_prefixed = spin_variable_name("n1foo", PlatformError::ConfigStore)
+            .expect("should encode n-prefixed key");
+        assert_eq!(
+            digit_leading, n_prefixed,
+            "aliasing is expected for invalid digit-leading keys; validate_kid prevents \
+             these from reaching this function in production"
+        );
+    }
+
+    #[test]
+    fn wasi_forbidden_headers_are_identified() {
+        for header in &[
+            "host",
+            "Host",
+            "HOST",
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+        ] {
+            assert!(
+                is_wasi_forbidden_outbound_header(header),
+                "{header} should be forbidden in WASI HTTP outbound requests"
+            );
+        }
+        for header in &[
+            "user-agent",
+            "accept",
+            "content-type",
+            "x-custom",
+            "authorization",
+        ] {
+            assert!(
+                !is_wasi_forbidden_outbound_header(header),
+                "{header} should be allowed in WASI HTTP outbound requests"
+            );
+        }
     }
 }
