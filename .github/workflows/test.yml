@@ -127,7 +127,7 @@ jobs:
         run: cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity
 
       - name: Clippy (parity test crate)
-        run: cargo clippy --manifest-path crates/integration-tests/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path crates/integration-tests/Cargo.toml --all-targets -- -D warnings
 
   test-typescript:
     name: vitest

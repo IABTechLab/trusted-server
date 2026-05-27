@@ -15,6 +15,20 @@ fn routes_build_without_panic() {
     let _router = TrustedServerApp::routes();
 }
 
+fn assert_route_registered(
+    router: &edgezero_core::router::RouterService,
+    method: &str,
+    path: &str,
+) {
+    assert!(
+        router
+            .routes()
+            .iter()
+            .any(|route| route.method().as_str() == method && route.path() == path),
+        "{method} {path} must be explicitly registered before the wildcard fallback"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Middleware regression tests — verify FinalizeResponseMiddleware and
 // AuthMiddleware are wired so they cannot be removed silently.
@@ -48,8 +62,9 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
     //
     // CI settings may not have basic_auth configured, so this test does not
     // assert 401 — it asserts that both middleware layers ran (X-Geo-Info-Available
-    // present) and that the route is actually reached (status != 404).
+    // present) and separately verifies the explicit auction route registration.
     let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/auction");
 
     let req = request_builder()
         .method("POST")
@@ -74,7 +89,7 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
 }
 
 // ---------------------------------------------------------------------------
-// Route smoke tests — verify all adapter routes are registered and do not 5xx
+// Route smoke tests — verify all adapter routes are explicitly registered
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -95,149 +110,55 @@ async fn tsjs_route_is_routed_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/verify-signature")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/verify-signature must be routed"
-    );
+    assert_route_registered(&router, "POST", "/verify-signature");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/admin/keys/rotate must be routed"
-    );
+    assert_route_registered(&router, "POST", "/admin/keys/rotate");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/admin/keys/deactivate must be routed"
-    );
+    assert_route_registered(&router, "POST", "/admin/keys/deactivate");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auction_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/auction")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from(r#"{"adUnits":[]}"#))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
+    assert_route_registered(&router, "POST", "/auction");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("GET")
-        .uri("/first-party/proxy")
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    // Handlers require valid outbound proxy settings; they may return 4xx/5xx in CI.
-    // The assertion is routing only: the path must not fall through to the 404 not-found handler.
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/proxy must be routed"
-    );
+    assert_route_registered(&router, "GET", "/first-party/proxy");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_click_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("GET")
-        .uri("/first-party/click")
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/click must be routed"
-    );
+    assert_route_registered(&router, "GET", "/first-party/click");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_get_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("GET")
-        .uri("/first-party/sign")
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "GET /first-party/sign must be routed"
-    );
+    assert_route_registered(&router, "GET", "/first-party/sign");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_post_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/first-party/sign")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "POST /first-party/sign must be routed"
-    );
+    assert_route_registered(&router, "POST", "/first-party/sign");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_is_routed() {
     let router = TrustedServerApp::routes();
-    let req = request_builder()
-        .method("POST")
-        .uri("/first-party/proxy-rebuild")
-        .header("content-type", "application/json")
-        .body(edgezero_core::body::Body::from("{}"))
-        .expect("should build request");
-    let resp = router.oneshot(req).await;
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/proxy-rebuild must be routed"
-    );
+    assert_route_registered(&router, "POST", "/first-party/proxy-rebuild");
 }
 
 // ---------------------------------------------------------------------------

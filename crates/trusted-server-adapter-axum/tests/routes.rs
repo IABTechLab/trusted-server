@@ -15,117 +15,59 @@ fn make_service() -> EdgeZeroAxumService {
     EdgeZeroAxumService::new(TrustedServerApp::routes())
 }
 
+fn assert_route_registered(
+    router: &edgezero_core::router::RouterService,
+    method: &str,
+    path: &str,
+) {
+    assert!(
+        router
+            .routes()
+            .iter()
+            .any(|route| route.method().as_str() == method && route.path() == path),
+        "{method} {path} must be explicitly registered before the wildcard fallback"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Route smoke tests — verify routing (not business logic correctness)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_is_routed() {
-    // Verifies the route exists — 5xx from missing signing keys is acceptable;
-    // 404 is not (that would mean the route was not registered).
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/.well-known/trusted-server.json")
-        .body(AxumBody::empty())
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "discovery endpoint must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "GET", "/.well-known/trusted-server.json");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_endpoint_is_routed() {
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/verify-signature")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "verify-signature must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/verify-signature");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_is_routed() {
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "admin/keys/rotate must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/admin/keys/rotate");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_is_routed() {
-    let mut svc = make_service();
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/admin/keys/deactivate");
+}
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "admin/keys/deactivate must be routed"
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auction_endpoint_is_routed() {
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/auction");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_returns_non_5xx() {
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/admin/keys/rotate");
+
     // Admin routes return 501 Not Implemented on the Axum dev server (store
     // writes are unsupported). Auth middleware may short-circuit with 4xx
     // before reaching the handler. Either way, no panic or unhandled 500.
@@ -351,6 +293,9 @@ async fn auction_endpoint_does_not_require_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_returns_non_404_non_5xx() {
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/admin/keys/rotate");
+
     let mut svc = make_service();
 
     let req = Request::builder()
@@ -434,112 +379,30 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/proxy")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/proxy must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "GET", "/first-party/proxy");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_click_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/click")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/click must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "GET", "/first-party/click");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_get_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("GET")
-        .uri("/first-party/sign")
-        .body(AxumBody::empty())
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "GET /first-party/sign must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "GET", "/first-party/sign");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_post_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/first-party/sign")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "POST /first-party/sign must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/first-party/sign");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_is_routed() {
-    let mut svc = make_service();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/first-party/proxy-rebuild")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    assert_ne!(
-        resp.status().as_u16(),
-        404,
-        "/first-party/proxy-rebuild must be routed"
-    );
+    let router = TrustedServerApp::routes();
+    assert_route_registered(&router, "POST", "/first-party/proxy-rebuild");
 }

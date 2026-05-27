@@ -104,6 +104,14 @@ async fn cf_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
     (s, h)
 }
 
+fn header_value<'a>(headers: &'a HeaderMap, name: &str, adapter: &str) -> &'a str {
+    headers
+        .get(name)
+        .unwrap_or_else(|| panic!("{adapter} response must include {name}"))
+        .to_str()
+        .unwrap_or_else(|_| panic!("{adapter} {name} header must be valid UTF-8"))
+}
+
 // ---------------------------------------------------------------------------
 // Route parity: same route → same status on both adapters
 // ---------------------------------------------------------------------------
@@ -215,18 +223,15 @@ async fn admin_rotate_unauthenticated_parity() {
         "both adapters must return the same status for unauthenticated admin route"
     );
 
-    assert!(
-        axum_headers.contains_key("www-authenticate"),
-        "Axum 401 must include WWW-Authenticate header"
+    let axum_www_auth = header_value(&axum_headers, "www-authenticate", "Axum");
+    let cf_www_auth = header_value(&cf_headers, "www-authenticate", "Cloudflare");
+    assert_eq!(
+        axum_www_auth, cf_www_auth,
+        "WWW-Authenticate values must match across adapters"
     );
-    let cf_www_auth = cf_headers
-        .get("www-authenticate")
-        .expect("should have www-authenticate header on 401")
-        .to_str()
-        .expect("should be valid UTF-8");
     assert!(
-        cf_www_auth.starts_with("Basic realm="),
-        "Cloudflare 401 WWW-Authenticate must be Basic scheme: {cf_www_auth:?}"
+        axum_www_auth.starts_with("Basic realm="),
+        "WWW-Authenticate must be Basic scheme: {axum_www_auth:?}"
     );
 }
 
@@ -249,13 +254,15 @@ async fn admin_deactivate_unauthenticated_parity() {
         "both adapters must return the same status for unauthenticated admin/keys/deactivate"
     );
 
-    assert!(
-        axum_headers.contains_key("www-authenticate"),
-        "Axum 401 on admin/keys/deactivate must include WWW-Authenticate header"
+    let axum_www_auth = header_value(&axum_headers, "www-authenticate", "Axum");
+    let cf_www_auth = header_value(&cf_headers, "www-authenticate", "Cloudflare");
+    assert_eq!(
+        axum_www_auth, cf_www_auth,
+        "WWW-Authenticate values must match across adapters"
     );
     assert!(
-        cf_headers.contains_key("www-authenticate"),
-        "Cloudflare 401 on admin/keys/deactivate must include WWW-Authenticate header"
+        axum_www_auth.starts_with("Basic realm="),
+        "WWW-Authenticate must be Basic scheme: {axum_www_auth:?}"
     );
 }
 
@@ -279,13 +286,12 @@ async fn geo_header_parity_on_all_responses() {
             cf_post_headers(path, body).await
         };
 
-        assert!(
-            axum_headers.contains_key("x-geo-info-available"),
-            "Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"
-        );
-        assert!(
-            cf_headers.contains_key("x-geo-info-available"),
-            "Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"
+        let axum_geo = header_value(&axum_headers, "x-geo-info-available", "Axum");
+        let cf_geo = header_value(&cf_headers, "x-geo-info-available", "Cloudflare");
+        assert_eq!(
+            axum_geo, cf_geo,
+            "X-Geo-Info-Available values must match for {method} {path} \
+             (axum_status={axum_status} cf_status={cf_status})"
         );
     }
 }
