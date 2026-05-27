@@ -1,9 +1,5 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
-//!
-//! This module also provides [`build_runtime_services`], a free function that
-//! constructs a [`RuntimeServices`] instance once at the entry point from the
-//! incoming Fastly request.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -12,14 +8,14 @@ use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{geo_lookup, Geo};
-use fastly::{ConfigStore, Request, SecretStore};
+use fastly::{ConfigStore, SecretStore};
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
+    GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId,
     StoreName,
 };
 
@@ -351,38 +347,6 @@ impl PlatformGeo for FastlyPlatformGeo {
 // Entry-point helper
 // ---------------------------------------------------------------------------
 
-/// Construct a [`RuntimeServices`] instance from the incoming Fastly request.
-///
-/// Call this once at the entry point before dispatching to handlers.
-/// `client_info` is populated from TLS and IP metadata available on the
-/// request; geo lookup is deferred to handler time via
-/// `services.geo().lookup(services.client_info().client_ip)`.
-///
-/// `kv_store` is an [`Arc<dyn PlatformKvStore>`] opened by the caller for
-/// the primary KV store. Use [`open_kv_store`] to construct it.
-#[must_use]
-pub fn build_runtime_services(
-    req: &Request,
-    kv_store: Arc<dyn PlatformKvStore>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(FastlyPlatformConfigStore))
-        .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(kv_store)
-        .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
-        .client_info(ClientInfo {
-            client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
-            tls_cipher: req
-                .get_tls_cipher_openssl_name()
-                .ok()
-                .flatten()
-                .map(str::to_string),
-        })
-        .build()
-}
 
 /// Open a named KV store as a [`PlatformKvStore`] implementation.
 ///
@@ -406,13 +370,8 @@ mod tests {
 
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
-    use edgezero_core::key_value_store::NoopKvStore;
 
     use super::*;
-
-    fn noop_kv_store() -> Arc<dyn PlatformKvStore> {
-        Arc::new(NoopKvStore)
-    }
 
     // --- FastlyPlatformBackend::predict_name --------------------------------
 
@@ -492,36 +451,6 @@ mod tests {
         assert!(
             name.ends_with("_t2000"),
             "should encode 2000ms timeout in name"
-        );
-    }
-
-    // --- ClientInfo extraction ----------------------------------------------
-
-    #[test]
-    fn build_runtime_services_client_info_is_none_without_tls() {
-        let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
-
-        assert!(
-            services.client_info().tls_protocol.is_none(),
-            "should have no tls_protocol on plain test request"
-        );
-        assert!(
-            services.client_info().tls_cipher.is_none(),
-            "should have no tls_cipher on plain test request"
-        );
-    }
-
-    #[test]
-    fn build_runtime_services_returns_cloneable_services() {
-        let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
-        let cloned = services.clone();
-
-        assert_eq!(
-            services.client_info().client_ip,
-            cloned.client_info().client_ip,
-            "should preserve client_ip through clone"
         );
     }
 
