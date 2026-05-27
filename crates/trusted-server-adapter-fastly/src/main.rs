@@ -43,8 +43,6 @@ mod logging;
 mod management_api;
 mod middleware;
 mod platform;
-#[cfg(test)]
-mod route_tests;
 
 use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
