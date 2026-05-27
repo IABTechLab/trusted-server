@@ -88,6 +88,7 @@ fn main() {
     edgezero_main(req);
 }
 
+/// Handles a request through the EdgeZero router path.
 fn edgezero_main(mut req: FastlyRequest) {
     let config_store = match open_trusted_server_config_store() {
         Ok(cs) => cs,
