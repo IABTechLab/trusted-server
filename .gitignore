@@ -3,6 +3,10 @@
 /pkg
 /target
 
+# local Spin CLI downloads
+/spin
+/spin.sig
+
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
 /crates/integration-tests/target

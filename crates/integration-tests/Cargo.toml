@@ -26,8 +26,9 @@ env_logger = "0.11"
 libc = "0.2"
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "38198f9839b70aef03ab971ae5876982773fc2a1", features = ["axum"] }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "38198f9839b70aef03ab971ae5876982773fc2a1" }
+trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", features = ["axum"] }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e" }
 axum = "0.8.9"
 tower = { version = "0.4", features = ["util"] }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] } # exact pin — keep in sync with workspace-resolved tokio version

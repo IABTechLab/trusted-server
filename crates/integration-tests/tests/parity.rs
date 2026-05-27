@@ -1,6 +1,6 @@
-//! Cross-adapter parity tests: Axum vs Cloudflare in-process.
+//! Cross-adapter parity tests: Axum vs Cloudflare vs Spin in-process.
 //!
-//! Sends identical requests to both adapters and asserts that:
+//! Sends identical requests to all host-runnable adapters and asserts that:
 //! - Response status codes match
 //! - Critical headers (X-Geo-Info-Available, WWW-Authenticate on 401) match
 //!
@@ -17,6 +17,7 @@ use http::HeaderMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
+use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
 
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
@@ -104,17 +105,65 @@ async fn cf_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
     (s, h)
 }
 
+/// Send a GET request to the Spin adapter and return (status, headers, body bytes).
+async fn spin_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
+    let router = SpinApp::routes();
+    let req = request_builder()
+        .method("GET")
+        .uri(uri)
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build GET request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body_bytes = resp.into_body().into_bytes();
+    (status, headers, body_bytes)
+}
+
+/// Send a GET request to the Spin adapter and return (status, headers).
+async fn spin_get(uri: &str) -> (u16, HeaderMap) {
+    let (s, h, _) = spin_get_body(uri).await;
+    (s, h)
+}
+
+/// Send a POST request to the Spin adapter and return (status, headers, body bytes).
+async fn spin_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
+    let router = SpinApp::routes();
+    let req = request_builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from(body.to_owned()))
+        .expect("should build POST request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body_bytes = resp.into_body().into_bytes();
+    (status, headers, body_bytes)
+}
+
+/// Convenience wrapper for tests that don't need body.
+async fn spin_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
+    let (s, h, _) = spin_post(uri, body).await;
+    (s, h)
+}
+
 // ---------------------------------------------------------------------------
-// Route parity: same route → same status on both adapters
+// Route parity: same route → same status on all adapters
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_route_status_parity() {
     let (axum_status, _) = axum_get("/.well-known/trusted-server.json").await;
     let (cf_status, _) = cf_get("/.well-known/trusted-server.json").await;
+    let (spin_status, _) = spin_get("/.well-known/trusted-server.json").await;
     assert_eq!(
         axum_status, cf_status,
         "/.well-known/trusted-server.json must return same status: axum={axum_status} cf={cf_status}"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "/.well-known/trusted-server.json must return same status: cf={cf_status} spin={spin_status}"
     );
 }
 
@@ -164,14 +213,24 @@ async fn discovery_route_body_is_json_parity() {
         (status, body)
     };
 
-    // Both adapters must agree on whether the response is JSON.
+    let (spin_status, _, spin_body_bytes) =
+        spin_get_body("/.well-known/trusted-server.json").await;
+
+    // All adapters must agree on whether the response is JSON.
     let axum_json: Option<Value> = serde_json::from_slice(&axum_body_bytes).ok();
     let cf_json: Option<Value> = serde_json::from_slice(&cf_body_bytes).ok();
+    let spin_json: Option<Value> = serde_json::from_slice(&spin_body_bytes).ok();
     assert_eq!(
         axum_json.is_some(),
         cf_json.is_some(),
         "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
          (axum_status={axum_status} cf_status={cf_status})"
+    );
+    assert_eq!(
+        cf_json.is_some(),
+        spin_json.is_some(),
+        "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
+         (cf_status={cf_status} spin_status={spin_status})"
     );
 }
 
@@ -182,15 +241,21 @@ async fn verify_signature_route_parity() {
     // (routing and middleware are wired identically).
     let (axum_status, _) = axum_post_headers("/verify-signature", "{}").await;
     let (cf_status, _) = cf_post_headers("/verify-signature", "{}").await;
+    let (spin_status, _) = spin_post_headers("/verify-signature", "{}").await;
 
     assert_ne!(axum_status, 404, "Axum /verify-signature must be routed");
     assert_ne!(
         cf_status, 404,
         "Cloudflare /verify-signature must be routed"
     );
+    assert_ne!(spin_status, 404, "Spin /verify-signature must be routed");
     assert_eq!(
         axum_status, cf_status,
         "/verify-signature must return same status: axum={axum_status} cf={cf_status}"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "/verify-signature must return same status: cf={cf_status} spin={spin_status}"
     );
 }
 
@@ -201,6 +266,7 @@ async fn admin_rotate_unauthenticated_parity() {
     // is separate and not covered here.
     let (axum_status, axum_headers) = axum_post_headers("/admin/keys/rotate", "{}").await;
     let (cf_status, cf_headers) = cf_post_headers("/admin/keys/rotate", "{}").await;
+    let (spin_status, spin_headers) = spin_post_headers("/admin/keys/rotate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -211,13 +277,25 @@ async fn admin_rotate_unauthenticated_parity() {
         "Cloudflare must return 401 for unauthenticated admin route"
     );
     assert_eq!(
+        spin_status, 401,
+        "Spin must return 401 for unauthenticated admin route"
+    );
+    assert_eq!(
         axum_status, cf_status,
-        "both adapters must return the same status for unauthenticated admin route"
+        "Axum and Cloudflare must return the same status for unauthenticated admin route"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "Cloudflare and Spin must return the same status for unauthenticated admin route"
     );
 
     assert!(
         axum_headers.contains_key("www-authenticate"),
         "Axum 401 must include WWW-Authenticate header"
+    );
+    assert!(
+        spin_headers.contains_key("www-authenticate"),
+        "Spin 401 must include WWW-Authenticate header"
     );
     let cf_www_auth = cf_headers
         .get("www-authenticate")
@@ -235,6 +313,7 @@ async fn admin_deactivate_unauthenticated_parity() {
     // Mirror of admin_rotate_unauthenticated_parity for the deactivate endpoint.
     let (axum_status, axum_headers) = axum_post_headers("/admin/keys/deactivate", "{}").await;
     let (cf_status, cf_headers) = cf_post_headers("/admin/keys/deactivate", "{}").await;
+    let (spin_status, spin_headers) = spin_post_headers("/admin/keys/deactivate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -245,8 +324,16 @@ async fn admin_deactivate_unauthenticated_parity() {
         "Cloudflare must return 401 for unauthenticated admin/keys/deactivate"
     );
     assert_eq!(
+        spin_status, 401,
+        "Spin must return 401 for unauthenticated admin/keys/deactivate"
+    );
+    assert_eq!(
         axum_status, cf_status,
-        "both adapters must return the same status for unauthenticated admin/keys/deactivate"
+        "Axum and Cloudflare must return the same status for unauthenticated admin/keys/deactivate"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "Cloudflare and Spin must return the same status for unauthenticated admin/keys/deactivate"
     );
 
     assert!(
@@ -256,6 +343,10 @@ async fn admin_deactivate_unauthenticated_parity() {
     assert!(
         cf_headers.contains_key("www-authenticate"),
         "Cloudflare 401 on admin/keys/deactivate must include WWW-Authenticate header"
+    );
+    assert!(
+        spin_headers.contains_key("www-authenticate"),
+        "Spin 401 on admin/keys/deactivate must include WWW-Authenticate header"
     );
 }
 
@@ -278,6 +369,11 @@ async fn geo_header_parity_on_all_responses() {
         } else {
             cf_post_headers(path, body).await
         };
+        let (spin_status, spin_headers) = if *method == "GET" {
+            spin_get(path).await
+        } else {
+            spin_post_headers(path, body).await
+        };
 
         assert!(
             axum_headers.contains_key("x-geo-info-available"),
@@ -287,6 +383,10 @@ async fn geo_header_parity_on_all_responses() {
             cf_headers.contains_key("x-geo-info-available"),
             "Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"
         );
+        assert!(
+            spin_headers.contains_key("x-geo-info-available"),
+            "Spin: {method} {path} (status={spin_status}) must have X-Geo-Info-Available"
+        );
     }
 }
 
@@ -294,9 +394,11 @@ async fn geo_header_parity_on_all_responses() {
 async fn auction_not_challenged_by_auth_parity() {
     let (axum_status, _) = axum_post_headers("/auction", r#"{"adUnits":[]}"#).await;
     let (cf_status, _) = cf_post_headers("/auction", r#"{"adUnits":[]}"#).await;
+    let (spin_status, _) = spin_post_headers("/auction", r#"{"adUnits":[]}"#).await;
 
     assert_ne!(axum_status, 401, "Axum /auction must not 401");
     assert_ne!(cf_status, 401, "Cloudflare /auction must not 401");
+    assert_ne!(spin_status, 401, "Spin /auction must not 401");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,19 +409,30 @@ async fn publisher_proxy_fallback_parity() {
     // whether the proxy succeeds.
     let (axum_status, axum_headers) = axum_get("/").await;
     let (cf_status, cf_headers) = cf_get("/").await;
+    let (spin_status, spin_headers) = spin_get("/").await;
 
-    // Both adapters must agree: either both proxy to the origin or both fail.
+    // All adapters must agree: either all proxy to the origin or all fail.
     assert_eq!(
         axum_status >= 500,
         cf_status >= 500,
         "publisher fallback 5xx behaviour must match: axum={axum_status} cf={cf_status}"
     );
+    assert_eq!(
+        cf_status >= 500,
+        spin_status >= 500,
+        "publisher fallback 5xx behaviour must match: cf={cf_status} spin={spin_status}"
+    );
 
     let axum_has_cookie = axum_headers.contains_key("set-cookie");
     let cf_has_cookie = cf_headers.contains_key("set-cookie");
+    let spin_has_cookie = spin_headers.contains_key("set-cookie");
     assert_eq!(
         axum_has_cookie, cf_has_cookie,
         "Set-Cookie presence must match: axum={axum_has_cookie} cf={cf_has_cookie}"
+    );
+    assert_eq!(
+        cf_has_cookie, spin_has_cookie,
+        "Set-Cookie presence must match: cf={cf_has_cookie} spin={spin_has_cookie}"
     );
 }
 
@@ -327,9 +440,14 @@ async fn publisher_proxy_fallback_parity() {
 async fn unknown_route_returns_same_status_parity() {
     let (axum_status, _) = axum_get("/this-route-does-not-exist-abc123").await;
     let (cf_status, _) = cf_get("/this-route-does-not-exist-abc123").await;
+    let (spin_status, _) = spin_get("/this-route-does-not-exist-abc123").await;
 
     assert_eq!(
         axum_status, cf_status,
         "unknown routes must return same status: axum={axum_status} cf={cf_status}"
+    );
+    assert_eq!(
+        cf_status, spin_status,
+        "unknown routes must return same status: cf={cf_status} spin={spin_status}"
     );
 }

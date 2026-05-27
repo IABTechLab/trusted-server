@@ -214,6 +214,13 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
         }));
     }
 
+    if kid.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
+                .into(),
+        }));
+    }
+
     if !kid
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
@@ -1000,6 +1007,13 @@ mod tests {
         let result = validate_kid("kid-a,kid-b");
 
         assert!(result.is_err(), "should reject commas in kid values");
+    }
+
+    #[test]
+    fn validate_kid_rejects_digit_leading_ids() {
+        let result = validate_kid("2026-key");
+
+        assert!(result.is_err(), "should reject digit-leading kid values");
     }
 
     #[test]

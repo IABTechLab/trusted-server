@@ -38,6 +38,15 @@ jobs:
       - name: Run cargo clippy (Axum — native)
         run: cargo clippy-axum
 
+      - name: Run cargo clippy (Cloudflare — native)
+        run: cargo clippy-cloudflare
+
+      - name: Run cargo clippy (Spin — native)
+        run: cargo clippy-spin-native
+
+      - name: Run cargo clippy (Spin — wasm32-wasip1)
+        run: cargo clippy-spin-wasm
+
   format-typescript:
     runs-on: ubuntu-latest
     defaults:

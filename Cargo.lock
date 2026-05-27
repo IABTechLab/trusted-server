@@ -882,7 +882,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -905,7 +905,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -942,9 +942,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgezero-adapter-spin"
+version = "0.1.0"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "brotli",
+ "bytes",
+ "edgezero-core",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "spin-sdk",
+]
+
+[[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -972,7 +989,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "log",
  "proc-macro2",
@@ -1065,9 +1082,9 @@ dependencies = [
 
 [[package]]
 name = "fastly"
-version = "0.11.13"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f767502306f09f6dcb76302d09cd2ea8542e228d5f155166f0c2da925e16c61"
+checksum = "531e4c3df48350d9f4fc95b4deaf87fd29820336b7926bb84bf460457c2a126b"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1093,9 +1110,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-macros"
-version = "0.11.13"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51ae08eeeb5ed0c1a8b454fc89dca0e316e13b7889e81fc9a435503c1e84a2d7"
+checksum = "cc2aef5f9690b04c8890f9a54ddb591b12b9779ec25ee0e572d207106e52e3d8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1104,9 +1121,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-shared"
-version = "0.11.13"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64ed1bba12ca45d1a2a80c2c55d903297adb3eeb4edc9d327c1d51ee709d404"
+checksum = "080ad138403159fd366d3e0b14bb49cb0c01dc18c25095bbbd1c85e3338f5413"
 dependencies = [
  "bitflags 1.3.2",
  "http",
@@ -1114,14 +1131,15 @@ dependencies = [
 
 [[package]]
 name = "fastly-sys"
-version = "0.11.13"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f1b82ebd99583740a074d8962ca75d7d17065b185a94e4919c3a3f2193268b6"
+checksum = "de75ef193f6c29c43d667458bede648970715aedd5db2d42c2eba3ffa3ad738b"
 dependencies = [
  "bitflags 1.3.2",
  "fastly-shared",
+ "http",
  "wasip2",
- "wit-bindgen 0.46.0",
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -1312,7 +1330,7 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "wasm-bindgen",
 ]
 
@@ -1933,9 +1951,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "log-fastly"
-version = "0.11.13"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a5d864949b863161476a8129ef0322c56c77bb15f98d88991002072f497b1e"
+checksum = "51dae5def13a2d557fdb63862d642f8d4641ec3773c036bb14092697b6764013"
 dependencies = [
  "fastly",
  "log",
@@ -2014,7 +2032,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
 
@@ -2566,9 +2584,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "3.1.3"
+version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba239c1c1693315d3cc0e601db3b3965543afbf48c41730fdca2f069f510f4a"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
 dependencies = [
  "libc",
 ]
@@ -2710,6 +2728,16 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "routefinder"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0971d3c8943a6267d6bd0d782fdc4afa7593e7381a92a3df950ff58897e066b5"
+dependencies = [
+ "smartcow",
+ "smartstring",
 ]
 
 [[package]]
@@ -3151,6 +3179,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smartcow"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "656fcb1c1fca8c4655372134ce87d8afdf5ec5949ebabe8d314be0141d8b5da2"
+dependencies = [
+ "smartstring",
+]
+
+[[package]]
+name = "smartstring"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
+dependencies = [
+ "autocfg",
+ "static_assertions",
+ "version_check",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3165,6 +3213,52 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
+name = "spin-executor"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bba409d00af758cd5de128da4a801e891af0545138f66a688f025f6d4e33870b"
+dependencies = [
+ "futures",
+ "once_cell",
+ "wasi 0.13.1+wasi-0.2.0",
+]
+
+[[package]]
+name = "spin-macro"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f959f16928e3c023468e41da9ebb77442e2ce22315e8dab11508fe76b3567ee1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "spin-sdk"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8951c7c4ab7f87f332d497789eeed9631c8116988b628b4851eb2fa999ead019"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "form_urlencoded",
+ "futures",
+ "http",
+ "once_cell",
+ "routefinder",
+ "spin-executor",
+ "spin-macro",
+ "thiserror 2.0.18",
+ "wasi 0.13.1+wasi-0.2.0",
+ "wit-bindgen 0.51.0",
+]
 
 [[package]]
 name = "spki"
@@ -3183,10 +3277,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
 
 [[package]]
 name = "strum_macros"
@@ -3605,6 +3714,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-adapter-spin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "brotli",
+ "bytes",
+ "edgezero-adapter-spin",
+ "edgezero-core",
+ "error-stack",
+ "flate2",
+ "log",
+ "spin-sdk",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-js",
+]
+
+[[package]]
 name = "trusted-server-core"
 version = "0.1.0"
 dependencies = [
@@ -3823,6 +3952,15 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "wasi"
+version = "0.13.1+wasi-0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f43d1c36145feb89a3e61aa0ba3e582d976a8ab77f1474aa0adb80800fe0cf8"
+dependencies = [
+ "wit-bindgen-rt",
+]
 
 [[package]]
 name = "wasip2"
@@ -4226,19 +4364,11 @@ dependencies = [
 
 [[package]]
 name = "wit-bindgen"
-version = "0.46.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
-dependencies = [
- "bitflags 2.11.1",
-]
-
-[[package]]
-name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 dependencies = [
+ "bitflags 2.11.1",
  "wit-bindgen-rust-macro",
 ]
 
@@ -4260,6 +4390,15 @@ dependencies = [
  "anyhow",
  "heck",
  "wit-parser",
+]
+
+[[package]]
+name = "wit-bindgen-rt"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b0780cf7046630ed70f689a098cd8d56c5c3b22f2a7379bbdb088879963ff96"
+dependencies = [
+ "bitflags 2.11.1",
 ]
 
 [[package]]
@@ -4332,9 +4471,9 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.7.5"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7267f3baa986254a8dace6f6a7c6ab88aef59f00c03aaad6749e048b5faaf6f6"
+checksum = "2d3c60a70414db58e1890f3675d02692adace736657cb66994f220ae3780c90d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4350,6 +4489,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "serde_urlencoded",
+ "strum",
  "tokio",
  "url",
  "wasm-bindgen",
@@ -4362,13 +4502,14 @@ dependencies = [
 
 [[package]]
 name = "worker-macros"
-version = "0.7.5"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7410081121531ec2fa111ab17b911efc601d7b6d590c0a92b847874ebeff0030"
+checksum = "60bcb459a67977fcb79698a3123ae58a928b1b24cc3035eaec033dbdfc139438"
 dependencies = [
  "async-trait",
  "proc-macro2",
  "quote",
+ "strum",
  "syn 2.0.117",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -4378,9 +4519,9 @@ dependencies = [
 
 [[package]]
 name = "worker-sys"
-version = "0.7.5"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4777582bf8a04174a034cb336f3702eb0e5cb444a67fdaa4fd44454ff7e2dd95"
+checksum = "c0e59a8504685d87649b8fda877d95fcc48f8c8177dbd77a4dc8e67f8fc80240"
 dependencies = [
  "cfg-if",
  "js-sys",
