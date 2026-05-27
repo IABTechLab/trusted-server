@@ -1,7 +1,7 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{Response as HttpResponse};
+use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
 
 /// Convert a `fastly::Response` into an [`HttpResponse`].
