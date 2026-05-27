@@ -217,6 +217,7 @@ pub(crate) struct StubHttpClient {
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
 }
 
@@ -233,6 +234,7 @@ impl StubHttpClient {
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
             image_optimizer_options: Mutex::new(Vec::new()),
+            request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
         }
     }
@@ -286,6 +288,14 @@ impl StubHttpClient {
             .clone()
     }
 
+    /// Return request methods captured per `send` call, in order.
+    pub fn recorded_request_methods(&self) -> Vec<String> {
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .clone()
+    }
+
     /// Return request URIs captured per `send` call, in order.
     pub fn recorded_request_uris(&self) -> Vec<String> {
         self.request_uris
@@ -311,6 +321,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .push(request.request.method().to_string());
         self.request_uris
             .lock()
             .expect("should lock request URIs")
