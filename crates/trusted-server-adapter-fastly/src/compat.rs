@@ -1,41 +1,8 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
-//!
-//! Contains only the functions used by the legacy `main()` entry point.
-//! Relocated from `trusted-server-core` as part of removing all `fastly` crate
-//! imports from the core library.
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{Request as HttpRequest, RequestBuilder, Response as HttpResponse, Uri};
+use edgezero_core::http::{Response as HttpResponse};
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
-
-fn build_http_request(req: &fastly::Request, body: EdgeBody) -> HttpRequest {
-    let uri: Uri = req
-        .get_url_str()
-        .parse()
-        .expect("should parse fastly request URL as URI");
-
-    let mut builder: RequestBuilder = edgezero_core::http::request_builder()
-        .method(req.get_method().clone())
-        .uri(uri);
-
-    for (name, value) in req.get_headers() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-
-    builder
-        .body(body)
-        .expect("should build http request from fastly request")
-}
-
-/// Convert an owned `fastly::Request` into an [`HttpRequest`].
-///
-/// # Panics
-///
-/// Panics if the Fastly request URL cannot be parsed as an `http::Uri`.
-pub(crate) fn from_fastly_request(mut req: fastly::Request) -> HttpRequest {
-    let body = EdgeBody::from(req.take_body_bytes());
-    build_http_request(&req, body)
-}
 
 /// Convert a `fastly::Response` into an [`HttpResponse`].
 pub(crate) fn from_fastly_response(mut resp: fastly::Response) -> HttpResponse {
@@ -68,19 +35,6 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
         }
     }
 
-    fastly_resp
-}
-
-/// Convert an [`HttpResponse`] into a `fastly::Response` without a body.
-///
-/// Use this when the caller will stream the body separately through
-/// [`fastly::Response::stream_to_client`].
-pub(crate) fn to_fastly_response_skeleton(resp: HttpResponse) -> fastly::Response {
-    let (parts, _body) = resp.into_parts();
-    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
-    for (name, value) in &parts.headers {
-        fastly_resp.append_header(name.as_str(), value.as_bytes());
-    }
     fastly_resp
 }
 

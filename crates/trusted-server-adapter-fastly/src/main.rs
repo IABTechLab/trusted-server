@@ -38,14 +38,12 @@ use trusted_server_core::settings_data::get_settings;
 mod app;
 mod backend;
 mod compat;
-mod error;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
 
 use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
-use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 
