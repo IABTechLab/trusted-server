@@ -5,33 +5,16 @@ use edgezero_adapter_fastly::FastlyConfigStore;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::http::{
-    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
-};
+use edgezero_core::http::{header, HeaderValue, Response as HttpResponse};
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::AuctionOrchestrator;
-use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
+use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::platform::RuntimeServices;
-use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
-};
-use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
-    OwnedProcessResponseParams, PublisherResponse,
-};
-use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
-};
+use trusted_server_core::publisher::{stream_publisher_body, PublisherResponse};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
@@ -43,9 +26,9 @@ mod management_api;
 mod middleware;
 mod platform;
 
-use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
+use crate::app::TrustedServerApp;
 use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
-use crate::platform::{build_runtime_services, FastlyPlatformGeo};
+use crate::platform::FastlyPlatformGeo;
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 
