@@ -328,6 +328,7 @@ export function installSpaAuctionHook(): void {
       });
       if (!res.ok) return;
       const data = (await res.json()) as PageBidsResponse;
+      if (inflight !== controller) return;
       win.__ts_ad_slots = data.slots;
       win.__ts_bids = data.bids;
       win.__tsAdInit?.();

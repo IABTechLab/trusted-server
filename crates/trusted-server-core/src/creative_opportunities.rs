@@ -42,6 +42,7 @@ pub struct CreativeOpportunitiesConfig {
 
 /// A single ad placement opportunity on the publisher's site.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitySlot {
     /// Unique identifier for the slot (e.g., `"atf"`, `"below-fold-sidebar"`).
     pub id: String,
@@ -224,6 +225,7 @@ pub struct ApsSlotParams {
 
 /// TOML file structure for creative opportunity slot definitions.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesFile {
     /// All slot definitions in the file (mapped from `[[slot]]` TOML arrays).
     #[serde(rename = "slot", default)]

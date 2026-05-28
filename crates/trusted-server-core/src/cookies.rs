@@ -141,7 +141,13 @@ pub(crate) fn parse_ts_eids_cookie(jar: Option<&CookieJar>) -> Option<Vec<crate:
         }
     };
     match serde_json::from_slice::<Vec<crate::openrtb::Eid>>(&decoded) {
-        Ok(eids) if !eids.is_empty() => Some(eids),
+        Ok(eids) if !eids.is_empty() => {
+            if eids.len() > 32 || eids.iter().any(|e| e.uids.len() > 32) {
+                log::debug!("ts-eids cookie: too many eids or uids, rejecting");
+                return None;
+            }
+            Some(eids)
+        }
         Ok(_) => None,
         Err(e) => {
             log::debug!("ts-eids cookie: JSON parse failed: {e}");

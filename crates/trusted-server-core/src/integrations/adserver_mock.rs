@@ -251,17 +251,31 @@ impl AdServerMockProvider {
                 // Recover bidder name from crid ("{bidder}-creative") to look up the
                 // original SSP bid and restore nurl/burl/ad_id the mediator drops.
                 let crid = bid["crid"].as_str().unwrap_or("");
-                let bidder = crid.strip_suffix("-creative").unwrap_or("");
+                let bidder = crid.strip_suffix("-creative").unwrap_or_else(|| {
+                    log::debug!(
+                        "adserver_mock: crid '{crid}' does not match '<bidder>-creative' — dropping nurl/burl/ad_id"
+                    );
+                    ""
+                });
                 let key = (seat_name.to_string(), slot_id.clone(), bidder.to_string());
                 let original = bid_index.get(&key);
+
+                let width = bid["w"].as_u64().unwrap_or(0) as u32;
+                let height = bid["h"].as_u64().unwrap_or(0) as u32;
+                if width == 0 || height == 0 {
+                    log::debug!(
+                        "adserver_mock: bid for slot '{slot_id}' has zero dimension ({width}×{height}), skipping"
+                    );
+                    continue;
+                }
 
                 all_bids.push(Bid {
                     slot_id,
                     price: bid["price"].as_f64(),
                     currency: "USD".to_string(),
                     creative: bid["adm"].as_str().map(String::from),
-                    width: bid["w"].as_u64().unwrap_or(0) as u32,
-                    height: bid["h"].as_u64().unwrap_or(0) as u32,
+                    width,
+                    height,
                     bidder: seat_name.to_string(),
                     adomain: bid["adomain"].as_array().map(|arr| {
                         arr.iter()

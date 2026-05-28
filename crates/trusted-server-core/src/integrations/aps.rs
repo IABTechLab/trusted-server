@@ -406,7 +406,17 @@ impl ApsAuctionProvider {
         }
 
         // Parse size from "WxH" format
-        let (width, height) = Self::parse_size(&slot.size).unwrap_or((0, 0));
+        let (width, height) = match Self::parse_size(&slot.size) {
+            Some(dims) => dims,
+            None => {
+                log::debug!(
+                    "APS: slot '{}' has malformed size '{}', skipping",
+                    slot.slot_id,
+                    slot.size
+                );
+                return Err(());
+            }
+        };
 
         // Build metadata from targeting keys - includes encoded price for mediation
         let mut metadata = HashMap::new();

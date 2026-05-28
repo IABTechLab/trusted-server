@@ -651,6 +651,8 @@ pub(crate) fn prepend_auction_debug_comment(
             *script = format!("{debug_comment}\n{script}");
         }
         None => {
+            // invariant: write_bids_to_state is always called before this and
+            // always sets Some(_); this branch is unreachable in production.
             *state = Some(debug_comment);
         }
     }
@@ -1351,6 +1353,14 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
         "<script>window.__ts_bids=JSON.parse(\"{}\");if(typeof window.__tsAdInit===\"function\")window.__tsAdInit();</script>",
         escaped
     )
+}
+
+/// Build the empty-bids `<script>` tag used when no bids were returned.
+///
+/// Shares the same shape as [`build_bids_script`] so any change to the script
+/// format stays in one place.
+pub(crate) fn build_empty_bids_script() -> String {
+    build_bids_script(&serde_json::Map::new())
 }
 
 /// Build the `__ts_ad_slots` `<script>` tag from matched slots.

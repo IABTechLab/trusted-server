@@ -34,6 +34,7 @@ use crate::integrations::{
     IntegrationHtmlContext, IntegrationHtmlPostProcessor, IntegrationRegistry,
     IntegrationScriptContext, ScriptRewriteAction,
 };
+use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
@@ -328,21 +329,19 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 let state = state.clone();
                 let injected_bids = injected_bids.clone();
                 if let Some(handlers) = el.end_tag_handlers() {
-                    let handler: EndTagHandler<'static> = Box::new(
-                        move |end_tag: &mut EndTag<'_>| {
+                    let handler: EndTagHandler<'static> =
+                        Box::new(move |end_tag: &mut EndTag<'_>| {
                             if injected_bids.swap(true, Ordering::SeqCst) {
                                 return Ok(());
                             }
                             let script_guard = state.lock().expect("should lock bid state");
                             let bids_script = match &*script_guard {
                                 Some(s) => s.clone(),
-                                None => r#"<script>window.__ts_bids=JSON.parse("{}");if(typeof window.__tsAdInit==="function")window.__tsAdInit();</script>"#
-                                    .to_string(),
+                                None => build_empty_bids_script(),
                             };
                             end_tag.before(&bids_script, ContentType::Html);
                             Ok(())
-                        },
-                    );
+                        });
                     handlers.push(handler);
                 }
                 Ok(())

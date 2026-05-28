@@ -76,6 +76,7 @@ pub struct ConsentedProvidersSettings {
 
 /// An Extended User ID entry from an identity provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
@@ -85,6 +86,7 @@ pub struct Eid {
 
 /// A single user identifier within an [`Eid`] entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Uid {
     /// The identifier value.
     pub id: String,
