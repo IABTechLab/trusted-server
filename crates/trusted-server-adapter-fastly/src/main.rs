@@ -48,8 +48,13 @@ use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore}
 ///
 /// The streaming arm keeps the publisher body out of WASM heap until it is written directly
 /// to the client via [`fastly::Response::stream_to_client`].  All other routes are buffered.
+///
+/// [`AuthChallenge`](HandlerOutcome::AuthChallenge) marks responses produced by this server's
+/// own `enforce_basic_auth` so the geo-lookup gate can distinguish them from origin-forwarded
+/// 401s, which should still carry geo headers.
 enum HandlerOutcome {
     Buffered(HttpResponse),
+    AuthChallenge(HttpResponse),
     Streaming {
         response: HttpResponse,
         body: EdgeBody,
@@ -58,9 +63,10 @@ enum HandlerOutcome {
 }
 
 impl HandlerOutcome {
+    #[cfg(test)]
     fn status(&self) -> edgezero_core::http::StatusCode {
         match self {
-            HandlerOutcome::Buffered(resp) => resp.status(),
+            HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
             HandlerOutcome::Streaming { response, .. } => response.status(),
         }
     }
@@ -142,8 +148,10 @@ fn main() {
     ))
     .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
-    // Skip geo lookup for 401s: avoids exposing geo headers to unauthenticated callers.
-    let geo_info = if outcome.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+    // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
+    // unauthenticated callers.  Origin-forwarded 401s are not AuthChallenge and
+    // do receive geo headers — the client already reached the origin anyway.
+    let geo_info = if matches!(outcome, HandlerOutcome::AuthChallenge(_)) {
         None
     } else {
         runtime_services
@@ -156,7 +164,7 @@ fn main() {
     };
 
     match outcome {
-        HandlerOutcome::Buffered(mut response) => {
+        HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
             compat::to_fastly_response(response).send_to_client();
         }
@@ -182,9 +190,9 @@ fn main() {
                 }
                 Err(e) => {
                     log::error!("streaming processing failed: {e:?}");
-                    if let Err(finish_err) = streaming_body.finish() {
-                        log::error!("failed to finish streaming body after error: {finish_err}");
-                    }
+                    // Headers already committed. Drop the body so the client sees a
+                    // truncated response (EOF mid-stream) — standard proxy behavior.
+                    drop(streaming_body);
                 }
             }
         }
@@ -244,7 +252,7 @@ async fn route_request(
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
-        Ok(Some(response)) => return Ok(HandlerOutcome::Buffered(response)),
+        Ok(Some(response)) => return Ok(HandlerOutcome::AuthChallenge(response)),
         Ok(None) => {}
         Err(e) => return Err(e),
     }
