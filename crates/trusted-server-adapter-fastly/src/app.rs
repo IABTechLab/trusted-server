@@ -114,8 +114,8 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
 /// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// matches the legacy `route_request` behavior where a misconfigured consent store
-/// makes consent-dependent routes unavailable rather than proceeding without consent.
+/// ensures a misconfigured consent store makes consent-dependent routes unavailable
+/// rather than proceeding without consent (fail-closed).
 ///
 /// # Errors
 ///
@@ -672,9 +672,9 @@ mod tests {
     #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
-        // fallback, not return a router-level 405. Legacy route_request proxies
-        // every (method, path) combination not matched by a specific arm through
-        // to the publisher origin.
+        // fallback, not return a router-level 405. The EdgeZero dispatch path
+        // proxies every (method, path) combination not matched by a specific
+        // arm through to the publisher origin.
         //
         // Without a live backend the publisher proxy errors (502/503), but the
         // important invariant is that the status is NOT 405.

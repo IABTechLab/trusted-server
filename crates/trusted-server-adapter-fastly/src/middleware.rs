@@ -1,4 +1,4 @@
-//! Middleware implementations for the dual-path entry point.
+//! Middleware implementations for the EdgeZero entry point.
 //!
 //! Provides two middleware types that mirror the finalization and auth logic
 //! used in the legacy entry point:
