@@ -207,12 +207,18 @@ impl CloudflareHttpClient {
         use worker::{Fetch, Headers, Method, Request, RequestInit};
 
         let uri = request.request.uri().to_string();
-        let method = Method::from(request.request.method().as_str().to_ascii_uppercase());
+        // worker 0.7's Method::from uppercases internally — no manual conversion needed.
+        let method = Method::from(request.request.method().as_str());
 
         let headers = Headers::new();
         for (name, value) in request.request.headers() {
+            let value_str = std::str::from_utf8(value.as_bytes())
+                .change_context(PlatformError::HttpClient)
+                .attach_with(|| {
+                    format!("non-UTF-8 bytes in outbound header `{name}` — value dropped")
+                })?;
             headers
-                .set(name.as_str(), &String::from_utf8_lossy(value.as_bytes()))
+                .set(name.as_str(), value_str)
                 .change_context(PlatformError::HttpClient)?;
         }
 
@@ -247,10 +253,9 @@ impl CloudflareHttpClient {
             // The Workers runtime auto-decompresses gzip/br/deflate and handles
             // chunked transfer — strip these headers so the proxy layer does not
             // attempt a second decompression pass on the already-decoded body.
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "content-encoding" | "transfer-encoding"
-            ) {
+            if name.eq_ignore_ascii_case("content-encoding")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+            {
                 continue;
             }
             edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
@@ -318,20 +323,7 @@ impl PlatformHttpClient for CloudflareHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        // Cloudflare Workers does not support concurrent fetch calls through the
-        // ?Send PlatformHttpClient interface. send_async() executes each request
-        // eagerly, so multi-provider auctions accrue sum(DSP_i) latency instead
-        // of max(DSP_i) and per-provider timeouts baked into the backend name are
-        // not enforced. Reject multi-provider fan-out loudly rather than silently
-        // degrading the auction budget.
-        if pending_requests.len() >= 2 {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "CloudflareHttpClient: multi-provider fan-out is not supported \
-                 ({} providers submitted). Configure a single auction provider \
-                 or use the Fastly adapter for parallel DSP fan-out.",
-                pending_requests.len()
-            )));
-        }
+        reject_multi_provider_fanout(pending_requests.len())?;
 
         let ready_platform = pending_requests.remove(0);
         let pending = ready_platform
@@ -381,6 +373,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         match self.env.secret(key) {
+            // worker 0.7: Secret implements Display via JsValue::as_string() which
+            // returns the raw JS string value with no wrapping or debug formatting.
+            // Verified in worker-rs src/env.rs: `impl Display for Secret { fn fmt ->
+            // write!(f, "{}", self.inner.as_string().unwrap_or_default()) }`.
             Ok(secret) => Ok(secret.to_string().into_bytes()),
             Err(err) => Err(Report::new(PlatformError::SecretStore)
                 .attach(format!("secret lookup failed for key `{key}`: {err}"))),
@@ -548,6 +544,28 @@ fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpA
         .and_then(|s| s.parse().ok())
 }
 
+/// Reject multi-provider auction fan-out at the Cloudflare adapter level.
+///
+/// Cloudflare Workers executes `send_async` eagerly (no true concurrency), so
+/// N simultaneous DSP requests run sequentially and accrue `sum(latencies)`
+/// instead of `max(latencies)`. Rejecting loudly here prevents a misconfigured
+/// multi-DSP auction from silently blowing the auction budget.
+///
+/// Extracted as a free function so the critical control-flow is testable on
+/// native targets where the `#[cfg(target_arch = "wasm32")]` `select` impl
+/// is excluded from the test binary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>> {
+    if len >= 2 {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "CloudflareHttpClient: multi-provider fan-out is not supported \
+             ({len} providers submitted). Configure a single auction provider \
+             or use the Fastly adapter for parallel DSP fan-out."
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +673,44 @@ mod tests {
         assert!(
             (info.longitude - (-74.01)).abs() < 0.01,
             "should populate longitude"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // reject_multi_provider_fanout tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn reject_multi_provider_fanout_passes_empty() {
+        assert!(
+            reject_multi_provider_fanout(0).is_ok(),
+            "len=0 should pass (empty list caught separately in select)"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_passes_single_provider() {
+        assert!(
+            reject_multi_provider_fanout(1).is_ok(),
+            "single provider should be allowed"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_rejects_two_providers() {
+        assert!(
+            reject_multi_provider_fanout(2).is_err(),
+            "len=2 should be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_rejects_five_providers() {
+        let err = reject_multi_provider_fanout(5).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("5"),
+            "error message should include provider count"
         );
     }
 }

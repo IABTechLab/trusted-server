@@ -87,6 +87,7 @@ fn resolve_publisher_response(
         } => {
             let mut output = Vec::new();
             stream_publisher_body(body, &mut output, &params, settings, registry)?;
+            response.headers_mut().remove(header::TRANSFER_ENCODING);
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
                 edgezero_core::http::HeaderValue::from(output.len() as u64),
