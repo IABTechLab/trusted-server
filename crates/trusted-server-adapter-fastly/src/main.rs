@@ -246,5 +246,4 @@ mod tests {
             "401 responses should still carry geo-unavailable headers"
         );
     }
-
 }
