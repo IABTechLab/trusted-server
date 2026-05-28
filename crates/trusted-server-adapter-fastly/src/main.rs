@@ -236,6 +236,8 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             }
         };
 
+    let mut response = compat::from_fastly_response(fastly_response);
+
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
