@@ -22,6 +22,7 @@ use crate::integrations::{
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
+
 use crate::settings::IntegrationConfig;
 
 // ============================================================================
@@ -602,7 +603,6 @@ impl AuctionProvider for ApsAuctionProvider {
             services,
             &self.config.endpoint,
             "aps",
-            true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {

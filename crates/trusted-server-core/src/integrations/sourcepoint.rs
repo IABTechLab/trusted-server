@@ -33,10 +33,10 @@ use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
-    INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -729,6 +729,7 @@ impl IntegrationProxy for SourcepointIntegration {
             services,
             &self.config.cdn_origin,
             SOURCEPOINT_INTEGRATION_ID,
+            None,
         )?;
 
         let mut response = services
@@ -805,15 +806,12 @@ impl IntegrationProxy for SourcepointIntegration {
             }
 
             let (resp_parts, resp_body) = response.into_parts();
-            let body_bytes = match resp_body {
-                EdgeBody::Once(b) => b.to_vec(),
-                EdgeBody::Stream(_) => {
-                    log::warn!("Sourcepoint: streaming response body, skipping rewrite");
-                    let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-            };
+            let body_bytes = collect_response_bounded(
+                resp_body,
+                MAX_REWRITE_BODY_SIZE as usize,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
             let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
 
             let body = match String::from_utf8(body_bytes) {

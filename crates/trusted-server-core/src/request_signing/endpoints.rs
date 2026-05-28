@@ -9,6 +9,7 @@ use http::{header, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
+use crate::http_util::enforce_max_body_size;
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
@@ -100,15 +101,7 @@ pub fn handle_verify_signature(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let body = req.into_body().into_bytes();
-    if body.len() > VERIFY_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "verify-signature payload {} exceeds limit of {}",
-                body.len(),
-                VERIFY_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -251,15 +244,7 @@ pub fn handle_rotate_key(
     } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
-    if body.len() > ADMIN_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "rotate-key payload {} exceeds limit of {}",
-                body.len(),
-                ADMIN_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
     } else {
@@ -378,15 +363,7 @@ pub fn handle_deactivate_key(
     } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
-    if body.len() > ADMIN_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "deactivate-key payload {} exceeds limit of {}",
-                body.len(),
-                ADMIN_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),

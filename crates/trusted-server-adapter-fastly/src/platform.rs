@@ -295,22 +295,20 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             .map(PlatformPendingRequest::new)
             .collect();
 
-        let ready = match result {
-            Ok(fastly_resp) => {
-                let backend_name = fastly_resp
-                    .get_backend_name()
-                    .unwrap_or_else(|| {
-                        log::warn!("select: response has no backend name, correlation will fail");
-                        ""
-                    })
-                    .to_string();
-                fastly_response_to_platform(fastly_resp, backend_name)
-            }
-            Err(e) => {
-                Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("fastly select error: {e}")))
-            }
-        };
+        let ready =
+            match result {
+                Ok(fastly_resp) => {
+                    let backend_name = fastly_resp.get_backend_name().map(str::to_string);
+                    match backend_name {
+                        Some(name) => fastly_response_to_platform(fastly_resp, name),
+                        None => Err(Report::new(PlatformError::HttpClient).attach(
+                            "select: response has no backend name; bid correlation impossible",
+                        )),
+                    }
+                }
+                Err(e) => Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("fastly select error: {e}"))),
+            };
 
         Ok(PlatformSelectResult { ready, remaining })
     }
