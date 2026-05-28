@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::FastlyConfigStore;
@@ -224,7 +222,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // internally. A second `set_logger` call panics because our custom fern
     // logger is already initialised above. `dispatch_with_config_handle` skips logger
     // initialisation and injects the config store directly.
-    let mut fastly_response =
+    let fastly_response =
         match edgezero_adapter_fastly::dispatch_with_config_handle(&app, req, config_store) {
             Ok(response) => response,
             Err(e) => {
@@ -541,90 +539,6 @@ fn resolve_publisher_response(
         PublisherResponse::PassThrough { mut response, body } => {
             *response.body_mut() = body;
             Ok(HandlerOutcome::Buffered(response))
-        }
-    }
-}
-
-struct BoundedWriter {
-    inner: Vec<u8>,
-    limit: usize,
-}
-
-impl BoundedWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            inner: Vec::new(),
-            limit,
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.inner
-    }
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.inner.len() + buf.len() > self.limit {
-            return Err(std::io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
-        }
-        self.inner.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub(crate) fn resolve_publisher_response_buffered(
-    publisher_response: PublisherResponse,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let bytes = match settings.publisher.max_buffered_body_bytes {
-                Some(limit) => {
-                    let mut output = BoundedWriter::new(limit);
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output.into_inner()
-                }
-                None => {
-                    let mut output = Vec::new();
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output
-                }
-            };
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(bytes.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(bytes);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
         }
     }
 }
