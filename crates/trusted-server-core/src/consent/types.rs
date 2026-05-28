@@ -302,6 +302,13 @@ pub struct GppConsent {
     pub section_ids: Vec<u16>,
     /// Decoded EU TCF v2.2 section (if present in GPP, section ID 2).
     pub eu_tcf: Option<TcfConsent>,
+    /// Whether the user opted out of sale of personal information via a US GPP
+    /// section (IDs 7–23).
+    ///
+    /// - `Some(true)` — a US section is present and `sale_opt_out == OptedOut`
+    /// - `Some(false)` — a US section is present and user did not opt out
+    /// - `None` — no US section exists in the GPP string
+    pub us_sale_opt_out: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
