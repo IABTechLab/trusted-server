@@ -428,7 +428,7 @@ impl DataDomeIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID)
+        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID, None)
     }
 }
 

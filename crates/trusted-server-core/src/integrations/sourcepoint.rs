@@ -34,9 +34,10 @@ use validator::{Validate, ValidationError};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
+    INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -315,9 +316,7 @@ impl SourcepointIntegration {
     ) -> bool {
         if let Some(client_ip) = client_ip {
             if let Ok(val) = HeaderValue::from_str(&client_ip.to_string()) {
-                proxy_req
-                    .headers_mut()
-                    .insert("x-forwarded-for", val);
+                proxy_req.headers_mut().insert("x-forwarded-for", val);
             }
         }
 
@@ -417,8 +416,11 @@ impl SourcepointIntegration {
             let val = if forwarded_cookies {
                 HeaderValue::from_static("private, max-age=0")
             } else {
-                HeaderValue::from_str(&format!("public, max-age={}", self.config.cache_ttl_seconds))
-                    .unwrap_or(HeaderValue::from_static("public"))
+                HeaderValue::from_str(&format!(
+                    "public, max-age={}",
+                    self.config.cache_ttl_seconds
+                ))
+                .unwrap_or(HeaderValue::from_static("public"))
             };
             response.headers_mut().insert(header::CACHE_CONTROL, val);
         }
@@ -680,9 +682,12 @@ impl IntegrationProxy for SourcepointIntegration {
         let (req_parts, req_body) = req.into_parts();
 
         let request_body = if method == Method::POST {
-            let bytes =
-                collect_body_bounded(req_body, INTEGRATION_MAX_BODY_BYTES, SOURCEPOINT_INTEGRATION_ID)
-                    .await?;
+            let bytes = collect_body_bounded(
+                req_body,
+                INTEGRATION_MAX_BODY_BYTES,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
             EdgeBody::from(bytes)
         } else {
             EdgeBody::empty()
@@ -703,9 +708,10 @@ impl IntegrationProxy for SourcepointIntegration {
         // responses (images, JSON API responses, CSS) keep the client's
         // original Accept-Encoding for efficiency.
         if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
-            proxy_req
-                .headers_mut()
-                .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+            proxy_req.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
         } else if let Some(ae) = source_req.headers().get(header::ACCEPT_ENCODING) {
             proxy_req
                 .headers_mut()
@@ -797,16 +803,12 @@ impl IntegrationProxy for SourcepointIntegration {
             }
 
             let (resp_parts, resp_body) = response.into_parts();
-            let body_bytes = match resp_body {
-                EdgeBody::Once(b) => b.to_vec(),
-                EdgeBody::Stream(_) => {
-                    log::warn!("Sourcepoint: streaming response body, skipping rewrite");
-                    let mut response =
-                        http::Response::from_parts(resp_parts, EdgeBody::empty());
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-            };
+            let body_bytes = collect_response_bounded(
+                resp_body,
+                MAX_REWRITE_BODY_SIZE as usize,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
             let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
 
             let body = match String::from_utf8(body_bytes) {
@@ -1431,14 +1433,26 @@ mod tests {
         req.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
-    fn set_header(resp: &mut Response<EdgeBody>, name: impl http::header::IntoHeaderName, value: &str) {
-        resp.headers_mut()
-            .insert(name, HeaderValue::from_str(value).expect("should build header value"));
+    fn set_header(
+        resp: &mut Response<EdgeBody>,
+        name: impl http::header::IntoHeaderName,
+        value: &str,
+    ) {
+        resp.headers_mut().insert(
+            name,
+            HeaderValue::from_str(value).expect("should build header value"),
+        );
     }
 
-    fn set_req_header(req: &mut Request<EdgeBody>, name: impl http::header::IntoHeaderName, value: &str) {
-        req.headers_mut()
-            .insert(name, HeaderValue::from_str(value).expect("should build header value"));
+    fn set_req_header(
+        req: &mut Request<EdgeBody>,
+        name: impl http::header::IntoHeaderName,
+        value: &str,
+    ) {
+        req.headers_mut().insert(
+            name,
+            HeaderValue::from_str(value).expect("should build header value"),
+        );
     }
 
     fn take_body_bytes(resp: Response<EdgeBody>) -> Vec<u8> {
@@ -1472,7 +1486,8 @@ mod tests {
     #[test]
     fn copy_headers_forwards_preflight_headers() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut original_req = make_req(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
+        let mut original_req =
+            make_req(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
         set_req_header(&mut original_req, "access-control-request-method", "POST");
         set_req_header(
             &mut original_req,
@@ -1552,7 +1567,11 @@ mod tests {
     fn apply_cache_headers_uses_private_no_store_for_cookie_setting_responses() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let mut response = make_resp_with_status(StatusCode::OK);
-        set_header(&mut response, header::SET_COOKIE, "consentUUID=uuid123; Path=/");
+        set_header(
+            &mut response,
+            header::SET_COOKIE,
+            "consentUUID=uuid123; Path=/",
+        );
         set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
 
         integration.apply_cache_headers(&mut response, false);
