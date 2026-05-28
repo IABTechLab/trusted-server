@@ -76,7 +76,7 @@ secret_access_key = "secret_access_key"
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
-- Credentials are loaded from the configured runtime secret store.
+- Credentials are loaded from the configured runtime secret store and cached per process by configured secret names.
 - Existing client `Authorization` and `x-amz-*` signing headers are replaced before signing.
 
 ### Secret store values
@@ -101,12 +101,17 @@ Use private deployment configuration for environment-specific store names or pro
 | `preserve` | Keep the incoming query string on the origin URL    |
 | `strip`    | Remove the incoming query string before origin send |
 
+Precedence:
+
+1. `proxy.asset_routes.auth.origin_query`, when auth is configured.
+2. `proxy.asset_routes.image_optimizer.origin_query`, when Image Optimizer is enabled.
+3. The route default.
+
 Defaults:
 
 - Plain asset routes default to `preserve`.
 - Image-optimized asset routes default to `strip`.
-- `proxy.asset_routes.auth.origin_query` overrides the route default.
-- Enabled Image Optimizer routes reject `preserve` to avoid arbitrary client query parameters becoming transformation inputs.
+- Enabled Image Optimizer routes reject effective `preserve` to avoid arbitrary client query parameters becoming transformation inputs.
 
 ## Fastly Image Optimizer profiles
 

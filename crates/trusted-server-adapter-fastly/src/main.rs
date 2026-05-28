@@ -28,7 +28,7 @@ use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput}
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, handle_s3_list_objects_debug,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
@@ -365,9 +365,6 @@ async fn route_request(
         (Method::OPTIONS, "/_ts/api/v1/identify") => {
             (cors_preflight_identify(settings, &req), false)
         }
-        (Method::GET, "/admin/debug/s3-objects") => {
-            handle_s3_list_objects_debug(settings, runtime_services, req).await
-        }
 
         // Unified auction endpoint (returns creative HTML inline)
         (Method::POST, "/auction") => {
@@ -549,9 +546,7 @@ async fn route_request(
     );
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
-    // Keep object-listing diagnostics non-cacheable even when operators set a
-    // global Cache-Control response header.
-    if preserve_no_store_private || path == "/admin/debug/s3-objects" {
+    if preserve_no_store_private {
         response.set_header(header::CACHE_CONTROL, "no-store, private");
     }
 

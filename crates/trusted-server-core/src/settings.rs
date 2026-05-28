@@ -661,7 +661,7 @@ impl AssetOriginAuth {
 ///
 /// The route `origin_url` must use the same `S3` host that `AWS` validates in
 /// the `SigV4` canonical request. Credentials are read from the named runtime
-/// secret store for each proxied asset request.
+/// secret store and cached per process by configured secret names.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct S3SigV4AuthConfig {
     /// `AWS` region used in the credential scope.
@@ -1421,6 +1421,10 @@ impl ProxyAssetRoute {
     }
 
     /// Return the effective origin query policy for this asset route.
+    ///
+    /// Precedence is auth-level `origin_query`, then enabled Image Optimizer
+    /// `origin_query`, then the route default. The default is `strip` for
+    /// enabled Image Optimizer routes and `preserve` otherwise.
     #[must_use]
     pub fn origin_query_policy(&self) -> OriginQueryPolicy {
         if let Some(policy) = self
@@ -1582,13 +1586,6 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
-    /// Expose the authenticated S3 object-listing debug endpoint at
-    /// `GET /admin/debug/s3-objects`.
-    ///
-    /// When `false` (the default), the endpoint returns 404 after admin
-    /// authentication succeeds. Enable only while investigating S3 object keys.
-    #[serde(default)]
-    pub s3_list_endpoint_enabled: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -1804,11 +1801,8 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &[
-        "/_ts/admin/keys/rotate",
-        "/_ts/admin/keys/deactivate",
-        "/admin/debug/s3-objects",
-    ];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
+        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -4149,11 +4143,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec![
-                "/_ts/admin/keys/rotate",
-                "/_ts/admin/keys/deactivate",
-                "/admin/debug/s3-objects",
-            ],
+            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"],
             "should report every admin endpoint as uncovered"
         );
     }
@@ -4187,7 +4177,7 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/_ts/admin/keys/deactivate", "/admin/debug/s3-objects"],
+            vec!["/_ts/admin/keys/deactivate"],
             "should detect the admin endpoints not covered by the narrow handler"
         );
     }
