@@ -1,4 +1,5 @@
-use std::net::IpAddr;
+use std::io::Write;
+
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::FastlyConfigStore;
@@ -48,7 +49,7 @@ mod route_tests;
 
 use crate::app::{build_state, runtime_services_for_consent_route, TrustedServerApp};
 use crate::error::to_error_response;
-use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
+use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, FastlyPlatformGeo};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -58,8 +59,13 @@ const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 ///
 /// The streaming arm keeps the publisher body out of WASM heap until it is written directly
 /// to the client via [`fastly::Response::stream_to_client`]. All other legacy routes are buffered.
+///
+/// [`AuthChallenge`](HandlerOutcome::AuthChallenge) marks responses produced by this server's
+/// own `enforce_basic_auth` so the geo-lookup gate can distinguish them from origin-forwarded
+/// 401s, which should still carry geo headers.
 enum HandlerOutcome {
     Buffered(HttpResponse),
+    AuthChallenge(HttpResponse),
     Streaming {
         response: HttpResponse,
         body: EdgeBody,
@@ -68,9 +74,10 @@ enum HandlerOutcome {
 }
 
 impl HandlerOutcome {
+    #[cfg(test)]
     fn status(&self) -> edgezero_core::http::StatusCode {
         match self {
-            HandlerOutcome::Buffered(resp) => resp.status(),
+            HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
             HandlerOutcome::Streaming { response, .. } => response.status(),
         }
     }
@@ -160,11 +167,41 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
+    // Short-circuit the JA4 debug probe before app construction, mirroring
+    // legacy_main. Must run here because TLS/JA4 accessors are only available
+    // on FastlyRequest before conversion to edgezero types.
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+        match get_settings() {
+            Ok(settings) if settings.debug.ja4_endpoint_enabled => {
+                build_ja4_debug_response(&req).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
+
     let app = TrustedServerApp::build_app();
 
     // Strip client-spoofable forwarded headers before handing off to the
     // EdgeZero dispatcher, mirroring the sanitization done in legacy_main.
     compat::sanitize_fastly_forwarded_headers(&mut req);
+
+    // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+    // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+    // metadata here is authoritative. detect_request_scheme in http_util
+    // checks this header so scheme-sensitive logic (publisher URL rewriting,
+    // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
+    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
+        req.set_header("fastly-ssl", "1");
+    }
 
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
@@ -185,7 +222,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             }
         };
 
-    if !response_was_finalized_by_middleware(&mut response) {
+    if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
         // verbs) carry TS/geo headers. Middleware-finalized responses are
@@ -193,12 +230,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         // normal registered-route path.
         match get_settings() {
             Ok(settings) => {
-                apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
+                let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
                     FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
                         log::warn!("entry-point geo lookup failed: {e}");
                         None
                     })
-                })
+                });
+                apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
             }
             Err(e) => {
                 log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -209,33 +247,19 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     compat::to_fastly_response(response).send_to_client();
 }
 
-fn response_was_finalized_by_middleware(response: &mut HttpResponse) -> bool {
+fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
     response
         .headers_mut()
         .remove(HEADER_X_TS_FINALIZED)
         .is_some()
 }
 
-fn apply_entry_point_finalize<F>(
-    settings: &Settings,
-    client_ip: Option<IpAddr>,
-    response: &mut HttpResponse,
-    lookup_geo: F,
-) where
-    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
-{
-    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
-        None
-    } else {
-        lookup_geo(client_ip)
-    };
-    apply_finalize_headers(settings, geo_info.as_ref(), response);
-}
-
 /// Handles a request using the original Fastly-native entry point.
 ///
-/// Preserves identical semantics to the pre-PR14 `main()`. Called when
-/// the `edgezero_enabled` config flag is absent or `false`.
+/// Preserves identical semantics to the pre-PR14 `main()`. Called whenever
+/// the `EdgeZero` flag is disabled or cannot be read/parsed as enabled — that
+/// includes config-store open failures, key-read errors, missing keys, and
+/// any value other than the accepted `"true"` / `"1"` forms.
 ///
 /// The thin fastly↔http conversion layer (via `compat::from_fastly_request` /
 /// `compat::to_fastly_response`) lives here in the adapter crate.
@@ -279,8 +303,10 @@ fn legacy_main(mut req: FastlyRequest) {
     ))
     .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
-    // Skip geo lookup for 401s: avoids exposing geo headers to unauthenticated callers.
-    let geo_info = if outcome.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
+    // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
+    // unauthenticated callers.  Origin-forwarded 401s are not AuthChallenge and
+    // do receive geo headers — the client already reached the origin anyway.
+    let geo_info = if matches!(outcome, HandlerOutcome::AuthChallenge(_)) {
         None
     } else {
         runtime_services
@@ -293,7 +319,7 @@ fn legacy_main(mut req: FastlyRequest) {
     };
 
     match outcome {
-        HandlerOutcome::Buffered(mut response) => {
+        HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             compat::to_fastly_response(response).send_to_client();
         }
@@ -319,9 +345,9 @@ fn legacy_main(mut req: FastlyRequest) {
                 }
                 Err(e) => {
                     log::error!("streaming processing failed: {e:?}");
-                    if let Err(finish_err) = streaming_body.finish() {
-                        log::error!("failed to finish streaming body after error: {finish_err}");
-                    }
+                    // Headers already committed. Drop the body so the client sees a
+                    // truncated response (EOF mid-stream) — standard proxy behavior.
+                    drop(streaming_body);
                 }
             }
         }
@@ -381,7 +407,7 @@ async fn route_request(
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {
-        Ok(Some(response)) => return Ok(HandlerOutcome::Buffered(response)),
+        Ok(Some(response)) => return Ok(HandlerOutcome::AuthChallenge(response)),
         Ok(None) => {}
         Err(e) => return Err(e),
     }
@@ -503,6 +529,40 @@ fn resolve_publisher_response(
     }
 }
 
+struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn resolve_publisher_response_buffered(
     publisher_response: PublisherResponse,
     settings: &Settings,
@@ -515,13 +575,35 @@ pub(crate) fn resolve_publisher_response_buffered(
             body,
             params,
         } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = match settings.publisher.max_buffered_body_bytes {
+                Some(limit) => {
+                    let mut output = BoundedWriter::new(limit);
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output.into_inner()
+                }
+                None => {
+                    let mut output = Vec::new();
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output
+                }
+            };
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
+                HeaderValue::from(bytes.len() as u64),
             );
-            *response.body_mut() = EdgeBody::from(output);
+            *response.body_mut() = EdgeBody::from(bytes);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {
@@ -619,14 +701,14 @@ mod tests {
     }
 
     #[test]
-    fn response_was_finalized_by_middleware_strips_sentinel() {
+    fn take_finalize_sentinel_strips_sentinel() {
         let mut response = HttpResponse::new(EdgeBody::empty());
         response
             .headers_mut()
             .insert("x-ts-finalized", HeaderValue::from_static("1"));
 
         assert!(
-            response_was_finalized_by_middleware(&mut response),
+            take_finalize_sentinel(&mut response),
             "should detect middleware-finalized responses"
         );
         assert!(
@@ -644,9 +726,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        apply_entry_point_finalize(&settings, None, &mut response, |_| {
+        let geo_info = resolve_geo_for_response(&response, None, |_| {
             panic!("should skip entry-point geo lookup for 401 responses");
         });
+        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
 
         assert_eq!(
             response

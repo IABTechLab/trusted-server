@@ -47,6 +47,7 @@ pub(crate) fn ensure_integration_backend(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
+    first_byte_timeout: Option<Duration>,
 ) -> Result<String, Report<TrustedServerError>> {
     services
         .backend()
@@ -54,7 +55,7 @@ pub(crate) fn ensure_integration_backend(
             url,
             integration,
             true,
-            DEFAULT_FIRST_BYTE_TIMEOUT,
+            first_byte_timeout.unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
         )?)
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),

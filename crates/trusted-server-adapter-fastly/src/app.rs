@@ -7,8 +7,9 @@
 //! Builds the [`AppState`] once per Wasm instance.
 //!
 //! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. The `EdgeZero` path therefore preserves TLS
-//! metadata as `None` until the upstream adapter exposes those fields.
+//! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
+//! header after stripping client-spoofable headers, so [`detect_request_scheme`]
+//! in `http_util` can still derive the correct scheme for HTTPS traffic.
 //!
 //! # Route inventory
 //!
@@ -37,7 +38,10 @@
 //!
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
-//! attach middleware — startup errors are returned without geo or TS headers.
+//! attach middleware. Startup-error responses may still receive entry-point
+//! finalization (geo and TS headers) when settings can be reloaded via
+//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
+//! fails, they are returned without geo or TS headers.
 
 use core::future::Future;
 use std::sync::Arc;
@@ -94,10 +98,13 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    build_state_from_settings(get_settings()?)
+}
 
+pub(crate) fn build_state_from_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
-
     let registry = IntegrationRegistry::new(&settings)?;
 
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -146,7 +153,8 @@ pub(crate) fn runtime_services_for_consent_route(
 ///
 /// Extracts the client IP address from the [`FastlyRequestContext`] extension
 /// inserted by `edgezero_adapter_fastly::dispatch`. TLS metadata is not
-/// available through the `EdgeZero` context so those fields are left empty.
+/// available through the `EdgeZero` context; scheme detection relies on the
+/// trusted `fastly-ssl` header injected by `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
 
@@ -314,55 +322,53 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 9] {
-    [
-        NamedRoute {
-            path: "/.well-known/trusted-server.json",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::TrustedServerDiscovery,
-        },
-        NamedRoute {
-            path: "/verify-signature",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::VerifySignature,
-        },
-        NamedRoute {
-            path: "/admin/keys/rotate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::RotateKey,
-        },
-        NamedRoute {
-            path: "/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::DeactivateKey,
-        },
-        NamedRoute {
-            path: "/auction",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::Auction,
-        },
-        NamedRoute {
-            path: "/first-party/proxy",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyProxy,
-        },
-        NamedRoute {
-            path: "/first-party/click",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyClick,
-        },
-        NamedRoute {
-            path: "/first-party/sign",
-            primary_methods: &[Method::GET, Method::POST],
-            handler: NamedRouteHandler::FirstPartySign,
-        },
-        NamedRoute {
-            path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::FirstPartyProxyRebuild,
-        },
-    ]
-}
+const NAMED_ROUTES: &[NamedRoute] = &[
+    NamedRoute {
+        path: "/.well-known/trusted-server.json",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TrustedServerDiscovery,
+    },
+    NamedRoute {
+        path: "/verify-signature",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::VerifySignature,
+    },
+    NamedRoute {
+        path: "/admin/keys/rotate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::RotateKey,
+    },
+    NamedRoute {
+        path: "/admin/keys/deactivate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::DeactivateKey,
+    },
+    NamedRoute {
+        path: "/auction",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::Auction,
+    },
+    NamedRoute {
+        path: "/first-party/proxy",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyProxy,
+    },
+    NamedRoute {
+        path: "/first-party/click",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyClick,
+    },
+    NamedRoute {
+        path: "/first-party/sign",
+        primary_methods: &[Method::GET, Method::POST],
+        handler: NamedRouteHandler::FirstPartySign,
+    },
+    NamedRoute {
+        path: "/first-party/proxy-rebuild",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::FirstPartyProxyRebuild,
+    },
+];
 
 fn named_route_handler(
     state: Arc<AppState>,
@@ -454,7 +460,7 @@ impl TrustedServerApp {
         // named route is registered from this single table, then every
         // non-primary publisher fallback method is registered from the same
         // row. Adding a named route now requires editing only this table.
-        for route in named_routes() {
+        for route in NAMED_ROUTES {
             for method in route.primary_methods {
                 router = router.route(
                     route.path,
@@ -501,7 +507,7 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_error_router, AppState, TrustedServerApp};
+    use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
 
     use std::sync::Arc;
 
@@ -511,11 +517,8 @@ mod tests {
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
-    use trusted_server_core::auction::build_orchestrator;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
-    use trusted_server_core::integrations::IntegrationRegistry;
-    use trusted_server_core::platform::PlatformKvStore;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -560,18 +563,7 @@ mod tests {
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
-        let orchestrator =
-            build_orchestrator(&settings).expect("should build auction orchestrator");
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let default_kv_store =
-            Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
-
-        Arc::new(AppState {
-            settings: Arc::new(settings),
-            orchestrator: Arc::new(orchestrator),
-            registry: Arc::new(registry),
-            default_kv_store,
-        })
+        build_state_from_settings(settings).expect("should build app state from settings")
     }
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {

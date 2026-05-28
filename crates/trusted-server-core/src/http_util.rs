@@ -1,11 +1,13 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::{header, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
+use crate::error::TrustedServerError;
 use crate::platform::ClientInfo;
 use crate::settings::Settings;
 
@@ -169,7 +171,7 @@ fn normalize_scheme(value: &str) -> Option<String> {
 /// 1. `ClientInfo` TLS fields populated at the adapter entry point (most reliable)
 /// 2. Forwarded header (RFC 7239)
 /// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (least reliable, can be spoofed)
+/// 4. Fastly-SSL header (trusted on `EdgeZero` path; can be spoofed on legacy path)
 /// 5. Default to HTTP
 fn detect_request_scheme(
     req: &Request<EdgeBody>,
@@ -210,7 +212,9 @@ fn detect_request_scheme(
         }
     }
 
-    // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
+    // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
+    //    authoritative Fastly TLS metadata after spoofable headers are stripped,
+    //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
     if let Some(ssl) = req.headers().get("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
             if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
@@ -397,6 +401,27 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
         .expect("decode must succeed for just-encoded data");
     let digest = Sha256::digest(&raw);
     URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Return an error if `bytes` exceeds `limit`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::RequestTooLarge`] when `bytes.len() > limit`.
+pub fn enforce_max_body_size(
+    bytes: &[u8],
+    limit: usize,
+    what: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if bytes.len() > limit {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "{what} payload {} exceeds limit of {limit} bytes",
+                bytes.len()
+            ),
+        }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
