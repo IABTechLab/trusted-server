@@ -169,11 +169,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
-    // Inject trusted TLS metadata as internal headers so build_per_request_services
-    // can populate ClientInfo.tls_protocol / tls_cipher. This must happen after
-    // sanitize_fastly_forwarded_headers to prevent clients from injecting these
-    // headers themselves. FastlyRequestContext only exposes client_ip, so headers
-    // are the only channel for TLS data across the dispatch boundary.
+    // Strip any client-supplied x-ts-tls-* headers before injecting the
+    // trusted values from the Fastly SDK. Without this, a plain-HTTP request
+    // carrying X-TS-TLS-Protocol: TLSv1.3 would sail through and cause
+    // detect_request_scheme to return "https", spoofing cookie Secure and
+    // URL rewriting. Must run after sanitize_fastly_forwarded_headers.
+    req.remove_header("x-ts-tls-protocol");
+    req.remove_header("x-ts-tls-cipher");
     if let Some(proto) = req.get_tls_protocol() {
         req.set_header("x-ts-tls-protocol", proto);
     }

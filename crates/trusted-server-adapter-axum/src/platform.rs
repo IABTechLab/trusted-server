@@ -491,17 +491,41 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
+    use trusted_server_core::platform::{
+        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+    };
+
+    // Stateless shims are promoted to process-wide statics so callers clone
+    // an existing Arc instead of allocating a new one per request.
+    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
+        std::sync::OnceLock::new();
+    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
+        std::sync::OnceLock::new();
+    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
+    static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
+    static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+
     RuntimeServices::builder()
-        .config_store(Arc::new(AxumPlatformConfigStore))
-        .secret_store(Arc::new(AxumPlatformSecretStore))
-        .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
-        .backend(Arc::new(AxumPlatformBackend))
+        .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
+            Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
+        })))
+        .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
+            Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
+        })))
+        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
+            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
+        })))
+        .backend(Arc::clone(BACKEND.get_or_init(|| {
+            Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
+        })))
         // Keep the HTTP client request-scoped in the dev adapter. Sharing a pooled
         // client across requests previously regressed the Next.js server-action →
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
-        .geo(Arc::new(AxumPlatformGeo))
+        .geo(Arc::clone(GEO.get_or_init(|| {
+            Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
+        })))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

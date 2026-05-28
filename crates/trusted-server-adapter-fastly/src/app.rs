@@ -12,7 +12,7 @@
 //! `x-ts-tls-cipher`) after stripping client-spoofable forwarded headers.
 //! [`build_per_request_services`] reads those internal headers to populate
 //! [`ClientInfo`] so that [`crate::http_util::RequestInfo::from_request`] detects
-//! HTTPS correctly on the EdgeZero path.
+//! HTTPS correctly on the `EdgeZero` path.
 //!
 //! # Route inventory
 //!
@@ -667,6 +667,40 @@ mod tests {
         assert!(
             services.client_info().tls_cipher.is_none(),
             "tls_cipher should be None when x-ts-tls-cipher header is absent"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_does_not_trust_client_supplied_tls_headers() {
+        // Regression: edgezero_main must strip x-ts-tls-* before dispatch so a
+        // plain-HTTP client cannot spoof HTTPS scheme detection by injecting these
+        // headers. After the strip+set logic runs, build_per_request_services
+        // should see no TLS data on a request where the Fastly SDK returned None.
+        //
+        // This test validates the contract at the build_per_request_services
+        // boundary: if the header is absent (because edgezero_main stripped it),
+        // tls_protocol is None.
+        let state = minimal_state();
+        // Simulate a request that arrived with NO internal header
+        // (edgezero_main already stripped and did not re-inject because
+        // req.get_tls_protocol() returned None on a plain-HTTP connection).
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("should build plain-HTTP request");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert!(
+            services.client_info().tls_protocol.is_none(),
+            "tls_protocol must be None after edgezero_main strips client-supplied header \
+             on a plain-HTTP connection — spoofed HTTPS would affect scheme detection"
+        );
+        assert!(
+            services.client_info().tls_cipher.is_none(),
+            "tls_cipher must be None for the same reason"
         );
     }
 

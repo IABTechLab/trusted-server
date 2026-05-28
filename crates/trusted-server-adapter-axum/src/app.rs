@@ -342,6 +342,16 @@ impl Hooks for TrustedServerApp {
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
+        router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(
+                edgezero_core::http::response_builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
+                    .body(edgezero_core::body::Body::from("ok"))
+                    .expect("should build health response"),
+            )
+        });
+
         for route in named_routes() {
             for method in route.primary_methods {
                 router = router.route(
