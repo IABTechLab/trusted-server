@@ -17,10 +17,24 @@ export interface AdRequestUnit {
   bids: Array<{ bidder: string; params: Record<string, unknown> }>;
 }
 
+/** A user identifier within an auction-level EID entry. */
+export interface AuctionUid {
+  id: string;
+  atype?: number;
+  ext?: Record<string, unknown>;
+}
+
+/** An auction-level EID entry forwarded to the server. */
+export interface AuctionEid {
+  source: string;
+  uids: AuctionUid[];
+}
+
 /** The payload POSTed to the /auction orchestrator. */
 export interface AdRequest {
   adUnits: AdRequestUnit[];
   config?: Record<string, unknown>;
+  eids?: AuctionEid[];
 }
 
 /** A parsed bid from an OpenRTB seatbid response. */
@@ -54,7 +68,7 @@ export interface AuctionBid {
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAdRequest(units: any[]): AdRequest {
+export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }): AdRequest {
   const unitMap = new Map<string, AdRequestUnit>();
 
   for (const u of units) {
@@ -87,7 +101,11 @@ export function buildAdRequest(units: any[]): AdRequest {
     }
   }
 
-  return { adUnits: [...unitMap.values()] };
+  const request: AdRequest = { adUnits: [...unitMap.values()] };
+  if (options?.eids && options.eids.length > 0) {
+    request.eids = options.eids;
+  }
+  return request;
 }
 
 // ---------------------------------------------------------------------------

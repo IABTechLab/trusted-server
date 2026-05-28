@@ -1,0 +1,86 @@
+{
+  "defaultPreset": [
+    "connectIdSystem",
+    "criteoIdSystem",
+    "id5IdSystem",
+    "identityLinkIdSystem",
+    "liveIntentIdSystem",
+    "pubProvidedIdSystem",
+    "sharedIdSystem",
+    "uid2IdSystem",
+    "unifiedIdSystem"
+  ],
+  "modules": [
+    {
+      "moduleName": "connectIdSystem",
+      "configNames": ["connectId"],
+      "eidSources": ["yahoo.com"],
+      "importPath": "prebid.js/modules/connectIdSystem.js"
+    },
+    {
+      "moduleName": "criteoIdSystem",
+      "configNames": ["criteo"],
+      "eidSources": ["criteo.com"],
+      "importPath": "prebid.js/modules/criteoIdSystem.js"
+    },
+    {
+      "moduleName": "id5IdSystem",
+      "configNames": ["id5Id"],
+      "eidSources": ["id5-sync.com"],
+      "importPath": "prebid.js/modules/id5IdSystem.js"
+    },
+    {
+      "moduleName": "identityLinkIdSystem",
+      "configNames": ["identityLink"],
+      "eidSources": ["liveramp.com"],
+      "importPath": "prebid.js/modules/identityLinkIdSystem.js"
+    },
+    {
+      "moduleName": "liveIntentIdSystem",
+      "configNames": ["liveIntentId"],
+      "eidSources": [
+        "liveintent.com",
+        "bidswitch.net",
+        "liveintent.triplelift.com",
+        "rubiconproject.com",
+        "liveintent.indexexchange.com",
+        "openx.net",
+        "pubmatic.com",
+        "liveintent.sovrn.com",
+        "liveintent.unrulymedia.com",
+        "media.net",
+        "zeta-ssp.liveintent.com",
+        "fpid.liveintent.com",
+        "sharethrough.com",
+        "liveintent.sonobi.com",
+        "liveintent.vidazoo.com"
+      ],
+      "importPath": "prebid.js/modules/liveIntentIdSystem.js",
+      "notes": "Imported through a local ESM shim because the public Prebid wrapper contains CommonJS require()."
+    },
+    {
+      "moduleName": "pubProvidedIdSystem",
+      "configNames": ["pubProvidedId"],
+      "eidSources": [],
+      "importPath": "prebid.js/modules/pubProvidedIdSystem.js"
+    },
+    {
+      "moduleName": "sharedIdSystem",
+      "configNames": ["sharedId", "pubCommonId"],
+      "eidSources": ["pubcid.org"],
+      "importPath": "prebid.js/modules/sharedIdSystem.js"
+    },
+    {
+      "moduleName": "uid2IdSystem",
+      "configNames": ["uid2"],
+      "eidSources": ["uidapi.com"],
+      "importPath": "prebid.js/modules/uid2IdSystem.js"
+    },
+    {
+      "moduleName": "unifiedIdSystem",
+      "configNames": ["unifiedId"],
+      "eidSources": ["adserver.org"],
+      "importPath": "prebid.js/modules/unifiedIdSystem.js"
+    }
+  ]
+}

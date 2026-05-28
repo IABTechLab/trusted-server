@@ -4,8 +4,13 @@
 //!
 //! 1. **Extract** raw consent strings from cookies and HTTP headers.
 //! 2. **Decode** each signal into structured data (TCF v2, GPP, US Privacy).
-//! 3. **Build** a normalized [`ConsentContext`] that flows through the auction
-//!    pipeline and populates `OpenRTB` bid requests.
+//! 3. **Build** a request-local [`ConsentContext`] that flows through the
+//!    auction pipeline and populates `OpenRTB` bid requests.
+//!
+//! Consent is interpreted from request cookies, headers, geolocation, and
+//! publisher policy defaults. The consent pipeline does not read from or write
+//! to KV storage; EC identity lifecycle state is managed separately by the EC
+//! identity graph.
 //!
 //! # Supported signals
 //!
@@ -22,8 +27,6 @@
 //!     req: &req,
 //!     config: &settings.consent,
 //!     geo: geo.as_ref(),
-//!     ec_id: Some("ec_abc123"),
-//!     kv_store: Some(runtime_services.kv_store()),
 //! });
 //! ```
 
@@ -34,12 +37,12 @@ pub mod tcf;
 pub mod types;
 pub mod us_privacy;
 
-pub use crate::storage::kv_store as kv;
 pub use extraction::extract_consent_signals;
 pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
@@ -55,6 +58,8 @@ const DECISECONDS_PER_DAY: u64 = 86_400 * 10;
 /// GPP section ID for EU TCF v2.
 const GPP_SECTION_ID_TCF_EU_V2: u16 = 2;
 
+static MISSING_GEO_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Inputs to the consent processing pipeline.
 ///
 /// Bundles all data needed to extract, decode, classify, and validate
@@ -68,17 +73,6 @@ pub struct ConsentPipelineInput<'a> {
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
     pub geo: Option<&'a GeoInfo>,
-    /// EC ID for KV Store consent persistence.
-    ///
-    /// When set along with `kv_store`, enables:
-    /// - **Read fallback**: loads consent from KV when cookies are absent.
-    /// - **Write-on-change**: persists cookie-sourced consent to KV.
-    pub ec_id: Option<&'a str>,
-    /// KV store for consent persistence.
-    ///
-    /// `None` when consent persistence is not configured for this request, or
-    /// when the caller intentionally skips consent KV access.
-    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -93,11 +87,19 @@ pub struct ConsentPipelineInput<'a> {
 /// 6. Builds a [`ConsentContext`] with both raw and decoded data.
 /// 7. Logs a summary for observability.
 ///
+/// The returned context reflects request-local consent signals plus policy
+/// defaults only. This function does not load persisted consent from KV and
+/// does not persist consent to KV.
+///
 /// Decoding failures are logged and the corresponding decoded field is set to
 /// `None` — the raw string is still preserved for proxy-mode forwarding.
 pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext {
     let signals = extract_consent_signals(input.jar, input.req);
     log_consent_signals(&signals);
+
+    if input.geo.is_none() {
+        log_missing_geo_warning_once();
+    }
 
     // In proxy mode, skip decoding entirely.
     if input.config.mode == ConsentMode::Proxy {
@@ -126,23 +128,11 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
         };
     }
 
-    // KV Store fallback: if no cookie-based signals exist, try loading
-    // persisted consent from the KV Store.
-    if should_try_kv_fallback(&signals) {
-        if let Some(ctx) = try_kv_fallback(input) {
-            log_consent_context(&ctx);
-            return ctx;
-        }
-    }
-
     let mut ctx = build_context_from_signals(&signals);
     ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
     apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
-
-    // KV Store write: persist cookie-sourced consent for future requests.
-    try_kv_write(input, &ctx);
 
     log_consent_context(&ctx);
     ctx
@@ -171,6 +161,8 @@ fn apply_expiration_check(ctx: &mut ConsentContext, config: &ConsentConfig) {
         return;
     }
 
+    // lgtm[rust/cleartext-logging]
+    // This warning logs consent age metadata only; no raw consent string is emitted.
     log::warn!(
         "TCF consent expired (age: {age_days}d, max: {}d)",
         config.max_consent_age_days
@@ -436,9 +428,8 @@ pub fn build_us_privacy_from_gpc(config: &ConsentConfig) -> Option<types::UsPriv
 /// Returns [`None`] if consent is missing or insufficient, stripping all EIDs
 /// from the outgoing bid request.
 ///
-/// **Note:** This function is implemented and tested but not yet wired into
-/// the bid request path. It will be connected when identity provider
-/// integration populates EIDs (see `prebid.rs` where `eids: None`).
+/// Called by `handle_auction` after resolving partner EIDs from the KV
+/// identity graph, before attaching them to the outbound `OpenRTB` request.
 #[must_use]
 pub fn gate_eids_by_consent<T>(
     eids: Option<Vec<T>>,
@@ -482,8 +473,12 @@ pub fn gate_eids_by_consent<T>(
 ///   information on a device) must be explicitly consented. If no TCF data is
 ///   available under GDPR, consent is assumed absent and EC is blocked.
 /// - **US state privacy**: opt-out model — EC is allowed unless the user has
-///   explicitly opted out via the US Privacy string or Global Privacy Control.
-/// - **Non-regulated / Unknown**: EC is allowed (no consent requirement).
+///   explicitly opted out via Global Privacy Control, GPP US sale opt-out, or
+///   the US Privacy string. Explicit US opt-out signals take precedence over
+///   TCF storage consent.
+/// - **Non-regulated**: EC is allowed (no consent requirement).
+/// - **Unknown**: fail-closed — jurisdiction cannot be determined so EC is
+///   blocked as a precaution.
 #[must_use]
 pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
     match &ctx.jurisdiction {
@@ -495,64 +490,84 @@ pub fn allows_ec_creation(ctx: &ConsentContext) -> bool {
             }
         }
         jurisdiction::Jurisdiction::UsState(_) => {
-            // US: opt-out model — allow unless user explicitly opted out.
-            if let Some(usp) = &ctx.us_privacy {
-                usp.opt_out_sale != PrivacyFlag::Yes
-            } else {
-                // No US Privacy string — fall back to GPC signal.
-                !ctx.gpc
+            // GPC is an independent opt-out signal — it always blocks EC
+            // creation regardless of other consent signals.
+            if ctx.gpc {
+                return false;
             }
+            // Explicit US opt-out signals take precedence over TCF storage
+            // consent in US-state jurisdictions.
+            if ctx.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true) {
+                return false;
+            }
+            if ctx
+                .us_privacy
+                .as_ref()
+                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+            {
+                return false;
+            }
+            // When a CMP uses TCF in the US (e.g. Didomi), respect the TCF
+            // Purpose 1 decision if no explicit US opt-out signal is present.
+            if let Some(tcf) = effective_tcf(ctx) {
+                return tcf.has_storage_consent();
+            }
+            // GPP US sale_opt_out=false is an explicit non-opt-out signal.
+            if let Some(gpp) = &ctx.gpp {
+                if let Some(opted_out) = gpp.us_sale_opt_out {
+                    return !opted_out;
+                }
+            }
+            // Check US Privacy string when no TCF decision is present.
+            if let Some(usp) = &ctx.us_privacy {
+                return usp.opt_out_sale != PrivacyFlag::Yes;
+            }
+            // Spec §6.1.1: "In regulated jurisdictions (GDPR, US state),
+            // consent cookies/headers must be present for
+            // allows_ec_creation() to return true." No signals = block.
+            false
         }
-        jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => true,
+        jurisdiction::Jurisdiction::NonRegulated => true,
+        // No geolocation data — cannot determine jurisdiction.
+        // Fail-closed: block EC creation as a precaution.
+        jurisdiction::Jurisdiction::Unknown => false,
     }
 }
 
-// ---------------------------------------------------------------------------
-// KV Store integration helpers
-// ---------------------------------------------------------------------------
-
-/// Returns whether KV fallback should be attempted for this request.
+/// Returns `true` only when the request contains an explicit EC opt-out signal.
 ///
-/// KV fallback is used only when cookie-based consent signals are absent.
-/// A standalone `Sec-GPC` header should not suppress fallback reads.
+/// This is intentionally narrower than [`allows_ec_creation`]. Some requests
+/// fail closed because consent cannot be verified yet (for example, missing geo
+/// or missing/undecodable consent signals in a regulated jurisdiction). Those
+/// cases must block *new* EC creation, but they must not be treated as an
+/// authoritative withdrawal of an already-issued EC.
 #[must_use]
-fn should_try_kv_fallback(signals: &RawConsentSignals) -> bool {
-    !signals.has_cookie_signals()
-}
-
-/// Attempts to load consent from the KV Store when cookie signals are empty.
-///
-/// Returns `Some(ConsentContext)` if a valid entry was found and decoded,
-/// `None` otherwise. Requires both `kv_store` and `ec_id` to be present.
-fn try_kv_fallback(input: &ConsentPipelineInput<'_>) -> Option<ConsentContext> {
-    let kv_store = input.kv_store?;
-    let ec_id = input.ec_id?;
-
-    log::debug!("No cookie consent signals, trying KV fallback for '{ec_id}'");
-    let mut ctx = kv::load_consent_from_kv(kv_store, ec_id)?;
-
-    // Re-detect jurisdiction from current geo (may differ from stored value).
-    ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
-    apply_tcf_conflict_resolution(&mut ctx, input.config);
-    apply_expiration_check(&mut ctx, input.config);
-    apply_gpc_us_privacy(&mut ctx, input.config);
-
-    Some(ctx)
-}
-
-/// Persists cookie-sourced consent to the KV Store when configured.
-///
-/// Only writes when consent signals are non-empty and have changed since
-/// the last write (fingerprint comparison).
-fn try_kv_write(input: &ConsentPipelineInput<'_>, ctx: &ConsentContext) {
-    let Some(kv_store) = input.kv_store else {
-        return;
-    };
-    let Some(ec_id) = input.ec_id else {
-        return;
-    };
-
-    kv::save_consent_to_kv(kv_store, ec_id, ctx, input.config.max_consent_age_days);
+pub fn has_explicit_ec_withdrawal(ctx: &ConsentContext) -> bool {
+    match &ctx.jurisdiction {
+        jurisdiction::Jurisdiction::Gdpr => {
+            effective_tcf(ctx).is_some_and(|tcf| !tcf.has_storage_consent())
+        }
+        jurisdiction::Jurisdiction::UsState(_) => {
+            if ctx.gpc {
+                return true;
+            }
+            if ctx.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true) {
+                return true;
+            }
+            if ctx
+                .us_privacy
+                .as_ref()
+                .is_some_and(|usp| usp.opt_out_sale == PrivacyFlag::Yes)
+            {
+                return true;
+            }
+            if let Some(tcf) = effective_tcf(ctx) {
+                return !tcf.has_storage_consent();
+            }
+            false
+        }
+        jurisdiction::Jurisdiction::NonRegulated | jurisdiction::Jurisdiction::Unknown => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +584,17 @@ fn log_consent_signals(signals: &RawConsentSignals) {
     } else {
         log::info!("Consent signals: {}", signals);
     }
+}
+
+/// Logs a one-time warning when request geolocation is unavailable.
+fn log_missing_geo_warning_once() {
+    if MISSING_GEO_WARNING_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    log::warn!(
+        "Geo lookup returned no data; consent jurisdiction will be unknown and EC creation will fail closed"
+    );
 }
 
 /// Derives a human-readable status label for a decoded signal.
@@ -618,7 +644,7 @@ mod tests {
 
     use super::{
         allows_ec_creation, apply_expiration_check, apply_tcf_conflict_resolution,
-        build_consent_context, build_context_from_signals, should_try_kv_fallback,
+        build_consent_context, build_context_from_signals, has_explicit_ec_withdrawal,
         ConsentPipelineInput,
     };
     use crate::consent::jurisdiction::Jurisdiction;
@@ -714,35 +740,32 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(gpp_last_updated_ds, gpp_allows_eids)),
+                us_sale_opt_out: None,
             }),
             ..ConsentContext::default()
         }
     }
 
     #[test]
-    fn kv_fallback_allowed_when_only_gpc_present() {
-        let signals = RawConsentSignals {
-            gpc: true,
-            ..RawConsentSignals::default()
-        };
+    fn missing_geo_keeps_unknown_jurisdiction_and_blocks_ec_creation() {
+        let req = build_request();
+        let config = ConsentConfig::default();
 
-        assert!(
-            should_try_kv_fallback(&signals),
-            "should allow KV fallback when only Sec-GPC is present"
+        let ctx = build_consent_context(&ConsentPipelineInput {
+            jar: None,
+            req: &req,
+            config: &config,
+            geo: None,
+        });
+
+        assert_eq!(
+            ctx.jurisdiction,
+            Jurisdiction::Unknown,
+            "missing geo should keep jurisdiction unknown"
         );
-    }
-
-    #[test]
-    fn kv_fallback_skipped_when_cookie_signal_present() {
-        let signals = RawConsentSignals {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            gpc: true,
-            ..RawConsentSignals::default()
-        };
-
         assert!(
-            !should_try_kv_fallback(&signals),
-            "should skip KV fallback when cookie signals are present"
+            !allows_ec_creation(&ctx),
+            "missing geo should keep EC creation fail-closed"
         );
     }
 
@@ -760,8 +783,6 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            ec_id: None,
-            kv_store: None,
         });
 
         assert!(
@@ -790,8 +811,6 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
-            ec_id: None,
-            kv_store: None,
         });
 
         assert!(
@@ -877,6 +896,7 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(0, true)),
+                us_sale_opt_out: None,
             }),
             ..ConsentContext::default()
         };
@@ -959,6 +979,7 @@ mod tests {
                 version: 1,
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf_with_storage(true)),
+                us_sale_opt_out: None,
             }),
             gdpr_applies: true,
             ..ConsentContext::default()
@@ -1020,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn ec_allowed_us_state_no_signals() {
+    fn ec_blocked_us_state_no_signals() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::UsState("CA".to_owned()),
             us_privacy: None,
@@ -1028,8 +1049,8 @@ mod tests {
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "US state + no opt-out signals should allow EC (opt-out model)"
+            !allows_ec_creation(&ctx),
+            "US state + no consent signals should block EC (spec §6.1.1: fail-closed)"
         );
     }
 
@@ -1046,14 +1067,41 @@ mod tests {
     }
 
     #[test]
-    fn ec_allowed_unknown_jurisdiction() {
+    fn ec_blocked_unknown_jurisdiction() {
         let ctx = ConsentContext {
             jurisdiction: Jurisdiction::Unknown,
             ..ConsentContext::default()
         };
         assert!(
-            allows_ec_creation(&ctx),
-            "unknown jurisdiction should allow EC (no geo data available)"
+            !allows_ec_creation(&ctx),
+            "unknown jurisdiction should block EC (fail-closed when geo unavailable)"
+        );
+        assert!(
+            !has_explicit_ec_withdrawal(&ctx),
+            "unknown jurisdiction should not be treated as an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::No,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC=true should block EC even when US Privacy says no opt-out"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPC=true should be treated as an explicit withdrawal signal"
         );
     }
 
@@ -1072,6 +1120,203 @@ mod tests {
         assert!(
             allows_ec_creation(&ctx),
             "US Privacy with opt_out=N/A should allow EC"
+        );
+    }
+
+    #[test]
+    fn ec_allowed_us_state_tcf_with_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "US state + TCF Purpose 1 consented should allow EC (Didomi-style CMP)"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_tcf_without_storage_consent() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(false)),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US state + TCF Purpose 1 denied should block EC"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_tcf() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            gpc: true,
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC should block EC even when TCF grants storage consent in US state"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_us_privacy_opt_out_overrides_tcf() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::Yes,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US Privacy opt-out should take priority over TCF consent"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "US Privacy opt-out should be treated as an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn ec_allowed_us_state_gpp_no_sale_opt_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "US state + GPP US sale_opt_out=false should allow EC"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpp_sale_opted_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(true),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US state + GPP US sale_opt_out=true should block EC"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPP US sale opt-out should be treated as an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn ec_blocked_us_state_gpc_overrides_gpp_us() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpc: true,
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPC should block EC even when GPP US says no opt-out"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_gpp_us_opt_out_overrides_tcf() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            tcf: Some(make_tcf_with_storage(true)),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(true),
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "GPP US opt-out should take priority over TCF consent"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "GPP US opt-out should be treated as an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_us_privacy_opt_out_overrides_gpp_non_opt_out() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("TN".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![7],
+                eu_tcf: None,
+                us_sale_opt_out: Some(false),
+            }),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::Yes,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            !allows_ec_creation(&ctx),
+            "US Privacy opt-out should block EC even when GPP US has no sale opt-out"
+        );
+        assert!(
+            has_explicit_ec_withdrawal(&ctx),
+            "US Privacy opt-out should be treated as an explicit withdrawal"
+        );
+    }
+
+    #[test]
+    fn ec_us_state_gpp_no_us_section_falls_through_to_us_privacy() {
+        let ctx = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpp: Some(GppConsent {
+                version: 1,
+                section_ids: vec![2],
+                eu_tcf: None,
+                us_sale_opt_out: None,
+            }),
+            us_privacy: Some(UsPrivacy {
+                version: 1,
+                notice_given: PrivacyFlag::Yes,
+                opt_out_sale: PrivacyFlag::No,
+                lspa_covered: PrivacyFlag::NotApplicable,
+            }),
+            ..ConsentContext::default()
+        };
+        assert!(
+            allows_ec_creation(&ctx),
+            "GPP without US section should fall through to us_privacy"
         );
     }
 }

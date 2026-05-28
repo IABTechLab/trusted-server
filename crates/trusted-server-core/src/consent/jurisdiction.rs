@@ -100,6 +100,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 0,
             region: region.map(str::to_owned),
+            asn: None,
         }
     }
 

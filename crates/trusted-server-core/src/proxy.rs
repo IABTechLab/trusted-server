@@ -1,7 +1,4 @@
-use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
-use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
@@ -13,61 +10,13 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
-use crate::edge_cookie::get_ec_id;
+use crate::ec::get_ec_id;
 use crate::error::TrustedServerError;
-use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices,
-};
 use crate::settings::Settings;
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
-
-/// Headers copied from the original client request to the upstream proxy request
-/// when `copy_request_headers` is enabled.
-///
-/// `Accept-Encoding` is also overridden in the same code path, but with a fixed
-/// value ([`SUPPORTED_ENCODINGS`]) rather than forwarding the client's preference.
-/// Both forwarded headers and the Accept-Encoding override are applied together in
-/// the `copy_request_headers` branch of the proxy request builder.
-const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
-    HEADER_USER_AGENT,
-    HEADER_ACCEPT,
-    HEADER_ACCEPT_LANGUAGE,
-    HEADER_REFERER,
-    HEADER_X_FORWARDED_FOR,
-];
-
-/// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
-///
-/// Shared with `auction/orchestrator.rs`. Both files will migrate off `fastly::Response`
-/// entirely in Phase 2, at which point this conversion helper will be removed.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
-/// streaming body, which this Fastly-only conversion path cannot materialize.
-pub(crate) fn platform_response_to_fastly(
-    platform_resp: PlatformResponse,
-) -> Result<Response, Report<TrustedServerError>> {
-    let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming platform response body is not supported by Fastly response conversion"
-                    .to_string(),
-            }));
-        }
-    };
-    let mut resp = Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.append_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    Ok(resp)
-}
 
 #[derive(Deserialize)]
 struct ProxySignReq {
@@ -97,16 +46,19 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
-    /// Domains allowed for the initial request and any redirects.
+    /// Domain allowlist enforced on the initial target and every redirect hop.
     ///
-    /// When empty every host is permitted (open mode). Integration proxies
-    /// should leave this empty; first-party handlers should pass
-    /// `&settings.proxy.allowed_domains` to enforce the publisher allowlist.
+    /// An empty slice disables allowlist enforcement (open mode).
+    /// Integration proxies should pass `&[]`; first-party proxy passes
+    /// `&settings.proxy.allowed_domains`.
     pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the EC ID.
+    ///
+    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
+    /// first-party proxy by setting `allowed_domains` directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
@@ -153,6 +105,23 @@ impl<'a> ProxyRequestConfig<'a> {
 /// Encodings we support decompressing in `finalize_proxied_response`.
 /// We override the client's Accept-Encoding to only advertise these.
 const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
+
+/// Copy a curated set of request headers to a proxied request.
+fn copy_proxy_forward_headers(src: &Request, dst: &mut Request) {
+    for header_name in [
+        HEADER_USER_AGENT,
+        HEADER_ACCEPT,
+        HEADER_ACCEPT_LANGUAGE,
+        HEADER_REFERER,
+        HEADER_X_FORWARDED_FOR,
+    ] {
+        if let Some(v) = src.get_header(&header_name) {
+            dst.set_header(&header_name, v);
+        }
+    }
+    // Only advertise encodings we can decompress (excludes zstd, etc.)
+    dst.set_header(HEADER_ACCEPT_ENCODING, SUPPORTED_ENCODINGS);
+}
 
 /// Rebuild a response with a new body, preserving headers except Content-Length.
 /// If `preserve_encoding` is true, the Content-Encoding header is kept (for compressed responses).
@@ -428,15 +397,9 @@ fn finalize_response(
     }
 }
 
-/// Bundles per-request header configuration and [`RuntimeServices`] for the proxy redirect loop.
 struct ProxyRequestHeaders<'a> {
     additional_headers: &'a [(header::HeaderName, HeaderValue)],
     copy_request_headers: bool,
-    services: &'a RuntimeServices,
-    /// Domains permitted for the initial request and any redirects.
-    ///
-    /// Empty slice means open mode (all hosts allowed). Populated by first-party
-    /// handlers; integration proxies leave it empty.
     allowed_domains: &'a [String],
 }
 
@@ -454,7 +417,6 @@ pub async fn proxy_request(
     settings: &Settings,
     req: Request,
     config: ProxyRequestConfig<'_>,
-    services: &RuntimeServices,
 ) -> Result<Response, Report<TrustedServerError>> {
     let ProxyRequestConfig {
         target_url,
@@ -486,7 +448,6 @@ pub async fn proxy_request(
         ProxyRequestHeaders {
             additional_headers: &headers,
             copy_request_headers,
-            services,
             allowed_domains,
         },
         stream_passthrough,
@@ -609,67 +570,28 @@ async fn proxy_with_redirects(
             }));
         }
 
-        let backend_name = request_headers
-            .services
-            .backend()
-            .ensure(&PlatformBackendSpec {
-                scheme: scheme.clone(),
-                host: host.to_string(),
-                port: parsed_url.port(),
-                certificate_check: settings.proxy.certificate_check,
-                first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
-            })
-            .change_context(TrustedServerError::Proxy {
-                message: "backend registration failed".to_string(),
-            })?;
+        let backend_name = crate::backend::BackendConfig::new(&scheme, host)
+            .port(parsed_url.port())
+            .certificate_check(settings.proxy.certificate_check)
+            .ensure()?;
 
-        let mut builder = edge_request_builder().method(current_method.clone()).uri(
-            current_url
-                .parse::<EdgeUri>()
-                .change_context(TrustedServerError::Proxy {
-                    message: "invalid url".to_string(),
-                })?,
-        );
-
-        // Collect outbound headers using insert-semantics so additional_headers override any
-        // header set by copy_request_headers, matching the old set_header() replace behavior.
-        let mut outbound_headers = http::HeaderMap::new();
+        let mut proxy_req = Request::new(current_method.clone(), &current_url);
         if request_headers.copy_request_headers {
-            for header_name in PROXY_FORWARD_HEADERS {
-                if let Some(v) = req.get_header(&header_name) {
-                    outbound_headers.insert(header_name, v.clone());
-                }
-            }
-            outbound_headers.insert(
-                HEADER_ACCEPT_ENCODING,
-                HeaderValue::from_static(SUPPORTED_ENCODINGS),
-            );
+            copy_proxy_forward_headers(req, &mut proxy_req);
         }
-        for (name, value) in request_headers.additional_headers {
-            // insert() replaces any existing value, matching set_header() semantics.
-            outbound_headers.insert(name.clone(), value.clone());
+        if let Some(body_bytes) = body {
+            proxy_req.set_body(body_bytes.to_vec());
         }
-        for (name, value) in &outbound_headers {
-            builder = builder.header(name, value);
-        }
-        let body_bytes = body.map(<[u8]>::to_vec).unwrap_or_default();
-        let edge_req =
-            builder
-                .body(EdgeBody::from(body_bytes))
-                .change_context(TrustedServerError::Proxy {
-                    message: "failed to build proxy request".to_string(),
-                })?;
 
-        let platform_resp = request_headers
-            .services
-            .http_client()
-            .send(PlatformHttpRequest::new(edge_req, backend_name))
-            .await
+        for (name, value) in request_headers.additional_headers {
+            proxy_req.set_header(name.clone(), value.clone());
+        }
+
+        let beresp = proxy_req
+            .send(&backend_name)
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to proxy".to_string(),
             })?;
-
-        let beresp = platform_response_to_fastly(platform_resp)?;
 
         if !follow_redirects {
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
@@ -772,7 +694,6 @@ async fn proxy_with_redirects(
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_proxy(
     settings: &Settings,
-    services: &RuntimeServices,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Parse, reconstruct, and validate the signed target URL
@@ -792,7 +713,6 @@ pub async fn handle_first_party_proxy(
             stream_passthrough: false,
             allowed_domains: &settings.proxy.allowed_domains,
         },
-        services,
     )
     .await
 }
@@ -809,7 +729,6 @@ pub async fn handle_first_party_proxy(
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
 pub async fn handle_first_party_click(
     settings: &Settings,
-    _services: &RuntimeServices,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let SignedTarget {
@@ -876,7 +795,6 @@ pub async fn handle_first_party_click(
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, or the URL uses an unsupported scheme.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
-    _services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let method = req.get_method().clone();
@@ -984,7 +902,6 @@ struct ProxyRebuildResp {
 /// Returns an error if JSON parsing fails, the URL is invalid, or the request body cannot be read.
 pub async fn handle_first_party_proxy_rebuild(
     settings: &Settings,
-    _services: &RuntimeServices,
     mut req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let method = req.get_method().clone();
@@ -1247,77 +1164,32 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::{
-        handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-        handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS,
+        copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
+        handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
+        rebuild_response_with_body, reconstruct_and_validate_signed_target, redirect_is_permitted,
+        ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
-    use crate::constants::HEADER_ACCEPT;
-    use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::{build_services_with_http_client, noop_services};
-    use crate::platform::{
-        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse, PlatformSelectResult,
-    };
     use crate::test_support::tests::create_test_settings;
-    use bytes::Bytes;
-    use edgezero_core::body::Body as EdgeBody;
-    use edgezero_core::http::response_builder as edge_response_builder;
+    use crate::{
+        constants::{
+            HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
+            HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
+        },
+        creative,
+    };
     use error_stack::Report;
     use fastly::http::{header, HeaderValue, Method, StatusCode};
     use fastly::{Request, Response};
-
-    /// Test double that always returns a streaming (non-buffered) response body.
-    ///
-    /// Used to exercise the `Body::Stream` error path in
-    /// `platform_response_to_fastly`, which cannot materialise a streaming body
-    /// into a `fastly::Response`. Only `send` is implemented; `send_async` and
-    /// `select` return `PlatformError::Unsupported`.
-    struct StreamingResponseHttpClient;
-
-    #[async_trait::async_trait(?Send)]
-    impl PlatformHttpClient for StreamingResponseHttpClient {
-        async fn send(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformResponse, Report<PlatformError>> {
-            let edge_response = edge_response_builder()
-                .status(StatusCode::OK)
-                .body(EdgeBody::stream(futures::stream::iter(vec![
-                    Bytes::from_static(b"chunk"),
-                ])))
-                .expect("should build streaming test response");
-
-            Ok(PlatformResponse::new(edge_response).with_backend_name("stub-backend"))
-        }
-
-        async fn send_async(
-            &self,
-            _request: PlatformHttpRequest,
-        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-
-        async fn select(
-            &self,
-            _pending_requests: Vec<PlatformPendingRequest>,
-        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
-            Err(Report::new(PlatformError::Unsupported))
-        }
-    }
 
     #[tokio::test]
     async fn proxy_missing_param_returns_400() {
         let settings = create_test_settings();
         let req = Request::new(Method::GET, "https://example.com/first-party/proxy");
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1329,10 +1201,9 @@ mod tests {
             Method::GET,
             "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
         );
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1344,7 +1215,7 @@ mod tests {
         });
         let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
         req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let mut resp = handle_first_party_proxy_sign(&settings, req)
             .await
             .expect("sign ok");
         assert_eq!(resp.get_status(), StatusCode::OK);
@@ -1366,10 +1237,9 @@ mod tests {
         });
         let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
         req.set_body(body.to_string());
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy_sign(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_proxy_sign(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1381,7 +1251,7 @@ mod tests {
         });
         let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
         req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let mut resp = handle_first_party_proxy_sign(&settings, req)
             .await
             .expect("should sign URL with non-standard port");
         assert_eq!(
@@ -1488,10 +1358,9 @@ mod tests {
     async fn click_missing_params_returns_400() {
         let settings = create_test_settings();
         let req = Request::new(Method::GET, "https://edge.example/first-party/click");
-        let err: Report<TrustedServerError> =
-            handle_first_party_click(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_click(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1511,7 +1380,7 @@ mod tests {
                 sig
             ),
         );
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
+        let resp = handle_first_party_click(&settings, req)
             .await
             .expect("should redirect");
         assert_eq!(resp.get_status(), StatusCode::FOUND);
@@ -1538,9 +1407,10 @@ mod tests {
                 sig
             ),
         );
-        req.set_header(crate::constants::HEADER_X_TS_EC, "ec-123");
+        let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
+        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
 
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
+        let resp = handle_first_party_click(&settings, req)
             .await
             .expect("should redirect");
 
@@ -1554,7 +1424,7 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
+        assert_eq!(pairs.remove("ts-ec").as_deref(), Some(valid_ec_id.as_str()));
         assert!(pairs.is_empty());
     }
 
@@ -1573,7 +1443,7 @@ mod tests {
             "https://edge.example/first-party/proxy-rebuild",
         );
         req.set_body(serde_json::to_string(&body).expect("test JSON should serialize"));
-        let mut resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+        let mut resp = handle_first_party_proxy_rebuild(&settings, req)
             .await
             .expect("rebuild ok");
         assert_eq!(resp.get_status(), StatusCode::OK);
@@ -1651,10 +1521,9 @@ mod tests {
         // Build a first-party proxy URL with a token for the unsupported scheme
         let first_party = creative::build_proxy_url(&settings, clear);
         let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
@@ -1672,11 +1541,68 @@ mod tests {
             sig
         );
         let req = Request::new(Method::GET, &url);
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
+        let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
+            .await
+            .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn header_copy_copies_curated_set() {
+        let mut src = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        src.set_header(HEADER_USER_AGENT, "UA/1.0");
+        src.set_header(HEADER_ACCEPT, "image/*");
+        src.set_header(HEADER_ACCEPT_LANGUAGE, "en-US");
+        src.set_header(HEADER_ACCEPT_ENCODING, "gzip");
+        src.set_header(HEADER_REFERER, "https://pub.example/page");
+        src.set_header(HEADER_X_FORWARDED_FOR, "203.0.113.1");
+
+        let mut dst = Request::new(Method::GET, "https://cdn.example/a.png");
+        copy_proxy_forward_headers(&src, &mut dst);
+
+        assert_eq!(
+            dst.get_header(HEADER_USER_AGENT)
+                .expect("User-Agent header should be copied")
+                .to_str()
+                .expect("User-Agent should be valid UTF-8"),
+            "UA/1.0"
+        );
+        assert_eq!(
+            dst.get_header(HEADER_ACCEPT)
+                .expect("Accept header should be copied")
+                .to_str()
+                .expect("Accept should be valid UTF-8"),
+            "image/*"
+        );
+        assert_eq!(
+            dst.get_header(HEADER_ACCEPT_LANGUAGE)
+                .expect("Accept-Language header should be copied")
+                .to_str()
+                .expect("Accept-Language should be valid UTF-8"),
+            "en-US"
+        );
+        // Accept-Encoding is overridden to only include supported encodings
+        assert_eq!(
+            dst.get_header(HEADER_ACCEPT_ENCODING)
+                .expect("Accept-Encoding header should be set")
+                .to_str()
+                .expect("Accept-Encoding should be valid UTF-8"),
+            SUPPORTED_ENCODINGS
+        );
+        assert_eq!(
+            dst.get_header(HEADER_REFERER)
+                .expect("Referer header should be copied")
+                .to_str()
+                .expect("Referer should be valid UTF-8"),
+            "https://pub.example/page"
+        );
+        assert_eq!(
+            dst.get_header(HEADER_X_FORWARDED_FOR)
+                .expect("X-Forwarded-For header should be copied")
+                .to_str()
+                .expect("X-Forwarded-For should be valid UTF-8"),
+            "203.0.113.1"
+        );
     }
 
     #[tokio::test]
@@ -1685,7 +1611,7 @@ mod tests {
         let clear = "https://cdn.example/landing.html?x=1";
         let first_party = creative::build_click_url(&settings, clear);
         let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
+        let resp = handle_first_party_click(&settings, req)
             .await
             .expect("should redirect");
         assert_eq!(resp.get_status(), StatusCode::FOUND);
@@ -1953,6 +1879,44 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
+        let mut beresp = Response::from_status(StatusCode::OK);
+        beresp.append_header(header::SET_COOKIE, "first=1; Path=/; HttpOnly");
+        beresp.append_header(header::SET_COOKIE, "second=2; Path=/; Secure");
+        beresp.set_header(header::CONTENT_TYPE, "text/plain");
+        beresp.set_header(header::CONTENT_LENGTH, "999");
+
+        let rebuilt = rebuild_response_with_body(
+            &beresp,
+            "text/html; charset=utf-8",
+            b"rewritten".to_vec(),
+            false,
+        );
+
+        let set_cookie_values: Vec<&str> = rebuilt
+            .get_headers()
+            .filter(|(name, _)| *name == header::SET_COOKIE)
+            .map(|(_, value)| value.to_str().expect("should be valid Set-Cookie"))
+            .collect();
+        assert_eq!(
+            set_cookie_values,
+            vec!["first=1; Path=/; HttpOnly", "second=2; Path=/; Secure"],
+            "should preserve multiple Set-Cookie headers"
+        );
+        assert_eq!(
+            rebuilt
+                .get_header(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "should set rewritten Content-Type"
+        );
+        assert!(
+            rebuilt.get_header(header::CONTENT_LENGTH).is_none(),
+            "should not preserve stale Content-Length"
+        );
+    }
+
+    #[test]
     fn html_uncompressed_response_is_processed_without_encoding() {
         let settings = create_test_settings();
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
@@ -1983,180 +1947,6 @@ mod tests {
             body.contains("/first-party/proxy?tsurl="),
             "HTML should be rewritten: {}",
             body
-        );
-    }
-
-    // --- Platform HTTP client integration ---
-
-    #[tokio::test]
-    async fn proxy_request_calls_platform_http_client_send() {
-        use crate::platform::test_support::StubHttpClient;
-
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/");
-
-        let result = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await;
-
-        assert!(result.is_ok(), "should proxy successfully");
-        let calls = stub.recorded_backend_names();
-        assert_eq!(calls.len(), 1, "should call send exactly once");
-        assert_eq!(
-            calls[0], "stub-backend",
-            "should use backend name from StubBackend"
-        );
-    }
-
-    #[tokio::test]
-    async fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
-        use crate::platform::test_support::StubHttpClient;
-
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/");
-        req.set_header(header::USER_AGENT, "test-agent/1.0");
-        req.set_header(header::ACCEPT, "text/html");
-        req.set_header(header::ACCEPT_LANGUAGE, "en-US");
-
-        let result = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: true,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await;
-
-        assert!(result.is_ok(), "should proxy successfully");
-        let all_headers = stub.recorded_request_headers();
-        assert_eq!(all_headers.len(), 1, "should have captured one request");
-        let sent = &all_headers[0];
-
-        let header_value = |name: &str| -> Option<String> {
-            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
-        };
-
-        assert_eq!(
-            header_value("user-agent").as_deref(),
-            Some("test-agent/1.0"),
-            "should forward User-Agent"
-        );
-        assert_eq!(
-            header_value("accept").as_deref(),
-            Some("text/html"),
-            "should forward Accept"
-        );
-        assert_eq!(
-            header_value("accept-language").as_deref(),
-            Some("en-US"),
-            "should forward Accept-Language"
-        );
-        assert_eq!(
-            header_value("accept-encoding").as_deref(),
-            Some(SUPPORTED_ENCODINGS),
-            "should override Accept-Encoding with supported encodings"
-        );
-    }
-
-    #[tokio::test]
-    async fn proxy_request_returns_error_for_streaming_platform_response_body() {
-        let services = build_services_with_http_client(
-            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/");
-
-        let err = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await
-        .expect_err("should reject streaming platform responses");
-
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::BAD_GATEWAY,
-            "should surface a proxy failure instead of truncating the body"
-        );
-        assert!(
-            format!("{err:?}").contains("streaming platform response body"),
-            "should describe the unsupported streaming body: {err:?}"
-        );
-    }
-
-    #[test]
-    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
-        let mut beresp = Response::from_status(StatusCode::OK);
-        beresp.append_header(header::SET_COOKIE, "a=1; Path=/; Secure");
-        beresp.append_header(header::SET_COOKIE, "b=2; Path=/; Secure");
-
-        let rebuilt = rebuild_response_with_body(
-            &beresp,
-            "text/html; charset=utf-8",
-            b"rewritten".to_vec(),
-            false,
-        );
-
-        let cookies: Vec<String> = rebuilt
-            .get_headers()
-            .filter(|(name, _)| *name == header::SET_COOKIE)
-            .map(|(_, value)| {
-                value
-                    .to_str()
-                    .expect("should preserve UTF-8 Set-Cookie header values")
-                    .to_string()
-            })
-            .collect();
-
-        assert_eq!(
-            cookies,
-            vec![
-                "a=1; Path=/; Secure".to_string(),
-                "b=2; Path=/; Secure".to_string(),
-            ],
-            "should preserve every Set-Cookie value when rebuilding the response"
         );
     }
 
@@ -2397,8 +2187,7 @@ mod tests {
             token,
         );
         let req = Request::new(Method::GET, url);
-        let services = crate::platform::test_support::noop_services();
-        let err = handle_first_party_proxy(&settings, &services, req)
+        let err = handle_first_party_proxy(&settings, req)
             .await
             .expect_err("should block initial target not in allowlist");
         assert_eq!(

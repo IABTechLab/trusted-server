@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::auction::context::ContextValue;
 use crate::geo::GeoInfo;
-use crate::platform::{ClientInfo, RuntimeServices};
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// Represents a unified auction request across all providers.
@@ -70,10 +70,10 @@ pub struct PublisherInfo {
 /// Privacy-preserving user information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
-    /// Stable EC ID (from cookie or freshly generated)
-    pub id: String,
-    /// Fresh ID for this session
-    pub fresh_id: String,
+    /// Stable EC ID (from cookie or freshly generated).
+    /// `None` when EC is unavailable or consent denies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Decoded consent context for this request.
     ///
     /// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded
@@ -82,6 +82,13 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
+    /// Consent-gated Extended User IDs resolved from the KV identity graph.
+    ///
+    /// Populated by the auction handler from partner data when the user has
+    /// a valid EC and consent permits EID transmission. `None` when no EIDs
+    /// are available (no EC, consent denied, or KV read failure).
+    #[serde(skip)]
+    pub eids: Option<Vec<crate::openrtb::Eid>>,
 }
 
 /// Device information from request.
@@ -103,7 +110,6 @@ pub struct SiteInfo {
 pub struct AuctionContext<'a> {
     pub settings: &'a Settings,
     pub request: &'a Request,
-    pub client_info: &'a ClientInfo,
     pub timeout_ms: u32,
     /// Provider responses from the bidding phase, used by mediators.
     /// This is `None` for regular bidders and `Some` when calling a mediator.
