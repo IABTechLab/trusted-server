@@ -3276,6 +3276,40 @@ server_url = "https://prebid.example"
         );
     }
 
+    #[test]
+    fn prebid_body_preview_bounds_partial_utf8_at_byte_boundary() {
+        let mut body = vec![b'a'; PREBID_ERROR_BODY_PREVIEW_BYTES - 1];
+        body.extend_from_slice("\u{2603}".as_bytes());
+        body.extend_from_slice(b"tail");
+
+        // The helper applies both byte and character caps. With the current
+        // four-byte-per-character byte cap, this boundary replacement is beyond
+        // the public character cap for ASCII input, so pin the bounded-slice
+        // conversion directly before checking the helper output.
+        let bounded_body = &body[..PREBID_ERROR_BODY_PREVIEW_BYTES];
+        let bounded_preview = String::from_utf8_lossy(bounded_body);
+        assert!(
+            bounded_preview.ends_with('\u{fffd}'),
+            "partial multibyte char at byte cap should become U+FFFD"
+        );
+        assert!(
+            !bounded_preview.contains("tail"),
+            "bounded conversion should not include bytes beyond the preview slice"
+        );
+
+        let preview = prebid_body_preview(&body);
+
+        assert_eq!(
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should keep the public preview capped"
+        );
+        assert!(
+            !preview.contains("tail"),
+            "should not include bytes beyond the bounded preview slice"
+        );
+    }
+
     fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
         AuctionRequest {
             id: "test-auction-1".to_string(),

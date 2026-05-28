@@ -713,7 +713,8 @@ mod tests {
         })
         .attach("internal/source.rs:12:34");
 
-        let response = super::provider_error_response("prebid", 37, "parse_response", &error);
+        let response =
+            super::provider_error_response("prebid", 37, super::ERROR_TYPE_PARSE_RESPONSE, &error);
 
         assert_eq!(
             response.status,
