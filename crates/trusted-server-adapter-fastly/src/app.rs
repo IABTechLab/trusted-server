@@ -98,14 +98,15 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    build_state_from_settings(get_settings()?)
+}
 
+pub(crate) fn build_state_from_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
-
     let registry = IntegrationRegistry::new(&settings)?;
-
     let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
-
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
@@ -318,55 +319,53 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 9] {
-    [
-        NamedRoute {
-            path: "/.well-known/trusted-server.json",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::TrustedServerDiscovery,
-        },
-        NamedRoute {
-            path: "/verify-signature",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::VerifySignature,
-        },
-        NamedRoute {
-            path: "/admin/keys/rotate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::RotateKey,
-        },
-        NamedRoute {
-            path: "/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::DeactivateKey,
-        },
-        NamedRoute {
-            path: "/auction",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::Auction,
-        },
-        NamedRoute {
-            path: "/first-party/proxy",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyProxy,
-        },
-        NamedRoute {
-            path: "/first-party/click",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyClick,
-        },
-        NamedRoute {
-            path: "/first-party/sign",
-            primary_methods: &[Method::GET, Method::POST],
-            handler: NamedRouteHandler::FirstPartySign,
-        },
-        NamedRoute {
-            path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::FirstPartyProxyRebuild,
-        },
-    ]
-}
+const NAMED_ROUTES: &[NamedRoute] = &[
+    NamedRoute {
+        path: "/.well-known/trusted-server.json",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TrustedServerDiscovery,
+    },
+    NamedRoute {
+        path: "/verify-signature",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::VerifySignature,
+    },
+    NamedRoute {
+        path: "/admin/keys/rotate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::RotateKey,
+    },
+    NamedRoute {
+        path: "/admin/keys/deactivate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::DeactivateKey,
+    },
+    NamedRoute {
+        path: "/auction",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::Auction,
+    },
+    NamedRoute {
+        path: "/first-party/proxy",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyProxy,
+    },
+    NamedRoute {
+        path: "/first-party/click",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyClick,
+    },
+    NamedRoute {
+        path: "/first-party/sign",
+        primary_methods: &[Method::GET, Method::POST],
+        handler: NamedRouteHandler::FirstPartySign,
+    },
+    NamedRoute {
+        path: "/first-party/proxy-rebuild",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::FirstPartyProxyRebuild,
+    },
+];
 
 fn named_route_handler(
     state: Arc<AppState>,
@@ -463,7 +462,7 @@ impl TrustedServerApp {
         // named route is registered from this single table, then every
         // non-primary publisher fallback method is registered from the same
         // row. Adding a named route now requires editing only this table.
-        for route in named_routes() {
+        for route in NAMED_ROUTES {
             for method in route.primary_methods {
                 router = router.route(
                     route.path,
@@ -510,7 +509,7 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_error_router, AppState, TrustedServerApp};
+    use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
 
     use std::sync::Arc;
 
@@ -520,11 +519,8 @@ mod tests {
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
-    use trusted_server_core::auction::build_orchestrator;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
-    use trusted_server_core::integrations::IntegrationRegistry;
-    use trusted_server_core::platform::PlatformKvStore;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -566,17 +562,7 @@ mod tests {
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
-        let orchestrator =
-            build_orchestrator(&settings).expect("should build auction orchestrator");
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let kv_store = Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
-
-        Arc::new(AppState {
-            settings: Arc::new(settings),
-            orchestrator: Arc::new(orchestrator),
-            registry: Arc::new(registry),
-            kv_store,
-        })
+        build_state_from_settings(settings).expect("should build app state from settings")
     }
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {

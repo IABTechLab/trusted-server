@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::net::IpAddr;
+
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::FastlyConfigStore;
@@ -215,7 +215,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             }
         };
 
-    if !response_was_finalized_by_middleware(&mut response) {
+    if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
         // verbs) carry TS/geo headers. Middleware-finalized responses are
@@ -223,12 +223,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         // normal registered-route path.
         match get_settings() {
             Ok(settings) => {
-                apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
+                let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
                     FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
                         log::warn!("entry-point geo lookup failed: {e}");
                         None
                     })
-                })
+                });
+                apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
             }
             Err(e) => {
                 log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -239,29 +240,17 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     compat::to_fastly_response(response).send_to_client();
 }
 
-fn response_was_finalized_by_middleware(response: &mut HttpResponse) -> bool {
+fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
     response
         .headers_mut()
         .remove(HEADER_X_TS_FINALIZED)
         .is_some()
 }
 
-fn apply_entry_point_finalize<F>(
-    settings: &Settings,
-    client_ip: Option<IpAddr>,
-    response: &mut HttpResponse,
-    lookup_geo: F,
-) where
-    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
-{
-    let geo_info = resolve_geo_for_response(response, client_ip, lookup_geo);
-    apply_finalize_headers(settings, geo_info.as_ref(), response);
-}
-
 /// Handles a request using the original Fastly-native entry point.
 ///
 /// Preserves identical semantics to the pre-PR14 `main()`. Called whenever
-/// the EdgeZero flag is disabled or cannot be read/parsed as enabled — that
+/// the `EdgeZero` flag is disabled or cannot be read/parsed as enabled — that
 /// includes config-store open failures, key-read errors, missing keys, and
 /// any value other than the accepted `"true"` / `"1"` forms.
 ///
@@ -552,8 +541,7 @@ impl BoundedWriter {
 impl Write for BoundedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.inner.len() + buf.len() > self.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "publisher body exceeded maximum buffered size",
             ));
         }
@@ -704,14 +692,14 @@ mod tests {
     }
 
     #[test]
-    fn response_was_finalized_by_middleware_strips_sentinel() {
+    fn take_finalize_sentinel_strips_sentinel() {
         let mut response = HttpResponse::new(EdgeBody::empty());
         response
             .headers_mut()
             .insert("x-ts-finalized", HeaderValue::from_static("1"));
 
         assert!(
-            response_was_finalized_by_middleware(&mut response),
+            take_finalize_sentinel(&mut response),
             "should detect middleware-finalized responses"
         );
         assert!(
@@ -729,9 +717,10 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        apply_entry_point_finalize(&settings, None, &mut response, |_| {
+        let geo_info = resolve_geo_for_response(&response, None, |_| {
             panic!("should skip entry-point geo lookup for 401 responses");
         });
+        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
 
         assert_eq!(
             response

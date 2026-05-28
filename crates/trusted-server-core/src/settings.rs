@@ -28,12 +28,16 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
-    /// Maximum number of bytes buffered when the EdgeZero publisher fallback processes
-    /// a streaming response. When `None` (the default), buffering is unbounded and limited
-    /// only by the Wasm heap. Set to a byte limit to cap per-request allocation and return
-    /// a 500 when the processed body exceeds the cap.
-    #[serde(default)]
+    /// Maximum number of bytes buffered when the `EdgeZero` publisher fallback processes
+    /// a streaming response. Defaults to 16 MiB — a conservative cap that prevents
+    /// Wasm-heap OOM at flag-flip. Set explicitly to a larger value or `null` (unbounded)
+    /// when the deployment serves publisher pages larger than 16 MiB.
+    #[serde(default = "default_max_buffered_body_bytes")]
     pub max_buffered_body_bytes: Option<usize>,
+}
+
+fn default_max_buffered_body_bytes() -> Option<usize> {
+    Some(16 * 1024 * 1024)
 }
 
 impl Publisher {
