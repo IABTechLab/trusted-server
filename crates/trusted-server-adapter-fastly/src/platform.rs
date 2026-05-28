@@ -363,7 +363,6 @@ pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvErr
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use edgezero_core::body::Body;

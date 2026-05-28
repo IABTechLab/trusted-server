@@ -32,7 +32,7 @@ use crate::platform::FastlyPlatformGeo;
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 
-/// Opens the Fastly Config Store used by the EdgeZero dispatcher.
+/// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
@@ -54,7 +54,7 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
-/// `#[fastly::main]` so the EdgeZero streaming publisher path can call
+/// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
 /// [`fastly::Response::stream_to_client`] explicitly.
 fn main() {
     let req = FastlyRequest::from_client();
@@ -69,7 +69,7 @@ fn main() {
     edgezero_main(req);
 }
 
-/// Handles a request through the EdgeZero router path.
+/// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
     let config_store = match open_trusted_server_config_store() {
         Ok(cs) => cs,
