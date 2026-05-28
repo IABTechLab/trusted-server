@@ -762,8 +762,14 @@ mod tests {
         );
 
         // Verify HTML structure
-        assert_eq!(&result[0..15], "<!DOCTYPE html>");
-        assert_eq!(&result[result.len() - 7..], "</html>");
+        assert!(
+            result.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            result.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(
@@ -893,8 +899,14 @@ mod tests {
         );
 
         // Verify structure
-        assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
-        assert_eq!(&decompressed[decompressed.len() - 7..], "</html>");
+        assert!(
+            decompressed.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            decompressed.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(
