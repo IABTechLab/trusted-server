@@ -103,8 +103,9 @@ pub trait IntoHttpResponse {
 
     /// Get a safe, user-facing error message.
     ///
-    /// Client errors (4xx) return a brief description; server/integration errors
-    /// return a generic message. Full error details are preserved in server logs.
+    /// Selected client errors return a brief description; forbidden and
+    /// server/integration errors return a generic message. Full error details
+    /// are preserved in server logs.
     fn user_message(&self) -> String;
 }
 
@@ -132,7 +133,7 @@ impl IntoHttpResponse for TrustedServerError {
 
     fn user_message(&self) -> String {
         match self {
-            // Client errors (4xx) — safe to surface a brief description
+            // Selected client errors with safe details to surface.
             Self::BadRequest { message } => format!("Bad request: {message}"),
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
@@ -194,6 +195,26 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_errors_return_generic_user_message() {
+        let cases = [
+            TrustedServerError::Forbidden {
+                message: "policy detail".into(),
+            },
+            TrustedServerError::AllowlistViolation {
+                host: "blocked.example.com".into(),
+            },
+        ];
+
+        for error in &cases {
+            assert_eq!(
+                error.user_message(),
+                "An internal error occurred",
+                "should not leak forbidden details for {error:?}",
+            );
+        }
+    }
+
+    #[test]
     fn client_errors_return_safe_descriptions() {
         let error = TrustedServerError::BadRequest {
             message: "missing field".into(),
@@ -215,7 +236,7 @@ mod tests {
     fn status_code_maps_each_error_variant_to_expected_http_response() {
         // Compile-time guard: adding a TrustedServerError variant without
         // updating this test will fail to compile.
-        let _exhaustive = |error: &TrustedServerError| match error {
+        let _guard: fn(&TrustedServerError) = |error| match error {
             TrustedServerError::BadRequest { .. }
             | TrustedServerError::Configuration { .. }
             | TrustedServerError::Auction { .. }
@@ -233,7 +254,7 @@ mod tests {
             | TrustedServerError::Ec { .. } => (),
         };
 
-        let cases = vec![
+        let cases = [
             (
                 TrustedServerError::BadRequest {
                     message: "bad input".to_string(),

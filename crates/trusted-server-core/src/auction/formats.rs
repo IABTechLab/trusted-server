@@ -304,8 +304,38 @@ pub fn convert_to_openrtb_response(
         ..Default::default()
     };
 
+    let mut response_json =
+        serde_json::to_value(&response_body).change_context(TrustedServerError::Auction {
+            message: "Failed to serialize auction response".to_string(),
+        })?;
+
+    if let Some(object) = response_json.as_object_mut() {
+        // The generated OpenRTB types skip empty vectors, but this endpoint's
+        // response contract uses explicit empty arrays for no-bid and no-adomain
+        // cases.
+        if response_body.seatbid.is_empty() {
+            object.insert("seatbid".to_string(), JsonValue::Array(Vec::new()));
+        }
+
+        if let Some(seatbids) = object.get_mut("seatbid").and_then(JsonValue::as_array_mut) {
+            for seatbid in seatbids {
+                let Some(bids) = seatbid.get_mut("bid").and_then(JsonValue::as_array_mut) else {
+                    continue;
+                };
+
+                for bid in bids {
+                    if let Some(bid_object) = bid.as_object_mut() {
+                        bid_object
+                            .entry("adomain".to_string())
+                            .or_insert_with(|| JsonValue::Array(Vec::new()));
+                    }
+                }
+            }
+        }
+    }
+
     let body_bytes =
-        serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {
+        serde_json::to_vec(&response_json).change_context(TrustedServerError::Auction {
             message: "Failed to serialize auction response".to_string(),
         })?;
 
@@ -487,7 +517,6 @@ mod tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::context::ContextValue;
     use crate::auction::orchestrator::OrchestrationResult;
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::platform::test_support::noop_services;
@@ -497,7 +526,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn make_request() -> Request {
-        let mut req = Request::new("POST", "https://publisher.example/auction");
+        let mut req = Request::new("POST", "https://publisher.example.com/auction");
         req.set_header(
             header::USER_AGENT,
             HeaderValue::from_str("Mozilla/5.0 test").expect("should create user-agent header"),
@@ -540,7 +569,7 @@ mod tests {
             price,
             currency: "USD".to_string(),
             creative: Some("<div>Ad</div>".to_string()),
-            adomain: Some(vec!["advertiser.example".to_string()]),
+            adomain: Some(vec!["advertiser.example.com".to_string()]),
             bidder: bidder.to_string(),
             width: 300,
             height: 250,
@@ -570,17 +599,8 @@ mod tests {
         serde_json::from_slice(&response.take_body_bytes()).expect("should parse JSON response")
     }
 
-    #[test]
-    fn convert_tsjs_to_auction_request_maps_banner_units_bidders_context_and_request_metadata() {
-        let mut settings = create_test_settings();
-        settings.auction.allowed_context_keys = HashSet::from([
-            "segments".to_string(),
-            "lockr_id".to_string(),
-            "count".to_string(),
-            "unsupported".to_string(),
-        ]);
-        let req = make_request();
-        let body = AdRequest {
+    fn make_banner_body(config: Option<JsonValue>) -> AdRequest {
+        AdRequest {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
@@ -599,26 +619,34 @@ mod tests {
                     },
                 ]),
             }],
-            config: Some(json!({
-                "segments": ["seg-a", "seg-b"],
-                "lockr_id": "lockr-123",
-                "count": 2,
-                "unsupported": { "nested": true },
-                "blocked": "drop-me"
-            })),
-        };
+            config,
+        }
+    }
 
+    fn convert_body_to_auction_request(
+        body: &AdRequest,
+        settings: &crate::settings::Settings,
+    ) -> AuctionRequest {
+        let req = make_request();
         let services = noop_services();
-        let auction_request = convert_tsjs_to_auction_request(
-            &body,
-            &settings,
+
+        convert_tsjs_to_auction_request(
+            body,
+            settings,
             &services,
             &req,
             ConsentContext::default(),
             "existing-ec-id",
             None,
         )
-        .expect("should convert banner request");
+        .expect("should convert banner request")
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_maps_banner_sizes_to_formats() {
+        let settings = create_test_settings();
+        let body = make_banner_body(None);
+        let auction_request = convert_body_to_auction_request(&body, &settings);
 
         assert_eq!(auction_request.slots.len(), 1, "should create one slot");
         let slot = &auction_request.slots[0];
@@ -639,6 +667,15 @@ mod tests {
             ],
             "should convert banner sizes to formats"
         );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_preserves_bidder_params() {
+        let settings = create_test_settings();
+        let body = make_banner_body(None);
+        let auction_request = convert_body_to_auction_request(&body, &settings);
+        let slot = &auction_request.slots[0];
+
         assert_eq!(
             slot.bidders.get("appnexus"),
             Some(&json!({ "placementId": 123 })),
@@ -649,6 +686,14 @@ mod tests {
             Some(&json!({ "accountId": 456 })),
             "should preserve all bidder params"
         );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_populates_publisher_user_device_and_site_metadata() {
+        let settings = create_test_settings();
+        let body = make_banner_body(None);
+        let auction_request = convert_body_to_auction_request(&body, &settings);
+
         assert_eq!(
             auction_request.publisher.domain, settings.publisher.domain,
             "should copy publisher domain"
@@ -681,6 +726,26 @@ mod tests {
             Some("Mozilla/5.0 test"),
             "should copy user-agent into device info"
         );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_filters_context_values() {
+        let mut settings = create_test_settings();
+        settings.auction.allowed_context_keys = HashSet::from([
+            "segments".to_string(),
+            "lockr_id".to_string(),
+            "count".to_string(),
+            "unsupported".to_string(),
+        ]);
+        let body = make_banner_body(Some(json!({
+            "segments": ["seg-a", "seg-b"],
+            "lockr_id": "lockr-123",
+            "count": 2,
+            "unsupported": { "nested": true },
+            "blocked": "drop-me"
+        })));
+        let auction_request = convert_body_to_auction_request(&body, &settings);
+
         assert_eq!(
             auction_request.context.get("segments"),
             Some(&ContextValue::StringList(vec![
@@ -823,7 +888,7 @@ mod tests {
         assert_eq!(bid["crid"], json!("appnexus-creative"));
         assert_eq!(bid["w"], json!(300));
         assert_eq!(bid["h"], json!(250));
-        assert_eq!(bid["adomain"], json!(["advertiser.example"]));
+        assert_eq!(bid["adomain"], json!(["advertiser.example.com"]));
         assert_eq!(
             json["ext"]["orchestrator"]["strategy"],
             json!("parallel_only"),
@@ -836,6 +901,172 @@ mod tests {
             json["ext"]["orchestrator"]["provider_details"][0]["name"],
             json!("prebid"),
             "should include provider summary details"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_serializes_missing_creative_as_empty_adm() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.creative = None;
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert bid without creative HTML");
+
+        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        let json = response_json(response);
+        assert_eq!(
+            json["seatbid"][0]["bid"][0]["adm"],
+            json!(""),
+            "should serialize missing creative as empty adm"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_serializes_missing_adomain_as_empty_array() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        bid.adomain = None;
+        let result = make_result(bid);
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert bid without advertiser domains");
+
+        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        let json = response_json(response);
+        assert_eq!(
+            json["seatbid"][0]["bid"][0]["adomain"],
+            json!([]),
+            "should serialize missing adomain as an empty array"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_allows_empty_winning_bids() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let result = OrchestrationResult {
+            provider_responses: vec![],
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert auction result without winning bids");
+
+        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        let json = response_json(response);
+        assert_eq!(
+            json["seatbid"],
+            json!([]),
+            "should emit empty seatbid array"
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["total_bids"],
+            json!(0),
+            "should report zero total bids"
+        );
+    }
+
+    #[test]
+    fn convert_to_openrtb_response_serializes_multiple_winning_bids() {
+        let settings = create_test_settings();
+        let auction_request = make_auction_request();
+        let top_bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
+        let mut sidebar_bid = make_bid("div-gpt-sidebar", "rubicon", Some(1.25));
+        sidebar_bid.creative = Some("<div>Sidebar</div>".to_string());
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse {
+                provider: "prebid".to_string(),
+                bids: vec![top_bid.clone(), sidebar_bid.clone()],
+                status: BidStatus::Success,
+                response_time_ms: 42,
+                metadata: HashMap::new(),
+            }],
+            mediator_response: None,
+            winning_bids: HashMap::from([
+                (top_bid.slot_id.clone(), top_bid),
+                (sidebar_bid.slot_id.clone(), sidebar_bid),
+            ]),
+            total_time_ms: 50,
+            metadata: HashMap::new(),
+        };
+
+        let response = convert_to_openrtb_response(&result, &settings, &auction_request)
+            .expect("should convert multiple winning bids");
+        let json = response_json(response);
+        let seatbids = json["seatbid"]
+            .as_array()
+            .expect("should serialize seatbid array");
+
+        assert_eq!(seatbids.len(), 2, "should emit one seatbid per winner");
+
+        let top_seatbid = seatbids
+            .iter()
+            .find(|seatbid| seatbid["bid"][0]["impid"].as_str() == Some("div-gpt-top"))
+            .expect("should include top slot seatbid");
+        assert_eq!(
+            top_seatbid["seat"],
+            json!("appnexus"),
+            "should preserve top bidder as seat"
+        );
+        let top_bid = &top_seatbid["bid"][0];
+        assert_eq!(
+            top_bid["id"],
+            json!("appnexus-div-gpt-top"),
+            "should preserve top bid ID"
+        );
+        assert_eq!(
+            top_bid["impid"],
+            json!("div-gpt-top"),
+            "should preserve top slot impid"
+        );
+        assert_eq!(top_bid["price"], json!(2.75), "should preserve top price");
+        assert_eq!(
+            top_bid["adm"],
+            json!("<div>Ad</div>"),
+            "should preserve top creative"
+        );
+
+        let sidebar_seatbid = seatbids
+            .iter()
+            .find(|seatbid| seatbid["bid"][0]["impid"].as_str() == Some("div-gpt-sidebar"))
+            .expect("should include sidebar slot seatbid");
+        assert_eq!(
+            sidebar_seatbid["seat"],
+            json!("rubicon"),
+            "should preserve sidebar bidder as seat"
+        );
+        let sidebar_bid = &sidebar_seatbid["bid"][0];
+        assert_eq!(
+            sidebar_bid["id"],
+            json!("rubicon-div-gpt-sidebar"),
+            "should preserve sidebar bid ID"
+        );
+        assert_eq!(
+            sidebar_bid["impid"],
+            json!("div-gpt-sidebar"),
+            "should preserve sidebar slot impid"
+        );
+        assert_eq!(
+            sidebar_bid["price"],
+            json!(1.25),
+            "should preserve sidebar price"
+        );
+        assert_eq!(
+            sidebar_bid["adm"],
+            json!("<div>Sidebar</div>"),
+            "should preserve sidebar creative"
+        );
+        assert_eq!(
+            json["ext"]["orchestrator"]["total_bids"],
+            json!(2),
+            "should count both provider bids"
         );
     }
 
@@ -878,14 +1109,15 @@ mod tests {
         let auction_request = make_auction_request();
         let mut bid = make_bid("div-gpt-top", "appnexus", Some(2.75));
         bid.width = u32::MAX;
+        bid.height = u32::MAX;
         let result = make_result(bid);
 
         let response = convert_to_openrtb_response(&result, &settings, &auction_request)
-            .expect("should convert bid with out-of-range OpenRTB width");
+            .expect("should convert bid with out-of-range OpenRTB dimensions");
         let json = response_json(response);
         let bid = &json["seatbid"][0]["bid"][0];
 
         assert!(bid.get("w").is_none(), "should omit out-of-range width");
-        assert_eq!(bid["h"], json!(250), "should keep in-range height");
+        assert!(bid.get("h").is_none(), "should omit out-of-range height");
     }
 }

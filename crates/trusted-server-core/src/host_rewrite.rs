@@ -63,11 +63,11 @@ mod tests {
         );
     }
 
-    fn assert_no_rewrite(input: &str) {
+    fn assert_no_rewrite(input: &str, message: &str) {
         assert_eq!(
             rewrite_bare_host_at_boundaries(input, ORIGIN_HOST, REQUEST_HOST),
             None,
-            "should not rewrite host embedded in a larger host token"
+            "{message}"
         );
     }
 
@@ -87,7 +87,10 @@ mod tests {
 
     #[test]
     fn returns_none_when_origin_host_is_absent() {
-        assert_no_rewrite("https://other.example.com/news");
+        assert_no_rewrite(
+            "https://other.example.com/news",
+            "should return none when origin host is absent",
+        );
     }
 
     #[test]
@@ -100,6 +103,14 @@ mod tests {
         assert_rewrite(
             "origin.example.com/news?x=1#top",
             "proxy.example.com/news?x=1#top",
+        );
+    }
+
+    #[test]
+    fn rewrites_bare_host_as_path_segment() {
+        assert_rewrite(
+            "https://cdn.example.com/assets/origin.example.com/image.png",
+            "https://cdn.example.com/assets/proxy.example.com/image.png",
         );
     }
 
@@ -121,15 +132,30 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_subdomains_or_embedded_prefixes() {
-        assert_no_rewrite("cdn.origin.example.com");
-        assert_no_rewrite("notorigin.example.com");
-        assert_no_rewrite("foo-origin.example.com");
+        assert_no_rewrite(
+            "cdn.origin.example.com",
+            "should not rewrite host embedded in a subdomain",
+        );
+        assert_no_rewrite(
+            "notorigin.example.com",
+            "should not rewrite host embedded in a larger host token",
+        );
+        assert_no_rewrite(
+            "foo-origin.example.com",
+            "should not rewrite host preceded by host-character punctuation",
+        );
     }
 
     #[test]
     fn does_not_rewrite_suffix_domains_or_host_char_continuations() {
-        assert_no_rewrite("origin.example.com.uk");
-        assert_no_rewrite("origin.example.com-prod");
+        assert_no_rewrite(
+            "origin.example.com.uk",
+            "should not rewrite host followed by a domain suffix",
+        );
+        assert_no_rewrite(
+            "origin.example.com-prod",
+            "should not rewrite host followed by host-character punctuation",
+        );
     }
 
     #[test]
@@ -147,6 +173,9 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_host_with_port_when_origin_omits_port() {
-        assert_no_rewrite("origin.example.com:8443/path");
+        assert_no_rewrite(
+            "origin.example.com:8443/path",
+            "should not rewrite host with port when origin omits port",
+        );
     }
 }

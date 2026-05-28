@@ -95,6 +95,22 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_script_src_empty_module_list_matches_core_only_bundle() {
+        let empty_src = tsjs_script_src(&[]);
+
+        assert!(
+            empty_src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
+            "should use unified static bundle path"
+        );
+        assert_sha256_hex_hash(hash_query_value(&empty_src));
+        assert_eq!(
+            empty_src,
+            tsjs_script_src(&["core"]),
+            "should include core exactly once for an empty module list"
+        );
+    }
+
+    #[test]
     fn tsjs_script_src_hash_changes_with_module_set() {
         let creative_src = tsjs_script_src(&["creative"]);
         let creative_prebid_src = tsjs_script_src(&["creative", "prebid"]);
@@ -102,6 +118,24 @@ mod tests {
         assert_ne!(
             creative_src, creative_prebid_src,
             "should include requested modules in cache-busting hash"
+        );
+    }
+
+    #[test]
+    fn tsjs_script_src_hash_depends_on_module_order() {
+        assert_ne!(
+            tsjs_script_src(&["creative", "prebid"]),
+            tsjs_script_src(&["prebid", "creative"]),
+            "should include module order in cache-busting hash"
+        );
+    }
+
+    #[test]
+    fn tsjs_script_src_deduplicates_core_module() {
+        assert_eq!(
+            tsjs_script_src(&["core", "prebid"]),
+            tsjs_script_src(&["prebid"]),
+            "should not hash core twice when requested explicitly"
         );
     }
 
