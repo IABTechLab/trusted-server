@@ -307,9 +307,18 @@ async fn admin_rotate_unauthenticated_parity() {
         axum_www_auth.starts_with("Basic"),
         "WWW-Authenticate must use Basic scheme: {axum_www_auth:?}"
     );
+    let spin_www_auth = spin_headers
+        .get("www-authenticate")
+        .expect("Spin 401 must include WWW-Authenticate")
+        .to_str()
+        .expect("should be valid UTF-8");
+    assert_eq!(
+        cf_www_auth, spin_www_auth,
+        "WWW-Authenticate value must match: cf={cf_www_auth:?} spin={spin_www_auth:?}"
+    );
     assert!(
-        spin_headers.contains_key("www-authenticate"),
-        "Spin 401 must include WWW-Authenticate header"
+        spin_www_auth.starts_with("Basic"),
+        "Spin WWW-Authenticate must use Basic scheme: {spin_www_auth:?}"
     );
 }
 
@@ -359,9 +368,18 @@ async fn admin_deactivate_unauthenticated_parity() {
         axum_www_auth.starts_with("Basic"),
         "WWW-Authenticate must use Basic scheme: {axum_www_auth:?}"
     );
+    let spin_www_auth = spin_headers
+        .get("www-authenticate")
+        .expect("Spin 401 on admin/keys/deactivate must include WWW-Authenticate")
+        .to_str()
+        .expect("should be valid UTF-8");
+    assert_eq!(
+        cf_www_auth, spin_www_auth,
+        "WWW-Authenticate value must match: cf={cf_www_auth:?} spin={spin_www_auth:?}"
+    );
     assert!(
-        spin_headers.contains_key("www-authenticate"),
-        "Spin 401 on admin/keys/deactivate must include WWW-Authenticate header"
+        spin_www_auth.starts_with("Basic"),
+        "Spin WWW-Authenticate must use Basic scheme: {spin_www_auth:?}"
     );
 }
 
@@ -405,6 +423,9 @@ async fn geo_header_parity_on_all_responses() {
             "{method} {path}: X-Geo-Info-Available value must match across adapters \
              (axum={axum_geo:?} cf={cf_geo:?})"
         );
+        // Spin hardcodes X-Geo-Info-Available: false (no geo headers available in the
+        // Spin runtime). Value comparison against axum/cf would lock in a known asymmetry,
+        // so presence is the gate here.
         assert!(
             spin_headers.contains_key("x-geo-info-available"),
             "Spin: {method} {path} (status={spin_status}) must have X-Geo-Info-Available"

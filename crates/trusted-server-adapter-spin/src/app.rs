@@ -10,7 +10,6 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::IntegrationRegistry;
-use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -58,14 +57,6 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-request RuntimeServices
-// ---------------------------------------------------------------------------
-
-fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
-    build_runtime_services(ctx)
-}
-
-// ---------------------------------------------------------------------------
 // Publisher response helper
 // ---------------------------------------------------------------------------
 
@@ -98,6 +89,63 @@ fn resolve_publisher_response(
             *response.body_mut() = body;
             Ok(response)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spin host extraction
+// ---------------------------------------------------------------------------
+
+// Extracts "host[:port]" from a full URL string (e.g. "http://localhost:3000/path" → "localhost:3000").
+// Used to populate the missing Host header from Spin's spin-full-url synthetic header.
+fn host_from_spin_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split('/').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_from_spin_url_extracts_localhost_with_port() {
+        assert_eq!(
+            host_from_spin_url("http://localhost:3000/some/path"),
+            Some("localhost:3000".to_string()),
+            "should extract host:port from http URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_extracts_production_domain() {
+        assert_eq!(
+            host_from_spin_url("https://www.publisher.com/cars/"),
+            Some("www.publisher.com".to_string()),
+            "should extract domain without port from https URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_handles_root_path() {
+        assert_eq!(
+            host_from_spin_url("http://127.0.0.1:3000/"),
+            Some("127.0.0.1:3000".to_string()),
+            "should extract host from root path URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_rejects_no_scheme() {
+        assert_eq!(
+            host_from_spin_url("localhost:3000/path"),
+            None,
+            "should return None when no scheme separator"
+        );
     }
 }
 
@@ -179,7 +227,7 @@ impl Hooks for TrustedServerApp {
         let discovery_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_trusted_server_discovery(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -191,7 +239,7 @@ impl Hooks for TrustedServerApp {
         let verify_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_verify_signature(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -203,7 +251,7 @@ impl Hooks for TrustedServerApp {
         let rotate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_rotate_key(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -215,7 +263,7 @@ impl Hooks for TrustedServerApp {
         let deactivate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_deactivate_key(&s.settings, &services, req)
                     .unwrap_or_else(|e| http_error(&e)))
@@ -227,7 +275,7 @@ impl Hooks for TrustedServerApp {
         let auction_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
                     .await
@@ -240,7 +288,7 @@ impl Hooks for TrustedServerApp {
         let fp_proxy_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
@@ -253,7 +301,7 @@ impl Hooks for TrustedServerApp {
         let fp_click_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
@@ -266,7 +314,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_get_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -279,7 +327,7 @@ impl Hooks for TrustedServerApp {
         let fp_sign_post_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
@@ -292,7 +340,7 @@ impl Hooks for TrustedServerApp {
         let fp_rebuild_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
-                let services = build_per_request_services(&ctx);
+                let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
@@ -308,8 +356,28 @@ impl Hooks for TrustedServerApp {
             ctx: RequestContext,
             allow_tsjs: bool,
         ) -> Result<Response, EdgeError> {
-            let services = build_per_request_services(&ctx);
-            let req = ctx.into_request();
+            let services = build_runtime_services(&ctx);
+            let mut req = ctx.into_request();
+
+            // Spin's WASI HTTP bridge does not surface the incoming Host header via
+            // IncomingRequest::headers() — the host is only accessible through the
+            // spin-full-url synthetic header injected by the Spin runtime. Without a
+            // Host header, extract_request_host() returns "" which causes
+            // classify_response_route to fall back to BufferedUnmodified and skip the
+            // HTML processor entirely (no URL rewriting, no TSJS injection).
+            if req.headers().get(header::HOST).is_none() {
+                if let Some(host) = req
+                    .headers()
+                    .get("spin-full-url")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(host_from_spin_url)
+                {
+                    if let Ok(hval) = HeaderValue::from_str(&host) {
+                        req.headers_mut().insert(header::HOST, hval);
+                    }
+                }
+            }
+
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
 

@@ -23,8 +23,11 @@ use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
+// 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
+// the Spin WASM component heap. Larger responses from misbehaving origins are
+// rejected with a typed error rather than OOMing the component.
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type HeaderPairs = Vec<(String, Vec<u8>)>;
@@ -430,6 +433,9 @@ impl SpinPlatformHttpClient {
         let body_bytes = match body {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
             edgezero_core::body::Body::Stream(_) => {
+                // TODO: streaming request bodies unsupported; large proxy POBs (e.g.
+                // /first-party/proxy-rebuild) will fail until Spin WASI HTTP buffering
+                // is added to this client.
                 return Err(Report::new(PlatformError::HttpClient)
                     .attach("streaming request bodies are not supported on Spin outbound HTTP"));
             }
@@ -971,8 +977,8 @@ mod tests {
         );
         assert_eq!(
             MAX_DECOMPRESSED_SIZE,
-            64 * 1024 * 1024,
-            "production limit should match EdgeZero Spin proxy"
+            8 * 1024 * 1024,
+            "production limit must stay within Spin WASM heap budget"
         );
     }
 

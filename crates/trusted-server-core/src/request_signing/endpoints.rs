@@ -214,6 +214,10 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
         }));
     }
 
+    // Digit-leading KIDs alias in the Spin variable encoder ("1foo" and "n1foo" both map
+    // to "v_n1foo"). Blocking them here keeps all adapters consistent — this check applies
+    // to Fastly, Cloudflare, and Axum as well. System-generated KIDs (ts-YYYY-MM-DD) start
+    // with 't' and are unaffected.
     if kid.starts_with(|c: char| c.is_ascii_digit()) {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
@@ -1011,9 +1015,12 @@ mod tests {
 
     #[test]
     fn validate_kid_rejects_digit_leading_ids() {
-        let result = validate_kid("2026-key");
-
-        assert!(result.is_err(), "should reject digit-leading kid values");
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject digit-leading kid value: {kid}"
+            );
+        }
     }
 
     #[test]

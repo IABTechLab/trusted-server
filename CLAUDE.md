@@ -198,6 +198,7 @@ pub struct UserId(Uuid);
 ## Error Handling
 
 - Use `error-stack` (`Report<MyError>`) — not anyhow or eyre.
+  - **Exception**: `crates/trusted-server-adapter-spin/src/lib.rs` entry point returns `anyhow::Result` because `edgezero_adapter_spin::run_app` forces this type at the WASM FFI boundary. Do not use `anyhow` anywhere else.
 - Use `Box<dyn Error>` only in tests or prototyping.
 - Use concrete error types with `Report<E>`.
 - Use `ensure!()` / `bail!()` macros for early returns.
