@@ -325,6 +325,8 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
+    let mut preserve_no_store_private = false;
+
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
         // Serve the tsjs library
@@ -439,10 +441,18 @@ async fn route_request(
                     asset_route.prefix,
                     asset_route.origin_url
                 );
-                (
-                    handle_asset_proxy_request(settings, runtime_services, req, asset_route).await,
-                    false,
-                )
+                let result =
+                    match handle_asset_proxy_request(settings, runtime_services, req, asset_route)
+                        .await
+                    {
+                        Ok(response) => {
+                            preserve_no_store_private = response.get_header_str(header::CACHE_CONTROL)
+                                == Some("no-store, private");
+                            Ok(response)
+                        }
+                        Err(e) => Err(e),
+                    };
+                (result, false)
             } else {
                 log::info!(
                     "No known route matched for path: {}, proxying to publisher origin",
@@ -541,7 +551,7 @@ async fn route_request(
     finalize_response(settings, geo_info.as_ref(), &mut response);
     // Keep object-listing diagnostics non-cacheable even when operators set a
     // global Cache-Control response header.
-    if path == "/admin/debug/s3-objects" {
+    if preserve_no_store_private || path == "/admin/debug/s3-objects" {
         response.set_header(header::CACHE_CONTROL, "no-store, private");
     }
 

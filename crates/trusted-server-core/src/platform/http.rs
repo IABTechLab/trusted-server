@@ -149,6 +149,11 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot attach this metadata to their send path should
     /// return an error rather than silently dropping transformations.
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    /// Whether the response body should stay streaming in the platform response.
+    ///
+    /// Adapters that cannot preserve streaming response bodies should return an
+    /// error rather than silently buffering large asset responses.
+    pub stream_response: bool,
 }
 
 impl PlatformHttpRequest {
@@ -159,6 +164,7 @@ impl PlatformHttpRequest {
             request,
             backend_name: backend_name.into(),
             image_optimizer: None,
+            stream_response: false,
         }
     }
 
@@ -170,6 +176,16 @@ impl PlatformHttpRequest {
     #[must_use]
     pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
         self.image_optimizer = Some(options);
+        self
+    }
+
+    /// Preserve the upstream response body as a stream when the adapter supports it.
+    ///
+    /// Asset routes use this to avoid materializing large image/static responses
+    /// into WASM memory before returning them to the client.
+    #[must_use]
+    pub fn with_stream_response(mut self) -> Self {
+        self.stream_response = true;
         self
     }
 }

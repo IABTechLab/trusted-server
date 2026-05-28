@@ -747,7 +747,7 @@ target_path = "/image/upload/$1.$2"
 - Built-in and integration routes take precedence.
 - The longest matching asset-route prefix wins.
 - `path_pattern` and `target_path` must be configured together.
-- `origin_url` must not include a path or query string.
+- `origin_url` must not include userinfo, a path, a query string, or a fragment.
 - Unsafe origin response headers such as `Set-Cookie` are stripped before the response reaches the browser.
 
 ### `[proxy.asset_routes.auth]`
@@ -840,12 +840,12 @@ Supported profile parameters are `quality`, `resize-filter`, `format`, `width`, 
 | Field      | Type          | Required | Description                                  |
 | ---------- | ------------- | -------- | -------------------------------------------- |
 | `allowed`  | Array[String] | No       | Allowed query values such as `1-1` or `16-9` |
-| `profiles` | Array[String] | No       | Profiles that accept aspect-ratio overrides  |
+| `profiles` | Array[String] | No       | Defined profiles that accept aspect-ratio overrides |
 
 ```toml
 [image_optimizer.profile_sets.default_images.aspect_ratios]
 allowed = ["1-1", "16-9", "4-3"]
-profiles = ["medium", "large"]
+profiles = ["medium", "thumbnail"]
 ```
 
 ### `[image_optimizer.profile_sets.<name>.crop_offsets]`

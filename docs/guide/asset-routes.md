@@ -35,6 +35,7 @@ https://assets.example.com/assets/logo.png?v=1
 ```
 
 Plain asset routes preserve the incoming query string by default.
+`origin_url` must be only an absolute `http` or `https` origin (scheme, host, and optional port), without userinfo, path, query, or fragment components.
 
 ## Path rewrite
 

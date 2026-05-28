@@ -217,6 +217,7 @@ pub(crate) struct StubHttpClient {
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
 }
@@ -234,6 +235,7 @@ impl StubHttpClient {
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
             image_optimizer_options: Mutex::new(Vec::new()),
+            stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
         }
@@ -288,6 +290,14 @@ impl StubHttpClient {
             .clone()
     }
 
+    /// Return streaming-response flags captured per `send` call, in order.
+    pub fn recorded_stream_response_flags(&self) -> Vec<bool> {
+        self.stream_response_flags
+            .lock()
+            .expect("should lock stream response flags")
+            .clone()
+    }
+
     /// Return request methods captured per `send` call, in order.
     pub fn recorded_request_methods(&self) -> Vec<String> {
         self.request_methods
@@ -321,6 +331,10 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock image optimizer options")
             .push(request.image_optimizer.clone());
+        self.stream_response_flags
+            .lock()
+            .expect("should lock stream response flags")
+            .push(request.stream_response);
         self.request_methods
             .lock()
             .expect("should lock request methods")

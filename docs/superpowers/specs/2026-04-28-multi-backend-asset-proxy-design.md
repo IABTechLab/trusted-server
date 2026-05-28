@@ -241,7 +241,7 @@ origin_url = "https://assets.example.net"
 - required
 - string
 - absolute `http` or `https` URL
-- must not include a trailing slash
+- must not include userinfo, a trailing slash, path, query, or fragment
 - used as the upstream scheme/host/port base
 - request query is preserved from the incoming request
 - request path is preserved unless `path_pattern` / `target_path` rewrite it
@@ -272,7 +272,7 @@ These should fail configuration loading:
 - `prefix` does not start with `/`
 - `origin_url` missing
 - `origin_url` is not an absolute `http`/`https` URL
-- `origin_url` has a trailing slash
+- `origin_url` has userinfo, a trailing slash, path, query, or fragment
 - `path_pattern` is configured without `target_path`, or vice versa
 - `path_pattern` does not compile as a regex
 - `target_path` rewrite output does not start with `/`
