@@ -1,7 +1,7 @@
 //! Middleware implementations for the dual-path entry point.
 //!
 //! Provides two middleware types that mirror the finalization and auth logic
-//! from the legacy [`crate::finalize_response`] and [`crate::route_request`]:
+//! used in the legacy entry point:
 //!
 //! - [`FinalizeResponseMiddleware`] — geo lookup and standard TS header injection
 //! - [`AuthMiddleware`] — basic-auth enforcement via [`enforce_basic_auth`]
@@ -147,8 +147,7 @@ impl Middleware for AuthMiddleware {
 
 /// Applies all standard Trusted Server response headers to the given response.
 ///
-/// Mirrors [`crate::finalize_response`] exactly, operating on [`Response`] from
-/// `edgezero_core::http` instead of `HttpResponse`.
+/// Operates on [`Response`] from `edgezero_core::http`.
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent

@@ -344,9 +344,8 @@ impl PlatformGeo for FastlyPlatformGeo {
 }
 
 // ---------------------------------------------------------------------------
-// Entry-point helper
+// KV store
 // ---------------------------------------------------------------------------
-
 
 /// Open a named KV store as a [`PlatformKvStore`] implementation.
 ///

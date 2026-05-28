@@ -1,6 +1,6 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
-//! Registers all routes from the legacy [`crate::route_request`] into a
+//! Registers all routes for the Trusted Server into a
 //! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
 //! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
 //! [`startup_error_router`] returns a bare router without middleware.
@@ -239,11 +239,7 @@ async fn dispatch_fallback(
 // Error helper
 // ---------------------------------------------------------------------------
 
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
-/// mirroring [`crate::http_error_response`] exactly.
-///
-/// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types.
+/// Converts a [`Report<TrustedServerError>`] into an HTTP [`Response`].
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
