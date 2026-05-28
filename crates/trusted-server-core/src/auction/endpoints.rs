@@ -10,6 +10,7 @@ use crate::consent;
 use crate::cookies::handle_request_cookies;
 use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
 use crate::error::TrustedServerError;
+use crate::http_util::enforce_max_body_size;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -42,15 +43,7 @@ pub async fn handle_auction(
 
     // Parse request body
     let body_bytes = body.into_bytes();
-    if body_bytes.len() > AUCTION_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "auction payload {} exceeds limit of {}",
-                body_bytes.len(),
-                AUCTION_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body_bytes, AUCTION_MAX_BODY_BYTES, "auction")?;
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
             message: "Failed to parse auction request body".to_string(),

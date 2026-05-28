@@ -396,13 +396,10 @@ pub struct OwnedProcessResponseParams {
 
 /// Stream the publisher response body through the processing pipeline.
 ///
-/// Called by the adapter after `stream_to_client()` has committed the
-/// response headers. Writes processed chunks directly to `output`.
-///
-/// This is `async` because it uses `services.http_client().send(...).await` rather
-/// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
-/// route handler in `block_on`, so behavior is equivalent — the change reflects the
-/// migration to the platform-agnostic HTTP client.
+/// Called by the adapter after `stream_to_client()` has committed the response
+/// headers. Runs synchronously against an already-materialised body; the async
+/// I/O happened upstream in [`handle_publisher_request`]. Writes processed
+/// chunks directly to `output`.
 ///
 /// # Errors
 ///
