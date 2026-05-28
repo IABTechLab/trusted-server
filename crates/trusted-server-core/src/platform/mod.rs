@@ -33,6 +33,7 @@
 
 mod error;
 mod http;
+mod image_optimizer;
 mod kv;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -42,9 +43,12 @@ mod types;
 pub use edgezero_core::key_value_store::{KvError, KvHandle, KvStore as PlatformKvStore};
 pub use error::PlatformError;
 pub use http::{
-    PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
-    PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+    PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+    PlatformSelectResult,
+};
+pub use image_optimizer::{
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams,
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
