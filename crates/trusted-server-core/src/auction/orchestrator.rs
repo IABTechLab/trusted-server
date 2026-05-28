@@ -434,9 +434,30 @@ impl AuctionOrchestrator {
                     }
                 }
                 Err(e) => {
-                    // When select() returns an error, we can't easily identify which
-                    // provider failed since the PendingRequest is consumed
-                    log::warn!("A provider request failed: {:?}", e);
+                    // Identify the failed provider by finding the backend_to_provider
+                    // entry whose backend name is no longer present in `remaining`
+                    // (select() consumed exactly one pending request — the failed one).
+                    let remaining_backends: std::collections::HashSet<&str> =
+                        remaining.iter().filter_map(|r| r.backend_name()).collect();
+                    let failed_backend = backend_to_provider
+                        .keys()
+                        .find(|name| !remaining_backends.contains(name.as_str()))
+                        .cloned();
+
+                    if let Some(ref backend_name) = failed_backend {
+                        if let Some((provider_name, start_time, _)) =
+                            backend_to_provider.remove(backend_name)
+                        {
+                            let response_time_ms = start_time.elapsed().as_millis() as u64;
+                            log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
+                            responses.push(AuctionResponse::error(provider_name, response_time_ms));
+                        }
+                    } else {
+                        log::warn!(
+                            "A provider request failed (backend not identified): {:?}",
+                            e
+                        );
+                    }
                 }
             }
 

@@ -93,7 +93,10 @@ pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
 
 /// Convert a borrowed `http::Request<EdgeBody>` into a `fastly::Request`.
 ///
-/// Headers, method, and URI are copied; the body is empty.
+/// Headers, method, and URI are copied; the body is always empty. This function
+/// requires that the caller has already consumed or discarded the body — passing
+/// a request with a non-empty body is a caller error: the body bytes will be
+/// silently lost with no warning or panic.
 ///
 /// # PR 15 removal target
 pub fn to_fastly_request_ref(req: &http::Request<EdgeBody>) -> fastly::Request {
@@ -637,6 +640,38 @@ mod tests {
                 settings.publisher.cookie_domain
             )),
             "should set expected expiry cookie"
+        );
+    }
+
+    #[test]
+    fn to_fastly_response_skeleton_copies_status_and_headers_discards_body() {
+        let http_resp = http::Response::builder()
+            .status(206)
+            .header("content-type", "text/html; charset=utf-8")
+            .header("x-custom", "value")
+            .body(EdgeBody::from(b"some body bytes".as_ref()))
+            .expect("should build response");
+
+        let fastly_resp = to_fastly_response_skeleton(http_resp);
+
+        assert_eq!(
+            fastly_resp.get_status().as_u16(),
+            206,
+            "should copy status code"
+        );
+        assert_eq!(
+            fastly_resp
+                .get_header("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "should copy content-type header"
+        );
+        assert_eq!(
+            fastly_resp
+                .get_header("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("value"),
+            "should copy custom header"
         );
     }
 

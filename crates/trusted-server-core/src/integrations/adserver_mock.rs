@@ -22,7 +22,9 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
-use crate::integrations::{collect_response_bounded, UPSTREAM_RTB_MAX_RESPONSE_BYTES};
+use crate::integrations::{
+    collect_response_bounded, ensure_integration_backend, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+};
 use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -334,20 +336,12 @@ impl AuctionProvider for AdServerMockProvider {
             }
         }
 
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
-        // Send async with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend(
+            context.services,
             &self.config.endpoint,
-            true,
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for mediation endpoint: {}",
-                self.config.endpoint
-            ),
-        })?;
+            "adserver_mock",
+            Some(Duration::from_millis(u64::from(context.timeout_ms))),
+        )?;
 
         let pending = context
             .services

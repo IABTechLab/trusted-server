@@ -22,9 +22,9 @@ use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_response_bounded, AttributeRewriteAction, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
+    collect_response_bounded, ensure_integration_backend, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 use crate::openrtb::{
@@ -1515,13 +1515,11 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
         *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
-        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
-        // timeout in ensure_integration_backend, which is for proxy endpoints.
-        // Send request asynchronously with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend(
+            context.services,
             &self.config.server_url,
-            true,
-            Duration::from_millis(u64::from(context.timeout_ms)),
+            "prebid",
+            Some(Duration::from_millis(u64::from(context.timeout_ms))),
         )?;
         let pending = context
             .services

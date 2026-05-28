@@ -1,5 +1,7 @@
 //! Integration module registry and sample implementations.
 
+use std::time::Duration;
+
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
@@ -45,6 +47,7 @@ pub(crate) fn ensure_integration_backend(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
+    first_byte_timeout: Option<Duration>,
 ) -> Result<String, Report<TrustedServerError>> {
     let parsed = Url::parse(url).change_context(TrustedServerError::Integration {
         integration: integration.to_string(),
@@ -66,7 +69,7 @@ pub(crate) fn ensure_integration_backend(
                 .to_string(),
             port: parsed.port(),
             certificate_check: true,
-            first_byte_timeout: std::time::Duration::from_secs(15),
+            first_byte_timeout: first_byte_timeout.unwrap_or_else(|| Duration::from_secs(15)),
         })
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),

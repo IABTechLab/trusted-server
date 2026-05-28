@@ -1,5 +1,5 @@
 use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
-use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
+use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
@@ -915,15 +915,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > SIGN_MAX_BODY_BYTES {
-            return Err(Report::new(TrustedServerError::RequestTooLarge {
-                message: format!(
-                    "payload size {} exceeds limit of {} bytes",
-                    body_bytes.len(),
-                    SIGN_MAX_BODY_BYTES,
-                ),
-            }));
-        }
+        enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
@@ -1038,15 +1030,7 @@ pub async fn handle_first_party_proxy_rebuild(
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > REBUILD_MAX_BODY_BYTES {
-            return Err(Report::new(TrustedServerError::RequestTooLarge {
-                message: format!(
-                    "payload size {} exceeds limit of {} bytes",
-                    body_bytes.len(),
-                    REBUILD_MAX_BODY_BYTES,
-                ),
-            }));
-        }
+        enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
