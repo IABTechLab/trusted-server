@@ -781,18 +781,20 @@ secret_access_key = "secret_access_key"
 # session_token = "session_token"
 ```
 
-S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates.
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credentials are cached per process by configured secret names after the first successful read.
+
+Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
 
 ### `[proxy.asset_routes.image_optimizer]`
 
 Route-level Image Optimizer configuration selects a reusable profile set.
 
-| Field          | Type    | Required         | Default              | Description                                                       |
-| -------------- | ------- | ---------------- | -------------------- | ----------------------------------------------------------------- |
-| `enabled`      | Boolean | No               | `true`               | Enable Image Optimizer for the route                              |
-| `region`       | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                    |
-| `profile_set`  | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                     |
-| `origin_query` | String  | No               | `strip` when enabled | `preserve` or `strip`; `preserve` is rejected while IO is enabled |
+| Field          | Type    | Required         | Default              | Description                                                                 |
+| -------------- | ------- | ---------------- | -------------------- | --------------------------------------------------------------------------- |
+| `enabled`      | Boolean | No               | `true`               | Enable Image Optimizer for the route                                        |
+| `region`       | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                              |
+| `profile_set`  | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                               |
+| `origin_query` | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled |
 
 **Example**:
 
@@ -837,9 +839,9 @@ Supported profile parameters are `quality`, `resize-filter`, `format`, `width`, 
 
 ### `[image_optimizer.profile_sets.<name>.aspect_ratios]`
 
-| Field      | Type          | Required | Description                                  |
-| ---------- | ------------- | -------- | -------------------------------------------- |
-| `allowed`  | Array[String] | No       | Allowed query values such as `1-1` or `16-9` |
+| Field      | Type          | Required | Description                                         |
+| ---------- | ------------- | -------- | --------------------------------------------------- |
+| `allowed`  | Array[String] | No       | Allowed query values such as `1-1` or `16-9`        |
 | `profiles` | Array[String] | No       | Defined profiles that accept aspect-ratio overrides |
 
 ```toml

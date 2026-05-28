@@ -30,9 +30,9 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 /// `AWS` credentials used to sign an `S3` request.
 ///
-/// Values are loaded from the configured runtime secret store immediately before
-/// signing. Temporary credentials can include a session token, which becomes the
-/// signed `x-amz-security-token` header.
+/// Values are loaded from the configured runtime secret store by the caller and
+/// may be cached between signatures. Temporary credentials can include a session
+/// token, which becomes the signed `x-amz-security-token` header.
 #[derive(Debug, Clone)]
 pub struct S3Credentials {
     /// `AWS` access key ID.
@@ -156,12 +156,7 @@ fn normalize_header_value(value: &HeaderValue) -> Result<String, Report<TrustedS
 }
 
 fn canonical_uri(url: &Url) -> String {
-    let path = url.path();
-    if path.is_empty() {
-        return "/".to_string();
-    }
-
-    aws_percent_encode_preserving_escapes(path, false)
+    aws_percent_encode_preserving_escapes(url.path(), false)
 }
 
 fn canonical_query(url: &Url) -> String {
