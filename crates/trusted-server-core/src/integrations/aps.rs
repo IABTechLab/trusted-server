@@ -602,7 +602,6 @@ impl AuctionProvider for ApsAuctionProvider {
             services,
             &self.config.endpoint,
             "aps",
-            true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {

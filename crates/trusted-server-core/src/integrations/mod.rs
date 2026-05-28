@@ -106,7 +106,6 @@ pub(crate) fn predict_integration_backend_name(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
-    certificate_check: bool,
     first_byte_timeout: Duration,
 ) -> Result<String, Report<TrustedServerError>> {
     services
@@ -114,7 +113,7 @@ pub(crate) fn predict_integration_backend_name(
         .predict_name(&integration_backend_spec(
             url,
             integration,
-            certificate_check,
+            true,
             first_byte_timeout,
         )?)
         .change_context(TrustedServerError::Integration {

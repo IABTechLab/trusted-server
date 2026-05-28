@@ -423,7 +423,6 @@ impl AuctionProvider for AdServerMockProvider {
             services,
             &self.config.endpoint,
             "adserver_mock",
-            true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {

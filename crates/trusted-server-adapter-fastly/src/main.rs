@@ -266,7 +266,8 @@ fn legacy_main(mut req: FastlyRequest) {
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let runtime_services = build_runtime_services(&req, std::sync::Arc::clone(&state.kv_store));
+    let runtime_services =
+        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
     let http_req = compat::from_fastly_request(req);
 
     let outcome = futures::executor::block_on(route_request(

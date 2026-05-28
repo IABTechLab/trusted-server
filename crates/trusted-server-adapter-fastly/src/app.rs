@@ -84,7 +84,7 @@ pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
-    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -100,13 +100,13 @@ pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>>
 
     let registry = IntegrationRegistry::new(&settings)?;
 
-    let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        kv_store,
+        default_kv_store,
     }))
 }
 
@@ -153,7 +153,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(Arc::clone(&state.kv_store))
+        .kv_store(Arc::clone(&state.default_kv_store))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -547,6 +547,9 @@ mod tests {
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
 
+                [integrations.datadome]
+                enabled = true
+
                 [auction]
                 enabled = true
                 providers = ["prebid"]
@@ -560,13 +563,14 @@ mod tests {
         let orchestrator =
             build_orchestrator(&settings).expect("should build auction orchestrator");
         let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let kv_store = Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+        let default_kv_store =
+            Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
         Arc::new(AppState {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
-            kv_store,
+            default_kv_store,
         })
     }
 
@@ -782,6 +786,17 @@ mod tests {
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "publisher fallback should fail closed when configured consent KV cannot be opened"
+        );
+
+        // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
+        // is wired only into the publisher and auction branches of dispatch_fallback, not into
+        // the integration proxy branch. A missing consent store must not 503 integration routes.
+        let integration_response =
+            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        assert_ne!(
+            integration_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "integration routes should be unaffected by a missing consent KV store"
         );
     }
 }

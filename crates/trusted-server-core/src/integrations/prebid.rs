@@ -1612,7 +1612,6 @@ impl AuctionProvider for PrebidAuctionProvider {
             services,
             &self.config.server_url,
             PREBID_INTEGRATION_ID,
-            true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {
