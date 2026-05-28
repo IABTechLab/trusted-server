@@ -111,7 +111,7 @@ image_optimizer = { enabled = true, region = "us_east", profile_set = "default_i
 | `secret_store`      | `s3-auth`                              | Runtime secret store name                        |
 | `access_key_id`     | `access_key_id`                        | Secret key containing AWS access key ID          |
 | `secret_access_key` | `secret_access_key`                    | Secret key containing AWS secret access key      |
-| `session_token`     | `session_token`                        | Optional secret key containing AWS session token |
+| `session_token`     | unset                                  | Optional secret key containing AWS session token |
 | `origin_query`      | `preserve` without IO, `strip` with IO | Query behavior for the origin/S3 request         |
 
 Credential fields name secret-store entries, not literal credential values.
@@ -138,7 +138,6 @@ large = "format=auto&width=1536"
 [image_optimizer.profile_sets.default_images.aspect_ratios]
 allowed = ["1-1", "16-9", "4-3"]
 profiles = ["medium", "large"]
-default_crop_mode = "smart"
 
 [image_optimizer.profile_sets.default_images.crop_offsets]
 enabled = true
@@ -236,9 +235,8 @@ runtime `StoreName`. The core signer receives strings/bytes and does not depend
 on Fastly Secret Store directly.
 
 Missing access key or secret key is a request-time proxy error. Missing session
-token is allowed when `session_token` is absent or when the optional configured
-secret is not present, depending on implementation ergonomics. Do not log secret
-values.
+token is allowed when `session_token` is absent. When `session_token` is
+configured, the named secret must be present. Do not log secret values.
 
 ### Endpoint assumptions
 
@@ -271,6 +269,7 @@ pub struct PlatformHttpRequest {
     pub request: EdgeRequest,
     pub backend_name: String,
     pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    pub stream_response: bool,
 }
 
 pub struct PlatformImageOptimizerOptions {
@@ -299,7 +298,9 @@ optimizer metadata because the Fastly Rust SDK does not support IO with
 `send_async` or `send_async_streaming`.
 
 Test platform clients should record the metadata so core tests can assert that
-IO would be requested without needing real Fastly IO locally.
+IO would be requested without needing real Fastly IO locally. Asset routes should
+set `stream_response` for final origin responses so large images/static assets are
+not materialized into WASM memory as a single buffer.
 
 ## Profile Table Conversion
 
@@ -479,9 +480,8 @@ service.
 
 - What exact S3 object key mapping will production deployments need? Keep this
   configurable through the existing path rewrite fields.
-- Should missing optional `session_token` be silently ignored or fail if the
-  config names a token secret that does not exist? Recommended: ignore only when
-  using the default optional key, fail if explicitly configured.
+- `session_token` is optional by default; if a route config names a session-token
+  secret, that secret must exist at request time.
 - Which Fastly IO region should production configs use? It should be close to
   the S3/image origin.
 - Should a later phase add legacy path-parameter normalization? Defer until

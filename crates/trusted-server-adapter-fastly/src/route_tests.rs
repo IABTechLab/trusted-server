@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +25,10 @@ use trusted_server_core::platform::{
     StoreName,
 };
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
-use trusted_server_core::settings::{ProxyAssetRoute, Settings};
+use trusted_server_core::settings::{
+    AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerProfileSet, ImageOptimizerSettings,
+    ProxyAssetRoute, S3SigV4AuthConfig, Settings,
+};
 
 use super::route_request;
 
@@ -57,6 +61,42 @@ impl PlatformConfigStore for StubJwksConfigStore {
 }
 
 struct NoopSecretStore;
+
+struct HashMapSecretStore {
+    data: HashMap<String, Vec<u8>>,
+}
+
+impl HashMapSecretStore {
+    fn new(data: HashMap<String, Vec<u8>>) -> Self {
+        Self { data }
+    }
+}
+
+impl PlatformSecretStore for HashMapSecretStore {
+    fn get_bytes(
+        &self,
+        _store_name: &StoreName,
+        key: &str,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        self.data
+            .get(key)
+            .cloned()
+            .ok_or_else(|| Report::new(PlatformError::SecretStore))
+    }
+
+    fn create(
+        &self,
+        _store_id: &StoreId,
+        _name: &str,
+        _value: &str,
+    ) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
 
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(
@@ -347,9 +387,23 @@ fn test_runtime_services_with_http_client(
     backend: Arc<dyn PlatformBackend>,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
+    test_runtime_services_with_secret_and_http_client(
+        req,
+        backend,
+        Arc::new(NoopSecretStore),
+        http_client,
+    )
+}
+
+fn test_runtime_services_with_secret_and_http_client(
+    req: &Request,
+    backend: Arc<dyn PlatformBackend>,
+    secret_store: Arc<dyn PlatformSecretStore>,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(StubJwksConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
+        .secret_store(secret_store)
         .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
         .backend(backend)
         .http_client(http_client)
@@ -693,6 +747,100 @@ fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
             .expect("should lock recorded calls")
             .is_empty(),
         "should not invoke the publisher origin when asset backend registration fails"
+    );
+}
+
+#[test]
+fn s3_asset_origin_error_stays_uncacheable_after_global_headers() {
+    let mut settings = create_test_settings();
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    settings.image_optimizer = ImageOptimizerSettings {
+        profile_sets: HashMap::from([(
+            "default_images".to_string(),
+            ImageOptimizerProfileSet {
+                base_params: String::new(),
+                default_profile: "default".to_string(),
+                unknown_profile: Default::default(),
+                profile_param: "profile".to_string(),
+                aspect_ratio_param: "ar".to_string(),
+                debug_param: "_io_debug".to_string(),
+                profiles: HashMap::from([("default".to_string(), "width=100".to_string())]),
+                aspect_ratios: None,
+                crop_offsets: None,
+            },
+        )]),
+    };
+    let mut route = ProxyAssetRoute::new(
+        "/.images/",
+        "https://examplebucket.s3.us-east-1.amazonaws.com",
+    );
+    route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+        region: "us-east-1".to_string(),
+        secret_store: "s3-auth".to_string(),
+        access_key_id: "access_key_id".to_string(),
+        secret_access_key: "secret_access_key".to_string(),
+        session_token: None,
+        origin_query: None,
+    }));
+    route.image_optimizer = Some(AssetImageOptimizerConfig {
+        enabled: true,
+        region: "us_east".to_string(),
+        profile_set: "default_images".to_string(),
+        origin_query: None,
+    });
+    settings.proxy.asset_routes = vec![route];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.images/missing.png?profile=default");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::NOT_FOUND));
+    let services = test_runtime_services_with_secret_and_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::new(HashMapSecretStore::new(HashMap::from([
+            (
+                "access_key_id".to_string(),
+                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
+            ),
+            (
+                "secret_access_key".to_string(),
+                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+            ),
+        ]))),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let resp = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+    ))
+    .expect("should route S3 asset request");
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::NOT_FOUND,
+        "should return the raw S3 origin error status"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CACHE_CONTROL),
+        Some("no-store, private"),
+        "should preserve the S3 origin error no-store policy after global headers"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(
+        calls.len(),
+        2,
+        "should preflight with HEAD and then fetch the S3 error body"
     );
 }
 

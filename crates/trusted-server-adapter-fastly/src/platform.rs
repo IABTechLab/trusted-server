@@ -5,9 +5,11 @@
 //! constructs a [`RuntimeServices`] instance once at the entry point from the
 //! incoming Fastly request.
 
+use std::io::Read as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
@@ -327,19 +329,41 @@ fn edge_request_to_fastly(
     Ok(fastly_req)
 }
 
+fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
+    let stream = futures::stream::unfold(Some(body), |state| async move {
+        let mut body = state?;
+        let mut chunk = vec![0; 8192];
+        match body.read(&mut chunk) {
+            Ok(0) => None,
+            Ok(bytes_read) => {
+                chunk.truncate(bytes_read);
+                Some((Ok(Bytes::from(chunk)), Some(body)))
+            }
+            Err(err) => Some((Err(err), None)),
+        }
+    });
+
+    edgezero_core::body::Body::from_stream(stream)
+}
+
 /// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
 fn fastly_response_to_platform(
     mut resp: fastly::Response,
     backend_name: impl Into<String>,
+    stream_response: bool,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
     let status = resp.get_status();
     let mut builder = edgezero_core::http::response_builder().status(status);
     for (name, value) in resp.get_headers() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
-    let body_bytes = resp.take_body_bytes();
+    let body = if stream_response {
+        fastly_body_to_edge_stream(resp.take_body())
+    } else {
+        edgezero_core::body::Body::from(resp.take_body_bytes())
+    };
     let edge_response = builder
-        .body(edgezero_core::body::Body::from(body_bytes))
+        .body(body)
         .change_context(PlatformError::HttpClient)?;
     Ok(PlatformResponse::new(edge_response).with_backend_name(backend_name))
 }
@@ -352,7 +376,8 @@ fn fastly_response_to_platform(
 ///
 /// - [`send`](PlatformHttpClient::send) converts the platform request to a
 ///   `fastly::Request`, applies Image Optimizer metadata when present, calls
-///   `.send()`, and wraps the response.
+///   `.send()`, and wraps the response. Asset requests can ask to preserve the
+///   response body as a stream instead of buffering it into a single `Vec`.
 /// - [`send_async`](PlatformHttpClient::send_async) converts the request and
 ///   calls `.send_async()`. It rejects Image Optimizer metadata because Fastly's
 ///   async request path does not expose the IO attachment used by asset routes.
@@ -369,6 +394,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
+        let stream_response = request.stream_response;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
             apply_fastly_image_optimizer(&mut fastly_req, options)?;
@@ -376,7 +402,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        fastly_response_to_platform(fastly_resp, backend_name)
+        fastly_response_to_platform(fastly_resp, backend_name, stream_response)
     }
 
     async fn send_async(
@@ -387,6 +413,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         if request.image_optimizer.is_some() {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported with Fastly send_async"));
+        }
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("streaming responses are not supported with Fastly send_async"));
         }
         let fastly_req = edge_request_to_fastly(request.request)?;
         let pending = fastly_req
@@ -437,7 +467,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                         ""
                     })
                     .to_string();
-                fastly_response_to_platform(fastly_resp, backend_name)
+                fastly_response_to_platform(fastly_resp, backend_name, false)
             }
             Err(e) => {
                 Err(Report::new(PlatformError::HttpClient)
@@ -763,6 +793,26 @@ mod tests {
         assert!(
             format!("{err:?}").contains("Image Optimizer"),
             "should explain unsupported async IO path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_platform_http_client_send_async_rejects_stream_response() {
+        let client = FastlyPlatformHttpClient;
+        let request = request_builder()
+            .method("GET")
+            .uri("https://example.com/image.jpg")
+            .body(Body::empty())
+            .expect("should build test request");
+        let platform_request =
+            PlatformHttpRequest::new(request, "nonexistent-backend").with_stream_response();
+
+        let err = futures::executor::block_on(client.send_async(platform_request))
+            .expect_err("should reject async streaming-response requests");
+
+        assert!(
+            format!("{err:?}").contains("streaming responses"),
+            "should explain unsupported async streaming-response path: {err:?}"
         );
     }
 

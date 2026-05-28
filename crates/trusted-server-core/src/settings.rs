@@ -892,7 +892,7 @@ impl ImageOptimizerProfileSet {
         }
         validate_image_optimizer_profile_set(name, self)?;
         if let Some(config) = &self.aspect_ratios {
-            config.prepare_runtime(name)?;
+            config.prepare_runtime(name, &self.profiles)?;
         }
         if let Some(config) = &self.crop_offsets {
             config.prepare_runtime(name)?;
@@ -932,12 +932,25 @@ impl ImageOptimizerAspectRatioConfig {
             .collect();
     }
 
-    fn prepare_runtime(&self, name: &str) -> Result<(), Report<TrustedServerError>> {
+    fn prepare_runtime(
+        &self,
+        name: &str,
+        configured_profiles: &HashMap<String, String>,
+    ) -> Result<(), Report<TrustedServerError>> {
         for ratio in &self.allowed {
             if parse_aspect_ratio_value(ratio).is_none() {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
                         "image_optimizer.profile_sets `{name}` aspect ratio `{ratio}` must look like `width-height`"
+                    ),
+                }));
+            }
+        }
+        for profile in &self.profiles {
+            if !configured_profiles.contains_key(profile) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "image_optimizer.profile_sets `{name}` aspect ratio profile `{profile}` is not defined"
                     ),
                 }));
             }
@@ -1972,6 +1985,20 @@ fn validate_proxy_origin_url(value: &str) -> Result<(), ValidationError> {
         let mut err = ValidationError::new("missing_origin_host");
         err.add_param("value".into(), &value);
         err.message = Some("origin_url must include a host".into());
+        return Err(err);
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let mut err = ValidationError::new("origin_url_has_userinfo");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must not include username or password".into());
+        return Err(err);
+    }
+
+    if parsed.fragment().is_some() {
+        let mut err = ValidationError::new("origin_url_has_fragment");
+        err.add_param("value".into(), &value);
+        err.message = Some("origin_url must not include a fragment".into());
         return Err(err);
     }
 
@@ -3607,6 +3634,29 @@ mod tests {
     }
 
     #[test]
+    fn image_optimizer_validation_rejects_unknown_aspect_ratio_profile() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets.default_images]
+            default_profile = "default"
+
+            [image_optimizer.profile_sets.default_images.profiles]
+            default = "width=1920"
+
+            [image_optimizer.profile_sets.default_images.aspect_ratios]
+            allowed = ["1-1"]
+            profiles = ["missing"]
+            "#;
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject aspect-ratio profiles that are not defined");
+        assert!(
+            format!("{err:?}").contains("aspect ratio profile `missing` is not defined"),
+            "should mention the unknown aspect-ratio profile: {err:?}"
+        );
+    }
+
+    #[test]
     fn proxy_asset_route_image_optimizer_env_accepts_nested_bool_strings_and_arrays() {
         let toml_str = crate_test_settings_str();
         let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
@@ -3947,6 +3997,42 @@ mod tests {
         assert!(
             format!("{err:?}").contains("origin_url must not include a query string"),
             "should mention the origin_url query validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_origin_url_userinfo() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://user:pass@assets.example.com"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject asset-route origin_url with userinfo");
+        assert!(
+            format!("{err:?}").contains("origin_url must not include username or password"),
+            "should mention the origin_url userinfo validation failure: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_origin_url_fragment() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com#fragment"
+            "#;
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject asset-route origin_url with fragment");
+        assert!(
+            format!("{err:?}").contains("origin_url must not include a fragment"),
+            "should mention the origin_url fragment validation failure: {err:?}"
         );
     }
 

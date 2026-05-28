@@ -5,7 +5,9 @@ use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUr
 use error_stack::{Report, ResultExt};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
@@ -90,6 +92,38 @@ pub(crate) fn platform_response_to_fastly(
         resp.append_header(name.as_str(), value.as_bytes());
     }
     resp.set_body(body_bytes);
+    Ok(resp)
+}
+
+async fn platform_response_to_fastly_asset(
+    platform_resp: PlatformResponse,
+) -> Result<Response, Report<TrustedServerError>> {
+    let (parts, body) = platform_resp.response.into_parts();
+    let mut resp = Response::from_status(parts.status.as_u16());
+    for (name, value) in parts.headers.iter() {
+        resp.append_header(name.as_str(), value.as_bytes());
+    }
+
+    match body {
+        EdgeBody::Once(bytes) => resp.set_body(bytes.to_vec()),
+        EdgeBody::Stream(mut stream) => {
+            let mut fastly_body = fastly::Body::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: format!("streaming platform response body failed: {err}"),
+                    })
+                })?;
+                fastly_body.write_all(chunk.as_ref()).change_context(
+                    TrustedServerError::Proxy {
+                        message: "failed to write streaming asset response body".to_string(),
+                    },
+                )?;
+            }
+            resp.set_body(fastly_body);
+        }
+    }
+
     Ok(resp)
 }
 
@@ -676,9 +710,13 @@ async fn send_asset_origin_request(
     method: &Method,
     target_url: &url::Url,
     outbound_headers: &http::HeaderMap,
+    stream_response: bool,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let platform_req =
+    let mut platform_req =
         build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
+    if stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
     let platform_resp = services
         .http_client()
         .send(platform_req)
@@ -687,7 +725,11 @@ async fn send_asset_origin_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    platform_response_to_fastly(platform_resp)
+    if stream_response {
+        platform_response_to_fastly_asset(platform_resp).await
+    } else {
+        platform_response_to_fastly(platform_resp)
+    }
 }
 
 fn strip_asset_proxy_response_headers(response: &mut Response) {
@@ -735,6 +777,7 @@ async fn preflight_s3_origin_for_image_optimizer(
         &Method::HEAD,
         target_url,
         &head_headers,
+        false,
     )
     .await?;
     let head_status = head_response.get_status();
@@ -757,6 +800,7 @@ async fn preflight_s3_origin_for_image_optimizer(
         &Method::GET,
         target_url,
         &get_headers,
+        true,
     )
     .await?;
     strip_asset_proxy_response_headers(&mut response);
@@ -862,6 +906,7 @@ pub async fn handle_asset_proxy_request(
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
     }
+    platform_req = platform_req.with_stream_response();
 
     let platform_resp = services
         .http_client()
@@ -871,7 +916,7 @@ pub async fn handle_asset_proxy_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    let mut response = platform_response_to_fastly(platform_resp)?;
+    let mut response = platform_response_to_fastly_asset(platform_resp).await?;
     strip_asset_proxy_response_headers(&mut response);
 
     Ok(response)
@@ -2168,10 +2213,10 @@ mod tests {
 
     /// Test double that always returns a streaming (non-buffered) response body.
     ///
-    /// Used to exercise the `Body::Stream` error path in
-    /// `platform_response_to_fastly`, which cannot materialise a streaming body
-    /// into a `fastly::Response`. Only `send` is implemented; `send_async` and
-    /// `select` return `PlatformError::Unsupported`.
+    /// Used to exercise both the asset streaming success path and the
+    /// `Body::Stream` error path in `platform_response_to_fastly`, which cannot
+    /// materialise a streaming body into a `fastly::Response`. Only `send` is
+    /// implemented; `send_async` and `select` return `PlatformError::Unsupported`.
     struct StreamingResponseHttpClient;
 
     #[async_trait::async_trait(?Send)]
@@ -3650,6 +3695,11 @@ mod tests {
             vec!["https://assets.example.com/.images/foo.jpg"],
             "should strip profile-table query from the origin request by default"
         );
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![true],
+            "final asset responses should stay streaming"
+        );
         let options = stub.recorded_image_optimizer_options();
         let options = options[0]
             .as_ref()
@@ -3702,6 +3752,11 @@ mod tests {
                 "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
             ],
             "should strip transform query from both S3 requests"
+        );
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![false, true],
+            "S3 HEAD preflight stays non-streaming, final asset GET stays streaming"
         );
         let options = stub.recorded_image_optimizer_options();
         assert_eq!(options.len(), 2, "should send two origin requests");
@@ -3767,6 +3822,11 @@ mod tests {
             vec!["HEAD", "GET"],
             "should fetch S3 error body after failed HEAD preflight"
         );
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![false, true],
+            "S3 HEAD preflight stays non-streaming, error-body GET stays streaming"
+        );
         let options = stub.recorded_image_optimizer_options();
         assert_eq!(
             options,
@@ -3808,6 +3868,11 @@ mod tests {
             vec![None],
             "debug query param should disable image optimizer metadata"
         );
+        assert_eq!(
+            stub.recorded_stream_response_flags(),
+            vec![true],
+            "debug asset responses should still stay streaming"
+        );
     }
 
     #[tokio::test]
@@ -3842,6 +3907,22 @@ mod tests {
             options[0].is_none(),
             "debug query param should disable image optimizer metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_asset_proxy_request_accepts_streaming_platform_response_body() {
+        let services = build_services_with_http_client(
+            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy a streaming asset response");
+
+        assert_eq!(response.take_body_str(), "chunk");
     }
 
     #[tokio::test]
