@@ -207,8 +207,8 @@ impl CloudflareHttpClient {
         use worker::{Fetch, Headers, Method, Request, RequestInit};
 
         let uri = request.request.uri().to_string();
-        // worker 0.7's Method::from uppercases internally — no manual conversion needed.
-        let method = Method::from(request.request.method().as_str());
+        // http::Method always stores uppercase; worker 0.7 implements From<String> only.
+        let method = Method::from(request.request.method().to_string());
 
         let headers = Headers::new();
         for (name, value) in request.request.headers() {
