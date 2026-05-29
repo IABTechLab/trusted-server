@@ -23,6 +23,8 @@ import { installGptGuard } from './script_guard';
  *   - Rewrite ad-unit paths for A/B testing.
  */
 
+const TS_INITIAL_TARGETING_KEY = 'ts_initial' as const;
+
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
 // ------------------------------------------------------------------
@@ -187,7 +189,7 @@ interface TsAdSlot {
   id: string;
   gam_unit_path: string;
   div_id: string;
-  formats: Array<number[]>;
+  formats: Array<[number, number]>;
   targeting: Record<string, string>;
 }
 
@@ -248,11 +250,7 @@ export function installTsAdInit(): void {
       const divToSlotId: Record<string, string> = {};
 
       slots.forEach((slot) => {
-        const gptSlot = g.defineSlot?.(
-          slot.gam_unit_path,
-          slot.formats as Array<number | number[]>,
-          slot.div_id
-        );
+        const gptSlot = g.defineSlot?.(slot.gam_unit_path, slot.formats, slot.div_id);
         if (!gptSlot) return;
         gptSlot.addService(g.pubads!());
         Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
@@ -260,7 +258,7 @@ export function installTsAdInit(): void {
         (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
           if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
         });
-        gptSlot.setTargeting('ts_initial', '1');
+        gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
         divToSlotId[slot.div_id] = slot.id;
         newSlots.push(gptSlot);
       });
