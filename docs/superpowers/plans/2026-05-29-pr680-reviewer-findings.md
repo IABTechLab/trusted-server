@@ -26,6 +26,7 @@
 **What:** Delete `creative-opportunities.toml`. Move `[[slot]]` arrays into `trusted-server.toml` as `[[creative_opportunities.slot]]`. Wire the `vec_from_seq_or_map` deserializer so env var JSON blobs also work. Remove the `SLOTS_FILE` static and `include_str!` from `main.rs`. Update `build.rs` to validate slot IDs from settings instead of a separate file.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/creative_opportunities.rs`
 - Modify: `crates/trusted-server-core/src/settings.rs`
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
@@ -178,6 +179,7 @@ Note: `build.rs` already pulls in `src/creative_opportunities.rs` as a module �
 - [ ] **Step 6: Update `main.rs` — remove `SLOTS_FILE` static**
 
 Remove:
+
 ```rust
 const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opportunities.toml");
 static SLOTS_FILE: std::sync::LazyLock<...> = ...;
@@ -275,17 +277,18 @@ git commit -m "Move slot templates from creative-opportunities.toml into trusted
 
 **Rename table:**
 
-| Old global | New property | Notes |
-|---|---|---|
-| `window.__ts_ad_slots` | `window._ts.adSlots` | Array, set at head-open |
-| `window.__ts_bids` | `window._ts.bids` | Object, set before `</body>` |
-| `window.__tsAdInit` | `window._ts.adInit` | Function |
-| `window.__tsPrevGptSlots` | `window._ts.prevGptSlots` | Array |
-| `window.__tsServicesEnabled` | `window._ts.servicesEnabled` | Boolean |
-| `window.__tsDivToSlotId` | `window._ts.divToSlotId` | Object |
-| `window.__tsSpaHookInstalled` | `window._ts.spaHookInstalled` | Boolean |
+| Old global                    | New property                  | Notes                        |
+| ----------------------------- | ----------------------------- | ---------------------------- |
+| `window.__ts_ad_slots`        | `window._ts.adSlots`          | Array, set at head-open      |
+| `window.__ts_bids`            | `window._ts.bids`             | Object, set before `</body>` |
+| `window.__tsAdInit`           | `window._ts.adInit`           | Function                     |
+| `window.__tsPrevGptSlots`     | `window._ts.prevGptSlots`     | Array                        |
+| `window.__tsServicesEnabled`  | `window._ts.servicesEnabled`  | Boolean                      |
+| `window.__tsDivToSlotId`      | `window._ts.divToSlotId`      | Object                       |
+| `window.__tsSpaHookInstalled` | `window._ts.spaHookInstalled` | Boolean                      |
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs`
 - Modify: `crates/trusted-server-core/src/integrations/gpt_bootstrap.js`
 - Modify: `crates/js/lib/src/integrations/gpt/index.ts`
@@ -331,61 +334,65 @@ Update any test assertions in `publisher.rs` that check for the old global names
 Replace all `window.__ts*` references. The bootstrap IIFE runs before the TS bundle, so it must initialise `window._ts` if absent:
 
 ```js
-(function () {
-  if (typeof window === "undefined") return;
+;(function () {
+  if (typeof window === 'undefined') return
   // Initialise namespace; adInit guard prevents double-install.
-  var ts = (window._ts = window._ts || {});
-  if (ts.adInit) return;
+  var ts = (window._ts = window._ts || {})
+  if (ts.adInit) return
 
   ts.adInit = function () {
-    var slots = ts.adSlots || [];
-    var bids = ts.bids || {};
-    var divToSlotId = {};
+    var slots = ts.adSlots || []
+    var bids = ts.bids || {}
+    var divToSlotId = {}
     googletag.cmd.push(function () {
-      var newSlots = [];
+      var newSlots = []
       slots.forEach(function (slot) {
-        var s = googletag.defineSlot(slot.gam_unit_path, slot.formats, slot.div_id);
-        if (!s) return;
-        s.addService(googletag.pubads());
+        var s = googletag.defineSlot(
+          slot.gam_unit_path,
+          slot.formats,
+          slot.div_id
+        )
+        if (!s) return
+        s.addService(googletag.pubads())
         Object.entries(slot.targeting || {}).forEach(function (e) {
-          s.setTargeting(e[0], e[1]);
-        });
-        var b = bids[slot.id] || {};
-        ["hb_pb", "hb_bidder", "hb_adid"].forEach(function (k) {
-          if (b[k]) s.setTargeting(k, b[k]);
-        });
-        s.setTargeting("ts_initial", "1");
-        divToSlotId[slot.div_id] = slot.id;
-        newSlots.push(s);
-      });
-      ts.prevGptSlots = newSlots;
-      ts.divToSlotId = divToSlotId;
+          s.setTargeting(e[0], e[1])
+        })
+        var b = bids[slot.id] || {}
+        ;['hb_pb', 'hb_bidder', 'hb_adid'].forEach(function (k) {
+          if (b[k]) s.setTargeting(k, b[k])
+        })
+        s.setTargeting('ts_initial', '1')
+        divToSlotId[slot.div_id] = slot.id
+        newSlots.push(s)
+      })
+      ts.prevGptSlots = newSlots
+      ts.divToSlotId = divToSlotId
       if (!ts.servicesEnabled) {
-        googletag.pubads().enableSingleRequest();
-        googletag.enableServices();
-        ts.servicesEnabled = true;
-        googletag.pubads().addEventListener("slotRenderEnded", function (ev) {
-          var divId = ev.slot.getSlotElementId();
-          var slotId = (ts.divToSlotId || {})[divId];
-          if (!slotId) return;
-          var b = (ts.bids || {})[slotId] || {};
+        googletag.pubads().enableSingleRequest()
+        googletag.enableServices()
+        ts.servicesEnabled = true
+        googletag.pubads().addEventListener('slotRenderEnded', function (ev) {
+          var divId = ev.slot.getSlotElementId()
+          var slotId = (ts.divToSlotId || {})[divId]
+          if (!slotId) return
+          var b = (ts.bids || {})[slotId] || {}
           var ourBidWon =
             !ev.isEmpty &&
             (b.hb_adid
-              ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
-              : !!b.hb_bidder);
+              ? ev.slot.getTargeting('hb_adid')[0] === b.hb_adid
+              : !!b.hb_bidder)
           if (ourBidWon) {
-            if (b.nurl) navigator.sendBeacon(b.nurl);
-            if (b.burl) navigator.sendBeacon(b.burl);
+            if (b.nurl) navigator.sendBeacon(b.nurl)
+            if (b.burl) navigator.sendBeacon(b.burl)
           }
-        });
+        })
       }
       if (newSlots.length > 0) {
-        googletag.pubads().refresh(newSlots);
+        googletag.pubads().refresh(newSlots)
       }
-    });
-  };
-})();
+    })
+  }
+})()
 ```
 
 - [ ] **Step 3: Update `index.ts` — rename `TsWindow` type**
@@ -394,18 +401,18 @@ Replace the `TsWindow` interface:
 
 ```typescript
 type TsNamespace = {
-  adSlots?: TsAdSlot[];
-  bids?: Record<string, TsBidData>;
-  adInit?: () => void;
-  prevGptSlots?: GoogleTagSlot[];
-  servicesEnabled?: boolean;
-  divToSlotId?: Record<string, string>;
-  spaHookInstalled?: boolean;
-};
+  adSlots?: TsAdSlot[]
+  bids?: Record<string, TsBidData>
+  adInit?: () => void
+  prevGptSlots?: GoogleTagSlot[]
+  servicesEnabled?: boolean
+  divToSlotId?: Record<string, string>
+  spaHookInstalled?: boolean
+}
 
 type TsWindow = Window & {
-  _ts?: TsNamespace;
-};
+  _ts?: TsNamespace
+}
 ```
 
 - [ ] **Step 4: Update `installTsAdInit` in `index.ts`**
@@ -414,64 +421,73 @@ Change every `w.__ts*` access to `w._ts.*`. Initialise `w._ts` at function entry
 
 ```typescript
 export function installTsAdInit(): void {
-  const w = window as TsWindow;
-  const ts = (w._ts = w._ts ?? {});
+  const w = window as TsWindow
+  const ts = (w._ts = w._ts ?? {})
   ts.adInit = function () {
-    const slots = ts.adSlots ?? [];
-    const bids = ts.bids ?? {};
-    const g = (window as GptWindow).googletag;
-    if (!g) return;
+    const slots = ts.adSlots ?? []
+    const bids = ts.bids ?? {}
+    const g = (window as GptWindow).googletag
+    if (!g) return
 
     g.cmd?.push(() => {
       if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
-        g.destroySlots?.(ts.prevGptSlots);
-        ts.prevGptSlots = [];
+        g.destroySlots?.(ts.prevGptSlots)
+        ts.prevGptSlots = []
       }
-      const newSlots: GoogleTagSlot[] = [];
-      const divToSlotId: Record<string, string> = {};
+      const newSlots: GoogleTagSlot[] = []
+      const divToSlotId: Record<string, string> = {}
 
       slots.forEach((slot) => {
-        const gptSlot = g.defineSlot?.(slot.gam_unit_path, slot.formats as Array<number | number[]>, slot.div_id);
-        if (!gptSlot) return;
-        gptSlot.addService(g.pubads!());
-        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
-        const bid = bids[slot.id] ?? {};
-        (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
-          if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
-        });
-        gptSlot.setTargeting('ts_initial', '1');
-        divToSlotId[slot.div_id] = slot.id;
-        newSlots.push(gptSlot);
-      });
+        const gptSlot = g.defineSlot?.(
+          slot.gam_unit_path,
+          slot.formats as Array<number | number[]>,
+          slot.div_id
+        )
+        if (!gptSlot) return
+        gptSlot.addService(g.pubads!())
+        Object.entries(slot.targeting ?? {}).forEach(([k, v]) =>
+          gptSlot.setTargeting(k, v)
+        )
+        const bid = bids[slot.id] ?? {}
+        ;(['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
+          if (bid[key]) gptSlot.setTargeting(key, bid[key]!)
+        })
+        gptSlot.setTargeting('ts_initial', '1')
+        divToSlotId[slot.div_id] = slot.id
+        newSlots.push(gptSlot)
+      })
 
-      ts.prevGptSlots = newSlots;
-      ts.divToSlotId = divToSlotId;
+      ts.prevGptSlots = newSlots
+      ts.divToSlotId = divToSlotId
 
       if (!ts.servicesEnabled) {
-        g.pubads!().enableSingleRequest();
-        g.enableServices?.();
-        ts.servicesEnabled = true;
-        g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
-          const divId: string = event.slot?.getSlotElementId?.() ?? '';
-          const slotId = (ts.divToSlotId ?? {})[divId];
-          if (!slotId) return;
-          const bid = (ts.bids ?? {})[slotId] ?? {};
-          const ourBidWon =
-            !event.isEmpty &&
-            (bid.hb_adid
-              ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
-              : !!bid.hb_bidder);
-          if (ourBidWon) {
-            if (bid.nurl) navigator.sendBeacon(bid.nurl);
-            if (bid.burl) navigator.sendBeacon(bid.burl);
+        g.pubads!().enableSingleRequest()
+        g.enableServices?.()
+        ts.servicesEnabled = true
+        g.pubads!().addEventListener?.(
+          'slotRenderEnded',
+          (event: SlotRenderEndedEvent) => {
+            const divId: string = event.slot?.getSlotElementId?.() ?? ''
+            const slotId = (ts.divToSlotId ?? {})[divId]
+            if (!slotId) return
+            const bid = (ts.bids ?? {})[slotId] ?? {}
+            const ourBidWon =
+              !event.isEmpty &&
+              (bid.hb_adid
+                ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
+                : !!bid.hb_bidder)
+            if (ourBidWon) {
+              if (bid.nurl) navigator.sendBeacon(bid.nurl)
+              if (bid.burl) navigator.sendBeacon(bid.burl)
+            }
           }
-        });
+        )
       }
       if (newSlots.length > 0) {
-        g.pubads!().refresh(newSlots);
+        g.pubads!().refresh(newSlots)
       }
-    });
-  };
+    })
+  }
 }
 ```
 
@@ -481,10 +497,10 @@ Replace `__tsSpaHookInstalled` and `__ts_ad_slots`/`__ts_bids` reads:
 
 ```typescript
 export function installSpaHook(): void {
-  const win = window as TsWindow;
-  const ts = (win._ts = win._ts ?? {});
-  if (ts.spaHookInstalled) return;
-  ts.spaHookInstalled = true;
+  const win = window as TsWindow
+  const ts = (win._ts = win._ts ?? {})
+  if (ts.spaHookInstalled) return
+  ts.spaHookInstalled = true
   // ... rest of SPA hook logic uses ts.adSlots, ts.bids, ts.adInit
 }
 ```
@@ -538,6 +554,7 @@ git commit -m "Namespace window globals under window._ts"
 **What:** Two small TypeScript/JS cleanups. `TsAdSlot.formats` should be typed as `Array<[number, number]>` (tuple, not array-of-array) to match GPT's actual input. The string `'ts_initial'` is hardcoded in both `gpt_bootstrap.js` and `index.ts` — extract as a named constant in `index.ts` (no JS equivalent needed since the bootstrap is vanilla JS).
 
 **Files:**
+
 - Modify: `crates/js/lib/src/integrations/gpt/index.ts`
 - Modify: `crates/trusted-server-core/src/integrations/gpt_bootstrap.js` (comment only — JS can't share TS constants)
 
@@ -576,7 +593,7 @@ slot.formats
 Near the top of `index.ts`, add:
 
 ```typescript
-const TS_INITIAL_TARGETING_KEY = 'ts_initial';
+const TS_INITIAL_TARGETING_KEY = 'ts_initial'
 ```
 
 Replace both occurrences of `'ts_initial'` in `installTsAdInit` with `TS_INITIAL_TARGETING_KEY`.
@@ -585,7 +602,7 @@ Add a comment in `gpt_bootstrap.js` where `'ts_initial'` appears:
 
 ```js
 // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
-s.setTargeting("ts_initial", "1");
+s.setTargeting('ts_initial', '1')
 ```
 
 - [ ] **Step 3: Run JS tests and format**
