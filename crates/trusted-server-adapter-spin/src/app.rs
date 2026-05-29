@@ -3,7 +3,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, header};
+use edgezero_core::http::{HeaderValue, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -172,32 +172,35 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every route with the startup error.
+/// Returns a [`RouterService`] that responds to every route with a generic
+/// 503 Service Unavailable. The startup error is logged but not echoed in the
+/// response body so that deployment state is not leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
-    let status = e.current_context().status_code();
+    log::error!("startup failed, serving error fallback: {:?}", e);
 
-    let make = move |msg: Arc<String>| {
-        move |_ctx: RequestContext| {
-            let body = edgezero_core::body::Body::from((*msg).clone());
-            let mut resp = Response::new(body);
-            *resp.status_mut() = status;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            async move { Ok::<Response, EdgeError>(resp) }
-        }
+    let handler = |_ctx: RequestContext| {
+        let body = edgezero_core::body::Body::from("Service Unavailable\n");
+        let mut resp = Response::new(body);
+        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        async move { Ok::<Response, EdgeError>(resp) }
     };
 
     RouterService::builder()
         .middleware(FinalizeResponseMiddleware::new(Arc::new(
             Settings::default(),
         )))
-        .get("/", make(Arc::clone(&message)))
-        .post("/", make(Arc::clone(&message)))
-        .get("/{*rest}", make(Arc::clone(&message)))
-        .post("/{*rest}", make(Arc::clone(&message)))
+        .get("/", handler)
+        .post("/", handler)
+        .put("/", handler)
+        .delete("/", handler)
+        .get("/{*rest}", handler)
+        .post("/{*rest}", handler)
+        .put("/{*rest}", handler)
+        .delete("/{*rest}", handler)
         .build()
 }
 
@@ -309,9 +312,9 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // GET /first-party/sign
+        // GET + POST /first-party/sign — identical handler, cloned for both bindings
         let s = Arc::clone(&state);
-        let fp_sign_get_handler = move |ctx: RequestContext| {
+        let fp_sign_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
@@ -321,19 +324,7 @@ impl Hooks for TrustedServerApp {
                     .unwrap_or_else(|e| http_error(&e)))
             }
         };
-
-        // POST /first-party/sign
-        let s = Arc::clone(&state);
-        let fp_sign_post_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+        let fp_sign_post_handler = fp_sign_handler.clone();
 
         // /first-party/proxy-rebuild
         let s = Arc::clone(&state);
@@ -426,7 +417,7 @@ impl Hooks for TrustedServerApp {
             .post("/auction", auction_handler)
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
-            .get("/first-party/sign", fp_sign_get_handler)
+            .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_handler)
             .get("/", get_fallback.clone())

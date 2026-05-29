@@ -1104,6 +1104,11 @@ pub async fn handle_first_party_proxy_rebuild(
             message: "invalid tsclick path".to_string(),
         }));
     }
+    // Validate the tstoken on the original click URL before applying any changes.
+    // Without this, an attacker could submit an unsigned tsclick and mint valid
+    // click redirects to arbitrary URLs.
+    reconstruct_and_validate_signed_target(settings, &format!("{}{}", base, payload.tsclick))?;
+
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
     let mut orig: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -1120,6 +1125,19 @@ pub async fn handle_first_party_proxy_rebuild(
             message: "missing tsurl".to_string(),
         })
     })?;
+
+    // Enforce allowed_domains on the redirect target before issuing a new signed URL.
+    if let Ok(parsed_tsurl) = url::Url::parse(&tsurl) {
+        if let Some(host) = parsed_tsurl.host_str() {
+            if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!(
+                        "redirect to `{host}` blocked: host not in proxy allowed_domains"
+                    ),
+                }));
+            }
+        }
+    }
 
     // Keep a snapshot before modifications for diagnostics
     let orig_before = orig.clone();

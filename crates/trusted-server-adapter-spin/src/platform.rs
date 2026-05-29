@@ -146,22 +146,20 @@ fn spin_variable_name(
         return Err(Report::new(error_context).attach("Spin variable key must not be empty"));
     }
 
-    let mut chars = key.chars().peekable();
-    let digit_leading = chars.peek().is_some_and(char::is_ascii_digit);
-
-    // `v_` prefix + optional `n` for digit-leading keys + encoded body.
-    let mut out = String::with_capacity(key.len() + 2 + usize::from(digit_leading));
-    out.push_str("v_");
-
     // Spin requires each _-separated word to start with an ASCII letter.
-    // If the key starts with a digit, prefix with 'n' so the first word is letter-led.
-    // `validate_kid` rejects digit-leading KIDs, so this branch is unreachable for
-    // all operator-supplied and system-generated keys; it is kept as a safety net.
-    if digit_leading {
-        out.push('n');
+    // Reject at the encoder boundary so no caller can accidentally produce aliasing
+    // (e.g. "1foo" and "n1foo" both encoding to the same variable name).
+    if !key.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(Report::new(error_context).attach(format!(
+            "Spin variable key `{key}` must start with a lowercase ASCII letter"
+        )));
     }
 
-    for ch in chars {
+    // `v_` prefix + worst-case 4 bytes per char for escape sequences.
+    let mut out = String::with_capacity(key.len() * 4 + 3);
+    out.push_str("v_");
+
+    for ch in key.chars() {
         match ch {
             'a'..='z' | '0'..='9' => out.push(ch),
             'A'..='Z' | '-' | '_' | '.' | ':' => {
@@ -394,6 +392,14 @@ struct SpinPendingResponse {
 /// `send_async` eagerly executes each request before returning. Multi-provider
 /// fan-out is rejected in `select`, matching the conservative Cloudflare
 /// adapter behavior.
+///
+/// # Known MVP limits
+///
+/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
+/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
+/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
+/// invocation for whatever default the Spin runtime imposes. Operators requiring
+/// deterministic timeout behaviour should use the Fastly adapter.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
@@ -573,6 +579,18 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 // ---------------------------------------------------------------------------
 
 /// Bridges Spin component variables to [`PlatformSecretStore`].
+///
+/// # Limitations
+///
+/// - **UTF-8 only.** `spin_sdk::variables::get` returns a `String`, so all
+///   secret values must be valid UTF-8. JSON-encoded signing keys work today;
+///   raw binary secrets (e.g. bare Ed25519 bytes) would silently fail at the
+///   Spin runtime layer.
+///
+/// - **Plaintext at rest.** Spin component variables are unencrypted in the
+///   application manifest by default. Production deployments must back variables
+///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
+///   storing signing keys in plaintext on disk.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 struct SpinSecretStoreAdapter;
 
@@ -773,10 +791,10 @@ mod tests {
                 .expect("should encode generated kid"),
             "v_ts_x2d2026_x2d05_x2d25"
         );
-        assert_eq!(
-            spin_variable_name("2026-key", PlatformError::ConfigStore)
-                .expect("should encode leading digits under the stable prefix"),
-            "v_n2026_x2dkey"
+        // Digit-leading keys are rejected at the encoder boundary.
+        assert!(
+            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
+            "should reject digit-leading key"
         );
     }
 
@@ -800,9 +818,8 @@ mod tests {
     #[test]
     fn spin_variable_name_does_not_collapse_distinct_allowed_kids() {
         let mut names = std::collections::BTreeSet::new();
-        for kid in [
-            "kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "KidA", "kida",
-        ] {
+        // Only lowercase-leading keys are accepted; "KidA" is rejected at the boundary.
+        for kid in ["kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "kida"] {
             let variable_name = spin_variable_name(kid, PlatformError::ConfigStore)
                 .expect("should encode allowed kid characters");
             assert!(
@@ -810,6 +827,10 @@ mod tests {
                 "Spin variable mapping must not collide for kid `{kid}` as `{variable_name}`"
             );
         }
+        assert!(
+            spin_variable_name("KidA", PlatformError::ConfigStore).is_err(),
+            "should reject uppercase-leading kid at the encoder boundary"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -983,19 +1004,22 @@ mod tests {
     }
 
     #[test]
-    fn spin_variable_name_digit_prefix_aliasing_is_unreachable_for_valid_kids() {
-        // The `n`-prefix for digit-leading keys would alias with keys starting with
-        // 'n' + the same digit sequence (e.g. "1foo" and "n1foo" both → "v_n1foo").
-        // `validate_kid` rejects digit-leading KIDs, so this branch is only reachable
-        // if `spin_variable_name` is called directly with an invalid key.
-        let digit_leading = spin_variable_name("1foo", PlatformError::ConfigStore)
-            .expect("should encode digit-leading key");
-        let n_prefixed = spin_variable_name("n1foo", PlatformError::ConfigStore)
-            .expect("should encode n-prefixed key");
-        assert_eq!(
-            digit_leading, n_prefixed,
-            "aliasing is expected for invalid digit-leading keys; validate_kid prevents \
-             these from reaching this function in production"
+    fn spin_variable_name_rejects_digit_leading_key() {
+        // Encoder enforces the lowercase-letter start contract at the boundary so
+        // no caller can produce aliasing (e.g. "1foo" and "n1foo" would collide).
+        let result = spin_variable_name("1foo", PlatformError::ConfigStore);
+        assert!(
+            result.is_err(),
+            "should reject digit-leading key at the encoder boundary"
+        );
+    }
+
+    #[test]
+    fn spin_variable_name_rejects_uppercase_leading_key() {
+        let result = spin_variable_name("Foo", PlatformError::ConfigStore);
+        assert!(
+            result.is_err(),
+            "should reject uppercase-leading key at the encoder boundary"
         );
     }
 
