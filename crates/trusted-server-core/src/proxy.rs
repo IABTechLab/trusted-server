@@ -1801,8 +1801,15 @@ mod tests {
     #[tokio::test]
     async fn proxy_rebuild_adds_and_removes_params() {
         let settings = create_test_settings();
-        // Original canonical (no token)
-        let tsclick = "/first-party/click?tsurl=https%3A%2F%2Fcdn.example%2Flanding.html&x=1";
+        // Build a properly signed click URL — rebuild validates tstoken before mutating.
+        let tsurl = "https://cdn.example/landing.html";
+        let full_for_token = format!("{}?x=1", tsurl);
+        let token = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+        let tsclick = format!(
+            "/first-party/click?tsurl={}&x=1&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            token,
+        );
         let body = serde_json::json!({
             "tsclick": tsclick,
             "add": {"y": "2"},
