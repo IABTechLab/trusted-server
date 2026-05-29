@@ -1323,10 +1323,30 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                if let Some(ref ad_id) = bid.ad_id {
+                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
+                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
+                // bid.ad_id for APS and other non-PBS providers.
+                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
-                        serde_json::Value::String(ad_id.clone()),
+                        serde_json::Value::String(id.to_string()),
+                    );
+                }
+
+                // Cache endpoint coordinates — only present for PBS bids with Prebid Cache enabled.
+                // The Prebid Universal Creative constructs:
+                //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
+                if let Some(ref host) = bid.cache_host {
+                    obj.insert(
+                        "hb_cache_host".to_string(),
+                        serde_json::Value::String(host.clone()),
+                    );
+                }
+                if let Some(ref path) = bid.cache_path {
+                    obj.insert(
+                        "hb_cache_path".to_string(),
+                        serde_json::Value::String(path.clone()),
                     );
                 }
                 if let Some(ref nurl) = bid.nurl {
@@ -2695,7 +2715,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("abc123"),
-                "should include ad_id"
+                "should fall back to ad_id when no cache_id present"
             );
             assert_eq!(
                 obj.get("nurl").and_then(|v| v.as_str()),
@@ -2706,6 +2726,131 @@ mod tests {
                 obj.get("burl").and_then(|v| v.as_str()),
                 Some("https://ssp/bill"),
                 "should include burl"
+            );
+        }
+
+        #[test]
+        fn bid_map_uses_cache_id_for_hb_adid_when_present() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "thetradedesk".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: Some("bid-impression-id".to_string()),
+                    cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
+                    cache_host: Some("openads.adsrvr.org".to_string()),
+                    cache_path: Some("/cache".to_string()),
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("f47447a0-b759-4f2f-9887-af458b79b570"),
+                "should use cache_id for hb_adid, not ad_id"
+            );
+            assert_eq!(
+                obj.get("hb_cache_host").and_then(|v| v.as_str()),
+                Some("openads.adsrvr.org"),
+                "should emit hb_cache_host"
+            );
+            assert_eq!(
+                obj.get("hb_cache_path").and_then(|v| v.as_str()),
+                Some("/cache"),
+                "should emit hb_cache_path"
+            );
+        }
+
+        #[test]
+        fn bid_map_falls_back_to_ad_id_when_cache_id_absent() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(0.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "amazon-aps".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: Some("aps-bid-token".to_string()),
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("aps-bid-token"),
+                "should fall back to ad_id when cache_id absent"
+            );
+            assert!(
+                obj.get("hb_cache_host").is_none(),
+                "should not emit hb_cache_host when absent"
+            );
+            assert!(
+                obj.get("hb_cache_path").is_none(),
+                "should not emit hb_cache_path when absent"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(0.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "amazon-aps".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert!(
+                obj.get("hb_adid").is_none(),
+                "should omit hb_adid when no cache_id and no ad_id"
             );
         }
 
