@@ -125,6 +125,16 @@ let (cache_host, cache_path) = cache_entry
         (host, path)
     })
     .unwrap_or((None, None));
+
+// Guard: if we extracted a cache UUID but couldn't extract the host,
+// the bid will have hb_adid set but no endpoint to fetch from — creative will fail.
+if cache_id.is_some() && cache_host.is_none() {
+    log::warn!(
+        "PBS bid has cache UUID but cache URL could not be parsed — \
+         creative will fail to render for slot '{}'",
+        slot_id
+    );
+}
 ```
 
 Note: `url` crate is already a workspace dependency. If not, parse host/path manually
@@ -152,7 +162,9 @@ Priority for `hb_adid`: use `cache_id` when present (PBS path), fall back to `ad
 (APS / other providers, backward compat):
 
 ```rust
-// hb_adid: cache UUID when available (PBS), bid adid otherwise (APS/other)
+// hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
+// this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
+// bid.ad_id for APS and other non-PBS providers.
 let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
 if let Some(id) = hb_adid {
     obj.insert("hb_adid".to_string(), serde_json::Value::String(id.to_string()));
@@ -227,7 +239,6 @@ Alternatively, publishers using the Prebid Universal Creative package can use:
 ```html
 <script src="https://cdn.jsdelivr.net/npm/prebid-universal-creative/dist/creative.js"></script>
 <script>
-  var $sf = window.$sf;
   pbuc.renderAd({
     adId: '%%PATTERN:hb_adid%%',
     cacheHost: '%%PATTERN:hb_cache_host%%',
@@ -238,6 +249,12 @@ Alternatively, publishers using the Prebid Universal Creative package can use:
 
 > **This creative configuration is a publisher/ad ops action, not a TS code change.**
 > Document it in the integration guide and verify during onboarding.
+
+> **Cache TTL:** PBS Cache entries expire per the `bid.exp` field (default 300–3600s;
+> the real response has `"exp": 3600`). Creative fetch must complete within this window.
+> BFCache page restores after long idle sessions may hit expired cache entries — the
+> creative will silently fail to render in that case. This is acceptable for Phase 1;
+> the probability is low for typical session lengths.
 
 ---
 
@@ -257,8 +274,16 @@ limitation tracked separately.
 | File | Change |
 |---|---|
 | `crates/trusted-server-core/src/auction/types.rs` | Add `cache_id`, `cache_host`, `cache_path` to `Bid` struct |
-| `crates/trusted-server-core/src/integrations/prebid.rs` | Extract `ext.prebid.cache.bids.{cacheId,url}` in `parse_bid_object` |
+| `crates/trusted-server-core/src/integrations/prebid.rs` | Extract `ext.prebid.cache.bids.{cacheId,url}` in `parse_bid_object`; update `AuctionBid` → `Bid` conversion to carry the three new fields |
 | `crates/trusted-server-core/src/publisher.rs` | `build_bid_map`: use `cache_id` for `hb_adid`, emit `hb_cache_host`/`hb_cache_path` |
+
+> **Implementer note — `AuctionBid` → `Bid` conversion:** `prebid.rs` constructs an
+> intermediate `AuctionBid` type that is later converted to the shared `Bid` type from
+> `types.rs`. The new `cache_id`, `cache_host`, `cache_path` fields must be added to
+> **both** types and the conversion must map them explicitly. Verify by grepping for
+> where `AuctionBid` is constructed and where it is converted to `Bid`; if they are the
+> same type (a type alias), only one struct needs the new fields. If they differ, both
+> need updating or the fields will silently be `None` in `build_bid_map`.
 
 Test files:
 | File | Change |
