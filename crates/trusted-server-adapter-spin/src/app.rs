@@ -108,47 +108,6 @@ fn host_from_spin_url(url: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_from_spin_url_extracts_localhost_with_port() {
-        assert_eq!(
-            host_from_spin_url("http://localhost:3000/some/path"),
-            Some("localhost:3000".to_string()),
-            "should extract host:port from http URL"
-        );
-    }
-
-    #[test]
-    fn host_from_spin_url_extracts_production_domain() {
-        assert_eq!(
-            host_from_spin_url("https://www.publisher.com/cars/"),
-            Some("www.publisher.com".to_string()),
-            "should extract domain without port from https URL"
-        );
-    }
-
-    #[test]
-    fn host_from_spin_url_handles_root_path() {
-        assert_eq!(
-            host_from_spin_url("http://127.0.0.1:3000/"),
-            Some("127.0.0.1:3000".to_string()),
-            "should extract host from root path URL"
-        );
-    }
-
-    #[test]
-    fn host_from_spin_url_rejects_no_scheme() {
-        assert_eq!(
-            host_from_spin_url("localhost:3000/path"),
-            None,
-            "should return None when no scheme separator"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -356,17 +315,15 @@ impl Hooks for TrustedServerApp {
             // Host header, extract_request_host() returns "" which causes
             // classify_response_route to fall back to BufferedUnmodified and skip the
             // HTML processor entirely (no URL rewriting, no TSJS injection).
-            if req.headers().get(header::HOST).is_none() {
-                if let Some(host) = req
+            if req.headers().get(header::HOST).is_none()
+                && let Some(host) = req
                     .headers()
                     .get("spin-full-url")
                     .and_then(|v| v.to_str().ok())
                     .and_then(host_from_spin_url)
-                {
-                    if let Ok(hval) = HeaderValue::from_str(&host) {
-                        req.headers_mut().insert(header::HOST, hval);
-                    }
-                }
+                && let Ok(hval) = HeaderValue::from_str(&host)
+            {
+                req.headers_mut().insert(header::HOST, hval);
             }
 
             let path = req.uri().path().to_owned();
@@ -425,5 +382,46 @@ impl Hooks for TrustedServerApp {
             .get("/{*rest}", get_fallback)
             .post("/{*rest}", post_fallback)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_from_spin_url_extracts_localhost_with_port() {
+        assert_eq!(
+            host_from_spin_url("http://localhost:3000/some/path"),
+            Some("localhost:3000".to_string()),
+            "should extract host:port from http URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_extracts_production_domain() {
+        assert_eq!(
+            host_from_spin_url("https://www.publisher.com/cars/"),
+            Some("www.publisher.com".to_string()),
+            "should extract domain without port from https URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_handles_root_path() {
+        assert_eq!(
+            host_from_spin_url("http://127.0.0.1:3000/"),
+            Some("127.0.0.1:3000".to_string()),
+            "should extract host from root path URL"
+        );
+    }
+
+    #[test]
+    fn host_from_spin_url_rejects_no_scheme() {
+        assert_eq!(
+            host_from_spin_url("localhost:3000/path"),
+            None,
+            "should return None when no scheme separator"
+        );
     }
 }
