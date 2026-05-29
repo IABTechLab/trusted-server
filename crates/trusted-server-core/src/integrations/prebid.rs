@@ -8,6 +8,7 @@ use fastly::http::{header, Method, StatusCode, Url};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use url::Url as ParsedUrl;
 use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
@@ -1374,6 +1375,49 @@ impl PrebidAuctionProvider {
                     .collect()
             });
 
+        // Extract PBS Cache coordinates from ext.prebid.cache.bids
+        let cache_entry = bid_obj
+            .get("ext")
+            .and_then(|e| e.get("prebid"))
+            .and_then(|p| p.get("cache"))
+            .and_then(|c| c.get("bids"));
+
+        let cache_id = cache_entry
+            .and_then(|c| c.get("cacheId"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let (cache_host, cache_path) = cache_entry
+            .and_then(|c| c.get("url"))
+            .and_then(|v| v.as_str())
+            .and_then(|url_str| {
+                ParsedUrl::parse(url_str)
+                    .map_err(|e| log::debug!("PBS cache URL parse failed: {}", e))
+                    .ok()
+            })
+            .map(|u| {
+                let host = u.host_str().map(String::from);
+                // path() returns "/" for root — only use if non-trivial
+                let path = u.path().to_string();
+                let path = if path.is_empty() || path == "/" {
+                    None
+                } else {
+                    Some(path)
+                };
+                (host, path)
+            })
+            .unwrap_or((None, None));
+
+        // Guard: if we extracted a cache UUID but couldn't extract the host,
+        // the bid will have hb_adid set but no endpoint to fetch from — creative will fail.
+        if cache_id.is_some() && cache_host.is_none() {
+            log::warn!(
+                "PBS bid has cache UUID but cache URL could not be parsed — \
+                 creative will fail to render for slot '{}'",
+                slot_id
+            );
+        }
+
         Ok(AuctionBid {
             slot_id,
             price: Some(price), // Prebid provides decoded prices
@@ -1386,6 +1430,9 @@ impl PrebidAuctionProvider {
             nurl,
             burl,
             ad_id,
+            cache_id,
+            cache_host,
+            cache_path,
             metadata: std::collections::HashMap::new(),
         })
     }

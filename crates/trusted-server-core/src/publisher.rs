@@ -2625,6 +2625,9 @@ mod tests {
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
                 ad_id: Some(ad_id.to_string()),
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: Default::default(),
             }
         }
@@ -2723,6 +2726,9 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
                     metadata: Default::default(),
                 },
             );

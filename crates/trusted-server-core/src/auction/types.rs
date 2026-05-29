@@ -198,6 +198,22 @@ pub struct Bid {
     pub burl: Option<String>,
     /// Ad ID from the bidder
     pub ad_id: Option<String>,
+    /// Prebid Cache UUID for this bid.
+    ///
+    /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
+    /// Used as `hb_adid` targeting value in `window._ts.bids`. `None` for
+    /// non-PBS providers (e.g., APS) and PBS bids without Prebid Cache enabled.
+    pub cache_id: Option<String>,
+    /// Prebid Cache host (e.g., `"openads.adsrvr.org"`).
+    ///
+    /// Populated from the host of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_host` targeting value. `None` when cache is absent.
+    pub cache_host: Option<String>,
+    /// Prebid Cache path (e.g., `"/cache"`).
+    ///
+    /// Populated from the path of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_path` targeting value. `None` when cache is absent.
+    pub cache_path: Option<String>,
     /// Provider-specific bid metadata
     /// For APS bids, contains encoded price in "amznbid" field
     pub metadata: HashMap<String, serde_json::Value>,
@@ -323,6 +339,9 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: HashMap::new(),
         }
     }
@@ -454,6 +473,9 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: Some("prebid-ad-id-abc".to_string()),
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: Default::default(),
         };
         assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));
