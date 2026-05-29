@@ -437,11 +437,11 @@ impl IntegrationHeadInjector for GptIntegration {
         GPT_INTEGRATION_ID
     }
 
-    /// Injects the `__tsAdInit` bootstrap script into `<head>`.
+    /// Injects the `_ts.adInit` bootstrap script into `<head>`.
     ///
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
-    /// `__tsAdInit` handles **initial render only**: it wires server-side bid
+    /// `_ts.adInit` handles **initial render only**: it wires server-side bid
     /// targeting into GPT slots and fires win beacons (`nurl`/`burl`) via
     /// `slotRenderEnded`. It does **not** trigger refresh auctions or handle
     /// GPT slot refresh events.
@@ -460,13 +460,13 @@ impl IntegrationHeadInjector for GptIntegration {
     }
 }
 
-/// Inline `window.__tsAdInit` bootstrap injected at `<head>` so the bids
+/// Inline `window._ts.adInit` bootstrap injected at `<head>` so the bids
 /// script at `</body>` can call it before the TSJS bundle has loaded.
 ///
 /// The bundle's idempotent implementation in
 /// `crates/js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
 /// Both implementations guard the one-time-per-page setup with
-/// `window.__tsServicesEnabled` so neither double-enables services if the
+/// `window._ts.servicesEnabled` so neither double-enables services if the
 /// publisher's own init code also calls `googletag.enableServices()`.
 const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
@@ -1062,10 +1062,10 @@ mod tests {
         };
         let inserts = integration.head_inserts(&ctx);
         let combined = inserts.join("");
-        assert!(combined.contains("__tsAdInit"), "should define __tsAdInit");
+        assert!(combined.contains("ts.adInit"), "should define _ts.adInit");
         assert!(
-            combined.contains("window.__ts_bids"),
-            "should read window.__ts_bids synchronously"
+            combined.contains("ts.bids"),
+            "should read _ts.bids synchronously"
         );
         assert!(
             combined.contains("ts_initial"),
@@ -1110,13 +1110,10 @@ mod tests {
         };
         let combined = integration.head_inserts(&ctx).join("");
         assert!(
-            combined.contains("__tsServicesEnabled"),
-            "should guard enableServices/enableSingleRequest with the __tsServicesEnabled flag"
+            combined.contains("ts.servicesEnabled"),
+            "should guard enableServices/enableSingleRequest with the _ts.servicesEnabled flag"
         );
-        assert!(
-            combined.contains("window.__tsAdInit"),
-            "should install __tsAdInit on window"
-        );
+        assert!(combined.contains("ts.adInit"), "should install _ts.adInit");
         assert!(
             !combined.contains("googletag.pubads().refresh()"),
             "should never call unbounded refresh() — only refresh(newSlots)"

@@ -428,7 +428,7 @@ pub struct OwnedProcessResponseParams {
     /// The streaming phase collects these and writes bids to `ad_bids_state`
     /// before processing the last body chunk, so `</body>` injection sees live bids.
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
-    /// Price granularity used to bucket bids when building `__ts_bids`.
+    /// Price granularity used to bucket bids when building `_ts.bids`.
     pub(crate) price_granularity: PriceGranularity,
 }
 
@@ -1341,7 +1341,7 @@ pub(crate) fn build_bid_map(
         .collect()
 }
 
-/// Build the `__ts_bids` `<script>` tag from a bucketed bid map.
+/// Build the `_ts.bids` `<script>` tag from a bucketed bid map.
 ///
 /// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
 /// raw `</script>` sequences inside the string.
@@ -1350,7 +1350,7 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>window.__ts_bids=JSON.parse(\"{}\");if(typeof window.__tsAdInit===\"function\")window.__tsAdInit();</script>",
+        "<script>(window._ts=window._ts||{{}}).bids=JSON.parse(\"{}\");if(typeof window._ts.adInit===\"function\")window._ts.adInit();</script>",
         escaped
     )
 }
@@ -1363,7 +1363,7 @@ pub(crate) fn build_empty_bids_script() -> String {
     build_bids_script(&serde_json::Map::new())
 }
 
-/// Build the `__ts_ad_slots` `<script>` tag from matched slots.
+/// Build the `_ts.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
 /// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
@@ -1399,7 +1399,7 @@ pub(crate) fn build_ad_slots_script(
         .expect("serde_json::to_string of Vec<Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>window.__ts_ad_slots=JSON.parse(\"{}\");</script>",
+        "<script>(window._ts=window._ts||{{}}).adSlots=JSON.parse(\"{}\");</script>",
         escaped
     )
 }
@@ -2635,11 +2635,15 @@ mod tests {
             let config = make_config();
             let script = build_ad_slots_script(&slots, &config);
             assert!(
-                script.contains("window.__ts_ad_slots=JSON.parse"),
-                "should use JSON.parse"
+                script.contains("window._ts=window._ts||{}"),
+                "should initialise _ts namespace"
+            );
+            assert!(
+                script.contains(".adSlots=JSON.parse"),
+                "should use JSON.parse for adSlots"
             );
             assert!(script.contains("atf_sidebar_ad"), "should include slot id");
-            assert!(!script.contains("__ts_bids"), "must NOT contain bids");
+            assert!(!script.contains("adInit"), "must NOT contain adInit");
             assert!(
                 !script.contains("__ts_request_id"),
                 "must NOT contain request_id"

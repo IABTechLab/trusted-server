@@ -8,27 +8,27 @@ interface SlotRenderEvent {
   };
 }
 
+type TsNamespace = {
+  adSlots?: unknown;
+  bids?: unknown;
+  adInit?: () => void;
+  prevGptSlots?: unknown;
+  servicesEnabled?: boolean;
+  spaHookInstalled?: boolean;
+  divToSlotId?: Record<string, string>;
+};
+
 type TestWindow = Window & {
   googletag?: unknown;
-  __ts_ad_slots?: unknown;
-  __ts_bids?: unknown;
-  __tsAdInit?: () => void;
-  __tsPrevGptSlots?: unknown;
-  __tsServicesEnabled?: boolean;
-  __tsSpaHookInstalled?: boolean;
-  __tsDivToSlotId?: Record<string, string>;
+  _ts?: TsNamespace;
 };
 
 describe('installTsAdInit', () => {
   beforeEach(() => {
     vi.resetModules();
-    delete (window as TestWindow).__ts_ad_slots;
-    delete (window as TestWindow).__ts_bids;
-    delete (window as TestWindow).__tsAdInit;
-    delete (window as TestWindow).__tsPrevGptSlots;
-    delete (window as TestWindow).__tsSpaHookInstalled;
-    delete (window as TestWindow).__tsDivToSlotId;
-    (window as TestWindow).__tsServicesEnabled = false;
+    const tw = window as TestWindow;
+    delete tw._ts;
+    (tw._ts as TsNamespace | undefined) = undefined;
     // jsdom does not implement navigator.sendBeacon; polyfill it for tests
     if (!('sendBeacon' in navigator)) {
       Object.defineProperty(navigator, 'sendBeacon', {
@@ -39,7 +39,7 @@ describe('installTsAdInit', () => {
     }
   });
 
-  it('reads window.__ts_bids synchronously and applies bid targeting before refresh', async () => {
+  it('reads window._ts.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
@@ -57,22 +57,24 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: { pos: 'atf' },
-      },
-    ];
-    (window as TestWindow).__ts_bids = {
-      atf_sidebar_ad: {
-        hb_pb: '1.00',
-        hb_bidder: 'kargo',
-        hb_adid: 'abc',
-        nurl: 'https://ssp/win',
-        burl: 'https://ssp/bill',
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: { pos: 'atf' },
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
       },
     };
 
@@ -80,7 +82,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
@@ -114,28 +116,30 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: {},
-      },
-    ];
-    (window as TestWindow).__ts_bids = {
-      atf_sidebar_ad: {
-        hb_pb: '1.00',
-        hb_bidder: 'kargo',
-        hb_adid: 'abc',
-        nurl: 'https://ssp/win',
-        burl: 'https://ssp/bill',
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
       },
     };
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
 
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
@@ -168,27 +172,29 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: {},
-      },
-    ];
-    (window as TestWindow).__ts_bids = {
-      atf_sidebar_ad: {
-        hb_pb: '1.50',
-        hb_bidder: 'aps',
-        nurl: 'https://aps/win',
-        burl: 'https://aps/bill',
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.50',
+          hb_bidder: 'aps',
+          nurl: 'https://aps/win',
+          burl: 'https://aps/bill',
+        },
       },
     };
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
 
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
@@ -226,28 +232,30 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: {},
-      },
-    ];
-    (window as TestWindow).__ts_bids = {
-      atf_sidebar_ad: {
-        hb_pb: '1.00',
-        hb_bidder: 'kargo',
-        hb_adid: 'abc',
-        nurl: 'https://ssp/win',
-        burl: 'https://ssp/bill',
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '1.00',
+          hb_bidder: 'kargo',
+          hb_adid: 'abc',
+          nurl: 'https://ssp/win',
+          burl: 'https://ssp/bill',
+        },
       },
     };
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
     capturedListener!({ isEmpty: false, slot: mockSlotNoMatch });
 
     expect(beaconSpy).not.toHaveBeenCalled();
@@ -281,22 +289,24 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: {},
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo', hb_adid: 'abc' },
       },
-    ];
-    (window as TestWindow).__ts_bids = {
-      atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo', hb_adid: 'abc' },
     };
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
 
     capturedListener!({ isEmpty: false, slot: arenaSlot });
 
@@ -304,7 +314,7 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('calls refresh even when __ts_bids is empty (graceful fallback)', async () => {
+  it('calls refresh even when _ts.bids is empty (graceful fallback)', async () => {
     const mockPubads = {
       enableSingleRequest: vi.fn(),
       addEventListener: vi.fn(),
@@ -319,20 +329,22 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow).__ts_ad_slots = [
-      {
-        id: 'atf_sidebar_ad',
-        gam_unit_path: '/123/atf',
-        div_id: 'div-atf-sidebar',
-        formats: [[300, 250]],
-        targeting: {},
-      },
-    ];
-    (window as TestWindow).__ts_bids = {};
+    (window as TestWindow)._ts = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow).__tsAdInit!();
+    (window as TestWindow)._ts!.adInit!();
 
     expect(mockPubads.refresh).toHaveBeenCalled();
   });

@@ -1,30 +1,27 @@
 // Edge-injected GPT auction bootstrap.
 //
-// This is the minimal `window.__tsAdInit` that runs on first page load
+// This is the minimal `window._ts.adInit` that runs on first page load
 // before the TSJS bundle has had a chance to install its richer
 // idempotent implementation. The bundle in
-// crates/js/lib/src/integrations/gpt/index.ts overwrites `__tsAdInit`
+// crates/js/lib/src/integrations/gpt/index.ts overwrites `_ts.adInit`
 // once it loads.
 //
 // Contract with the bundle:
-//   - Both implementations must set `window.__tsServicesEnabled = true`
+//   - Both implementations must set `window._ts.servicesEnabled = true`
 //     after calling `enableSingleRequest()`/`enableServices()` so a
-//     subsequent call from any source (the bundle's `__tsAdInit`, the
-//     publisher's own GPT init code) becomes a no-op.
+//     subsequent call becomes a no-op.
 //   - `refresh()` is called only for the slots defined in this pass,
-//     never the global slot list, so we never accidentally refresh
-//     publisher-managed slots that we don't own.
+//     never the global slot list.
 //
-// Only installed if `window.__tsAdInit` isn't already defined — that
-// way the bundle (or anything else) can preempt this fallback by
-// installing first.
+// Only installed if `window._ts.adInit` isn't already defined.
 (function () {
-  if (typeof window === "undefined" || window.__tsAdInit) {
-    return;
-  }
-  window.__tsAdInit = function () {
-    var slots = window.__ts_ad_slots || [];
-    var bids = window.__ts_bids || {};
+  if (typeof window === "undefined") return;
+  var ts = (window._ts = window._ts || {});
+  if (ts.adInit) return;
+
+  ts.adInit = function () {
+    var slots = ts.adSlots || [];
+    var bids = ts.bids || {};
     var divToSlotId = {};
     googletag.cmd.push(function () {
       var newSlots = [];
@@ -43,33 +40,24 @@
         ["hb_pb", "hb_bidder", "hb_adid"].forEach(function (k) {
           if (b[k]) s.setTargeting(k, b[k]);
         });
+        // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
         divToSlotId[slot.div_id] = slot.id;
         newSlots.push(s);
       });
-      // Expose slot metadata on window so later calls (SPA navigation,
-      // the bundle's __tsAdInit) can destroy stale slots and the render
-      // listener can resolve slot IDs after navigation updates these maps.
-      window.__tsPrevGptSlots = newSlots;
-      window.__tsDivToSlotId = divToSlotId;
-      // Guard the one-time-per-page setup so a follow-up call (e.g.
-      // publisher's own init code or the bundle's `__tsAdInit` after
-      // it overwrites this stub) doesn't double-enable services.
-      if (!window.__tsServicesEnabled) {
+      ts.prevGptSlots = newSlots;
+      ts.divToSlotId = divToSlotId;
+      if (!ts.servicesEnabled) {
         googletag.pubads().enableSingleRequest();
         googletag.enableServices();
-        window.__tsServicesEnabled = true;
+        ts.servicesEnabled = true;
         googletag
           .pubads()
           .addEventListener("slotRenderEnded", function (ev) {
             var divId = ev.slot.getSlotElementId();
-            // Read from window so SPA navigation updates are picked up;
-            // early-return for slots not managed by Trusted Server.
-            var slotId = (window.__tsDivToSlotId || {})[divId];
+            var slotId = (ts.divToSlotId || {})[divId];
             if (!slotId) return;
-            var b = (window.__ts_bids || {})[slotId] || {};
-            // Prebid: verify the specific creative via hb_adid targeting.
-            // APS: no hb_adid — fire if any TS bidder is present and slot is non-empty.
+            var b = (ts.bids || {})[slotId] || {};
             var ourBidWon =
               !ev.isEmpty &&
               (b.hb_adid

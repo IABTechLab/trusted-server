@@ -199,40 +199,46 @@ interface TsBidData {
   burl?: string;
 }
 
+type TsNamespace = {
+  adSlots?: TsAdSlot[];
+  bids?: Record<string, TsBidData>;
+  adInit?: () => void;
+  prevGptSlots?: GoogleTagSlot[];
+  servicesEnabled?: boolean;
+  divToSlotId?: Record<string, string>;
+  spaHookInstalled?: boolean;
+};
+
 type TsWindow = Window & {
-  __ts_ad_slots?: TsAdSlot[];
-  __ts_bids?: Record<string, TsBidData>;
-  __tsAdInit?: () => void;
-  __tsPrevGptSlots?: GoogleTagSlot[];
-  __tsServicesEnabled?: boolean;
-  __tsDivToSlotId?: Record<string, string>;
+  _ts?: TsNamespace;
 };
 
 /**
- * Install `window.__tsAdInit`.
+ * Install `window._ts.adInit`.
  *
- * Reads `window.__ts_ad_slots` (injected at head-open) and `window.__ts_bids`
+ * Reads `window._ts.adSlots` (injected at head-open) and `window._ts.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
  * targeting to GPT slots, sets the `ts_initial` sentinel, registers
  * `slotRenderEnded` to fire both nurl and burl via sendBeacon when our
  * specific Prebid bid wins the GAM line item match, then calls refresh().
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
- * so it is safe to call again after SPA navigation updates `__ts_ad_slots`/`__ts_bids`.
+ * so it is safe to call again after SPA navigation updates `_ts.adSlots`/`_ts.bids`.
  */
 export function installTsAdInit(): void {
   const w = window as TsWindow;
-  w.__tsAdInit = function () {
-    const slots = w.__ts_ad_slots ?? [];
-    const bids = w.__ts_bids ?? {};
+  const ts = (w._ts = w._ts ?? {});
+  ts.adInit = function () {
+    const slots = ts.adSlots ?? [];
+    const bids = ts.bids ?? {};
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
     g.cmd?.push(() => {
       // Destroy previously defined TS slots before redefining for the new page.
-      if (w.__tsPrevGptSlots && w.__tsPrevGptSlots.length > 0) {
-        g.destroySlots?.(w.__tsPrevGptSlots);
-        w.__tsPrevGptSlots = [];
+      if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
+        g.destroySlots?.(ts.prevGptSlots);
+        ts.prevGptSlots = [];
       }
 
       const newSlots: GoogleTagSlot[] = [];
@@ -256,21 +262,21 @@ export function installTsAdInit(): void {
         newSlots.push(gptSlot);
       });
 
-      w.__tsPrevGptSlots = newSlots;
+      ts.prevGptSlots = newSlots;
       // Replace (not merge) so destroyed slots from previous navigation don't linger.
-      w.__tsDivToSlotId = divToSlotId;
+      ts.divToSlotId = divToSlotId;
 
       // enableSingleRequest and enableServices must only be called once per page load.
-      if (!w.__tsServicesEnabled) {
+      if (!ts.servicesEnabled) {
         g.pubads!().enableSingleRequest();
         g.enableServices?.();
-        w.__tsServicesEnabled = true;
+        ts.servicesEnabled = true;
 
         g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
           const divId: string = event.slot?.getSlotElementId?.() ?? '';
-          const slotId = (w.__tsDivToSlotId ?? {})[divId];
+          const slotId = (ts.divToSlotId ?? {})[divId];
           if (!slotId) return;
-          const bid = (w.__ts_bids ?? {})[slotId] ?? {};
+          const bid = (ts.bids ?? {})[slotId] ?? {};
           // Prebid: compare hb_adid targeting to verify the specific creative won.
           // APS: no hb_adid equivalent — fires if bidder exists and slot is non-empty.
           // Known limitation: APS path may over-fire if a non-APS line item wins.
@@ -304,15 +310,16 @@ interface PageBidsResponse {
  * Patches `history.pushState` and `history.replaceState`, and listens to
  * `popstate`, so that after each client-side route change the trusted server
  * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
- * `window.__ts_ad_slots` / `window.__ts_bids`, and calls `window.__tsAdInit()`.
+ * `window._ts.adSlots` / `window._ts.bids`, and calls `window._ts.adInit()`.
  *
- * Idempotent: guarded by `window.__tsSpaHookInstalled` so multiple calls are safe.
+ * Idempotent: guarded by `window._ts.spaHookInstalled` so multiple calls are safe.
  */
 export function installSpaAuctionHook(): void {
   if (typeof window === 'undefined') return;
-  const win = window as TsWindow & { __tsSpaHookInstalled?: boolean };
-  if (win.__tsSpaHookInstalled) return;
-  win.__tsSpaHookInstalled = true;
+  const win = window as TsWindow;
+  const ts = (win._ts = win._ts ?? {});
+  if (ts.spaHookInstalled) return;
+  ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
 
@@ -329,9 +336,9 @@ export function installSpaAuctionHook(): void {
       if (!res.ok) return;
       const data = (await res.json()) as PageBidsResponse;
       if (inflight !== controller) return;
-      win.__ts_ad_slots = data.slots;
-      win.__ts_bids = data.bids;
-      win.__tsAdInit?.();
+      ts.adSlots = data.slots;
+      ts.bids = data.bids;
+      ts.adInit?.();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       log.warn('SPA auction hook: fetch failed', err);
