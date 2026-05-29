@@ -28,7 +28,6 @@ describe('installTsAdInit', () => {
     vi.resetModules();
     const tw = window as TestWindow;
     delete tw._ts;
-    (tw._ts as TsNamespace | undefined) = undefined;
     // jsdom does not implement navigator.sendBeacon; polyfill it for tests
     if (!('sendBeacon' in navigator)) {
       Object.defineProperty(navigator, 'sendBeacon', {

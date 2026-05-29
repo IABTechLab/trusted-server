@@ -230,6 +230,9 @@ export function installTsAdInit(): void {
   const ts = (w._ts = w._ts ?? {});
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
+    // Snapshot bids at adInit() call time — correct for targeting setup.
+    // The slotRenderEnded listener below reads ts.bids live so SPA navigation
+    // updates (new ts.bids injected before </body>) are picked up at render time.
     const bids = ts.bids ?? {};
     const g = (window as GptWindow).googletag;
     if (!g) return;
@@ -276,6 +279,7 @@ export function installTsAdInit(): void {
           const divId: string = event.slot?.getSlotElementId?.() ?? '';
           const slotId = (ts.divToSlotId ?? {})[divId];
           if (!slotId) return;
+          // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
           // Prebid: compare hb_adid targeting to verify the specific creative won.
           // APS: no hb_adid equivalent — fires if bidder exists and slot is non-empty.
