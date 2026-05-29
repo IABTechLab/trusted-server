@@ -12,6 +12,7 @@ use glob::Pattern;
 
 use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
+use crate::settings::vec_from_seq_or_map;
 
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,10 +39,22 @@ pub struct CreativeOpportunitiesConfig {
     /// Price granularity for header-bidding price bucketing.
     #[serde(default = "PriceGranularity::dense")]
     pub price_granularity: PriceGranularity,
+    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub slot: Vec<CreativeOpportunitySlot>,
+}
+
+impl CreativeOpportunitiesConfig {
+    /// Pre-compile glob patterns for all slots. Call once after deserialization.
+    pub fn compile_slots(&mut self) {
+        for slot in &mut self.slot {
+            slot.compile_patterns();
+        }
+    }
 }
 
 /// A single ad placement opportunity on the publisher's site.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitySlot {
     /// Unique identifier for the slot (e.g., `"atf"`, `"below-fold-sidebar"`).
@@ -68,10 +81,10 @@ pub struct CreativeOpportunitySlot {
     pub providers: SlotProviders,
     /// Pre-compiled [`page_patterns`](Self::page_patterns) for hot-path matching.
     ///
-    /// Populated by [`compile_patterns`](Self::compile_patterns) once at file
-    /// load time (see [`CreativeOpportunitiesFile::compile`]). When this is
+    /// Populated by [`compile_patterns`](Self::compile_patterns) once at startup
+    /// via [`CreativeOpportunitiesConfig::compile_slots`]. When this is
     /// empty, [`matches_path`](Self::matches_path) falls back to compiling on
-    /// every call so callers that build slots by hand (tests, legacy code)
+    /// every call so callers that build slots by hand in tests
     /// still work.
     ///
     /// `pub(crate)` rather than private so cross-module test helpers in this
@@ -188,7 +201,7 @@ impl CreativeOpportunitySlot {
 }
 
 /// An ad format combining a media type with pixel dimensions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreativeOpportunityFormat {
     /// Creative width in pixels.
     pub width: u32,
@@ -210,38 +223,17 @@ impl CreativeOpportunityFormat {
 }
 
 /// Provider-specific slot identifiers for a [`CreativeOpportunitySlot`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SlotProviders {
     /// Amazon Publisher Services (APS/TAM) slot parameters.
     pub aps: Option<ApsSlotParams>,
 }
 
 /// APS-specific parameters for a slot.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApsSlotParams {
     /// The APS slot ID string used when making TAM bid requests.
     pub slot_id: String,
-}
-
-/// TOML file structure for creative opportunity slot definitions.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CreativeOpportunitiesFile {
-    /// All slot definitions in the file (mapped from `[[slot]]` TOML arrays).
-    #[serde(rename = "slot", default)]
-    pub slots: Vec<CreativeOpportunitySlot>,
-}
-
-impl CreativeOpportunitiesFile {
-    /// Pre-compile every slot's
-    /// [`page_patterns`](CreativeOpportunitySlot::page_patterns) so
-    /// [`matches_path`](CreativeOpportunitySlot::matches_path) runs without
-    /// re-invoking `Pattern::new` on every request. Call once after loading.
-    pub fn compile(&mut self) {
-        for slot in &mut self.slots {
-            slot.compile_patterns();
-        }
-    }
 }
 
 /// Validates that a slot ID contains only safe characters.
@@ -326,16 +318,16 @@ mod tests {
     }
 
     #[test]
-    fn file_compile_populates_every_slot() {
-        let mut file = CreativeOpportunitiesFile {
-            slots: vec![make_slot("a", vec!["/a/*"]), make_slot("b", vec!["/b/*"])],
-        };
-        file.compile();
-        for slot in &file.slots {
+    fn compile_slots_populates_every_slot() {
+        let mut slots = vec![make_slot("a", vec!["/a/*"]), make_slot("b", vec!["/b/*"])];
+        for slot in &mut slots {
+            slot.compile_patterns();
+        }
+        for slot in &slots {
             assert_eq!(
                 slot.compiled_patterns.len(),
                 1,
-                "every slot's patterns should be pre-compiled after file.compile()"
+                "every slot's patterns should be pre-compiled after compile_patterns()"
             );
         }
     }

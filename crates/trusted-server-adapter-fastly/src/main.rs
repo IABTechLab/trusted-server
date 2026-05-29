@@ -40,41 +40,6 @@ use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, open_kv_store, UnavailableKvStore};
 
-const CREATIVE_OPPORTUNITIES_TOML: &str = include_str!("../../../creative-opportunities.toml");
-
-/// Parses the embedded `creative-opportunities.toml` at most once per Wasm
-/// instance.
-///
-/// On parse failure, logs an error and falls back to an empty
-/// [`CreativeOpportunitiesFile`] — i.e. the documented "feature disabled"
-/// state — instead of panicking the request hot path. The build-time
-/// validator in `crates/trusted-server-core/build.rs` catches every realistic
-/// authoring mistake; this fallback exists so a CI-bypassed binary patch or a
-/// future schema change can't take the entire fleet down with a per-request
-/// panic.
-static SLOTS_FILE: std::sync::LazyLock<
-    trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
-> = std::sync::LazyLock::new(|| {
-    let mut file = match toml::from_str::<
-        trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
-    >(CREATIVE_OPPORTUNITIES_TOML)
-    {
-        Ok(file) => file,
-        Err(err) => {
-            log::error!(
-                "creative-opportunities.toml failed to parse at startup; \
-                     falling back to an empty slots file (server-side ad-slot \
-                     templates disabled): {err}"
-            );
-            trusted_server_core::creative_opportunities::CreativeOpportunitiesFile::default()
-        }
-    };
-    // Pre-compile glob patterns once so per-request `matches_path` doesn't
-    // re-invoke `Pattern::new` on every page hit.
-    file.compile();
-    file
-});
-
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `Request::from_client()` instead of
@@ -127,8 +92,6 @@ fn main() {
         }
     };
 
-    let slots_file = &*SLOTS_FILE;
-
     let integration_registry = match IntegrationRegistry::new(&settings) {
         Ok(r) => r,
         Err(e) => {
@@ -152,7 +115,7 @@ fn main() {
         &orchestrator,
         &integration_registry,
         &runtime_services,
-        slots_file,
+        settings.creative_opportunity_slots(),
         req,
     )) {
         response.send_to_client();
@@ -206,7 +169,7 @@ async fn route_request(
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     runtime_services: &RuntimeServices,
-    slots_file: &trusted_server_core::creative_opportunities::CreativeOpportunitiesFile,
+    slots: &[trusted_server_core::creative_opportunities::CreativeOpportunitySlot],
     mut req: Request,
 ) -> Option<Response> {
     // Strip client-spoofable forwarded headers at the edge.
@@ -285,8 +248,7 @@ async fn route_request(
         (Method::GET, "/__ts/page-bids") => {
             match runtime_services_for_consent_route(settings, runtime_services) {
                 Ok(publisher_services) => {
-                    handle_page_bids(settings, orchestrator, &publisher_services, slots_file, req)
-                        .await
+                    handle_page_bids(settings, orchestrator, &publisher_services, slots, req).await
                 }
                 Err(e) => Err(e),
             }
@@ -328,7 +290,7 @@ async fn route_request(
                         integration_registry,
                         &publisher_services,
                         orchestrator,
-                        slots_file,
+                        slots,
                         req,
                     )
                     .await

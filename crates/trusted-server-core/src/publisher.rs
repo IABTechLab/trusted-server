@@ -853,7 +853,7 @@ pub async fn handle_publisher_request(
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
     orchestrator: &AuctionOrchestrator,
-    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
+    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -939,7 +939,7 @@ pub async fn handle_publisher_request(
     let is_bot = is_bot_user_agent(&req);
 
     let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
-        crate::creative_opportunities::match_slots(&slots_file.slots, &request_path)
+        crate::creative_opportunities::match_slots(slots, &request_path)
             .into_iter()
             .cloned()
             .collect()
@@ -1479,7 +1479,7 @@ pub async fn handle_page_bids(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
-    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
+    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let Some(co_config) = &settings.creative_opportunities else {
@@ -1494,11 +1494,10 @@ pub async fn handle_page_bids(
         .map(|(_, v)| v.into_owned())
         .unwrap_or_else(|| "/".to_string());
 
-    let matched_slots: Vec<_> =
-        crate::creative_opportunities::match_slots(&slots_file.slots, &path_param)
-            .into_iter()
-            .cloned()
-            .collect();
+    let matched_slots: Vec<_> = crate::creative_opportunities::match_slots(slots, &path_param)
+        .into_iter()
+        .cloned()
+        .collect();
 
     let http_req = compat::from_fastly_headers_ref(&req);
     let request_info =
@@ -2582,6 +2581,7 @@ mod tests {
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
+                slot: Vec::new(),
             }
         }
 
@@ -2789,9 +2789,7 @@ mod tests {
     mod page_bids_no_match_tests {
         use super::super::*;
         use crate::auction::AuctionOrchestrator;
-        use crate::creative_opportunities::{
-            CreativeOpportunitiesFile, CreativeOpportunityFormat, CreativeOpportunitySlot,
-        };
+        use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::noop_services;
         use crate::test_support::tests::crate_test_settings_str;
         use fastly::http::Method;
@@ -2805,24 +2803,22 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
-        fn file_with_article_slot() -> CreativeOpportunitiesFile {
-            CreativeOpportunitiesFile {
-                slots: vec![CreativeOpportunitySlot {
-                    id: "atf".to_string(),
-                    gam_unit_path: None,
-                    div_id: None,
-                    page_patterns: vec!["/20**".to_string()],
-                    formats: vec![CreativeOpportunityFormat {
-                        width: 300,
-                        height: 250,
-                        media_type: crate::auction::types::MediaType::Banner,
-                    }],
-                    floor_price: Some(0.50),
-                    targeting: Default::default(),
-                    providers: Default::default(),
-                    compiled_patterns: Vec::new(),
+        fn article_slot() -> Vec<CreativeOpportunitySlot> {
+            vec![CreativeOpportunitySlot {
+                id: "atf".to_string(),
+                gam_unit_path: None,
+                div_id: None,
+                page_patterns: vec!["/20**".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: crate::auction::types::MediaType::Banner,
                 }],
-            }
+                floor_price: Some(0.50),
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+            }]
         }
 
         fn make_page_bids_request(path: &str) -> Request {
@@ -2839,10 +2835,9 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = CreativeOpportunitiesFile { slots: vec![] };
             let req = make_page_bids_request("/2024/01/my-article/");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &[], req)
                 .await
                 .expect("should return ok response");
 
@@ -2855,7 +2850,7 @@ mod tests {
                     .expect("slots should be array")
                     .len(),
                 0,
-                "empty slots file should produce zero injected slots"
+                "empty slots should produce zero injected slots"
             );
             assert_eq!(
                 body["bids"]
@@ -2863,7 +2858,7 @@ mod tests {
                     .expect("bids should be object")
                     .len(),
                 0,
-                "empty slots file should produce zero bids"
+                "empty slots should produce zero bids"
             );
         }
 
@@ -2875,11 +2870,11 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot();
+            let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
@@ -2911,11 +2906,11 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot();
+            let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("sec-purpose", "prefetch");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
@@ -2946,10 +2941,10 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot(); // slot matches /20** only
+            let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
