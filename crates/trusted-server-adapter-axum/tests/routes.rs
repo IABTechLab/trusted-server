@@ -15,6 +15,47 @@ fn make_service() -> EdgeZeroAxumService {
     EdgeZeroAxumService::new(TrustedServerApp::routes())
 }
 
+fn registered_routes() -> Vec<(String, String)> {
+    TrustedServerApp::routes()
+        .routes()
+        .into_iter()
+        .map(|r| (r.method().to_string(), r.path().to_string()))
+        .collect()
+}
+
+fn assert_route_registered(method: &str, path: &str) {
+    let routes = registered_routes();
+    assert!(
+        routes.iter().any(|(m, p)| m == method && p == path),
+        "{method} {path} must be explicitly registered; registered routes: {routes:?}"
+    );
+}
+
+/// Verify that every expected explicit route is registered in the route table.
+///
+/// Uses [`RouterService::routes()`] for introspection rather than checking
+/// response status codes — wildcards (`/{*rest}`) can return non-404 even when
+/// an explicit registration is missing, making status-based checks false positives.
+#[test]
+fn all_explicit_routes_are_registered() {
+    let expected: &[(&str, &str)] = &[
+        ("GET", "/.well-known/trusted-server.json"),
+        ("POST", "/verify-signature"),
+        ("POST", "/admin/keys/rotate"),
+        ("POST", "/admin/keys/deactivate"),
+        ("POST", "/auction"),
+        ("GET", "/first-party/proxy"),
+        ("GET", "/first-party/click"),
+        ("GET", "/first-party/sign"),
+        ("POST", "/first-party/sign"),
+        ("POST", "/first-party/proxy-rebuild"),
+    ];
+
+    for (method, path) in expected {
+        assert_route_registered(method, path);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route smoke tests — verify routing (not business logic correctness)
 // ---------------------------------------------------------------------------

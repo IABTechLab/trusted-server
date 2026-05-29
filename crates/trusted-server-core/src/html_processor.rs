@@ -534,8 +534,10 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    // 2× accounts for the injected tsjs script tag plus URL attribute rewrites.
-    const MAX_GROWTH_FACTOR: f64 = 2.0;
+    // 1.1× accounts for the injected tsjs script tag plus URL attribute rewrites.
+    // Observed growth on the test fixture is ≤1.01×; 1.1× gives headroom while
+    // catching real regressions (e.g., double-injection or buffer leak).
+    const MAX_GROWTH_FACTOR: f64 = 1.1;
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {

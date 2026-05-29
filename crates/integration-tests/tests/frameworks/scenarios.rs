@@ -37,7 +37,7 @@ pub enum CustomScenario {
     /// Next.js: Form action URLs are rewritten from origin to proxy.
     NextJsFormAction,
 
-    /// WordPress: Admin pages (`/wp-admin/`) receive script injection.
+    /// `WordPress`: Admin pages (`/wp-admin/`) receive script injection.
     ///
     /// The trusted server currently injects into ALL HTML responses
     /// regardless of path. This test documents that behavior and guards

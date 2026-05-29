@@ -59,34 +59,28 @@ async fn finalize_middleware_injects_geo_header() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_middleware_runs_in_chain_for_protected_routes() {
-    // Verifies that AuthMiddleware is wired into the middleware chain for auction
-    // requests. Without it, FinalizeResponseMiddleware would still run but auth
-    // challenges would be skipped silently.
-    //
-    // CI settings may not have basic_auth configured, so this test does not
-    // assert 401 — it asserts that both middleware layers ran (X-Geo-Info-Available
-    // present) and that the route is actually reached (status != 404).
+    // Verifies that AuthMiddleware is wired by asserting the 401 + WWW-Authenticate
+    // challenge on a protected route (/admin/keys/rotate). Only AuthMiddleware
+    // short-circuits with this response — FinalizeResponseMiddleware alone would not.
     let router = TrustedServerApp::routes();
 
     let req = request_builder()
         .method("POST")
-        .uri("/auction")
+        .uri("/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
 
     let resp = router.oneshot(req).await;
 
-    // Regardless of auth config the response must carry the finalize header,
-    // confirming both middleware layers ran (auth short-circuits through finalize).
-    assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "middleware chain must inject X-Geo-Info-Available even on auth-rejected responses"
-    );
-    assert_ne!(
+    assert_eq!(
         resp.status().as_u16(),
-        404,
-        "auction endpoint must be routed"
+        401,
+        "AuthMiddleware must short-circuit with 401 on protected routes without credentials"
+    );
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "AuthMiddleware must include WWW-Authenticate on 401 responses"
     );
 }
 

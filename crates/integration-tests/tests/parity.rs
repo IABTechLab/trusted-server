@@ -173,6 +173,18 @@ async fn discovery_route_body_is_json_parity() {
         "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
          (axum_status={axum_status} cf_status={cf_status})"
     );
+
+    // When both return JSON objects, top-level key sets must also match.
+    if let (Some(Value::Object(axum_obj)), Some(Value::Object(cf_obj))) = (&axum_json, &cf_json) {
+        let mut axum_keys: Vec<&str> = axum_obj.keys().map(String::as_str).collect();
+        let mut cf_keys: Vec<&str> = cf_obj.keys().map(String::as_str).collect();
+        axum_keys.sort_unstable();
+        cf_keys.sort_unstable();
+        assert_eq!(
+            axum_keys, cf_keys,
+            "/.well-known/trusted-server.json top-level JSON keys must match across adapters"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -294,14 +306,22 @@ async fn geo_header_parity_on_all_responses() {
             cf_post_headers(path, body).await
         };
 
+        assert!(
+            axum_headers.contains_key("x-geo-info-available"),
+            "Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"
+        );
+        assert!(
+            cf_headers.contains_key("x-geo-info-available"),
+            "Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"
+        );
         let axum_geo = axum_headers
             .get("x-geo-info-available")
-            .unwrap_or_else(|| panic!("Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"))
+            .expect("should have x-geo-info-available after assert")
             .to_str()
             .expect("should be valid UTF-8");
         let cf_geo = cf_headers
             .get("x-geo-info-available")
-            .unwrap_or_else(|| panic!("Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"))
+            .expect("should have x-geo-info-available after assert")
             .to_str()
             .expect("should be valid UTF-8");
         assert_eq!(
