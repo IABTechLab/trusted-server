@@ -4386,4 +4386,137 @@ set = { networkId = 42 }
             "should fail fast when a canonical rule has no matcher fields"
         );
     }
+
+    #[test]
+    fn parse_bid_extracts_cache_id_from_ext_prebid_cache_bids() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-123",
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "adm": "<div>ad</div>",
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "https://openads.adsrvr.org/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570",
+                            "cacheId": "f47447a0-b759-4f2f-9887-af458b79b570"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "thetradedesk")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("f47447a0-b759-4f2f-9887-af458b79b570"),
+            "should extract cacheId as cache_id"
+        );
+        assert_eq!(
+            bid.cache_host.as_deref(),
+            Some("openads.adsrvr.org"),
+            "should extract host from cache URL"
+        );
+        assert_eq!(
+            bid.cache_path.as_deref(),
+            Some("/cache"),
+            "should extract path from cache URL"
+        );
+    }
+
+    #[test]
+    fn parse_bid_sets_cache_fields_to_none_when_no_cache_entry() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-456",
+            "impid": "atf_sidebar_ad",
+            "price": 0.50,
+            "w": 300,
+            "h": 250
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert!(bid.cache_id.is_none(), "should be None when cache absent");
+        assert!(bid.cache_host.is_none(), "should be None when cache absent");
+        assert!(bid.cache_path.is_none(), "should be None when cache absent");
+    }
+
+    #[test]
+    fn parse_bid_handles_malformed_cache_url_gracefully() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-789",
+            "impid": "atf_sidebar_ad",
+            "price": 0.50,
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "not-a-valid-url",
+                            "cacheId": "some-uuid"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid without panicking");
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("some-uuid"),
+            "should still extract cacheId even if URL is malformed"
+        );
+        assert!(
+            bid.cache_host.is_none(),
+            "should be None when URL parse fails"
+        );
+        assert!(
+            bid.cache_path.is_none(),
+            "should be None when URL parse fails"
+        );
+    }
+
+    #[test]
+    fn parse_bid_preserves_ad_id_alongside_cache_id() {
+        let bid_json = serde_json::json!({
+            "id": "bid-impression-id",
+            "impid": "atf_sidebar_ad",
+            "adid": "bidder-ad-id-abc",
+            "price": 1.0,
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "https://cache.example.com/cache",
+                            "cacheId": "cache-uuid-xyz"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.ad_id.as_deref(),
+            Some("bidder-ad-id-abc"),
+            "should keep ad_id from adid field"
+        );
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("cache-uuid-xyz"),
+            "should extract cache UUID separately"
+        );
+    }
 }
