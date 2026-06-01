@@ -340,3 +340,101 @@ if (typeof window !== 'undefined') {
 
 export { pbjs };
 export default installPrebidNpm;
+
+// ─── TS pbRender bridge ────────────────────────────────────────────────────
+//
+// When a GAM Prebid line item fires, the `pbRender` creative sends a
+// "Prebid Request" postMessage via a MessageChannel looking for Prebid.js.
+// For server-side TS bids, Prebid.js doesn't have the bid in its store because
+// the auction ran at the edge.  This bridge intercepts those requests, fetches
+// the ad from PBS Cache using the targeting keys TS already forwarded to GAM,
+// and replies with a "Prebid Response" so the creative renders correctly.
+//
+// The bridge reads `window.tsjs.bids` live on every message so SPA navigation
+// updates are handled automatically without re-registration.
+
+/** Minimal display renderer — set as `window.render` inside the ad iframe. */
+const TS_DISPLAY_RENDERER = `(function(){window.render=function(d,h,w){var doc=w.document;var f=h.mkFrame(doc,{width:d.width||'100%',height:d.height||'100%'});if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}doc.body.appendChild(f);};})();`;
+
+/**
+ * Install the TS → pbRender bridge.
+ *
+ * Listens for Prebid cross-domain `"Prebid Request"` messages on the publisher
+ * window. When the `adId` matches a TS server-side bid that has PBS Cache
+ * coordinates (`hb_cache_host` / `hb_cache_path`), the bridge fetches the
+ * creative markup from PBS Cache and replies with a `"Prebid Response"` so the
+ * GAM Prebid creative can render without needing Prebid.js's local bid store.
+ *
+ * Must be called after `installPrebidNpm()` so `window.__pb_locator__` is set
+ * and pbRender can locate this window.
+ */
+export function installTsRenderBridge(): void {
+  if (typeof window === 'undefined') return;
+
+  window.addEventListener('message', async (e: MessageEvent) => {
+    let data: Record<string, unknown>;
+    try {
+      data = typeof e.data === 'object' ? e.data : (JSON.parse(e.data as string) as Record<string, unknown>);
+    } catch {
+      return;
+    }
+
+    if (data['message'] !== 'Prebid Request') return;
+    const adId = data['adId'] as string | undefined;
+    if (!adId) return;
+
+    // Only the first port is used — it's channel.port2 from the creative's
+    // MessageChannel; posting to it triggers channel.port1.onmessage.
+    const port = e.ports?.[0];
+    if (!port) return;
+
+    // Build reverse map: hb_adid → slotId from live window.tsjs.bids.
+    // Read live so SPA navigation updates are captured automatically.
+    const bids = window.tsjs?.bids ?? {};
+    let slotId: string | undefined;
+    let matchedBid: typeof bids[string] | undefined;
+    for (const [sid, bid] of Object.entries(bids)) {
+      if (bid.hb_adid === adId) {
+        slotId = sid;
+        matchedBid = bid;
+        break;
+      }
+    }
+
+    if (!slotId || !matchedBid?.hb_cache_host || !matchedBid?.hb_cache_path) {
+      // Not a TS bid — let Prebid.js handle it via its own listener.
+      return;
+    }
+
+    // Fetch ad markup from PBS Cache.
+    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    let ad: string;
+    try {
+      const res = await fetch(cacheUrl, { mode: 'cors' });
+      if (!res.ok) return;
+      ad = await res.text();
+    } catch {
+      return;
+    }
+
+    // Look up dimensions from window.tsjs.adSlots.
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    // Reply with the Prebid Response contract that crossDomain.js expects.
+    port.postMessage(
+      JSON.stringify({
+        message: 'Prebid Response',
+        adId,
+        ad,
+        renderer: TS_DISPLAY_RENDERER,
+        width,
+        height,
+      }),
+    );
+
+    log.debug(`[tsjs-prebid] pbRender bridge served ad for slot '${slotId}' from PBS Cache`);
+  });
+
+  log.info('[tsjs-prebid] TS pbRender bridge installed');
+}

@@ -279,6 +279,14 @@ export function installTsAdInit(): void {
         divToSlotId[actualDivId] = slot.id;
         if (tsOwned) newSlots.push(gptSlot);
         slotsToRefresh.push(gptSlot);
+
+        // APS: signal to apstag that bids are ready so Amazon's GAM creative
+        // can render.  apstag must already be initialised on the page (which it
+        // is on production publisher pages).  Safe no-op if apstag is absent.
+        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (window as any).apstag?.setDisplayBids?.();
+        }
       });
 
       ts.prevGptSlots = newSlots as unknown[];
@@ -386,12 +394,14 @@ export function installSpaAuctionHook(): void {
 
 /**
  * Register the slim-Prebid lazy loader. Fires after window.load — off the
- * critical path. slim-Prebid handles refresh auctions and userID module
- * warm-up (ID5, sharedID, LiveRamp ATS, Lockr). It skips initial-render slots
- * (ts_initial=1) and registers as the GPT refresh handler for scroll/sticky auctions.
+ * critical path. Slim-Prebid handles scroll/refresh auctions and userID
+ * module warm-up (ID5, sharedID, LiveRamp ATS, Lockr).
  *
- * Phase 1: no-op unless window.__tsjs_slim_prebid_url is set (it won't be until
- * the slim-Prebid bundle build target ships in a later phase).
+ * Phase 1: no-op unless `window.__tsjs_slim_prebid_url` is set (the slim
+ * bundle build target ships in a later phase).
+ *
+ * The TS pbRender bridge (`installTsRenderBridge`) is registered separately
+ * at module init so it activates with the existing tsjs-prebid.min.js bundle.
  */
 export function installSlimPrebidLoader(): void {
   const url = (window as GptWindow).__tsjs_slim_prebid_url;
@@ -401,6 +411,24 @@ export function installSlimPrebidLoader(): void {
     script.src = url;
     script.defer = true;
     document.head.appendChild(script);
+  });
+}
+
+/**
+ * Install the TS pbRender bridge post-load.
+ *
+ * Intercepts Prebid cross-domain `"Prebid Request"` messages for TS
+ * server-side bids, fetches the creative from PBS Cache, and replies so the
+ * GAM Prebid Universal Creative renders without Prebid.js's local bid store.
+ * Runs with the existing tsjs-prebid.min.js bundle — no slim-Prebid needed.
+ */
+function installTsRenderBridgePostLoad(): void {
+  window.addEventListener('load', () => {
+    import('../prebid/index').then(({ installTsRenderBridge }) => {
+      installTsRenderBridge();
+    }).catch(() => {
+      // Prebid bundle not available — bridge skipped silently.
+    });
   });
 }
 
@@ -424,4 +452,5 @@ if (typeof window !== 'undefined') {
   installTsAdInit();
   installSpaAuctionHook();
   installSlimPrebidLoader();
+  installTsRenderBridgePostLoad();
 }
