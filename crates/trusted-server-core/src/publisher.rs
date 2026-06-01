@@ -478,11 +478,13 @@ pub fn handle_publisher_request(
         ec_context.ec_value(),
     );
 
-    let backend_name = BackendConfig::from_url(
+    let backend_name = BackendConfig::from_url_with_host_header_override(
         &settings.publisher.origin_url,
         settings.proxy.certificate_check,
+        settings.publisher.origin_host_header_override.as_deref(),
     )?;
     let origin_host = settings.publisher.origin_host();
+    let origin_host_header = settings.publisher.origin_host_header();
 
     // lgtm[rust/cleartext-logging]
     // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
@@ -493,6 +495,7 @@ pub fn handle_publisher_request(
     );
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
+    req.set_header("host", &origin_host_header);
 
     let mut response = req
         .send(&backend_name)

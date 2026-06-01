@@ -13,6 +13,7 @@ use validator::{Validate, ValidationError};
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
+use crate::host_header::validate_host_header_override_value;
 use crate::redacted::Redacted;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
@@ -28,6 +29,10 @@ pub struct Publisher {
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
     pub origin_url: String,
+    /// Optional outbound Host header to send while connecting to `origin_url`.
+    #[serde(default)]
+    #[validate(custom(function = validate_host_header_override))]
+    pub origin_host_header_override: Option<String>,
     /// Secret used to encrypt/decrypt proxied URLs in `/first-party/proxy`.
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
@@ -69,6 +74,7 @@ impl Publisher {
     ///     domain: "example.com".to_string(),
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
+    ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -85,6 +91,14 @@ impl Publisher {
                 })
             })
             .unwrap_or_else(|| self.origin_url.clone())
+    }
+
+    /// Returns the outbound Host header for proxied publisher-origin requests.
+    #[must_use]
+    pub fn origin_host_header(&self) -> String {
+        self.origin_host_header_override
+            .clone()
+            .unwrap_or_else(|| self.origin_host())
     }
 }
 
@@ -1952,6 +1966,21 @@ fn validate_no_trailing_slash(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_host_header_override(value: &str) -> Result<(), ValidationError> {
+    if let Err(reason) = validate_host_header_override_value(value) {
+        let mut err = ValidationError::new("invalid_host_header_override");
+        err.add_param("value".into(), &value);
+        err.add_param("reason".into(), &reason);
+        err.message = Some(
+            "origin_host_header_override must be a valid host or host:port without scheme, path, query, or fragment"
+                .into(),
+        );
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 fn validate_redacted_not_empty(value: &Redacted<String>) -> Result<(), ValidationError> {
     if value.expose().is_empty() {
         return Err(ValidationError::new("empty_value"));
@@ -2240,6 +2269,7 @@ mod tests {
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
+        assert_eq!(settings.publisher.origin_host_header_override, None);
         assert_eq!(
             settings.ec.passphrase.expose(),
             "test-secret-key-32-bytes-minimum"
@@ -2317,6 +2347,57 @@ mod tests {
             assert!(
                 result.is_err(),
                 "should reject invalid source_domain {source_domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_origin_host_header_override() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"origin_url = "https://origin.test-publisher.com""#,
+            r#"origin_url = "https://origin.test-publisher.com"
+origin_host_header_override = "www.example.com:8443""#,
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should accept host header override");
+        assert_eq!(
+            settings.publisher.origin_host_header(),
+            "www.example.com:8443",
+            "should use configured host header override"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_origin_host_header_overrides() {
+        for override_value in [
+            "",
+            " www.example.com",
+            "www.example.com ",
+            "https://www.example.com",
+            "www.example.com/path",
+            "www.example.com?query=1",
+            "www.example.com#fragment",
+            "www.example.com\n",
+            "www.example.com:",
+            "www.example.com:99999",
+            "example..com",
+            ".",
+            "-",
+            "-example.com",
+            "example-.com",
+            "[::1",
+        ] {
+            let toml_str = crate_test_settings_str().replace(
+                r#"origin_url = "https://origin.test-publisher.com""#,
+                &format!(
+                    "origin_url = \"https://origin.test-publisher.com\"\norigin_host_header_override = {override_value:?}"
+                ),
+            );
+
+            let result = Settings::from_toml(&toml_str);
+            assert!(
+                result.is_err(),
+                "origin_host_header_override {override_value:?} should fail validation"
             );
         }
     }
@@ -2998,12 +3079,34 @@ mod tests {
     }
 
     #[test]
+    fn test_origin_host_header_override_env() {
+        let env_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(env_key, Some("www.example.com"), || {
+            let settings = Settings::from_toml_and_env(&crate_test_settings_str())
+                .expect("should load settings with host header override env");
+
+            assert_eq!(
+                settings.publisher.origin_host_header_override.as_deref(),
+                Some("www.example.com")
+            );
+            assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
+        });
+    }
+
+    #[test]
     fn test_publisher_origin_host() {
         // Test with full URL including port
         let publisher = Publisher {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
@@ -3013,6 +3116,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
@@ -3022,6 +3126,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -3031,6 +3136,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
@@ -3040,6 +3146,7 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
@@ -3049,9 +3156,36 @@ mod tests {
             domain: "example.com".to_string(),
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
+            origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
+    }
+
+    #[test]
+    fn test_publisher_origin_host_header_defaults_to_origin_host() {
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com:8443".to_string(),
+            origin_host_header_override: None,
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+
+        assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
+    }
+
+    #[test]
+    fn test_publisher_origin_host_header_uses_override() {
+        let publisher = Publisher {
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            origin_host_header_override: Some("www.example.com".to_string()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+        };
+
+        assert_eq!(publisher.origin_host_header(), "www.example.com");
     }
 
     #[test]
