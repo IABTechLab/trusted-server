@@ -29,6 +29,7 @@ not the bid ID. The cache host and path are also not forwarded today.
 ### Gap 1: Wrong `hb_adid` source
 
 `prebid.rs` extracts:
+
 ```rust
 let ad_id = bid_obj
     .get("adid")
@@ -38,6 +39,7 @@ let ad_id = bid_obj
 ```
 
 Real PBS response has (in `ext.prebid.cache.bids`):
+
 ```json
 {
   "url": "https://openads.adsrvr.org/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570",
@@ -76,7 +78,7 @@ response:
 ```rust
 /// Prebid Cache UUID for this bid. Populated from
 /// `ext.prebid.cache.bids.cacheId` in the PBS response.
-/// Used as `hb_adid` targeting value in `window._ts.bids`.
+/// Used as `hb_adid` targeting value in `window.tsjs.bids`.
 /// None for non-PBS providers (e.g., APS) and PBS bids without cache enabled.
 pub cache_id: Option<String>,
 
@@ -145,6 +147,7 @@ The `ad_id` field (from `bid.adid` / `bid.id`) is **kept** — it maps to the Op
 **in addition**, not replacing `ad_id`.
 
 Populate all three fields on `AuctionBid`:
+
 ```rust
 Ok(AuctionBid {
     ...,
@@ -179,7 +182,7 @@ if let Some(ref path) = bid.cache_path {
 }
 ```
 
-### 4.4 What `window._ts.bids` looks like after the fix
+### 4.4 What `window.tsjs.bids` looks like after the fix
 
 ```json
 {
@@ -198,6 +201,7 @@ if let Some(ref path) = bid.cache_path {
 ### 4.5 Win detection — no change required
 
 `slotRenderEnded` checks:
+
 ```js
 event.slot.getTargeting('hb_adid')[0] === bid.hb_adid
 ```
@@ -219,31 +223,32 @@ directly from PBS Cache:
 
 ```html
 <script>
-(function () {
-  var host = '%%PATTERN:hb_cache_host%%';
-  var path = '%%PATTERN:hb_cache_path%%';
-  var uuid = '%%PATTERN:hb_adid%%';
-  if (!host || !uuid) return;
-  var url = 'https://' + host + path + '?uuid=' + encodeURIComponent(uuid);
-  var xhr = new XMLHttpRequest();
-  xhr.open('GET', url);
-  xhr.onload = function () {
-    if (xhr.status === 200) document.write(xhr.responseText);
-  };
-  xhr.send();
-})();
+  ;(function () {
+    var host = '%%PATTERN:hb_cache_host%%'
+    var path = '%%PATTERN:hb_cache_path%%'
+    var uuid = '%%PATTERN:hb_adid%%'
+    if (!host || !uuid) return
+    var url = 'https://' + host + path + '?uuid=' + encodeURIComponent(uuid)
+    var xhr = new XMLHttpRequest()
+    xhr.open('GET', url)
+    xhr.onload = function () {
+      if (xhr.status === 200) document.write(xhr.responseText)
+    }
+    xhr.send()
+  })()
 </script>
 ```
 
 Alternatively, publishers using the Prebid Universal Creative package can use:
+
 ```html
 <script src="https://cdn.jsdelivr.net/npm/prebid-universal-creative/dist/creative.js"></script>
 <script>
   pbuc.renderAd({
     adId: '%%PATTERN:hb_adid%%',
     cacheHost: '%%PATTERN:hb_cache_host%%',
-    cachePath: '%%PATTERN:hb_cache_path%%'
-  });
+    cachePath: '%%PATTERN:hb_cache_path%%',
+  })
 </script>
 ```
 
@@ -271,11 +276,11 @@ limitation tracked separately.
 
 ## 6. Files Changed
 
-| File | Change |
-|---|---|
-| `crates/trusted-server-core/src/auction/types.rs` | Add `cache_id`, `cache_host`, `cache_path` to `Bid` struct |
+| File                                                    | Change                                                                                                                                    |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/trusted-server-core/src/auction/types.rs`       | Add `cache_id`, `cache_host`, `cache_path` to `Bid` struct                                                                                |
 | `crates/trusted-server-core/src/integrations/prebid.rs` | Extract `ext.prebid.cache.bids.{cacheId,url}` in `parse_bid_object`; update `AuctionBid` → `Bid` conversion to carry the three new fields |
-| `crates/trusted-server-core/src/publisher.rs` | `build_bid_map`: use `cache_id` for `hb_adid`, emit `hb_cache_host`/`hb_cache_path` |
+| `crates/trusted-server-core/src/publisher.rs`           | `build_bid_map`: use `cache_id` for `hb_adid`, emit `hb_cache_host`/`hb_cache_path`                                                       |
 
 > **Implementer note — `AuctionBid` → `Bid` conversion:** `prebid.rs` constructs an
 > intermediate `AuctionBid` type that is later converted to the shared `Bid` type from
@@ -312,7 +317,7 @@ Test files:
 
 **Integration verification (manual):**
 
-After deploying, verify `window._ts.bids` in browser devtools shows `hb_cache_host`
+After deploying, verify `window.tsjs.bids` in browser devtools shows `hb_cache_host`
 and `hb_cache_path` present. Verify `hb_adid` matches the UUID in
 `ext.prebid.cache.bids.cacheId` from the raw PBS response.
 
@@ -327,14 +332,14 @@ Before this fix has end-to-end effect:
       cache-fetch variant (see §4.6)
 - [ ] PBS: Prebid Cache enabled and populated (confirmed from real response — already
       working)
-- [ ] Verify: `window._ts.bids` shows correct cache UUID in `hb_adid` after deploy
+- [ ] Verify: `window.tsjs.bids` shows correct cache UUID in `hb_adid` after deploy
 
 ---
 
 ## 9. Known Remaining Gaps (not in scope)
 
-| Gap | Severity | Tracking |
-|---|---|---|
-| APS win detection over-fires nurl/burl | P1 | Separate issue |
-| Dual bootstrap (`gpt_bootstrap.js` + `installTsAdInit`) sync risk | P2 | Separate issue |
-| Slim-Prebid bundle not yet built | Phase 2 | §9.8 of design doc |
+| Gap                                                               | Severity | Tracking           |
+| ----------------------------------------------------------------- | -------- | ------------------ |
+| APS win detection over-fires nurl/burl                            | P1       | Separate issue     |
+| Dual bootstrap (`gpt_bootstrap.js` + `installTsAdInit`) sync risk | P2       | Separate issue     |
+| Slim-Prebid bundle not yet built                                  | Phase 2  | §9.8 of design doc |

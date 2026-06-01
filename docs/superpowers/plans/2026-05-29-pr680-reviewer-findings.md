@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Address the two reviewer-required findings from PR #680 plus low-effort cleanups: consolidate slot config into `trusted-server.toml`, namespace `window.__ts*` globals under `window._ts`, and fix the TypeScript `formats` type cast and `ts_initial` hardcoded string.
+**Goal:** Address the two reviewer-required findings from PR #680 plus low-effort cleanups: consolidate slot config into `trusted-server.toml`, consolidate `window.__ts*` globals under `window.tsjs`, and fix the TypeScript `formats` type cast and `ts_initial` hardcoded string.
 
 **Architecture:** Slot templates move from the standalone `creative-opportunities.toml` (embedded via `include_str!`) into the `[creative_opportunities]` section of `trusted-server.toml`, using the existing `vec_from_seq_or_map` deserializer pattern already used for `BID_PARAM_ZONE_OVERRIDES`. The window globals rename is a coordinated change across `gpt_bootstrap.js`, `index.ts`, and `publisher.rs` — all three must change together since they share a runtime contract.
 
@@ -271,21 +271,21 @@ git commit -m "Move slot templates from creative-opportunities.toml into trusted
 
 ---
 
-## Task 2: Namespace `window.__ts*` globals under `window._ts`
+## Task 2: Consolidate `window.__ts*` globals under `window.tsjs`
 
 **What:** All `window.__ts*` globals become properties on a single `window._ts` namespace object. Changes must be coordinated across three files: `gpt_bootstrap.js`, `index.ts`, and `publisher.rs`. Tests in `index.test.ts` must be updated too.
 
 **Rename table:**
 
-| Old global                    | New property                  | Notes                        |
-| ----------------------------- | ----------------------------- | ---------------------------- |
-| `window.__ts_ad_slots`        | `window._ts.adSlots`          | Array, set at head-open      |
-| `window.__ts_bids`            | `window._ts.bids`             | Object, set before `</body>` |
-| `window.__tsAdInit`           | `window._ts.adInit`           | Function                     |
-| `window.__tsPrevGptSlots`     | `window._ts.prevGptSlots`     | Array                        |
-| `window.__tsServicesEnabled`  | `window._ts.servicesEnabled`  | Boolean                      |
-| `window.__tsDivToSlotId`      | `window._ts.divToSlotId`      | Object                       |
-| `window.__tsSpaHookInstalled` | `window._ts.spaHookInstalled` | Boolean                      |
+| Old global                    | New property                   | Notes                        |
+| ----------------------------- | ------------------------------ | ---------------------------- |
+| `window.__ts_ad_slots`        | `window.tsjs.adSlots`          | Array, set at head-open      |
+| `window.__ts_bids`            | `window.tsjs.bids`             | Object, set before `</body>` |
+| `window.__tsAdInit`           | `window.tsjs.adInit`           | Function                     |
+| `window.__tsPrevGptSlots`     | `window.tsjs.prevGptSlots`     | Array                        |
+| `window.__tsServicesEnabled`  | `window.tsjs.servicesEnabled`  | Boolean                      |
+| `window.__tsDivToSlotId`      | `window.tsjs.divToSlotId`      | Object                       |
+| `window.__tsSpaHookInstalled` | `window.tsjs.spaHookInstalled` | Boolean                      |
 
 **Files:**
 
@@ -306,7 +306,7 @@ git commit -m "Move slot templates from creative-opportunities.toml into trusted
 format!("<script>window.__ts_ad_slots=JSON.parse(\"{}\");</script>", escaped)
 
 // After — initialise _ts if absent, then set adSlots
-format!("<script>(window._ts=window._ts||{{}}).adSlots=JSON.parse(\"{}\");</script>", escaped)
+format!("<script>(window.tsjs=window.tsjs||{{}}).adSlots=JSON.parse(\"{}\");</script>", escaped)
 ```
 
 `build_bids_script` generates the script injected before `</body>`. Change:
@@ -320,7 +320,7 @@ format!(
 
 // After
 format!(
-    "<script>(window._ts=window._ts||{{}}).bids=JSON.parse(\"{}\");if(typeof window._ts.adInit===\"function\")window._ts.adInit();</script>",
+    "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");if(typeof window.tsjs.adInit===\"function\")window.tsjs.adInit();</script>",
     escaped
 )
 ```
@@ -417,7 +417,7 @@ type TsWindow = Window & {
 
 - [ ] **Step 4: Update `installTsAdInit` in `index.ts`**
 
-Change every `w.__ts*` access to `w._ts.*`. Initialise `w._ts` at function entry:
+Update all properties to live under `window.tsjs`. Use `window.tsjs` directly:
 
 ```typescript
 export function installTsAdInit(): void {
@@ -507,7 +507,7 @@ export function installSpaHook(): void {
 
 - [ ] **Step 6: Update tests in `index.test.ts`**
 
-Find all test assertions that reference `window.__ts_ad_slots`, `window.__ts_bids`, `window.__tsAdInit`, etc. and update to `window._ts.adSlots`, `window._ts.bids`, `window._ts.adInit` etc.
+Find all test assertions that reference `window.__ts_ad_slots`, `window.__ts_bids`, `window.__tsAdInit`, etc. and update to `window.tsjs.adSlots`, `window.tsjs.bids`, `window.tsjs.adInit` etc.
 
 Run tests first to see what fails:
 

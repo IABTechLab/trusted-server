@@ -182,6 +182,11 @@ impl CreativeOpportunitySlot {
                 serde_json::json!({ "slotID": aps.slot_id }),
             );
         }
+        if let Some(ref prebid) = self.providers.prebid {
+            for (name, params) in &prebid.bidders {
+                bidders.insert(name.clone(), params.clone());
+            }
+        }
         AdSlot {
             id: self.id.clone(),
             formats: self
@@ -227,6 +232,12 @@ impl CreativeOpportunityFormat {
 pub struct SlotProviders {
     /// Amazon Publisher Services (APS/TAM) slot parameters.
     pub aps: Option<ApsSlotParams>,
+    /// Prebid Server inline bidder parameters.
+    ///
+    /// When present, these are forwarded directly as `ext.prebid.bidder.*`
+    /// in the OpenRTB request, bypassing PBS stored-request lookup for this slot.
+    /// Useful in development environments where stored requests are not available.
+    pub prebid: Option<PrebidSlotParams>,
 }
 
 /// APS-specific parameters for a slot.
@@ -234,6 +245,16 @@ pub struct SlotProviders {
 pub struct ApsSlotParams {
     /// The APS slot ID string used when making TAM bid requests.
     pub slot_id: String,
+}
+
+/// Inline Prebid Server bidder parameters for a slot.
+///
+/// Keyed by bidder name (e.g., `"mocktioneer"`). Each value is the
+/// bidder-specific params object forwarded verbatim to PBS.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrebidSlotParams {
+    /// Per-bidder inline params map. Bidder name → params object.
+    pub bidders: HashMap<String, serde_json::Value>,
 }
 
 /// Validates that a slot ID contains only safe characters.

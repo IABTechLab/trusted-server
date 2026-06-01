@@ -140,12 +140,12 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
-    /// Pre-computed `<script>(window._ts=window._ts||{}).adSlots=...;</script>`.
+    /// Pre-computed `<script>(window.tsjs=window.tsjs||{}).adSlots=...;</script>`.
     /// Injected at `<head>` open. `None` when no slots matched.
     pub ad_slots_script: Option<String>,
     /// Shared auction result — written by auction task before HTML processing begins.
     /// Handler reads this in `el.on_end_tag()` on the body element.
-    /// `None` means no auction ran; inject empty `_ts.bids = {}` as fallback.
+    /// `None` means no auction ran; inject empty `tsjs.bids = {}` as fallback.
     pub ad_bids_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -311,10 +311,10 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                 Ok(())
             }
         }),
-        // Inject _ts.bids before </body> via end_tag_handlers — only when
+        // Inject tsjs.bids before </body> via end_tag_handlers — only when
         // slots matched this URL. When no slots matched, skip injection entirely
         // so the publisher's existing client-side Prebid/GPT flow is unmodified
-        // (dual-mode rollout: calling _ts.adInit with empty slots would invoke
+        // (dual-mode rollout: calling tsjs.adInit with empty slots would invoke
         // enableSingleRequest/enableServices and conflict with the publisher's GPT init).
         // Guard with AtomicBool so the script is only injected once even if
         // the origin HTML contains multiple <body> elements (e.g. template fragments).
@@ -1278,7 +1278,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: Some(
-                r#"<script>(window._ts=window._ts||{}).adSlots=JSON.parse("[]");</script>"#
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
                     .to_string(),
             ),
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1292,7 +1292,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            html.contains("window._ts=window._ts||{}"),
+            html.contains("window.tsjs=window.tsjs||{}"),
             "should inject ad slots namespace at head-open"
         );
         assert!(
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn injects_ts_bids_before_body_close() {
-        let bids_script = r#"<script>(window._ts=window._ts||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
+        let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
@@ -1315,7 +1315,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: Some(
-                r#"<script>(window._ts=window._ts||{}).adSlots=[];</script>"#.to_string(),
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
             ad_bids_state: state,
         };
@@ -1325,7 +1325,7 @@ mod tests {
             .expect("should process");
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
-            html.contains("window._ts=window._ts||{}"),
+            html.contains("window.tsjs=window.tsjs||{}"),
             "should inject _ts namespace for bids before </body>"
         );
         assert!(
@@ -1333,7 +1333,7 @@ mod tests {
             "should inject bids before </body>"
         );
         let bids_pos = html
-            .find("window._ts=window._ts||{}")
+            .find("window.tsjs=window.tsjs||{}")
             .expect("bids namespace should be in output");
         let body_close_pos = html.find("</body>").expect("</body> should be in output");
         assert!(bids_pos < body_close_pos, "bids must appear before </body>");
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn injects_ts_bids_only_once_with_multiple_body_elements() {
-        let bids_script = r#"<script>(window._ts=window._ts||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
+        let bids_script = r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{\"atf\":{\"hb_pb\":\"1.00\"}}");</script>"#;
         let state = std::sync::Arc::new(std::sync::Mutex::new(Some(bids_script.to_string())));
         let config = HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
@@ -1349,7 +1349,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: Some(
-                r#"<script>(window._ts=window._ts||{}).adSlots=[];</script>"#.to_string(),
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
             ad_bids_state: state,
         };
@@ -1362,7 +1362,7 @@ mod tests {
         assert_eq!(
             html.matches(".bids=JSON.parse").count(),
             1,
-            "should inject _ts.bids exactly once even with multiple <body> elements"
+            "should inject tsjs.bids exactly once even with multiple <body> elements"
         );
     }
 
@@ -1377,7 +1377,7 @@ mod tests {
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::empty_for_tests(),
             ad_slots_script: Some(
-                r#"<script>(window._ts=window._ts||{}).adSlots=[];</script>"#.to_string(),
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=[];</script>"#.to_string(),
             ),
             ad_bids_state: state,
         };
@@ -1394,7 +1394,7 @@ mod tests {
 
     #[test]
     fn does_not_inject_ts_bids_when_no_slots_matched() {
-        // No slots matched this URL — ad_slots_script is None. _ts.bids must be
+        // No slots matched this URL — ad_slots_script is None. tsjs.bids must be
         // omitted entirely so the publisher's existing client-side GPT flow is
         // unmodified (spec §8: "Existing client-side Prebid/GPT flow runs unmodified").
         let state = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -1413,7 +1413,7 @@ mod tests {
         let html = std::str::from_utf8(&output).expect("should be utf8");
         assert!(
             !html.contains(".bids=JSON.parse"),
-            "should NOT inject _ts.bids when no slots matched"
+            "should NOT inject tsjs.bids when no slots matched"
         );
     }
 }

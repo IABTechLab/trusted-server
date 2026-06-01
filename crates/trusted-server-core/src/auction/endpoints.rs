@@ -64,7 +64,7 @@ use super::AuctionOrchestrator;
 /// **SPA navigation** is handled by `GET /__ts/page-bids`: the client-side SPA
 /// hook (`installSpaAuctionHook`) intercepts `pushState`/`replaceState`/`popstate`
 /// events and calls that endpoint to fetch fresh slots and bids for each new
-/// route, then invokes `window._ts.adInit()` with the updated data.
+/// route, then invokes `window.tsjs.adInit()` with the updated data.
 ///
 /// **Scroll and GPT refresh** are owned by slim-Prebid in Phase 1: it runs
 /// post-`window.load`, listens for GPT refresh events, and runs client-side

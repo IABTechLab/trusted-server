@@ -49,8 +49,9 @@ mod creative_opportunities {
         #[serde(default = "default_price_granularity")]
         pub price_granularity: String,
         /// Deserialized as raw JSON values so build.rs can validate slot IDs
-        /// without pulling in the full runtime type.
-        #[serde(default, rename = "slot")]
+        /// without pulling in the full runtime type. Uses vec_from_seq_or_map
+        /// so env var JSON blobs (strings) deserialize correctly.
+        #[serde(default, rename = "slot", deserialize_with = "crate::settings::vec_from_seq_or_map")]
         pub slot_raw: Vec<serde_json::Value>,
         /// Typed slot vec — always empty in the build context; exists only so
         /// settings.rs (included via #[path]) compiles against the stub.

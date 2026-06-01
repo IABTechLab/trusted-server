@@ -26,6 +26,7 @@
 **What:** Add three new `Option<String>` fields to `Bid`. Since Rust struct literals are exhaustive, every place that constructs a `Bid { ... }` in the codebase will fail to compile until the new fields are added. Fix all of them with `None` defaults (except the APS provider which constructs a real `Bid` — also `None` since APS doesn't use PBS Cache).
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/types.rs:200` (after `ad_id` field)
 - Modify (test helpers/literals — add `None` fields):
   - `crates/trusted-server-core/src/auction/types.rs:314` (`make_bid` helper)
@@ -97,6 +98,7 @@
 - [ ] **Step 4: Fix inline `Bid` literal in `types.rs` (line ~445)**
 
   Find the `Bid {` literal around line 445 in the test section of `types.rs`. Add:
+
   ```rust
   cache_id: None,
   cache_host: None,
@@ -106,6 +108,7 @@
 - [ ] **Step 5: Fix `make_bid` helper in `publisher.rs` (line ~2616)**
 
   In the `make_bid` test helper function in `publisher.rs`, add to the `Bid {}` literal:
+
   ```rust
   cache_id: None,
   cache_host: None,
@@ -115,6 +118,7 @@
 - [ ] **Step 6: Fix inline `Bid` literal in `publisher.rs` (line ~2714)**
 
   Find the `Bid {` literal around line 2714 in `publisher.rs` tests. Add:
+
   ```rust
   cache_id: None,
   cache_host: None,
@@ -124,6 +128,7 @@
 - [ ] **Step 7: Fix five `Bid` literals in `orchestrator.rs` (lines ~1121,1138,1278,1325,1358)**
 
   Add to each of the five `Bid {}` literals in the test section of `orchestrator.rs`:
+
   ```rust
   cache_id: None,
   cache_host: None,
@@ -133,6 +138,7 @@
 - [ ] **Step 8: Fix APS production `Bid` construction in `aps.rs` (line ~442)**
 
   In `aps.rs`, inside `parse_aps_response` (or wherever the `Ok(Bid { ... })` is around line 442), add:
+
   ```rust
   cache_id: None,
   cache_host: None,
@@ -183,6 +189,7 @@
 **What:** After extracting `ad_id` in `parse_bid`, extract `ext.prebid.cache.bids.cacheId` as `cache_id` and split `ext.prebid.cache.bids.url` into `cache_host` + `cache_path`. Populate all three new fields on the returned `AuctionBid`. Add TDD tests first.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/integrations/prebid.rs:1362–1391` (extraction + struct literal)
 - Test: `crates/trusted-server-core/src/integrations/prebid.rs` (test module near bottom)
 
@@ -441,6 +448,7 @@
 **What:** Change `build_bid_map` to use `bid.cache_id` for `hb_adid` (falling back to `bid.ad_id` for APS/other providers), and emit `hb_cache_host`/`hb_cache_path` when present. Update the existing `bid_map_includes_nurl_and_burl` test (which currently passes `"abc123"` as `ad_id` and asserts `hb_adid = "abc123"`) to use a cache-based bid. Add new tests covering cache fields and fallback path.
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs:1311–1342` (`build_bid_map`)
 - Modify: `crates/trusted-server-core/src/publisher.rs:2608–2630` (`make_bid` helper — add cache params)
 - Modify: `crates/trusted-server-core/src/publisher.rs:2666–2707` (existing `bid_map_includes_nurl_and_burl` test)
@@ -708,9 +716,11 @@
   ```
 
   Run:
+
   ```bash
   cargo test --package trusted-server-core bid_with_cache_fields_round_trips 2>&1 | tail -5
   ```
+
   Expected: PASS.
 
 - [ ] **Step 7: Run full CI suite**

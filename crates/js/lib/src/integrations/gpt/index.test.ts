@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 interface SlotRenderEvent {
   isEmpty: boolean;
@@ -8,7 +8,7 @@ interface SlotRenderEvent {
   };
 }
 
-type TsNamespace = {
+type TsjsApi = {
   adSlots?: unknown;
   bids?: unknown;
   adInit?: () => void;
@@ -20,14 +20,14 @@ type TsNamespace = {
 
 type TestWindow = Window & {
   googletag?: unknown;
-  _ts?: TsNamespace;
+  tsjs?: TsjsApi;
 };
 
 describe('installTsAdInit', () => {
   beforeEach(() => {
     vi.resetModules();
     const tw = window as TestWindow;
-    delete tw._ts;
+    delete tw.tsjs;
     // jsdom does not implement navigator.sendBeacon; polyfill it for tests
     if (!('sendBeacon' in navigator)) {
       Object.defineProperty(navigator, 'sendBeacon', {
@@ -36,9 +36,20 @@ describe('installTsAdInit', () => {
         configurable: true,
       });
     }
+    // adInit now queries the DOM for div elements by id/prefix — create the
+    // test div so getElementById and querySelector both resolve correctly.
+    if (!document.getElementById('div-atf-sidebar')) {
+      const div = document.createElement('div');
+      div.id = 'div-atf-sidebar';
+      document.body.appendChild(div);
+    }
   });
 
-  it('reads window._ts.bids synchronously and applies bid targeting before refresh', async () => {
+  afterEach(() => {
+    document.getElementById('div-atf-sidebar')?.remove();
+  });
+
+  it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
       setTargeting: vi.fn().mockReturnThis(),
@@ -47,6 +58,7 @@ describe('installTsAdInit', () => {
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
       addEventListener: vi.fn(),
       refresh: vi.fn(),
     };
@@ -56,7 +68,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -81,7 +93,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
 
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
@@ -104,6 +116,7 @@ describe('installTsAdInit', () => {
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
       refresh: vi.fn(),
       addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
@@ -115,7 +128,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -138,7 +151,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
 
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
@@ -160,6 +173,7 @@ describe('installTsAdInit', () => {
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
       refresh: vi.fn(),
       addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
@@ -171,7 +185,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -193,7 +207,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
 
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
@@ -220,6 +234,7 @@ describe('installTsAdInit', () => {
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlotNoMatch]),
       refresh: vi.fn(),
       addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
@@ -231,7 +246,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -254,7 +269,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
     capturedListener!({ isEmpty: false, slot: mockSlotNoMatch });
 
     expect(beaconSpy).not.toHaveBeenCalled();
@@ -277,6 +292,7 @@ describe('installTsAdInit', () => {
     };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
       refresh: vi.fn(),
       addEventListener: vi.fn((event: string, fn: (e: SlotRenderEvent) => void) => {
         if (event === 'slotRenderEnded') capturedListener = fn;
@@ -288,7 +304,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -305,7 +321,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
 
     capturedListener!({ isEmpty: false, slot: arenaSlot });
 
@@ -313,9 +329,16 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('calls refresh even when _ts.bids is empty (graceful fallback)', async () => {
+  it('calls refresh even when tsjs.bids is empty (graceful fallback)', async () => {
+    const emptyTestSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
     const mockPubads = {
       enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([emptyTestSlot]),
       addEventListener: vi.fn(),
       refresh: vi.fn(),
     };
@@ -328,7 +351,7 @@ describe('installTsAdInit', () => {
       pubads: vi.fn().mockReturnValue(mockPubads),
       enableServices: vi.fn(),
     };
-    (window as TestWindow)._ts = {
+    (window as TestWindow).tsjs = {
       adSlots: [
         {
           id: 'atf_sidebar_ad',
@@ -343,7 +366,7 @@ describe('installTsAdInit', () => {
 
     const { installTsAdInit } = await import('./index');
     installTsAdInit();
-    (window as TestWindow)._ts!.adInit!();
+    (window as TestWindow).tsjs!.adInit!();
 
     expect(mockPubads.refresh).toHaveBeenCalled();
   });

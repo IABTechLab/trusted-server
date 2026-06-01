@@ -20,6 +20,26 @@ export interface AdUnit {
   bids?: Bid[];
 }
 
+/** Minimal shape of a server-side auction slot injected into `window.tsjs.adSlots`. */
+export interface AuctionSlot {
+  id: string;
+  gam_unit_path: string;
+  div_id: string;
+  formats: Array<[number, number]>;
+  targeting?: Record<string, string>;
+}
+
+/** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
+export interface AuctionBidData {
+  hb_pb?: string;
+  hb_bidder?: string;
+  hb_adid?: string;
+  hb_cache_host?: string;
+  hb_cache_path?: string;
+  nurl?: string;
+  burl?: string;
+}
+
 export interface TsjsApi {
   version: string;
   que: Array<() => void>;
@@ -41,4 +61,20 @@ export interface TsjsApi {
     error(...args: unknown[]): void;
     debug(...args: unknown[]): void;
   };
+
+  // ── Server-side auction runtime (populated by TS edge injection) ──────────
+  /** Ad slot definitions injected at <head> open. */
+  adSlots?: AuctionSlot[];
+  /** Winning bid targeting data injected before </body>. */
+  bids?: Record<string, AuctionBidData>;
+  /** Initialises GPT slots with server-side bid targeting and calls refresh(). */
+  adInit?: () => void;
+  /** GPT slot objects TS defined — used to destroy stale slots on SPA navigation. */
+  prevGptSlots?: unknown[];
+  /** Guards one-time-per-page enableSingleRequest/enableServices calls. */
+  servicesEnabled?: boolean;
+  /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
+  divToSlotId?: Record<string, string>;
+  /** Guards SPA pushState hook installation. */
+  spaHookInstalled?: boolean;
 }
