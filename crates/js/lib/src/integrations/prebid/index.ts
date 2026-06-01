@@ -342,16 +342,10 @@ export { pbjs };
 export default installPrebidNpm;
 
 // ─── TS pbRender bridge ────────────────────────────────────────────────────
-//
-// When a GAM Prebid line item fires, the `pbRender` creative sends a
-// "Prebid Request" postMessage via a MessageChannel looking for Prebid.js.
-// For server-side TS bids, Prebid.js doesn't have the bid in its store because
-// the auction ran at the edge.  This bridge intercepts those requests, fetches
-// the ad from PBS Cache using the targeting keys TS already forwarded to GAM,
-// and replies with a "Prebid Response" so the creative renders correctly.
-//
-// The bridge reads `window.tsjs.bids` live on every message so SPA navigation
-// updates are handled automatically without re-registration.
+// NOTE: The bridge implementation lives in gpt/index.ts (installTsRenderBridge)
+// to avoid pulling the full Prebid bundle into tsjs-gpt.js via
+// inlineDynamicImports. The export below is kept for direct use by the Prebid
+// bundle when slim-Prebid ships in Phase B.
 
 /** Minimal display renderer — set as `window.render` inside the ad iframe. */
 const TS_DISPLAY_RENDERER = `(function(){window.render=function(d,h,w){var doc=w.document;var f=h.mkFrame(doc,{width:d.width||'100%',height:d.height||'100%'});if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}doc.body.appendChild(f);};})();`;

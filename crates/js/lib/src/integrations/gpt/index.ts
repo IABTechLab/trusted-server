@@ -399,9 +399,6 @@ export function installSpaAuctionHook(): void {
  *
  * Phase 1: no-op unless `window.__tsjs_slim_prebid_url` is set (the slim
  * bundle build target ships in a later phase).
- *
- * The TS pbRender bridge (`installTsRenderBridge`) is registered separately
- * at module init so it activates with the existing tsjs-prebid.min.js bundle.
  */
 export function installSlimPrebidLoader(): void {
   const url = (window as GptWindow).__tsjs_slim_prebid_url;
@@ -414,21 +411,91 @@ export function installSlimPrebidLoader(): void {
   });
 }
 
+/** Minimal display renderer injected into the ad iframe by pbRender. */
+const TS_DISPLAY_RENDERER =
+  '(function(){window.render=function(d,h,w){' +
+  'var f=h.mkFrame(w.document,{width:d.width||"100%",height:d.height||"100%"});' +
+  'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
+  'w.document.body.appendChild(f);};})();';
+
 /**
- * Install the TS pbRender bridge post-load.
+ * Install the TS → pbRender bridge.
  *
- * Intercepts Prebid cross-domain `"Prebid Request"` messages for TS
- * server-side bids, fetches the creative from PBS Cache, and replies so the
- * GAM Prebid Universal Creative renders without Prebid.js's local bid store.
- * Runs with the existing tsjs-prebid.min.js bundle — no slim-Prebid needed.
+ * Must be installed synchronously at module init — before `adInit()` fires
+ * `refresh()`, which triggers GAM to serve the Prebid creative. Installing
+ * post-load would miss first-impression `"Prebid Request"` messages.
+ *
+ * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
+ * has PBS Cache coordinates, the bridge:
+ *   1. Fetches the ad markup from PBS Cache.
+ *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
+ *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
+ *      the message and log spurious failures.
+ *
+ * Lives in gpt/index.ts (not prebid/index.ts) to avoid pulling the full
+ * Prebid bundle into tsjs-gpt.js via inlineDynamicImports.
  */
-function installTsRenderBridgePostLoad(): void {
-  window.addEventListener('load', () => {
-    import('../prebid/index').then(({ installTsRenderBridge }) => {
-      installTsRenderBridge();
-    }).catch(() => {
-      // Prebid bundle not available — bridge skipped silently.
-    });
+export function installTsRenderBridge(): void {
+  if (typeof window === 'undefined') return;
+
+  window.addEventListener('message', (e: MessageEvent) => {
+    let data: Record<string, unknown>;
+    try {
+      data =
+        typeof e.data === 'object'
+          ? (e.data as Record<string, unknown>)
+          : (JSON.parse(e.data as string) as Record<string, unknown>);
+    } catch {
+      return;
+    }
+
+    if (data['message'] !== 'Prebid Request') return;
+    const adId = data['adId'] as string | undefined;
+    if (!adId) return;
+
+    const port = e.ports?.[0];
+    if (!port) return;
+
+    // Build reverse map adId → slotId from live window.tsjs.bids.
+    const bids = window.tsjs?.bids ?? {};
+    let slotId: string | undefined;
+    let matchedBid: (typeof bids)[string] | undefined;
+    for (const [sid, bid] of Object.entries(bids)) {
+      if (bid.hb_adid === adId) {
+        slotId = sid;
+        matchedBid = bid;
+        break;
+      }
+    }
+
+    // Not a TS bid — let Prebid.js handle it.
+    if (!slotId || !matchedBid?.hb_cache_host || !matchedBid?.hb_cache_path) return;
+
+    // TS owns this adId — stop Prebid from also processing it.
+    e.stopImmediatePropagation();
+
+    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    fetch(cacheUrl, { mode: 'cors' })
+      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
+      .then((ad) => {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad,
+            renderer: TS_DISPLAY_RENDERER,
+            width,
+            height,
+          }),
+        );
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
+      })
+      .catch((err) => {
+        log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
+      });
   });
 }
 
@@ -452,5 +519,5 @@ if (typeof window !== 'undefined') {
   installTsAdInit();
   installSpaAuctionHook();
   installSlimPrebidLoader();
-  installTsRenderBridgePostLoad();
+  installTsRenderBridge();
 }
