@@ -82,12 +82,15 @@ describe('installTsAdInit', () => {
         atf_sidebar_ad: {
           hb_pb: '1.00',
           hb_bidder: 'kargo',
-          hb_adid: 'abc',
+          hb_adid: 'abc-uuid',
+          hb_cache_host: 'cache.example.com',
+          hb_cache_path: '/pbc/v1/cache',
           nurl: 'https://ssp/win',
           burl: 'https://ssp/bill',
         },
       },
-    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
 
     const fetchSpy = vi.spyOn(global, 'fetch');
 
@@ -98,6 +101,9 @@ describe('installTsAdInit', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '1.00');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_bidder', 'kargo');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'abc-uuid');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_host', 'cache.example.com');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_cache_path', '/pbc/v1/cache');
     expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
     expect(mockPubads.refresh).toHaveBeenCalled();
 

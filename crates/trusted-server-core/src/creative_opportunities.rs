@@ -235,7 +235,7 @@ pub struct SlotProviders {
     /// Prebid Server inline bidder parameters.
     ///
     /// When present, these are forwarded directly as `ext.prebid.bidder.*`
-    /// in the OpenRTB request, bypassing PBS stored-request lookup for this slot.
+    /// in the `OpenRTB` request, bypassing PBS stored request lookup for this slot.
     /// Useful in development environments where stored requests are not available.
     pub prebid: Option<PrebidSlotParams>,
 }

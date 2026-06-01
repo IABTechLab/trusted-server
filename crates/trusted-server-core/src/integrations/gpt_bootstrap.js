@@ -68,9 +68,11 @@
           s.setTargeting(e[0], e[1]);
         });
         var b = bids[slot.id] || {};
-        ["hb_pb", "hb_bidder", "hb_adid"].forEach(function (k) {
-          if (b[k]) s.setTargeting(k, b[k]);
-        });
+        ["hb_pb", "hb_bidder", "hb_adid", "hb_cache_host", "hb_cache_path"].forEach(
+          function (k) {
+            if (b[k]) s.setTargeting(k, b[k]);
+          },
+        );
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
         divToSlotId[actualDivId] = slot.id;

@@ -262,9 +262,11 @@ export function installTsAdInit(): void {
 
         Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
         const bid = bids[slot.id] ?? {};
-        (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
-          if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
-        });
+        (['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const).forEach(
+          (key) => {
+            if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
+          },
+        );
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
         divToSlotId[actualDivId] = slot.id;
         if (tsOwned) newSlots.push(gptSlot);
