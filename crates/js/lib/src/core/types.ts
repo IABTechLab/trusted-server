@@ -38,6 +38,8 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   nurl?: string;
   burl?: string;
+  /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
+  adm?: string;
 }
 
 export interface TsjsApi {

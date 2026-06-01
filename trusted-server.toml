@@ -212,6 +212,11 @@ timeout_ms = 1000
 # Inject <!-- ts-debug: ssp=N mediator=ok(N_bids) winning=N --> before </body>.
 # Visible in page source. Disable after investigation.
 # auction_html_comment = true
+#
+# Inject raw adm creative markup into window.tsjs.bids and render it directly
+# into slot divs, bypassing GAM entirely. Use to validate the full
+# auction→creative pipeline without GAM line items. NEVER enable in production.
+# inject_adm_for_testing = true
 # Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
 # Returns a plain-text response with the following fields (Fastly-observed values):
 #   ja4         — JA4 TLS client fingerprint

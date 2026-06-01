@@ -64,10 +64,18 @@
           tsOwned = true;
         }
 
+        // Debug: if adm is present, inject creative directly into div and skip GAM.
+        // Only populated when [debug] inject_adm_for_testing = true in config.
+        var b = bids[slot.id] || {};
+        if (b.adm) {
+          el.innerHTML = b.adm;
+          divToSlotId[actualDivId] = slot.id;
+          return;
+        }
+
         Object.entries(slot.targeting || {}).forEach(function (e) {
           s.setTargeting(e[0], e[1]);
         });
-        var b = bids[slot.id] || {};
         ["hb_pb", "hb_bidder", "hb_adid", "hb_cache_host", "hb_cache_path"].forEach(
           function (k) {
             if (b[k]) s.setTargeting(k, b[k]);

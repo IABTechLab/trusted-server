@@ -516,6 +516,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             &result.winning_bids,
             params.price_granularity,
             &params.ad_bids_state,
+            settings.debug.inject_adm_for_testing,
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
@@ -611,13 +612,14 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
+    inject_adm: bool,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity);
+    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -757,7 +759,12 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     "one_behind_loop: collect complete — {} winning bid(s)",
                     result.winning_bids.len()
                 );
-                write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
+                write_bids_to_state(
+                    &result.winning_bids,
+                    price_granularity,
+                    ad_bids_state,
+                    settings.debug.inject_adm_for_testing,
+                );
 
                 if settings.debug.auction_html_comment {
                     prepend_auction_debug_comment("stream", &result, ad_bids_state);
@@ -1192,7 +1199,12 @@ pub async fn handle_publisher_request(
                     "BufferedProcessed: auction collected — {} winning bid(s)",
                     result.winning_bids.len()
                 );
-                write_bids_to_state(&result.winning_bids, price_granularity, &ad_bids_state);
+                write_bids_to_state(
+                    &result.winning_bids,
+                    price_granularity,
+                    &ad_bids_state,
+                    settings.debug.inject_adm_for_testing,
+                );
 
                 if settings.debug.auction_html_comment {
                     prepend_auction_debug_comment("buffered", &result, &ad_bids_state);
@@ -1311,6 +1323,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
+    inject_adm: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -1354,6 +1367,13 @@ pub(crate) fn build_bid_map(
                 }
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
+                }
+                // Debug: include raw creative markup so adInit() can bypass GAM.
+                // Only set when inject_adm_for_testing is enabled — never in production.
+                if inject_adm {
+                    if let Some(ref adm) = bid.creative {
+                        obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                    }
                 }
                 (slot_id.clone(), serde_json::Value::Object(obj))
             })
@@ -1619,7 +1639,11 @@ pub async fn handle_page_bids(
             std::collections::HashMap::new()
         };
 
-    let bid_map = build_bid_map(&winning_bids, co_config.price_granularity);
+    let bid_map = build_bid_map(
+        &winning_bids,
+        co_config.price_granularity,
+        settings.debug.inject_adm_for_testing,
+    );
 
     let slots_json: Vec<serde_json::Value> = matched_slots
         .iter()
@@ -2699,7 +2723,7 @@ mod tests {
                     "https://ssp/bill",
                 ),
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
             let obj = entry.as_object().expect("should be object");
             assert_eq!(
@@ -2752,7 +2776,7 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -2798,7 +2822,7 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -2842,7 +2866,7 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let obj = map
                 .get("atf_sidebar_ad")
                 .expect("should have bid entry")
@@ -2877,7 +2901,7 @@ mod tests {
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             assert!(
                 map.is_empty(),
                 "slot with no price should be excluded from bid map"

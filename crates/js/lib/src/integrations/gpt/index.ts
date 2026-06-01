@@ -260,8 +260,16 @@ export function installTsAdInit(): void {
           tsOwned = true;
         }
 
-        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
+        // Debug: if adm is present, inject creative directly into div and skip GAM.
+        // Only populated when [debug] inject_adm_for_testing = true in config.
         const bid = bids[slot.id] ?? {};
+        if (bid.adm && el) {
+          el.innerHTML = String(bid.adm);
+          divToSlotId[actualDivId] = slot.id;
+          return;
+        }
+
+        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
         (['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const).forEach(
           (key) => {
             if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));

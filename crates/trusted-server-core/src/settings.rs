@@ -416,6 +416,14 @@ pub struct DebugConfig {
     /// Never enable in production — visible in page source.
     #[serde(default)]
     pub auction_html_comment: bool,
+
+    /// Include raw `adm` creative markup in `window.tsjs.bids` and have
+    /// `adInit()` render it directly into the slot div, bypassing GAM entirely.
+    ///
+    /// Use this to validate the full auction→creative pipeline without GAM
+    /// line items. Never enable in production — injects raw HTML from SSPs.
+    #[serde(default)]
+    pub inject_adm_for_testing: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
