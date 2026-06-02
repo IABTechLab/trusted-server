@@ -333,102 +333,117 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   return pbjs;
 }
 
+// ─── Phase B: GPT scroll/refresh auction handler ──────────────────────────
+
+/**
+ * Install the scroll/refresh auction handler.
+ *
+ * Wraps `googletag.pubads().refresh()` so that when the publisher's GPT
+ * refresh policy fires (sticky anchor, viewability dwell, infinite scroll),
+ * Prebid runs a fresh client-side auction for the refreshing slots before
+ * the GAM call. TS-owned first-impression slots (`ts_initial=1`) are excluded
+ * — they are managed server-side and should not re-auction client-side.
+ *
+ * Must be called after `installPrebidNpm()` and after GPT is loaded.
+ * Idempotent: safe to call multiple times — wraps only once via a sentinel.
+ */
+export function installRefreshHandler(timeoutMs = 1500): void {
+  if (typeof window === 'undefined') return;
+  const g = (window as unknown as { googletag?: { cmd?: { push(fn: () => void): void }; pubads?(): { refresh(slots?: unknown[], opts?: unknown): void; getTargeting?(key: string): string[] } } }).googletag;
+  if (!g?.cmd) return;
+
+  g.cmd.push(() => {
+    const pubads = g.pubads?.();
+    if (!pubads || (pubads as { __tsRefreshWrapped?: boolean }).__tsRefreshWrapped) return;
+    (pubads as { __tsRefreshWrapped?: boolean }).__tsRefreshWrapped = true;
+
+    const originalRefresh = pubads.refresh.bind(pubads);
+    pubads.refresh = function (slots?: unknown[], opts?: unknown) {
+      // For bare refresh() calls (no slots arg), get all registered slots from GPT
+      // so we can filter out TS first-impression slots and auction the rest.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const targetSlots: any[] = slots ?? (pubads as any).getSlots?.() ?? [];
+
+      // Filter out TS first-impression slots — they don't need client-side refresh auctions.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const nonTsSlots = targetSlots.filter(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (s: any) => !s.getTargeting?.('ts_initial')?.includes('1'),
+      );
+
+      if (!nonTsSlots.length) {
+        // All slots are TS-owned — pass through unchanged.
+        return originalRefresh(slots, opts);
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const adUnits = nonTsSlots.map((s: any) => ({
+        code: s.getSlotElementId?.() ?? s,
+        mediaTypes: { banner: { sizes: [[728, 90], [300, 250]] as [number, number][] } },
+        bids: [{ bidder: ADAPTER_CODE, params: { zone: 'refresh' } }],
+      }));
+
+      pbjs.requestBids({
+        adUnits,
+        bidsBackHandler: () => {
+          pbjs.setTargetingForGPTAsync?.();
+          // Refresh only the non-TS slots (pass explicit list so TS slots are not re-refreshed).
+          originalRefresh(nonTsSlots, opts);
+        },
+        timeout: timeoutMs,
+      });
+    };
+
+    log.info('[tsjs-prebid] GPT refresh handler installed');
+  });
+}
+
+/**
+ * Configure Prebid.js userID modules for identity warm-up.
+ *
+ * Runs post-window.load (called from installPrebidNpm after setup).
+ * Writes identity tokens to 1P cookies so the next server-side request
+ * can harvest them for EC graph enrichment.
+ *
+ * **Current state:** This function only configures `pbjs.userSync` settings.
+ * It does NOT import or register any userID modules. Actual module imports
+ * (ID5, sharedID, LiveRamp ATS, Lockr) must be added to this bundle explicitly
+ * — there is currently no `_userIdModules.generated.ts` build step.
+ * Track as Phase B follow-up: add `TSJS_PREBID_USER_ID_MODULES` handling to
+ * `build-all.mjs` (similar to `TSJS_PREBID_ADAPTERS`) and import generated file.
+ */
+export function installUserIdModules(): void {
+  // NOTE: No userID module imports exist yet. `_userIdModules.generated.ts` and
+  // `TSJS_PREBID_USER_ID_MODULES` handling in `build-all.mjs` are not implemented.
+  // This function only configures pbjs.userSync settings; actual module registration
+  // requires the Phase B follow-up described in the docblock above.
+  // Configure sync behavior so modules will run post-window.load when added.
+  try {
+    pbjs.setConfig({
+      userSync: {
+        syncEnabled: true,
+        filterSettings: {
+          all: { bidders: '*', filter: 'include' },
+        },
+        auctionDelay: 0,
+        syncsPerBidder: 5,
+        syncDelay: 3000,
+      },
+    });
+    log.info('[tsjs-prebid] userID modules configured');
+  } catch {
+    // pbjs not ready — userID modules will use defaults
+  }
+}
+
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
+  installRefreshHandler();
+  window.addEventListener('load', () => {
+    installUserIdModules();
+  });
 }
 
 export { pbjs };
 export default installPrebidNpm;
-
-// ─── TS pbRender bridge ────────────────────────────────────────────────────
-// NOTE: The bridge implementation lives in gpt/index.ts (installTsRenderBridge)
-// to avoid pulling the full Prebid bundle into tsjs-gpt.js via
-// inlineDynamicImports. The export below is kept for direct use by the Prebid
-// bundle when slim-Prebid ships in Phase B.
-
-/** Minimal display renderer — set as `window.render` inside the ad iframe. */
-const TS_DISPLAY_RENDERER = `(function(){window.render=function(d,h,w){var doc=w.document;var f=h.mkFrame(doc,{width:d.width||'100%',height:d.height||'100%'});if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}doc.body.appendChild(f);};})();`;
-
-/**
- * Install the TS → pbRender bridge.
- *
- * Listens for Prebid cross-domain `"Prebid Request"` messages on the publisher
- * window. When the `adId` matches a TS server-side bid that has PBS Cache
- * coordinates (`hb_cache_host` / `hb_cache_path`), the bridge fetches the
- * creative markup from PBS Cache and replies with a `"Prebid Response"` so the
- * GAM Prebid creative can render without needing Prebid.js's local bid store.
- *
- * Must be called after `installPrebidNpm()` so `window.__pb_locator__` is set
- * and pbRender can locate this window.
- */
-export function installTsRenderBridge(): void {
-  if (typeof window === 'undefined') return;
-
-  window.addEventListener('message', async (e: MessageEvent) => {
-    let data: Record<string, unknown>;
-    try {
-      data = typeof e.data === 'object' ? e.data : (JSON.parse(e.data as string) as Record<string, unknown>);
-    } catch {
-      return;
-    }
-
-    if (data['message'] !== 'Prebid Request') return;
-    const adId = data['adId'] as string | undefined;
-    if (!adId) return;
-
-    // Only the first port is used — it's channel.port2 from the creative's
-    // MessageChannel; posting to it triggers channel.port1.onmessage.
-    const port = e.ports?.[0];
-    if (!port) return;
-
-    // Build reverse map: hb_adid → slotId from live window.tsjs.bids.
-    // Read live so SPA navigation updates are captured automatically.
-    const bids = window.tsjs?.bids ?? {};
-    let slotId: string | undefined;
-    let matchedBid: typeof bids[string] | undefined;
-    for (const [sid, bid] of Object.entries(bids)) {
-      if (bid.hb_adid === adId) {
-        slotId = sid;
-        matchedBid = bid;
-        break;
-      }
-    }
-
-    if (!slotId || !matchedBid?.hb_cache_host || !matchedBid?.hb_cache_path) {
-      // Not a TS bid — let Prebid.js handle it via its own listener.
-      return;
-    }
-
-    // Fetch ad markup from PBS Cache.
-    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
-    let ad: string;
-    try {
-      const res = await fetch(cacheUrl, { mode: 'cors' });
-      if (!res.ok) return;
-      ad = await res.text();
-    } catch {
-      return;
-    }
-
-    // Look up dimensions from window.tsjs.adSlots.
-    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    const [width, height] = slot?.formats?.[0] ?? [728, 90];
-
-    // Reply with the Prebid Response contract that crossDomain.js expects.
-    port.postMessage(
-      JSON.stringify({
-        message: 'Prebid Response',
-        adId,
-        ad,
-        renderer: TS_DISPLAY_RENDERER,
-        width,
-        height,
-      }),
-    );
-
-    log.debug(`[tsjs-prebid] pbRender bridge served ad for slot '${slotId}' from PBS Cache`);
-  });
-
-  log.info('[tsjs-prebid] TS pbRender bridge installed');
-}

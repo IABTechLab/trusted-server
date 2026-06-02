@@ -1,5 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Track every 'message' EventListener added to window across the entire test
+// file.  This lets the installTsRenderBridge suite remove all accumulated
+// handlers (registered by each vi.resetModules() + import('./index') in the
+// installTsAdInit suite) before dispatching its own events.
+const allMessageHandlers: EventListener[] = [];
+const _origWindowAddEventListener = window.addEventListener.bind(window);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(window as any).addEventListener = function (
+  type: string,
+  handler: EventListenerOrEventListenerObject,
+  options?: unknown,
+) {
+  if (type === 'message') {
+    allMessageHandlers.push(handler as EventListener);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return _origWindowAddEventListener(type, handler as EventListener, options as any);
+};
+
 interface SlotRenderEvent {
   isEmpty: boolean;
   slot: {
@@ -8,19 +27,13 @@ interface SlotRenderEvent {
   };
 }
 
-type TsjsApi = {
-  adSlots?: unknown;
-  bids?: unknown;
-  adInit?: () => void;
-  prevGptSlots?: unknown;
-  servicesEnabled?: boolean;
-  spaHookInstalled?: boolean;
-  divToSlotId?: Record<string, string>;
-};
-
 type TestWindow = Window & {
   googletag?: unknown;
-  tsjs?: TsjsApi;
+  // Typed as `any` to avoid the TypeScript intersection with the global
+  // Window.tsjs declaration (TsjsApi from core/types.ts), which would require
+  // every test fixture to satisfy the full TsjsApi shape.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tsjs?: any;
 };
 
 describe('installTsAdInit', () => {
@@ -335,6 +348,100 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
+  it('calls apstag.setDisplayBids when hb_bidder is aps', async () => {
+    const setDisplayBidsSpy = vi.fn();
+    (window as any).apstag = { setDisplayBids: setDisplayBidsSpy };
+
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
+      },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(setDisplayBidsSpy).toHaveBeenCalled();
+
+    delete (window as any).apstag;
+  });
+
+  it('does not call apstag.setDisplayBids when hb_bidder is not aps', async () => {
+    const setDisplayBidsSpy = vi.fn();
+    (window as any).apstag = { setDisplayBids: setDisplayBidsSpy };
+
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' },
+      },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(setDisplayBidsSpy).not.toHaveBeenCalled();
+
+    delete (window as any).apstag;
+  });
+
   it('calls refresh even when tsjs.bids is empty (graceful fallback)', async () => {
     const emptyTestSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -375,5 +482,124 @@ describe('installTsAdInit', () => {
     (window as TestWindow).tsjs!.adInit!();
 
     expect(mockPubads.refresh).toHaveBeenCalled();
+  });
+});
+
+describe('installTsRenderBridge', () => {
+  let fetchStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.resetModules();
+    // Remove ALL accumulated 'message' handlers from previous test module imports
+    // to prevent stale bridge listeners from intercepting our test event.
+    for (const handler of allMessageHandlers) {
+      window.removeEventListener('message', handler);
+    }
+    allMessageHandlers.length = 0;
+
+    fetchStub = vi.fn();
+    vi.stubGlobal('fetch', fetchStub);
+
+    (window as any).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'test-cache-uuid',
+          hb_bidder: 'kargo',
+          hb_pb: '1.50',
+          hb_cache_host: 'openads.example.com',
+          hb_cache_path: '/cache',
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+      ],
+    };
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (window as any).tsjs;
+  });
+
+  it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
+    const mockAd = '<div>Test Creative</div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(mockAd),
+    } as Response);
+
+    // Capture the bridge's 'message' listener at module-init time.
+    let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
+    const origAdd = window.addEventListener.bind(window);
+    const addSpy = vi.spyOn(window, 'addEventListener').mockImplementation(
+      (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
+        if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        origAdd(type, handler as EventListener, opts as any);
+      },
+    );
+    await import('./index');
+    addSpy.mockRestore(); // Restore only addEventListener — fetchStub must stay stubbed
+
+    expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
+
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+
+    // Dispatch the fake event — bridge listener fires synchronously, then runs
+    // fire-and-forget fetch().then() chains asynchronously.
+    bridgeListener!(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent,
+    );
+
+    // Flush microtasks so the fetch mock resolves and .then chains fire.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(fetchStub).toHaveBeenCalledWith(
+      'https://openads.example.com/cache?uuid=test-cache-uuid',
+      { mode: 'cors' },
+    );
+    expect(stopSpy).toHaveBeenCalled();
+    expect(portMessages).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+    expect(parsed.message).toBe('Prebid Response');
+    expect(parsed.adId).toBe('test-cache-uuid');
+    expect(parsed.ad).toBe(mockAd);
+  });
+
+  it('ignores message when adId does not match any TS bid', async () => {
+    await import('./index');
+    fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'unknown-id' }),
+        ports: [],
+      }),
+    );
+
+    await new Promise<void>((r) => setTimeout(r, 100));
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('ignores non-Prebid messages', async () => {
+    await import('./index');
+    window.dispatchEvent(
+      new MessageEvent('message', { data: JSON.stringify({ message: 'Other' }) }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 50));
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 });

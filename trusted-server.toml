@@ -125,6 +125,7 @@ enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
+# slim_prebid_url = "https://cdn.example.com/tsjs-prebid.min.js"
 
 # Consent forwarding configuration
 # Controls how Trusted Server interprets and forwards privacy consent signals.

@@ -81,6 +81,16 @@ pub struct GptConfig {
     /// Whether to rewrite GPT script URLs in publisher HTML.
     #[serde(default = "default_rewrite_script")]
     pub rewrite_script: bool,
+
+    /// URL for the slim-Prebid bundle loaded post-window.load.
+    ///
+    /// When set, `installSlimPrebidLoader()` in the GPT bundle will load this
+    /// script after `window.load`, enabling scroll/refresh client-side auctions
+    /// and userID module warm-up. Set to the publisher's tsjs-prebid bundle URL.
+    ///
+    /// Override via env var: `TRUSTED_SERVER__INTEGRATIONS__GPT__SLIM_PREBID_URL`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slim_prebid_url: Option<String>,
 }
 
 impl IntegrationConfig for GptConfig {
@@ -451,12 +461,21 @@ impl IntegrationHeadInjector for GptIntegration {
     /// impressions. SPA pushState navigation is also slim-Prebid's domain.
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![
+        let mut scripts = vec![
             "<script>window.__tsjs_gpt_enabled=true;\
              window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                 .to_string(),
             format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
-        ]
+        ];
+
+        if let Some(ref url) = self.config.slim_prebid_url {
+            scripts.push(format!(
+                "<script>window.__tsjs_slim_prebid_url={};</script>",
+                serde_json::to_string(url).expect("should serialize string")
+            ));
+        }
+
+        scripts
     }
 }
 
@@ -502,6 +521,7 @@ mod tests {
             script_url: default_script_url(),
             cache_ttl_seconds: 3600,
             rewrite_script: true,
+            slim_prebid_url: None,
         }
     }
 
@@ -1126,6 +1146,61 @@ mod tests {
         assert_eq!(
             IntegrationHeadInjector::integration_id(integration.as_ref()),
             "gpt"
+        );
+    }
+
+    #[test]
+    fn head_inserts_emits_slim_prebid_url_when_configured() {
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit three head inserts when slim_prebid_url is set"
+        );
+        assert_eq!(
+            inserts[2],
+            r#"<script>window.__tsjs_slim_prebid_url="https://cdn.example.com/tsjs-prebid.min.js";</script>"#,
+            "should emit the slim-Prebid URL as a JSON-encoded string assignment"
+        );
+    }
+
+    #[test]
+    fn head_inserts_omits_slim_prebid_url_when_not_configured() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit exactly two head inserts when slim_prebid_url is absent"
+        );
+        assert!(
+            inserts
+                .iter()
+                .all(|s| !s.contains("__tsjs_slim_prebid_url")),
+            "should not emit slim-Prebid URL tag when not configured"
         );
     }
 }
