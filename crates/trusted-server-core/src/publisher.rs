@@ -1323,7 +1323,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
-    inject_adm: bool,
+    include_adm: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -1368,12 +1368,32 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
-                // Debug: include raw creative markup so adInit() can bypass GAM.
-                // Only set when inject_adm_for_testing is enabled — never in production.
-                if inject_adm {
+                // Include raw creative markup only for explicit debug injection.
+                // The pbRender bridge can use it while PBS Cache is unavailable.
+                if include_adm {
                     if let Some(ref adm) = bid.creative {
                         obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
                     }
+                    obj.insert(
+                        "debug_bid".to_string(),
+                        serde_json::json!({
+                            "slot_id": bid.slot_id,
+                            "price": bid.price,
+                            "currency": bid.currency,
+                            "creative": bid.creative,
+                            "adomain": bid.adomain,
+                            "bidder": bid.bidder,
+                            "width": bid.width,
+                            "height": bid.height,
+                            "nurl": bid.nurl,
+                            "burl": bid.burl,
+                            "ad_id": bid.ad_id,
+                            "cache_id": bid.cache_id,
+                            "cache_host": bid.cache_host,
+                            "cache_path": bid.cache_path,
+                            "metadata": bid.metadata,
+                        }),
+                    );
                 }
                 (slot_id.clone(), serde_json::Value::Object(obj))
             })
@@ -2750,6 +2770,125 @@ mod tests {
                 obj.get("burl").and_then(|v| v.as_str()),
                 Some("https://ssp/bill"),
                 "should include burl"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_omits_adm_by_default() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert!(
+                obj.get("adm").is_none(),
+                "should omit adm when debug injection is disabled"
+            );
+            assert!(
+                obj.get("debug_bid").is_none(),
+                "should omit debug bid when debug injection is disabled"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_includes_adm_when_debug_injection_enabled() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert_eq!(
+                obj.get("adm").and_then(|v| v.as_str()),
+                Some("<div>Creative</div>"),
+                "should include adm when debug injection is enabled"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_includes_debug_bid_when_debug_injection_enabled() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "mocktioneer",
+                "bid-ad-id",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            bid.adomain = Some(vec!["example.com".to_string()]);
+            bid.cache_id = Some("cache-uuid".to_string());
+            bid.cache_host = Some("cache.example".to_string());
+            bid.cache_path = Some("/cache".to_string());
+            bid.metadata.insert(
+                "raw_field".to_string(),
+                serde_json::Value::String("raw-value".to_string()),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            let debug_bid = obj
+                .get("debug_bid")
+                .and_then(|v| v.as_object())
+                .expect("should include debug bid when debug injection is enabled");
+
+            assert_eq!(
+                debug_bid.get("slot_id").and_then(|v| v.as_str()),
+                Some("atf_sidebar_ad"),
+                "should expose original slot id"
+            );
+            assert_eq!(
+                debug_bid.get("bidder").and_then(|v| v.as_str()),
+                Some("mocktioneer"),
+                "should expose original bidder"
+            );
+            assert_eq!(
+                debug_bid.get("ad_id").and_then(|v| v.as_str()),
+                Some("bid-ad-id"),
+                "should expose original bid ad id"
+            );
+            assert_eq!(
+                debug_bid.get("cache_id").and_then(|v| v.as_str()),
+                Some("cache-uuid"),
+                "should expose original PBS cache id"
+            );
+            assert_eq!(
+                debug_bid.get("metadata").and_then(|v| v.get("raw_field")),
+                Some(&serde_json::Value::String("raw-value".to_string())),
+                "should expose provider metadata"
             );
         }
 

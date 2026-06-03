@@ -214,10 +214,9 @@ timeout_ms = 1000
 # Visible in page source. Disable after investigation.
 # auction_html_comment = true
 #
-# Inject raw adm creative markup into window.tsjs.bids and render it directly
-# into slot divs, bypassing GAM entirely. Use to validate the full
-# auction→creative pipeline without GAM line items. NEVER enable in production.
-# inject_adm_for_testing = true
+# Inject raw adm creative markup into window.tsjs.bids for GPT/GAM bridge
+# debugging while PBS Cache is unavailable. NEVER enable in production.
+inject_adm_for_testing = true
 # Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
 # Returns a plain-text response with the following fields (Fastly-observed values):
 #   ja4         — JA4 TLS client fingerprint
@@ -298,4 +297,3 @@ zone = "fixedBottom"
 
 [creative_opportunities.slot.providers.aps]
 slot_id = "aps-slot-homepage-footer"
-

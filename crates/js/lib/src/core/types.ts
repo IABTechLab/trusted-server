@@ -29,6 +29,25 @@ export interface AuctionSlot {
   targeting?: Record<string, string>;
 }
 
+/** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
+export interface AuctionDebugBidData {
+  slot_id?: string;
+  price?: number | null;
+  currency?: string;
+  creative?: string | null;
+  adomain?: string[] | null;
+  bidder?: string;
+  width?: number;
+  height?: number;
+  nurl?: string | null;
+  burl?: string | null;
+  ad_id?: string | null;
+  cache_id?: string | null;
+  cache_host?: string | null;
+  cache_path?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
   hb_pb?: string;
@@ -40,6 +59,8 @@ export interface AuctionBidData {
   burl?: string;
   /** Raw creative markup. Only present when `[debug] inject_adm_for_testing = true`. */
   adm?: string;
+  /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
+  debug_bid?: AuctionDebugBidData;
 }
 
 export interface TsjsApi {

@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
 
 import { installGptGuard } from './script_guard';
 
@@ -186,8 +187,6 @@ export function installGptShim(): boolean {
 // Trusted Server ad-init
 // ------------------------------------------------------------------
 
-import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
-
 /**
  * Install `window.tsjs.adInit`.
  *
@@ -234,15 +233,11 @@ export function installTsAdInit(): void {
           document.querySelector<HTMLElement>(`[id^='${slot.div_id}']:not([id$='-container'])`);
         if (!el) return;
         const actualDivId = el.id;
+        const bid = bids[slot.id] ?? {};
 
-        // Reuse publisher's existing GPT slot when present — avoids duplicate
-        // slot definitions on the same div and lets TS inject bid targeting
-        // onto the slot the publisher already configured in GAM.
-        // If no publisher slot exists yet (async framework race), fall back to
-        // defining TS's own slot so bid targeting still reaches GAM.
-        const existingSlot = g.pubads!().getSlots?.()?.find?.(
-          (s: GoogleTagSlot) => s.getSlotElementId() === actualDivId,
-        );
+        const existingSlot = g.pubads!()
+          .getSlots?.()
+          ?.find?.((s: GoogleTagSlot) => s.getSlotElementId() === actualDivId);
         let gptSlot: GoogleTagSlot;
         let tsOwned = false;
         if (existingSlot) {
@@ -260,20 +255,11 @@ export function installTsAdInit(): void {
           tsOwned = true;
         }
 
-        // Debug: if adm is present, inject creative directly into div and skip GAM.
-        // Only populated when [debug] inject_adm_for_testing = true in config.
-        const bid = bids[slot.id] ?? {};
-        if (bid.adm && el) {
-          el.innerHTML = String(bid.adm);
-          divToSlotId[actualDivId] = slot.id;
-          return;
-        }
-
         Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
         (['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const).forEach(
           (key) => {
             if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
-          },
+          }
         );
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
         divToSlotId[actualDivId] = slot.id;
@@ -426,8 +412,8 @@ const TS_DISPLAY_RENDERER =
  * post-load would miss first-impression `"Prebid Request"` messages.
  *
  * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
- * has PBS Cache coordinates, the bridge:
- *   1. Fetches the ad markup from PBS Cache.
+ * has renderable markup, the bridge:
+ *   1. Uses debug `adm` directly when present, otherwise fetches from PBS Cache.
  *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
  *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
  *      the message and log spurious failures.
@@ -469,14 +455,34 @@ export function installTsRenderBridge(): void {
     }
 
     // Not a TS bid — let Prebid.js handle it.
-    if (!slotId || !matchedBid?.hb_cache_host || !matchedBid?.hb_cache_path) return;
+    if (!slotId || !matchedBid) return;
+
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    if (matchedBid.adm) {
+      e.stopImmediatePropagation();
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          ad: matchedBid.adm,
+          renderer: TS_DISPLAY_RENDERER,
+          width,
+          height,
+        })
+      );
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      return;
+    }
+
+    // No TS render source — let Prebid.js handle it.
+    if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
 
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
 
     const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
-    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    const [width, height] = slot?.formats?.[0] ?? [728, 90];
 
     fetch(cacheUrl, { mode: 'cors' })
       .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
@@ -489,7 +495,7 @@ export function installTsRenderBridge(): void {
             renderer: TS_DISPLAY_RENDERER,
             width,
             height,
-          }),
+          })
         );
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })

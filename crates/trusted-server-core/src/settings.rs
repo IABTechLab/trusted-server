@@ -417,11 +417,12 @@ pub struct DebugConfig {
     #[serde(default)]
     pub auction_html_comment: bool,
 
-    /// Include raw `adm` creative markup in `window.tsjs.bids` and have
-    /// `adInit()` render it directly into the slot div, bypassing GAM entirely.
+    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
+    /// debug rendering through the Prebid Universal Creative bridge.
     ///
-    /// Use this to validate the full auction→creative pipeline without GAM
-    /// line items. Never enable in production — injects raw HTML from SSPs.
+    /// Use this to validate the server-side auction→GAM targeting→creative
+    /// rendering pipeline while PBS Cache is unavailable. Never enable in
+    /// production — injects raw HTML from SSPs.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
 }

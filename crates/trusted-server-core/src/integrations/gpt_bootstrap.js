@@ -23,6 +23,7 @@
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
     var divToSlotId = {};
+
     googletag.cmd.push(function () {
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
@@ -40,12 +41,8 @@
           );
         if (!el) return;
         var actualDivId = el.id;
+        var b = bids[slot.id] || {};
 
-        // Reuse publisher's existing GPT slot when present — avoids duplicate
-        // slot definitions on the same div and lets TS inject bid targeting
-        // onto the slot the publisher already configured in GAM.
-        // If no publisher slot exists yet (async framework race), fall back to
-        // defining TS's own slot so bid targeting still reaches GAM.
         var existingSlots = googletag.pubads().getSlots();
         var s =
           existingSlots.find(function (gs) {
@@ -64,23 +61,18 @@
           tsOwned = true;
         }
 
-        // Debug: if adm is present, inject creative directly into div and skip GAM.
-        // Only populated when [debug] inject_adm_for_testing = true in config.
-        var b = bids[slot.id] || {};
-        if (b.adm) {
-          el.innerHTML = b.adm;
-          divToSlotId[actualDivId] = slot.id;
-          return;
-        }
-
         Object.entries(slot.targeting || {}).forEach(function (e) {
           s.setTargeting(e[0], e[1]);
         });
-        ["hb_pb", "hb_bidder", "hb_adid", "hb_cache_host", "hb_cache_path"].forEach(
-          function (k) {
-            if (b[k]) s.setTargeting(k, b[k]);
-          },
-        );
+        [
+          "hb_pb",
+          "hb_bidder",
+          "hb_adid",
+          "hb_cache_host",
+          "hb_cache_path",
+        ].forEach(function (k) {
+          if (b[k]) s.setTargeting(k, b[k]);
+        });
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
         divToSlotId[actualDivId] = slot.id;
@@ -93,23 +85,21 @@
         googletag.pubads().enableSingleRequest();
         googletag.enableServices();
         ts.servicesEnabled = true;
-        googletag
-          .pubads()
-          .addEventListener("slotRenderEnded", function (ev) {
-            var divId = ev.slot.getSlotElementId();
-            var slotId = (ts.divToSlotId || {})[divId];
-            if (!slotId) return;
-            var b = (ts.bids || {})[slotId] || {};
-            var ourBidWon =
-              !ev.isEmpty &&
-              (b.hb_adid
-                ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
-                : !!b.hb_bidder);
-            if (ourBidWon) {
-              if (b.nurl) navigator.sendBeacon(b.nurl);
-              if (b.burl) navigator.sendBeacon(b.burl);
-            }
-          });
+        googletag.pubads().addEventListener("slotRenderEnded", function (ev) {
+          var divId = ev.slot.getSlotElementId();
+          var slotId = (ts.divToSlotId || {})[divId];
+          if (!slotId) return;
+          var b = (ts.bids || {})[slotId] || {};
+          var ourBidWon =
+            !ev.isEmpty &&
+            (b.hb_adid
+              ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
+              : !!b.hb_bidder);
+          if (ourBidWon) {
+            if (b.nurl) navigator.sendBeacon(b.nurl);
+            if (b.burl) navigator.sendBeacon(b.burl);
+          }
+        });
       }
       if (slotsToRefresh.length > 0) {
         googletag.pubads().refresh(slotsToRefresh);

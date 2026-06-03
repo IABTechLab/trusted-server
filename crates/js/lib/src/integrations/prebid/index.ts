@@ -349,7 +349,17 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
  */
 export function installRefreshHandler(timeoutMs = 1500): void {
   if (typeof window === 'undefined') return;
-  const g = (window as unknown as { googletag?: { cmd?: { push(fn: () => void): void }; pubads?(): { refresh(slots?: unknown[], opts?: unknown): void; getTargeting?(key: string): string[] } } }).googletag;
+  const g = (
+    window as unknown as {
+      googletag?: {
+        cmd?: { push(fn: () => void): void };
+        pubads?(): {
+          refresh(slots?: unknown[], opts?: unknown): void;
+          getTargeting?(key: string): string[];
+        };
+      };
+    }
+  ).googletag;
   if (!g?.cmd) return;
 
   g.cmd.push(() => {
@@ -365,10 +375,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       const targetSlots: any[] = slots ?? (pubads as any).getSlots?.() ?? [];
 
       // Filter out TS first-impression slots — they don't need client-side refresh auctions.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const nonTsSlots = targetSlots.filter(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (s: any) => !s.getTargeting?.('ts_initial')?.includes('1'),
+        (s: any) => !s.getTargeting?.('ts_initial')?.includes('1')
       );
 
       if (!nonTsSlots.length) {
@@ -379,7 +388,14 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const adUnits = nonTsSlots.map((s: any) => ({
         code: s.getSlotElementId?.() ?? s,
-        mediaTypes: { banner: { sizes: [[728, 90], [300, 250]] as [number, number][] } },
+        mediaTypes: {
+          banner: {
+            sizes: [
+              [728, 90],
+              [300, 250],
+            ] as [number, number][],
+          },
+        },
         bids: [{ bidder: ADAPTER_CODE, params: { zone: 'refresh' } }],
       }));
 

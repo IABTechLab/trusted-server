@@ -89,7 +89,7 @@ impl IntegrationConfig for AdServerMockConfig {
 // ============================================================================
 
 /// Lookup index built from original SSP bids during `request_bids`, consumed
-/// during `parse_response` to restore `nurl`/`burl`/`ad_id` that the mock
+/// during `parse_response` to restore render/accounting fields that the mock
 /// mediator endpoint does not echo back.
 ///
 /// Keyed by `(provider_name, slot_id, bidder_name)`.
@@ -98,7 +98,7 @@ type BidIndex = HashMap<(String, String, String), Bid>;
 /// Mock ad server mediator provider.
 pub struct AdServerMockProvider {
     config: AdServerMockConfig,
-    /// Bridges SSP bid metadata (`nurl`/`burl`/`ad_id`) from `request_bids` to `parse_response`.
+    /// Bridges SSP bid metadata from `request_bids` to `parse_response`.
     bid_index: Mutex<Option<BidIndex>>,
 }
 
@@ -226,7 +226,7 @@ impl AdServerMockProvider {
     /// Mediation returns decoded prices for all bids (including APS bids that were encoded).
     ///
     /// `bid_index` is the SSP-bid lookup built in `request_bids`. The mock mediator
-    /// does not echo `nurl`/`burl`/`ad_id` back, so they are restored from the index
+    /// does not echo render/accounting fields back, so they are restored from the index
     /// using `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
     fn parse_mediation_response(
@@ -249,16 +249,18 @@ impl AdServerMockProvider {
                 let slot_id = bid["impid"].as_str().unwrap_or("").to_string();
 
                 // Recover bidder name from crid ("{bidder}-creative") to look up the
-                // original SSP bid and restore nurl/burl/ad_id the mediator drops.
+                // original SSP bid and restore render/accounting fields the mediator drops.
                 let crid = bid["crid"].as_str().unwrap_or("");
                 let bidder = crid.strip_suffix("-creative").unwrap_or_else(|| {
                     log::debug!(
-                        "adserver_mock: crid '{crid}' does not match '<bidder>-creative' — dropping nurl/burl/ad_id"
+                        "adserver_mock: crid '{crid}' does not match '<bidder>-creative'; render/accounting fields may be missing"
                     );
                     ""
                 });
                 let key = (seat_name.to_string(), slot_id.clone(), bidder.to_string());
                 let original = bid_index.get(&key);
+                let restored_bidder =
+                    original.map_or_else(|| seat_name.to_string(), |b| b.bidder.clone());
 
                 let width = bid["w"].as_u64().unwrap_or(0) as u32;
                 let height = bid["h"].as_u64().unwrap_or(0) as u32;
@@ -276,7 +278,7 @@ impl AdServerMockProvider {
                     creative: bid["adm"].as_str().map(String::from),
                     width,
                     height,
-                    bidder: seat_name.to_string(),
+                    bidder: restored_bidder,
                     adomain: bid["adomain"].as_array().map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(String::from))
@@ -285,9 +287,9 @@ impl AdServerMockProvider {
                     nurl: original.and_then(|b| b.nurl.clone()),
                     burl: original.and_then(|b| b.burl.clone()),
                     ad_id: original.and_then(|b| b.ad_id.clone()),
-                    cache_id: None,
-                    cache_host: None,
-                    cache_path: None,
+                    cache_id: original.and_then(|b| b.cache_id.clone()),
+                    cache_host: original.and_then(|b| b.cache_host.clone()),
+                    cache_path: original.and_then(|b| b.cache_path.clone()),
                     metadata: HashMap::new(),
                 });
             }
@@ -663,6 +665,98 @@ mod tests {
         assert_eq!(bid.bidder, "test-bidder");
         assert_eq!(bid.width, 728);
         assert_eq!(bid.height, 90);
+    }
+
+    #[test]
+    fn parse_mediation_response_restores_original_bid_render_fields() {
+        let provider = AdServerMockProvider::new(AdServerMockConfig::default());
+        let mediation_response = json!({
+            "id": "test-auction-123",
+            "seatbid": [
+                {
+                    "seat": "prebid",
+                    "bid": [
+                        {
+                            "id": "mediated-bid-001",
+                            "impid": "header-banner",
+                            "price": 0.20,
+                            "adm": "<div>Mediated Ad</div>",
+                            "w": 728,
+                            "h": 90,
+                            "crid": "mocktioneer-creative",
+                            "adomain": ["example.com"]
+                        }
+                    ]
+                }
+            ],
+            "cur": "USD"
+        });
+        let mut bid_index = BidIndex::new();
+        bid_index.insert(
+            (
+                "prebid".to_string(),
+                "header-banner".to_string(),
+                "mocktioneer".to_string(),
+            ),
+            Bid {
+                slot_id: "header-banner".to_string(),
+                price: Some(0.20),
+                currency: "USD".to_string(),
+                creative: Some("<div>Original Ad</div>".to_string()),
+                adomain: Some(vec!["example.com".to_string()]),
+                bidder: "mocktioneer".to_string(),
+                width: 728,
+                height: 90,
+                nurl: Some("https://ssp.example/win".to_string()),
+                burl: Some("https://ssp.example/bill".to_string()),
+                ad_id: Some("bid-impression-id".to_string()),
+                cache_id: Some("cache-uuid".to_string()),
+                cache_host: Some("cache.example".to_string()),
+                cache_path: Some("/cache".to_string()),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let auction_response =
+            provider.parse_mediation_response(&mediation_response, 42, &bid_index);
+
+        assert_eq!(auction_response.status, BidStatus::Success);
+        assert_eq!(auction_response.bids.len(), 1);
+        let bid = &auction_response.bids[0];
+        assert_eq!(
+            bid.bidder, "mocktioneer",
+            "should preserve underlying bidder for hb_bidder targeting"
+        );
+        assert_eq!(
+            bid.nurl.as_deref(),
+            Some("https://ssp.example/win"),
+            "should restore nurl"
+        );
+        assert_eq!(
+            bid.burl.as_deref(),
+            Some("https://ssp.example/bill"),
+            "should restore burl"
+        );
+        assert_eq!(
+            bid.ad_id.as_deref(),
+            Some("bid-impression-id"),
+            "should restore ad_id"
+        );
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("cache-uuid"),
+            "should restore PBS cache UUID"
+        );
+        assert_eq!(
+            bid.cache_host.as_deref(),
+            Some("cache.example"),
+            "should restore PBS cache host"
+        );
+        assert_eq!(
+            bid.cache_path.as_deref(),
+            Some("/cache"),
+            "should restore PBS cache path"
+        );
     }
 
     #[test]

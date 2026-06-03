@@ -10,7 +10,7 @@ const _origWindowAddEventListener = window.addEventListener.bind(window);
 (window as any).addEventListener = function (
   type: string,
   handler: EventListenerOrEventListenerObject,
-  options?: unknown,
+  options?: unknown
 ) {
   if (type === 'message') {
     allMessageHandlers.push(handler as EventListener);
@@ -29,6 +29,7 @@ interface SlotRenderEvent {
 
 type TestWindow = Window & {
   googletag?: unknown;
+  apstag?: { setDisplayBids?: () => void };
   // Typed as `any` to avoid the TypeScript intersection with the global
   // Window.tsjs declaration (TsjsApi from core/types.ts), which would require
   // every test fixture to satisfy the full TsjsApi shape.
@@ -102,7 +103,7 @@ describe('installTsAdInit', () => {
           burl: 'https://ssp/bill',
         },
       },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
     const fetchSpy = vi.spyOn(global, 'fetch');
@@ -121,6 +122,61 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).toHaveBeenCalled();
 
     fetchSpy.mockRestore();
+  });
+
+  it('keeps the GAM path when debug adm is present', async () => {
+    const slotEl = document.getElementById('div-atf-sidebar')!;
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue(['debug-uuid']),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const destroySlots = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      destroySlots,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: { pos: 'atf' },
+        },
+      ],
+      bids: {
+        atf_sidebar_ad: {
+          hb_pb: '0.20',
+          hb_bidder: 'mocktioneer',
+          hb_adid: 'debug-uuid',
+          adm: '<div>Debug creative</div>',
+        },
+      },
+    };
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(slotEl.innerHTML).toBe('');
+    expect(destroySlots).not.toHaveBeenCalledWith([mockSlot]);
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_pb', '0.20');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_bidder', 'mocktioneer');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('hb_adid', 'debug-uuid');
+    expect(mockSlot.setTargeting).toHaveBeenCalledWith('ts_initial', '1');
+    expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
 
   it('fires both nurl and burl via sendBeacon on slotRenderEnded when our bid won', async () => {
@@ -350,7 +406,7 @@ describe('installTsAdInit', () => {
 
   it('calls apstag.setDisplayBids when hb_bidder is aps', async () => {
     const setDisplayBidsSpy = vi.fn();
-    (window as any).apstag = { setDisplayBids: setDisplayBidsSpy };
+    (window as TestWindow).apstag = { setDisplayBids: setDisplayBidsSpy };
 
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -383,7 +439,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.50', hb_bidder: 'aps', nurl: '', burl: '' },
       },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
     const { installTsAdInit } = await import('./index');
@@ -392,12 +448,12 @@ describe('installTsAdInit', () => {
 
     expect(setDisplayBidsSpy).toHaveBeenCalled();
 
-    delete (window as any).apstag;
+    delete (window as TestWindow).apstag;
   });
 
   it('does not call apstag.setDisplayBids when hb_bidder is not aps', async () => {
     const setDisplayBidsSpy = vi.fn();
-    (window as any).apstag = { setDisplayBids: setDisplayBidsSpy };
+    (window as TestWindow).apstag = { setDisplayBids: setDisplayBidsSpy };
 
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -430,7 +486,7 @@ describe('installTsAdInit', () => {
       bids: {
         atf_sidebar_ad: { hb_pb: '1.00', hb_bidder: 'kargo' },
       },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
     const { installTsAdInit } = await import('./index');
@@ -439,7 +495,7 @@ describe('installTsAdInit', () => {
 
     expect(setDisplayBidsSpy).not.toHaveBeenCalled();
 
-    delete (window as any).apstag;
+    delete (window as TestWindow).apstag;
   });
 
   it('calls refresh even when tsjs.bids is empty (graceful fallback)', async () => {
@@ -500,7 +556,7 @@ describe('installTsRenderBridge', () => {
     fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
 
-    (window as any).tsjs = {
+    (window as TestWindow).tsjs = {
       bids: {
         homepage_header: {
           hb_adid: 'test-cache-uuid',
@@ -524,7 +580,7 @@ describe('installTsRenderBridge', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    delete (window as any).tsjs;
+    delete (window as TestWindow).tsjs;
   });
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
@@ -537,13 +593,15 @@ describe('installTsRenderBridge', () => {
     // Capture the bridge's 'message' listener at module-init time.
     let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
     const origAdd = window.addEventListener.bind(window);
-    const addSpy = vi.spyOn(window, 'addEventListener').mockImplementation(
-      (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
-        if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        origAdd(type, handler as EventListener, opts as any);
-      },
-    );
+    const addSpy = vi
+      .spyOn(window, 'addEventListener')
+      .mockImplementation(
+        (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
+          if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          origAdd(type, handler as EventListener, opts as any);
+        }
+      );
     await import('./index');
     addSpy.mockRestore(); // Restore only addEventListener — fetchStub must stay stubbed
 
@@ -560,7 +618,7 @@ describe('installTsRenderBridge', () => {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
         ports: [fakePort],
         stopImmediatePropagation: stopSpy,
-      }) as unknown as MessageEvent,
+      }) as unknown as MessageEvent
     );
 
     // Flush microtasks so the fetch mock resolves and .then chains fire.
@@ -568,7 +626,7 @@ describe('installTsRenderBridge', () => {
 
     expect(fetchStub).toHaveBeenCalledWith(
       'https://openads.example.com/cache?uuid=test-cache-uuid',
-      { mode: 'cors' },
+      { mode: 'cors' }
     );
     expect(stopSpy).toHaveBeenCalled();
     expect(portMessages).toHaveLength(1);
@@ -579,6 +637,70 @@ describe('installTsRenderBridge', () => {
     expect(parsed.ad).toBe(mockAd);
   });
 
+  it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
+    const debugAdm = '<div>Debug Creative</div>';
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'debug-adid',
+          hb_bidder: 'mocktioneer',
+          hb_pb: '0.20',
+          adm: debugAdm,
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [[728, 90]] as [number, number][],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+      ],
+    };
+
+    let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
+    const origAdd = window.addEventListener.bind(window);
+    const addSpy = vi
+      .spyOn(window, 'addEventListener')
+      .mockImplementation(
+        (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
+          if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          origAdd(type, handler as EventListener, opts as any);
+        }
+      );
+    await import('./index');
+    addSpy.mockRestore();
+
+    expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
+
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+
+    bridgeListener!(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'debug-adid' }),
+        ports: [fakePort],
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(stopSpy).toHaveBeenCalled();
+    expect(portMessages).toHaveLength(1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const parsed = JSON.parse(portMessages[0]) as Record<string, any>;
+    expect(parsed.message).toBe('Prebid Response');
+    expect(parsed.adId).toBe('debug-adid');
+    expect(parsed.ad).toBe(debugAdm);
+    expect(parsed.width).toBe(728);
+    expect(parsed.height).toBe(90);
+  });
+
   it('ignores message when adId does not match any TS bid', async () => {
     await import('./index');
     fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
@@ -587,7 +709,7 @@ describe('installTsRenderBridge', () => {
       new MessageEvent('message', {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'unknown-id' }),
         ports: [],
-      }),
+      })
     );
 
     await new Promise<void>((r) => setTimeout(r, 100));
@@ -597,7 +719,7 @@ describe('installTsRenderBridge', () => {
   it('ignores non-Prebid messages', async () => {
     await import('./index');
     window.dispatchEvent(
-      new MessageEvent('message', { data: JSON.stringify({ message: 'Other' }) }),
+      new MessageEvent('message', { data: JSON.stringify({ message: 'Other' }) })
     );
     await new Promise<void>((r) => setTimeout(r, 50));
     expect(fetchStub).not.toHaveBeenCalled();
