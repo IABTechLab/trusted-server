@@ -673,6 +673,11 @@ fn build_asset_proxy_target_url(
     Ok(target_url)
 }
 
+fn asset_path_skips_image_optimizer(target_url: &url::Url) -> bool {
+    let lower_path = target_url.path().to_ascii_lowercase();
+    lower_path.ends_with(".svg") || lower_path.ends_with(".svgz")
+}
+
 fn asset_origin_host_header(
     target_url: &url::Url,
 ) -> Result<HeaderValue, Report<TrustedServerError>> {
@@ -949,8 +954,16 @@ pub async fn handle_asset_proxy_request(
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let incoming_query = req.get_query_str().unwrap_or("");
     let mut target_url = build_asset_proxy_target_url(route, req.get_path(), incoming_query)?;
-    let image_optimizer =
-        crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?;
+    let skip_image_optimizer = asset_path_skips_image_optimizer(&target_url);
+    let image_optimizer = if skip_image_optimizer {
+        log::debug!(
+            "Skipping Image Optimizer for unsupported SVG asset path: {}",
+            target_url.path()
+        );
+        None
+    } else {
+        crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?
+    };
 
     if route.origin_query_policy() == OriginQueryPolicy::Strip {
         target_url.set_query(None);
@@ -1791,7 +1804,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        asset_origin_host_header, build_asset_proxy_target_url,
+        asset_origin_host_header, asset_path_skips_image_optimizer, build_asset_proxy_target_url,
         clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
         handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
         is_host_allowed, proxy_request, rebuild_response_with_body,
@@ -1810,7 +1823,7 @@ mod tests {
     use crate::settings::{
         AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
-        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
     };
     use crate::test_support::tests::create_test_settings;
     use crate::{
@@ -2873,6 +2886,36 @@ mod tests {
     }
 
     #[test]
+    fn asset_path_skips_image_optimizer_for_svg_extensions() {
+        for url in [
+            "https://assets.example.com/.images/logo.svg",
+            "https://assets.example.com/.images/LOGO.SVG",
+            "https://assets.example.com/.images/icon.svgz",
+        ] {
+            let target_url = url::Url::parse(url).expect("should parse target URL");
+            assert!(
+                asset_path_skips_image_optimizer(&target_url),
+                "should skip Image Optimizer for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_path_uses_image_optimizer_for_raster_extensions() {
+        for url in [
+            "https://assets.example.com/.images/photo.jpg",
+            "https://assets.example.com/.images/photo.png",
+            "https://assets.example.com/.images/photo.webp",
+        ] {
+            let target_url = url::Url::parse(url).expect("should parse target URL");
+            assert!(
+                !asset_path_skips_image_optimizer(&target_url),
+                "should allow Image Optimizer for {url}"
+            );
+        }
+    }
+
+    #[test]
     fn asset_origin_host_header_omits_standard_port() {
         let target_url = url::Url::parse("https://assets.example.com/.images/foo.jpg")
             .expect("should parse URL");
@@ -3300,6 +3343,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_asset_proxy_request_skips_image_optimizer_for_svg_assets() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut settings = create_test_settings();
+        let mut profile_set = test_profile_set();
+        profile_set.unknown_profile = UnknownProfilePolicy::Reject;
+        settings.image_optimizer = ImageOptimizerSettings {
+            profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
+        };
+        let req = Request::new(
+            Method::GET,
+            "https://www.example.com/.images/logo.SVG?profile=unknown&ar=1-1",
+        );
+        let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+        });
+
+        handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy SVG asset without Image Optimizer profile parsing");
+
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://assets.example.com/.images/logo.SVG"],
+            "should still strip profile-table query from SVG origin requests"
+        );
+        assert_eq!(
+            stub.recorded_image_optimizer_options(),
+            vec![None],
+            "SVG assets should bypass Image Optimizer metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_asset_proxy_request_skips_image_optimizer_for_rewritten_svg_assets() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let mut settings = create_test_settings();
+        settings.image_optimizer = ImageOptimizerSettings {
+            profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+        };
+        let req = Request::new(
+            Method::GET,
+            "https://www.example.com/.image/options/id/logo.svg?profile=medium",
+        );
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
+        route.target_path = Some("/image/upload/$1.$2".to_string());
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+        });
+
+        handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy rewritten SVG asset without Image Optimizer metadata");
+
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://assets.example.com/image/upload/options/id.svg"],
+            "should detect SVG after route path rewriting"
+        );
+        assert_eq!(
+            stub.recorded_image_optimizer_options(),
+            vec![None],
+            "rewritten SVG assets should bypass Image Optimizer metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_asset_proxy_request_skips_s3_preflight_for_svg_image_optimizer_routes() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"raw-svg".to_vec());
+        let services = build_services_with_secret_and_http_client(
+            HashMapSecretStore::new(test_s3_secrets()),
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+        );
+        let settings = create_test_settings();
+        let req = Request::new(
+            Method::GET,
+            "https://www.example.com/.images/logo.svg?profile=medium",
+        );
+        let route = test_s3_image_optimizer_route();
+
+        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy raw SVG asset through S3 route")
+            .into_response();
+
+        assert_eq!(response.take_body_str(), "raw-svg");
+        assert_eq!(
+            stub.recorded_request_methods(),
+            vec!["GET"],
+            "SVG IO bypass should not add an S3 preflight"
+        );
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/logo.svg"],
+            "SVG IO bypass should still strip the transform query"
+        );
+        assert_eq!(
+            stub.recorded_image_optimizer_options(),
+            vec![None],
+            "SVG IO bypass should not attach Image Optimizer metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, Vec::new());
@@ -3361,7 +3524,7 @@ mod tests {
         stub.push_response(404, Vec::new());
         stub.push_response_with_headers(
             404,
-            br#"<Error><Code>NoSuchKey</Code><Key>image/upload/missing.svg</Key></Error>"#.to_vec(),
+            br#"<Error><Code>NoSuchKey</Code><Key>image/upload/missing.jpg</Key></Error>"#.to_vec(),
             vec![
                 (header::CONTENT_TYPE.as_str(), "application/xml"),
                 (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
@@ -3378,7 +3541,7 @@ mod tests {
         };
         let req = Request::new(
             Method::GET,
-            "https://www.example.com/.images/missing.svg?profile=medium",
+            "https://www.example.com/.images/missing.jpg?profile=medium",
         );
         let route = test_s3_image_optimizer_route();
 
@@ -3405,7 +3568,7 @@ mod tests {
         let body = response.take_body_str();
         assert!(body.contains("NoSuchKey"), "should return S3 error body");
         assert!(
-            body.contains("image/upload/missing.svg"),
+            body.contains("image/upload/missing.jpg"),
             "should expose the missing S3 key"
         );
         assert_eq!(
