@@ -119,7 +119,9 @@ Cloudflare Workers expose image transformations by passing options on a fetch
 subrequest:
 
 ```javascript
-fetch(imageURL, { cf: { image: { fit: "scale-down", width: 800, height: 600 } } });
+fetch(imageURL, {
+  cf: { image: { fit: 'scale-down', width: 800, height: 600 } },
+})
 ```
 
 Relevant documented capabilities:
@@ -142,15 +144,15 @@ Sources:
 
 Mapping notes for a future `edgezero-adapter-cloudflare` implementation:
 
-| EdgeZero option | Cloudflare mapping |
-| --- | --- |
-| `quality = Some(n)` | `cf.image.quality = n` |
-| `format = "avif"`, `"webp"`, `"jpeg"`, `"png"` | `cf.image.format = ...` |
-| `format = "auto"` | inspect the request `Accept` header and choose AVIF/WebP, matching Cloudflare's Worker guidance |
-| `width` / `height` | `cf.image.width` / `cf.image.height` |
-| bare aspect-ratio crop plus width | derive target height and use `fit = "cover"` or `fit = "crop"` |
-| `Smart` crop mode | `gravity = "auto"` |
-| offset `x` / `y` in `0..=100` | `gravity = { x: x / 100.0, y: y / 100.0 }` |
+| EdgeZero option                                | Cloudflare mapping                                                                              |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `quality = Some(n)`                            | `cf.image.quality = n`                                                                          |
+| `format = "avif"`, `"webp"`, `"jpeg"`, `"png"` | `cf.image.format = ...`                                                                         |
+| `format = "auto"`                              | inspect the request `Accept` header and choose AVIF/WebP, matching Cloudflare's Worker guidance |
+| `width` / `height`                             | `cf.image.width` / `cf.image.height`                                                            |
+| bare aspect-ratio crop plus width              | derive target height and use `fit = "cover"` or `fit = "crop"`                                  |
+| `Smart` crop mode                              | `gravity = "auto"`                                                                              |
+| offset `x` / `y` in `0..=100`                  | `gravity = { x: x / 100.0, y: y / 100.0 }`                                                      |
 
 The current Trusted Server DTO also contains Fastly-shaped fields:
 

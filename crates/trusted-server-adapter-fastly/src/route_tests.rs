@@ -411,6 +411,10 @@ fn test_runtime_services_with_secret_and_http_client(
         .build()
 }
 
+fn test_partner_registry(settings: &Settings) -> PartnerRegistry {
+    PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry")
+}
+
 fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
     let (orchestrator, integration_registry) = build_route_stack(settings);
 
@@ -489,8 +493,7 @@ fn routes_use_request_local_consent() {
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
-    let partner_registry =
-        PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry");
+    let partner_registry = test_partner_registry(&settings);
 
     let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_req);
@@ -749,14 +752,14 @@ fn s3_asset_origin_error_stays_uncacheable_after_global_headers() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = route_buffered_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route S3 asset request");
+        "should route S3 asset request",
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -922,6 +925,7 @@ fn asset_routes_pass_redirect_responses_through() {
 #[test]
 fn asset_routes_skip_non_get_head_requests() {
     let mut settings = create_test_settings();
+    settings.publisher.origin_url = "https://".to_string();
     settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
         "/.images/",
         "https://assets.example.com",
@@ -949,7 +953,7 @@ fn asset_routes_skip_non_get_head_requests() {
 
     assert_eq!(
         resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::BAD_GATEWAY,
         "should fall through to publisher fallback for POST requests"
     );
     assert!(
