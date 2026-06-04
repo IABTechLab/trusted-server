@@ -184,6 +184,60 @@ export function installGptShim(): boolean {
 }
 
 // ------------------------------------------------------------------
+// GAM interceptor (testing only)
+// ------------------------------------------------------------------
+
+/**
+ * Replace the GAM-rendered creative with the server-side auction adm.
+ *
+ * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
+ * Instead of reading from pbjs, reads adm directly from window.tsjs.bids.
+ * Only active when inject_adm_for_testing injects adm server-side.
+ *
+ * Strategy:
+ * 1. If adm contains an <iframe src="...">, set that src on the GAM iframe
+ *    directly — avoids cross-origin document access.
+ * 2. Otherwise replace the slot element's content with a srcdoc iframe.
+ */
+function injectAdmIntoSlot(divId: string, adm: string): void {
+  try {
+    // divId may be the container div (used by GPT slot) or the inner div.
+    // Search both so we can find the GAM iframe wherever it was rendered.
+    let slotEl = document.getElementById(divId);
+    if (!slotEl) return;
+
+    // Extract the first iframe src from the adm (e.g. mocktioneer creative
+    // wraps a first-party proxy iframe in a div).
+    const srcMatch = adm.match(/<iframe[^>]+\bsrc=["']([^"']+)["']/i);
+    const innerSrc = srcMatch?.[1];
+    const gamIframe = slotEl.querySelector('iframe') as HTMLIFrameElement | null;
+
+    if (innerSrc && gamIframe) {
+      // Set the GAM iframe src — works even cross-origin (no document access needed).
+      gamIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+      log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
+    } else if (innerSrc && !gamIframe) {
+      // GAM iframe not yet in DOM — skip rather than blanking the slot.
+      // APS will render via apstag.setDisplayBids() when it arrives.
+      log.debug(`[tsjs-gpt] gam-intercept: no iframe found yet for '${divId}', skipping`);
+    } else {
+      // No extractable src — replace slot content with a sandboxed srcdoc iframe.
+      slotEl.innerHTML = '';
+      const f = document.createElement('iframe');
+      f.style.border = 'none';
+      f.width = String(slotEl.offsetWidth || 728);
+      f.height = String(slotEl.offsetHeight || 90);
+      f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
+      f.srcdoc = adm;
+      slotEl.appendChild(f);
+      log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);
+    }
+  } catch (err) {
+    log.warn('[tsjs-gpt] gam-intercept: error injecting adm', err);
+  }
+}
+
+// ------------------------------------------------------------------
 // Trusted Server ad-init
 // ------------------------------------------------------------------
 
@@ -262,7 +316,12 @@ export function installTsAdInit(): void {
           }
         );
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Map both inner div and container div → slot ID so slotRenderEnded
+        // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
+        // the slot, while adm injection (which targets the inner div) also works.
         divToSlotId[actualDivId] = slot.id;
+        const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
+        if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
         if (tsOwned) newSlots.push(gptSlot);
         slotsToRefresh.push(gptSlot);
 
@@ -302,6 +361,13 @@ export function installTsAdInit(): void {
           if (ourBidWon) {
             if (bid.nurl) navigator.sendBeacon(bid.nurl);
             if (bid.burl) navigator.sendBeacon(bid.burl);
+          }
+
+          // GAM interceptor (testing): when adm is present, replace the GAM creative.
+          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
+          // Only active when inject_adm_for_testing injects adm into bids server-side.
+          if (bid.adm) {
+            injectAdmIntoSlot(divId, bid.adm);
           }
         });
       }

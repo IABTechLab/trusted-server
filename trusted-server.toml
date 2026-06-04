@@ -216,7 +216,7 @@ timeout_ms = 1000
 #
 # Inject raw adm creative markup into window.tsjs.bids for GPT/GAM bridge
 # debugging while PBS Cache is unavailable. NEVER enable in production.
-inject_adm_for_testing = true
+# inject_adm_for_testing = true
 # Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
 # Returns a plain-text response with the following fields (Fastly-observed values):
 #   ja4         — JA4 TLS client fingerprint
