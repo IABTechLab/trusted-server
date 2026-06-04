@@ -28,7 +28,7 @@ use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput}
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
@@ -325,7 +325,7 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
-    let mut preserve_no_store_private = false;
+    let mut asset_cache_policy = AssetProxyCachePolicy::OriginControlled;
 
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
@@ -442,10 +442,9 @@ async fn route_request(
                     match handle_asset_proxy_request(settings, runtime_services, req, asset_route)
                         .await
                     {
-                        Ok(response) => {
-                            preserve_no_store_private = response.get_header_str(header::CACHE_CONTROL)
-                                == Some("no-store, private");
-                            Ok(response)
+                        Ok(asset_response) => {
+                            asset_cache_policy = asset_response.cache_policy();
+                            Ok(asset_response.into_response())
                         }
                         Err(e) => Err(e),
                     };
@@ -546,9 +545,7 @@ async fn route_request(
     );
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
-    if preserve_no_store_private {
-        response.set_header(header::CACHE_CONTROL, "no-store, private");
-    }
+    asset_cache_policy.apply_after_route_finalization(&mut response);
 
     let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
         // Pull sync is intentionally refreshed only from successful organic

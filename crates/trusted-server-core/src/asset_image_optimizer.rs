@@ -75,7 +75,14 @@ pub(crate) fn options_for_asset_request(
     let profile_params = profile_set
         .profiles
         .get(selected_profile)
-        .expect("should select only configured image optimizer profiles");
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "image_optimizer.profile_sets `{}` selected profile `{selected_profile}` is not defined",
+                    route_config.profile_set
+                ),
+            })
+        })?;
     params.merge_from(parse_param_string(profile_params)?);
 
     apply_aspect_ratio_override(profile_set, selected_profile, query, &mut params);
@@ -362,7 +369,8 @@ fn parse_aspect_ratio_value(value: &str) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use crate::settings::{
-        ImageOptimizerAspectRatioConfig, ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet,
+        AssetImageOptimizerConfig, ImageOptimizerAspectRatioConfig,
+        ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
     };
 
     fn profile_set() -> ImageOptimizerProfileSet {
@@ -390,6 +398,34 @@ mod tests {
                 when_missing: MissingCropOffsetMode::Smart,
             }),
         }
+    }
+
+    #[test]
+    fn options_for_asset_request_returns_error_when_selected_profile_is_missing() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        let mut profile_set = profile_set();
+        profile_set.profiles.remove("default");
+        settings.image_optimizer = ImageOptimizerSettings {
+            profile_sets: std::collections::HashMap::from([(
+                "default_images".to_string(),
+                profile_set,
+            )]),
+        };
+        let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+        });
+
+        let err = options_for_asset_request(&settings, &route, "")
+            .expect_err("should return a configuration error for broken profile sets");
+
+        assert!(
+            format!("{err:?}").contains("selected profile `default` is not defined"),
+            "should describe the missing selected profile without panicking: {err:?}"
+        );
     }
 
     #[test]

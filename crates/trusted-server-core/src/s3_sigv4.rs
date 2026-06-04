@@ -20,6 +20,7 @@ use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use crate::error::TrustedServerError;
+use crate::redacted::Redacted;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,9 +39,9 @@ pub struct S3Credentials {
     /// `AWS` access key ID.
     pub access_key_id: String,
     /// `AWS` secret access key.
-    pub secret_access_key: String,
+    pub secret_access_key: Redacted<String>,
     /// Optional `AWS` session token for temporary credentials.
-    pub session_token: Option<String>,
+    pub session_token: Option<Redacted<String>>,
 }
 
 /// Sign an `S3` request header map using AWS Signature Version 4.
@@ -85,7 +86,8 @@ pub fn sign_headers(
     );
     if let Some(token) = credentials
         .session_token
-        .as_deref()
+        .as_ref()
+        .map(Redacted::expose)
         .filter(|token| !token.is_empty())
     {
         headers.insert(
@@ -108,7 +110,7 @@ pub fn sign_headers(
     let credential_scope = format!("{date_stamp}/{region}/{SERVICE}/{TERMINATOR}");
     let string_to_sign =
         format!("{ALGORITHM}\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
-    let signing_key = signing_key(&credentials.secret_access_key, &date_stamp, region);
+    let signing_key = signing_key(credentials.secret_access_key.expose(), &date_stamp, region);
     let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
     let authorization = format!(
         "{ALGORITHM} Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
@@ -263,7 +265,9 @@ mod tests {
         );
         let credentials = S3Credentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            secret_access_key: Redacted::new(
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
             session_token: None,
         };
         let now = DateTime::parse_from_rfc3339("2013-05-24T00:00:00Z")
@@ -294,6 +298,34 @@ mod tests {
             authorization,
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=17ee2dc4ebe24953b3ebb4aad72c73aada1b27aa77109a55301af128fdcf571f",
             "should include expected credential scope, signed headers, and signature"
+        );
+    }
+
+    #[test]
+    fn credentials_debug_redacts_secret_material() {
+        let credentials = S3Credentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: Redacted::new("debug-secret-key".to_string()),
+            session_token: Some(Redacted::new("debug-session-token".to_string())),
+        };
+
+        let debug_output = format!("{credentials:?}");
+
+        assert!(
+            debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "should leave non-secret access key ID visible"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "should show redaction markers for secret fields"
+        );
+        assert!(
+            !debug_output.contains("debug-secret-key"),
+            "should not expose the secret access key in Debug output"
+        );
+        assert!(
+            !debug_output.contains("debug-session-token"),
+            "should not expose the session token in Debug output"
         );
     }
 

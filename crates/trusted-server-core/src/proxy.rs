@@ -22,6 +22,7 @@ use crate::error::TrustedServerError;
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices, StoreName,
 };
+use crate::redacted::Redacted;
 use crate::s3_sigv4::{self, S3Credentials};
 use crate::settings::{
     AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings,
@@ -68,6 +69,66 @@ const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
 
 const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
     ["set-cookie", "strict-transport-security", "clear-site-data"];
+
+/// Cache-control value used when asset proxy responses must not be stored.
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+
+/// Cache policy metadata emitted by the asset proxy handler.
+///
+/// The Fastly router finalizes standard response headers after the asset handler
+/// returns. This typed policy lets the router reapply protected cache directives
+/// without depending on an exact header string set by the handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetProxyCachePolicy {
+    /// Leave origin/cache-control headers under normal response finalization.
+    OriginControlled,
+    /// Reapply `Cache-Control: no-store, private` after standard finalization.
+    NoStorePrivate,
+}
+
+impl AssetProxyCachePolicy {
+    /// Apply protected cache headers after route-level response finalization.
+    pub fn apply_after_route_finalization(self, response: &mut Response) {
+        if self == Self::NoStorePrivate {
+            apply_no_store_cache_control(response);
+        }
+    }
+}
+
+/// Asset proxy response plus metadata needed by the outer router.
+pub struct AssetProxyResponse {
+    response: Response,
+    cache_policy: AssetProxyCachePolicy,
+}
+
+impl AssetProxyResponse {
+    fn new(response: Response, cache_policy: AssetProxyCachePolicy) -> Self {
+        Self {
+            response,
+            cache_policy,
+        }
+    }
+
+    fn origin_controlled(response: Response) -> Self {
+        Self::new(response, AssetProxyCachePolicy::OriginControlled)
+    }
+
+    fn no_store_private(response: Response) -> Self {
+        Self::new(response, AssetProxyCachePolicy::NoStorePrivate)
+    }
+
+    /// Return cache policy metadata for router finalization.
+    #[must_use]
+    pub fn cache_policy(&self) -> AssetProxyCachePolicy {
+        self.cache_policy
+    }
+
+    /// Consume this wrapper and return the Fastly response.
+    #[must_use]
+    pub fn into_response(self) -> Response {
+        self.response
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct S3CredentialsCacheKey {
@@ -687,8 +748,8 @@ fn load_s3_credentials(
         .transpose()?;
     let credentials = Arc::new(S3Credentials {
         access_key_id,
-        secret_access_key,
-        session_token,
+        secret_access_key: Redacted::new(secret_access_key),
+        session_token: session_token.map(Redacted::new),
     });
 
     let mut cache = S3_CREDENTIALS_CACHE
@@ -795,7 +856,7 @@ fn strip_asset_proxy_response_headers(response: &mut Response) {
 fn apply_no_store_cache_control(response: &mut Response) {
     response.set_header(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, private"),
+        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
     );
 }
 
@@ -816,7 +877,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     request_method: &Method,
     unsigned_headers: &http::HeaderMap,
     backend_name: &str,
-) -> Result<Option<Response>, Report<TrustedServerError>> {
+) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
     let Some(auth @ AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
         return Ok(None);
     };
@@ -844,7 +905,7 @@ async fn preflight_s3_origin_for_image_optimizer(
         let mut response = head_response;
         strip_asset_proxy_response_headers(&mut response);
         apply_no_store_cache_control(&mut response);
-        return Ok(Some(response));
+        return Ok(Some(AssetProxyResponse::no_store_private(response)));
     }
 
     let mut get_headers = unsigned_headers.clone();
@@ -861,7 +922,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     strip_asset_proxy_response_headers(&mut response);
     apply_no_store_cache_control(&mut response);
 
-    Ok(Some(response))
+    Ok(Some(AssetProxyResponse::no_store_private(response)))
 }
 
 /// Proxy a configured first-party asset path to its matched asset origin.
@@ -885,7 +946,7 @@ pub async fn handle_asset_proxy_request(
     services: &RuntimeServices,
     req: Request,
     route: &ProxyAssetRoute,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let incoming_query = req.get_query_str().unwrap_or("");
     let mut target_url = build_asset_proxy_target_url(route, req.get_path(), incoming_query)?;
     let image_optimizer =
@@ -970,7 +1031,7 @@ pub async fn handle_asset_proxy_request(
     let mut response = platform_response_to_fastly_asset(platform_resp).await?;
     strip_asset_proxy_response_headers(&mut response);
 
-    Ok(response)
+    Ok(AssetProxyResponse::origin_controlled(response))
 }
 
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
@@ -1734,8 +1795,8 @@ mod tests {
         clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
         handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
         is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, AssetProxyCachePolicy,
+        ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::platform::test_support::{
@@ -2866,7 +2927,8 @@ mod tests {
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
-            .expect("should proxy asset request");
+            .expect("should proxy asset request")
+            .into_response();
         assert_eq!(response.get_status(), StatusCode::OK);
 
         let all_headers = stub.recorded_request_headers();
@@ -2957,7 +3019,8 @@ mod tests {
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
-            .expect("should proxy asset request");
+            .expect("should proxy asset request")
+            .into_response();
 
         assert!(
             response.get_header(header::SET_COOKIE).is_none(),
@@ -3257,7 +3320,8 @@ mod tests {
 
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
-            .expect("should proxy optimized S3 asset request");
+            .expect("should proxy optimized S3 asset request")
+            .into_response();
 
         assert_eq!(response.get_status(), StatusCode::OK);
         assert_eq!(response.take_body_str(), "optimized");
@@ -3318,9 +3382,15 @@ mod tests {
         );
         let route = test_s3_image_optimizer_route();
 
-        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+        let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should return raw S3 error response");
+        assert_eq!(
+            asset_response.cache_policy(),
+            AssetProxyCachePolicy::NoStorePrivate,
+            "should carry a typed no-store policy for router finalization"
+        );
+        let mut response = asset_response.into_response();
 
         assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
         assert_eq!(
@@ -3376,7 +3446,8 @@ mod tests {
 
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
-            .expect("should proxy debug S3 asset request");
+            .expect("should proxy debug S3 asset request")
+            .into_response();
 
         assert_eq!(response.take_body_str(), "raw");
         assert_eq!(
@@ -3441,7 +3512,8 @@ mod tests {
 
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
-            .expect("should proxy a streaming asset response");
+            .expect("should proxy a streaming asset response")
+            .into_response();
 
         assert_eq!(response.take_body_str(), "chunk");
     }
