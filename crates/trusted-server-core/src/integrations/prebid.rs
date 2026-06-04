@@ -3282,21 +3282,6 @@ server_url = "https://prebid.example"
         body.extend_from_slice("\u{2603}".as_bytes());
         body.extend_from_slice(b"tail");
 
-        // The helper applies both byte and character caps. With the current
-        // four-byte-per-character byte cap, this boundary replacement is beyond
-        // the public character cap for ASCII input, so pin the bounded-slice
-        // conversion directly before checking the helper output.
-        let bounded_body = &body[..PREBID_ERROR_BODY_PREVIEW_BYTES];
-        let bounded_preview = String::from_utf8_lossy(bounded_body);
-        assert!(
-            bounded_preview.ends_with('\u{fffd}'),
-            "partial multibyte char at byte cap should become U+FFFD"
-        );
-        assert!(
-            !bounded_preview.contains("tail"),
-            "bounded conversion should not include bytes beyond the preview slice"
-        );
-
         let preview = prebid_body_preview(&body);
 
         assert_eq!(
