@@ -7,8 +7,8 @@ use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
 use fastly::http::{header, Method, StatusCode};
-use fastly::Request;
-use trusted_server_core::auction::build_orchestrator;
+use fastly::{Request, Response};
+use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
@@ -330,14 +330,38 @@ fn test_runtime_services_with_secret_and_http_client(
         .build()
 }
 
+fn test_partner_registry(settings: &Settings) -> PartnerRegistry {
+    PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry")
+}
+
+fn buffered_route_response(
+    settings: &Settings,
+    orchestrator: &AuctionOrchestrator,
+    integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
+    req: Request,
+) -> Response {
+    let partner_registry = test_partner_registry(settings);
+    let outcome = futures::executor::block_on(route_request(
+        settings,
+        orchestrator,
+        integration_registry,
+        &partner_registry,
+        services,
+        req,
+    ))
+    .expect("should route test request");
+
+    outcome.response.expect("should buffer test response")
+}
+
 #[test]
 fn routes_use_request_local_consent() {
     let settings = create_test_settings();
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
-    let partner_registry =
-        PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry");
+    let partner_registry = test_partner_registry(&settings);
 
     let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_req);
@@ -396,14 +420,13 @@ fn asset_routes_bypass_publisher_consent_dependencies() {
 
     let asset_req = Request::get("https://test.com/.images/logo.png?auto=webp");
     let asset_services = test_runtime_services(&asset_req);
-    let asset_resp = futures::executor::block_on(route_request(
+    let asset_resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &asset_services,
         asset_req,
-    ))
-    .expect("should return an error response for asset proxy requests");
+    );
     assert_eq!(
         asset_resp.get_status(),
         StatusCode::BAD_GATEWAY,
@@ -430,14 +453,13 @@ fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should return an error response for failed asset origin");
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -518,14 +540,13 @@ fn s3_asset_origin_error_stays_uncacheable_after_global_headers() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route S3 asset request");
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -567,14 +588,13 @@ fn asset_routes_proxy_head_requests() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route HEAD asset request");
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -617,14 +637,13 @@ fn asset_routes_ignore_query_string_for_matching() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route asset request with query string");
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -667,14 +686,13 @@ fn asset_routes_pass_redirect_responses_through() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route redirecting asset request");
+    );
 
     assert_eq!(
         resp.get_status(),
@@ -691,6 +709,7 @@ fn asset_routes_pass_redirect_responses_through() {
 #[test]
 fn asset_routes_skip_non_get_head_requests() {
     let mut settings = create_test_settings();
+    settings.publisher.origin_url = "https://".to_string();
     settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
         "/.images/",
         "https://assets.example.com",
@@ -707,18 +726,17 @@ fn asset_routes_skip_non_get_head_requests() {
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
     );
 
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route non-asset POST request");
+    );
 
     assert_eq!(
         resp.get_status(),
-        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::BAD_GATEWAY,
         "should fall through to publisher fallback for POST requests"
     );
     assert!(
@@ -744,14 +762,13 @@ fn built_in_routes_take_precedence_over_asset_routes() {
 
     let req = Request::get("https://test.com/.well-known/trusted-server.json");
     let services = test_runtime_services(&req);
-    let resp = futures::executor::block_on(route_request(
+    let resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route discovery request");
+    );
     assert_eq!(
         resp.get_status(),
         StatusCode::OK,
@@ -772,14 +789,13 @@ fn integration_routes_take_precedence_over_asset_routes() {
 
     let req = Request::get("https://test.com/prebid.js");
     let services = test_runtime_services(&req);
-    let mut resp = futures::executor::block_on(route_request(
+    let mut resp = buffered_route_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &services,
         req,
-    ))
-    .expect("should route integration request");
+    );
     assert_eq!(
         resp.get_status(),
         StatusCode::OK,

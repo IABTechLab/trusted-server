@@ -14,6 +14,7 @@ use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -267,6 +268,7 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
+        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>>;
 
@@ -557,6 +559,7 @@ pub struct ProxyDispatchInput<'a> {
     pub settings: &'a Settings,
     pub kv: Option<&'a KvIdentityGraph>,
     pub ec_context: &'a mut EcContext,
+    pub services: &'a RuntimeServices,
     pub req: Request,
 }
 
@@ -688,6 +691,7 @@ impl IntegrationRegistry {
             settings,
             kv,
             ec_context,
+            services,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
@@ -709,7 +713,7 @@ impl IntegrationRegistry {
             // Remove any caller-supplied EC header rather than forwarding it.
             req.remove_header(HEADER_X_TS_EC);
 
-            Some(proxy.handle(settings, req).await)
+            Some(proxy.handle(settings, services, req).await)
         } else {
             None
         }
@@ -1002,6 +1006,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             _req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             Ok(Response::new())
@@ -1284,6 +1289,7 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
+            _services: &RuntimeServices,
             req: Request,
         ) -> Result<Response, Report<TrustedServerError>> {
             let mut response =
@@ -1316,6 +1322,7 @@ mod tests {
         req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let services = crate::platform::test_support::noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
@@ -1324,6 +1331,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }));
 
@@ -1357,6 +1365,7 @@ mod tests {
         req.set_header(HEADER_X_TS_EC, "evil;injected");
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
@@ -1364,6 +1373,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }))
         .expect("should handle proxy request");
@@ -1394,6 +1404,7 @@ mod tests {
         req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
@@ -1401,6 +1412,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }))
         .expect("should handle proxy request");
@@ -1433,6 +1445,7 @@ mod tests {
         req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::POST,
@@ -1440,6 +1453,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }));
 

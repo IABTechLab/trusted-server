@@ -30,6 +30,7 @@ use crate::openrtb::{
     OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
     TrustedServerExt, User, UserExt,
 };
+use crate::platform::RuntimeServices;
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
 
@@ -420,6 +421,7 @@ impl IntegrationProxy for PrebidIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
