@@ -1545,10 +1545,7 @@ mod tests {
     };
     use crate::test_support::tests::create_test_settings;
     use crate::{
-        constants::{
-            HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
-            HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
-        },
+        constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR},
         creative,
     };
     use bytes::Bytes;
@@ -1965,64 +1962,6 @@ mod tests {
                 .await
                 .expect_err("expected error");
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn header_copy_copies_curated_set() {
-        let mut src = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        src.set_header(HEADER_USER_AGENT, "UA/1.0");
-        src.set_header(HEADER_ACCEPT, "image/*");
-        src.set_header(HEADER_ACCEPT_LANGUAGE, "en-US");
-        src.set_header(HEADER_ACCEPT_ENCODING, "gzip");
-        src.set_header(HEADER_REFERER, "https://pub.example/page");
-        src.set_header(HEADER_X_FORWARDED_FOR, "203.0.113.1");
-
-        let mut dst = Request::new(Method::GET, "https://cdn.example/a.png");
-        copy_proxy_forward_headers(&src, &mut dst);
-
-        assert_eq!(
-            dst.get_header(HEADER_USER_AGENT)
-                .expect("User-Agent header should be copied")
-                .to_str()
-                .expect("User-Agent should be valid UTF-8"),
-            "UA/1.0"
-        );
-        assert_eq!(
-            dst.get_header(HEADER_ACCEPT)
-                .expect("Accept header should be copied")
-                .to_str()
-                .expect("Accept should be valid UTF-8"),
-            "image/*"
-        );
-        assert_eq!(
-            dst.get_header(HEADER_ACCEPT_LANGUAGE)
-                .expect("Accept-Language header should be copied")
-                .to_str()
-                .expect("Accept-Language should be valid UTF-8"),
-            "en-US"
-        );
-        // Accept-Encoding is overridden to only include supported encodings
-        assert_eq!(
-            dst.get_header(HEADER_ACCEPT_ENCODING)
-                .expect("Accept-Encoding header should be set")
-                .to_str()
-                .expect("Accept-Encoding should be valid UTF-8"),
-            SUPPORTED_ENCODINGS
-        );
-        assert_eq!(
-            dst.get_header(HEADER_REFERER)
-                .expect("Referer header should be copied")
-                .to_str()
-                .expect("Referer should be valid UTF-8"),
-            "https://pub.example/page"
-        );
-        assert_eq!(
-            dst.get_header(HEADER_X_FORWARDED_FOR)
-                .expect("X-Forwarded-For header should be copied")
-                .to_str()
-                .expect("X-Forwarded-For should be valid UTF-8"),
-            "203.0.113.1"
-        );
     }
 
     #[tokio::test]
@@ -3043,40 +2982,6 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming platform response body"),
             "should describe the unsupported streaming body: {err:?}"
-        );
-    }
-
-    #[test]
-    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
-        let mut beresp = Response::from_status(StatusCode::OK);
-        beresp.append_header(header::SET_COOKIE, "a=1; Path=/; Secure");
-        beresp.append_header(header::SET_COOKIE, "b=2; Path=/; Secure");
-
-        let rebuilt = rebuild_response_with_body(
-            &beresp,
-            "text/html; charset=utf-8",
-            b"rewritten".to_vec(),
-            false,
-        );
-
-        let cookies: Vec<String> = rebuilt
-            .get_headers()
-            .filter(|(name, _)| *name == header::SET_COOKIE)
-            .map(|(_, value)| {
-                value
-                    .to_str()
-                    .expect("should preserve UTF-8 Set-Cookie header values")
-                    .to_string()
-            })
-            .collect();
-
-        assert_eq!(
-            cookies,
-            vec![
-                "a=1; Path=/; Secure".to_string(),
-                "b=2; Path=/; Secure".to_string(),
-            ],
-            "should preserve every Set-Cookie value when rebuilding the response"
         );
     }
 

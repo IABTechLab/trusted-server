@@ -613,6 +613,7 @@ mod tests {
         IntegrationDocumentState, IntegrationRegistry, IntegrationScriptContext,
         IntegrationScriptRewriter, ScriptRewriteAction,
     };
+    use crate::platform::test_support::noop_services;
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
@@ -1215,7 +1216,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         let settings = make_settings();
         let response = integration
-            .handle(&settings, req)
+            .handle(&settings, &noop_services(), req)
             .await
             .expect("handle should not return error");
 
@@ -1250,7 +1251,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
         let settings = make_settings();
         let response = integration
-            .handle(&settings, req)
+            .handle(&settings, &noop_services(), req)
             .await
             .expect("handle should not return error");
 
