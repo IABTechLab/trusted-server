@@ -785,7 +785,7 @@ S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to rea
 
 ### `[proxy.asset_routes.image_optimizer]`
 
-Route-level Image Optimizer configuration selects a reusable profile set.
+Route-level Image Optimizer configuration selects a reusable profile set. SVG and SVGZ asset paths bypass Fastly IO metadata because Fastly Image Optimizer does not support SVG processing; the asset route still proxies the object and still applies path rewriting, query policy, auth, and response-header sanitization.
 
 | Field          | Type    | Required         | Default              | Description                                                       |
 | -------------- | ------- | ---------------- | -------------------- | ----------------------------------------------------------------- |

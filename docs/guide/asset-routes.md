@@ -163,6 +163,8 @@ A request such as:
 
 uses the `medium` profile, applies the allowed `1-1` crop override, buckets offsets to the configured values, strips the origin query, signs the S3 request if auth is enabled, and sends Fastly IO metadata through the Fastly adapter.
 
+SVG and SVGZ assets are proxied normally but bypass Fastly IO metadata because Fastly Image Optimizer does not support SVG processing. Route path rewriting, origin-query stripping, S3 signing, and response-header sanitization still run for those requests.
+
 ## Supported profile parameters
 
 Profile strings intentionally accept a strict subset of Image Optimizer parameters.
