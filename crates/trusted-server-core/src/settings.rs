@@ -687,6 +687,12 @@ pub struct S3SigV4AuthConfig {
     pub origin_query: Option<OriginQueryPolicy>,
 }
 
+fn s3_region_is_valid(region: &str) -> bool {
+    region
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 impl S3SigV4AuthConfig {
     fn normalize(&mut self) {
         self.region = self.region.trim().to_string();
@@ -704,6 +710,13 @@ impl S3SigV4AuthConfig {
         if self.region.is_empty() {
             return Err(Report::new(TrustedServerError::Configuration {
                 message: "proxy.asset_routes auth s3_sigv4 region must not be empty".to_string(),
+            }));
+        }
+        if !s3_region_is_valid(&self.region) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message:
+                    "proxy.asset_routes auth s3_sigv4 region must contain only lowercase letters, digits, and '-'"
+                        .to_string(),
             }));
         }
         if self.secret_store.is_empty()
@@ -3624,6 +3637,34 @@ mod tests {
                 assert_eq!(config.access_key_id, "access_key_id");
                 assert_eq!(config.secret_access_key, "secret_access_key");
             }
+        }
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_invalid_s3_regions() {
+        for region in ["us east 1", "us/east/1", "US-EAST-1", "us-east-\\n1"] {
+            let toml_str = crate_test_settings_str()
+                + &format!(
+                    r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+            [proxy.asset_routes.auth]
+            type = "s3_sigv4"
+            region = "{region}"
+            "#
+                );
+
+            let err = Settings::from_toml(&toml_str)
+                .expect_err("should reject malformed S3 region values");
+
+            assert!(
+                format!("{err:?}").contains("region must contain only lowercase letters"),
+                "should mention the S3 region character policy for {region:?}: {err:?}"
+            );
         }
     }
 
