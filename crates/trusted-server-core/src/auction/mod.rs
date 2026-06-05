@@ -120,7 +120,7 @@ mod tests {
 
         assert_orchestrator_error_contains(
             &settings,
-            "Auction provider `missing-provider` is configured but not registered",
+            "Auction provider `missing-provider` is listed in [auction] but no enabled integration provides it",
         );
     }
 
@@ -137,7 +137,7 @@ mod tests {
 
         assert_orchestrator_error_contains(
             &settings,
-            "Auction provider `missing-provider` is configured but not registered",
+            "Auction provider `missing-provider` is listed in [auction] but no enabled integration provides it",
         );
     }
 
@@ -155,7 +155,7 @@ mod tests {
 
         assert_orchestrator_error_contains(
             &settings,
-            "Auction provider `missing-mediator` is configured but not registered",
+            "Auction provider `missing-mediator` is listed in [auction] but no enabled integration provides it",
         );
     }
 }

@@ -89,7 +89,7 @@ impl AuctionOrchestrator {
         self.providers.len()
     }
 
-    /// Validate that every configured provider name has a registered provider.
+    /// Validate that every configured provider name has an enabled provider integration.
     pub(crate) fn validate_configured_provider_names(
         &self,
     ) -> Result<(), Report<TrustedServerError>> {
@@ -106,7 +106,7 @@ impl AuctionOrchestrator {
             if !self.providers.contains_key(provider_name) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "Auction provider `{provider_name}` is configured but not registered"
+                        "Auction provider `{provider_name}` is listed in [auction] but no enabled integration provides it"
                     ),
                 }));
             }
