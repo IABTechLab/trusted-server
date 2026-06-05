@@ -216,10 +216,27 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       // Set the GAM iframe src — works even cross-origin (no document access needed).
       gamIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
       log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
-    } else if (innerSrc && !gamIframe) {
-      // GAM iframe not yet in DOM — skip rather than blanking the slot.
-      // APS will render via apstag.setDisplayBids() when it arrives.
-      log.debug(`[tsjs-gpt] gam-intercept: no iframe found yet for '${divId}', skipping`);
+    } else if (innerSrc) {
+      // GAM iframe not yet in DOM (APS renders async after slotRenderEnded).
+      // Retry on next animation frame so APS has a tick to insert its iframe;
+      // if it still isn't there, replace slot content directly.
+      requestAnimationFrame(() => {
+        const retryIframe = slotEl!.querySelector('iframe') as HTMLIFrameElement | null;
+        if (retryIframe) {
+          retryIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          log.debug(`[tsjs-gpt] gam-intercept: set iframe src (retry) for '${divId}'`);
+        } else {
+          slotEl!.innerHTML = '';
+          const f = document.createElement('iframe');
+          f.style.cssText = 'border:none';
+          f.width = String(slotEl!.offsetWidth || 728);
+          f.height = String(slotEl!.offsetHeight || 90);
+          f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
+          f.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          slotEl!.appendChild(f);
+          log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
+        }
+      });
     } else {
       // No extractable src — replace slot content with a sandboxed srcdoc iframe.
       slotEl.innerHTML = '';
