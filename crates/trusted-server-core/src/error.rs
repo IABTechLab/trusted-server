@@ -184,6 +184,9 @@ mod tests {
             TrustedServerError::InvalidUtf8 {
                 message: "byte 0xff".into(),
             },
+            TrustedServerError::InsecureDefault {
+                field: "ec.passphrase".into(),
+            },
         ];
         for error in &cases {
             assert_eq!(
@@ -195,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_errors_return_generic_user_message() {
+    fn other_client_errors_return_generic_user_message() {
         let cases = [
             TrustedServerError::Forbidden {
                 message: "policy detail".into(),
@@ -203,13 +206,16 @@ mod tests {
             TrustedServerError::AllowlistViolation {
                 host: "blocked.example.com".into(),
             },
+            TrustedServerError::PartnerNotFound {
+                partner_id: "partner-1".into(),
+            },
         ];
 
         for error in &cases {
             assert_eq!(
                 error.user_message(),
                 "An internal error occurred",
-                "should not leak forbidden details for {error:?}",
+                "should not leak client-error details for {error:?}",
             );
         }
     }
@@ -251,7 +257,9 @@ mod tests {
             | TrustedServerError::Forbidden { .. }
             | TrustedServerError::AllowlistViolation { .. }
             | TrustedServerError::Settings { .. }
-            | TrustedServerError::Ec { .. } => (),
+            | TrustedServerError::EdgeCookie { .. }
+            | TrustedServerError::PartnerNotFound { .. }
+            | TrustedServerError::InsecureDefault { .. } => (),
         };
 
         let cases = [
@@ -281,7 +289,7 @@ mod tests {
             ),
             (
                 TrustedServerError::AllowlistViolation {
-                    host: "evil.example".to_string(),
+                    host: "evil.example.com".to_string(),
                 },
                 StatusCode::FORBIDDEN,
             ),
@@ -304,8 +312,20 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
-                TrustedServerError::Ec {
+                TrustedServerError::EdgeCookie {
                     message: "ec failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::PartnerNotFound {
+                    partner_id: "partner-1".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                TrustedServerError::InsecureDefault {
+                    field: "ec.passphrase".to_string(),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
