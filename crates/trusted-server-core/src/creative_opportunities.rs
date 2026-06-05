@@ -173,6 +173,11 @@ impl CreativeOpportunitySlot {
     ///
     /// Provider-specific params (e.g., APS `slotID`, PBS bidder params) are wired
     /// into the `bidders` map keyed by provider/bidder name.
+    ///
+    /// When [`PrebidSlotParams::bidders`] is empty, a `trustedServer` entry is
+    /// injected so [`PrebidAuctionProvider`] expands all `config.bidders`
+    /// automatically. The slot's `targeting.zone` value is forwarded as
+    /// `trustedServer.zone` so zone-aware bid-param override rules fire correctly.
     #[must_use]
     pub fn to_ad_slot(&self) -> AdSlot {
         let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
@@ -183,8 +188,21 @@ impl CreativeOpportunitySlot {
             );
         }
         if let Some(ref prebid) = self.providers.prebid {
-            for (name, params) in &prebid.bidders {
-                bidders.insert(name.clone(), params.clone());
+            if prebid.bidders.is_empty() {
+                // No explicit per-bidder override: let the Prebid provider expand
+                // all config.bidders. The "trustedServer" key triggers
+                // expand_trusted_server_bidders in PrebidAuctionProvider, giving
+                // each bidder an empty params object that the override engine then
+                // fills with zone-aware rules.
+                let mut ts = serde_json::json!({ "bidderParams": {} });
+                if let Some(zone) = self.targeting.get("zone") {
+                    ts["zone"] = serde_json::Value::String(zone.clone());
+                }
+                bidders.insert("trustedServer".to_string(), ts);
+            } else {
+                for (name, params) in &prebid.bidders {
+                    bidders.insert(name.clone(), params.clone());
+                }
             }
         }
         AdSlot {
@@ -249,11 +267,17 @@ pub struct ApsSlotParams {
 
 /// Inline Prebid Server bidder parameters for a slot.
 ///
-/// Keyed by bidder name (e.g., `"mocktioneer"`). Each value is the
-/// bidder-specific params object forwarded verbatim to PBS.
+/// When `bidders` is empty, `to_ad_slot` injects a `trustedServer` entry so
+/// [`PrebidAuctionProvider`] expands all `config.bidders` automatically.
+/// When `bidders` is non-empty the map is forwarded verbatim, bypassing
+/// automatic expansion (useful for slots that need explicit per-bidder params).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PrebidSlotParams {
     /// Per-bidder inline params map. Bidder name → params object.
+    ///
+    /// Leave empty (or omit `bidders` in config) to auto-expand all
+    /// `config.bidders` with zone-aware param overrides.
+    #[serde(default)]
     pub bidders: HashMap<String, serde_json::Value>,
 }
 
@@ -428,5 +452,85 @@ mod tests {
         assert_eq!(ad_slot.id, "atf");
         assert_eq!(ad_slot.floor_price, Some(0.50));
         assert_eq!(ad_slot.formats.len(), 1);
+    }
+
+    #[test]
+    fn to_ad_slot_injects_trusted_server_when_prebid_bidders_empty() {
+        let mut slot = make_slot("header", vec!["/"]);
+        slot.targeting.insert("zone".to_string(), "header".to_string());
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::new(),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        let ts = ad_slot
+            .bidders
+            .get("trustedServer")
+            .expect("should have trustedServer bidder");
+        assert_eq!(
+            ts.get("zone").and_then(|v| v.as_str()),
+            Some("header"),
+            "should forward zone from targeting"
+        );
+        assert!(
+            ts.get("bidderParams").is_some(),
+            "should include bidderParams key for expand_trusted_server_bidders"
+        );
+    }
+
+    #[test]
+    fn to_ad_slot_injects_trusted_server_without_zone_when_targeting_absent() {
+        let mut slot = make_slot("no-zone", vec!["/"]);
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::new(),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        let ts = ad_slot
+            .bidders
+            .get("trustedServer")
+            .expect("should have trustedServer bidder");
+        assert!(
+            ts.get("zone").is_none(),
+            "should not inject zone when targeting has no zone key"
+        );
+    }
+
+    #[test]
+    fn to_ad_slot_uses_explicit_bidders_when_nonempty() {
+        let mut slot = make_slot("explicit", vec!["/"]);
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::from([(
+                "mocktioneer".to_string(),
+                serde_json::json!({"custom": true}),
+            )]),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        assert!(
+            !ad_slot.bidders.contains_key("trustedServer"),
+            "should not inject trustedServer when explicit bidders are set"
+        );
+        let params = ad_slot
+            .bidders
+            .get("mocktioneer")
+            .expect("should have mocktioneer bidder");
+        assert_eq!(params.get("custom").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn prebid_slot_params_deserializes_without_bidders_field() {
+        let json = r#"{"bidders": {}}"#;
+        let params: PrebidSlotParams =
+            serde_json::from_str(json).expect("should deserialize with empty bidders");
+        assert!(params.bidders.is_empty(), "should have empty bidders map");
+
+        let json_no_field = r#"{}"#;
+        let params2: PrebidSlotParams =
+            serde_json::from_str(json_no_field).expect("should deserialize without bidders field");
+        assert!(
+            params2.bidders.is_empty(),
+            "should default to empty when bidders field absent"
+        );
     }
 }
