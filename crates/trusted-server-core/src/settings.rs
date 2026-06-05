@@ -1550,6 +1550,14 @@ impl Proxy {
                     route.prefix
                 );
             }
+
+            if !route.prefix.is_empty() && route.prefix != "/" && !route.prefix.ends_with('/') {
+                log::warn!(
+                    "proxy.asset_routes prefix `{}` does not end with `/`; matching uses raw string-prefix semantics, so this also matches paths such as `{}example`",
+                    route.prefix,
+                    route.prefix
+                );
+            }
         }
     }
 
