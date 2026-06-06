@@ -18,6 +18,9 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
 
+/// Fallback `Content-Type` for image-like responses missing an origin type.
+const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
+
 #[derive(Deserialize)]
 struct ProxySignReq {
     url: String,
@@ -256,7 +259,7 @@ fn finalize_proxied_response(
         );
     }
 
-    // Image handling: set generic content-type if missing and log pixel heuristics
+    // Image handling: set a valid fallback content type if missing and log pixel heuristics
     let req_accept_images = req
         .get_header(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
@@ -265,7 +268,7 @@ fn finalize_proxied_response(
 
     if ct.starts_with("image/") || req_accept_images {
         if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+            beresp.set_header(header::CONTENT_TYPE, IMAGE_FALLBACK_CONTENT_TYPE);
         }
 
         // Heuristics to log likely tracking pixels without altering response
@@ -344,7 +347,7 @@ fn finalize_proxied_response_streaming(
 
     if ct.starts_with("image/") || req_accept_images {
         if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+            beresp.set_header(header::CONTENT_TYPE, IMAGE_FALLBACK_CONTENT_TYPE);
         }
 
         let mut is_pixel = false;
@@ -685,9 +688,9 @@ async fn proxy_with_redirects(
 /// - Proxies the decoded URL via a dynamic backend derived from scheme/host/port.
 /// - If the response `Content-Type` contains `text/html`, rewrites the HTML creative
 ///   (img/srcset/iframe to first-party) before returning `text/html; charset=utf-8`.
-/// - If the response is an image or the request `Accept` indicates images, ensures a
-///   generic `image/*` content type if origin omitted it, and logs likely 1×1 pixels
-///   using simple size/URL heuristics. No special response (still proxied).
+/// - If the response is an image or the request `Accept` indicates images, ensures an
+///   `application/octet-stream` content type if origin omitted it, and logs likely 1×1
+///   pixels using simple size/URL heuristics. No special response (still proxied).
 ///
 /// # Errors
 ///
@@ -1168,7 +1171,7 @@ mod tests {
         copy_proxy_forward_headers, handle_first_party_click, handle_first_party_proxy,
         handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, is_host_allowed,
         rebuild_response_with_body, reconstruct_and_validate_signed_target, redirect_is_permitted,
-        ProxyRequestConfig, SUPPORTED_ENCODINGS,
+        ProxyRequestConfig, IMAGE_FALLBACK_CONTENT_TYPE, SUPPORTED_ENCODINGS,
     };
     use crate::error::{IntoHttpResponse, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
@@ -1625,8 +1628,9 @@ mod tests {
 
     // --- Finalization path tests (no network) ---
 
-    // Access the finalize function within the crate for testing
+    // Access the finalize helpers within the crate for testing
     use super::finalize_proxied_response as finalize;
+    use super::finalize_proxied_response_streaming as finalize_streaming;
 
     #[test]
     fn html_response_is_rewritten_and_content_type_set() {
@@ -1728,20 +1732,36 @@ mod tests {
     }
 
     #[test]
-    fn image_accept_sets_generic_content_type_when_missing() {
+    fn image_accept_sets_fallback_content_type_when_missing() {
         let settings = create_test_settings();
         let beresp = Response::from_status(StatusCode::OK).with_body("PNG");
         let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
         req.set_header(HEADER_ACCEPT, "image/*");
         let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
             .expect("finalize should succeed");
-        // Since CT was missing and Accept indicates image, it should set generic image/*
+        // Since CT was missing and Accept indicates image, it should set a valid fallback.
         let ct = out
             .get_header(header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
             .to_str()
             .expect("Content-Type should be valid UTF-8");
-        assert_eq!(ct, "image/*");
+        assert_eq!(ct, IMAGE_FALLBACK_CONTENT_TYPE);
+    }
+
+    #[test]
+    fn streaming_image_accept_sets_fallback_content_type_when_missing() {
+        let beresp = Response::from_status(StatusCode::OK).with_body("GIF");
+        let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        req.set_header(HEADER_ACCEPT, "image/*");
+
+        let out = finalize_streaming(&req, "https://cdn.example/pixel.gif", beresp);
+        let ct = out
+            .get_header(header::CONTENT_TYPE)
+            .expect("Content-Type header should be present")
+            .to_str()
+            .expect("Content-Type should be valid UTF-8");
+
+        assert_eq!(ct, IMAGE_FALLBACK_CONTENT_TYPE);
     }
 
     #[test]
