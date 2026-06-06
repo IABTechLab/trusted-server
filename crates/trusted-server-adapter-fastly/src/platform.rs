@@ -205,17 +205,52 @@ fn edge_request_to_fastly(
     Ok(fastly_req)
 }
 
+/// Maximum origin response body size copied into WASM heap.
+///
+/// `take_body_bytes()` copies the full origin response into a single
+/// allocation.  This cap prevents oversized origin responses from exhausting
+/// the WASM address space.  The Content-Length pre-check avoids the copy
+/// entirely for responses that declare their size.  Streaming response support
+/// will remove this limit in PR 15.
+const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
 /// Convert a [`fastly::Response`] to a [`PlatformResponse`] with the given backend name.
 fn fastly_response_to_platform(
     mut resp: fastly::Response,
     backend_name: impl Into<String>,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
+    // Pre-flight: reject oversized responses before copying bytes into WASM heap.
+    // Content-Length is advisory but covers most origin responses; chunked
+    // responses without it fall through to the post-materialization check below.
+    if let Some(claimed_len) = resp
+        .get_header("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin Content-Length {claimed_len} exceeds \
+                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+            )));
+        }
+    }
+
     let status = resp.get_status();
     let mut builder = edgezero_core::http::response_builder().status(status);
     for (name, value) in resp.get_headers() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
     let body_bytes = resp.take_body_bytes();
+
+    // Belt-and-suspenders: catches chunked responses without Content-Length.
+    if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "origin response body {} bytes exceeds \
+             {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
+            body_bytes.len()
+        )));
+    }
+
     let edge_response = builder
         .body(edgezero_core::body::Body::from(body_bytes))
         .change_context(PlatformError::HttpClient)?;

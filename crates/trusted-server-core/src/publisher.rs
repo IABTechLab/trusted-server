@@ -285,6 +285,11 @@ pub enum PublisherResponse {
     /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
     /// 3. Call `stream_publisher_body()` with the body and streaming writer
     /// 4. Call `StreamingBody::finish()`
+    ///
+    /// **Interim (PR 15):** `body` has already been fully materialised into
+    /// WASM heap by the platform HTTP client.  `stream_publisher_body` reads
+    /// from an in-memory buffer, not a live origin stream.  The origin-side
+    /// peak is bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`.
     Stream {
         /// Response with all headers set (EC ID, cookies, etc.)
         /// but body not yet written. `Content-Length` already removed.
@@ -300,6 +305,11 @@ pub enum PublisherResponse {
     /// response-dispatch level, not in this arm.
     ///
     /// `Content-Length` is preserved — the body is unmodified.
+    ///
+    /// **Interim (PR 15):** `body` has been fully materialised into WASM heap.
+    /// Previously, binary assets streamed lazily from origin with no WASM
+    /// buffering.  This path is now bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`;
+    /// assets exceeding that limit return an error instead of exhausting heap.
     PassThrough {
         /// Response with all headers set but body not yet written.
         response: Response<EdgeBody>,
