@@ -140,6 +140,19 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_script_src_is_stable_for_identical_module_ids() {
+        let module_ids = ["core", "lockr", "permutive"];
+        let src = tsjs_script_src(&module_ids);
+
+        assert_sha256_hex_hash(hash_query_value(&src));
+        assert_eq!(
+            src,
+            tsjs_script_src(&module_ids),
+            "should produce a stable URL for identical module IDs"
+        );
+    }
+
+    #[test]
     fn tsjs_script_tag_wraps_source_in_single_trustedserver_tag() {
         let module_ids = ["creative"];
         let src = tsjs_script_src(&module_ids);
