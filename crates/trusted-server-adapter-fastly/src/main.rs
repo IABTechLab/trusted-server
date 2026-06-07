@@ -429,16 +429,16 @@ async fn route_request(
     // consent withdrawals. Revocations need the KV graph so tombstones remain
     // authoritative even for privacy-extension-heavy clients that do not look
     // like known browsers.
-    let kv_graph = if is_real_browser {
-        maybe_identity_graph(settings)
-    } else {
-        None
-    };
+    // Build the KV identity graph once. The write-path (finalize_kv_graph) is
+    // also given to bots when they signal consent withdrawal so tombstones are
+    // authoritative even for privacy-extension-heavy clients.
+    let kv_graph = maybe_identity_graph(settings);
     let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
-        maybe_identity_graph(settings)
+        kv_graph.clone()
     } else {
         None
     };
+    let kv_graph = if is_real_browser { kv_graph } else { None };
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared

@@ -302,6 +302,22 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock calls")
             .push(backend_name.clone());
 
+        let headers: Vec<(String, String)> = request
+            .request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .push(headers);
+
         let (status, body_bytes) = self
             .responses
             .lock()
@@ -429,6 +445,13 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
+/// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
+///
+/// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than
+/// [`NoopBackend`] (always returns `Err(Unsupported)`) so that handlers which
+/// both make HTTP calls and resolve backends don't need two separate service
+/// setups.  If your test must verify that a missing backend returns an error,
+/// use [`noop_services`] directly.
 pub(crate) fn build_services_with_http_client(
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {

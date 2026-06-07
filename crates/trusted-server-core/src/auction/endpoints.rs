@@ -70,9 +70,12 @@ pub async fn handle_auction(
     if content_length_exceeded {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(EdgeBody::from(Vec::<u8>::new()))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(EdgeBody::from(
+                format!("Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"),
+            ))
             .change_context(TrustedServerError::Auction {
-                message: "Failed to build oversized response".to_string(),
+                message: "Auction request body exceeded maximum size".to_string(),
             });
     }
 
@@ -81,9 +84,12 @@ pub async fn handle_auction(
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(EdgeBody::from(Vec::<u8>::new()))
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(EdgeBody::from(
+                format!("Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"),
+            ))
             .change_context(TrustedServerError::Auction {
-                message: "Failed to build oversized response".to_string(),
+                message: "Auction request body exceeded maximum size".to_string(),
             });
     }
     let body: AdRequest =
