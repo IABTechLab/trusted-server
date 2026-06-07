@@ -43,6 +43,7 @@ pub mod constants;
 pub mod cookies;
 pub mod creative;
 pub mod ec;
+pub(crate) mod edge_cookie;
 pub mod error;
 pub mod geo;
 pub(crate) mod host_rewrite;
