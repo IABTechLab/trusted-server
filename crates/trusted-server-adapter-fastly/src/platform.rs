@@ -409,6 +409,7 @@ pub fn build_runtime_services(
 ///
 /// Returns [`KvError::Unavailable`] when the store does not exist, or
 /// [`KvError::Internal`] when the Fastly SDK fails to open it.
+#[allow(dead_code)]
 pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
     FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }

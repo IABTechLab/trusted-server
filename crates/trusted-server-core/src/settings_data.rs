@@ -3,7 +3,7 @@ use error_stack::{Report, ResultExt};
 use validator::Validate;
 
 use crate::error::TrustedServerError;
-use crate::settings::{EdgeCookie, Publisher, Settings};
+use crate::settings::Settings;
 
 pub use crate::auction_config_types::AuctionConfig;
 
@@ -40,37 +40,163 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
         );
     }
 
-    if EdgeCookie::is_placeholder_secret_key(settings.edge_cookie.secret_key.expose()) {
-        log::warn!(
-            "INSECURE: edge_cookie.secret_key is set to a default placeholder — \
-             HMAC-SHA256 signatures can be forged. \
-             Override via TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY at build time"
-        );
-    }
-
-    if Publisher::is_placeholder_proxy_secret(settings.publisher.proxy_secret.expose()) {
-        log::warn!(
-            "INSECURE: publisher.proxy_secret is set to a default placeholder — \
-             XChaCha20-Poly1305 encrypted URLs can be decrypted by anyone. \
-             Override via TRUSTED_SERVER__PUBLISHER__PROXY_SECRET at build time"
-        );
-    }
+    settings.reject_placeholder_secrets()?;
 
     Ok(settings)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::error::TrustedServerError;
+    use crate::settings::Settings;
+    use crate::test_support::tests::crate_test_settings_str;
+
+    /// Builds a TOML string with the given secret values swapped in.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replacement patterns no longer match the test TOML,
+    /// which would cause the substitution to silently no-op.
+    fn toml_with_secrets(passphrase: &str, proxy_secret: &str) -> String {
+        let original = crate_test_settings_str();
+        let after_passphrase = original.replace(
+            r#"passphrase = "test-secret-key-32-bytes-minimum""#,
+            &format!(r#"passphrase = "{passphrase}""#),
+        );
+        assert_ne!(
+            after_passphrase, original,
+            "should have replaced passphrase value"
+        );
+        let result = after_passphrase.replace(
+            r#"proxy_secret = "unit-test-proxy-secret""#,
+            &format!(r#"proxy_secret = "{proxy_secret}""#),
+        );
+        assert_ne!(
+            result, after_passphrase,
+            "should have replaced proxy_secret value"
+        );
+        result
+    }
+
+    fn toml_with_partner_api_token(api_token: &str) -> String {
+        format!(
+            r#"{}
+
+            [[ec.partners]]
+            name = "Unit Test Partner"
+            source_domain = "unit-test-partner.example.com"
+            api_token = "{}"
+            "#,
+            crate_test_settings_str(),
+            api_token
+        )
+    }
 
     #[test]
-    fn get_settings_loads_embedded_toml_successfully() {
-        // The embedded TOML contains placeholder secrets (e.g. "trusted-server",
-        // "change-me-proxy-secret"). This is expected — production builds override
-        // them via TRUSTED_SERVER__* env vars at build time.
-        let settings = get_settings().expect("should load settings from embedded TOML");
-        assert!(!settings.publisher.domain.is_empty());
-        assert!(!settings.publisher.cookie_domain.is_empty());
-        assert!(!settings.publisher.origin_url.is_empty());
+    fn rejects_placeholder_passphrase() {
+        let toml = toml_with_secrets("trusted-server-placeholder-secret", "real-proxy-secret");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder secret_key");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("ec.passphrase")),
+            "error should mention ec.passphrase, got: {root}"
+        );
+    }
+
+    #[test]
+    fn rejects_placeholder_proxy_secret() {
+        let toml = toml_with_secrets(
+            "production-secret-key-32-bytes-min",
+            "change-me-proxy-secret",
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder proxy_secret");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("publisher.proxy_secret")),
+            "error should mention publisher.proxy_secret, got: {root}"
+        );
+    }
+
+    #[test]
+    fn rejects_both_placeholders_in_single_error() {
+        let toml = toml_with_secrets(
+            "trusted-server-placeholder-secret",
+            "change-me-proxy-secret",
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject both placeholder secrets");
+        let root = err.current_context();
+        match root {
+            TrustedServerError::InsecureDefault { field } => {
+                assert!(
+                    field.contains("ec.passphrase"),
+                    "error should mention ec.passphrase, got: {field}"
+                );
+                assert!(
+                    field.contains("publisher.proxy_secret"),
+                    "error should mention publisher.proxy_secret, got: {field}"
+                );
+            }
+            other => panic!("expected InsecureDefault, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn accepts_non_placeholder_secrets() {
+        let toml = toml_with_secrets(
+            "production-secret-key-32-bytes-min",
+            "production-proxy-secret",
+        );
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        settings
+            .reject_placeholder_secrets()
+            .expect("non-placeholder secrets should pass validation");
+    }
+
+    #[test]
+    fn rejects_placeholder_partner_api_token() {
+        let toml = toml_with_partner_api_token("sharedid-internal-token-32-bytes");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder partner api_token");
+        let root = err.current_context();
+        assert!(
+            matches!(root, TrustedServerError::InsecureDefault { field } if field.contains("ec.partners[unit-test-partner.example.com].api_token")),
+            "error should mention partner api_token, got: {root}"
+        );
+    }
+
+    #[test]
+    fn accepts_non_placeholder_partner_api_token() {
+        let toml = toml_with_partner_api_token("production-partner-token-32-bytes-min");
+        let settings = Settings::from_toml(&toml).expect("should parse TOML");
+        settings
+            .reject_placeholder_secrets()
+            .expect("non-placeholder partner api_token should pass validation");
+    }
+
+    /// Smoke-test the full `get_settings()` pipeline (embedded bytes → UTF-8 →
+    /// parse → validate → placeholder check).  The build-time TOML ships with
+    /// placeholder secrets, so the expected outcome is an [`InsecureDefault`]
+    /// error — but reaching that error proves every earlier stage succeeded.
+    #[test]
+    fn get_settings_rejects_embedded_placeholder_secrets() {
+        let err = super::get_settings().expect_err("should reject embedded placeholder secrets");
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::InsecureDefault { .. }
+            ),
+            "should fail with InsecureDefault, got: {err}"
+        );
     }
 }

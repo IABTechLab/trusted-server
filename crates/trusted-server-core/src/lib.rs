@@ -16,7 +16,7 @@
 //! - [`privacy`]: Privacy utilities and helpers
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
-//! - [`edge_cookie`]: Edge Cookie (EC) ID generation using HMAC
+//! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
 //! - [`test_support`]: Testing utilities and mocks
 //! - [`why`]: Debugging and introspection utilities
 
@@ -42,7 +42,7 @@ pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
-pub mod edge_cookie;
+pub mod ec;
 pub mod error;
 pub mod geo;
 pub(crate) mod host_rewrite;

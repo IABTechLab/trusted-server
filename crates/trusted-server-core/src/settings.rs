@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use url::Url;
 use validator::{Validate, ValidationError};
@@ -19,7 +20,10 @@ pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Publisher {
+    #[validate(custom(function = validate_publisher_domain))]
     pub domain: String,
+    /// Domain for non-EC cookies. EC cookies use a separate computed domain
+    /// (see [`ec_cookie_domain`](Self::ec_cookie_domain)).
     #[validate(custom(function = validate_cookie_domain))]
     pub cookie_domain: String,
     #[validate(custom(function = validate_no_trailing_slash))]
@@ -33,6 +37,17 @@ pub struct Publisher {
 impl Publisher {
     /// Known placeholder values that must not be used in production.
     pub const PROXY_SECRET_PLACEHOLDERS: &[&str] = &["change-me-proxy-secret", "proxy-secret"];
+
+    /// Returns the EC cookie domain, computed as `.{domain}`.
+    ///
+    /// Per spec §5.2, EC cookies derive their domain from
+    /// `publisher.domain` — **not** from `publisher.cookie_domain`.
+    /// This ensures the EC cookie is always scoped to the publisher's
+    /// apex domain regardless of how `cookie_domain` is configured.
+    #[must_use]
+    pub fn ec_cookie_domain(&self) -> String {
+        format!(".{}", self.domain)
+    }
 
     /// Returns `true` if `proxy_secret` matches a known placeholder value
     /// (case-insensitive).
@@ -203,35 +218,251 @@ impl DerefMut for IntegrationSettings {
     }
 }
 
-/// Edge Cookie configuration.
-#[allow(unused)]
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
-pub struct EdgeCookie {
-    #[validate(custom(function = EdgeCookie::validate_secret_key))]
-    pub secret_key: Redacted<String>,
+/// A partner (SSP, DSP, identity vendor) configured in `[[ec.partners]]`.
+///
+/// Partners are defined statically in `trusted-server.toml` rather than
+/// registered via API. At startup, each partner's `api_token` is hashed
+/// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct EcPartner {
+    /// Human-readable partner name.
+    pub name: String,
+    /// `OpenRTB` `source.domain` for EID entries (e.g. `"liveramp.com"`).
+    ///
+    /// This normalized domain is also the canonical EC KV `ids` map key.
+    #[validate(custom(function = EcPartner::validate_source_domain))]
+    pub source_domain: String,
+    /// `OpenRTB` `atype` value (typically 3).
+    #[serde(
+        default = "EcPartner::default_openrtb_atype",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub openrtb_atype: u8,
+    /// Whether this partner's UIDs appear in auction `user.eids`.
+    #[serde(default, deserialize_with = "from_value_or_str")]
+    pub bidstream_enabled: bool,
+    /// Plaintext API token. Hashed at startup for auth lookups.
+    /// Used by batch sync (inbound) and identify (inbound).
+    pub api_token: Redacted<String>,
+    /// Max batch sync API requests per partner per minute.
+    #[serde(
+        default = "EcPartner::default_batch_rate_limit",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub batch_rate_limit: u32,
+    /// Whether server-to-server pull sync is enabled for this partner.
+    #[serde(default, deserialize_with = "from_value_or_str")]
+    pub pull_sync_enabled: bool,
+    /// URL to call for pull sync. Required when `pull_sync_enabled`.
+    #[serde(default)]
+    pub pull_sync_url: Option<String>,
+    /// Allowlist of domains TS may call for this partner's pull sync.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub pull_sync_allowed_domains: Vec<String>,
+    /// Legacy pull-sync refresh interval retained for config compatibility.
+    ///
+    /// EC identity entries no longer store per-partner sync timestamps, so
+    /// this value is not used by the current fill-missing-only pull sync
+    /// behavior.
+    #[serde(
+        default = "EcPartner::default_pull_sync_ttl_sec",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub pull_sync_ttl_sec: u64,
+    /// Max pull sync calls per EC hash per partner per hour.
+    #[serde(
+        default = "EcPartner::default_pull_sync_rate_limit",
+        deserialize_with = "from_value_or_str"
+    )]
+    pub pull_sync_rate_limit: u32,
+    /// Outbound bearer token for pull sync requests.
+    #[serde(default)]
+    pub ts_pull_token: Option<Redacted<String>>,
 }
 
-impl EdgeCookie {
-    /// Known placeholder values that must not be used in production.
-    pub const SECRET_KEY_PLACEHOLDERS: &[&str] = &["secret-key", "secret_key", "trusted-server"];
+impl EcPartner {
+    /// Known partner API token placeholders that must not be used in deployments.
+    pub const API_TOKEN_PLACEHOLDERS: &[&str] = &[
+        "partner-api-token-32-bytes-minimum",
+        "replace-with-partner-api-token-32-bytes-minimum",
+        "sharedid-internal-token-32-bytes",
+        "inttest-api-key-1-32-bytes-minimum",
+        "inttest2-api-key-2-32-bytes-minimum",
+    ];
 
-    /// Returns `true` if `secret_key` matches a known placeholder value
+    /// Returns `true` if `api_token` matches a known placeholder value
     /// (case-insensitive).
     #[must_use]
-    pub fn is_placeholder_secret_key(secret_key: &str) -> bool {
-        Self::SECRET_KEY_PLACEHOLDERS
+    pub fn is_placeholder_api_token(api_token: &str) -> bool {
+        let token = api_token.trim();
+        Self::API_TOKEN_PLACEHOLDERS
             .iter()
-            .any(|p| p.eq_ignore_ascii_case(secret_key))
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(token))
     }
 
-    /// Validates that the secret key is not empty.
+    /// Validates a partner source domain for use as the canonical key.
     ///
     /// # Errors
     ///
-    /// Returns a validation error if the secret key is empty.
-    pub fn validate_secret_key(secret_key: &Redacted<String>) -> Result<(), ValidationError> {
-        if secret_key.expose().is_empty() {
-            return Err(ValidationError::new("empty_secret_key"));
+    /// Returns a validation error when `source_domain` is not a plain hostname.
+    pub fn validate_source_domain(source_domain: &str) -> Result<(), ValidationError> {
+        let trimmed = source_domain.trim();
+        if trimmed.is_empty()
+            || trimmed != source_domain
+            || trimmed.len() > 255
+            || !trimmed.is_ascii()
+            || trimmed.contains("://")
+            || trimmed.contains('/')
+            || trimmed.contains(':')
+        {
+            return Err(ValidationError::new("invalid_source_domain"));
+        }
+
+        let normalized = trimmed.trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() || normalized.len() > 255 {
+            return Err(ValidationError::new("invalid_source_domain"));
+        }
+
+        for label in normalized.split('.') {
+            if label.is_empty() || label.len() > 63 {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
+            let bytes = label.as_bytes();
+            let Some(first) = bytes.first().copied() else {
+                return Err(ValidationError::new("invalid_source_domain"));
+            };
+            let Some(last) = bytes.last().copied() else {
+                return Err(ValidationError::new("invalid_source_domain"));
+            };
+            if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
+            if !bytes
+                .iter()
+                .copied()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err(ValidationError::new("invalid_source_domain"));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn default_openrtb_atype() -> u8 {
+        3
+    }
+
+    #[must_use]
+    pub const fn default_batch_rate_limit() -> u32 {
+        60
+    }
+
+    #[must_use]
+    pub const fn default_pull_sync_ttl_sec() -> u64 {
+        86400
+    }
+
+    #[must_use]
+    pub const fn default_pull_sync_rate_limit() -> u32 {
+        10
+    }
+}
+
+/// Edge Cookie (EC) configuration.
+///
+/// Mapped from the `[ec]` TOML section. Controls EC identity generation,
+/// KV store names, and partner registry.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+pub struct Ec {
+    /// Publisher passphrase used as HMAC key for EC generation.
+    #[validate(custom(function = Ec::validate_passphrase))]
+    pub passphrase: Redacted<String>,
+
+    /// Fastly KV store name for the EC identity graph.
+    #[serde(default)]
+    pub ec_store: Option<String>,
+
+    /// Maximum number of concurrent pull-sync requests.
+    #[serde(default = "Ec::default_pull_sync_concurrency")]
+    pub pull_sync_concurrency: usize,
+
+    /// Entries with `cluster_size` at or below this value are treated as
+    /// individual users for identity resolution. B2B publishers should
+    /// raise this to 50+ since readers are frequently on office networks.
+    #[serde(default = "Ec::default_cluster_trust_threshold")]
+    pub cluster_trust_threshold: u32,
+
+    /// Legacy cluster re-check interval retained for config compatibility.
+    ///
+    /// EC identity entries no longer store cluster-check timestamps, so this
+    /// value is not used. `/_ts/api/v1/identify` computes cluster size only
+    /// when an entry does not already have a stored `cluster_size`.
+    #[serde(default = "Ec::default_cluster_recheck_secs")]
+    pub cluster_recheck_secs: u64,
+
+    /// Partners (SSPs, DSPs, identity vendors) for EC identity sync.
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    #[validate(nested)]
+    pub partners: Vec<EcPartner>,
+}
+
+impl Ec {
+    /// Known placeholder values that must not be used in production.
+    pub const PASSPHRASE_PLACEHOLDERS: &[&str] = &[
+        "secret-key",
+        "secret_key",
+        "trusted-server",
+        "trusted-server-placeholder-secret",
+    ];
+
+    /// Default maximum concurrent pull-sync requests.
+    #[must_use]
+    pub const fn default_pull_sync_concurrency() -> usize {
+        3
+    }
+
+    /// Default cluster trust threshold.
+    #[must_use]
+    pub const fn default_cluster_trust_threshold() -> u32 {
+        10
+    }
+
+    /// Default cluster re-check interval (1 hour).
+    #[must_use]
+    pub const fn default_cluster_recheck_secs() -> u64 {
+        3600
+    }
+
+    /// Returns `true` if `passphrase` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_passphrase(passphrase: &str) -> bool {
+        Self::PASSPHRASE_PLACEHOLDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(passphrase))
+    }
+
+    /// Minimum passphrase length for HMAC-SHA256 key strength.
+    ///
+    /// The EC passphrase is long-lived keying material for visitor ID
+    /// derivation. Operators should use a high-entropy random passphrase per
+    /// the EC setup and key-rotation documentation.
+    const MIN_PASSPHRASE_LENGTH: usize = 32;
+
+    /// Validates that the passphrase is not empty and meets minimum length.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the passphrase is empty or shorter
+    /// than [`Self::MIN_PASSPHRASE_LENGTH`] characters.
+    pub fn validate_passphrase(passphrase: &Redacted<String>) -> Result<(), ValidationError> {
+        if passphrase.expose().is_empty() {
+            return Err(ValidationError::new("empty_passphrase"));
+        }
+        if passphrase.expose().len() < Self::MIN_PASSPHRASE_LENGTH {
+            return Err(ValidationError::new("short_passphrase"));
         }
         Ok(())
     }
@@ -357,6 +588,13 @@ fn default_certificate_check() -> bool {
     true
 }
 
+fn is_admin_placeholder_password(password: &str) -> bool {
+    matches!(
+        password.trim().to_ascii_lowercase().as_str(),
+        "changeme" | "password" | "admin"
+    )
+}
+
 impl Default for Proxy {
     fn default() -> Self {
         Self {
@@ -417,7 +655,7 @@ pub struct Settings {
     pub publisher: Publisher,
     #[serde(default)]
     #[validate(nested)]
-    pub edge_cookie: EdgeCookie,
+    pub ec: Ec,
     #[serde(default)]
     pub integrations: IntegrationSettings,
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -439,7 +677,6 @@ pub struct Settings {
     pub debug: DebugConfig,
 }
 
-#[allow(unused)]
 impl Settings {
     /// Creates a new [`Settings`] instance from a pre-built TOML string.
     ///
@@ -458,7 +695,15 @@ impl Settings {
         settings.proxy.normalize();
         settings.consent.validate();
         settings.prepare_runtime()?;
+
+        settings.validate().map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("Configuration validation failed: {err}"),
+            })
+        })?;
+
         settings.validate_admin_coverage()?;
+        settings.validate_admin_handler_passwords()?;
 
         Ok(settings)
     }
@@ -504,6 +749,7 @@ impl Settings {
 
         settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
+        settings.validate_admin_handler_passwords()?;
 
         Ok(settings)
     }
@@ -512,7 +758,7 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
+    /// Returns a configuration error if any handler path regex does not compile.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
             handler.prepare_runtime()?;
@@ -532,6 +778,36 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Rejects known placeholder secret values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::InsecureDefault`] when one or more secret
+    /// fields still contain a placeholder value.
+    pub fn reject_placeholder_secrets(&self) -> Result<(), Report<TrustedServerError>> {
+        let mut insecure_fields: Vec<String> = Vec::new();
+
+        if Ec::is_placeholder_passphrase(self.ec.passphrase.expose()) {
+            insecure_fields.push("ec.passphrase".to_owned());
+        }
+        if Publisher::is_placeholder_proxy_secret(self.publisher.proxy_secret.expose()) {
+            insecure_fields.push("publisher.proxy_secret".to_owned());
+        }
+        for partner in &self.ec.partners {
+            if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
+                insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+        }
+
+        if insecure_fields.is_empty() {
+            return Ok(());
+        }
+
+        Err(Report::new(TrustedServerError::InsecureDefault {
+            field: insecure_fields.join(", "),
+        }))
     }
 
     /// Resolve the first handler whose regex matches the request path.
@@ -559,7 +835,8 @@ impl Settings {
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
     /// admin routes to `crates/trusted-server-adapter-fastly/src/main.rs`.
-    pub(crate) const ADMIN_ENDPOINTS: &[&str] = &["/admin/keys/rotate", "/admin/keys/deactivate"];
+    pub(crate) const ADMIN_ENDPOINTS: &[&str] =
+        &["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"];
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
@@ -603,11 +880,32 @@ impl Settings {
         Err(Report::new(TrustedServerError::Configuration {
             message: format!(
                 "No handler covers admin endpoint(s): {}. \
-                 Add a [[handlers]] entry with a path regex matching /admin/ \
+                 Add a [[handlers]] entry with a path regex matching /_ts/admin/ \
                  to protect admin access.",
                 uncovered.join(", ")
             ),
         }))
+    }
+
+    fn validate_admin_handler_passwords(&self) -> Result<(), Report<TrustedServerError>> {
+        for handler in &self.handlers {
+            let covers_admin = Self::ADMIN_ENDPOINTS
+                .iter()
+                .try_fold(false, |covered, path| {
+                    handler.matches_path(path).map(|matches| covered || matches)
+                })?;
+
+            if covers_admin && is_admin_placeholder_password(handler.password.expose()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Admin handler `{}` uses a placeholder password; configure a strong secret",
+                        handler.path
+                    ),
+                }));
+            }
+        }
+
+        Ok(())
     }
 
     /// Retrieves the integration configuration of a specific type.
@@ -624,6 +922,33 @@ impl Settings {
     {
         self.integrations.get_typed(integration_id)
     }
+}
+
+fn validate_publisher_domain(value: &str) -> Result<(), ValidationError> {
+    if value.trim() != value || value.is_empty() || value.len() > 253 {
+        return Err(ValidationError::new("invalid_publisher_domain"));
+    }
+    if value.starts_with('.') || value.ends_with('.') || value.contains(['/', ':']) {
+        return Err(ValidationError::new("invalid_publisher_domain"));
+    }
+
+    for label in value.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+        let bytes = label.as_bytes();
+        if bytes.first() == Some(&b'-') || bytes.last() == Some(&b'-') {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+        if !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err(ValidationError::new("invalid_publisher_domain"));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_cookie_domain(value: &str) -> Result<(), ValidationError> {
@@ -663,6 +988,19 @@ fn validate_path(value: &str) -> Result<(), ValidationError> {
         validation_error
     })
 }
+fn from_value_or_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = JsonValue::deserialize(deserializer)?;
+    match value {
+        JsonValue::String(value) => T::from_str(&value).map_err(serde::de::Error::custom),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
+}
+
 // Helper: allow Vec fields to deserialize from either a JSON array or a map of numeric indices.
 // This lets env vars like TRUSTED_SERVER__INTEGRATIONS__PREBID__BIDDERS__0=smartadserver work, which the config env source
 // represents as an object {"0": "value"} rather than a sequence. Also supports string inputs that are
@@ -830,10 +1168,18 @@ mod tests {
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
         assert_eq!(
+            settings.publisher.ec_cookie_domain(),
+            ".test-publisher.com",
+            "EC cookie domain should be computed as .{{domain}}"
+        );
+        assert_eq!(
             settings.publisher.origin_url,
             "https://origin.test-publisher.com"
         );
-        assert_eq!(settings.edge_cookie.secret_key.expose(), "test-secret-key");
+        assert_eq!(
+            settings.ec.passphrase.expose(),
+            "test-secret-key-32-bytes-minimum"
+        );
 
         settings.validate().expect("Failed to validate settings");
     }
@@ -845,12 +1191,70 @@ mod tests {
             r#"origin_url = "https://origin.test-publisher.com/""#,
         );
 
-        let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
-        let result = settings.validate();
+        let result = Settings::from_toml(&toml_str);
         assert!(
             result.is_err(),
             "origin_url ending with '/' should fail validation"
         );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_publisher_domains() {
+        for domain in [
+            "",
+            ".example.com",
+            "example.com.",
+            "https://example.com",
+            "bad_domain.com",
+        ] {
+            let toml_str = crate_test_settings_str().replace(
+                r#"domain = "test-publisher.com""#,
+                &format!(r#"domain = "{domain}""#),
+            );
+
+            let result = Settings::from_toml(&toml_str);
+            assert!(result.is_err(), "should reject invalid domain {domain:?}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_localhost_publisher_domain() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"domain = "test-publisher.com""#,
+            r#"domain = "localhost""#,
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should accept localhost domain");
+        assert_eq!(settings.publisher.ec_cookie_domain(), ".localhost");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_ec_partner_source_domains() {
+        for source_domain in [
+            "",
+            " bad.example.com",
+            "https://bad.example.com",
+            "bad.example.com/path",
+            "bad.example.com:443",
+            "bad_domain.example.com",
+        ] {
+            let toml_str = format!(
+                r#"{}
+                [[ec.partners]]
+                name = "Invalid Partner"
+                source_domain = "{}"
+                api_token = "invalid-token"
+                "#,
+                crate_test_settings_str(),
+                source_domain,
+            );
+
+            let result = Settings::from_toml(&toml_str);
+            assert!(
+                result.is_err(),
+                "should reject invalid source_domain {source_domain:?}"
+            );
+        }
     }
 
     #[test]
@@ -880,33 +1284,79 @@ mod tests {
     }
 
     #[test]
-    fn is_placeholder_secret_key_rejects_all_known_placeholders() {
-        for placeholder in EdgeCookie::SECRET_KEY_PLACEHOLDERS {
+    fn is_placeholder_passphrase_rejects_all_known_placeholders() {
+        for placeholder in Ec::PASSPHRASE_PLACEHOLDERS {
             assert!(
-                EdgeCookie::is_placeholder_secret_key(placeholder),
-                "should detect placeholder secret_key '{placeholder}'"
+                Ec::is_placeholder_passphrase(placeholder),
+                "should detect placeholder passphrase '{placeholder}'"
             );
         }
     }
 
     #[test]
-    fn is_placeholder_secret_key_is_case_insensitive() {
+    fn is_placeholder_passphrase_is_case_insensitive() {
         assert!(
-            EdgeCookie::is_placeholder_secret_key("SECRET-KEY"),
-            "should detect case-insensitive placeholder secret_key"
+            Ec::is_placeholder_passphrase("SECRET-KEY"),
+            "should detect case-insensitive placeholder passphrase"
         );
         assert!(
-            EdgeCookie::is_placeholder_secret_key("Trusted-Server"),
-            "should detect mixed-case placeholder secret_key"
+            Ec::is_placeholder_passphrase("Trusted-Server"),
+            "should detect mixed-case placeholder passphrase"
         );
     }
 
     #[test]
-    fn is_placeholder_secret_key_accepts_non_placeholder() {
+    fn is_placeholder_passphrase_accepts_non_placeholder() {
         assert!(
-            !EdgeCookie::is_placeholder_secret_key("test-secret-key"),
-            "should accept non-placeholder secret_key"
+            !Ec::is_placeholder_passphrase("test-secret-key-32-bytes-minimum"),
+            "should accept non-placeholder passphrase"
         );
+    }
+
+    #[test]
+    fn is_placeholder_api_token_rejects_all_known_placeholders() {
+        for placeholder in EcPartner::API_TOKEN_PLACEHOLDERS {
+            assert!(
+                EcPartner::is_placeholder_api_token(placeholder),
+                "should detect placeholder api_token '{placeholder}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_placeholder_api_token_is_case_insensitive() {
+        assert!(
+            EcPartner::is_placeholder_api_token("SHAREDID-INTERNAL-TOKEN-32-BYTES"),
+            "should detect case-insensitive placeholder api_token"
+        );
+    }
+
+    #[test]
+    fn is_placeholder_api_token_accepts_non_placeholder() {
+        assert!(
+            !EcPartner::is_placeholder_api_token("production-partner-token-32-bytes-min"),
+            "should accept non-placeholder api_token"
+        );
+    }
+
+    #[test]
+    fn validate_passphrase_rejects_under_32_characters() {
+        let passphrase = Redacted::new("a".repeat(31));
+
+        let err = Ec::validate_passphrase(&passphrase).expect_err("should reject short passphrase");
+
+        assert_eq!(
+            err.code.as_ref(),
+            "short_passphrase",
+            "should report short passphrase validation error"
+        );
+    }
+
+    #[test]
+    fn validate_passphrase_accepts_32_characters() {
+        let passphrase = Redacted::new("a".repeat(32));
+
+        Ec::validate_passphrase(&passphrase).expect("should accept 32-character passphrase");
     }
 
     #[test]
@@ -1226,7 +1676,7 @@ mod tests {
                 (path_key_0, Some("^/env-handler")),
                 (username_key_0, Some("env-user")),
                 (password_key_0, Some("env-pass")),
-                (path_key_1, Some("^/admin")),
+                (path_key_1, Some("^/_ts/admin")),
                 (username_key_1, Some("admin")),
                 (password_key_1, Some("admin-pass")),
             ],
@@ -1238,6 +1688,136 @@ mod tests {
                 assert_eq!(handler.path, "^/env-handler");
                 assert_eq!(handler.username.expose(), "env-user");
                 assert_eq!(handler.password.expose(), "env-pass");
+            },
+        );
+    }
+
+    #[test]
+    fn test_ec_partners_override_with_indexed_env() {
+        let toml_str = crate_test_settings_str();
+
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_name_key = format!(
+            "{}{}EC{}PARTNERS{}0{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_source_domain_key = format!(
+            "{}{}EC{}PARTNERS{}0{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_openrtb_atype_key = format!(
+            "{}{}EC{}PARTNERS{}0{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_bidstream_enabled_key = format!(
+            "{}{}EC{}PARTNERS{}0{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_0_api_token_key = format!(
+            "{}{}EC{}PARTNERS{}0{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_name_key = format!(
+            "{}{}EC{}PARTNERS{}1{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_source_domain_key = format!(
+            "{}{}EC{}PARTNERS{}1{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_openrtb_atype_key = format!(
+            "{}{}EC{}PARTNERS{}1{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_bidstream_enabled_key = format!(
+            "{}{}EC{}PARTNERS{}1{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        let partner_1_api_token_key = format!(
+            "{}{}EC{}PARTNERS{}1{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_vars(
+            [
+                (origin_key, Some("https://origin.test-publisher.com")),
+                (partner_0_name_key, Some("Env Partner 0")),
+                (partner_0_source_domain_key, Some("envpartner0.example.com")),
+                (partner_0_openrtb_atype_key, Some("1")),
+                (partner_0_bidstream_enabled_key, Some("true")),
+                (partner_0_api_token_key, Some("env-token-0")),
+                (partner_1_name_key, Some("Env Partner 1")),
+                (partner_1_source_domain_key, Some("envpartner1.example.com")),
+                (partner_1_openrtb_atype_key, Some("3")),
+                (partner_1_bidstream_enabled_key, Some("false")),
+                (partner_1_api_token_key, Some("env-token-1")),
+            ],
+            || {
+                let settings = Settings::from_toml_and_env(&toml_str)
+                    .expect("Settings should load indexed EC partners from env");
+
+                assert_eq!(settings.ec.partners.len(), 2);
+                assert_eq!(settings.ec.partners[0].name, "Env Partner 0");
+                assert_eq!(
+                    settings.ec.partners[0].source_domain,
+                    "envpartner0.example.com"
+                );
+                assert_eq!(settings.ec.partners[0].openrtb_atype, 1);
+                assert!(settings.ec.partners[0].bidstream_enabled);
+                assert_eq!(settings.ec.partners[0].api_token.expose(), "env-token-0");
+                assert_eq!(settings.ec.partners[1].name, "Env Partner 1");
+                assert_eq!(
+                    settings.ec.partners[1].source_domain,
+                    "envpartner1.example.com"
+                );
+                assert_eq!(settings.ec.partners[1].openrtb_atype, 3);
+                assert!(!settings.ec.partners[1].bidstream_enabled);
+                assert_eq!(settings.ec.partners[1].api_token.expose(), "env-token-1");
             },
         );
     }
@@ -1949,8 +2529,8 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
             config_store_id = "test-config-store-id"
@@ -1970,8 +2550,8 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/admin/keys/rotate", "/admin/keys/deactivate"],
-            "should report both admin endpoints as uncovered"
+            vec!["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate",],
+            "should report all admin endpoints as uncovered"
         );
     }
 
@@ -1983,7 +2563,7 @@ mod tests {
             .expect("should check admin coverage");
         assert!(
             uncovered.is_empty(),
-            "should report no uncovered admin endpoints when handler covers /admin"
+            "should report no uncovered admin endpoints when handler covers /_ts/admin"
         );
     }
 
@@ -1992,7 +2572,7 @@ mod tests {
         let toml_str = settings_str_without_admin_handler()
             + r#"
             [[handlers]]
-            path = "^/admin/keys/rotate$"
+            path = "^/_ts/admin/keys/rotate$"
             username = "admin"
             password = "secret"
             "#;
@@ -2004,8 +2584,8 @@ mod tests {
             .expect("should check admin coverage");
         assert_eq!(
             uncovered,
-            vec!["/admin/keys/deactivate"],
-            "should detect that only deactivate is uncovered"
+            vec!["/_ts/admin/keys/deactivate"],
+            "should detect endpoints not covered by the rotate-only handler"
         );
     }
 
@@ -2033,6 +2613,30 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_admin_handler_placeholder_password() {
+        let toml_str = crate_test_settings_str()
+            .replace(r#"password = "admin-pass""#, r#"password = "changeme""#);
+
+        let result = Settings::from_toml(&toml_str);
+        assert!(
+            result.is_err(),
+            "should reject placeholder password on admin handler"
+        );
+        let err = format!("{:?}", result.expect_err("should reject placeholder"));
+        assert!(
+            err.contains("placeholder password"),
+            "error should mention placeholder admin password, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_non_placeholder_admin_password() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should accept non-placeholder admin password");
+        assert_eq!(settings.handlers.len(), 2, "should parse handlers");
     }
 
     #[test]
@@ -2075,9 +2679,9 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                // Match arms look like: (Method::POST, "/admin/...") => ...
-                if trimmed.starts_with('(') && trimmed.contains("\"/admin/") {
-                    let start = trimmed.find("\"/admin/")?;
+                // Match arms look like: (Method::POST, "/_ts/admin/...") => ...
+                if trimmed.starts_with('(') && trimmed.contains("\"/_ts/admin/") {
+                    let start = trimmed.find("\"/_ts/admin/")?;
                     let rest = &trimmed[start + 1..];
                     let end = rest.find('"')?;
                     Some(&rest[..end])

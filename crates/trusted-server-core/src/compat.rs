@@ -6,13 +6,10 @@
 //! # PR 15 removal target
 
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::Report;
 use fastly::http::header;
 
 use crate::constants::INTERNAL_HEADERS;
-use crate::error::TrustedServerError;
 use crate::http_util::SPOOFABLE_FORWARDED_HEADERS;
-use crate::platform::PlatformResponse;
 
 fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<EdgeBody> {
     let uri: http::Uri = req.get_url_str().parse().unwrap_or_else(|_| {
@@ -176,13 +173,24 @@ pub fn to_fastly_response_skeleton(resp: http::Response<EdgeBody>) -> fastly::Re
     fastly_resp
 }
 
-/// Sanitize forwarded headers on a `fastly::Request`.
+/// Sanitize forwarded and internal headers on a `fastly::Request`.
+///
+/// Strips spoofable forwarded headers (X-Forwarded-Host etc.) and TS-internal
+/// identity headers (x-ts-ec, x-ts-eids, …) that clients must not be able to
+/// inject.  Both sets are stripped at the edge entry point, before any
+/// request-derived context is built or the request is converted to http types.
 ///
 /// # PR 15 removal target
 pub fn sanitize_fastly_forwarded_headers(req: &mut fastly::Request) {
     for &name in SPOOFABLE_FORWARDED_HEADERS {
         if req.get_header(name).is_some() {
             log::debug!("Stripped spoofable header: {name}");
+            req.remove_header(name);
+        }
+    }
+    for &name in crate::constants::INTERNAL_HEADERS {
+        if req.get_header(name).is_some() {
+            log::debug!("Stripped inbound internal header: {name}");
             req.remove_header(name);
         }
     }
@@ -240,17 +248,7 @@ pub fn set_fastly_ec_cookie(
     response: &mut fastly::Response,
     ec_id: &str,
 ) {
-    if !crate::cookies::ec_cookie_value_is_safe(ec_id) {
-        log::warn!(
-            "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
-            ec_id.len()
-        );
-        return;
-    }
-    response.append_header(
-        header::SET_COOKIE,
-        crate::cookies::create_ec_cookie(settings, ec_id),
-    );
+    crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
 }
 
 /// Expire the EC ID cookie on a `fastly::Response`.
@@ -260,42 +258,9 @@ pub fn expire_fastly_ec_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
-    response.append_header(
-        header::SET_COOKIE,
-        format!(
-            "{}=; {}",
-            crate::constants::COOKIE_TS_EC,
-            crate::cookies::ec_cookie_attributes(settings, 0),
-        ),
-    );
+    crate::ec::cookies::expire_ec_cookie(settings, response);
 }
 
-/// Converts a [`PlatformResponse`] into a [`fastly::Response`].
-///
-/// # Errors
-///
-/// - [`TrustedServerError::Proxy`] if `platform_resp` carries a streaming body,
-///   which this Fastly-only conversion path cannot materialise.
-pub(crate) fn platform_response_to_fastly(
-    platform_resp: PlatformResponse,
-) -> Result<fastly::Response, Report<TrustedServerError>> {
-    let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming platform response body is not supported by Fastly response conversion"
-                    .to_string(),
-            }));
-        }
-    };
-    let mut resp = fastly::Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.append_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    Ok(resp)
-}
 
 #[cfg(test)]
 mod tests {
@@ -636,7 +601,8 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let mut response = fastly::Response::new();
 
-        set_fastly_ec_cookie(&settings, &mut response, "abc123.XyZ789");
+        let ec_id = format!("{}.Ab12z9", "a".repeat(64));
+        set_fastly_ec_cookie(&settings, &mut response, &ec_id);
 
         let cookie = response
             .get_header(header::SET_COOKIE)
@@ -645,8 +611,8 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "ts-ec=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
-                settings.publisher.cookie_domain
+                "ts-ec={ec_id}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=31536000; HttpOnly",
+                settings.publisher.domain
             )),
             "should set expected EC cookie"
         );
@@ -666,8 +632,8 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "ts-ec=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
-                settings.publisher.cookie_domain
+                "ts-ec=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
+                settings.publisher.domain
             )),
             "should set expected expiry cookie"
         );

@@ -328,6 +328,16 @@ When the integration is enabled, the `IntegrationAttributeRewriter` removes any 
 
 The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
 
+**5. Hybrid EID forwarding**
+
+For Prebid-routed auctions, Trusted Server now forwards identity using a hybrid model:
+
+- TSJS reads current-request EIDs from `pbjs.getUserIdsAsEids()` and includes them in the `/auction` payload.
+- The edge resolves additional EIDs from the EC/KV identity graph.
+- The auction handler merges and deduplicates both sets.
+- The Prebid provider forwards the merged result to Prebid Server as `user.ext.eids`.
+- The `ts-eids` cookie is still ingested after the response so future requests can benefit from those IDs even without fresh browser-side resolution.
+
 Reusing these patterns makes it straightforward to convert additional legacy flows (for example, Next.js rewrites) into first-class integrations.
 
 ## Future Improvements
