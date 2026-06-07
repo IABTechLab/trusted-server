@@ -261,7 +261,6 @@ pub fn expire_fastly_ec_cookie(
     crate::ec::cookies::expire_ec_cookie(settings, response);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

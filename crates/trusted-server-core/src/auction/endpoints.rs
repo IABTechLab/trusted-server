@@ -71,9 +71,9 @@ pub async fn handle_auction(
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(
-                format!("Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"),
-            ))
+            .body(EdgeBody::from(format!(
+                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+            )))
             .change_context(TrustedServerError::Auction {
                 message: "Auction request body exceeded maximum size".to_string(),
             });
@@ -85,9 +85,9 @@ pub async fn handle_auction(
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .header(header::CONTENT_TYPE, "text/plain")
-            .body(EdgeBody::from(
-                format!("Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"),
-            ))
+            .body(EdgeBody::from(format!(
+                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+            )))
             .change_context(TrustedServerError::Auction {
                 message: "Auction request body exceeded maximum size".to_string(),
             });
