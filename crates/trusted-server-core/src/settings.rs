@@ -34,7 +34,7 @@ pub struct Publisher {
     pub proxy_secret: Redacted<String>,
     /// Maximum number of bytes buffered when the `EdgeZero` publisher fallback processes
     /// a streaming response. Defaults to 16 MiB — a conservative cap that prevents
-    /// Wasm-heap OOM at flag-flip. Set explicitly to a larger value or `null` (unbounded)
+    /// Wasm-heap OOM at flag-flip. Set explicitly to a larger integer value
     /// when the deployment serves publisher pages larger than 16 MiB.
     #[serde(default = "default_max_buffered_body_bytes")]
     pub max_buffered_body_bytes: Option<usize>,

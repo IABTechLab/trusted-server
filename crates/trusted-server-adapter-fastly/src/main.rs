@@ -2,7 +2,7 @@ use std::io::Write;
 
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::FastlyConfigStore;
+use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
@@ -230,21 +230,29 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
-    // `run_app_with_config` and `run_app_with_logging` call `init_logger`
-    // internally. A second `set_logger` call panics because our custom fern
-    // logger is already initialised above. `dispatch_with_config_handle` skips logger
-    // initialisation and injects the config store directly.
-    let mut response =
-        match edgezero_adapter_fastly::dispatch_with_config_handle(&app, req, config_store) {
-            Ok(response) => compat::from_fastly_response(response),
+    // Dispatch directly through the EdgeZero router without an intermediate
+    // fastly::Response conversion. The standard dispatch helpers
+    // (dispatch_with_config_handle, etc.) convert through fastly::Response using
+    // set_header, which drops duplicate header values — silently losing multiple
+    // Set-Cookie headers from publisher/origin responses.
+    //
+    // Bypassing to app.router().oneshot() preserves every header value in the
+    // http::HeaderMap and skips the logger-reinit that prevents using run_app_*.
+    let mut response = {
+        match into_core_request(req) {
+            Ok(mut core_req) => {
+                core_req.extensions_mut().insert(config_store);
+                futures::executor::block_on(app.router().oneshot(core_req))
+            }
             Err(e) => {
-                log::error!("EdgeZero dispatch failed: {e}");
+                log::error!("EdgeZero request conversion failed: {e}");
                 FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .with_body_text_plain("Internal Server Error")
                     .send_to_client();
                 return;
             }
-        };
+        }
+    };
 
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level

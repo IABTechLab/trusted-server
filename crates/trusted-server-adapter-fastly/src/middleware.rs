@@ -151,6 +151,14 @@ impl Middleware for AuthMiddleware {
 ///
 /// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
 /// in `main.rs` so the 401-skip rule is defined in one place.
+///
+/// # Parity note
+///
+/// The legacy path skips geo only for its own `HandlerOutcome::AuthChallenge`
+/// responses; origin-forwarded 401s still receive geo headers there. The `EdgeZero`
+/// path skips geo for **all** 401s by status. This is intentionally more
+/// conservative: geo data is not sent to any unauthenticated caller regardless of
+/// whether the 401 originated from this server or the upstream origin.
 pub(crate) fn resolve_geo_for_response<F>(
     response: &Response,
     client_ip: Option<IpAddr>,
@@ -444,6 +452,34 @@ mod tests {
     // ---------------------------------------------------------------------------
     // AuthMiddleware::handle tests
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn finalize_handle_preserves_duplicate_set_cookie_headers() {
+        // Regression guard: FinalizeResponseMiddleware must not drop duplicate
+        // Set-Cookie headers. The old dispatch_with_config_handle path silently
+        // collapsed them because fastly::Response uses set_header (last-wins).
+        // This test verifies the EdgeZero middleware chain is header-transparent.
+        let settings = settings_with_response_headers(vec![]);
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            let resp = response_builder()
+                .header("set-cookie", "session=abc; Path=/; HttpOnly")
+                .header("set-cookie", "tracker=xyz; Path=/; SameSite=Lax")
+                .body(Body::empty())
+                .expect("should build response with two Set-Cookie headers");
+            Ok::<Response, EdgeError>(resp)
+        });
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should succeed");
+
+        let cookie_count = response.headers().get_all("set-cookie").iter().count();
+        assert_eq!(
+            cookie_count, 2,
+            "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
+        );
+    }
 
     #[test]
     fn auth_handle_passes_through_when_auth_not_configured() {

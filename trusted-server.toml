@@ -14,7 +14,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "change-me-proxy-secret"
 # Maximum bytes buffered when processing a streaming publisher response on the EdgeZero path.
-# Omit (default) for unbounded buffering, limited only by the Wasm heap.
+# Defaults to 16 MiB when omitted; responses exceeding the cap return 500.
+# Raise it for deployments serving larger publisher pages:
 # max_buffered_body_bytes = 16777216  # 16 MiB
 
 [ec]
