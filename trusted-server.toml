@@ -12,6 +12,8 @@ password = "replace-with-admin-password-32-bytes"
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
+# Optional: override outbound Host header while connecting to origin_url.
+# origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]

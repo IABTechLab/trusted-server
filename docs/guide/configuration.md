@@ -154,12 +154,13 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field           | Type   | Required | Description                                            |
-| --------------- | ------ | -------- | ------------------------------------------------------ |
-| `domain`        | String | Yes      | Publisher's apex domain name                           |
-| `cookie_domain` | String | Yes      | Domain for non-EC cookies (typically with leading dot) |
-| `origin_url`    | String | Yes      | Full URL of publisher origin server                    |
-| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs           |
+| Field                         | Type   | Required | Description                                                   |
+| ----------------------------- | ------ | -------- | ------------------------------------------------------------- |
+| `domain`                      | String | Yes      | Publisher's apex domain name                                  |
+| `cookie_domain`               | String | Yes      | Domain for non-EC cookies (typically with leading dot)        |
+| `origin_url`                  | String | Yes      | Full URL of publisher origin server                           |
+| `origin_host_header_override` | String | No       | Outbound Host header to send while connecting to `origin_url` |
+| `proxy_secret`                | String | Yes      | Secret key for encrypting/signing proxy URLs                  |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -171,6 +172,8 @@ Core publisher settings for domain, origin, and proxy configuration.
 domain = "publisher.com"
 cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
+# Optional: connect to origin_url but send this outbound Host header.
+# origin_host_header_override = "www.publisher.com"
 proxy_secret = "change-me-to-secure-random-value"
 ```
 
@@ -180,6 +183,7 @@ proxy_secret = "change-me-to-secure-random-value"
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 ```
 
@@ -235,6 +239,26 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 - ❌ `origin.publisher.com` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+#### `origin_host_header_override`
+
+**Purpose**: Optional Host header to send to the publisher origin while still
+connecting to the host in `origin_url`.
+
+**Usage**:
+
+- Connects, uses SNI, and checks certificates against `origin_url`
+- Sends the configured value as the outbound HTTP `Host` header
+- Useful when the origin endpoint expects a canonical publisher hostname
+
+**Format**: Hostname with optional port, without protocol, path, query, or fragment
+
+- ✅ `www.publisher.com`
+- ✅ `www.publisher.com:8443`
+- ❌ `https://www.publisher.com`
+- ❌ `www.publisher.com/path`
+
+**Default**: When omitted, Trusted Server sends the host from `origin_url`.
 
 #### `proxy_secret`
 

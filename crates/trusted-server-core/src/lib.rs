@@ -44,6 +44,7 @@ pub mod creative;
 pub mod ec;
 pub mod error;
 pub mod geo;
+pub(crate) mod host_header;
 pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
