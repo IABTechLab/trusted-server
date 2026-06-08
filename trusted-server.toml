@@ -4,9 +4,9 @@ username = "user"
 password = "pass"
 
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
-password = "changeme"
+password = "replace-with-admin-password-32-bytes"
 
 [publisher]
 domain = "test-publisher.com"
@@ -17,8 +17,32 @@ proxy_secret = "change-me-proxy-secret"
 # Omit (default) for unbounded buffering, limited only by the Wasm heap.
 # max_buffered_body_bytes = 16777216  # 16 MiB
 
-[edge_cookie]
-secret_key = "trusted-server"
+[ec]
+passphrase = "local-dev-passphrase-32-bytes-min"
+ec_store = "ec_identity_store"
+pull_sync_concurrency = 3
+# cluster_trust_threshold = 10   # Entries with cluster_size <= this are individual users
+# cluster_recheck_secs = 3600    # Re-evaluate cluster_size after this many seconds
+
+# [[ec.partners]]
+# name = "LiveRamp"
+# source_domain = "liveramp.com"
+# openrtb_atype = 3
+# bidstream_enabled = true
+# api_token = "partner-api-token-32-bytes-minimum"
+# batch_rate_limit = 60
+# pull_sync_enabled = false
+
+# Configure real partners via private build-time config or environment
+# overrides. Do not commit deployable partner API tokens in this placeholder
+# config; the integration-test partners are injected by test scripts.
+#
+# [[ec.partners]]
+# name = "Prebid SharedID"
+# source_domain = "sharedid.org"
+# openrtb_atype = 1
+# bidstream_enabled = true
+# api_token = "replace-with-partner-api-token-32-bytes-minimum"
 
 # Custom headers to be included in every response
 # Allows publishers to include tags such as X-Robots-Tag: noindex
@@ -48,7 +72,7 @@ debug = false
 # Bidders that run client-side via native Prebid.js adapters instead of
 # being routed through the server-side auction. Their adapter modules must
 # be statically imported in the JS bundle.
-client_side_bidders = ["rubicon"]
+client_side_bidders = []
 
 # Compatibility sugar for static per-bidder params merged into every outgoing
 # PBS request. These normalize into bid_param_override_rules internally.
@@ -152,8 +176,9 @@ rewrite_script = true
 # mode = "restrictive"          # "restrictive" | "newest" | "permissive"
 # freshness_threshold_days = 30
 
-# KV Store consent persistence (requires a KV store named "consent_store" in fastly.toml)
-# consent_store = "consent_store"
+# Consent is interpreted from request cookies, headers, geolocation, and these
+# policy settings. EC identity lifecycle state and withdrawal tombstones are
+# stored in the KV store configured by [ec].ec_store.
 
 # Rewrite configuration for creative HTML/CSS processing
 # [rewrite]

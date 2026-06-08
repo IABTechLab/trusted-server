@@ -549,10 +549,7 @@ Auction results are returned in standard OpenRTB format with an `ext.orchestrato
 }
 ```
 
-The response also includes EC ID headers:
-
-- `X-TS-EC` — The persistent EC user ID
-- `X-TS-EC-Fresh` — A fresh ID generated for this session
+EC identity is maintained with the `ts-ec` cookie; auction responses do not emit EC ID headers.
 
 ## Creative Processing
 

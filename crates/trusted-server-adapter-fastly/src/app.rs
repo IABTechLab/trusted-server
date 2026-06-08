@@ -17,8 +17,8 @@
 //! |--------|-------------|---------|
 //! | GET | `/.well-known/trusted-server.json` | [`handle_trusted_server_discovery`] |
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
-//! | POST | `/admin/keys/rotate` | [`handle_rotate_key`] |
-//! | POST | `/admin/keys/deactivate` | [`handle_deactivate_key`] |
+//! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
+//! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -55,8 +55,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -72,8 +73,8 @@ use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
-    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
+    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
+    FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,34 +114,6 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         kv_store,
     }))
-}
-
-/// Resolves per-request consent KV store services for routes that read consent data.
-///
-/// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// matches the legacy `route_request` behavior where a misconfigured consent store
-/// makes consent-dependent routes unavailable rather than proceeding without consent.
-///
-/// # Errors
-///
-/// Returns an error when the configured consent store cannot be opened.
-pub(crate) fn runtime_services_for_consent_route(
-    settings: &Settings,
-    runtime_services: &RuntimeServices,
-) -> Result<RuntimeServices, Report<TrustedServerError>> {
-    let Some(store_name) = settings.consent.consent_store.as_deref() else {
-        return Ok(runtime_services.clone());
-    };
-
-    open_kv_store(store_name)
-        .map(|store| runtime_services.clone().with_kv_store(store))
-        .map_err(|e| {
-            Report::new(TrustedServerError::KvStore {
-                store_name: store_name.to_string(),
-                message: e.to_string(),
-            })
-        })
 }
 
 // ---------------------------------------------------------------------------
@@ -217,9 +190,18 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
+        let mut ec_context = EcContext::default();
         return state
             .registry
-            .handle_proxy(&method, &path, &state.settings, services, req)
+            .handle_proxy(ProxyDispatchInput {
+                method: &method,
+                path: &path,
+                settings: &state.settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services,
+                req,
+            })
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -331,12 +313,12 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         handler: NamedRouteHandler::VerifySignature,
     },
     NamedRoute {
-        path: "/admin/keys/rotate",
+        path: "/_ts/admin/keys/rotate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::RotateKey,
     },
     NamedRoute {
-        path: "/admin/keys/deactivate",
+        path: "/_ts/admin/keys/deactivate",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
     },
@@ -391,18 +373,17 @@ fn named_route_handler(
                         handle_deactivate_key(&state.settings, &services, req)
                     }
                     NamedRouteHandler::Auction => {
-                        match runtime_services_for_consent_route(&state.settings, &services) {
-                            Ok(consent_services) => {
-                                handle_auction(
-                                    &state.settings,
-                                    &state.orchestrator,
-                                    &consent_services,
-                                    req,
-                                )
-                                .await
-                            }
-                            Err(e) => Err(e),
-                        }
+                        let ec_context = EcContext::default();
+                        handle_auction(
+                            &state.settings,
+                            &state.orchestrator,
+                            None,
+                            None,
+                            &ec_context,
+                            &services,
+                            req,
+                        )
+                        .await
                     }
                     NamedRouteHandler::FirstPartyProxy => {
                         handle_first_party_proxy(&state.settings, &services, req).await
@@ -430,12 +411,7 @@ fn fallback_route_handler(
         Box::pin(execute_handler(
             state,
             ctx,
-            |state, services, req| async move {
-                match runtime_services_for_consent_route(&state.settings, &services) {
-                    Ok(consent_services) => dispatch_fallback(&state, &consent_services, req).await,
-                    Err(e) => Err(e),
-                }
-            },
+            |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
         ))
     }
 }
@@ -509,61 +485,16 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
+    use super::{build_state_from_settings, startup_error_router, TrustedServerApp};
 
-    use std::sync::Arc;
-
-    use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::router::RouterService;
     use error_stack::Report;
     use futures::executor::block_on;
-    use serde_json::json;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::settings::Settings;
-
-    fn settings_with_missing_consent_store() -> Settings {
-        Settings::from_toml(
-            r#"
-                [[handlers]]
-                path = "^/admin"
-                username = "admin"
-                password = "admin-pass"
-
-                [publisher]
-                domain = "test-publisher.com"
-                cookie_domain = ".test-publisher.com"
-                origin_url = "https://origin.test-publisher.com"
-                proxy_secret = "unit-test-proxy-secret"
-
-                [edge_cookie]
-                secret_key = "test-secret-key"
-
-                [request_signing]
-                enabled = false
-                config_store_id = "test-config-store-id"
-                secret_store_id = "test-secret-store-id"
-
-                [consent]
-                consent_store = "missing-consent-store"
-
-                [integrations.prebid]
-                enabled = true
-                server_url = "https://test-prebid.com/openrtb2/auction"
-
-                [auction]
-                enabled = true
-                providers = ["prebid"]
-                timeout_ms = 2000
-            "#,
-        )
-        .expect("should parse EdgeZero app test settings")
-    }
-
-    fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
-        build_state_from_settings(settings).expect("should build app state from settings")
-    }
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {
         request_builder()
@@ -571,6 +502,43 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
+    }
+
+    fn test_router() -> RouterService {
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [integrations.prebid]
+            enabled = true
+            server_url = "https://test-prebid.com/openrtb2/auction"
+
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            timeout_ms = 2000
+            "#,
+        )
+        .expect("should parse test settings");
+        let state = build_state_from_settings(settings).expect("should build test state");
+        TrustedServerApp::routes_for_state(&state)
     }
 
     #[test]
@@ -636,7 +604,7 @@ mod tests {
         // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
         // must still carry standard TS headers before reaching the client.
         //
-        // The embedded trusted-server.toml protects `^/admin` with basic-auth.
+        // The test settings protects `^/_ts/admin` with basic-auth.
         // Sending the request without an Authorization header causes AuthMiddleware
         // to short-circuit with a 401, which then bubbles through
         // FinalizeResponseMiddleware for header injection.
@@ -644,10 +612,10 @@ mod tests {
         // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
         // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
         // short-circuits without calling any Fastly ABI.
-        let router = TrustedServerApp::routes();
+        let router = test_router();
         let req = request_builder()
             .method(Method::POST)
-            .uri("/admin/keys/rotate")
+            .uri("/_ts/admin/keys/rotate")
             .body(Body::empty())
             .expect("should build test request");
 
@@ -677,7 +645,7 @@ mod tests {
         //
         // Without a live backend the publisher proxy errors (502/503), but the
         // important invariant is that the status is NOT 405.
-        let router = TrustedServerApp::routes();
+        let router = test_router();
         let req = request_builder()
             .method(Method::HEAD)
             .uri("/first-party/proxy")
@@ -694,27 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_auction_with_missing_consent_store_returns_503() {
-        let state = app_state_for_settings(settings_with_missing_consent_store());
-        let router = TrustedServerApp::routes_for_state(&state);
-        let body = json!({ "adUnits": [] }).to_string();
-        let req = request_builder()
-            .method(Method::POST)
-            .uri("/auction")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .expect("should build auction request");
-
-        let response = block_on(router.oneshot(req));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "auction route should fail closed when configured consent store cannot be opened"
-        );
-    }
-
-    #[test]
     fn dispatch_unregistered_method_returns_405_at_router_level() {
         // Documents the known router-level behavior for verbs outside the
         // publisher_fallback_methods() list (e.g. TRACE, CONNECT): the RouterService
@@ -723,7 +670,7 @@ mod tests {
         //
         // The full-system guarantee (TS headers on ALL responses including these 405s)
         // is maintained by the entry-point apply_finalize_headers call in main.rs.
-        let router = TrustedServerApp::routes();
+        let router = test_router();
         let req = request_builder()
             .method(Method::from_bytes(b"TRACE").expect("should parse TRACE"))
             .uri("/")

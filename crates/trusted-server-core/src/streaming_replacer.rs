@@ -2,8 +2,6 @@
 //!
 //! This module provides functionality for replacing patterns in content
 //! in streaming fashion, handling content that may be split across multiple chunks.
-//!
-//! See [`crate::platform`] module doc for platform notes.
 
 // Note: std::io::{Read, Write} were previously used by stream_process function
 // which has been removed in favor of StreamingPipeline

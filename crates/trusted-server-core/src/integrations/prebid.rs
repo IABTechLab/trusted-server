@@ -46,6 +46,22 @@ const ZONE_KEY: &str = "zone";
 /// Default currency for `OpenRTB` bid floors and responses.
 const DEFAULT_CURRENCY: &str = "USD";
 
+#[cfg(test)]
+const PREBID_ERROR_BODY_PREVIEW_CHARS: usize = 1000;
+
+#[cfg(test)]
+const PREBID_ERROR_BODY_PREVIEW_BYTES: usize = PREBID_ERROR_BODY_PREVIEW_CHARS * 4;
+
+#[cfg(test)]
+fn prebid_body_preview(body: &[u8]) -> String {
+    let bounded_body = &body[..body.len().min(PREBID_ERROR_BODY_PREVIEW_BYTES)];
+
+    String::from_utf8_lossy(bounded_body)
+        .chars()
+        .take(PREBID_ERROR_BODY_PREVIEW_CHARS)
+        .collect()
+}
+
 /// CCPA/US-privacy string sent when the `Sec-GPC` header signals opt-out.
 ///
 /// Encodes: version `1`, notice given (`Y`), user opted out (`Y`), LSPA not
@@ -918,7 +934,7 @@ impl PrebidAuctionProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
-        _request_info: RequestInfo,
+        request_info: RequestInfo,
     ) -> OpenRtbRequest {
         let imps = request
             .slots
@@ -1028,7 +1044,7 @@ impl PrebidAuctionProvider {
         };
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
-            id: Some(request.user.id.clone()),
+            id: request.user.id.clone(),
             // OpenRTB 2.6 top-level consent field
             consent: raw_tc.clone(),
             ext: UserExt {
@@ -1039,10 +1055,9 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs will be populated by identity providers; consent gating
-                // is applied via `gate_eids_by_consent` before they are set here.
-                eids: None,
-                ec_fresh: Some(request.user.fresh_id.clone()),
+                // EIDs resolved from the KV identity graph and consent-gated
+                // in `handle_auction` via `gate_eids_by_consent`.
+                eids: request.user.eids.clone(),
             }
             .to_ext(),
             ..Default::default()
@@ -1139,8 +1154,6 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let request_info =
-            RequestInfo::from_request(context.request, context.services.client_info());
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (
@@ -1305,9 +1318,9 @@ impl PrebidAuctionProvider {
         }
 
         if bids.is_empty() {
-            AuctionResponse::no_bid("prebid", response_time_ms)
+            AuctionResponse::no_bid(PREBID_INTEGRATION_ID, response_time_ms)
         } else {
-            AuctionResponse::success("prebid", bids, response_time_ms)
+            AuctionResponse::success(PREBID_INTEGRATION_ID, bids, response_time_ms)
         }
     }
 
@@ -1426,7 +1439,7 @@ impl PrebidAuctionProvider {
 #[async_trait(?Send)]
 impl AuctionProvider for PrebidAuctionProvider {
     fn provider_name(&self) -> &'static str {
-        "prebid"
+        PREBID_INTEGRATION_ID
     }
 
     async fn request_bids(
@@ -1722,9 +1735,9 @@ mod tests {
                 page_url: Some("https://pub.example/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
+                eids: None,
             },
             device: None,
             site: None,
@@ -1805,7 +1818,7 @@ mod tests {
     /// Shared TOML prefix for config-parsing tests (publisher + ec sections).
     const TOML_BASE: &str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1815,8 +1828,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
@@ -2476,6 +2489,7 @@ server_url = "https://prebid.example"
                 longitude: 13.405,
                 metro_code: 0,
                 region: None,
+                asn: None,
             }),
         });
 
@@ -2526,6 +2540,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 
@@ -2564,6 +2579,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 
@@ -2997,6 +3013,7 @@ server_url = "https://prebid.example"
                 longitude: -74.006,
                 metro_code: 501,
                 region: Some("NY".to_string()),
+                asn: None,
             }),
         });
 
@@ -3172,6 +3189,77 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn to_openrtb_includes_eids_from_auction_request() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.eids = Some(vec![
+            crate::openrtb::Eid {
+                source: "liveramp.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "LR_xyz".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+            },
+            crate::openrtb::Eid {
+                source: "id5-sync.com".to_owned(),
+                uids: vec![crate::openrtb::Uid {
+                    id: "ID5_abc".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            },
+        ]);
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        let ext_eids = &serialized["user"]["ext"]["eids"];
+        assert!(ext_eids.is_array(), "should populate user.ext.eids");
+        assert_eq!(ext_eids.as_array().unwrap().len(), 2, "should have 2 EIDs");
+        assert_eq!(
+            ext_eids[0]["source"], "liveramp.com",
+            "should include liveramp EID"
+        );
+        assert_eq!(
+            ext_eids[1]["source"], "id5-sync.com",
+            "should include id5 EID"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_eids_when_none() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert!(
+            serialized["user"]["ext"]["eids"].is_null(),
+            "should omit user.ext.eids when no EIDs available"
+        );
+    }
+
+    #[test]
     fn expand_trusted_server_bidders_uses_per_bidder_map_when_present() {
         let params = json!({
             "bidderParams": {
@@ -3238,28 +3326,63 @@ server_url = "https://prebid.example"
         assert_eq!(routes.len(), 0);
     }
 
-    /// Verifies body-preview truncation keeps a UTF-8 char boundary.
     #[test]
-    fn body_preview_truncation_is_utf8_safe() {
-        // 999 ASCII bytes + U+2603 SNOWMAN (3 bytes: E2 98 83) = 1002 bytes.
-        // Byte index 1000 lands on 0x98, the second byte of the snowman.
-        let mut body = "x".repeat(999);
-        body.push('\u{2603}'); // ☃
-        assert_eq!(body.len(), 1002);
+    fn prebid_body_preview_truncates_to_character_limit() {
+        let body = "x".repeat(PREBID_ERROR_BODY_PREVIEW_CHARS + 100);
 
-        let truncation_index = body.floor_char_boundary(1000);
+        let preview = prebid_body_preview(body.as_bytes());
+
+        assert_eq!(
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should cap the upstream body preview"
+        );
+    }
+
+    #[test]
+    fn prebid_body_preview_handles_non_utf8_lossily() {
+        let preview = prebid_body_preview(&[b'o', b'k', 0xff, b'!']);
+
+        assert_eq!(
+            preview, "ok\u{fffd}!",
+            "should replace invalid UTF-8 bytes without panicking"
+        );
+    }
+
+    #[test]
+    fn prebid_body_preview_ignores_bytes_after_bounded_slice() {
+        let mut body = vec![b'x'; PREBID_ERROR_BODY_PREVIEW_BYTES];
+        body.extend_from_slice(&[0xff, b't', b'a', b'i', b'l']);
+
+        let preview = prebid_body_preview(&body);
+
+        assert_eq!(
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should keep the public preview capped"
+        );
         assert!(
-            body.is_char_boundary(truncation_index),
-            "should truncate at a valid UTF-8 boundary"
+            !preview.contains('\u{fffd}') && !preview.contains("tail"),
+            "should not process bytes beyond the bounded preview slice"
         );
+    }
+
+    #[test]
+    fn prebid_body_preview_bounds_partial_utf8_at_byte_boundary() {
+        let mut body = vec![b'a'; PREBID_ERROR_BODY_PREVIEW_BYTES - 1];
+        body.extend_from_slice("\u{2603}".as_bytes());
+        body.extend_from_slice(b"tail");
+
+        let preview = prebid_body_preview(&body);
+
         assert_eq!(
-            body[..truncation_index].len(),
-            999,
-            "should drop the partial multibyte character"
+            preview.chars().count(),
+            PREBID_ERROR_BODY_PREVIEW_CHARS,
+            "should keep the public preview capped"
         );
-        assert_eq!(
-            truncation_index, 999,
-            "should step back to the previous char boundary"
+        assert!(
+            !preview.contains("tail"),
+            "should not include bytes beyond the bounded preview slice"
         );
     }
 
@@ -3272,9 +3395,9 @@ server_url = "https://prebid.example"
                 page_url: Some("https://example.com/page".to_string()),
             },
             user: UserInfo {
-                id: "synth-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+                id: Some("synth-123".to_string()),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("test-agent".to_string()),

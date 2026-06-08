@@ -262,9 +262,34 @@ mod tests {
         }
     }
 
+    fn test_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse test settings")
+    }
+
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        let mut s =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        let mut s = test_settings();
         s.response_headers = headers
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -422,8 +447,7 @@ mod tests {
 
     #[test]
     fn auth_handle_passes_through_when_auth_not_configured() {
-        let settings =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        let settings = test_settings();
         let middleware = AuthMiddleware::new(Arc::new(settings));
         let handler =
             Arc::new(

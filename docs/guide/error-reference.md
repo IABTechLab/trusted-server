@@ -69,7 +69,7 @@ proxy_secret = "change-me-to-random-string"
 - `publisher.domain`
 - `publisher.origin_url`
 - `publisher.proxy_secret`
-- `edge_cookie.secret_key`
+- `ec.passphrase`
 
 ---
 
@@ -141,17 +141,17 @@ Failed to generate EC ID: HMAC error
 
 **Solution:**
 
-1. Ensure `secret_key` is set in `trusted-server.toml`:
+1. Ensure `passphrase` is set in `trusted-server.toml`:
 
 ```toml
-[edge_cookie]
-secret_key = "your-secure-hmac-secret"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 2. Or set via environment variable:
 
 ```bash
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secure-hmac-secret
+TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ---
@@ -245,7 +245,9 @@ curl -w "%{time_total}\n" https://upstream-service.example.com
 Warning: Cookie not set due to domain mismatch
 ```
 
-**Cause:** `publisher.cookie_domain` doesn't match request domain
+**Cause:** `publisher.cookie_domain` doesn't match request domain.
+Note: EC cookies (`ts-ec`) use a computed domain from `publisher.domain`,
+not `cookie_domain`.
 
 **Solution:**
 
@@ -402,7 +404,7 @@ Signing key not found: ts-2025-01-A
 3. Run key rotation to generate new key:
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password
 ```
 
@@ -425,7 +427,7 @@ curl -X POST https://edge.example.com/admin/keys/rotate \
 1. Initialize keys using rotation endpoint:
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password
 ```
 

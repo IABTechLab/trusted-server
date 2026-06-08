@@ -553,20 +553,28 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                 GTM_INTEGRATION_ID,
             )
             .await?;
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            let rewritten_body = Self::rewrite_gtm_urls(&body_str);
+            let (rewritten_body_bytes, content_type) = match std::str::from_utf8(&body_bytes) {
+                Ok(body_str) => {
+                    let rewritten = Self::rewrite_gtm_urls(body_str);
+                    (
+                        rewritten.into_bytes(),
+                        "application/javascript; charset=utf-8",
+                    )
+                }
+                Err(_) => {
+                    log::warn!("GTM upstream response body is not valid UTF-8; serving original");
+                    (body_bytes.to_vec(), "application/javascript")
+                }
+            };
 
             return Response::builder()
                 .status(status)
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )
+                .header(header::CONTENT_TYPE, content_type)
                 .header(
                     header::CACHE_CONTROL,
                     format!("public, max-age={}", self.config.cache_max_age),
                 )
-                .body(EdgeBody::from(rewritten_body.into_bytes()))
+                .body(EdgeBody::from(rewritten_body_bytes))
                 .change_context(Self::error("Failed to build rewritten GTM response"));
         }
 
@@ -677,7 +685,6 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
-    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use http::Method;
     use std::io::Cursor;
@@ -1295,8 +1302,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
 
         let settings = make_settings();
+        let services = crate::platform::test_support::noop_services();
         let response = integration
-            .handle(&settings, &noop_services(), req)
+            .handle(&settings, &services, req)
             .await
             .expect("handle should not return error");
 
@@ -1333,8 +1341,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
 
         let settings = make_settings();
+        let services = crate::platform::test_support::noop_services();
         let response = integration
-            .handle(&settings, &noop_services(), req)
+            .handle(&settings, &services, req)
             .await
             .expect("handle should not return error");
 
@@ -1501,7 +1510,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_config_parsing() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1511,8 +1520,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1534,7 +1543,7 @@ upstream_url = "https://custom.gtm.example"
     fn test_config_defaults() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1544,8 +1553,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"

@@ -84,9 +84,17 @@ pub enum TrustedServerError {
     #[display("Settings error: {message}")]
     Settings { message: String },
 
-    /// EC ID generation or validation failed.
-    #[display("EC error: {message}")]
-    Ec { message: String },
+    /// Edge cookie ID generation or validation failed.
+    #[display("Edge cookie error: {message}")]
+    EdgeCookie { message: String },
+
+    /// Requested partner was not found in the partner registry.
+    #[display("Partner not found: {partner_id}")]
+    PartnerNotFound { partner_id: String },
+
+    /// A secret field still contains a known placeholder/default value.
+    #[display("Insecure default value for: {field}")]
+    InsecureDefault { field: String },
 }
 
 impl Error for TrustedServerError {}
@@ -121,7 +129,9 @@ impl IntoHttpResponse for TrustedServerError {
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
-            Self::Ec { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -156,7 +166,7 @@ mod tests {
             TrustedServerError::Proxy {
                 message: "upstream 10.0.0.1 refused".into(),
             },
-            TrustedServerError::Ec {
+            TrustedServerError::EdgeCookie {
                 message: "seed file missing".into(),
             },
             TrustedServerError::Auction {
