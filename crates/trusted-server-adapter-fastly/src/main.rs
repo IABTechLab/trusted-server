@@ -28,7 +28,8 @@ use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput}
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
+    AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, PublisherResponse,
@@ -434,19 +435,34 @@ async fn route_request(
 
             if let Some(asset_route) = matched_asset_route {
                 should_finalize_ec = false;
-                log::info!(
-                    "No explicit route matched for path: {}, proxying via asset route prefix {} to {}",
-                    path,
-                    asset_route.prefix,
-                    asset_route.origin_url
-                );
+                log::info!("No explicit route matched; proxying via configured asset route");
                 let result =
                     match handle_asset_proxy_request(settings, runtime_services, req, asset_route)
                         .await
                     {
                         Ok(asset_response) => {
                             asset_cache_policy = asset_response.cache_policy();
-                            Ok(asset_response.into_response())
+                            let (mut response, stream_body) =
+                                asset_response.into_response_and_body();
+                            if let Some(body) = stream_body {
+                                finalize_response(settings, geo_info.as_ref(), &mut response);
+                                asset_cache_policy.apply_after_route_finalization(&mut response);
+
+                                let mut streaming_body = response.stream_to_client();
+                                if let Err(err) = stream_asset_body(body, &mut streaming_body).await
+                                {
+                                    log::error!("Asset streaming failed: {err:?}");
+                                    drop(streaming_body);
+                                } else if let Err(err) = streaming_body.finish() {
+                                    log::error!("Failed to finish asset streaming body: {err}");
+                                }
+
+                                return Ok(RouteOutcome {
+                                    response: None,
+                                    pull_sync_context: None,
+                                });
+                            }
+                            Ok(response)
                         }
                         Err(e) => {
                             asset_cache_policy = AssetProxyCachePolicy::NoStorePrivate;

@@ -8,7 +8,7 @@ use fastly::{Request, Response};
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::Write;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -98,23 +98,50 @@ impl AssetProxyCachePolicy {
 /// Asset proxy response plus metadata needed by the outer router.
 pub struct AssetProxyResponse {
     response: Response,
+    stream_body: Option<EdgeBody>,
     cache_policy: AssetProxyCachePolicy,
 }
 
 impl AssetProxyResponse {
-    fn new(response: Response, cache_policy: AssetProxyCachePolicy) -> Self {
+    fn new(
+        response: Response,
+        stream_body: Option<EdgeBody>,
+        cache_policy: AssetProxyCachePolicy,
+    ) -> Self {
         Self {
             response,
+            stream_body,
             cache_policy,
         }
     }
 
     fn origin_controlled(response: Response) -> Self {
-        Self::new(response, AssetProxyCachePolicy::OriginControlled)
+        Self::new(response, None, AssetProxyCachePolicy::OriginControlled)
+    }
+
+    fn origin_controlled_stream(response: Response, stream_body: EdgeBody) -> Self {
+        Self::new(
+            response,
+            Some(stream_body),
+            AssetProxyCachePolicy::OriginControlled,
+        )
     }
 
     fn no_store_private(response: Response) -> Self {
-        Self::new(response, AssetProxyCachePolicy::NoStorePrivate)
+        Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+    }
+
+    fn response(&self) -> &Response {
+        &self.response
+    }
+
+    fn response_mut(&mut self) -> &mut Response {
+        &mut self.response
+    }
+
+    fn apply_no_store_private_policy(&mut self) {
+        self.cache_policy = AssetProxyCachePolicy::NoStorePrivate;
+        apply_no_store_cache_control(&mut self.response);
     }
 
     /// Return cache policy metadata for router finalization.
@@ -124,9 +151,25 @@ impl AssetProxyResponse {
     }
 
     /// Consume this wrapper and return the Fastly response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the response carries a streaming body. Use
+    /// [`Self::into_response_and_body`] when the caller needs to handle both
+    /// buffered and streaming asset responses.
     #[must_use]
     pub fn into_response(self) -> Response {
+        assert!(
+            self.stream_body.is_none(),
+            "should consume streaming asset responses with into_response_and_body"
+        );
         self.response
+    }
+
+    /// Consume this wrapper and return the response headers plus optional stream body.
+    #[must_use]
+    pub fn into_response_and_body(self) -> (Response, Option<EdgeBody>) {
+        (self.response, self.stream_body)
     }
 }
 
@@ -171,9 +214,7 @@ pub(crate) fn platform_response_to_fastly(
     Ok(resp)
 }
 
-async fn platform_response_to_fastly_asset(
-    platform_resp: PlatformResponse,
-) -> Result<Response, Report<TrustedServerError>> {
+fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
     let mut resp = Response::from_status(parts.status.as_u16());
     for (name, value) in parts.headers.iter() {
@@ -181,26 +222,51 @@ async fn platform_response_to_fastly_asset(
     }
 
     match body {
-        EdgeBody::Once(bytes) => resp.set_body(bytes.to_vec()),
+        EdgeBody::Once(bytes) => {
+            resp.set_body(bytes.to_vec());
+            AssetProxyResponse::origin_controlled(resp)
+        }
+        stream_body @ EdgeBody::Stream(_) => {
+            AssetProxyResponse::origin_controlled_stream(resp, stream_body)
+        }
+    }
+}
+
+/// Stream an asset response body directly to a writable client stream.
+///
+/// # Errors
+///
+/// Returns an error if the platform stream yields an error or if writing a
+/// chunk to the client stream fails.
+pub async fn stream_asset_body<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+) -> Result<(), Report<TrustedServerError>> {
+    match body {
+        EdgeBody::Once(bytes) => {
+            output
+                .write_all(bytes.as_ref())
+                .change_context(TrustedServerError::Proxy {
+                    message: "failed to write buffered asset response body".to_string(),
+                })?;
+        }
         EdgeBody::Stream(mut stream) => {
-            let mut fastly_body = fastly::Body::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|err| {
                     Report::new(TrustedServerError::Proxy {
                         message: format!("streaming platform response body failed: {err}"),
                     })
                 })?;
-                fastly_body.write_all(chunk.as_ref()).change_context(
-                    TrustedServerError::Proxy {
+                output
+                    .write_all(chunk.as_ref())
+                    .change_context(TrustedServerError::Proxy {
                         message: "failed to write streaming asset response body".to_string(),
-                    },
-                )?;
+                    })?;
             }
-            resp.set_body(fastly_body);
         }
     }
 
-    Ok(resp)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -829,7 +895,7 @@ async fn send_asset_origin_request(
     target_url: &url::Url,
     outbound_headers: &http::HeaderMap,
     stream_response: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let mut platform_req =
         build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
     if stream_response {
@@ -844,9 +910,9 @@ async fn send_asset_origin_request(
         })?;
 
     if stream_response {
-        platform_response_to_fastly_asset(platform_resp).await
+        Ok(platform_response_to_fastly_asset(platform_resp))
     } else {
-        platform_response_to_fastly(platform_resp)
+        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)
     }
 }
 
@@ -901,13 +967,13 @@ async fn preflight_s3_origin_for_image_optimizer(
         false,
     )
     .await?;
-    let head_status = head_response.get_status();
+    let head_status = head_response.response().get_status();
     if head_status.is_success() || head_status == StatusCode::NOT_MODIFIED {
         return Ok(None);
     }
 
     if request_method == Method::HEAD {
-        let mut response = head_response;
+        let mut response = head_response.into_response();
         strip_asset_proxy_response_headers(&mut response);
         apply_no_store_cache_control(&mut response);
         return Ok(Some(AssetProxyResponse::no_store_private(response)));
@@ -924,10 +990,10 @@ async fn preflight_s3_origin_for_image_optimizer(
         true,
     )
     .await?;
-    strip_asset_proxy_response_headers(&mut response);
-    apply_no_store_cache_control(&mut response);
+    strip_asset_proxy_response_headers(response.response_mut());
+    response.apply_no_store_private_policy();
 
-    Ok(Some(AssetProxyResponse::no_store_private(response)))
+    Ok(Some(response))
 }
 
 /// Proxy a configured first-party asset path to its matched asset origin.
@@ -1041,10 +1107,10 @@ pub async fn handle_asset_proxy_request(
             message: "Failed to proxy asset request".to_string(),
         })?;
 
-    let mut response = platform_response_to_fastly_asset(platform_resp).await?;
-    strip_asset_proxy_response_headers(&mut response);
+    let mut response = platform_response_to_fastly_asset(platform_resp);
+    strip_asset_proxy_response_headers(response.response_mut());
 
-    Ok(AssetProxyResponse::origin_controlled(response))
+    Ok(response)
 }
 
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
@@ -1808,8 +1874,8 @@ mod tests {
         clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
         handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
         is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, AssetProxyCachePolicy,
-        ProxyRequestConfig, SUPPORTED_ENCODINGS,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, stream_asset_body,
+        AssetProxyCachePolicy, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
@@ -3610,12 +3676,20 @@ mod tests {
         let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
-        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+        let (response, stream_body) = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy a streaming asset response")
-            .into_response();
+            .into_response_and_body();
+        assert_eq!(response.get_status(), StatusCode::OK);
+        let mut output = Vec::new();
+        stream_asset_body(
+            stream_body.expect("should preserve asset body as a stream"),
+            &mut output,
+        )
+        .await
+        .expect("should stream asset body");
 
-        assert_eq!(response.take_body_str(), "chunk");
+        assert_eq!(output, b"chunk");
     }
 
     #[tokio::test]
