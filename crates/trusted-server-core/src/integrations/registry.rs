@@ -259,8 +259,24 @@ pub trait IntegrationProxy: Send + Sync {
     /// Use this with the `namespaced_*` helper methods to automatically prefix routes.
     fn integration_name(&self) -> &'static str;
 
+    /// Returns the URL path prefix for this integration's proxy routes.
+    ///
+    /// Override this to provide a custom, customer-specific proxy path that is
+    /// harder for ad blockers to target. When not overridden, defaults to
+    /// `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn proxy_prefix(&self) -> String {
+    ///     "/my-custom-path".to_string()  // instead of /integrations/didomi
+    /// }
+    /// ```
+    fn proxy_prefix(&self) -> String {
+        format!("/integrations/{}", self.integration_name())
+    }
+
     /// Routes handled by this integration.
-    /// to automatically namespace routes under `/integrations/{integration_name()}/`,
+    /// to automatically namespace routes under the proxy prefix,
     /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
@@ -273,62 +289,37 @@ pub trait IntegrationProxy: Send + Sync {
     ) -> Result<Response, Report<TrustedServerError>>;
 
     /// Helper to create a namespaced GET endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.namespaced_get("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn get(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.post("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn post(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.put("/users")  // becomes /integrations/my_integration/users
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn put(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn delete(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn patch(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::patch(full_path)
     }
 }

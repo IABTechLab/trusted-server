@@ -15,7 +15,7 @@ use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
-const DIDOMI_PREFIX: &str = "/integrations/didomi/consent";
+const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -23,6 +23,10 @@ pub struct DidomiIntegrationConfig {
     /// Whether the integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Custom proxy path prefix to avoid ad-blocker detection.
+    /// Defaults to "integrations/didomi/consent" if not set.
+    #[serde(default)]
+    pub proxy_path: Option<String>,
     /// Base URL for the Didomi SDK origin.
     #[serde(default = "default_sdk_origin")]
     #[validate(url)]
@@ -192,8 +196,15 @@ impl IntegrationProxy for DidomiIntegration {
         DIDOMI_INTEGRATION_ID
     }
 
+    fn proxy_prefix(&self) -> String {
+        match &self.config.proxy_path {
+            Some(custom) => format!("/{}", custom.trim_start_matches('/')),
+            None => DIDOMI_DEFAULT_PREFIX.to_string(),
+        }
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get("/consent/*"), self.post("/consent/*")]
+        vec![self.get("/*"), self.post("/*")]
     }
 
     async fn handle(
@@ -203,7 +214,8 @@ impl IntegrationProxy for DidomiIntegration {
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();
-        let consent_path = path.strip_prefix(DIDOMI_PREFIX).unwrap_or(path);
+        let prefix = self.proxy_prefix();
+        let consent_path = path.strip_prefix(&prefix).unwrap_or(path);
         let backend = self.backend_for_path(consent_path);
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
@@ -248,6 +260,7 @@ mod tests {
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
             enabled,
+            proxy_path: None,
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
         }
@@ -287,5 +300,26 @@ mod tests {
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
+    }
+
+    #[test]
+    fn registers_custom_proxy_path() {
+        let mut settings = create_test_settings();
+        let custom_config = DidomiIntegrationConfig {
+            enabled: true,
+            proxy_path: Some("my-custom-consent".to_string()),
+            sdk_origin: default_sdk_origin(),
+            api_origin: default_api_origin(),
+        };
+        settings
+            .integrations
+            .insert_config(DIDOMI_INTEGRATION_ID, &custom_config)
+            .expect("should insert config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        assert!(registry.has_route(&Method::GET, "/my-custom-consent/loader.js"));
+        assert!(registry.has_route(&Method::POST, "/my-custom-consent/api/events"));
+        // Original path should NOT match
+        assert!(!registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
     }
 }
