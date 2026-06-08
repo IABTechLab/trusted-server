@@ -1,10 +1,14 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+pub const COOKIE_TS_EIDS: &str = "ts-eids";
+pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
 pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
-pub const HEADER_X_TS_EC_FRESH: HeaderName = HeaderName::from_static("x-ts-ec-fresh");
+pub const HEADER_X_TS_EIDS: HeaderName = HeaderName::from_static("x-ts-eids");
+pub const HEADER_X_TS_EC_CONSENT: HeaderName = HeaderName::from_static("x-ts-ec-consent");
+pub const HEADER_X_TS_EIDS_TRUNCATED: HeaderName = HeaderName::from_static("x-ts-eids-truncated");
 pub const HEADER_X_CONSENT_ADVERTISING: HeaderName =
     HeaderName::from_static("x-consent-advertising");
 pub const HEADER_X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -45,7 +49,9 @@ pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
 /// in `const` context.
 pub const INTERNAL_HEADERS: &[&str] = &[
     "x-ts-ec",
-    "x-ts-ec-fresh",
+    "x-ts-eids",
+    "x-ts-ec-consent",
+    "x-ts-eids-truncated",
     "x-pub-user-id",
     "x-subject-id",
     "x-consent-advertising",

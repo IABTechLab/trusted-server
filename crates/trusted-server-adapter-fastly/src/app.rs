@@ -55,8 +55,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
@@ -219,9 +220,18 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
+        let mut ec_context = EcContext::default();
         return state
             .registry
-            .handle_proxy(&method, &path, &state.settings, services, req)
+            .handle_proxy(ProxyDispatchInput {
+                method: &method,
+                path: &path,
+                settings: &state.settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services,
+                req,
+            })
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -396,9 +406,13 @@ fn named_route_handler(
                     NamedRouteHandler::Auction => {
                         match runtime_services_for_consent_route(&state.settings, &services) {
                             Ok(consent_services) => {
+                                let ec_context = EcContext::default();
                                 handle_auction(
                                     &state.settings,
                                     &state.orchestrator,
+                                    None,
+                                    None,
+                                    &ec_context,
                                     &consent_services,
                                     req,
                                 )
@@ -525,7 +539,7 @@ mod tests {
         Settings::from_toml(
             r#"
                 [[handlers]]
-                path = "^/admin"
+                path = "^/(_ts/)?admin"
                 username = "admin"
                 password = "admin-pass"
 
@@ -535,8 +549,8 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
-                [edge_cookie]
-                secret_key = "test-secret-key"
+                [ec]
+                passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
                 enabled = false
@@ -637,15 +651,12 @@ mod tests {
         // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
         // must still carry standard TS headers before reaching the client.
         //
-        // The embedded trusted-server.toml protects `^/admin` with basic-auth.
-        // Sending the request without an Authorization header causes AuthMiddleware
-        // to short-circuit with a 401, which then bubbles through
+        // Test settings protect `^/(_ts/)?admin` with basic-auth. Sending the
+        // request without an Authorization header causes AuthMiddleware to
+        // short-circuit with a 401, which then bubbles through
         // FinalizeResponseMiddleware for header injection.
-        //
-        // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
-        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
-        // short-circuits without calling any Fastly ABI.
-        let router = TrustedServerApp::routes();
+        let state = app_state_for_settings(settings_with_missing_consent_store());
+        let router = TrustedServerApp::routes_for_state(&state);
         let req = request_builder()
             .method(Method::POST)
             .uri("/admin/keys/rotate")

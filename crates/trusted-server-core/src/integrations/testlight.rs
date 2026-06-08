@@ -185,13 +185,13 @@ impl IntegrationProxy for TestlightIntegration {
                 .await?;
         let req = http::Request::from_parts(parts, EdgeBody::empty());
 
-        // Read EC ID from header (set by registry) or cookie
+        // Read EC ID from the ts-ec cookie forwarded by the client.
+        // The registry strips x-ts-ec before dispatching, so only the cookie is available here.
         let ec_id = get_ec_id(&req)
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "EC ID not found in request header or cookie — \
-                     check that the integration registry propagated it",
+                    "EC ID not found in ts-ec cookie — the client must carry a valid EC cookie",
                 ))
             })?;
 

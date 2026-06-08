@@ -206,6 +206,7 @@ mod tests {
             longitude: -74.0060,
             metro_code: 501,
             region: Some("NY".to_string()),
+            asn: None,
         };
 
         assert_eq!(
@@ -225,6 +226,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 807,
             region: None,
+            asn: None,
         };
         assert!(
             geo.has_metro_code(),
@@ -242,6 +244,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 0,
             region: None,
+            asn: None,
         };
         assert!(
             !geo.has_metro_code(),

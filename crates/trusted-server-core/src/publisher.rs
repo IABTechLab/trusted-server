@@ -750,14 +750,14 @@ fn apply_ec_headers(
         }
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        crate::cookies::set_ec_cookie(settings, response, ec_id);
+        crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        crate::cookies::expire_ec_cookie(settings, response);
+        crate::ec::cookies::expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }

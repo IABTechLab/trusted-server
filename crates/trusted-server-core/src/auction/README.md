@@ -258,18 +258,18 @@ The trusted-server handles several types of routes defined in `crates/trusted-se
 
 | Route                     | Method | Handler                        | Purpose                                          | Line |
 |---------------------------|--------|--------------------------------|--------------------------------------------------|------|
-| `/auction`                | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 162  |
-| `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 167  |
-| `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 170  |
-| `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 173  |
-| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 176  |
-| `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 145  |
-| `/.well-known/trusted-server.json` | GET  | `handle_trusted_server_discovery()` | Public key distribution for request signing | 149  |
-| `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 154  |
-| `/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 158  |
-| `/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 159  |
-| `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 179  |
-| `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 195  |
+| `/auction`                | POST   | `handle_auction()`             | Main auction endpoint (Prebid.js/tsjs format)    | 84   |
+| `/first-party/proxy`      | GET    | `handle_first_party_proxy()`   | Proxy creatives through first-party domain       | 84   |
+| `/first-party/click`      | GET    | `handle_first_party_click()`   | Track clicks on ads                              | 85   |
+| `/first-party/sign`       | GET/POST | `handle_first_party_proxy_sign()` | Generate signed URLs for creatives            | 86   |
+| `/first-party/proxy-rebuild` | POST | `handle_first_party_proxy_rebuild()` | Rebuild creative HTML with new settings     | 89   |
+| `/static/tsjs=*`          | GET    | `handle_tsjs_dynamic()`        | Serve tsjs library (Prebid.js alternative)       | 66   |
+| `/.well-known/ts.jwks.json` | GET  | `handle_jwks_endpoint()`       | Public key distribution for request signing      | 71   |
+| `/verify-signature`       | POST   | `handle_verify_signature()`    | Verify signed requests                           | 74   |
+| `/_ts/admin/keys/rotate`      | POST   | `handle_rotate_key()`          | Rotate signing keys (admin only)                 | 77   |
+| `/_ts/admin/keys/deactivate`  | POST   | `handle_deactivate_key()`      | Deactivate signing keys (admin only)             | 78   |
+| `/integrations/*`         | *      | Integration Registry           | Provider-specific endpoints (Prebid, etc.)       | 92   |
+| `*` (fallback)            | *      | `handle_publisher_request()`   | Proxy to publisher origin                        | 108  |
 
 ### How Routing Works
 
@@ -278,50 +278,22 @@ The Fastly Compute entrypoint uses pattern matching on `(Method, path)` tuples:
 
 ```rust
 let result = match (method, path.as_str()) {
-    (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-        handle_tsjs_dynamic(&req, integration_registry)
-    }
-    (Method::GET, "/.well-known/trusted-server.json") => {
-        handle_trusted_server_discovery(settings, runtime_services, req)
-    }
-    (Method::POST, "/verify-signature") => handle_verify_signature(settings, req),
-    (Method::POST, "/admin/keys/rotate") => handle_rotate_key(settings, req),
-    (Method::POST, "/admin/keys/deactivate") => handle_deactivate_key(settings, req),
+    // Auction endpoint
     (Method::POST, "/auction") => {
-        match runtime_services_for_consent_route(settings, runtime_services) {
-            Ok(auction_services) => {
-                handle_auction(settings, orchestrator, &auction_services, req).await
-            }
-            Err(e) => Err(e),
-        }
-    }
-    (Method::GET, "/first-party/proxy") => {
-        handle_first_party_proxy(settings, runtime_services, req).await
-    }
-    (Method::GET, "/first-party/click") => {
-        handle_first_party_click(settings, runtime_services, req).await
-    }
-    (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
-        handle_first_party_proxy_sign(settings, runtime_services, req).await
-    }
-    (Method::POST, "/first-party/proxy-rebuild") => {
-        handle_first_party_proxy_rebuild(settings, runtime_services, req).await
-    }
-    (m, path) if integration_registry.has_route(&m, path) => integration_registry
-        .handle_proxy(&m, path, settings, runtime_services, req)
-        .await
-        .unwrap_or_else(|| {
-            Err(Report::new(TrustedServerError::BadRequest {
-                message: format!("Unknown integration route: {path}"),
-            }))
-        }),
-    _ => match runtime_services_for_consent_route(settings, runtime_services) {
-        Ok(publisher_services) => {
-            handle_publisher_request(settings, integration_registry, &publisher_services, req)
-        }
-        Err(e) => Err(e),
+        handle_auction(&settings, &orchestrator, &runtime_services, req).await
     },
-};
+    
+    // First-party endpoints
+    (Method::GET, "/first-party/proxy") => handle_first_party_proxy(&settings, req).await,
+    
+    // Integration registry (dynamic routes)
+    (m, path) if integration_registry.has_route(&m, path) => {
+        integration_registry.handle_proxy(&m, path, &settings, req).await
+    },
+    
+    // Fallback to publisher origin
+    _ => handle_publisher_request(&settings, &integration_registry, &runtime_services, req),
+}
 ```
 
 #### 2. Integration Registry (Dynamic Routes)
@@ -347,7 +319,7 @@ The integration registry checks if a route matches any registered integration ro
 #### 3. Route Priority
 Routes are matched in this order:
 1. **Exact top-level routes** (`/auction`, `/first-party/proxy`, etc.)
-2. **Admin routes** (`/admin/*`)
+2. **Admin routes** (`/_ts/admin/*`)
 3. **Integration routes** (`/integrations/*`)
 4. **Fallback to publisher origin** (all other paths)
 

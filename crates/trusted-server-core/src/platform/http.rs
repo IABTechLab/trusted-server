@@ -145,7 +145,16 @@ pub struct PlatformSelectResult {
     /// Completed response, or the error returned by the ready request.
     pub ready: Result<PlatformResponse, Report<PlatformError>>,
     /// Requests still in flight after the ready result is removed.
+    ///
+    /// Note: entries in this list may have `backend_name == None` on some
+    /// adapters (e.g., Fastly), because the adapter cannot preserve input
+    /// identifiers across the platform `select()` call. Orchestrators must
+    /// not rely on `backend_name()` being set on remaining entries.
     pub remaining: Vec<PlatformPendingRequest>,
+    /// Backend name of the request that became ready with an error, when
+    /// `ready` is `Err`. `None` on the success path and when the adapter
+    /// cannot identify the failed backend.
+    pub failed_backend_name: Option<String>,
 }
 
 /// Outbound HTTP client abstraction.
