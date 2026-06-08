@@ -1509,42 +1509,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publisher_request_uses_platform_http_client_with_http_types() {
-        let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"origin response".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example/page")
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+    #[test]
+    fn publisher_request_uses_platform_http_client_with_http_types() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
 
-        let pub_response = handle_publisher_request(&settings, &registry, &services, req)
-            .await
-            .expect("should proxy publisher request");
-        let response = match pub_response {
-            PublisherResponse::Buffered(r) => r,
-            PublisherResponse::PassThrough { mut response, body } => {
-                *response.body_mut() = body;
-                response
-            }
-            PublisherResponse::Stream { response, .. } => response,
-        };
+            let pub_response = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+            let response = match pub_response {
+                PublisherResponse::Buffered(r) => r,
+                PublisherResponse::PassThrough { mut response, body } => {
+                    *response.body_mut() = body;
+                    response
+                }
+                PublisherResponse::Stream { response, .. } => response,
+            };
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "origin response");
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should proxy through the platform http client"
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "origin response");
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "should proxy through the platform http client"
+            );
+        });
     }
 
     #[test]
