@@ -934,7 +934,7 @@ impl PrebidAuctionProvider {
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
         signer: Option<(&RequestSigner, String, &SigningParams)>,
-        _request_info: RequestInfo,
+        request_info: RequestInfo,
     ) -> OpenRtbRequest {
         let imps = request
             .slots
@@ -1154,8 +1154,6 @@ impl PrebidAuctionProvider {
         let regs = Self::build_regs(consent_ctx);
 
         // Build ext object
-        let request_info =
-            RequestInfo::from_request(context.request, context.services.client_info());
         let (version, signature, kid, ts) = signer
             .map(|(s, sig, params)| {
                 (

@@ -428,9 +428,14 @@ impl AuctionOrchestrator {
                     break;
                 }
             };
-            remaining = platform_result.remaining;
+            let crate::platform::PlatformSelectResult {
+                ready,
+                remaining: new_remaining,
+                failed_backend_name,
+            } = platform_result;
+            remaining = new_remaining;
 
-            match platform_result.ready {
+            match ready {
                 Ok(response) => {
                     // Identify the provider from the backend name
                     let backend_name = response
@@ -479,23 +484,19 @@ impl AuctionOrchestrator {
                     }
                 }
                 Err(e) => {
-                    // Identify the failed provider by finding the backend_to_provider
-                    // entry whose backend name is no longer present in `remaining`
-                    // (select() consumed exactly one pending request — the failed one).
-                    let remaining_backends: std::collections::HashSet<&str> =
-                        remaining.iter().filter_map(|r| r.backend_name()).collect();
-                    let failed_backend = backend_to_provider
-                        .keys()
-                        .find(|name| !remaining_backends.contains(name.as_str()))
-                        .cloned();
-
-                    if let Some(ref backend_name) = failed_backend {
+                    if let Some(ref backend_name) = failed_backend_name {
                         if let Some((provider_name, start_time, _)) =
                             backend_to_provider.remove(backend_name)
                         {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
                             log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
                             responses.push(AuctionResponse::error(provider_name, response_time_ms));
+                        } else {
+                            log::warn!(
+                                "A provider request failed (backend '{}' not tracked): {:?}",
+                                backend_name,
+                                e
+                            );
                         }
                     } else {
                         log::warn!(
@@ -691,17 +692,82 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::provider::AuctionProvider;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, Bid, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus,
+        MediaType, PublisherInfo, UserInfo,
     };
-
     use crate::error::TrustedServerError;
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::{
+        PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
+    };
     use crate::test_support::tests::crate_test_settings_str;
-    use error_stack::Report;
+    use error_stack::{Report, ResultExt};
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use super::AuctionOrchestrator;
+
+    // ---------------------------------------------------------------------------
+    // Minimal test double for AuctionProvider
+    // ---------------------------------------------------------------------------
+
+    struct StubAuctionProvider {
+        name: &'static str,
+        backend: &'static str,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for StubAuctionProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            let req = PlatformHttpRequest::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build stub bid request"),
+                self.backend,
+            );
+            context
+                .services
+                .http_client()
+                .send_async(req)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "stub launch failed".to_string(),
+                })
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                self.name,
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some(self.backend.to_string())
+        }
+    }
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
@@ -975,6 +1041,89 @@ mod tests {
         assert!(
             result > 1900,
             "should still have most of the budget, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_error_is_attributed_to_correct_provider() {
+        // Arrange: two stub providers backed by distinct backend names.
+        // The stub HTTP client injects a select() error for the first request
+        // that completes (backend-a). backend-b should still produce a success.
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-a
+        stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-b
+        stub.push_select_error(); // first select() reports backend-a as failed
+
+        let services = build_services_with_http_client(stub);
+        // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+        // The leaked allocation is bounded to the test process lifetime.
+        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "provider-a",
+            backend: "backend-a",
+        }));
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "provider-b",
+            backend: "backend-b",
+        }));
+
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &req,
+            timeout_ms: 2000,
+            provider_responses: None,
+            services,
+        };
+
+        // Act
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should complete auction even when one provider errors");
+
+        // Assert: exactly two responses — one error, one success.
+        assert_eq!(
+            result.provider_responses.len(),
+            2,
+            "should collect responses from both providers"
+        );
+
+        let provider_a = result
+            .provider_responses
+            .iter()
+            .find(|r| r.provider == "provider-a")
+            .expect("should have provider-a response");
+        let provider_b = result
+            .provider_responses
+            .iter()
+            .find(|r| r.provider == "provider-b")
+            .expect("should have provider-b response");
+
+        assert_eq!(
+            provider_a.status,
+            BidStatus::Error,
+            "provider-a should be marked error — select() Err was attributed via failed_backend_name"
+        );
+        assert_eq!(
+            provider_b.status,
+            BidStatus::Success,
+            "provider-b should succeed — error was correctly isolated to provider-a"
         );
     }
 

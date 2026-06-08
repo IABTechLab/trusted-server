@@ -553,20 +553,28 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
                 GTM_INTEGRATION_ID,
             )
             .await?;
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            let rewritten_body = Self::rewrite_gtm_urls(&body_str);
+            let (rewritten_body_bytes, content_type) = match std::str::from_utf8(&body_bytes) {
+                Ok(body_str) => {
+                    let rewritten = Self::rewrite_gtm_urls(body_str);
+                    (
+                        rewritten.into_bytes(),
+                        "application/javascript; charset=utf-8",
+                    )
+                }
+                Err(_) => {
+                    log::warn!("GTM upstream response body is not valid UTF-8; serving original");
+                    (body_bytes.to_vec(), "application/javascript")
+                }
+            };
 
             return Response::builder()
                 .status(status)
-                .header(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )
+                .header(header::CONTENT_TYPE, content_type)
                 .header(
                     header::CACHE_CONTROL,
                     format!("public, max-age={}", self.config.cache_max_age),
                 )
-                .body(EdgeBody::from(rewritten_body.into_bytes()))
+                .body(EdgeBody::from(rewritten_body_bytes))
                 .change_context(Self::error("Failed to build rewritten GTM response"));
         }
 
