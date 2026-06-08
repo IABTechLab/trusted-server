@@ -219,6 +219,8 @@ pub(crate) struct StubHttpClient {
     responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
+    // Queued select() errors — each pop makes the next select() return ready: Err.
+    select_errors: Mutex<VecDeque<()>>,
 }
 
 impl StubHttpClient {
@@ -227,6 +229,7 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            select_errors: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -238,14 +241,22 @@ impl StubHttpClient {
             .push_back((status, body));
     }
 
+    /// Inject a `select()` error: the next call to `select()` will return
+    /// `ready: Err(...)` with the failed request's backend name in
+    /// `failed_backend_name`. The corresponding queued response is consumed.
+    pub fn push_select_error(&self) {
+        self.select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .push_back(());
+    }
+
     /// Return backend names recorded across all `send` calls, in order.
     pub fn recorded_backend_names(&self) -> Vec<String> {
         self.calls.lock().expect("should lock calls").clone()
     }
 
-    /// Return the request headers captured per `send` call, in order.
-    ///
-    /// Each entry is the set of `(name, value)` pairs from one call.
+    /// Return request headers recorded across all `send` calls, in order.
     pub fn recorded_request_headers(&self) -> Vec<Vec<(String, String)>> {
         self.request_headers
             .lock()
@@ -307,6 +318,22 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock calls")
             .push(backend_name.clone());
 
+        let headers: Vec<(String, String)> = request
+            .request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .push(headers);
+
         let (status, body_bytes) = self
             .responses
             .lock()
@@ -345,16 +372,47 @@ impl PlatformHttpClient for StubHttpClient {
                     .attach("unexpected inner type in StubHttpClient::select")
             })?;
 
+        let ready_backend_name = stub.backend_name.clone();
+
+        // Strip backend names from remaining to match Fastly production behavior:
+        // Fastly's select() rebuilds remaining with PlatformPendingRequest::new()
+        // (no backend_name) — orchestrators must not rely on names being set.
+        let remaining: Vec<PlatformPendingRequest> = pending_requests
+            .into_iter()
+            .map(|r| match r.downcast::<StubPendingResponse>() {
+                Ok(inner) => PlatformPendingRequest::new(inner),
+                Err(r) => r,
+            })
+            .collect();
+
+        let should_error = self
+            .select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .pop_front()
+            .is_some();
+
+        if should_error {
+            return Ok(PlatformSelectResult {
+                ready: Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "injected select error for backend '{ready_backend_name}'"
+                ))),
+                remaining,
+                failed_backend_name: Some(ready_backend_name),
+            });
+        }
+
         let edge_response = edgezero_core::http::response_builder()
             .status(stub.status)
             .body(edgezero_core::body::Body::from(stub.body))
             .change_context(PlatformError::HttpClient)?;
 
-        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(stub.backend_name));
+        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
         Ok(PlatformSelectResult {
             ready,
-            remaining: pending_requests,
+            remaining,
+            failed_backend_name: None,
         })
     }
 }
@@ -495,25 +553,13 @@ pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
 }
 
-pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(NoopBackend))
-        .http_client(Arc::new(NoopHttpClient))
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: Some(ip),
-            tls_protocol: None,
-            tls_cipher: None,
-        })
-        .build()
-}
-
-/// Build a [`RuntimeServices`] with a [`StubBackend`] and the given HTTP client.
+/// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
 ///
-/// Useful for tests that need to verify `services.http_client()` call sites.
+/// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than
+/// [`NoopBackend`] (always returns `Err(Unsupported)`) so that handlers which
+/// both make HTTP calls and resolve backends don't need two separate service
+/// setups.  If your test must verify that a missing backend returns an error,
+/// use [`noop_services`] directly.
 pub(crate) fn build_services_with_http_client(
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
@@ -526,6 +572,22 @@ pub(crate) fn build_services_with_http_client(
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: None,
+            tls_protocol: None,
+            tls_cipher: None,
+        })
+        .build()
+}
+
+pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(NoopBackend))
+        .http_client(Arc::new(NoopHttpClient))
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: Some(ip),
             tls_protocol: None,
             tls_cipher: None,
         })
@@ -637,8 +699,8 @@ mod tests {
         );
         assert_eq!(
             result.remaining[0].backend_name(),
-            Some("backend-b"),
-            "should preserve backend name on remaining request"
+            None,
+            "should strip backend name from remaining (matches Fastly production behavior)"
         );
 
         let names = stub.recorded_backend_names();

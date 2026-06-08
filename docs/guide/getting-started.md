@@ -120,5 +120,6 @@ fastly compute publish
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)
+- Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

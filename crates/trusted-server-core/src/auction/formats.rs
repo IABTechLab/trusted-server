@@ -14,12 +14,13 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
+use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
-use crate::edge_cookie::generate_ec_id;
+use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
-use crate::platform::{GeoInfo, RuntimeServices};
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -34,6 +35,7 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
+    pub eids: Option<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,14 +88,10 @@ pub fn convert_tsjs_to_auction_request(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
     consent: ConsentContext,
-    ec_id: &str,
+    ec_id: Option<&str>,
     geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
-    let ec_id = ec_id.to_owned();
-    let fresh_id =
-        generate_ec_id(settings, services).change_context(TrustedServerError::Auction {
-            message: "Failed to generate fresh EC ID".to_string(),
-        })?;
+    let ec_id = ec_id.map(str::to_owned);
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -189,8 +187,8 @@ pub fn convert_tsjs_to_auction_request(
         },
         user: UserInfo {
             id: ec_id,
-            fresh_id,
             consent: Some(consent),
+            eids: None,
         },
         device,
         site: Some(SiteInfo {
@@ -214,6 +212,7 @@ pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,
     auction_request: &AuctionRequest,
+    ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
@@ -314,72 +313,52 @@ pub fn convert_to_openrtb_response(
             message: "Failed to serialize auction response".to_string(),
         })?;
 
-    let mut response = Response::new(EdgeBody::from(body_bytes));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    insert_response_header(
-        response.headers_mut(),
-        &HEADER_X_TS_EC,
-        auction_request.user.id.as_str(),
-    )?;
-    insert_response_header(
-        response.headers_mut(),
-        &HEADER_X_TS_EC_FRESH,
-        auction_request.user.fresh_id.as_str(),
-    )?;
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body_bytes))
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to build auction response".to_string(),
+        })?;
+
+    // Signal consent status independently of whether EIDs were resolved.
+    if ec_allowed {
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
+    }
+
+    // Attach EID response headers when consent-gated EIDs are available.
+    if let Some(ref eids) = auction_request.user.eids {
+        let (encoded, truncated) = encode_eids_header(eids)?;
+        let header_val =
+            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
+                message: "Failed to encode EIDs header value".to_string(),
+            })?;
+        response.headers_mut().insert(HEADER_X_TS_EIDS, header_val);
+        if truncated {
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
+        }
+    }
 
     Ok(response)
-}
-
-fn insert_response_header(
-    headers: &mut http::HeaderMap,
-    name: &http::HeaderName,
-    value: &str,
-) -> Result<(), Report<TrustedServerError>> {
-    let header_value =
-        HeaderValue::from_str(value).change_context(TrustedServerError::InvalidHeaderValue {
-            message: format!("Invalid response header value for {name}"),
-        })?;
-    headers.insert(name.clone(), header_value);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::{AuctionResponse, Bid};
-    use crate::consent::ConsentContext;
-    use crate::platform::test_support::noop_services;
-    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
-    use edgezero_core::body::Body as EdgeBody;
-    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
+    use crate::openrtb::{Eid, Uid};
 
-    fn sample_ad_request() -> AdRequest {
-        AdRequest {
-            ad_units: vec![AdUnit {
-                code: "slot-1".to_string(),
-                media_types: Some(MediaTypes {
-                    banner: Some(BannerUnit {
-                        sizes: vec![vec![300, 250]],
-                    }),
-                }),
-                bids: Some(vec![BidConfig {
-                    bidder: "prebid".to_string(),
-                    params: serde_json::json!({"placementId": "abc"}),
-                }]),
-            }],
-            config: None,
-        }
-    }
-
-    fn sample_auction_request() -> AuctionRequest {
+    fn make_minimal_auction_request() -> AuctionRequest {
         AuctionRequest {
-            id: "auction-123".to_string(),
+            id: "test-auction".to_owned(),
             slots: vec![AdSlot {
-                id: "slot-1".to_string(),
+                id: "slot-1".to_owned(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
                     width: 300,
@@ -390,94 +369,129 @@ mod tests {
                 bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
-                domain: "publisher.example".to_string(),
-                page_url: Some("https://publisher.example/page".to_string()),
+                domain: "test.com".to_owned(),
+                page_url: None,
             },
             user: UserInfo {
-                id: VALID_SYNTHETIC_ID.to_string(),
-                fresh_id: "fresh-123".to_string(),
-                consent: Some(ConsentContext::default()),
+                id: Some("test-ec-id".to_owned()),
+                consent: None,
+                eids: None,
             },
             device: None,
-            site: Some(SiteInfo {
-                domain: "publisher.example".to_string(),
-                page: "https://publisher.example/page".to_string(),
-            }),
+            site: None,
             context: HashMap::new(),
         }
     }
 
+    fn make_empty_result() -> OrchestrationResult {
+        OrchestrationResult {
+            winning_bids: HashMap::new(),
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            total_time_ms: 10,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_settings() -> Settings {
+        crate::test_support::tests::create_test_settings()
+    }
+
     #[test]
-    fn convert_tsjs_to_auction_request_accepts_http_request() {
-        let settings = create_test_settings();
-        let req = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("https://publisher.example/auction")
-            .header(header::USER_AGENT, "test-agent")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+    fn response_includes_eid_headers_when_eids_present() {
+        let mut request = make_minimal_auction_request();
+        request.user.eids = Some(vec![Eid {
+            source: "ssp.com".to_owned(),
+            uids: vec![Uid {
+                id: "uid-1".to_owned(),
+                atype: Some(3),
+                ext: None,
+            }],
+        }]);
 
-        let auction_request = convert_tsjs_to_auction_request(
-            &sample_ad_request(),
-            &settings,
-            &noop_services(),
-            &req,
-            ConsentContext::default(),
-            VALID_SYNTHETIC_ID,
-            None,
-        )
-        .expect("should convert auction request");
+        let settings = make_settings();
+        let result = make_empty_result();
 
-        assert_eq!(auction_request.slots.len(), 1, "should create one slot");
+        let response = convert_to_openrtb_response(&result, &settings, &request, true)
+            .expect("should build response");
+
+        assert!(
+            response.headers().get(&HEADER_X_TS_EIDS).is_some(),
+            "should include x-ts-eids header when EIDs are present"
+        );
         assert_eq!(
-            auction_request.slots[0].id, "slot-1",
-            "should preserve slot code"
+            response
+                .headers()
+                .get(&HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("ok"),
+            "should include x-ts-ec-consent: ok when ec_allowed is true"
+        );
+        assert!(
+            response
+                .headers()
+                .get(&HEADER_X_TS_EIDS_TRUNCATED)
+                .is_none(),
+            "should not include truncated header for small payload"
         );
     }
 
     #[test]
-    fn convert_to_openrtb_response_returns_http_response_with_ec_headers() {
-        let settings = create_test_settings();
-        let bid = Bid {
-            slot_id: "slot-1".to_string(),
-            price: Some(1.25),
-            currency: "USD".to_string(),
-            creative: Some("<div>creative</div>".to_string()),
-            adomain: Some(vec!["advertiser.example".to_string()]),
-            bidder: "prebid".to_string(),
-            width: 300,
-            height: 250,
-            nurl: None,
-            burl: None,
-            metadata: HashMap::new(),
-        };
-        let result = OrchestrationResult {
-            provider_responses: vec![AuctionResponse::success("prebid", vec![bid.clone()], 12)],
-            mediator_response: None,
-            winning_bids: HashMap::from([(String::from("slot-1"), bid)]),
-            total_time_ms: 12,
-            metadata: HashMap::new(),
-        };
+    fn response_sets_consent_header_even_without_eids() {
+        let request = make_minimal_auction_request();
+        let settings = make_settings();
+        let result = make_empty_result();
 
-        let response = convert_to_openrtb_response(&result, &settings, &sample_auction_request())
-            .expect("should convert to openrtb response");
+        let response = convert_to_openrtb_response(&result, &settings, &request, true)
+            .expect("should build response");
 
-        assert_eq!(response.status(), StatusCode::OK, "should return 200 OK");
         assert_eq!(
             response
                 .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("application/json"),
-            "should return json content type"
+                .get(&HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("ok"),
+            "should set x-ts-ec-consent: ok based on consent, not EID presence"
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(&crate::constants::HEADER_X_TS_EC)
-                .and_then(|value| value.to_str().ok()),
-            Some(VALID_SYNTHETIC_ID),
-            "should include EC ID header"
+        assert!(
+            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
+            "should omit x-ts-eids when no EIDs available"
+        );
+    }
+
+    #[test]
+    fn response_omits_consent_header_when_not_allowed() {
+        let request = make_minimal_auction_request();
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should build response");
+
+        assert!(
+            response.headers().get(&HEADER_X_TS_EC_CONSENT).is_none(),
+            "should omit x-ts-ec-consent when ec_allowed is false"
+        );
+        assert!(
+            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
+            "should omit x-ts-eids when no EIDs available"
+        );
+    }
+
+    #[test]
+    fn response_omits_ec_header_when_ec_id_is_none() {
+        let mut request = make_minimal_auction_request();
+        request.user.id = None;
+
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should build response");
+
+        assert!(
+            response.headers().get("x-ts-ec").is_none(),
+            "should omit x-ts-ec when no EC ID is available"
         );
     }
 }

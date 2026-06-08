@@ -22,6 +22,7 @@ config = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
+fastly = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -76,7 +77,6 @@ default = []
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
-tokio = { workspace = true }
 
 [[bench]]
 name = "consent_decode"

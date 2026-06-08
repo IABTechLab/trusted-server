@@ -74,6 +74,14 @@ jobs:
       - name: Run Axum adapter tests
         run: cargo test-axum
 
+      - name: Verify Fastly WASM release build
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
+          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+        run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest

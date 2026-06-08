@@ -785,14 +785,14 @@ fn apply_ec_headers(
         }
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        crate::cookies::set_ec_cookie(settings, response, ec_id);
+        crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        crate::cookies::expire_ec_cookie(settings, response);
+        crate::ec::cookies::expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -1544,42 +1544,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publisher_request_uses_platform_http_client_with_http_types() {
-        let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"origin response".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example/page")
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+    #[test]
+    fn publisher_request_uses_platform_http_client_with_http_types() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
 
-        let pub_response = handle_publisher_request(&settings, &registry, &services, req)
-            .await
-            .expect("should proxy publisher request");
-        let response = match pub_response {
-            PublisherResponse::Buffered(r) => r,
-            PublisherResponse::PassThrough { mut response, body } => {
-                *response.body_mut() = body;
-                response
-            }
-            PublisherResponse::Stream { response, .. } => response,
-        };
+            let pub_response = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+            let response = match pub_response {
+                PublisherResponse::Buffered(r) => r,
+                PublisherResponse::PassThrough { mut response, body } => {
+                    *response.body_mut() = body;
+                    response
+                }
+                PublisherResponse::Stream { response, .. } => response,
+            };
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "origin response");
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should proxy through the platform http client"
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "origin response");
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "should proxy through the platform http client"
+            );
+        });
     }
 
     #[test]

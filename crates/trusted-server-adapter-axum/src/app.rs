@@ -11,8 +11,9 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -116,9 +117,18 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
+        let mut ec_context = EcContext::default();
         return state
             .registry
-            .handle_proxy(&method, &path, &state.settings, services, req)
+            .handle_proxy(ProxyDispatchInput {
+                method: &method,
+                path: &path,
+                settings: &state.settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services,
+                req,
+            })
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -251,7 +261,17 @@ fn named_route_handler(
                         Ok(resp)
                     }
                     NamedRouteHandler::Auction => {
-                        handle_auction(&state.settings, &state.orchestrator, &services, req).await
+                        let ec_context = EcContext::default();
+                        handle_auction(
+                            &state.settings,
+                            &state.orchestrator,
+                            None,
+                            None,
+                            &ec_context,
+                            &services,
+                            req,
+                        )
+                        .await
                     }
                     NamedRouteHandler::FirstPartyProxy => {
                         handle_first_party_proxy(&state.settings, &services, req).await

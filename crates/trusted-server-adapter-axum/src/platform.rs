@@ -463,7 +463,11 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })
             .map(|edge_resp| PlatformResponse::new(edge_resp).with_backend_name(backend_name));
 
-        Ok(PlatformSelectResult { ready, remaining })
+        Ok(PlatformSelectResult {
+            ready,
+            remaining,
+            failed_backend_name: None,
+        })
     }
 }
 

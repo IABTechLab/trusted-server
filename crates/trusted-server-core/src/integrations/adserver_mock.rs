@@ -330,11 +330,18 @@ impl AuctionProvider for AdServerMockProvider {
                 } else {
                     host.to_string()
                 };
-                req.headers_mut().insert(
-                    header::HOST,
-                    header::HeaderValue::from_str(&host_with_port)
-                        .expect("should build host header"),
-                );
+                match header::HeaderValue::from_str(&host_with_port) {
+                    Ok(value) => {
+                        req.headers_mut().insert(header::HOST, value);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to build Host header for '{}': {}",
+                            host_with_port,
+                            e
+                        );
+                    }
+                }
             }
         }
 
@@ -498,9 +505,9 @@ mod tests {
                 page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("Mozilla/5.0".to_string()),
@@ -672,9 +679,9 @@ mod tests {
                 page_url: None,
             },
             user: UserInfo {
-                id: "user-1".to_string(),
-                fresh_id: "fresh-1".to_string(),
+                id: Some("user-1".to_string()),
                 consent: None,
+                eids: None,
             },
             device: None,
             site: None,
