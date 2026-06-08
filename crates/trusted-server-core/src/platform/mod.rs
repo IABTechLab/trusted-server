@@ -25,8 +25,7 @@
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
 //!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
-//!   accepts any reader, including `fastly::Body` (which implements
-//!   `std::io::Read`).
+//!   accepts any reader that implements `std::io::Read`.
 //!
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
