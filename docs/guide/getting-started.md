@@ -7,6 +7,7 @@ Get up and running with Trusted Server quickly.
 Before you begin, ensure you have:
 
 - Rust 1.91.1 (see `.tool-versions`)
+- Node.js >= 18 and npm >= 7 (required for building client-side JS bundles)
 - Fastly CLI installed
 - A Fastly account and API key
 - Basic familiarity with WebAssembly
