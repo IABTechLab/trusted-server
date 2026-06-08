@@ -28,6 +28,10 @@ pub struct GeoInfo {
     pub metro_code: i64,
     /// Region code.
     pub region: Option<String>,
+    /// Autonomous System Number (e.g. `7922` = Comcast).
+    /// Used to distinguish home ISP vs. corporate VPN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
 }
 
 impl GeoInfo {

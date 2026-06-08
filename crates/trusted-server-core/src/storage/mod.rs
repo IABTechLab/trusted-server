@@ -8,7 +8,6 @@
 //! via [`crate::platform::RuntimeServices`].
 
 pub(crate) mod config_store;
-pub mod kv_store;
 pub(crate) mod secret_store;
 
 pub use config_store::FastlyConfigStore;

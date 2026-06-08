@@ -239,16 +239,6 @@ impl StubHttpClient {
     pub fn recorded_backend_names(&self) -> Vec<String> {
         self.calls.lock().expect("should lock calls").clone()
     }
-
-    /// Return the request headers captured per `send` call, in order.
-    ///
-    /// Each entry is the set of `(name, value)` pairs from one call.
-    pub fn recorded_request_headers(&self) -> Vec<Vec<(String, String)>> {
-        self.request_headers
-            .lock()
-            .expect("should lock request_headers")
-            .clone()
-    }
 }
 
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
@@ -441,27 +431,6 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
-            tls_protocol: None,
-            tls_cipher: None,
-        })
-        .build()
-}
-
-/// Build a [`RuntimeServices`] with a [`StubBackend`] and the given HTTP client.
-///
-/// Useful for tests that need to verify `services.http_client()` call sites.
-pub(crate) fn build_services_with_http_client(
-    http_client: Arc<dyn PlatformHttpClient>,
-) -> RuntimeServices {
-    RuntimeServices::builder()
-        .config_store(Arc::new(NoopConfigStore))
-        .secret_store(Arc::new(NoopSecretStore))
-        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-        .backend(Arc::new(StubBackend))
-        .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
             tls_protocol: None,
             tls_cipher: None,
         })

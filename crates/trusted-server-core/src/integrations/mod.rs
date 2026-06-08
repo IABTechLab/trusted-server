@@ -24,7 +24,8 @@ pub use registry::{
     IntegrationAttributeRewriter, IntegrationDocumentState, IntegrationEndpoint,
     IntegrationHeadInjector, IntegrationHtmlContext, IntegrationHtmlPostProcessor,
     IntegrationMetadata, IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder,
-    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
+    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput,
+    ScriptRewriteAction,
 };
 
 type IntegrationBuilder =

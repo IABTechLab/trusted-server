@@ -209,6 +209,14 @@ impl core::error::Error for MyError {}
 - Format messages with present-tense verbs.
 - Use `log-fastly` as the backend for Fastly Compute.
 
+## Other guidelines
+
+- Use only example or fictional information in comments, tests, docs, examples,
+  and similar non-runtime materials. (eg. for urls use: example.com domains only)
+- Do not write or commit real domains, customer names, credentials,
+  configuration values, or other potentially sensitive real-world information in
+  comments, tests, docs, or examples.
+
 ---
 
 ## Git Commit Conventions
@@ -366,7 +374,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
 | `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
 | `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/trusted-server-core/src/edge_cookie.rs`           | Edge Cookie (EC) ID generation                    |
+| `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
@@ -382,6 +390,7 @@ both runtime behavior and build/tooling changes.
 - Do not use `unwrap()` in production code — use `expect("should ...")`.
 - Do not use thiserror — use `derive_more::Display` + `impl Error`.
 - Do not use wildcard imports (except `use super::*` in test modules).
-- Do not commit `.env` files or secrets.
+- Do not commit `.env` files, secrets, or potentially sensitive real-world
+  information in comments, tests, docs, examples, or configuration files.
 - Do not make large refactors without approval.
 - Always run tests and linting before committing.

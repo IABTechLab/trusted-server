@@ -94,8 +94,45 @@ fastly secret-store create --name signing_keys
 
 Note the store IDs - you'll need them for your `trusted-server.toml` configuration.
 
+## Create EC KV Store
+
+Edge Cookie flows require one KV store:
+
+- Identity graph store (`ec_store`) - EC identity graph, source-domain keyed partner UIDs, minimal consent metadata, and withdrawal tombstones
+
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
+
+Create it:
+
+```bash
+fastly kv-store create --name ec_identity_store
+```
+
+Configure in `trusted-server.toml`:
+
+```toml
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"}]}},{
+ec_store = "ec_identity_store"
+```
+
+Verify stores exist:
+
+```bash
+fastly kv-store list
+```
+
+Verify stores are linked to your active service version:
+
+```bash
+fastly resource-link list --service-id <service-id> --version <active-version>
+```
+
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
+
 ## Next Steps
 
 - Return to [Getting Started](/guide/getting-started) to continue setup
 - See [Configuration](/guide/configuration) for detailed configuration options
+- See [EC Setup Guide](/guide/ec-setup-guide) for end-to-end EC verification
 - See [Request Signing](/guide/request-signing) for setting up cryptographic signing

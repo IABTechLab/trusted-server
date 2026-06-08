@@ -44,6 +44,25 @@ pub trait AuctionProvider: Send + Sync {
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>>;
 
+    /// Parse the response with access to the original auction context.
+    ///
+    /// Providers that need request-local metadata while transforming responses
+    /// can override this method. The default preserves the existing
+    /// response-only provider contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response cannot be parsed into a valid [`AuctionResponse`].
+    fn parse_response_with_context(
+        &self,
+        response: fastly::Response,
+        response_time_ms: u64,
+        context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let _ = context;
+        self.parse_response(response, response_time_ms)
+    }
+
     /// Check if this provider supports a specific media type.
     fn supports_media_type(&self, media_type: &super::types::MediaType) -> bool {
         // By default, support banner ads
