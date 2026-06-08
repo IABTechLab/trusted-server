@@ -48,7 +48,7 @@ pub use http::{
 };
 pub use image_optimizer::{
     PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
-    PlatformImageOptimizerParams,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};

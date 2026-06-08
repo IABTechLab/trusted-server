@@ -10,8 +10,8 @@ use rand::rngs::OsRng;
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
-    PlatformPendingRequest, PlatformResponse, PlatformSecretStore, PlatformSelectResult,
-    RuntimeServices, StoreId, StoreName,
+    PlatformImageOptimizerParams, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -382,6 +382,15 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("Image Optimizer is not supported with StubHttpClient send_async"));
+        }
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("streaming responses are not supported with StubHttpClient send_async"));
+        }
+
         let backend_name = request.backend_name.clone();
         self.calls
             .lock()
@@ -674,6 +683,53 @@ mod tests {
             names,
             vec!["backend-a", "backend-b"],
             "should record both send_async calls in order"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_send_async_rejects_image_optimizer_metadata() {
+        let stub = StubHttpClient::new();
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/image.jpg")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_image_optimizer(PlatformImageOptimizerOptions::new(
+            "us_east",
+            PlatformImageOptimizerParams::default(),
+        ));
+
+        let err = futures::executor::block_on(stub.send_async(req))
+            .expect_err("should reject async Image Optimizer metadata");
+
+        assert!(
+            format!("{err:?}").contains("Image Optimizer"),
+            "should explain unsupported async IO path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_send_async_rejects_stream_response() {
+        let stub = StubHttpClient::new();
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/image.jpg")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_stream_response();
+
+        let err = futures::executor::block_on(stub.send_async(req))
+            .expect_err("should reject async streaming-response requests");
+
+        assert!(
+            format!("{err:?}").contains("streaming responses"),
+            "should explain unsupported async streaming-response path: {err:?}"
         );
     }
 

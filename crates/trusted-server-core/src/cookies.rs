@@ -1,7 +1,7 @@
 //! Cookie handling utilities.
 //!
-//! This module provides functionality for parsing, creating, stripping, and forwarding cookies
-//! used in the trusted server system.
+//! This module provides functionality for parsing, stripping, and forwarding cookies used in the
+//! trusted server system.
 
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;

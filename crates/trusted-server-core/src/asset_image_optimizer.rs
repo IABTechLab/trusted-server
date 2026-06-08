@@ -204,7 +204,7 @@ fn normalize_offset(value: Option<&str>, config: &ImageOptimizerCropOffsetsConfi
     for window in config.buckets.windows(2) {
         let current = window[0];
         let next = window[1];
-        let midpoint = current + ((next - current) / 2);
+        let midpoint = current + (next.saturating_sub(current) / 2);
         if parsed < midpoint {
             return current;
         }

@@ -23,8 +23,8 @@ use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
     PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
     PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
-    PlatformKvStore, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
+    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 
 // ---------------------------------------------------------------------------
@@ -184,21 +184,16 @@ fn fastly_image_optimizer_region(
 ) -> Result<fastly::image_optimizer::ImageOptimizerRegion, Report<PlatformError>> {
     use fastly::image_optimizer::ImageOptimizerRegion;
 
-    match region
-        .trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
-    {
-        "us_east" | "us_east_1" => Ok(ImageOptimizerRegion::UsEast),
-        "us_central" | "us_central_1" => Ok(ImageOptimizerRegion::UsCentral),
-        "us_west" | "us_west_1" | "us_west_2" => Ok(ImageOptimizerRegion::UsWest),
-        "eu_central" | "eu_central_1" => Ok(ImageOptimizerRegion::EuCentral),
-        "eu_west" | "eu_west_1" => Ok(ImageOptimizerRegion::EuWest),
-        "asia" => Ok(ImageOptimizerRegion::Asia),
-        "australia" => Ok(ImageOptimizerRegion::Australia),
-        other => Err(Report::new(PlatformError::HttpClient)
-            .attach(format!("unsupported Image Optimizer region: {other}"))),
+    match PlatformImageOptimizerRegion::parse(region) {
+        Some(PlatformImageOptimizerRegion::UsEast) => Ok(ImageOptimizerRegion::UsEast),
+        Some(PlatformImageOptimizerRegion::UsCentral) => Ok(ImageOptimizerRegion::UsCentral),
+        Some(PlatformImageOptimizerRegion::UsWest) => Ok(ImageOptimizerRegion::UsWest),
+        Some(PlatformImageOptimizerRegion::EuCentral) => Ok(ImageOptimizerRegion::EuCentral),
+        Some(PlatformImageOptimizerRegion::EuWest) => Ok(ImageOptimizerRegion::EuWest),
+        Some(PlatformImageOptimizerRegion::Asia) => Ok(ImageOptimizerRegion::Asia),
+        Some(PlatformImageOptimizerRegion::Australia) => Ok(ImageOptimizerRegion::Australia),
+        None => Err(Report::new(PlatformError::HttpClient)
+            .attach(format!("unsupported Image Optimizer region: {region}"))),
     }
 }
 

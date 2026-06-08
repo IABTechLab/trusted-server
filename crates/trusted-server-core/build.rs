@@ -18,6 +18,13 @@ mod consent_config;
 #[path = "src/host_header.rs"]
 mod host_header;
 
+#[path = "src/platform/image_optimizer.rs"]
+mod platform_image_optimizer;
+
+mod platform {
+    pub use crate::platform_image_optimizer::PlatformImageOptimizerRegion;
+}
+
 #[path = "src/settings.rs"]
 mod settings;
 

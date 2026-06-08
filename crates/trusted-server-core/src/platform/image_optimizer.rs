@@ -9,6 +9,50 @@
 //! Unsupported adapters should reject requests carrying this metadata rather
 //! than silently dropping transformations.
 
+/// Platform-neutral Image Optimizer processing region.
+///
+/// These variants mirror the regions currently exposed by the Fastly SDK while
+/// keeping config validation in core independent from adapter-specific types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformImageOptimizerRegion {
+    /// Apply image optimization in the eastern United States.
+    UsEast,
+    /// Apply image optimization in the central United States.
+    UsCentral,
+    /// Apply image optimization in the western United States.
+    UsWest,
+    /// Apply image optimization in central Europe.
+    EuCentral,
+    /// Apply image optimization in western Europe.
+    EuWest,
+    /// Apply image optimization in Asia.
+    Asia,
+    /// Apply image optimization in Australia.
+    Australia,
+}
+
+impl PlatformImageOptimizerRegion {
+    /// Parse a configured region string into a supported Image Optimizer region.
+    #[must_use]
+    pub fn parse(region: &str) -> Option<Self> {
+        match region
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "us_east" | "us_east_1" => Some(Self::UsEast),
+            "us_central" | "us_central_1" => Some(Self::UsCentral),
+            "us_west" | "us_west_1" | "us_west_2" => Some(Self::UsWest),
+            "eu_central" | "eu_central_1" => Some(Self::EuCentral),
+            "eu_west" | "eu_west_1" => Some(Self::EuWest),
+            "asia" => Some(Self::Asia),
+            "australia" => Some(Self::Australia),
+            _ => None,
+        }
+    }
+}
+
 /// Platform-neutral Image Optimizer options for an upstream request.
 ///
 /// Core code stores only a closed transformation set here. The Fastly adapter is

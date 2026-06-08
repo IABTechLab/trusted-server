@@ -326,6 +326,7 @@ async fn route_request(
     let method = req.get_method().clone();
 
     let mut asset_cache_policy = AssetProxyCachePolicy::OriginControlled;
+    let mut should_finalize_ec = true;
 
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
@@ -432,6 +433,7 @@ async fn route_request(
                 .flatten();
 
             if let Some(asset_route) = matched_asset_route {
+                should_finalize_ec = false;
                 log::info!(
                     "No explicit route matched for path: {}, proxying via asset route prefix {} to {}",
                     path,
@@ -446,7 +448,10 @@ async fn route_request(
                             asset_cache_policy = asset_response.cache_policy();
                             Ok(asset_response.into_response())
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            asset_cache_policy = AssetProxyCachePolicy::NoStorePrivate;
+                            Err(e)
+                        }
                     };
                 (result, false)
             } else {
@@ -534,15 +539,17 @@ async fn route_request(
     // Bot gate still suppresses generated EC writes and pull sync via
     // `kv_graph = None`, but withdrawal finalization uses `finalize_kv_graph`
     // so revocation tombstones are not lost for bot-classified clients.
-    ec_finalize_response(
-        settings,
-        &ec_context,
-        finalize_kv_graph.as_ref(),
-        partner_registry,
-        eids_cookie.as_deref(),
-        sharedid_cookie.as_deref(),
-        &mut response,
-    );
+    if should_finalize_ec {
+        ec_finalize_response(
+            settings,
+            &ec_context,
+            finalize_kv_graph.as_ref(),
+            partner_registry,
+            eids_cookie.as_deref(),
+            sharedid_cookie.as_deref(),
+            &mut response,
+        );
+    }
 
     finalize_response(settings, geo_info.as_ref(), &mut response);
     asset_cache_policy.apply_after_route_finalization(&mut response);

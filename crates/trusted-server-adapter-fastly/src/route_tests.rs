@@ -288,6 +288,31 @@ impl AuctionProvider for DisabledRouteProvider {
     }
 }
 
+struct FixedGeo(GeoInfo);
+
+impl PlatformGeo for FixedGeo {
+    fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+fn us_california_geo() -> GeoInfo {
+    GeoInfo {
+        city: "Example City".to_string(),
+        country: "US".to_string(),
+        continent: "NA".to_string(),
+        latitude: 37.0,
+        longitude: -122.0,
+        metro_code: 807,
+        region: Some("CA".to_string()),
+        asn: None,
+    }
+}
+
+fn valid_ec_id() -> String {
+    format!("{}.Abc123", "a".repeat(64))
+}
+
 fn base_route_settings_toml() -> &'static str {
     r#"
             [[handlers]]
@@ -396,13 +421,29 @@ fn test_runtime_services_with_secret_and_http_client(
     secret_store: Arc<dyn PlatformSecretStore>,
     http_client: Arc<dyn PlatformHttpClient>,
 ) -> RuntimeServices {
+    test_runtime_services_with_secret_http_client_and_geo(
+        req,
+        backend,
+        secret_store,
+        http_client,
+        Arc::new(NoopGeo),
+    )
+}
+
+fn test_runtime_services_with_secret_http_client_and_geo(
+    req: &Request,
+    backend: Arc<dyn PlatformBackend>,
+    secret_store: Arc<dyn PlatformSecretStore>,
+    http_client: Arc<dyn PlatformHttpClient>,
+    geo: Arc<dyn PlatformGeo>,
+) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(StubJwksConfigStore))
         .secret_store(secret_store)
         .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
         .backend(backend)
         .http_client(http_client)
-        .geo(Arc::new(NoopGeo))
+        .geo(geo)
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
             tls_protocol: req.get_tls_protocol().map(str::to_string),
@@ -629,19 +670,87 @@ fn asset_routes_bypass_publisher_consent_dependencies() {
         IntegrationRegistry::new(&settings).expect("should create integration registry");
 
     let asset_req = Request::get("https://test.com/.images/logo.png?auto=webp");
-    let asset_services = test_runtime_services(&asset_req);
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::ACCEPTED));
+    let asset_services = test_runtime_services_with_http_client(
+        &asset_req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
     let asset_resp = route_buffered_response(
         &settings,
         &orchestrator,
         &integration_registry,
         &asset_services,
         asset_req,
-        "should return an error response for asset proxy requests",
+        "should route asset proxy request",
     );
+
     assert_eq!(
         asset_resp.get_status(),
-        StatusCode::BAD_GATEWAY,
-        "should bypass publisher consent dependencies and fail only on the missing upstream client"
+        StatusCode::ACCEPTED,
+        "should return the asset-origin response without publisher consent dependencies"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should send exactly one asset request");
+    assert_eq!(
+        calls[0].backend_name, "https-assets.example.com",
+        "should resolve the configured asset backend, not the publisher origin"
+    );
+    assert_eq!(
+        calls[0].uri, "https://assets.example.com/.images/logo.png?auto=webp",
+        "should send the request to the configured asset origin"
+    );
+}
+
+#[test]
+fn asset_routes_skip_ec_finalization_cookie_mutations() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let mut req = Request::get("https://test.com/.images/logo.png");
+    req.set_header(header::COOKIE, format!("ts-ec={}", valid_ec_id()));
+    req.set_header("sec-gpc", "1");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::OK));
+    let services = test_runtime_services_with_secret_http_client_and_geo(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::new(NoopSecretStore),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+        Arc::new(FixedGeo(us_california_geo())),
+    );
+
+    let resp = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route asset request without EC finalization",
+    );
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should return the asset-origin response"
+    );
+    assert_eq!(
+        resp.get_header_str(header::SET_COOKIE),
+        None,
+        "should not expire or set EC cookies on asset responses"
+    );
+    assert_eq!(
+        resp.get_header_str("x-ts-ec"),
+        None,
+        "should not emit EC identity headers on asset responses"
     );
 }
 
@@ -685,6 +794,45 @@ fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
             .expect("should lock recorded calls")
             .is_empty(),
         "should not invoke the publisher origin when asset backend registration fails"
+    );
+}
+
+#[test]
+fn asset_handler_error_stays_uncacheable_after_global_headers() {
+    let mut settings = create_test_settings();
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+
+    let req = Request::get("https://test.com/.images/logo.png");
+    let services = test_runtime_services(&req);
+
+    let resp = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route generated asset error response",
+    );
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should return the generated asset proxy error"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CACHE_CONTROL),
+        Some("no-store, private"),
+        "should not let global cache headers make generated asset errors cacheable"
     );
 }
 

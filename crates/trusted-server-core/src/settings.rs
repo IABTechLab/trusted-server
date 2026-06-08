@@ -14,6 +14,7 @@ use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
+use crate::platform::PlatformImageOptimizerRegion;
 use crate::redacted::Redacted;
 
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
@@ -677,6 +678,7 @@ impl AssetOriginAuth {
 /// the `SigV4` canonical request. Credentials are read from the named runtime
 /// secret store and cached per process by configured secret names.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3SigV4AuthConfig {
     /// `AWS` region used in the credential scope.
     pub region: String,
@@ -787,6 +789,14 @@ impl AssetImageOptimizerConfig {
                 message:
                     "proxy.asset_routes image_optimizer region and profile_set must not be empty"
                         .to_string(),
+            }));
+        }
+        if PlatformImageOptimizerRegion::parse(&self.region).is_none() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "proxy.asset_routes image_optimizer region `{}` is not supported",
+                    self.region
+                ),
             }));
         }
         Ok(())
@@ -3808,6 +3818,63 @@ origin_host_header_override = "www.example.com:8443""#,
                 "should mention the S3 region character policy for {region:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_unknown_s3_auth_fields() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+            [proxy.asset_routes.auth]
+            type = "s3_sigv4"
+            region = "us-east-1"
+            secret_access_key_name = "secret_access_key"
+            "#;
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject unknown S3 auth config fields");
+
+        assert!(
+            format!("{err:?}").contains("secret_access_key_name"),
+            "should mention the unknown S3 auth field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_invalid_image_optimizer_regions() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets.default_images]
+            base_params = "quality=70"
+            default_profile = "default"
+
+            [image_optimizer.profile_sets.default_images.profiles]
+            default = "width=1920"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            enabled = true
+            region = "us-east-2"
+            profile_set = "default_images"
+            "#;
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject unsupported Image Optimizer regions");
+
+        assert!(
+            format!("{err:?}").contains("image_optimizer region `us-east-2` is not supported"),
+            "should mention the unsupported Image Optimizer region: {err:?}"
+        );
     }
 
     #[test]

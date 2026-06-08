@@ -234,7 +234,7 @@ rewrite_script = true
 #
 # [[proxy.asset_routes]]
 # prefix = "/.images/"
-# origin_url = "https://some.fastly-service.com"
+# origin_url = "https://some.fastly-service.example.com"
 #
 # Example: private S3 origin with Fastly IO profile-table conversion.
 # [[proxy.asset_routes]]

@@ -73,10 +73,12 @@ secret_access_key = "secret_access_key"
 ### S3 requirements
 
 - `origin_url` must be the real S3 host that AWS validates in the SigV4 canonical request.
+- Use `https` origins for authenticated routes. `http` origins are accepted by the generic asset route validator, but they would send SigV4 headers in clear text.
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
 - Credentials are loaded from the configured runtime secret store and cached per process by configured secret names.
+- Successful authenticated S3 responses preserve the origin `Cache-Control`; configure object cache headers intentionally.
 - Existing client `Authorization` and `x-amz-*` signing headers are replaced before signing.
 
 ### Secret store values
@@ -202,6 +204,8 @@ Viceroy does not perform real Fastly Image Optimizer transformations. Local test
 
 - Use a private S3 bucket policy that permits only the configured AWS principal.
 - Store AWS credentials in Fastly Secret Store or an equivalent runtime secret store.
+- Use HTTPS origins for authenticated routes so SigV4 headers are not transmitted in clear text.
+- Set origin `Cache-Control` for authenticated S3 objects based on the intended audience: use public cache headers for public assets in private buckets, and `private` or `no-store` for assets that must not be shared from cache.
 - Keep customer-specific profile names and profile tables in private deployment config when needed.
 - Use `origin_query = "strip"` for image transformation routes unless the query string is part of the S3 object identity.
 - Configure narrow path prefixes so asset routes do not capture unrelated application paths.
