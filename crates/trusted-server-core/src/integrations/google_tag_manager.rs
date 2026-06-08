@@ -677,7 +677,6 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
 
-    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use http::Method;
     use std::io::Cursor;
@@ -1295,8 +1294,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
 
         let settings = make_settings();
+        let services = crate::platform::test_support::noop_services();
         let response = integration
-            .handle(&settings, &noop_services(), req)
+            .handle(&settings, &services, req)
             .await
             .expect("handle should not return error");
 
@@ -1333,8 +1333,9 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
 
         let settings = make_settings();
+        let services = crate::platform::test_support::noop_services();
         let response = integration
-            .handle(&settings, &noop_services(), req)
+            .handle(&settings, &services, req)
             .await
             .expect("handle should not return error");
 
@@ -1501,7 +1502,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_config_parsing() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1511,8 +1512,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 enabled = true
@@ -1534,7 +1535,7 @@ upstream_url = "https://custom.gtm.example"
     fn test_config_defaults() {
         let toml_str = r#"
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "admin-pass"
 
@@ -1544,8 +1545,8 @@ cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
-[edge_cookie]
-secret_key = "test-secret-key"
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
 
 [integrations.google_tag_manager]
 container_id = "GTM-DEFAULT"

@@ -45,6 +45,13 @@ pub enum TestError {
     #[display("Origin URL not rewritten in HTML attributes")]
     AttributeNotRewritten,
 
+    // EC lifecycle errors
+    #[display("Expected HTTP status {expected}, got {actual}")]
+    UnexpectedStatusCode { expected: u16, actual: u16 },
+
+    #[display("JSON field assertion failed: {field}")]
+    JsonFieldMismatch { field: String },
+
     // Resource errors
     #[display("No available port found")]
     NoPortAvailable,
