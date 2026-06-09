@@ -171,7 +171,7 @@ pub fn handle_tsjs_dynamic(
     Ok(not_found_response())
 }
 
-/// Extract a module ID from a deferred-module filename like `tsjs-prebid.min.js`.
+/// Extract a module ID from a deferred-module filename like `tsjs-sourcepoint.min.js`.
 ///
 /// Returns `Some(&'static str)` if the filename matches a known JS module ID,
 /// `None` otherwise. The caller must additionally verify that the module is
@@ -1563,14 +1563,14 @@ mod tests {
     #[test]
     fn parse_deferred_module_filename_extracts_known_id() {
         assert_eq!(
-            parse_deferred_module_filename("tsjs-prebid.min.js"),
-            Some("prebid"),
-            "should extract prebid from minified filename"
+            parse_deferred_module_filename("tsjs-sourcepoint.min.js"),
+            Some("sourcepoint"),
+            "should extract sourcepoint from minified filename"
         );
         assert_eq!(
-            parse_deferred_module_filename("tsjs-prebid.js"),
-            Some("prebid"),
-            "should extract prebid from unminified filename"
+            parse_deferred_module_filename("tsjs-sourcepoint.js"),
+            Some("sourcepoint"),
+            "should extract sourcepoint from unminified filename"
         );
     }
 
@@ -1592,15 +1592,14 @@ mod tests {
             "should reject without tsjs- prefix"
         );
         assert_eq!(
-            parse_deferred_module_filename("tsjs-prebid.txt"),
+            parse_deferred_module_filename("tsjs-sourcepoint.txt"),
             None,
             "should reject non-js extension"
         );
     }
 
     #[test]
-    fn tsjs_dynamic_serves_deferred_prebid_when_enabled() {
-        // Default test settings include prebid enabled
+    fn tsjs_dynamic_does_not_serve_embedded_prebid() {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
@@ -1611,9 +1610,9 @@ mod tests {
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "should serve deferred prebid module when enabled"
+            response.get_status(),
+            StatusCode::NOT_FOUND,
+            "should not serve embedded prebid module"
         );
     }
 
@@ -1626,7 +1625,8 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");

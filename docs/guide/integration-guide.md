@@ -212,7 +212,7 @@ impl IntegrationScriptRewriter for MyIntegration {
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
 ::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because Trusted Server injects a first-party `/integrations/prebid/bundle.js` URL for the configured external bundle.
 :::
 
 ### 5b. Implement Head Injection (Optional)
@@ -251,7 +251,7 @@ Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder
 
 Place any integration-specific JavaScript entrypoint under `crates/trusted-server-js/lib/src/integrations/<integration-id>/index.ts` (for example, `crates/trusted-server-js/lib/src/integrations/testlight/index.ts`). The shared `npm run build` script automatically discovers every integration directory with an `index.ts` file and produces a bundle named `tsjs-<integration-id>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<integration-id>.min.js`.
 
-Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own deferred bundle automatically.
+Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Prebid drops publisher tags because the server injects the configured external Prebid bundle through a first-party route.
 
 ### 8. Test Locally
 
@@ -288,9 +288,9 @@ Integrations are loaded in one of two ways:
 
 ### Prebid
 
-**Loading**: Deferred (`<script defer>`)
+**Loading**: External first-party bundle (`/integrations/prebid/bundle.js`)
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects EC IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
+**Purpose**: Production Prebid Server bridge that owns `/auction`, injects Prebid client configuration, removes publisher-supplied Prebid scripts, and loads a publisher-specific generated Prebid bundle through a same-origin first-party route.
 
 **Key files**:
 
@@ -311,6 +311,9 @@ enabled = true
 server_url = "https://prebid.example/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["equativ", "sampleBidder"]
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+# external_bundle_sha256 = "..."
+# external_bundle_sri = "sha384-..."
 # script_patterns = ["/static/prebid/*"]
 ```
 
@@ -318,15 +321,15 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **2. Routes Owned by the Integration**
 
-`IntegrationProxy::routes` declares the `/integrations/prebid/first-party/ad` (GET) and `/integrations/prebid/third-party/ad` (POST) endpoints. Both handlers share helpers that shape OpenRTB payloads, inject EC IDs + geo/request-signing context, forward requests via `ensure_backend_from_url`, and run the HTML creative rewrites before responding. All routes are properly namespaced under `/integrations/prebid/` to follow the integration routing pattern.
+`IntegrationProxy::routes` declares `/integrations/prebid/bundle.js` for first-party Prebid bundle delivery and script-pattern routes that return empty JavaScript for intercepted publisher Prebid URLs. Auctions continue to use the shared `/auction` endpoint.
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The Prebid module is loaded as a separate `<script defer>` tag after the main TSJS bundle, so dropping the publisher assets prevents duplicate downloads. The server-injected config (`window.__tsjs_prebid`) is an inline script that runs before both bundles, ensuring configuration is available when the deferred Prebid module auto-initializes.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. Trusted Server injects `window.__tsjs_prebid` plus a same-origin `<script defer src="/integrations/prebid/bundle.js">` tag, so dropping publisher assets prevents duplicate downloads while configuration is available before the external bundle initializes.
 
-**4. TSJS Assets & Testing**
+**4. External Bundle Assets & Testing**
 
-The NPM integration lives in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
+The NPM integration lives in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` and is built with `crates/trusted-server-js/lib/build-prebid-external.mjs`, outside the embedded Cargo TSJS build. Tests typically assert that publisher references disappear and the first-party `/integrations/prebid/bundle.js` tag is present.
 
 **5. Hybrid EID forwarding**
 

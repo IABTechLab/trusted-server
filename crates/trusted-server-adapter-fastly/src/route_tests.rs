@@ -408,7 +408,8 @@ fn prebid_integration_toml() -> &'static str {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
-        "#
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+            "#
 }
 
 fn create_test_settings() -> Settings {
@@ -423,7 +424,7 @@ fn create_test_settings() -> Settings {
             enabled = true
             providers = ["prebid"]
             timeout_ms = 2000
-        "#,
+        "#,        
     );
     let settings = Settings::from_toml(&config).expect("should parse adapter route test settings");
 

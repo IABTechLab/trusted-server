@@ -23,7 +23,8 @@ pub mod tests {
 
             [integrations.prebid]
             enabled = true
-            server_url = "https://test-prebid.com/openrtb2/auction"  
+            server_url = "https://test-prebid.com/openrtb2/auction"
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [integrations.nextjs]
             enabled = false

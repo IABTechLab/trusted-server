@@ -19,10 +19,8 @@ import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
 // Client-side bid adapters — self-register with prebid.js on import.
-// The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
-// build time. See _adapters.generated.ts (written by build-all.mjs).
-// User ID submodules come from the deterministic attested preset in
-// user_id_modules.json. See _user_ids.generated.ts.
+// The external bundle generator writes _adapters.generated.ts and
+// _user_ids.generated.ts from its --adapters and --user-id-modules options.
 // When a bidder is listed in `client_side_bidders` in trusted-server.toml,
 // the requestBids shim leaves its bids untouched and the corresponding
 // adapter handles them natively in the browser.
@@ -156,7 +154,9 @@ function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
   }
 
   for (const name of missingConfiguredUserIdNames) {
-    log.warn(`[tsjs-prebid] configured User ID module "${name}" is not included in TSJS`);
+    log.warn(
+      `[tsjs-prebid] configured User ID module "${name}" is not included in the external bundle`
+    );
   }
 
   return diagnostics;
@@ -462,21 +462,21 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   // Validate that every client-side bidder has its adapter registered.
   // Adapters self-register on import, so a missing adapter means the bidder
-  // was listed in client_side_bidders but not in TSJS_PREBID_ADAPTERS at
-  // build time. Without the adapter the bidder is silently dropped from both
-  // server-side and client-side auctions.
+  // was listed in client_side_bidders but not included in the generated
+  // external Prebid bundle. Without the adapter the bidder is silently dropped
+  // from both server-side and client-side auctions.
   for (const bidder of clientSideBidders) {
     try {
       if (!adapterManager.getBidAdapter(bidder)) {
         log.error(
           `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-            `Add it to TSJS_PREBID_ADAPTERS at build time.`
+            `Add it to build-prebid-external.mjs --adapters.`
         );
       }
     } catch {
       log.error(
         `[tsjs-prebid] client-side bidder "${bidder}" has no adapter loaded. ` +
-          `Add it to TSJS_PREBID_ADAPTERS at build time.`
+          `Add it to build-prebid-external.mjs --adapters.`
       );
     }
   }

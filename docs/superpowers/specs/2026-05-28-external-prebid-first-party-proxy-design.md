@@ -31,7 +31,7 @@ origin so the integration preserves the current first-party deployment model.
   double-loaded.
 - Support content-addressed URLs and integrity metadata so external bundles can
   be auditable and cacheable when hash metadata is configured.
-- Keep Phase 1 focused on the managed external bundle flow only.
+- Keep Phase 1 focused on the external bundle flow only.
 
 ## Non-Goals
 
@@ -71,7 +71,7 @@ Trusted Server becomes responsible for:
 - `/auction`
 - HTML script interception
 - injecting `window.__tsjs_prebid`
-- injecting a first-party script URL for the managed external Prebid bundle
+- injecting a first-party script URL for the external Prebid bundle
 - proxying that script URL to the configured external asset
 
 The external generated Prebid bundle becomes responsible for:
@@ -85,7 +85,7 @@ The external generated Prebid bundle becomes responsible for:
 
 ## Configuration
 
-Add managed external bundle settings under `integrations.prebid`:
+Add external bundle settings under `integrations.prebid`:
 
 ```toml
 [integrations.prebid]
@@ -94,11 +94,9 @@ server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1000
 bidders = ["example-bidder"]
 
-# Phase 1 managed external bundle mode.
-bundle_mode = "managed_external"
+# Phase 1 requires a generated external Prebid bundle.
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid-abc123.js"
-# Optional but recommended. Enables content-addressed URLs, immutable caching,
-# and optional edge-side byte validation.
+# Optional but recommended. Enables content-addressed URLs and immutable caching.
 external_bundle_sha256 = "abc123..."
 
 # Optional but recommended when sha256 is configured.
@@ -107,16 +105,15 @@ external_bundle_sri = "sha384-..."
 
 ### Field Semantics
 
-| Field                    | Required                                    | Description                                                                                                                       |
-| ------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `bundle_mode`            | No                                          | Defaults to current embedded behavior during migration. Phase 1 introduces `managed_external`.                                    |
-| `external_bundle_url`    | Yes when `bundle_mode = "managed_external"` | Absolute `https://` URL of the generated Prebid bundle.                                                                           |
-| `external_bundle_sha256` | No                                          | Hex SHA-256 of the exact JS bytes. When present, enables content-addressed URLs, immutable caching, and optional edge validation. |
-| `external_bundle_sri`    | Recommended when SHA-256 is configured      | Browser Subresource Integrity value for the proxied first-party script response.                                                  |
+| Field                    | Required                               | Description                                                                                                                         |
+| ------------------------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `external_bundle_url`    | Yes when Prebid integration is enabled | Absolute `https://` URL of the generated Prebid bundle.                                                                             |
+| `external_bundle_sha256` | No                                     | Hex SHA-256 of the exact JS bytes. When present, enables content-addressed URLs and immutable caching for versioned route requests. |
+| `external_bundle_sri`    | Recommended when SHA-256 is configured | Optional browser Subresource Integrity value for the proxied first-party script response.                                           |
 
-`managed_external` should fail config validation when:
+Prebid config should fail validation when:
 
-- `external_bundle_url` is missing
+- `external_bundle_url` is missing while Prebid is enabled
 - `external_bundle_url` is not `https://`
 - `external_bundle_url` host is not permitted by `proxy.allowed_domains` when
   `proxy.allowed_domains` is non-empty
@@ -198,7 +195,7 @@ sequenceDiagram
 
 ## HTML Injection Behavior
 
-In `managed_external` mode, Prebid head injection should emit:
+When Prebid is enabled, Prebid head injection should emit:
 
 1. the existing `window.pbjs` queue stub
 2. `window.__tsjs_prebid` config
@@ -212,9 +209,9 @@ modules and the `trustedServer` adapter before calling `pbjs.processQueue()`.
 
 ## Script Interception Behavior
 
-In Phase 1, `managed_external` mode owns Prebid loading. Therefore existing
-publisher Prebid script tags should continue to be removed when they match
-`script_patterns`.
+In Phase 1, Trusted Server always owns Prebid loading through the generated
+external bundle. Therefore existing publisher Prebid script tags should continue
+to be removed when they match `script_patterns`.
 
 Requests for intercepted publisher Prebid script URLs may continue returning the
 existing empty JS response. This prevents duplicate Prebid instances when the
@@ -256,8 +253,8 @@ The generator should emit a manifest:
 
 Trusted Server config should reference the generated asset URL. When the
 manifest includes hash values, config should also reference those values to
-enable content-addressed delivery, immutable caching, SRI, and optional
-edge-side validation.
+enable content-addressed delivery, immutable caching, and browser SRI when
+configured.
 
 ## Required Code Changes
 
@@ -273,9 +270,9 @@ edge-side validation.
 
 ### Rust Integration
 
-- Add `bundle_mode`, `external_bundle_url`, `external_bundle_sha256`, and
+- Add `external_bundle_url`, `external_bundle_sha256`, and
   `external_bundle_sri` fields to `PrebidIntegrationConfig`.
-- In `managed_external` mode, do not register Prebid with `.with_deferred_js()`.
+- Do not register Prebid with `.with_deferred_js()`.
 - Register a Prebid integration GET route for `/integrations/prebid/bundle.js`.
 - Implement the route as a first-party proxy to `external_bundle_url` with static
   asset behavior.
@@ -284,10 +281,8 @@ edge-side validation.
 
 ### Publisher Static Serving
 
-- `/static/tsjs=tsjs-prebid.min.js` should no longer be the Prebid loading path in
-  `managed_external` mode.
-- Existing deferred-module serving can remain for other integrations or migration
-  compatibility.
+- `/static/tsjs=tsjs-prebid.min.js` should no longer be a Prebid loading path.
+- Existing deferred-module serving can remain for other integrations.
 
 ## Response Headers
 
@@ -321,8 +316,8 @@ use a short-lived revalidation-oriented policy, for example:
 Cache-Control: public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400
 ```
 
-In this mode, `ETag` should be forwarded from the external asset when safe or
-computed from the proxied response bytes when feasible.
+In this mode, validators may be omitted. Phase 1 preserves streaming passthrough,
+so Trusted Server should not buffer the bundle solely to compute an `ETag`.
 
 ## Integrity and Attestation
 
@@ -340,32 +335,33 @@ The Prebid bundle should be audited through its own manifest containing:
 - SRI value
 - generator version or source revision when available
 
-When configured, browser SRI should validate the first-party proxied response.
-Edge-side SHA-256 validation is recommended when `external_bundle_sha256` is
-configured and feasible; if validation fails, the route should return an error
-rather than serving mismatched JS.
+When configured, browser SRI validates the first-party proxied response. SRI is
+recommended with `external_bundle_sha256`, but it is not required; deployments may
+use the hash metadata only for versioned first-party URLs, cache policy, and
+manifest auditing.
 
-If `external_bundle_sha256` is omitted, Trusted Server cannot treat the route as
-content-addressed. That mode trades stronger attestation and long-lived caching
-for easier operations and must use non-immutable cache headers.
+Phase 1 does not perform mandatory edge-side SHA-256 byte validation. Doing so
+would require buffering the proxied bundle and would break the streaming
+passthrough behavior for this route. If `external_bundle_sha256` is omitted,
+Trusted Server cannot treat the route as content-addressed. That mode trades
+stronger attestation and long-lived caching for easier operations and must use
+non-immutable cache headers.
 
 ## Migration Plan
 
-1. Add config fields and validation while preserving the current embedded default.
-2. Add first-party bundle proxy route and injection for `managed_external` mode.
+1. Add required external bundle URL config and optional hash/SRI metadata.
+2. Add first-party bundle proxy route and injection.
 3. Add external bundle generation tooling and manifest output.
-4. Disable embedded Prebid JS registration when `managed_external` is selected.
-5. Update docs and examples to prefer `managed_external`.
-6. After deployments are migrated, consider making `managed_external` the default
-   and removing embedded Prebid support in a later phase.
+4. Remove Prebid from the embedded TSJS build and never register it as deferred JS.
+5. Update docs and examples to point publishers at the generated external bundle.
 
 ## Test Plan
 
 ### Rust Tests
 
-- Config validation accepts valid `managed_external` settings.
+- Config validation accepts valid external bundle settings.
 - Config validation rejects missing required external bundle settings and malformed optional hash or SRI metadata.
-- Registry does not include `prebid` in deferred JS IDs for `managed_external`.
+- Registry does not include `prebid` in embedded or deferred JS IDs.
 - Head injection emits the first-party bundle URL with the configured hash when present and without a hash query value when absent.
 - Script interception still removes matching publisher Prebid scripts.
 - Bundle route proxies to `external_bundle_url` without forwarding EC ID.
@@ -379,16 +375,15 @@ for easier operations and must use non-immutable cache headers.
 ### JS Tests
 
 - External generated bundle registers the `trustedServer` adapter.
-- External generated bundle shims `requestBids()` as the current embedded bundle
-  does.
+- External generated bundle shims `requestBids()` as the previous embedded bundle
+  did.
 - External generated bundle calls `pbjs.processQueue()` after module/adapter
   registration.
 - Client-side bidder adapter selection is reflected in the generated manifest.
 
 ### Browser/Integration Tests
 
-- Publisher page loads no `/static/tsjs=tsjs-prebid.min.js` in
-  `managed_external` mode.
+- Publisher page loads no `/static/tsjs=tsjs-prebid.min.js`.
 - Browser loads `/integrations/prebid/bundle.js?v=<sha256>` from first-party
   origin when SHA-256 is configured, or `/integrations/prebid/bundle.js` when it
   is omitted.
@@ -396,13 +391,11 @@ for easier operations and must use non-immutable cache headers.
 - A Prebid auction still posts to `/auction`.
 - No duplicate Prebid instances are created.
 
-## Open Questions
+## Final Phase 1 Decisions
 
-- When SHA-256 is configured, should edge-side validation be mandatory in Phase
-  1, or is browser SRI plus content-addressed URLs sufficient initially?
-- Should `external_bundle_url` redirects be allowed, or should Phase 1 require a
-  direct generated asset URL with no redirects? If redirects are allowed, every
-  hop must remain `https://` and the redirect target host must be permitted by
-  `proxy.allowed_domains`.
-- Should the injected script tag include `crossorigin`, or omit it because the
-  browser-visible URL is same-origin?
+- Edge-side SHA-256 byte validation is not mandatory in Phase 1 because the route
+  preserves streaming passthrough.
+- Redirects are allowed only when every hop remains `https://` and each redirect
+  target host is permitted by `proxy.allowed_domains`.
+- The injected script tag omits `crossorigin` because the browser-visible bundle
+  URL is same-origin.

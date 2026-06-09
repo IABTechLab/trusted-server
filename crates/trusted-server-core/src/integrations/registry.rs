@@ -1937,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_immediate_excludes_prebid_and_includes_core_js_only_modules() {
+    fn js_module_ids_exclude_prebid_and_include_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1947,6 +1947,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
                     "debug": false
@@ -1962,8 +1963,8 @@ mod tests {
         let deferred = registry.js_module_ids_deferred();
 
         assert!(
-            all.contains(&"prebid"),
-            "should include prebid in full list"
+            !all.contains(&"prebid"),
+            "should not include prebid in embedded TSJS module IDs"
         );
         assert!(
             immediate.contains(&"creative"),
@@ -1978,8 +1979,8 @@ mod tests {
             "should not include prebid in immediate IDs"
         );
         assert!(
-            deferred.contains(&"prebid"),
-            "should include prebid in deferred IDs"
+            !deferred.contains(&"prebid"),
+            "should not include prebid in deferred IDs"
         );
     }
 
@@ -2048,7 +2049,8 @@ mod tests {
                 "prebid",
                 &serde_json::json!({
                     "enabled": false,
-                    "server_url": "https://test-prebid.com/openrtb2/auction"
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                 }),
             )
             .expect("should update prebid config");
@@ -2063,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_exclude_prebid_when_managed_external() {
+    fn js_module_ids_exclude_prebid_when_external_bundle_is_configured() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
             .integrations
@@ -2072,7 +2074,6 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "server_url": "https://test-prebid.com/openrtb2/auction",
-                    "bundle_mode": "managed_external",
                     "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
                 }),
             )
@@ -2082,19 +2083,19 @@ mod tests {
 
         assert!(
             !registry.js_module_ids().contains(&"prebid"),
-            "managed external mode should not include prebid in embedded TSJS modules"
+            "external bundle mode should not include prebid in embedded TSJS modules"
         );
         assert!(
             !registry.js_module_ids_immediate().contains(&"prebid"),
-            "managed external mode should not include prebid in immediate TSJS modules"
+            "external bundle mode should not include prebid in immediate TSJS modules"
         );
         assert!(
             !registry.js_module_ids_deferred().contains(&"prebid"),
-            "managed external mode should not include prebid in deferred TSJS modules"
+            "external bundle mode should not include prebid in deferred TSJS modules"
         );
         assert!(
             registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
-            "managed external mode should register the first-party bundle route"
+            "external bundle mode should register the first-party bundle route"
         );
     }
 
@@ -2109,6 +2110,7 @@ mod tests {
                 &serde_json::json!({
                     "enabled": true,
                     "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
                     "timeout_ms": 1000,
                     "bidders": ["mocktioneer"],
                     "debug": false

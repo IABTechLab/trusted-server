@@ -23,6 +23,11 @@ bidders = ["kargo", "appnexus", "openx"]
 debug = false
 # test_mode = false
 
+# Generated external Prebid bundle served through /integrations/prebid/bundle.js.
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+# external_bundle_sha256 = "..."
+# external_bundle_sri = "sha384-..."
+
 # Bidders that run client-side via native Prebid.js adapters instead of
 # being routed through the server-side auction.
 client_side_bidders = ["rubicon"]
@@ -55,6 +60,9 @@ set = { placementId = "_s2sHeaderPlacement" }
 | `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                       |
 | `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                  |
 | `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                          |
+| `external_bundle_url`      | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`                                     |
+| `external_bundle_sha256`   | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                              |
+| `external_bundle_sri`      | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                               |
 | `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                      |
 | `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                   |
 | `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts    |
@@ -137,7 +145,7 @@ Optional Ed25519 request signing for bid request authentication and fraud preven
 
 ### Script Interception
 
-The `script_patterns` configuration controls which Prebid scripts are intercepted and replaced with empty JavaScript. This enables server-side bidding by preventing client-side Prebid.js from loading.
+The `script_patterns` configuration controls which publisher-provided Prebid scripts are intercepted and replaced with empty JavaScript. Trusted Server always injects its managed first-party `/integrations/prebid/bundle.js` script for the configured external bundle, so interception prevents duplicate Prebid instances.
 
 **Pattern Matching**:
 
@@ -154,11 +162,11 @@ script_patterns = ["/prebid.js", "/prebid.min.js"]
 # Custom CDN path with wildcard
 script_patterns = ["/static/prebid/*", "/assets/js/prebid.min.js"]
 
-# Disable script interception (keep client-side Prebid)
+# Disable script interception (not recommended; may duplicate the managed bundle)
 script_patterns = []
 ```
 
-When a request matches a script pattern, Trusted Server returns an empty JavaScript file with aggressive caching (`max-age=31536000, immutable`).
+When a request matches a script pattern, Trusted Server returns an empty JavaScript file with aggressive caching (`max-age=31536000`).
 
 ### Bid Param Overrides
 
@@ -280,22 +288,22 @@ client_side_bidders = ["rubicon"]             # native browser adapters
 
 The two lists are independent — the operator manages both explicitly. If a bidder appears in both lists, a warning is logged at startup (the bidder will run in both paths, which is likely unintended).
 
-### Build-time adapter selection
+### External bundle adapter selection
 
-Client-side bidders need their Prebid.js adapter modules bundled in the JS output. This is controlled by the `TSJS_PREBID_ADAPTERS` environment variable at build time:
+Client-side bidders need their Prebid.js adapter modules included in the generated external bundle:
 
 ```bash
-# Default: only rubicon
-TSJS_PREBID_ADAPTERS=rubicon
-
-# Multiple adapters
-TSJS_PREBID_ADAPTERS=rubicon,appnexus,openx
+cd crates/trusted-server-js/lib
+npm run build:prebid-external -- \
+  --adapters=rubicon,appnexus,openx \
+  --user-id-modules=sharedIdSystem,uid2IdSystem \
+  --out=dist/prebid
 ```
 
-The build script (`build-all.mjs`) validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js` and generates `_adapters.generated.ts` with the appropriate imports. At runtime, TSJS also validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
+The generator validates that each adapter exists in `prebid.js/modules/{name}BidAdapter.js`, writes a content-addressed bundle plus `manifest.json`, and reports the SHA-256 and SRI values to copy into `integrations.prebid` config. At runtime, TSJS validates that every bidder in `client_side_bidders` has a registered adapter and logs an error if one is missing.
 
 ::: warning
-Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a rebuild with the adapter included in `TSJS_PREBID_ADAPTERS`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
+Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a regenerated external bundle with the adapter included in `--adapters`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
 :::
 
 ## User ID Modules
@@ -304,24 +312,17 @@ Prebid.js can expose publisher-configured User ID Module output via
 `pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
 EIDs after auctions and forwards them to Trusted Server when they are available.
 
-User ID submodule inclusion is deterministic for attested builds. The module
-preset is checked in at
-`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`, and
-`build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
-that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
-production builds so publisher-specific ID choices do not change the attested JS
-artifact.
+User ID submodule inclusion is selected by the external bundle generator. The
+available modules and default preset are checked in at
+`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`. Pass
+`--user-id-modules` to `build-prebid-external.mjs` when a publisher needs a
+specific subset; omit it to use the default preset.
 
-This is deliberate: Trusted Server replaces the publisher's Prebid.js bundle so
-we can install the `trustedServer` adapter and route auctions through `/auction`,
-but publishers often have custom or opaque Prebid builds. It is difficult to
-know every User ID submodule needed for a publisher before runtime, and making
-that list an environment-driven build input would produce different JS bytes per
-publisher. Those publisher-specific bundles would undermine deployment
-attestation because the trusted artifact hash would vary based on integration
-configuration rather than code changes. Keeping a broad, reviewed preset in
-source control makes the auction flow predictable while keeping the generated
-bundle stable across publishers.
+This is deliberate: Trusted Server injects a generated Prebid.js bundle so we
+can install the `trustedServer` adapter and route auctions through `/auction`,
+but publishers often need different User ID submodules. Moving that selection to
+the external bundle keeps publisher-specific Prebid choices out of the Trusted
+Server WASM artifact while preserving a manifest and bundle hash for auditing.
 
 The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
 LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
@@ -342,11 +343,7 @@ Example EID source mapping:
 | `id5-sync.com`                                                    | `id5IdSystem`          |
 | `liveramp.com`                                                    | `identityLinkIdSystem` |
 
-For local experiments only, `TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE` can
-replace the preset. Do not use that override for trusted deployments because it
-changes the bundle hash.
-
-This is separate from `TSJS_PREBID_ADAPTERS`, which continues to control
+User ID module selection is separate from `--adapters`, which controls
 client-side bidder adapter modules.
 
 ## Identity Forwarding
