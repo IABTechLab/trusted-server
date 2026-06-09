@@ -4834,8 +4834,14 @@ set = { networkId = 42 }
         let bid = provider
             .parse_bid(&bid_json, "appnexus")
             .expect("should parse bid");
-        assert_eq!(bid.nurl, None, "should strip nurl when suppress_nurl is true");
-        assert_eq!(bid.burl, None, "should strip burl when suppress_nurl is true");
+        assert_eq!(
+            bid.nurl, None,
+            "should strip nurl when suppress_nurl is true"
+        );
+        assert_eq!(
+            bid.burl, None,
+            "should strip burl when suppress_nurl is true"
+        );
     }
 
     #[test]
