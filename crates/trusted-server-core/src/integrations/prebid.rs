@@ -2,16 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt};
-use http::header::HeaderValue;
-use http::{header, Method, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::Value as Json;
-use url::Url;
-use validator::Validate;
-
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
@@ -35,10 +25,32 @@ use crate::openrtb::{
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
+use crate::proxy::{is_host_allowed, proxy_request, ProxyRequestConfig};
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
+use async_trait::async_trait;
+use base64::{
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD,
+    },
+    Engine as _,
+};
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::header::HeaderValue;
+use http::{header, Method, StatusCode};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use url::Url;
+use validator::{Validate, ValidationError};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
+const PREBID_BUNDLE_ROUTE: &str = "/integrations/prebid/bundle.js";
+const PREBID_BUNDLE_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
+const PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const PREBID_BUNDLE_REVALIDATION_CACHE_CONTROL: &str =
+    "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400";
+const PREBID_BUNDLE_ERROR_CACHE_CONTROL: &str = "no-store";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
 const ZONE_KEY: &str = "zone";
@@ -70,6 +82,17 @@ fn prebid_body_preview(body: &[u8]) -> String {
 /// all publishers — consider making this configurable per-publisher in the future.
 #[cfg(test)]
 const GPC_US_PRIVACY: &str = "1YYN";
+
+/// Controls how the browser loads Prebid.js for the integration.
+#[derive(Debug, Default, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrebidBundleMode {
+    /// Load the embedded TSJS Prebid bundle served from `/static/tsjs=`.
+    #[default]
+    Embedded,
+    /// Load a configured external Prebid bundle through a first-party route.
+    ManagedExternal,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct PrebidIntegrationConfig {
@@ -107,6 +130,22 @@ pub struct PrebidIntegrationConfig {
         deserialize_with = "crate::settings::vec_from_seq_or_map"
     )]
     pub script_patterns: Vec<String>,
+    /// Controls whether Prebid loads from the embedded TSJS module or an
+    /// external managed bundle proxied through a first-party route.
+    #[serde(default)]
+    pub bundle_mode: PrebidBundleMode,
+    /// Absolute HTTPS URL of the generated external Prebid bundle.
+    #[serde(default)]
+    #[validate(custom(function = "validate_external_bundle_url"))]
+    pub external_bundle_url: Option<String>,
+    /// Optional hex SHA-256 of the exact external bundle bytes.
+    #[serde(default)]
+    #[validate(custom(function = "validate_external_bundle_sha256"))]
+    pub external_bundle_sha256: Option<String>,
+    /// Optional browser Subresource Integrity value for the first-party script.
+    #[serde(default)]
+    #[validate(custom(function = "validate_external_bundle_sri"))]
+    pub external_bundle_sri: Option<String>,
     /// Bidders that should run client-side in the browser via native Prebid.js
     /// adapters instead of being routed through the server-side auction.
     ///
@@ -266,6 +305,213 @@ fn default_script_patterns() -> Vec<String> {
         .collect()
 }
 
+fn validate_external_bundle_url(value: &str) -> Result<(), ValidationError> {
+    let url = Url::parse(value).map_err(|_| {
+        let mut err = ValidationError::new("invalid_external_bundle_url");
+        err.message = Some("external_bundle_url must be a valid absolute URL".into());
+        err
+    })?;
+
+    if url.scheme() != "https" {
+        let mut err = ValidationError::new("invalid_external_bundle_scheme");
+        err.message = Some("external_bundle_url must use https".into());
+        return Err(err);
+    }
+
+    if url.host_str().is_none() {
+        let mut err = ValidationError::new("missing_external_bundle_host");
+        err.message = Some("external_bundle_url must include a host".into());
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+fn validate_external_bundle_sha256(value: &str) -> Result<(), ValidationError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+
+    let mut err = ValidationError::new("invalid_external_bundle_sha256");
+    err.message = Some("external_bundle_sha256 must be a 64-character hex SHA-256".into());
+    Err(err)
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ExternalBundleSriAlgorithm {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl ExternalBundleSriAlgorithm {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sha256" => Some(Self::Sha256),
+            "sha384" => Some(Self::Sha384),
+            "sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+
+    fn expected_digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExternalBundleSriToken {
+    algorithm: ExternalBundleSriAlgorithm,
+    digest: Vec<u8>,
+}
+
+fn external_bundle_sri_validation_error(message: &'static str) -> ValidationError {
+    let mut err = ValidationError::new("invalid_external_bundle_sri");
+    err.message = Some(message.into());
+    err
+}
+
+fn parse_external_bundle_sri(value: &str) -> Result<Vec<ExternalBundleSriToken>, ValidationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(external_bundle_sri_validation_error(
+            "external_bundle_sri must be non-empty with no surrounding whitespace",
+        ));
+    }
+
+    let mut tokens = Vec::new();
+    for token in trimmed.split_ascii_whitespace() {
+        let Some((algorithm_raw, digest_raw)) = token.split_once('-') else {
+            return Err(external_bundle_sri_validation_error(
+                "external_bundle_sri entries must use algorithm-digest format",
+            ));
+        };
+
+        let Some(algorithm) = ExternalBundleSriAlgorithm::parse(algorithm_raw) else {
+            return Err(external_bundle_sri_validation_error(
+                "external_bundle_sri must use sha256, sha384, or sha512",
+            ));
+        };
+
+        if digest_raw.is_empty() {
+            return Err(external_bundle_sri_validation_error(
+                "external_bundle_sri digest must be non-empty",
+            ));
+        }
+
+        let digest = BASE64_STANDARD
+            .decode(digest_raw)
+            .or_else(|_| BASE64_STANDARD_NO_PAD.decode(digest_raw))
+            .map_err(|_| {
+                external_bundle_sri_validation_error("external_bundle_sri digest must be base64")
+            })?;
+
+        if digest.len() != algorithm.expected_digest_len() {
+            return Err(external_bundle_sri_validation_error(
+                "external_bundle_sri digest length does not match its algorithm",
+            ));
+        }
+
+        tokens.push(ExternalBundleSriToken { algorithm, digest });
+    }
+
+    Ok(tokens)
+}
+
+fn validate_external_bundle_sri(value: &str) -> Result<(), ValidationError> {
+    parse_external_bundle_sri(value).map(|_| ())
+}
+
+fn external_bundle_sri_configuration_message(err: ValidationError) -> String {
+    let detail = err
+        .message
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|| err.code.into_owned());
+    format!("integrations.prebid.external_bundle_sri is invalid: {detail}")
+}
+
+fn validate_managed_external_bundle_config(
+    config: &PrebidIntegrationConfig,
+    allowed_domains: &[String],
+) -> Result<(), Report<TrustedServerError>> {
+    if config.bundle_mode != PrebidBundleMode::ManagedExternal {
+        return Ok(());
+    }
+
+    let url = config.external_bundle_url.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "integrations.prebid.external_bundle_url is required when bundle_mode is managed_external".to_string(),
+        })
+    })?;
+
+    let parsed = Url::parse(url).map_err(|_| {
+        Report::new(TrustedServerError::Configuration {
+            message: "integrations.prebid.external_bundle_url must be a valid absolute URL"
+                .to_string(),
+        })
+    })?;
+
+    if parsed.scheme() != "https" {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "integrations.prebid.external_bundle_url must use https".to_string(),
+        }));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "integrations.prebid.external_bundle_url must include a host".to_string(),
+        })
+    })?;
+
+    if !allowed_domains.is_empty()
+        && !allowed_domains
+            .iter()
+            .any(|pattern| is_host_allowed(host, pattern))
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integrations.prebid.external_bundle_url host `{host}` is not permitted by proxy.allowed_domains"
+            ),
+        }));
+    }
+
+    if let Some(expected_sha256) = config.external_bundle_sha256.as_deref() {
+        let sri = config.external_bundle_sri.as_deref().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "integrations.prebid.external_bundle_sri is required when external_bundle_sha256 is configured".to_string(),
+            })
+        })?;
+
+        let expected_digest = hex::decode(expected_sha256).map_err(|_| {
+            Report::new(TrustedServerError::Configuration {
+                message:
+                    "integrations.prebid.external_bundle_sha256 must be a 64-character hex SHA-256"
+                        .to_string(),
+            })
+        })?;
+        let sri_tokens = parse_external_bundle_sri(sri).map_err(|err| {
+            Report::new(TrustedServerError::Configuration {
+                message: external_bundle_sri_configuration_message(err),
+            })
+        })?;
+
+        if sri_tokens.iter().any(|token| {
+            token.algorithm == ExternalBundleSriAlgorithm::Sha256
+                && token.digest.as_slice() != expected_digest.as_slice()
+        }) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "integrations.prebid.external_bundle_sri sha256 digest must match external_bundle_sha256".to_string(),
+            }));
+        }
+    }
+
+    Ok(())
+}
+
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
     engine: Arc<BidParamOverrideEngine>,
@@ -362,16 +608,185 @@ impl PrebidIntegration {
 
         http::Response::builder()
             .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            )
+            .header(header::CONTENT_TYPE, PREBID_BUNDLE_CONTENT_TYPE)
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .body(EdgeBody::from(body))
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to build Prebid script handler response".to_string(),
             })
     }
+
+    fn is_managed_external(&self) -> bool {
+        self.config.bundle_mode == PrebidBundleMode::ManagedExternal
+    }
+
+    fn external_bundle_script_src(&self) -> String {
+        match self.config.external_bundle_sha256.as_deref() {
+            Some(sha256) => format!("{PREBID_BUNDLE_ROUTE}?v={sha256}"),
+            None => PREBID_BUNDLE_ROUTE.to_string(),
+        }
+    }
+
+    fn external_bundle_script_tag(&self) -> String {
+        let src = self.external_bundle_script_src();
+        let integrity = self
+            .config
+            .external_bundle_sri
+            .as_deref()
+            .map(|value| format!(" integrity=\"{}\"", escape_html_attr(value)))
+            .unwrap_or_default();
+
+        format!("<script src=\"{src}\"{integrity} defer></script>")
+    }
+
+    fn external_bundle_request_cache_mode(
+        &self,
+        req: &http::Request<EdgeBody>,
+    ) -> Result<Option<ExternalBundleCacheMode>, Report<TrustedServerError>> {
+        let versions = req
+            .uri()
+            .query()
+            .map(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .filter(|(key, _)| key == "v")
+                    .map(|(_, value)| value.into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if versions.len() > 1 {
+            return Ok(None);
+        }
+
+        let requested_version = versions.first().map(String::as_str);
+        match (
+            self.config.external_bundle_sha256.as_deref(),
+            requested_version,
+        ) {
+            (None, Some(_)) => Ok(None),
+            (Some(expected), Some(actual)) if expected != actual => Ok(None),
+            (Some(_), Some(_)) if self.config.external_bundle_sri.is_some() => {
+                Ok(Some(ExternalBundleCacheMode::Immutable))
+            }
+            _ => Ok(Some(ExternalBundleCacheMode::Revalidate)),
+        }
+    }
+
+    fn apply_external_bundle_headers(
+        &self,
+        response: &mut http::Response<EdgeBody>,
+        mode: ExternalBundleCacheMode,
+    ) {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(PREBID_BUNDLE_CONTENT_TYPE),
+        );
+
+        match mode {
+            ExternalBundleCacheMode::Immutable => {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL),
+                );
+                if let Some(sha256) = self.config.external_bundle_sha256.as_deref() {
+                    response.headers_mut().insert(
+                        header::ETAG,
+                        HeaderValue::from_str(&format!("\"sha256:{sha256}\""))
+                            .expect("should build etag header"),
+                    );
+                }
+            }
+            ExternalBundleCacheMode::Revalidate => {
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(PREBID_BUNDLE_REVALIDATION_CACHE_CONTROL),
+                );
+                if let Some(sha256) = self.config.external_bundle_sha256.as_deref() {
+                    response.headers_mut().insert(
+                        header::ETAG,
+                        HeaderValue::from_str(&format!("\"sha256:{sha256}\""))
+                            .expect("should build etag header"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn sanitize_external_bundle_response(
+        &self,
+        response: http::Response<EdgeBody>,
+        mode: ExternalBundleCacheMode,
+    ) -> http::Response<EdgeBody> {
+        let status = response.status();
+        let content_encoding = response.headers().get(header::CONTENT_ENCODING).cloned();
+        let body = response.into_body();
+
+        let mut sanitized = http::Response::builder()
+            .status(status)
+            .body(body)
+            .expect("should build sanitized response");
+
+        if let Some(content_encoding) = content_encoding {
+            sanitized
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, content_encoding);
+        }
+
+        if status == StatusCode::OK {
+            self.apply_external_bundle_headers(&mut sanitized, mode);
+        } else {
+            sanitized.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(PREBID_BUNDLE_ERROR_CACHE_CONTROL),
+            );
+        }
+
+        sanitized
+    }
+
+    async fn handle_external_bundle(
+        &self,
+        settings: &Settings,
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let Some(cache_mode) = self.external_bundle_request_cache_mode(&req)? else {
+            return Ok(http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(EdgeBody::from("Not Found"))
+                .expect("should build not found response"));
+        };
+
+        let target_url = self.config.external_bundle_url.as_deref().ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "integrations.prebid.external_bundle_url is required when bundle_mode is managed_external".to_string(),
+            })
+        })?;
+
+        let proxy_config = ProxyRequestConfig::new(target_url)
+            .without_ec_id()
+            .without_forward_headers()
+            .with_streaming()
+            .with_allowed_domains(&settings.proxy.allowed_domains)
+            .with_https_only();
+
+        let response = proxy_request(settings, req, proxy_config, services).await?;
+        Ok(self.sanitize_external_bundle_response(response, cache_mode))
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ExternalBundleCacheMode {
+    Immutable,
+    Revalidate,
+}
+
+fn escape_html_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn build(
@@ -382,6 +797,8 @@ fn build(
     else {
         return Ok(None);
     };
+
+    validate_managed_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
 
     // Warn about bidders that appear in both lists — this is likely a config
     // mistake. A bidder should be in either `bidders` (server-side) or
@@ -412,14 +829,18 @@ pub fn register(
         return Ok(None);
     };
 
-    Ok(Some(
-        IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
-            .with_deferred_js()
-            .build(),
-    ))
+    let mut registration = IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_attribute_rewriter(integration.clone())
+        .with_head_injector(integration.clone());
+
+    if integration.is_managed_external() {
+        registration = registration.without_js();
+    } else {
+        registration = registration.with_deferred_js();
+    }
+
+    Ok(Some(registration.build()))
 }
 
 #[async_trait(?Send)]
@@ -430,6 +851,10 @@ impl IntegrationProxy for PrebidIntegration {
 
     fn routes(&self) -> Vec<IntegrationEndpoint> {
         let mut routes = vec![];
+
+        if self.is_managed_external() {
+            routes.push(self.get("/bundle.js"));
+        }
 
         // Register routes for script removal patterns
         // Patterns can be exact paths (e.g., "/prebid.min.js") or use matchit wildcards
@@ -446,14 +871,17 @@ impl IntegrationProxy for PrebidIntegration {
 
     async fn handle(
         &self,
-        _settings: &Settings,
-        _services: &RuntimeServices,
+        settings: &Settings,
+        services: &RuntimeServices,
         req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
 
         match method {
+            Method::GET if self.is_managed_external() && path == PREBID_BUNDLE_ROUTE => {
+                self.handle_external_bundle(settings, services, req).await
+            }
             // Serve empty JS for matching script patterns
             Method::GET if self.matches_script_pattern(&path) => self.handle_script_handler(),
             _ => http::Response::builder()
@@ -522,9 +950,15 @@ impl IntegrationHeadInjector for PrebidIntegration {
             })
             .replace("</", "<\\/");
 
-        vec![format!(
+        let mut inserts = vec![format!(
             r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
-        )]
+        )];
+
+        if self.is_managed_external() {
+            inserts.push(self.external_bundle_script_tag());
+        }
+
+        inserts
     }
 }
 
@@ -1722,6 +2156,7 @@ mod tests {
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
+    use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use http::Method;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1742,6 +2177,10 @@ mod tests {
             test_mode: false,
             debug_query_params: None,
             script_patterns: default_script_patterns(),
+            bundle_mode: PrebidBundleMode::Embedded,
+            external_bundle_url: None,
+            external_bundle_sha256: None,
+            external_bundle_sri: None,
             client_side_bidders: Vec::new(),
             bid_param_zone_overrides: HashMap::default(),
             bid_param_overrides: HashMap::default(),
@@ -1800,6 +2239,40 @@ mod tests {
             backend_name, "predicted_https_prebid.example_123",
             "should use PlatformBackend::predict_name instead of duplicating the naming scheme"
         );
+    }
+
+    fn test_sri(algorithm: &str, digest: &[u8]) -> String {
+        format!("{algorithm}-{}", TEST_BASE64_STANDARD.encode(digest))
+    }
+
+    fn test_request(url: impl AsRef<str>) -> http::Request<EdgeBody> {
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri(url.as_ref())
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    fn header_value_str(response: &http::Response<EdgeBody>, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok().map(std::string::ToString::to_string))
+    }
+
+    fn response_header_is_present(response: &http::Response<EdgeBody>, name: &str) -> bool {
+        response.headers().contains_key(name)
+    }
+
+    fn response_body_string(response: http::Response<EdgeBody>) -> String {
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("should parse response body as utf-8")
     }
 
     fn create_test_auction_request() -> AuctionRequest {
@@ -2127,6 +2600,247 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn managed_external_config_parses_with_optional_hash_metadata() {
+        let config = parse_prebid_toml(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bundle_mode = "managed_external"
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+"#,
+        );
+
+        assert_eq!(
+            config.bundle_mode,
+            PrebidBundleMode::ManagedExternal,
+            "should parse managed external mode"
+        );
+        assert_eq!(
+            config.external_bundle_url.as_deref(),
+            Some("https://assets.example/prebid/trusted-prebid.js"),
+            "should preserve configured external bundle URL"
+        );
+        assert!(
+            config.external_bundle_sha256.is_none(),
+            "SHA-256 should be optional"
+        );
+    }
+
+    #[test]
+    fn managed_external_config_rejects_malformed_hash_metadata() {
+        let err = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bundle_mode = "managed_external"
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+external_bundle_sha256 = "not-a-sha"
+"#,
+        )
+        .expect_err("should reject malformed SHA-256");
+
+        assert!(
+            err.to_string().contains("external_bundle_sha256"),
+            "error should mention malformed SHA-256: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_config_rejects_non_https_bundle_url() {
+        let err = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bundle_mode = "managed_external"
+external_bundle_url = "http://assets.example/prebid/trusted-prebid.js"
+"#,
+        )
+        .expect_err("should reject non-HTTPS external bundle URL");
+
+        assert!(
+            err.to_string().contains("external_bundle_url"),
+            "error should mention external bundle URL: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_config_rejects_invalid_sri_base64() {
+        let err = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bundle_mode = "managed_external"
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+external_bundle_sri = "sha384-not-valid!!!"
+"#,
+        )
+        .expect_err("should reject invalid SRI base64");
+
+        assert!(
+            err.to_string().contains("external_bundle_sri"),
+            "error should mention external bundle SRI: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_config_rejects_sri_with_wrong_digest_length() {
+        let err = parse_prebid_toml_result(
+            r#"
+[integrations.prebid]
+enabled = true
+server_url = "https://prebid.example"
+bundle_mode = "managed_external"
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+external_bundle_sri = "sha384-AAAA"
+"#,
+        )
+        .expect_err("should reject SRI with wrong digest length");
+
+        assert!(
+            err.to_string().contains("external_bundle_sri"),
+            "error should mention external bundle SRI: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_registration_requires_sri_when_sha256_is_configured() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "bundle_mode": "managed_external",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "external_bundle_sha256": "0".repeat(64)
+                }),
+            )
+            .expect("should update prebid config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("should reject missing SRI for hashed bundle"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("external_bundle_sri"),
+            "error should mention required external bundle SRI: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_registration_allows_sha256_with_valid_sha384_sri() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "bundle_mode": "managed_external",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "external_bundle_sha256": "0".repeat(64),
+                    "external_bundle_sri": test_sri("sha384", &[0; 48])
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings)
+            .expect("should create registry with valid SHA-256 and SHA-384 SRI");
+
+        assert!(
+            registry.has_route(&Method::GET, PREBID_BUNDLE_ROUTE),
+            "should register managed external bundle route"
+        );
+    }
+
+    #[test]
+    fn managed_external_registration_rejects_mismatched_sha256_sri() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "bundle_mode": "managed_external",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js",
+                    "external_bundle_sha256": "0".repeat(64),
+                    "external_bundle_sri": test_sri("sha256", &[1; 32])
+                }),
+            )
+            .expect("should update prebid config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("should reject mismatched SHA-256 SRI"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("external_bundle_sri"),
+            "error should mention external bundle SRI mismatch: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_registration_requires_bundle_url() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "bundle_mode": "managed_external"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("should reject missing URL"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("external_bundle_url"),
+            "error should mention missing external bundle URL: {err:?}"
+        );
+    }
+
+    #[test]
+    fn managed_external_registration_uses_proxy_allowed_domains() {
+        let mut settings = make_settings();
+        settings.proxy.allowed_domains = vec!["allowed.example".to_string()];
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &json!({
+                    "enabled": true,
+                    "server_url": "https://prebid.example/openrtb2/auction",
+                    "bundle_mode": "managed_external",
+                    "external_bundle_url": "https://blocked.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("should reject bundle host outside proxy.allowed_domains"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {err:?}"
+        );
+    }
+
+    #[test]
     fn script_handler_returns_empty_js() {
         let integration = PrebidIntegration::new(base_config());
 
@@ -2162,6 +2876,259 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn external_bundle_request_cache_mode_validates_version_query() {
+        let sha256 = "a".repeat(64);
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        config.external_bundle_sha256 = Some(sha256.clone());
+        config.external_bundle_sri = Some(test_sri("sha384", &[0; 48]));
+        let integration = PrebidIntegration::new(config);
+
+        let versioned_req = test_request(format!(
+            "https://pub.example{PREBID_BUNDLE_ROUTE}?v={sha256}"
+        ));
+        let missing_version_req = test_request(format!("https://pub.example{PREBID_BUNDLE_ROUTE}"));
+        let mismatched_req = test_request(format!(
+            "https://pub.example{PREBID_BUNDLE_ROUTE}?v={}",
+            "b".repeat(64)
+        ));
+
+        assert_eq!(
+            integration
+                .external_bundle_request_cache_mode(&versioned_req)
+                .expect("should parse versioned request"),
+            Some(ExternalBundleCacheMode::Immutable),
+            "matching v query should use immutable cache mode"
+        );
+        assert_eq!(
+            integration
+                .external_bundle_request_cache_mode(&missing_version_req)
+                .expect("should parse unversioned request"),
+            Some(ExternalBundleCacheMode::Revalidate),
+            "missing v query should use revalidation cache mode"
+        );
+        assert_eq!(
+            integration
+                .external_bundle_request_cache_mode(&mismatched_req)
+                .expect("should parse mismatched request"),
+            None,
+            "mismatched v query should 404"
+        );
+    }
+
+    #[test]
+    fn external_bundle_request_cache_mode_rejects_version_when_hash_is_absent() {
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        let integration = PrebidIntegration::new(config);
+
+        let versioned_req = test_request(format!(
+            "https://pub.example{PREBID_BUNDLE_ROUTE}?v={}",
+            "a".repeat(64)
+        ));
+        let unversioned_req = test_request(format!("https://pub.example{PREBID_BUNDLE_ROUTE}"));
+
+        assert_eq!(
+            integration
+                .external_bundle_request_cache_mode(&versioned_req)
+                .expect("should parse versioned request"),
+            None,
+            "v query should 404 when SHA-256 is omitted"
+        );
+        assert_eq!(
+            integration
+                .external_bundle_request_cache_mode(&unversioned_req)
+                .expect("should parse unversioned request"),
+            Some(ExternalBundleCacheMode::Revalidate),
+            "unversioned request should be served with revalidation cache mode"
+        );
+    }
+
+    #[test]
+    fn external_bundle_headers_use_cache_policy_for_mode() {
+        let sha256 = "a".repeat(64);
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        config.external_bundle_sha256 = Some(sha256.clone());
+        config.external_bundle_sri = Some(test_sri("sha384", &[0; 48]));
+        let integration = PrebidIntegration::new(config);
+
+        let mut immutable = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        integration
+            .apply_external_bundle_headers(&mut immutable, ExternalBundleCacheMode::Immutable);
+        assert_eq!(
+            header_value_str(&immutable, "content-type"),
+            Some(PREBID_BUNDLE_CONTENT_TYPE.to_string()),
+            "should normalize JS content type"
+        );
+        assert_eq!(
+            header_value_str(&immutable, "cache-control"),
+            Some(PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL.to_string()),
+            "versioned responses should be immutable"
+        );
+        assert_eq!(
+            header_value_str(&immutable, "etag"),
+            Some(format!("\"sha256:{sha256}\"")),
+            "should emit configured hash ETag"
+        );
+
+        let mut revalidate = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(EdgeBody::empty())
+            .expect("should build response");
+        integration
+            .apply_external_bundle_headers(&mut revalidate, ExternalBundleCacheMode::Revalidate);
+        assert_eq!(
+            header_value_str(&revalidate, "cache-control"),
+            Some(PREBID_BUNDLE_REVALIDATION_CACHE_CONTROL.to_string()),
+            "unversioned responses should use short-lived revalidation"
+        );
+    }
+
+    #[test]
+    fn external_bundle_response_sanitization_uses_header_whitelist_for_ok_response() {
+        let sha256 = "a".repeat(64);
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        config.external_bundle_sha256 = Some(sha256.clone());
+        config.external_bundle_sri = Some(test_sri("sha384", &[0; 48]));
+        let integration = PrebidIntegration::new(config);
+
+        let mut upstream = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(EdgeBody::from("console.log('ok');"))
+            .expect("should build upstream response");
+        upstream
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        upstream.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
+        upstream.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("bad=1; Path=/"),
+        );
+        upstream
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        upstream
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("16"));
+        upstream.headers_mut().insert(
+            header::HeaderName::from_static("x-upstream"),
+            HeaderValue::from_static("leak"),
+        );
+
+        let sanitized = integration
+            .sanitize_external_bundle_response(upstream, ExternalBundleCacheMode::Immutable);
+
+        assert_eq!(
+            header_value_str(&sanitized, "content-type"),
+            Some(PREBID_BUNDLE_CONTENT_TYPE.to_string()),
+            "should normalize JS content type"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, "cache-control"),
+            Some(PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL.to_string()),
+            "should apply trusted cache policy"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, "etag"),
+            Some(format!("\"sha256:{sha256}\"")),
+            "should emit trusted ETag"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, "content-encoding"),
+            Some("gzip".to_string()),
+            "should preserve body encoding metadata"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "content-length"),
+            "should strip upstream content length so the platform can derive it from the body"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "set-cookie"),
+            "should strip upstream Set-Cookie"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "x-upstream"),
+            "should strip arbitrary upstream headers"
+        );
+        assert_eq!(
+            response_body_string(sanitized),
+            "console.log('ok');",
+            "should preserve body bytes"
+        );
+    }
+
+    #[test]
+    fn external_bundle_response_sanitization_strips_headers_for_error_response() {
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        let integration = PrebidIntegration::new(config);
+
+        let mut upstream = http::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(EdgeBody::from("missing"))
+            .expect("should build upstream response");
+        upstream
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        upstream.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000"),
+        );
+        upstream.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("bad=1; Path=/"),
+        );
+        upstream.headers_mut().insert(
+            header::HeaderName::from_static("x-upstream"),
+            HeaderValue::from_static("leak"),
+        );
+
+        let sanitized = integration
+            .sanitize_external_bundle_response(upstream, ExternalBundleCacheMode::Revalidate);
+
+        assert_eq!(
+            sanitized.status(),
+            StatusCode::NOT_FOUND,
+            "should preserve upstream status"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, "cache-control"),
+            Some(PREBID_BUNDLE_ERROR_CACHE_CONTROL.to_string()),
+            "should prevent caching upstream error responses"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "content-type"),
+            "should strip upstream content type on error responses"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "set-cookie"),
+            "should strip upstream Set-Cookie on error responses"
+        );
+        assert!(
+            !response_header_is_present(&sanitized, "x-upstream"),
+            "should strip arbitrary upstream headers on error responses"
+        );
+    }
+
+    #[test]
     fn routes_include_script_patterns() {
         let integration = PrebidIntegration::new(base_config());
 
@@ -2181,6 +3148,28 @@ server_url = "https://prebid.example"
         assert!(
             has_prebid_min_js_route,
             "should register /prebid.min.js route"
+        );
+        assert!(
+            !routes.iter().any(|r| r.path == PREBID_BUNDLE_ROUTE),
+            "embedded mode should not register the external bundle route"
+        );
+    }
+
+    #[test]
+    fn routes_include_bundle_route_for_managed_external_mode() {
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        let integration = PrebidIntegration::new(config);
+
+        let routes = integration.routes();
+
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == PREBID_BUNDLE_ROUTE && r.method == Method::GET),
+            "managed external mode should register the bundle route"
         );
     }
 
@@ -2244,6 +3233,74 @@ server_url = "https://prebid.example"
             script.contains(r#""accountId":"""#),
             "should emit empty accountId when not configured: {}",
             script
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_managed_external_bundle_script_with_hash_and_integrity() {
+        let sha256 = "a".repeat(64);
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        config.external_bundle_sha256 = Some(sha256.clone());
+        config.external_bundle_sri = Some(test_sri("sha384", &[0; 48]));
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
+        assert!(
+            inserts[1].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}?v={sha256}\"")),
+            "bundle script should use content-addressed first-party URL: {}",
+            inserts[1]
+        );
+        assert!(
+            inserts[1].contains("integrity=\"sha384-"),
+            "bundle script should include configured SRI: {}",
+            inserts[1]
+        );
+        assert!(
+            !inserts[1].contains("crossorigin"),
+            "same-origin bundle script should not include crossorigin: {}",
+            inserts[1]
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_managed_external_bundle_script_without_hash_query_when_unhashed() {
+        let mut config = base_config();
+        config.bundle_mode = PrebidBundleMode::ManagedExternal;
+        config.external_bundle_url =
+            Some("https://assets.example/prebid/trusted-prebid.js".to_string());
+        let integration = PrebidIntegration::new(config);
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 2, "should emit config and bundle scripts");
+        assert!(
+            inserts[1].contains(&format!("src=\"{PREBID_BUNDLE_ROUTE}\"")),
+            "bundle script should use first-party route without hash query: {}",
+            inserts[1]
+        );
+        assert!(
+            !inserts[1].contains("?v="),
+            "unhashed bundle script should not include version query: {}",
+            inserts[1]
         );
     }
 

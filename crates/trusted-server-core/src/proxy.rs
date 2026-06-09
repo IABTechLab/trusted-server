@@ -323,6 +323,8 @@ pub struct ProxyRequestConfig<'a> {
     /// `&settings.proxy.allowed_domains` because it follows redirect chains that may
     /// originate from untrusted creative-supplied URLs.
     pub allowed_domains: &'a [String],
+    /// Require the initial target and every followed redirect hop to use HTTPS.
+    pub require_https: bool,
 }
 
 impl<'a> ProxyRequestConfig<'a> {
@@ -338,6 +340,7 @@ impl<'a> ProxyRequestConfig<'a> {
             copy_request_headers: true,
             stream_passthrough: false,
             allowed_domains: &[],
+            require_https: false,
         }
     }
 
@@ -366,6 +369,27 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_streaming(mut self) -> Self {
         self.stream_passthrough = true;
+        self
+    }
+
+    /// Disable EC ID query-param forwarding to the target URL.
+    #[must_use]
+    pub fn without_ec_id(mut self) -> Self {
+        self.forward_ec_id = false;
+        self
+    }
+
+    /// Enforce a domain allowlist on the target URL and followed redirects.
+    #[must_use]
+    pub fn with_allowed_domains(mut self, allowed_domains: &'a [String]) -> Self {
+        self.allowed_domains = allowed_domains;
+        self
+    }
+
+    /// Require HTTPS for the target URL and followed redirects.
+    #[must_use]
+    pub fn with_https_only(mut self) -> Self {
+        self.require_https = true;
         self
     }
 }
@@ -646,6 +670,7 @@ struct ProxyRedirectPolicy<'a> {
     follow_redirects: bool,
     stream_passthrough: bool,
     allowed_domains: &'a [String],
+    require_https: bool,
 }
 
 /// Proxy a request to a clear target URL while reusing creative rewrite logic.
@@ -673,6 +698,7 @@ pub async fn proxy_request(
         copy_request_headers,
         stream_passthrough,
         allowed_domains,
+        require_https,
     } = config;
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
@@ -699,6 +725,7 @@ pub async fn proxy_request(
             follow_redirects,
             stream_passthrough,
             allowed_domains,
+            require_https,
         },
     )
     .await
@@ -1186,7 +1213,7 @@ fn redirect_is_permitted<S: AsRef<str>>(allowed_domains: &[S], host: &str) -> bo
 ///
 /// Comparison is case-insensitive. The wildcard check requires a dot boundary,
 /// so `"*.example.com"` does **not** match `"evil-example.com"`.
-fn is_host_allowed(host: &str, pattern: &str) -> bool {
+pub(crate) fn is_host_allowed(host: &str, pattern: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
 
@@ -1224,6 +1251,12 @@ async fn proxy_with_redirects(
         if scheme != "http" && scheme != "https" {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "unsupported scheme".to_string(),
+            }));
+        }
+        if request_headers.require_https && scheme != "https" {
+            log::warn!("request to `{}` blocked: HTTPS is required", current_url);
+            return Err(Report::new(TrustedServerError::Forbidden {
+                message: "non-HTTPS proxy target blocked".to_string(),
             }));
         }
 
@@ -1370,6 +1403,12 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
+            if request_headers.require_https {
+                log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
+                return Err(Report::new(TrustedServerError::Forbidden {
+                    message: "non-HTTPS redirect blocked".to_string(),
+                }));
+            }
             return finalize_response(
                 settings,
                 req,
@@ -1377,6 +1416,12 @@ async fn proxy_with_redirects(
                 beresp,
                 redirect_policy.stream_passthrough,
             );
+        }
+        if request_headers.require_https && next_scheme != "https" {
+            log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
+            return Err(Report::new(TrustedServerError::Forbidden {
+                message: "non-HTTPS redirect blocked".to_string(),
+            }));
         }
 
         let next_host = match next_url.host_str() {
@@ -1452,6 +1497,7 @@ pub async fn handle_first_party_proxy(
             copy_request_headers: true,
             stream_passthrough: false,
             allowed_domains: &settings.proxy.allowed_domains,
+            require_https: false,
         },
         services,
     )
@@ -3106,6 +3152,7 @@ mod tests {
                     copy_request_headers: false,
                     stream_passthrough: false,
                     allowed_domains: &[],
+                    require_https: false,
                 },
                 &services,
             )
@@ -3146,6 +3193,7 @@ mod tests {
                     copy_request_headers: false,
                     stream_passthrough: false,
                     allowed_domains: &[],
+                    require_https: false,
                 },
                 &services,
             )
@@ -3191,6 +3239,7 @@ mod tests {
                     copy_request_headers: false,
                     stream_passthrough: false,
                     allowed_domains: &[],
+                    require_https: false,
                 },
                 &services,
             )
@@ -3239,6 +3288,7 @@ mod tests {
                     copy_request_headers: true,
                     stream_passthrough: false,
                     allowed_domains: &[],
+                    require_https: false,
                 },
                 &services,
             )
@@ -3303,6 +3353,7 @@ mod tests {
                     copy_request_headers: false,
                     stream_passthrough: false,
                     allowed_domains: &[],
+                    require_https: false,
                 },
                 &services,
             )
@@ -4647,6 +4698,38 @@ mod tests {
     // The unit tests above cover the host-matching logic itself. The tests
     // below verify that proxy_request threads config.allowed_domains through
     // the initial target check and redirect hops.
+
+    #[tokio::test]
+    async fn proxy_request_blocks_non_https_target_when_https_only() {
+        let settings = create_test_settings();
+        let services = crate::platform::test_support::build_services_with_http_client(Arc::new(
+            StreamingResponseHttpClient,
+        )
+            as Arc<dyn PlatformHttpClient>);
+        let req = build_http_request(
+            Method::GET,
+            "https://edge.example/integrations/prebid/bundle.js",
+        );
+        let config = ProxyRequestConfig::new("http://assets.example/prebid/trusted-prebid.js")
+            .without_ec_id()
+            .without_forward_headers()
+            .with_streaming()
+            .with_https_only();
+
+        let err = proxy_request(&settings, req, config, &services)
+            .await
+            .expect_err("should block non-HTTPS target before proxying");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::FORBIDDEN,
+            "HTTPS-only proxy requests should reject http targets"
+        );
+        assert!(
+            matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
+            "should return a forbidden error"
+        );
+    }
 
     #[test]
     fn proxy_initial_target_blocked_by_allowlist() {

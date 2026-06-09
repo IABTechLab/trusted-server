@@ -581,6 +581,7 @@ pub trait IntegrationHeadInjector: Send + Sync {
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
     pub js_deferred: bool,
+    pub js_disabled: bool,
     pub proxies: Vec<Arc<dyn IntegrationProxy>>,
     pub attribute_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -606,6 +607,7 @@ impl IntegrationRegistrationBuilder {
             registration: IntegrationRegistration {
                 integration_id,
                 js_deferred: false,
+                js_disabled: false,
                 proxies: Vec::new(),
                 attribute_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
@@ -666,6 +668,14 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    /// Disable TSJS module inclusion for an integration that is handled by other assets.
+    #[must_use]
+    pub fn without_js(mut self) -> Self {
+        self.registration.js_disabled = true;
+        self.registration.js_deferred = false;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> IntegrationRegistration {
         self.registration
@@ -688,6 +698,7 @@ struct IntegrationRegistryInner {
     routes: Vec<(IntegrationEndpoint, &'static str)>,
     enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
+    disabled_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
@@ -707,12 +718,13 @@ impl Default for IntegrationRegistryInner {
             options_router: Router::new(),
             routes: Vec::new(),
             enabled_integration_ids: Vec::new(),
+            deferred_js_ids: Vec::new(),
+            disabled_js_ids: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
-            deferred_js_ids: Vec::new(),
         }
     }
 }
@@ -838,7 +850,9 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
-                if registration.js_deferred {
+                if registration.js_disabled {
+                    inner.disabled_js_ids.push(registration.integration_id);
+                } else if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
             }
@@ -1099,7 +1113,10 @@ impl IntegrationRegistry {
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
         for id in &self.inner.enabled_integration_ids {
-            if trusted_server_js::module_bundle(id).is_some() && !ids.contains(id) {
+            if trusted_server_js::module_bundle(id).is_some()
+                && !self.inner.disabled_js_ids.contains(id)
+                && !ids.contains(id)
+            {
                 ids.push(*id);
             }
         }
@@ -1154,6 +1171,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1182,6 +1200,7 @@ impl IntegrationRegistry {
                 head_injectors,
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1206,6 +1225,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters,
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -1270,6 +1290,7 @@ impl IntegrationRegistry {
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                disabled_js_ids: Vec::new(),
             }),
         }
     }
@@ -2038,6 +2059,42 @@ mod tests {
         assert!(
             deferred.is_empty(),
             "should have no deferred IDs when prebid is disabled"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_exclude_prebid_when_managed_external() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "prebid",
+                &serde_json::json!({
+                    "enabled": true,
+                    "server_url": "https://test-prebid.com/openrtb2/auction",
+                    "bundle_mode": "managed_external",
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should update prebid config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            !registry.js_module_ids().contains(&"prebid"),
+            "managed external mode should not include prebid in embedded TSJS modules"
+        );
+        assert!(
+            !registry.js_module_ids_immediate().contains(&"prebid"),
+            "managed external mode should not include prebid in immediate TSJS modules"
+        );
+        assert!(
+            !registry.js_module_ids_deferred().contains(&"prebid"),
+            "managed external mode should not include prebid in deferred TSJS modules"
+        );
+        assert!(
+            registry.has_route(&Method::GET, "/integrations/prebid/bundle.js"),
+            "managed external mode should register the first-party bundle route"
         );
     }
 
