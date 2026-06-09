@@ -182,6 +182,13 @@ pub struct PrebidIntegrationConfig {
     /// - `both` — consent in both cookies and body (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
+    /// Strip `nurl` and `burl` from PBS bids before they reach `window.tsjs.bids`.
+    ///
+    /// Set to `true` when the PBS deployment is configured to fire win/billing
+    /// notifications server-side (e.g. `ext.prebid.events.enabled`), so the
+    /// client does not double-fire them via `sendBeacon`. Default: `false`.
+    #[serde(default)]
+    pub suppress_nurl: bool,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -1363,15 +1370,23 @@ impl PrebidAuctionProvider {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
 
-        let nurl = bid_obj
-            .get("nurl")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string);
+        let nurl = if self.config.suppress_nurl {
+            None
+        } else {
+            bid_obj
+                .get("nurl")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        };
 
-        let burl = bid_obj
-            .get("burl")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string);
+        let burl = if self.config.suppress_nurl {
+            None
+        } else {
+            bid_obj
+                .get("burl")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        };
 
         let ad_id = bid_obj
             .get("adid")
@@ -1745,6 +1760,7 @@ mod tests {
             bid_param_overrides: HashMap::default(),
             bid_param_override_rules: Vec::new(),
             consent_forwarding: ConsentForwardingMode::Both,
+            suppress_nurl: false,
         }
     }
 
@@ -4772,6 +4788,54 @@ set = { networkId = 42 }
             bid.cache_path.is_none(),
             "should be None when URL parse fails"
         );
+    }
+
+    #[test]
+    fn parse_bid_includes_nurl_and_burl_by_default() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.nurl.as_deref(),
+            Some("https://ssp.example/win?id=abc123"),
+            "should include nurl when suppress_nurl is false"
+        );
+        assert_eq!(
+            bid.burl.as_deref(),
+            Some("https://ssp.example/bill?id=abc123"),
+            "should include burl when suppress_nurl is false"
+        );
+    }
+
+    #[test]
+    fn parse_bid_strips_nurl_and_burl_when_suppress_nurl_enabled() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let config = PrebidIntegrationConfig {
+            suppress_nurl: true,
+            ..base_config()
+        };
+        let provider = PrebidAuctionProvider::new(config);
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(bid.nurl, None, "should strip nurl when suppress_nurl is true");
+        assert_eq!(bid.burl, None, "should strip burl when suppress_nurl is true");
     }
 
     #[test]

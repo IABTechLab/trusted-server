@@ -92,6 +92,10 @@ client_side_bidders = []
 # when.zone = "header"
 # set = { placementId = "_abc" }
 
+# Set to true if PBS is configured to fire win/billing notifications server-side
+# (ext.prebid.events.enabled), to prevent the client from double-firing nurl/burl.
+# suppress_nurl = false
+
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
