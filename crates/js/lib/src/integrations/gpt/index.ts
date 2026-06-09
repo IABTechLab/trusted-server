@@ -203,7 +203,7 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
   try {
     // divId may be the container div (used by GPT slot) or the inner div.
     // Search both so we can find the GAM iframe wherever it was rendered.
-    let slotEl = document.getElementById(divId);
+    const slotEl = document.getElementById(divId);
     if (!slotEl) return;
 
     // Extract the first iframe src from the adm (e.g. mocktioneer creative
