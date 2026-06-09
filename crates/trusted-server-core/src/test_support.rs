@@ -2,10 +2,6 @@
 pub mod tests {
     use crate::settings::Settings;
 
-    /// A well-formed synthetic ID for use in tests: 64 lowercase hex chars + `'.'` + 6 alphanumeric.
-    pub const VALID_SYNTHETIC_ID: &str =
-        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2.Ab12z9";
-
     #[must_use]
     pub fn crate_test_settings_str() -> String {
         r#"
@@ -15,7 +11,7 @@ pub mod tests {
             password = "pass"
 
             [[handlers]]
-            path = "^/admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -34,8 +30,8 @@ pub mod tests {
             enabled = false
             rewrite_attributes = ["href", "link", "url"]
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
             [request_signing]
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"

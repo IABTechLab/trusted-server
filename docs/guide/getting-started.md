@@ -4,10 +4,11 @@ Get up and running with Trusted Server quickly.
 
 ## Prerequisites
 
-Before you begin, ensure you have:
+Before you begin, ensure you have the following installed (versions are pinned in `.tool-versions`):
 
-- Rust 1.91.1 (see `.tool-versions`)
-- Fastly CLI installed
+- Rust {{RUST_VERSION}}
+- NodeJS {{NODEJS_VERSION}}
+- Fastly {{FASTLY_VERSION}} CLI installed
 - A Fastly account and API key
 - Basic familiarity with WebAssembly
 
@@ -72,5 +73,6 @@ fastly compute publish
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)
+- Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

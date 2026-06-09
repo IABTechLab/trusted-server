@@ -1,22 +1,6 @@
-//! Simplified HTML processor that combines URL replacement and integration injection.
+//! Simplified HTML processor that combines URL replacement and integration injection
 //!
-//! This module provides a [`StreamProcessor`] implementation for HTML content.
-//! It handles `<script>` tag injection at `<head>`, attribute URL rewriting
-//! (`href`, `src`, `action`, `srcset`, `imagesrcset`), and post-processing
-//! hooks for enabled integrations.
-//!
-//! # Platform notes
-//!
-//! This module is **platform-agnostic** (verified 2026-03-31; see
-//! `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`). It has zero
-//! `fastly` imports and depends only on `lol_html`, `std`, and crate-internal
-//! types. [`create_html_processor`] returns an impl [`StreamProcessor`]
-//! whose `process_chunk` method operates on `&[u8]` slices with no
-//! platform body type involved.
-//!
-//! Future adapters (Cloudflare Workers, Axum, Spin) do not need to implement any content-rewriting
-//! interface. See `crate::platform` module doc for the authoritative note.
-
+//! This module provides a `StreamProcessor` implementation for HTML content.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
@@ -116,6 +100,8 @@ impl StreamProcessor for HtmlWithPostProcessing {
         }
 
         if changed {
+            // lgtm[rust/cleartext-logging]
+            // This debug log records hostnames and output length only; no sensitive values are logged.
             log::debug!(
                 "HTML post-processing complete: origin_host={}, output_len={}",
                 self.origin_host,
@@ -860,8 +846,14 @@ mod tests {
         );
 
         // Verify HTML structure
-        assert_eq!(&result[0..15], "<!DOCTYPE html>");
-        assert_eq!(&result[result.len() - 7..], "</html>");
+        assert!(
+            result.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            result.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(
@@ -991,8 +983,14 @@ mod tests {
         );
 
         // Verify structure
-        assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
-        assert_eq!(&decompressed[decompressed.len() - 7..], "</html>");
+        assert!(
+            decompressed.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            decompressed.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(

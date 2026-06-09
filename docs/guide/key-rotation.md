@@ -26,6 +26,10 @@ Key rotation is the process of generating new signing keys and transitioning fro
 - **Incident-based**: Immediately if compromise suspected
 - **Before major releases**: Ensure fresh keys for new deployments
 
+## Edge Cookie HMAC Passphrase
+
+The Edge Cookie `ec.passphrase` is long-lived HMAC-SHA256 keying material used to derive visitor EC IDs. Use a high-entropy random value of at least 32 characters; shorter values are rejected at settings validation. Rotating this passphrase changes derived EC IDs and requires rebuilding or allowing expiry of the existing EC identity graph.
+
 ## Prerequisites
 
 Before you can rotate keys, you need to set up the required Fastly stores and API credentials.
@@ -240,14 +244,14 @@ You should see a JWKS response with your public keys.
 
 ### Using the Rotation Endpoint
 
-**Endpoint**: `POST /admin/keys/rotate`
+**Endpoint**: `POST /_ts/admin/keys/rotate`
 
 #### Automatic Key ID (Recommended)
 
 Let Trusted Server generate a date-based key ID:
 
 ```bash
-curl -X POST https://your-domain/admin/keys/rotate \
+curl -X POST https://your-domain/_ts/admin/keys/rotate \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
@@ -276,7 +280,7 @@ curl -X POST https://your-domain/admin/keys/rotate \
 Specify a custom key identifier:
 
 ```bash
-curl -X POST https://your-domain/admin/keys/rotate \
+curl -X POST https://your-domain/_ts/admin/keys/rotate \
   -H "Content-Type: application/json" \
   -d '{"kid": "production-2024-q1"}'
 ```
@@ -356,14 +360,14 @@ Deactivate old keys after:
 
 ### Deactivation Endpoint
 
-**Endpoint**: `POST /admin/keys/deactivate`
+**Endpoint**: `POST /_ts/admin/keys/deactivate`
 
 #### Deactivate (Keep in Storage)
 
 Remove from active rotation but keep in storage:
 
 ```bash
-curl -X POST https://your-domain/admin/keys/deactivate \
+curl -X POST https://your-domain/_ts/admin/keys/deactivate \
   -H "Content-Type: application/json" \
   -d '{
     "kid": "ts-2024-01-15",
@@ -388,7 +392,7 @@ curl -X POST https://your-domain/admin/keys/deactivate \
 Remove from storage completely:
 
 ```bash
-curl -X POST https://your-domain/admin/keys/deactivate \
+curl -X POST https://your-domain/_ts/admin/keys/deactivate \
   -H "Content-Type: application/json" \
   -d '{
     "kid": "ts-2024-01-15",
@@ -476,14 +480,14 @@ Regular rotation on a fixed schedule:
 ```bash
 #!/bin/bash
 # Rotate signing keys
-curl -X POST https://your-domain/admin/keys/rotate
+curl -X POST https://your-domain/_ts/admin/keys/rotate
 
 # Wait 30 days grace period
 sleep $((30 * 24 * 60 * 60))
 
 # Deactivate old key
 OLD_KEY=$(date -d '90 days ago' +ts-%Y-%m-%d)
-curl -X POST https://your-domain/admin/keys/deactivate \
+curl -X POST https://your-domain/_ts/admin/keys/deactivate \
   -d "{\"kid\": \"$OLD_KEY\", \"delete\": true}"
 ```
 
@@ -647,13 +651,13 @@ If a key is compromised:
 1. **Immediate**: Rotate to new key
 
 ```bash
-curl -X POST /admin/keys/rotate
+curl -X POST /_ts/admin/keys/rotate
 ```
 
 2. **Urgent**: Deactivate compromised key
 
 ```bash
-curl -X POST /admin/keys/deactivate \
+curl -X POST /_ts/admin/keys/deactivate \
   -d '{"kid": "compromised-key", "delete": false}'
 ```
 
@@ -664,7 +668,7 @@ curl -X POST /admin/keys/deactivate \
 5. **Cleanup**: Delete compromised key after investigation
 
 ```bash
-curl -X POST /admin/keys/deactivate \
+curl -X POST /_ts/admin/keys/deactivate \
   -d '{"kid": "compromised-key", "delete": true}'
 ```
 

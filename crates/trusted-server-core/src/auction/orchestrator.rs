@@ -1,13 +1,13 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
 use error_stack::{Report, ResultExt};
+use fastly::http::request::{select, PendingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformPendingRequest, RuntimeServices};
-use crate::proxy::platform_response_to_fastly;
+use crate::platform::{PlatformPendingRequest, PlatformResponse, RuntimeServices};
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
@@ -28,6 +28,44 @@ pub struct DispatchedAuction {
     floor_prices: HashMap<String, f64>,
     /// Carried so the mediator call in collect can pass it as the auction request.
     request: AuctionRequest,
+}
+
+const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
+
+pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
+const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
+const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
+
+// SECURITY: the returned string is included verbatim (truncated to
+// PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
+// ProviderSummary.metadata["message"]. Providers MUST NOT interpolate
+// upstream-controlled content (response bodies, parse errors, headers) into
+// their TrustedServerError::*.message fields. Use static text and log details
+// server-side with `log::warn!` instead.
+fn provider_error_message(error: &Report<TrustedServerError>) -> String {
+    error
+        .current_context()
+        .to_string()
+        .chars()
+        .take(PROVIDER_ERROR_MESSAGE_CHARS)
+        .collect()
+}
+
+fn provider_error_response(
+    provider_name: &str,
+    response_time_ms: u64,
+    error_type: &str,
+    error: &Report<TrustedServerError>,
+) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(error_type))
+        .with_metadata("message", serde_json::json!(provider_error_message(error)))
+}
+
+fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+        .with_metadata("message", serde_json::json!("Provider launch failed"))
 }
 
 /// Compute the remaining time budget from a deadline.
@@ -83,7 +121,6 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let start_time = Instant::now();
 
@@ -91,13 +128,12 @@ impl AuctionOrchestrator {
         let (strategy_name, result) = if self.config.has_mediator() {
             (
                 "parallel_mediation",
-                self.run_parallel_mediation(request, context, services)
-                    .await?,
+                self.run_parallel_mediation(request, context).await?,
             )
         } else {
             (
                 "parallel_only",
-                self.run_parallel_only(request, context, services).await?,
+                self.run_parallel_only(request, context).await?,
             )
         };
 
@@ -122,12 +158,9 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
         let mediation_start = Instant::now();
-        let provider_responses = self
-            .run_providers_parallel(request, context, services)
-            .await?;
+        let provider_responses = self.run_providers_parallel(request, context).await?;
 
         let floor_prices = self.floor_prices_by_slot(request);
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
@@ -145,6 +178,8 @@ impl AuctionOrchestrator {
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
 
             if remaining_ms == 0 {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
                     context.timeout_ms
@@ -162,7 +197,6 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                client_info: context.client_info,
                 timeout_ms: remaining_ms,
                 provider_responses: Some(&provider_responses),
                 services: context.services,
@@ -175,25 +209,13 @@ impl AuctionOrchestrator {
                     message: format!("Mediator {} failed to launch", mediator.provider_name()),
                 })?;
 
-            let platform_resp = services
-                .http_client()
-                .wait(PlatformPendingRequest::new(pending))
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: format!("Mediator {} request failed", mediator.provider_name()),
-                })?;
-            let backend_response = platform_response_to_fastly(platform_resp).change_context(
-                TrustedServerError::Auction {
-                    message: format!(
-                        "Mediator {} returned an unsupported response body",
-                        mediator.provider_name()
-                    ),
-                },
-            )?;
+            let backend_response = pending.wait().change_context(TrustedServerError::Auction {
+                message: format!("Mediator {} request failed", mediator.provider_name()),
+            })?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
             let mediator_resp = mediator
-                .parse_response(backend_response, response_time_ms)
+                .parse_response_with_context(backend_response, response_time_ms, &mediator_context)
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} parse failed", mediator.provider_name()),
                 })?;
@@ -242,11 +264,8 @@ impl AuctionOrchestrator {
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        services: &RuntimeServices,
     ) -> Result<OrchestrationResult, Report<TrustedServerError>> {
-        let provider_responses = self
-            .run_providers_parallel(request, context, services)
-            .await?;
+        let provider_responses = self.run_providers_parallel(request, context).await?;
         let floor_prices = self.floor_prices_by_slot(request);
         let winning_bids = self.select_winning_bids(&provider_responses, &floor_prices);
 
@@ -261,14 +280,12 @@ impl AuctionOrchestrator {
 
     /// Run all providers in parallel and collect responses.
     ///
-    /// Uses [`RuntimeServices::http_client`] and
-    /// [`crate::platform::PlatformHttpClient::select`] to process responses as
-    /// they become ready, rather than waiting for each response sequentially.
+    /// Uses `fastly::http::request::select()` to process responses as they
+    /// become ready, rather than waiting for each response sequentially.
     async fn run_providers_parallel(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-        services: &RuntimeServices,
     ) -> Result<Vec<AuctionResponse>, Report<TrustedServerError>> {
         let provider_names = self.config.provider_names();
 
@@ -290,7 +307,8 @@ impl AuctionOrchestrator {
         // Maps backend_name -> (provider_name, start_time, provider)
         let mut backend_to_provider: HashMap<String, (&str, Instant, &dyn AuctionProvider)> =
             HashMap::new();
-        let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        let mut pending_requests: Vec<PendingRequest> = Vec::new();
+        let mut responses = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -317,6 +335,8 @@ impl AuctionOrchestrator {
             let effective_timeout = remaining_ms.min(provider.timeout_ms());
 
             if effective_timeout == 0 {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
                     context.timeout_ms,
@@ -342,7 +362,6 @@ impl AuctionOrchestrator {
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
                 services: context.services,
@@ -359,27 +378,33 @@ impl AuctionOrchestrator {
             match provider.request_bids(request, &provider_context) {
                 Ok(pending) => {
                     backend_to_provider.insert(
-                        backend_name.clone(),
+                        backend_name,
                         (provider.provider_name(), start_time, provider.as_ref()),
                     );
-                    pending_requests
-                        .push(PlatformPendingRequest::new(pending).with_backend_name(backend_name));
+                    pending_requests.push(pending);
                     log::debug!(
                         "Request to '{}' launched successfully",
                         provider.provider_name()
                     );
                 }
                 Err(e) => {
+                    let response_time_ms = start_time.elapsed().as_millis() as u64;
                     log::warn!(
                         "Provider '{}' failed to launch request: {:?}",
                         provider.provider_name(),
                         e
                     );
+                    responses.push(provider_launch_failed_response(
+                        provider.provider_name(),
+                        response_time_ms,
+                    ));
                 }
             }
         }
 
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
+        // lgtm[rust/cleartext-logging]
+        // This info log reports request counts and timeout budget only; no secret settings are logged.
         log::info!(
             "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
             pending_requests.len(),
@@ -394,63 +419,51 @@ impl AuctionOrchestrator {
         // transport timeout fires). Hard deadline enforcement therefore depends
         // on every backend's `first_byte_timeout` being set to at most the
         // remaining auction budget — which Phase 1 above guarantees.
-        let mut responses = Vec::new();
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
-            let select_result = services
-                .http_client()
-                .select(remaining)
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "HTTP select failed".to_string(),
-                })?;
-            remaining = select_result.remaining;
+            let (result, rest) = select(remaining);
+            remaining = rest;
 
-            match select_result.ready {
-                Ok(platform_response) => {
+            match result {
+                Ok(response) => {
                     // Identify the provider from the backend name
-                    let backend_name = platform_response.backend_name.clone().unwrap_or_default();
+                    let backend_name = response.get_backend_name().unwrap_or_default().to_string();
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match platform_response_to_fastly(platform_response) {
-                            Ok(response) => {
-                                match provider.parse_response(response, response_time_ms) {
-                                    Ok(auction_response) => {
-                                        log::info!(
-                                        "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
-                                        auction_response.provider,
-                                        auction_response.bids.len(),
-                                        auction_response.status,
-                                        auction_response.response_time_ms
-                                    );
-                                        responses.push(auction_response);
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Provider '{}' failed to parse response: {:?}",
-                                            provider_name,
-                                            e
-                                        );
-                                        responses.push(AuctionResponse::error(
-                                            provider_name,
-                                            response_time_ms,
-                                        ));
-                                    }
-                                }
+                        match provider.parse_response_with_context(
+                            response,
+                            response_time_ms,
+                            context,
+                        ) {
+                            Ok(auction_response) => {
+                                log::info!(
+                                    "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",
+                                    auction_response.provider,
+                                    auction_response.bids.len(),
+                                    auction_response.status,
+                                    auction_response.response_time_ms
+                                );
+                                responses.push(auction_response);
                             }
                             Err(e) => {
+                                // lgtm[rust/cleartext-logging]
+                                // This warning reports provider parse failures only; no secret values are logged.
                                 log::warn!(
-                                    "Provider '{}' returned an unsupported response body: {:?}",
+                                    "Provider '{}' failed to parse response: {:?}",
                                     provider_name,
                                     e
                                 );
-                                responses
-                                    .push(AuctionResponse::error(provider_name, response_time_ms));
+                                responses.push(provider_error_response(
+                                    provider_name,
+                                    response_time_ms,
+                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    &e,
+                                ));
                             }
                         }
                     } else {
@@ -471,6 +484,8 @@ impl AuctionOrchestrator {
             // Remaining PendingRequests are dropped, which abandons the
             // in-flight HTTP calls on the Fastly host.
             if auction_start.elapsed() >= deadline && !remaining.is_empty() {
+                // lgtm[rust/cleartext-logging]
+                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
                     "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
                     context.timeout_ms,
@@ -671,7 +686,6 @@ impl AuctionOrchestrator {
             let provider_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                client_info: context.client_info,
                 timeout_ms: effective_timeout,
                 provider_responses: context.provider_responses,
                 services: context.services,
@@ -880,7 +894,6 @@ impl AuctionOrchestrator {
                     let mediator_context = AuctionContext {
                         settings: context.settings,
                         request: &placeholder,
-                        client_info: context.client_info,
                         timeout_ms: mediator_timeout,
                         provider_responses: Some(&responses),
                         services: context.services,
@@ -1036,24 +1049,24 @@ impl OrchestrationResult {
     }
 }
 
+fn platform_response_to_fastly(
+    platform_response: PlatformResponse,
+) -> Result<fastly::Response, Report<TrustedServerError>> {
+    Ok(crate::compat::to_fastly_response(
+        platform_response.response,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, Bid, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionRequest, Bid, BidStatus, MediaType, PublisherInfo, UserInfo,
     };
-
-    // All-None ClientInfo used across tests that don't need real IP/TLS data.
-    // Defined as a const so &EMPTY_CLIENT_INFO has 'static lifetime, avoiding
-    // the temporary-lifetime issue that arises with &ClientInfo::default().
-    const EMPTY_CLIENT_INFO: crate::platform::ClientInfo = crate::platform::ClientInfo {
-        client_ip: None,
-        tls_protocol: None,
-        tls_cipher: None,
-    };
-    use crate::platform::test_support::noop_services;
+    use crate::error::TrustedServerError;
     use crate::test_support::tests::crate_test_settings_str;
+    use error_stack::Report;
     use fastly::Request;
     use std::collections::{HashMap, HashSet};
 
@@ -1091,8 +1104,7 @@ mod tests {
                 page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
                 eids: None,
             },
@@ -1105,6 +1117,81 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
+    }
+
+    #[test]
+    fn provider_error_response_includes_diagnostic_metadata() {
+        let error = Report::new(TrustedServerError::Auction {
+            message: "parse failed".to_string(),
+        })
+        .attach("internal/source.rs:12:34");
+
+        let response =
+            super::provider_error_response("prebid", 37, super::ERROR_TYPE_PARSE_RESPONSE, &error);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark diagnostic provider responses as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("parse_response"),
+            "should include the provider error classification"
+        );
+
+        let message = response.metadata["message"]
+            .as_str()
+            .expect("should include provider error message");
+        assert!(
+            message.contains("parse failed"),
+            "should include user-safe diagnostic detail"
+        );
+        assert!(
+            !message.contains("internal/source.rs"),
+            "should not include attached internal details"
+        );
+    }
+
+    #[test]
+    fn launch_failed_response_has_safe_static_message() {
+        let response = super::provider_launch_failed_response("prebid", 58);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark launch failures as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("launch_failed"),
+            "should include launch_failed classification"
+        );
+        assert_eq!(
+            response.metadata["message"],
+            serde_json::json!("Provider launch failed"),
+            "should use a safe, stable public launch failure message"
+        );
+    }
+
+    #[test]
+    fn provider_error_message_truncates_user_safe_context() {
+        let long_message = "x".repeat(super::PROVIDER_ERROR_MESSAGE_CHARS + 100);
+        let error = Report::new(TrustedServerError::Auction {
+            message: long_message,
+        });
+
+        let message = super::provider_error_message(&error);
+
+        assert_eq!(
+            message.chars().count(),
+            super::PROVIDER_ERROR_MESSAGE_CHARS,
+            "should cap provider error messages"
+        );
+        assert!(
+            message.starts_with("Auction error: "),
+            "should preserve the current context display text"
+        );
     }
 
     #[test]
@@ -1202,11 +1289,9 @@ mod tests {
         let request = create_test_auction_request();
         let settings = create_test_settings();
         let req = Request::get("https://test.com/test");
-        let context = create_test_auction_context(&settings, &req, &EMPTY_CLIENT_INFO, 2000);
+        let context = create_test_auction_context(&settings, &req, 2000);
 
-        let result = orchestrator
-            .run_auction(&request, &context, &noop_services())
-            .await;
+        let result = orchestrator.run_auction(&request, &context).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();

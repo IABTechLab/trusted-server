@@ -49,12 +49,6 @@ pub struct UserExt {
     /// Gated by TCF Purpose 1 (storage) and Purpose 4 (personalized ads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eids: Option<Vec<Eid>>,
-    /// Whether this EC ID was freshly generated for this request.
-    ///
-    /// **Breaking change:** this wire field was previously named `synthetic_fresh`.
-    /// Downstream PBS modules or analytics reading the old name must be updated.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ec_fresh: Option<String>,
 }
 
 impl ToExt for UserExt {}
@@ -76,7 +70,6 @@ pub struct ConsentedProvidersSettings {
 
 /// An Extended User ID entry from an identity provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
@@ -86,7 +79,6 @@ pub struct Eid {
 
 /// A single user identifier within an [`Eid`] entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Uid {
     /// The identifier value.
     pub id: String,
@@ -350,7 +342,6 @@ mod tests {
                     consented_providers: Some("2~2628.2316~dv.".to_string()),
                 }),
                 eids: None,
-                ec_fresh: None,
             }
             .to_ext(),
             ..Default::default()
@@ -409,26 +400,6 @@ mod tests {
         assert!(
             serialized["uids"][0].get("ext").is_none(),
             "ext should be omitted when None"
-        );
-    }
-
-    #[test]
-    fn user_ext_serializes_ec_fresh_not_synthetic_fresh() {
-        let ext = UserExt {
-            consent: None,
-            consented_providers_settings: None,
-            eids: None,
-            ec_fresh: Some("true".to_string()),
-        };
-
-        let serialized = serde_json::to_value(&ext).expect("should serialize UserExt");
-        assert_eq!(
-            serialized["ec_fresh"], "true",
-            "ec_fresh should be present in serialized output"
-        );
-        assert!(
-            serialized.get("synthetic_fresh").is_none(),
-            "synthetic_fresh should not appear — field was renamed to ec_fresh"
         );
     }
 }

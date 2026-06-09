@@ -14,12 +14,12 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::{HEADER_X_TS_EC, HEADER_X_TS_EC_FRESH};
+use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
-use crate::edge_cookie::generate_ec_id;
+use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
-use crate::platform::{GeoInfo, RuntimeServices};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -38,6 +38,7 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
+    pub eids: Option<JsonValue>,
 }
 
 /// A single ad placement in an [`AdRequest`].
@@ -100,17 +101,11 @@ pub struct BannerUnit {
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
-    services: &RuntimeServices,
     req: &Request,
     consent: ConsentContext,
-    ec_id: &str,
-    geo: Option<GeoInfo>,
+    ec_id: Option<&str>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
-    let ec_id = ec_id.to_owned();
-    let fresh_id =
-        generate_ec_id(settings, services).change_context(TrustedServerError::Auction {
-            message: "Failed to generate fresh EC ID".to_string(),
-        })?;
+    let ec_id = ec_id.map(str::to_owned);
 
     // Convert ad units to slots
     let mut slots = Vec::new();
@@ -157,8 +152,9 @@ pub fn convert_tsjs_to_auction_request(
         user_agent: req
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
-        ip: services.client_info.client_ip.map(|ip| ip.to_string()),
-        geo,
+        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
+        #[allow(deprecated)]
+        geo: GeoInfo::from_request(req),
     });
 
     // Forward allowed config entries from the JS request into the context map.
@@ -204,7 +200,6 @@ pub fn convert_tsjs_to_auction_request(
         },
         user: UserInfo {
             id: ec_id,
-            fresh_id,
             consent: Some(consent),
             eids: None,
         },
@@ -230,6 +225,7 @@ pub fn convert_to_openrtb_response(
     result: &OrchestrationResult,
     settings: &Settings,
     auction_request: &AuctionRequest,
+    ec_allowed: bool,
 ) -> Result<Response, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
@@ -330,18 +326,185 @@ pub fn convert_to_openrtb_response(
             message: "Failed to serialize auction response".to_string(),
         })?;
 
-    Ok(Response::from_status(StatusCode::OK)
+    let mut response = Response::from_status(StatusCode::OK)
         .with_header(header::CONTENT_TYPE, "application/json")
-        .with_header(HEADER_X_TS_EC, &auction_request.user.id)
-        .with_header(HEADER_X_TS_EC_FRESH, &auction_request.user.fresh_id)
-        .with_body(body_bytes))
+        .with_body(body_bytes);
+
+    // Signal consent status independently of whether EIDs were resolved.
+    // A user may have granted consent but have no partner syncs yet;
+    // downstream clients rely on this header to know consent was verified.
+    if ec_allowed {
+        response.set_header(HEADER_X_TS_EC_CONSENT, "ok");
+    }
+
+    // Attach EID response headers when consent-gated EIDs are available.
+    // `Some(empty)` means "we looked and found no synced partners" — the
+    // header is still set (with an encoded empty array) so clients can
+    // distinguish this from `None` (EIDs not checked / consent denied).
+    if let Some(ref eids) = auction_request.user.eids {
+        let (encoded, truncated) = encode_eids_header(eids)?;
+        response.set_header(HEADER_X_TS_EIDS, encoded);
+        if truncated {
+            response.set_header(HEADER_X_TS_EIDS_TRUNCATED, "true");
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::orchestrator::OrchestrationResult;
+    use crate::auction::types::{AdFormat, AdSlot, MediaType};
+    use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
+    use crate::openrtb::{Eid, Uid};
+
+    fn make_minimal_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "test-auction".to_owned(),
+            slots: vec![AdSlot {
+                id: "slot-1".to_owned(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders: HashMap::new(),
+            }],
+            publisher: PublisherInfo {
+                domain: "test.com".to_owned(),
+                page_url: None,
+            },
+            user: UserInfo {
+                id: Some("test-ec-id".to_owned()),
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn make_empty_result() -> OrchestrationResult {
+        OrchestrationResult {
+            winning_bids: HashMap::new(),
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            total_time_ms: 10,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_settings() -> Settings {
+        crate::test_support::tests::create_test_settings()
+    }
+
+    #[test]
+    fn response_includes_eid_headers_when_eids_present() {
+        let mut request = make_minimal_auction_request();
+        request.user.eids = Some(vec![Eid {
+            source: "ssp.com".to_owned(),
+            uids: vec![Uid {
+                id: "uid-1".to_owned(),
+                atype: Some(3),
+                ext: None,
+            }],
+        }]);
+
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, true)
+            .expect("should build response");
+
+        assert!(
+            response.get_header(HEADER_X_TS_EIDS).is_some(),
+            "should include x-ts-eids header when EIDs are present"
+        );
+        assert_eq!(
+            response
+                .get_header(HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("ok"),
+            "should include x-ts-ec-consent: ok when ec_allowed is true"
+        );
+        assert!(
+            response.get_header(HEADER_X_TS_EIDS_TRUNCATED).is_none(),
+            "should not include truncated header for small payload"
+        );
+    }
+
+    #[test]
+    fn response_sets_consent_header_even_without_eids() {
+        let request = make_minimal_auction_request();
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, true)
+            .expect("should build response");
+
+        assert_eq!(
+            response
+                .get_header(HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("ok"),
+            "should set x-ts-ec-consent: ok based on consent, not EID presence"
+        );
+        assert!(
+            response.get_header(HEADER_X_TS_EIDS).is_none(),
+            "should omit x-ts-eids when no EIDs available"
+        );
+    }
+
+    #[test]
+    fn response_omits_consent_header_when_not_allowed() {
+        let request = make_minimal_auction_request();
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should build response");
+
+        assert!(
+            response.get_header(HEADER_X_TS_EC_CONSENT).is_none(),
+            "should omit x-ts-ec-consent when ec_allowed is false"
+        );
+        assert!(
+            response.get_header(HEADER_X_TS_EIDS).is_none(),
+            "should omit x-ts-eids when no EIDs available"
+        );
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "should not emit x-ts-ec when a valid EC is present"
+        );
+    }
+
+    #[test]
+    fn response_omits_ec_header_when_ec_id_is_none() {
+        let mut request = make_minimal_auction_request();
+        request.user.id = None;
+
+        let settings = make_settings();
+        let result = make_empty_result();
+
+        let response = convert_to_openrtb_response(&result, &settings, &request, false)
+            .expect("should build response");
+
+        assert!(
+            response.get_header("x-ts-ec").is_none(),
+            "should omit x-ts-ec when no EC ID is available"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
     use crate::consent::ConsentContext;
-    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
     use fastly::http::Method;
     use fastly::Request;
@@ -356,16 +519,13 @@ mod tests {
 
     fn call_convert(body: &AdRequest) -> AuctionRequest {
         let settings = make_settings();
-        let services = noop_services();
         let req = make_req();
         convert_tsjs_to_auction_request(
             body,
             &settings,
-            &services,
             &req,
             ConsentContext::default(),
-            "test-ec-id",
-            None,
+            Some("test-ec-id"),
         )
         .expect("should convert without error")
     }
@@ -386,6 +546,7 @@ mod tests {
                 bids: None,
             }],
             config: None,
+            eids: None,
         };
 
         let auction_request = call_convert(&body);
@@ -417,6 +578,7 @@ mod tests {
                 }]),
             }],
             config: None,
+            eids: None,
         };
 
         let auction_request = call_convert(&body);
@@ -443,7 +605,6 @@ mod tests {
             crate_test_settings_str()
         );
         let settings = Settings::from_toml(&settings_str).expect("should parse");
-        let services = noop_services();
         let req = make_req();
 
         let body = AdRequest {
@@ -452,16 +613,15 @@ mod tests {
                 "permutive_segments": ["seg1", "seg2"],
                 "disallowed_key": "should be dropped",
             })),
+            eids: None,
         };
 
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
-            &services,
             &req,
             ConsentContext::default(),
-            "test-ec-id",
-            None,
+            Some("test-ec-id"),
         )
         .expect("should convert");
 
@@ -489,19 +649,17 @@ mod tests {
                 bids: None,
             }],
             config: None,
+            eids: None,
         };
 
         let settings = make_settings();
-        let services = noop_services();
         let req = make_req();
         let result = convert_tsjs_to_auction_request(
             &body,
             &settings,
-            &services,
             &req,
             ConsentContext::default(),
-            "test-ec-id",
-            None,
+            Some("test-ec-id"),
         );
 
         assert!(

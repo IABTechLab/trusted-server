@@ -37,7 +37,6 @@ use crate::integrations::{
     IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
     IntegrationRegistration,
 };
-use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
@@ -642,7 +641,6 @@ impl IntegrationProxy for SourcepointIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
-        services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path().to_string();
@@ -658,8 +656,7 @@ impl IntegrationProxy for SourcepointIntegration {
         log::info!("Sourcepoint: proxying {method} {path} → {target_url}");
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        let forwarded_cookies =
-            self.copy_headers(services.client_info.client_ip, &req, &mut proxy_req);
+        let forwarded_cookies = self.copy_headers(req.get_client_ip_addr(), &req, &mut proxy_req);
 
         // Request uncompressed content only for paths that are likely
         // JavaScript (the files we need to regex-rewrite).  All other CDN
@@ -1136,9 +1133,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.prospecta.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.prospecta.com",
             document_state: &document_state,
         };
 

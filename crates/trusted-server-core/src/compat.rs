@@ -142,9 +142,7 @@ pub fn set_fastly_ec_cookie(
     response: &mut fastly::Response,
     ec_id: &str,
 ) {
-    if let Some(cookie) = crate::cookies::try_build_ec_cookie_value(settings, ec_id) {
-        response.append_header(header::SET_COOKIE, cookie);
-    }
+    crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
 }
 
 /// Expire the EC ID cookie on a `fastly::Response`.
@@ -154,14 +152,7 @@ pub fn expire_fastly_ec_cookie(
     settings: &crate::settings::Settings,
     response: &mut fastly::Response,
 ) {
-    response.append_header(
-        header::SET_COOKIE,
-        format!(
-            "{}=; {}",
-            crate::constants::COOKIE_TS_EC,
-            crate::cookies::ec_cookie_attributes(settings, 0),
-        ),
-    );
+    crate::ec::cookies::expire_ec_cookie(settings, response);
 }
 
 #[cfg(test)]
@@ -347,7 +338,8 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         let mut response = fastly::Response::new();
 
-        set_fastly_ec_cookie(&settings, &mut response, "abc123.XyZ789");
+        let ec_id = format!("{}.Ab12z9", "a".repeat(64));
+        set_fastly_ec_cookie(&settings, &mut response, &ec_id);
 
         let cookie = response
             .get_header(header::SET_COOKIE)
@@ -356,8 +348,8 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "ts-ec=abc123.XyZ789; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000",
-                settings.publisher.cookie_domain
+                "ts-ec={ec_id}; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=31536000; HttpOnly",
+                settings.publisher.domain
             )),
             "should set expected EC cookie"
         );
@@ -377,8 +369,8 @@ mod tests {
         assert_eq!(
             cookie,
             Some(format!(
-                "ts-ec=; Domain={}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0",
-                settings.publisher.cookie_domain
+                "ts-ec=; Domain=.{}; Path=/; Secure; SameSite=Lax; Max-Age=0; HttpOnly",
+                settings.publisher.domain
             )),
             "should set expected expiry cookie"
         );

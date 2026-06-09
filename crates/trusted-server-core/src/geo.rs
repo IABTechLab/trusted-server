@@ -17,11 +17,15 @@ use crate::constants::{
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
 
-/// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
+/// Convert a Fastly [`Geo`] value into a [`GeoInfo`].
 ///
-/// Shared by `GeoInfo::from_request` (legacy) and `FastlyPlatformGeo::lookup` in
-/// `trusted-server-adapter-fastly` so that field mapping is never duplicated.
+/// Shared by `GeoInfo::from_request` (legacy) and adapter geo lookups
+/// so that field mapping is never duplicated.
 pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
+    let asn = match geo.as_number() {
+        0 => None,
+        n => Some(n),
+    };
     GeoInfo {
         city: geo.city().to_string(),
         country: geo.country_code().to_string(),
@@ -30,6 +34,7 @@ pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
         longitude: geo.longitude(),
         metro_code: geo.metro_code(),
         region: geo.region().map(str::to_string),
+        asn,
     }
 }
 
@@ -129,6 +134,7 @@ mod tests {
             longitude: -122.4194,
             metro_code: 807,
             region: Some("CA".to_string()),
+            asn: Some(7922),
         }
     }
 

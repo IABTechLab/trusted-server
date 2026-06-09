@@ -16,18 +16,24 @@ import adapterManager from 'prebid.js/src/adapterManager.js';
 import 'prebid.js/modules/consentManagementTcf.js';
 import 'prebid.js/modules/consentManagementGpp.js';
 import 'prebid.js/modules/consentManagementUsp.js';
+import 'prebid.js/modules/userId.js';
 
 // Client-side bid adapters — self-register with prebid.js on import.
 // The set of adapters is controlled by the TSJS_PREBID_ADAPTERS env var at
 // build time. See _adapters.generated.ts (written by build-all.mjs).
+// User ID submodules come from the deterministic attested preset in
+// user_id_modules.json. See _user_ids.generated.ts.
 // When a bidder is listed in `client_side_bidders` in trusted-server.toml,
 // the requestBids shim leaves its bids untouched and the corresponding
 // adapter handles them natively in the browser.
 import './_adapters.generated';
+import './_user_ids.generated';
 
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
-import type { AuctionBid } from '../../core/auction';
+import type { AuctionBid, AuctionEid } from '../../core/auction';
+
+import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
@@ -56,6 +62,12 @@ interface InjectedPrebidConfig {
   clientSideBidders?: string[];
 }
 
+interface PrebidUserIdDiagnostics {
+  includedModules: string[];
+  configuredUserIdNames: string[];
+  missingConfiguredUserIdNames: string[];
+}
+
 /** Read server-injected config from window.__tsjs_prebid, if present. */
 export function getInjectedConfig(): InjectedPrebidConfig | undefined {
   if (typeof window !== 'undefined') {
@@ -78,6 +90,76 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
     }
   }
   return [...bidders];
+}
+
+function configuredUserIdNamesFromConfig(config: unknown): string[] {
+  const userIds = Array.isArray(config)
+    ? config
+    : config && typeof config === 'object'
+      ? ((
+          config as {
+            userSync?: { userIds?: Array<{ name?: unknown }> };
+            userIds?: Array<{ name?: unknown }>;
+          }
+        ).userSync?.userIds ?? (config as { userIds?: Array<{ name?: unknown }> }).userIds)
+      : undefined;
+
+  if (!Array.isArray(userIds)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      userIds
+        .map((entry) => entry?.name)
+        .filter((name): name is string => typeof name === 'string' && name.length > 0)
+    ),
+  ].sort();
+}
+
+function readConfiguredUserIdNames(): string[] {
+  const getConfig = (pbjs as unknown as { getConfig?: (key?: string) => unknown }).getConfig;
+  if (typeof getConfig !== 'function') {
+    return [];
+  }
+
+  return configuredUserIdNamesFromConfig(getConfig('userSync.userIds')).concat(
+    configuredUserIdNamesFromConfig(getConfig())
+  );
+}
+
+function recordUserIdModuleDiagnostics(): PrebidUserIdDiagnostics {
+  const configuredUserIdNames = [...new Set(readConfiguredUserIdNames())].sort();
+  const coveredConfigNames = new Set(
+    PREBID_USER_ID_MODULE_REGISTRY.filter((entry) =>
+      DEFAULT_PREBID_USER_ID_MODULES.includes(entry.moduleName)
+    ).flatMap((entry) => entry.configNames)
+  );
+  const missingConfiguredUserIdNames = configuredUserIdNames.filter(
+    (name) => !coveredConfigNames.has(name)
+  );
+
+  const diagnostics: PrebidUserIdDiagnostics = {
+    includedModules: [...DEFAULT_PREBID_USER_ID_MODULES],
+    configuredUserIdNames,
+    missingConfiguredUserIdNames,
+  };
+
+  if (typeof window !== 'undefined') {
+    const tsjsWindow = window as typeof window & {
+      __tsjs_prebid_diagnostics?: { userIdModules?: PrebidUserIdDiagnostics };
+    };
+    tsjsWindow.__tsjs_prebid_diagnostics = {
+      ...(tsjsWindow.__tsjs_prebid_diagnostics ?? {}),
+      userIdModules: diagnostics,
+    };
+  }
+
+  for (const name of missingConfiguredUserIdNames) {
+    log.warn(`[tsjs-prebid] configured User ID module "${name}" is not included in TSJS`);
+  }
+
+  return diagnostics;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +227,62 @@ type TrustedServerRequest = {
   tsjsBidRequests: TrustedServerBidRequest[];
 };
 
+type PrebidUserIdEid = {
+  source?: unknown;
+  uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
+};
+
+function sanitizeAuctionUid(uid: {
+  id?: unknown;
+  atype?: unknown;
+  ext?: unknown;
+}): AuctionEid['uids'][number] | undefined {
+  if (typeof uid?.id !== 'string' || uid.id.length === 0) {
+    return undefined;
+  }
+
+  const sanitizedUid: AuctionEid['uids'][number] = { id: uid.id };
+
+  if (Number.isInteger(uid.atype) && uid.atype >= 0 && uid.atype <= 255) {
+    sanitizedUid.atype = uid.atype;
+  }
+
+  if (uid.ext && typeof uid.ext === 'object' && !Array.isArray(uid.ext)) {
+    sanitizedUid.ext = uid.ext as Record<string, unknown>;
+  }
+
+  return sanitizedUid;
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
+function collectAuctionEids(): AuctionEid[] | undefined {
+  if (typeof pbjs.getUserIdsAsEids !== 'function') {
+    return undefined;
+  }
+
+  const rawEids = (pbjs.getUserIdsAsEids() ?? []) as PrebidUserIdEid[];
+  const eids: AuctionEid[] = [];
+
+  for (const eid of rawEids) {
+    if (typeof eid?.source !== 'string' || eid.source.length === 0) {
+      continue;
+    }
+
+    const uids = Array.isArray(eid.uids) ? eid.uids.map(sanitizeAuctionUid).filter(isDefined) : [];
+
+    if (uids.length === 0) {
+      continue;
+    }
+
+    eids.push({ source: eid.source, uids });
+  }
+
+  return eids.length > 0 ? eids : undefined;
+}
+
 /**
  * Install the Prebid integration.
  *
@@ -178,7 +316,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
-      const payload = buildAdRequest(validBidRequests);
+      const hasUserIdApi = typeof pbjs.getUserIdsAsEids === 'function';
+      const auctionEids = collectAuctionEids();
+      if (hasUserIdApi && !auctionEids) {
+        clearPrebidEidsCookie();
+      }
+      const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
       return {
         method: 'POST',
         url: auctionEndpoint,
@@ -243,6 +386,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         bidderParams[bid.bidder] = bid.params ?? {};
       }
 
+      // Keep only bids that should still execute in the browser. All other
+      // bidders are routed through the trustedServer adapter.
+      unit.bids = unit.bids.filter(
+        (bid) => bid?.bidder === ADAPTER_CODE || clientSideBidders.has(bid?.bidder ?? '')
+      );
+
       // WORKAROUND: Read the zone from mediaTypes.banner.name. This is NOT a
       // standard Prebid.js field — publishers must add it as a custom property
       // in their ad unit config. The server uses it to apply zone-specific
@@ -269,13 +418,6 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       } else {
         unit.bids.push({ bidder: ADAPTER_CODE, params: tsParams });
       }
-
-      // Remove server-side bidder entries — they are now handled via the
-      // trustedServer adapter. Only keep client-side bidders (which run via
-      // their native Prebid.js adapters) and the trustedServer bid itself.
-      unit.bids = unit.bids.filter(
-        (b) => b.bidder === ADAPTER_CODE || clientSideBidders.has(b.bidder ?? '')
-      );
     }
 
     // Ensure the trustedServer adapter is allowed to return bids under any
@@ -289,6 +431,16 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         allowAlternateBidderCodes: true,
         allowedAlternateBidderCodes: ['*'],
       },
+    };
+
+    // Chain a bidsBackHandler to collect Prebid User ID Module EIDs
+    // and persist them as a cookie for backend sync.
+    const originalBidsBack = opts.bidsBackHandler;
+    opts.bidsBackHandler = function (...args: unknown[]) {
+      syncPrebidEidsCookie();
+      if (typeof originalBidsBack === 'function') {
+        originalBidsBack.apply(this, args);
+      }
     };
 
     return originalRequestBids(opts);
@@ -306,6 +458,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   // processQueue() must be called after all modules are loaded when using
   // prebid.js via NPM.
   pbjs.processQueue();
+  recordUserIdModuleDiagnostics();
 
   // Validate that every client-side bidder has its adapter registered.
   // Adapters self-register on import, so a missing adapter means the bidder
@@ -449,6 +602,79 @@ export function installUserIdModules(): void {
     log.info('[tsjs-prebid] userID modules configured');
   } catch {
     // pbjs not ready — userID modules will use defaults
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prebid EID cookie sync
+// ---------------------------------------------------------------------------
+
+/** Maximum cookie payload size in bytes (leave room for other cookies). */
+const MAX_EID_COOKIE_BYTES = 3072;
+
+/** Cookie name for persisted Prebid EIDs. */
+const EID_COOKIE_NAME = 'ts-eids';
+
+/** Cookie max-age in seconds (1 day). */
+const EID_COOKIE_MAX_AGE = 86400;
+
+/** Clears any previously persisted Prebid EIDs cookie. */
+function clearPrebidEidsCookie(): void {
+  document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
+}
+
+function fitAuctionEidsToCookie(eids: AuctionEid[]): AuctionEid[] | undefined {
+  let payload = eids.map((eid) => ({ source: eid.source, uids: [...eid.uids] }));
+
+  while (payload.length > 0) {
+    const encoded = btoa(JSON.stringify(payload));
+    if (encoded.length <= MAX_EID_COOKIE_BYTES) {
+      return payload;
+    }
+
+    const last = payload[payload.length - 1];
+    if (last && last.uids.length > 1) {
+      last.uids = last.uids.slice(0, last.uids.length - 1);
+      continue;
+    }
+
+    payload = payload.slice(0, payload.length - 1);
+  }
+
+  return undefined;
+}
+
+/**
+ * Collects EIDs from Prebid's User ID Module and writes them as a
+ * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
+ * and auction fallback on later requests.
+ */
+function syncPrebidEidsCookie(): void {
+  try {
+    if (typeof pbjs.getUserIdsAsEids !== 'function') {
+      // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
+      clearPrebidEidsCookie();
+      return;
+    }
+
+    const eids = collectAuctionEids();
+    if (!eids) {
+      clearPrebidEidsCookie();
+      return;
+    }
+
+    const payload = fitAuctionEidsToCookie(eids);
+    if (!payload) {
+      clearPrebidEidsCookie();
+      return;
+    }
+
+    const encoded = btoa(JSON.stringify(payload));
+    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+
+    log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
+  } catch (err) {
+    log.warn('[tsjs-prebid] failed to sync EIDs cookie', err);
   }
 }
 
