@@ -4,8 +4,7 @@
 //! the API boundary:
 //! - pass-through for non-processable `2xx` content
 //! - streamed processing for stream-safe processable responses
-//! - buffered responses for unsupported encodings, `204/205`, or HTML routes
-//!   that require full-document post-processing
+//! - buffered responses for unsupported encodings or `204/205`
 //!
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
@@ -342,13 +341,10 @@ pub enum PublisherResponse {
 pub(crate) enum ResponseRoute {
     /// `2xx` non-processable content (images, fonts, video), not `204/205`.
     PassThrough,
-    /// Processable content with supported encoding and either non-HTML or no
-    /// HTML post-processors registered.
+    /// Processable content with supported encoding.
     Stream,
     /// Response returned unmodified via [`PublisherResponse::Buffered`].
     BufferedUnmodified,
-    /// HTML with post-processors registered; requires full-document buffering.
-    BufferedProcessed,
 }
 
 /// Decide how a proxied response should be routed.
@@ -360,7 +356,7 @@ pub(crate) fn classify_response_route(
     content_type: &str,
     content_encoding: &str,
     request_host: &str,
-    has_post_processors: bool,
+    _has_post_processors: bool,
 ) -> ResponseRoute {
     if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
         return ResponseRoute::BufferedUnmodified;
@@ -381,11 +377,6 @@ pub(crate) fn classify_response_route(
 
     if !is_supported_content_encoding(content_encoding) {
         return ResponseRoute::BufferedUnmodified;
-    }
-
-    let is_html = content_type.contains("text/html");
-    if is_html && has_post_processors {
-        return ResponseRoute::BufferedProcessed;
     }
 
     ResponseRoute::Stream
@@ -442,16 +433,16 @@ pub fn stream_publisher_body<W: Write>(
     process_response_streaming(body, output, &borrowed)
 }
 
-/// Stream publisher body with a "last-chunk hold" for live bid injection.
+/// Stream publisher body with a `</body` tail hold for live bid injection.
 ///
 /// Drives the origin body through the HTML pipeline one chunk at a time, using a
-/// one-behind buffer so the last raw origin chunk is held back.  When the origin
-/// body is exhausted (`read` returns `Ok(0)`):
+/// small buffer that holds the first raw `</body` tail. When the origin body is
+/// exhausted (`read` returns `Ok(0)`):
 ///
 /// 1. [`collect_dispatched_auction`](AuctionOrchestrator::collect_dispatched_auction)
 ///    is awaited with the remaining deadline.
 /// 2. Winning bids are written to `ad_bids_state`.
-/// 3. The held last chunk is fed through the pipeline — `lol_html` fires its
+/// 3. The held tail is fed through the pipeline so `lol_html` fires its
 ///    `</body>` handler with bids now in state.
 ///
 /// For non-HTML content types the auction is collected before any body bytes
@@ -584,6 +575,18 @@ pub(crate) fn is_prefetch_request(req: &Request) -> bool {
             .is_some_and(|v| v.contains("prefetch"))
 }
 
+/// Returns true only when the publisher request should run the full
+/// server-side ad stack: auction dispatch plus initial ad-slot injection.
+pub(crate) fn should_run_server_side_ad_stack(
+    is_get: bool,
+    is_prefetch: bool,
+    is_bot: bool,
+    has_matched_slots: bool,
+    consent_allows_auction: bool,
+) -> bool {
+    is_get && !is_prefetch && !is_bot && has_matched_slots && consent_allows_auction
+}
+
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
 pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
@@ -647,8 +650,8 @@ struct AuctionCollectCtx<'a> {
     settings: &'a Settings,
 }
 
-/// Run the one-behind chunk loop for HTML bodies, collecting the auction before
-/// the last chunk so `lol_html`'s `</body>` handler sees live bids.
+/// Run the close-body hold loop for HTML bodies, collecting the auction before
+/// the raw `</body` tail is processed so `lol_html` sees live bids.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     body: Body,
     output: &mut W,
@@ -663,11 +666,11 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     use flate2::write::{GzEncoder, ZlibEncoder};
 
     match compression {
-        Compression::None => one_behind_loop(body, output, processor, ctx).await,
+        Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
         Compression::Gzip => {
             let decoder = GzDecoder::new(body);
             let mut encoder = GzEncoder::new(&mut *output, flate2::Compression::default());
-            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize gzip encoder".to_string(),
             })?;
@@ -676,7 +679,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
         Compression::Deflate => {
             let decoder = ZlibDecoder::new(body);
             let mut encoder = ZlibEncoder::new(&mut *output, flate2::Compression::default());
-            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
             encoder.finish().change_context(TrustedServerError::Proxy {
                 message: "Failed to finalize deflate encoder".to_string(),
             })?;
@@ -691,19 +694,69 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
             };
             let mut encoder =
                 CompressorWriter::with_params(&mut *output, STREAM_CHUNK_SIZE, &params);
-            one_behind_loop(decoder, &mut encoder, processor, ctx).await?;
+            body_close_hold_loop(decoder, &mut encoder, processor, ctx).await?;
             let _ = encoder.into_inner();
             Ok(())
         }
     }
 }
 
-/// Core one-behind chunk loop.
+const BODY_CLOSE_PREFIX: &[u8] = b"</body";
+
+struct BodyCloseHoldBuffer {
+    buffered: Vec<u8>,
+    found_close: bool,
+}
+
+impl BodyCloseHoldBuffer {
+    fn new() -> Self {
+        Self {
+            buffered: Vec::new(),
+            found_close: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.buffered.extend_from_slice(chunk);
+
+        if self.found_close {
+            return Vec::new();
+        }
+
+        if let Some(pos) = find_ascii_case_insensitive(&self.buffered, BODY_CLOSE_PREFIX) {
+            self.found_close = true;
+            return self.buffered.drain(..pos).collect();
+        }
+
+        let keep_len = BODY_CLOSE_PREFIX.len().saturating_sub(1);
+        if self.buffered.len() <= keep_len {
+            return Vec::new();
+        }
+
+        let split_at = self.buffered.len() - keep_len;
+        self.buffered.drain(..split_at).collect()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buffered
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| {
+        window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
+}
+
+/// Core close-body hold loop.
 ///
-/// Reads from `reader`, writing processed output to `writer` for every chunk
-/// except the current one (which is held pending).  On EOF, the auction is
-/// collected, bids written, and the held chunk processed last.
-async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
+/// Streams processed output until the first case-insensitive `</body` prefix is
+/// seen, then holds that tail. On EOF, the auction is collected, bids are
+/// written, and the held tail is processed before finalization.
+async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     mut reader: R,
     writer: &mut W,
     processor: &mut P,
@@ -718,22 +771,19 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         settings,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
-    let mut pending: Vec<u8> = Vec::new();
+    let mut hold = BodyCloseHoldBuffer::new();
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                // Origin exhausted — pending holds the last chunk.
-                // Collect the auction before feeding it to lol_html so that
-                // the </body> handler sees populated ad_bids_state.
-                log::info!("one_behind_loop: EOF — collecting dispatched auction");
+                log::info!("body_close_hold_loop: EOF - collecting dispatched auction");
                 let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
                 let collect_ctx = make_collect_context(settings, services, &placeholder);
                 let result = orchestrator
                     .collect_dispatched_auction(dispatched, services, &collect_ctx)
                     .await;
                 log::info!(
-                    "one_behind_loop: collect complete — {} winning bid(s)",
+                    "body_close_hold_loop: collect complete - {} winning bid(s)",
                     result.winning_bids.len()
                 );
                 write_bids_to_state(
@@ -747,18 +797,18 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     prepend_auction_debug_comment("stream", &result, ad_bids_state);
                 }
 
-                // Process the held last chunk (not is_last — finalization is separate).
-                if !pending.is_empty() {
-                    let out = processor.process_chunk(&pending, false).change_context(
+                let held = hold.finish();
+                if !held.is_empty() {
+                    let out = processor.process_chunk(&held, false).change_context(
                         TrustedServerError::Proxy {
-                            message: "Failed to process last chunk".to_string(),
+                            message: "Failed to process held body close".to_string(),
                         },
                     )?;
                     if !out.is_empty() {
                         writer
                             .write_all(&out)
                             .change_context(TrustedServerError::Proxy {
-                                message: "Failed to write last chunk".to_string(),
+                                message: "Failed to write held body close".to_string(),
                             })?;
                     }
                 }
@@ -778,9 +828,9 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 break;
             }
             Ok(n) => {
-                // Stream the previously held chunk (it is not the last).
-                if !pending.is_empty() {
-                    let out = processor.process_chunk(&pending, false).change_context(
+                let ready = hold.push(&buffer[..n]);
+                if !ready.is_empty() {
+                    let out = processor.process_chunk(&ready, false).change_context(
                         TrustedServerError::Proxy {
                             message: "Failed to process chunk".to_string(),
                         },
@@ -793,7 +843,6 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                             })?;
                     }
                 }
-                pending = buffer[..n].to_vec();
             }
             Err(e) => {
                 return Err(Report::new(TrustedServerError::Proxy {
@@ -935,8 +984,14 @@ pub async fn handle_publisher_request(
             .as_ref()
             .is_some_and(|tcf| tcf.has_purpose_consent(1));
 
-    let should_run_auction =
-        is_get && !is_prefetch && !is_bot && !matched_slots.is_empty() && consent_allows_auction;
+    let should_run_ad_stack = should_run_server_side_ad_stack(
+        is_get,
+        is_prefetch,
+        is_bot,
+        !matched_slots.is_empty(),
+        consent_allows_auction,
+    );
+    let should_run_auction = should_run_ad_stack;
 
     if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
@@ -1044,12 +1099,11 @@ pub async fn handle_publisher_request(
         log::debug!("  {}: {:?}", name, value);
     }
 
-    let ad_slots_script = if let Some(co_config) = &settings.creative_opportunities {
-        if !matched_slots.is_empty() {
-            Some(build_ad_slots_script(&matched_slots, co_config))
-        } else {
-            None
-        }
+    let ad_slots_script = if should_run_ad_stack {
+        settings
+            .creative_opportunities
+            .as_ref()
+            .map(|co_config| build_ad_slots_script(&matched_slots, co_config))
     } else {
         None
     };
@@ -1150,67 +1204,6 @@ pub async fn handle_publisher_request(
                     price_granularity,
                 }),
             })
-        }
-        ResponseRoute::BufferedProcessed => {
-            log::debug!(
-                "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-                content_type,
-                content_encoding,
-                request_host,
-                origin_host,
-            );
-
-            // Collect any in-flight auction before processing buffered HTML.
-            // BufferedProcessed is taken when HTML has post-processors (e.g. Next.js rewriters).
-            // Unlike the Stream path, the body is fully buffered first — collect auction
-            // now so bids are available when the </body> handler fires.
-            if let Some(dispatched) = dispatched_auction {
-                let placeholder =
-                    fastly::Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
-                let result = auction
-                    .orchestrator
-                    .collect_dispatched_auction(
-                        dispatched,
-                        services,
-                        &make_collect_context(settings, services, &placeholder),
-                    )
-                    .await;
-                log::info!(
-                    "BufferedProcessed: auction collected — {} winning bid(s)",
-                    result.winning_bids.len()
-                );
-                write_bids_to_state(
-                    &result.winning_bids,
-                    price_granularity,
-                    &ad_bids_state,
-                    settings.debug.inject_adm_for_testing,
-                );
-
-                if settings.debug.auction_html_comment {
-                    prepend_auction_debug_comment("buffered", &result, &ad_bids_state);
-                }
-            }
-
-            let body = response.take_body();
-            let params = ProcessResponseParams {
-                content_encoding: &content_encoding,
-                origin_host: &origin_host,
-                origin_url: &settings.publisher.origin_url,
-                request_host,
-                request_scheme,
-                settings,
-                content_type: &content_type,
-                integration_registry,
-                ad_slots_script: ad_slots_script.as_deref(),
-                ad_bids_state: &ad_bids_state,
-            };
-            let mut output = Vec::new();
-            process_response_streaming(body, &mut output, &params)?;
-
-            response.set_header(header::CONTENT_LENGTH, output.len().to_string());
-            response.set_body(Body::from(output));
-
-            Ok(PublisherResponse::Buffered(response))
         }
     }
 }
@@ -1764,6 +1757,75 @@ mod tests {
     }
 
     #[test]
+    fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
+        assert!(
+            should_run_server_side_ad_stack(true, false, false, true, true),
+            "GET, real navigation, matched slots, and consent should run TS ad stack"
+        );
+
+        assert!(
+            !should_run_server_side_ad_stack(false, false, false, true, true),
+            "non-GET requests should skip TS ad stack"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, true, false, true, true),
+            "prefetch requests should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, false, true, true, true),
+            "bot requests should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, false, false, false, true),
+            "requests with no matching slots should skip TS ad stack"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, false, false, true, false),
+            "requests without required consent should skip TS ad stack and injection"
+        );
+    }
+
+    #[test]
+    fn body_close_hold_buffer_holds_close_body_tail_in_single_chunk() {
+        let mut hold = BodyCloseHoldBuffer::new();
+
+        let ready = hold.push(b"<html><body>painted</body></html>");
+        let held = hold.finish();
+
+        assert_eq!(
+            std::str::from_utf8(&ready).expect("should be utf8"),
+            "<html><body>painted",
+            "content before </body> should stream before auction collection"
+        );
+        assert_eq!(
+            std::str::from_utf8(&held).expect("should be utf8"),
+            "</body></html>",
+            "the close-body tag and trailing bytes should be held"
+        );
+    }
+
+    #[test]
+    fn body_close_hold_buffer_holds_close_body_tail_across_chunks() {
+        let mut hold = BodyCloseHoldBuffer::new();
+
+        let first = hold.push(b"<html><body>painted</bo");
+        let second = hold.push(b"dy></html>");
+        let held = hold.finish();
+
+        let streamed = [first, second].concat();
+        assert_eq!(
+            std::str::from_utf8(&streamed).expect("should be utf8"),
+            "<html><body>painted",
+            "split </body> bytes must not leak before auction collection"
+        );
+        assert_eq!(
+            std::str::from_utf8(&held).expect("should be utf8"),
+            "</body></html>",
+            "split close-body tag should be held intact"
+        );
+    }
+
+    #[test]
     fn unsupported_encoding_response_is_returned_unmodified() {
         assert_eq!(
             classify_response_route(
@@ -1833,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn route_buffers_html_with_post_processors_for_processing() {
+    fn route_streams_html_with_post_processors() {
         assert_eq!(
             classify_response_route(
                 StatusCode::OK,
@@ -1842,7 +1904,7 @@ mod tests {
                 "example.com",
                 true,
             ),
-            ResponseRoute::BufferedProcessed,
+            ResponseRoute::Stream,
         );
     }
 
@@ -1934,7 +1996,7 @@ mod tests {
                 true,
             ),
             ResponseRoute::BufferedUnmodified,
-            "204 + HTML + post-processors must not route to BufferedProcessed",
+            "204 + HTML + post-processors must not route to Stream",
         );
     }
 
@@ -1978,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn route_processes_non_2xx_html_with_post_processors() {
+    fn route_streams_non_2xx_html_with_post_processors() {
         assert_eq!(
             classify_response_route(
                 StatusCode::NOT_FOUND,
@@ -1987,7 +2049,7 @@ mod tests {
                 "example.com",
                 true,
             ),
-            ResponseRoute::BufferedProcessed,
+            ResponseRoute::Stream,
         );
     }
 
@@ -2503,12 +2565,11 @@ mod tests {
         );
     }
 
-    /// Buffered-processed dispatch contract: HTML with a registered post-processor
-    /// routes through `BufferedProcessed`, and the handler path sets
-    /// `Content-Length` from the processed body length. Verify that invariant
-    /// via the classifier + `process_response_streaming` composition.
+    /// Streaming dispatch contract: HTML with a registered post-processor still
+    /// routes through `Stream`, and the shared processor pipeline still applies
+    /// the post-processor rewrite.
     #[test]
-    fn buffered_processed_sets_content_length_from_processed_body() {
+    fn streaming_html_with_post_processors_rewrites_body() {
         // Configure nextjs so a post-processor is registered.
         let mut settings = create_test_settings();
         settings
@@ -2537,12 +2598,11 @@ mod tests {
                 "proxy.example.com",
                 registry.has_html_post_processors(),
             ),
-            ResponseRoute::BufferedProcessed,
-            "HTML with post-processors must route to BufferedProcessed"
+            ResponseRoute::Stream,
+            "HTML with post-processors must route to Stream"
         );
 
-        // Feed a small HTML body through the same pipeline the
-        // BufferedProcessed arm uses (Vec<u8> output).
+        // Feed a small HTML body through the same pipeline the Stream arm uses.
         let html =
             b"<html><body><a href=\"https://origin.example.com/page\">link</a></body></html>";
         let body = Body::from(html.to_vec());
@@ -2561,11 +2621,11 @@ mod tests {
         };
         let mut output = Vec::new();
         stream_publisher_body(body, &mut output, &params, &settings, &registry)
-            .expect("should process buffered HTML");
+            .expect("should process streaming HTML");
 
         assert!(
             !output.is_empty(),
-            "buffered processed output must not be empty"
+            "streaming processed output must not be empty"
         );
         let as_str = std::str::from_utf8(&output).expect("output should be valid UTF-8");
         assert!(

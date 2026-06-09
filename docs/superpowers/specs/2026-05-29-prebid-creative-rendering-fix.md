@@ -206,9 +206,9 @@ if let Some(ref path) = bid.cache_path {
 event.slot.getTargeting('hb_adid')[0] === bid.hb_adid
 ```
 
-`adInit()` calls `setTargeting('hb_adid', cacheId)` with the cache UUID.  
-`event.slot.getTargeting('hb_adid')[0]` returns that same cache UUID.  
-`bid.hb_adid` is now also the cache UUID.  
+`adInit()` calls `setTargeting('hb_adid', cacheId)` with the cache UUID.
+`event.slot.getTargeting('hb_adid')[0]` returns that same cache UUID.
+`bid.hb_adid` is now also the cache UUID.
 Match holds. No change to the win detection logic.
 
 ### 4.6 GAM line item creative requirement (publisher action — not TS code)

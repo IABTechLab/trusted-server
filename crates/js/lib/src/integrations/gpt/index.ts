@@ -367,14 +367,11 @@ export function installTsAdInit(): void {
           if (!slotId) return;
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
-          // Prebid: compare hb_adid targeting to verify the specific creative won.
-          // APS: no hb_adid equivalent — fires if bidder exists and slot is non-empty.
-          // Known limitation: APS path may over-fire if a non-APS line item wins.
+          // Compare hb_adid targeting to verify the specific creative won.
           const ourBidWon =
             !event.isEmpty &&
-            (bid.hb_adid
-              ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
-              : !!bid.hb_bidder);
+            !!bid.hb_adid &&
+            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
           if (ourBidWon) {
             if (bid.nurl) navigator.sendBeacon(bid.nurl);
             if (bid.burl) navigator.sendBeacon(bid.burl);

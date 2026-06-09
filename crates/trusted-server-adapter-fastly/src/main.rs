@@ -31,7 +31,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body_async,
     PublisherResponse,
 };
 use trusted_server_core::request_signing::{
@@ -460,7 +460,7 @@ async fn route_request(
                 Ok(PublisherResponse::Stream {
                     mut response,
                     body,
-                    params,
+                    mut params,
                 }) => {
                     // Publisher fallback has multiple delivery modes.
                     // EC finalization is header-only, so it must happen before
@@ -478,13 +478,17 @@ async fn route_request(
 
                     let mut streaming_body = response.stream_to_client();
                     let mut stream_succeeded = false;
-                    if let Err(err) = stream_publisher_body(
+                    if let Err(err) = stream_publisher_body_async(
                         body,
                         &mut streaming_body,
-                        &params,
+                        &mut params,
                         settings,
                         integration_registry,
-                    ) {
+                        orchestrator,
+                        runtime_services,
+                    )
+                    .await
+                    {
                         // Headers are already committed. Log and abort rather
                         // than trying to replace the response mid-stream.
                         log::error!("Streaming processing failed: {err:?}");

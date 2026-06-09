@@ -19,6 +19,16 @@ use trusted_server_core::settings::Settings;
 
 use super::route_request;
 
+#[test]
+fn streaming_publisher_path_uses_async_auction_collector() {
+    let router_source = include_str!("main.rs");
+
+    assert!(
+        router_source.contains("stream_publisher_body_async("),
+        "streaming publisher responses must collect dispatched auctions before </body> injection"
+    );
+}
+
 struct StubJwksConfigStore;
 
 impl PlatformConfigStore for StubJwksConfigStore {

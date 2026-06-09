@@ -236,7 +236,7 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('fires beacons for APS bid (no hb_adid) when ad renders in our slot', async () => {
+  it('does not fire beacons when a rendered bid has no hb_adid confirmation', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
@@ -287,10 +287,8 @@ describe('installTsAdInit', () => {
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
 
-    expect(beaconSpy).toHaveBeenCalledWith('https://aps/win');
-    expect(beaconSpy).toHaveBeenCalledWith('https://aps/bill');
+    expect(beaconSpy).not.toHaveBeenCalled();
 
-    beaconSpy.mockClear();
     capturedListener!({ isEmpty: true, slot: mockSlot });
     expect(beaconSpy).not.toHaveBeenCalled();
 
