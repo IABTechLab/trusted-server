@@ -89,13 +89,14 @@ across every navigation in the user's clickstream rather than once per session.
 
 ## 4. Architecture
 
-### 4.1 New File: `creative-opportunities.toml`
+### 4.1 Slot configuration in `trusted-server.toml`
 
-A new config file at the repo root, alongside `trusted-server.toml`. It holds all slot
-templates: page pattern matching rules, ad formats, floor prices, GAM targeting
-key-values, and per-provider bidder params. PBS bidder-level params (placement IDs,
-account IDs) live in Prebid Server stored requests, keyed by slot ID. APS params are
-specified inline per slot under `[slot.providers.aps]`.
+Slot templates live in `trusted-server.toml` under `[[creative_opportunities.slot]]`
+(consolidated from the original `creative-opportunities.toml`). Each entry holds page
+pattern matching rules, ad formats, floor prices, GAM targeting key-values, and
+per-provider bidder params. PBS bidder-level params (placement IDs, account IDs) live
+in Prebid Server stored requests, keyed by slot ID. APS params are specified inline per
+slot under `[slot.providers.aps]`.
 
 Loaded at build time via `include_str!()` and compiled into the WASM binary. Slot
 changes require a redeploy; this is intentional (fast reads, no KV overhead, no
@@ -103,7 +104,7 @@ per-request cost). A migration path to KV-backed config is tracked in §9.5.
 
 `floor_price` is the publisher-owned hard floor per slot — the source of truth for the
 minimum acceptable bid price, enforced at the edge before bids reach the ad server. Any
-bid below the floor is discarded at the orchestrator level before it enters `__ts_bids`.
+bid below the floor is discarded at the orchestrator level before it enters `tsjs.bids`.
 SSPs may apply their own dynamic floors independently within their platforms; this floor
 is the publisher's baseline that supersedes all other floor logic by virtue of being
 enforced earliest in the pipeline.
@@ -118,7 +119,7 @@ gam_network_id = "21765378893"
 # Optional. Defaults to [auction].timeout_ms if not set.
 # Recommended: 500ms (vs client-side 1000–1500ms) due to lower edge→PBS RTT.
 # This value is also the upper bound on the </body>-close hold; once A_deadline
-# fires, TS injects an empty __ts_bids and emits </body> regardless.
+# fires, TS injects an empty tsjs.bids and emits </body> regardless.
 auction_timeout_ms = 500
 
 # Granularity table for hb_pb price bucket strings.
@@ -127,7 +128,7 @@ auction_timeout_ms = 500
 price_granularity = "dense"
 ```
 
-#### `creative-opportunities.toml` schema
+#### `[creative_opportunities]` schema
 
 ```toml
 [[slot]]
@@ -278,10 +279,10 @@ request. Before firing, TS gates on:
   skip the auction. Avoids spending auction inventory on speculative navigations that
   may never paint.
 - **Method** — only `GET` requests trigger auctions. `HEAD` requests skip.
-- **Slot match** — at least one slot in `creative-opportunities.toml` must match the
+- **Slot match** — at least one slot in `[creative_opportunities]` (in `trusted-server.toml`) must match the
   request path. Empty match = no auction.
 
-Skipped auctions emit no `__ts_bids` and let the page proceed unmodified by the ad
+Skipped auctions emit no `tsjs.bids` and let the page proceed unmodified by the ad
 stack. Skipped requests still benefit from the EC cookie set / KV identity update
 paths that run independently of the auction.
 
@@ -294,7 +295,7 @@ existing EC pipeline and is the load-bearing identity input to the auction (see 
 Consent gating:
 
 - If consent is **absent or denied** (no TCF consent string, or purpose 1 not consented):
-  the auction is not fired. `__ts_bids` is omitted from the page. GPT falls back to its
+  the auction is not fired. `tsjs.bids` is omitted from the page. GPT falls back to its
   own auction. This is treated as a first-class edge case in §8.
 - **Mid-page consent revocation** is out of scope for Phase 1; bids already injected
   remain. Phase 2 will address consent event propagation.
@@ -313,8 +314,7 @@ The orchestrator's existing behavior is unchanged:
   (`creative_opportunities.auction_timeout_ms`, falling back to `[auction].timeout_ms`)
 - Floor price filtering, bid unification, and winning bid selection are applied as today
 - PBS resolves bidder params from its stored requests by slot ID
-- APS bidder params are read from `[slot.providers.aps]` in
-  `creative-opportunities.toml`
+- APS bidder params are read from `[slot.providers.aps]` in `trusted-server.toml`
 
 #### The bounded `</body>` hold
 
@@ -344,7 +344,7 @@ In English:
   finished by the time we need it because we waited for origin too.
 - If origin drains before the auction completes: body close held until either auction
   completes or `A_deadline` fires. Hold is bounded by `A_deadline`.
-- If `A_deadline` fires first: TS injects `__ts_bids = {}` (graceful no-bid fallback)
+- If `A_deadline` fires first: TS injects `tsjs.bids = {}` (graceful no-bid fallback)
   and emits the close tag. GPT proceeds without bid targeting; GAM runs its own auction.
   This is the **soft inner deadline watchdog** — auction overrun never blocks the page
   past `A_deadline`.
@@ -371,12 +371,12 @@ and resource load time, exactly the same as a page without TS in the path.
 
 TS injects two `<script>` blocks into the HTML response:
 
-1. **`window.__ts_ad_slots`** — at `<head>` open, immediately from config. No auction
+1. **`window.tsjs.adSlots`** — at `<head>` open, immediately from config. No auction
    wait. Available to GPT the moment the browser parses `<head>`.
-2. **`window.__ts_bids`** — before `</body>`, after the bounded hold described in §4.3.
+2. **`window.tsjs.bids`** — before `</body>`, after the bounded hold described in §4.3.
    Carries the per-slot Prebid targeting and `nurl`/`burl` for billing.
 
-#### `__ts_ad_slots` (at `<head>` open)
+#### `tsjs.adSlots` (at `<head>` open)
 
 Owned by the `gpt` integration head injector:
 
@@ -402,7 +402,7 @@ Owned by the `gpt` integration head injector:
 ]
 ```
 
-#### `__ts_bids` (before `</body>`)
+#### `tsjs.bids` (before `</body>`)
 
 JSON object keyed by slot ID:
 
@@ -432,10 +432,10 @@ because both are fired client-side from `slotRenderEnded` (see §4.5).
 
 #### Injection mechanic
 
-`__ts_ad_slots` is emitted via the existing `el.prepend()` head handler (already used
+`tsjs.adSlots` is emitted via the existing `el.prepend()` head handler (already used
 by integrations for head-tag injection).
 
-`__ts_bids` is emitted via lol_html's `el.on_end_tag()` registered against the body
+`tsjs.bids` is emitted via lol_html's `el.on_end_tag()` registered against the body
 element. The handler reads from a shared auction-result state (resolved by the auction
 task, fallback to `{}` on watchdog) and calls
 `end_tag.before(<script>...</script>, ContentType::Html)`.
@@ -446,7 +446,7 @@ task, fallback to `{}` on watchdog) and calls
 > U+2029 are unicode-escaped to neutralize any markup that could break out of the
 > `<script>` context.
 
-> **Cache contract (load-bearing invariant):** The HTML response with `__ts_bids`
+> **Cache contract (load-bearing invariant):** The HTML response with `tsjs.bids`
 > contains per-user bid data inline. TS sets **`Cache-Control: private, max-age=0`** on
 > the browser-facing response. **`Surrogate-Control` and `Fastly-Surrogate-Control`
 > are stripped** so downstream Fastly-aware caches do not override the directive. The
@@ -465,12 +465,12 @@ auctions whose bids never actually rendered (direct deal won the GAM line item, 
 backfill won, user navigated away before tsjs loaded, etc.) — that's billing inflation
 and a violation of MRC counting standards.
 
-**Render-confirmed firing pattern (registered in `__tsAdInit`):**
+**Render-confirmed firing pattern (registered in `tsjs.adInit`):**
 
 ```javascript
 googletag.pubads().addEventListener('slotRenderEnded', function (event) {
   var slotId = event.slot.getSlotElementId()
-  var bidData = (window.__ts_bids || {})[slotId] || {}
+  var bidData = (window.tsjs.bids || {})[slotId] || {}
   var ourBidWon =
     !event.isEmpty &&
     bidData.hb_adid &&
@@ -500,14 +500,14 @@ path.
 ### 4.6 Client Residual
 
 Prebid.js is removed from the page-load critical path. A small inline shim
-(`__tsAdInit`) reads `window.__ts_bids` synchronously from the page, drives GPT
+(`tsjs.adInit`) reads `window.tsjs.bids` synchronously from the page, drives GPT
 directly, and registers the `slotRenderEnded` listener for win/billing pixels. **No
 fetch, no Promise, no second round-trip — bids are already on the page.**
 
 ```javascript
-window.__tsAdInit = function () {
-  var slots = window.__ts_ad_slots || []
-  var bids = window.__ts_bids || {}
+window.tsjs.adInit = function () {
+  var slots = window.tsjs.adSlots || []
+  var bids = window.tsjs.bids || {}
 
   googletag.cmd.push(function () {
     slots.forEach(function (slot) {
@@ -585,14 +585,14 @@ sibling module loaded post-`window.load`.
 
 #### Failure modes
 
-- **`__ts_bids = {}`** (auction watchdog fired or zero bids above floor): GPT runs
+- **`tsjs.bids = {}`** (auction watchdog fired or zero bids above floor): GPT runs
   without bid targeting; GAM falls back to its own auction. Same graceful degradation
   path as a no-bid scenario today.
-- **`__ts_bids` missing entirely** (consent denied, bot UA, no slot match): same
+- **`tsjs.bids` missing entirely** (consent denied, bot UA, no slot match): same
   fallback, plus the page proceeds with no TS ad stack at all.
 - **slim-Prebid fails to load:** refresh auctions don't fire; initial-render
   impressions unaffected. Publisher's existing GPT refresh logic (if any) takes over.
-- **`__tsAdInit` not yet defined when `</body>` script executes:** the shim is loaded
+- **`tsjs.adInit` not yet defined when `</body>` script executes:** the shim is loaded
   via the `gpt` integration bundle which is part of the head injection — this is a
   build-time invariant, not a runtime risk.
 
@@ -608,8 +608,8 @@ architecture is designed so that everything that can be cached, is.
 | Origin HTML             | Fastly edge HTTP cache             | Yes, if origin sends `Cache-Control: public, max-age=...` |
 | Origin CSS / fonts / JS | Fastly edge + browser              | Yes (typically hashed URLs, immutable)                    |
 | `tsjs` bundle           | Fastly edge + browser              | Yes (already content-hashed via `bundle.rs`, immutable)   |
-| `__ts_ad_slots` payload | Computed per-request               | Sub-millisecond match — not worth caching                 |
-| `__ts_bids` payload     | Live result of per-request auction | Per-user, never shared                                    |
+| `tsjs.adSlots` payload  | Computed per-request               | Sub-millisecond match — not worth caching                 |
+| `tsjs.bids` payload     | Live result of per-request auction | Per-user, never shared                                    |
 | Assembled HTML response | Browser disk cache + BFCache only  | `private, max-age=0` — same-user only, never shared       |
 
 **Architecture:**
@@ -619,7 +619,7 @@ architecture is designed so that everything that can be cached, is.
    caching layer — it leverages the existing Fastly cache.
 2. On request: TS reads from cache (cache hit, ~5ms) or fetches from origin (cache
    miss, ~150ms typical).
-3. TS injects `__ts_ad_slots` at `<head>` open and `__ts_bids` before `</body>` per
+3. TS injects `tsjs.adSlots` at `<head>` open and `tsjs.bids` before `</body>` per
    request. **The cached origin entry is never modified** — modifications happen on
    the per-request assembled response only.
 4. The auction runs in parallel regardless of HTML cache state.
@@ -796,7 +796,7 @@ sequenceDiagram
         end
     end
 
-    Note over E: Force Transfer-Encoding: chunked<br/>Inject __ts_ad_slots at <head> open<br/>Cache-Control: private, max-age=0
+    Note over E: Force Transfer-Encoding: chunked<br/>Inject tsjs.adSlots at <head> open<br/>Cache-Control: private, max-age=0
 
     E-->>B: Stream <head> + body chunks (no hold)
 
@@ -807,14 +807,14 @@ sequenceDiagram
     Note over E: At </body>: hold close tag until<br/>auction_complete OR A_deadline<br/>(bounded by auction_timeout_ms)
 
     alt Auction completes before A_deadline
-        Note over E: Inject __ts_bids JSON before </body><br/>Emit </body>
+        Note over E: Inject tsjs.bids JSON before </body><br/>Emit </body>
     else A_deadline fires first (auction overrun)
-        Note over E: Inject __ts_bids = {} (graceful fallback)<br/>Emit </body>
+        Note over E: Inject tsjs.bids = {} (graceful fallback)<br/>Emit </body>
     end
 
     E-->>B: </body> chunk arrives
 
-    Note over B: tsjs executes (DCL fires)<br/>__tsAdInit reads __ts_bids inline<br/>Defines GPT slots + applies hb_* targeting<br/>Sets ts_initial=1 sentinel<br/>Registers slotRenderEnded listener<br/>googletag.pubads().refresh() fires
+    Note over B: tsjs executes (DCL fires)<br/>tsjs.adInit reads tsjs.bids inline<br/>Defines GPT slots + applies hb_* targeting<br/>Sets ts_initial=1 sentinel<br/>Registers slotRenderEnded listener<br/>googletag.pubads().refresh() fires
 
     B->>G: GET /gampad/ads<br/>with hb_* key-values
 
@@ -824,7 +824,7 @@ sequenceDiagram
 
     Note over B: Creative iframe loads in slot<br/>Fetches sub-resources<br/>(images, scripts, viewability pixels)
 
-    Note over B: 🎯 Creative paints<br/>slotRenderEnded event fires<br/>__tsAdInit checks hb_adid match
+    Note over B: 🎯 Creative paints<br/>slotRenderEnded event fires<br/>tsjs.adInit checks hb_adid match
 
     alt Our Prebid bid won the GAM line item match
         B->>S: navigator.sendBeacon(nurl)<br/>navigator.sendBeacon(burl)
@@ -845,7 +845,7 @@ This is the common case for anonymous visitors on cacheable content pages.
 ```
 t=0ms     GET ts.publisher.com/article arrives at Fastly edge
 
-t=1ms     URL matched against creative-opportunities.toml
+t=1ms     URL matched against [creative_opportunities] slots in trusted-server.toml
           Slots matched: [atf_sidebar_ad, below-content-ad, section_ad]
           EC cookie resolved → KV lookup for EID enrichment
           Consent: TCF Purpose 1 present → auction proceeds
@@ -856,11 +856,11 @@ t=2ms     AuctionOrchestrator.run_auction() dispatched (parallel)
           user.eids decorated from KV graph
           Edge→PBS RTT: ~20–30ms
           Fastly cache lookup dispatched in parallel
-          __ts_ad_slots <script> assembled from config
+          tsjs.adSlots <script> assembled from config
 
 t=5ms     Cache HIT — origin HTML retrieved from Fastly edge cache
           TS forces Transfer-Encoding: chunked
-          __ts_ad_slots injected at <head> open
+          tsjs.adSlots injected at <head> open
           Cache-Control: private, max-age=0 set on response
           Stream begins to browser
 
@@ -874,14 +874,14 @@ t=60ms    </head> chunk reaches browser (no hold)
 t=80ms    FIRST CONTENTFUL PAINT ✨ (auction never blocked rendering)
 
 t=502ms   Server-side auction completes (≤500ms budget) or A_deadline fires
-          Winning bids selected; nurl/burl per slot included in __ts_bids
-          __ts_bids JSON injected before </body>
+          Winning bids selected; nurl/burl per slot included in tsjs.bids
+          tsjs.bids JSON injected before </body>
           </body> emitted
           (origin drained at t=5ms, so </body> was held ~497ms — DCL slip)
 
 t=510ms   </body> reaches browser
           tsjs executes (DCL fires)
-          __tsAdInit reads __ts_bids inline (no fetch)
+          tsjs.adInit reads tsjs.bids inline (no fetch)
           GPT slots defined; hb_* + ts_initial=1 targeting applied
           slotRenderEnded listener registered
           googletag.pubads().refresh() fires
@@ -913,12 +913,12 @@ t=1ms     URL matched, EC lookup, consent + gate checks
 t=2ms     Auction dispatched, origin fetch dispatched in parallel
 
 t=150ms   Origin HTML arrives at edge (cache miss — full origin RTT)
-          TS forces chunked encoding, injects __ts_ad_slots at <head> open
+          TS forces chunked encoding, injects tsjs.adSlots at <head> open
           Stream begins to browser
 
 t=200ms   </head> reaches browser (no hold)
 t=250ms   FIRST CONTENTFUL PAINT
-t=502ms   Auction completes; __ts_bids injected; </body> emitted
+t=502ms   Auction completes; tsjs.bids injected; </body> emitted
           (origin drained at 150ms, auction at 502ms — </body> held ~352ms)
 t=512ms   </body> reaches browser; tsjs runs; refresh() fires
 t=622ms   GET /gampad/ads
@@ -1002,13 +1002,14 @@ saving.
 
 ### New
 
-- `creative-opportunities.toml` — slot template config file at repo root
+- `[[creative_opportunities.slot]]` entries in `trusted-server.toml` — slot template
+  config (consolidated; no separate file)
 - `crates/trusted-server-core/src/creative_opportunities.rs` — config types, TOML
   parsing, URL glob matching, slot-to-`AdSlot` conversion
 - `crates/trusted-server-core/src/price_bucket.rs` — Prebid price granularity tables
   (dense default; publisher-configurable); converts raw CPM `f64` to `hb_pb` string
-- `crates/trusted-server-core/build.rs` updates — `include_str!()` for
-  `creative-opportunities.toml`; startup slot-ID validation
+- `crates/trusted-server-core/build.rs` updates — startup slot-ID validation against
+  `trusted-server.toml` `[creative_opportunities]` section
 - **slim-Prebid bundle build target** — custom Prebid build with TS-handled bid
   adapters removed; bundled with `crates/js/lib/src/integrations/gpt/` and lazy-loaded
   post-`window.load`. Bundle composition tracked in §9.8.
@@ -1034,15 +1035,15 @@ saving.
 - **`crates/trusted-server-adapter-fastly/src/main.rs`** — `.await` the now-async
   publisher handler; pass orchestrator reference
 - **`crates/trusted-server-core/src/html_processor.rs`**:
-  - Inject `window.__ts_ad_slots` at `<head>` open via existing `el.prepend()` head
+  - Inject `window.tsjs.adSlots` at `<head>` open via existing `el.prepend()` head
     handler (no hold)
-  - Inject `window.__ts_bids` before `</body>` via lol_html's `el.on_end_tag()` on
+  - Inject `window.tsjs.bids` before `</body>` via lol_html's `el.on_end_tag()` on
     the body element, reading from shared auction-result state
   - Set `Cache-Control: private, max-age=0` on the assembled response
   - Strip `Surrogate-Control` and `Fastly-Surrogate-Control` from the response
 - **`crates/trusted-server-core/src/integrations/gpt.rs`** — extend head injector to
-  emit `window.__ts_ad_slots` from matched slots; emit `__tsAdInit` bootstrap script
-- **`crates/js/lib/src/integrations/gpt/index.ts`** — add `__tsAdInit` function with
+  emit `window.tsjs.adSlots` from matched slots; emit `tsjs.adInit` bootstrap script
+- **`crates/js/lib/src/integrations/gpt/index.ts`** — add `tsjs.adInit` function with
   synchronous bid read, `slotRenderEnded` nurl + burl firing, `ts_initial` sentinel;
   add lazy slim-Prebid loader scheduled for post-`window.load`
 - **`crates/trusted-server-core/src/integrations/prebid.rs`** — add
@@ -1069,16 +1070,16 @@ saving.
 
 ## 8. Edge Cases
 
-**No slots match the URL** — auction is not fired. `__ts_bids` is omitted. The page
-renders with `__ts_ad_slots` still absent (no slots = no slot config to inject); no
+**No slots match the URL** — auction is not fired. `tsjs.bids` is omitted. The page
+renders with `tsjs.adSlots` still absent (no slots = no slot config to inject); no
 `</body>` hold. Existing client-side Prebid/GPT flow runs unmodified (for publishers
 in dual-mode rollout).
 
-**Consent absent or denied** — auction is not fired. `__ts_bids` is omitted; `</body>`
+**Consent absent or denied** — auction is not fired. `tsjs.bids` is omitted; `</body>`
 flushes immediately on origin emit. `Cache-Control: private, max-age=0` is still set.
 Page loads normally; GAM runs its own auction without TS targeting.
 
-**Bot / crawler User-Agent** — auction skipped. `__ts_bids` omitted; `</body>` flushes
+**Bot / crawler User-Agent** — auction skipped. `tsjs.bids` omitted; `</body>` flushes
 immediately. SSP QPS budget preserved. Crawlers typically don't render JS, but if they
 do, GPT runs without TS targeting.
 
@@ -1089,11 +1090,11 @@ triggers a real auction.
 
 **HEAD request** — auction skipped; response carries headers only.
 
-**Auction times out with partial results (watchdog)** — `__ts_bids` includes whatever
+**Auction times out with partial results (watchdog)** — `tsjs.bids` includes whatever
 bids arrived before `A_deadline`. Slots with no bid are omitted. GPT fires without
 pre-set targeting for those slots; GAM falls back to its own auction.
 
-**Auction times out with zero results** — `__ts_bids = {}` injected. All slots fire
+**Auction times out with zero results** — `tsjs.bids = {}` injected. All slots fire
 GAM without bid targeting. No revenue impact beyond the timeout scenario itself.
 
 **Buffered origin (WordPress, Drupal, Rails, NextJS 14, static sites)** — origin
@@ -1123,7 +1124,7 @@ enriched impressions. Subsequent navigations populate the EC graph. Measure via 
 **BFCache restoration** — user navigates back to a TS-served page. Browser restores
 the page from BFCache (eligible because we set `private, max-age=0`, not `no-store`).
 Already-rendered ads display from the BFCache snapshot; no new GAM call fires; no new
-auction needed. `__ts_bids` in JS heap is stale but inert. This is the desired
+auction needed. `tsjs.bids` in JS heap is stale but inert. This is the desired
 behavior — instant back-button restore for the user.
 
 **Slow origin (origin drain > A_deadline)** — `</body>` waits for origin regardless
@@ -1135,15 +1136,16 @@ impressions are unaffected. Publisher's existing GPT refresh logic (if any) take
 over. Phase B identity refresh doesn't happen for that session — EC graph staleness
 shifts to next session's S2S sync.
 
-**`creative-opportunities.toml` missing or malformed** — startup fails with a clear
-error. No silent degradation.
+**`[creative_opportunities]` missing or malformed in `trusted-server.toml`** — startup
+fails with a clear error. No silent degradation.
 
 **Config empty (zero slots)** — treated as "no match" for all URLs; auction never
-fires. No error. Useful as a kill-switch: deploying an empty
-`creative-opportunities.toml` disables the feature without a code change.
+fires. No error. Useful as a kill-switch: deploying an empty `[creative_opportunities]`
+section (or removing all `[[creative_opportunities.slot]]` entries) disables the
+feature without a code change.
 
 **Slot ID not found in PBS stored requests** — PBS returns a no-bid for that slot.
-Slot is omitted from `__ts_bids`. The remaining slots proceed normally.
+Slot is omitted from `tsjs.bids`. The remaining slots proceed normally.
 
 ---
 
@@ -1151,7 +1153,7 @@ Slot is omitted from `__ts_bids`. The remaining slots proceed normally.
 
 1. **URL pattern coverage** — does `/20**` cover all article paths, or are there
    non-date-prefixed article URLs? Publisher to confirm per onboarding.
-2. **PBS stored request setup** — slot IDs in `creative-opportunities.toml` must have
+2. **PBS stored request setup** — slot IDs in `trusted-server.toml` `[creative_opportunities]` must have
    corresponding stored requests configured in the publisher's PBS instance before
    this goes live. Recommend a CI check or startup probe to PBS that lists stored
    requests and diffs against the toml; tracked as a Phase 1 implementation item.
@@ -1171,12 +1173,12 @@ Slot is omitted from `__ts_bids`. The remaining slots proceed normally.
    (`securepubads.g.doubleclick.net`, ~110ms RTT). Routing GAM through the edge would
    eliminate that hop, but it requires Google agreement which is a business
    negotiation, not an engineering decision. **Aspirational, not committed for any
-   phase.** The current architecture is shape-compatible (`__ts_ad_slots` gives the
+   phase.** The current architecture is shape-compatible (`tsjs.adSlots` gives the
    edge full slot inventory) so no rework would be required if Google agrees later.
-7. **`tsjs-gpt` bootstrap delivery** — ✅ Resolved: `__tsAdInit` is part of the
+7. **`tsjs-gpt` bootstrap delivery** — ✅ Resolved: `tsjs.adInit` is part of the
    existing `gpt` integration bundle, not a new integration. Injection order:
-   `window.__ts_ad_slots` (head) → existing GPT shim → `__tsAdInit` (head) →
-   `window.__ts_bids` (body close). Bid script can rely on `__tsAdInit` and slot
+   `window.tsjs.adSlots` (head) → existing GPT shim → `tsjs.adInit` (head) →
+   `window.tsjs.bids` (body close). Bid script can rely on `tsjs.adInit` and slot
    config being defined.
 8. **slim-Prebid bundle composition** — which userID modules ship in the lazy bundle?
    Default candidates: ID5, sharedID, LiveRamp ATS, Lockr. Each adds bundle weight
