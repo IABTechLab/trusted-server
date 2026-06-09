@@ -457,7 +457,8 @@ mod tests {
     #[test]
     fn to_ad_slot_injects_trusted_server_when_prebid_bidders_empty() {
         let mut slot = make_slot("header", vec!["/"]);
-        slot.targeting.insert("zone".to_string(), "header".to_string());
+        slot.targeting
+            .insert("zone".to_string(), "header".to_string());
         slot.providers.prebid = Some(PrebidSlotParams {
             bidders: HashMap::new(),
         });
@@ -515,7 +516,10 @@ mod tests {
             .bidders
             .get("mocktioneer")
             .expect("should have mocktioneer bidder");
-        assert_eq!(params.get("custom").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            params.get("custom").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

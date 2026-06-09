@@ -328,6 +328,12 @@ async fn route_request(
     let path = req.get_path().to_string();
     let method = req.get_method().clone();
 
+    let registry_ref = if partner_registry.is_empty() {
+        None
+    } else {
+        Some(partner_registry)
+    };
+
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
         // Serve the tsjs library
@@ -368,30 +374,32 @@ async fn route_request(
         }
 
         // Unified auction endpoint (returns creative HTML inline)
-        (Method::POST, "/auction") => {
-            let registry_ref = if partner_registry.is_empty() {
-                None
-            } else {
-                Some(partner_registry)
-            };
-            (
-                handle_auction(
-                    settings,
-                    orchestrator,
-                    kv_graph.as_ref(),
-                    registry_ref,
-                    &ec_context,
-                    runtime_services,
-                    req,
-                )
-                .await,
-                false,
+        (Method::POST, "/auction") => (
+            handle_auction(
+                settings,
+                orchestrator,
+                kv_graph.as_ref(),
+                registry_ref,
+                &ec_context,
+                runtime_services,
+                req,
             )
-        }
+            .await,
+            false,
+        ),
 
         // SPA/CSR navigation endpoint — returns slots + bids JSON for the given path
         (Method::GET, "/__ts/page-bids") => (
-            handle_page_bids(settings, orchestrator, runtime_services, slots, req).await,
+            handle_page_bids(
+                settings,
+                orchestrator,
+                runtime_services,
+                kv_graph.as_ref(),
+                registry_ref,
+                slots,
+                req,
+            )
+            .await,
             false,
         ),
 
@@ -443,6 +451,7 @@ async fn route_request(
                 trusted_server_core::publisher::AuctionDispatch {
                     orchestrator,
                     slots,
+                    registry: registry_ref,
                 },
                 req,
             )

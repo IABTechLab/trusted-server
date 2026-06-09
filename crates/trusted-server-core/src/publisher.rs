@@ -18,15 +18,20 @@ use error_stack::{Report, ResultExt};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
+use crate::auction::endpoints::{
+    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
+};
 use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
 use crate::backend::BackendConfig;
 use crate::compat;
-use crate::constants::HEADER_X_COMPRESS_HINT;
-use crate::cookies::{handle_request_cookies, parse_ts_eids_cookie};
+use crate::consent::gate_eids_by_consent;
+use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::cookies::handle_request_cookies;
 use crate::ec::kv::KvIdentityGraph;
+use crate::ec::registry::PartnerRegistry;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
@@ -810,6 +815,8 @@ pub struct AuctionDispatch<'a> {
     pub orchestrator: &'a crate::auction::orchestrator::AuctionOrchestrator,
     /// Creative opportunity slot definitions matched against the request path.
     pub slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
+    /// Partner registry for KV-backed EID resolution. `None` skips KV enrichment.
+    pub registry: Option<&'a PartnerRegistry>,
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -968,7 +975,19 @@ pub async fn handle_publisher_request(
             &request_info,
             req.get_header_str("user-agent"),
         );
-        auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
+        let ts_eids_value = cookie_jar
+            .as_ref()
+            .and_then(|j| j.get(COOKIE_TS_EIDS))
+            .map(|c| c.value().to_owned());
+        let client_eids = resolve_client_auction_eids(None, ts_eids_value.as_deref());
+        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
+        let merged_eids = merge_auction_eids(client_eids, kv_eids);
+        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+        auction_request.user.eids =
+            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        if had_eids && auction_request.user.eids.is_none() {
+            log::warn!("Server-side auction EIDs stripped by TCF consent gating");
+        }
         let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
         if client_ip.is_some() || geo.is_some() {
             let device = auction_request.device.get_or_insert(DeviceInfo {
@@ -1456,6 +1475,8 @@ pub async fn handle_page_bids(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
+    kv: Option<&KvIdentityGraph>,
+    registry: Option<&PartnerRegistry>,
     slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
@@ -1527,7 +1548,19 @@ pub async fn handle_page_bids(
                 &request_info,
                 req.get_header_str("user-agent"),
             );
-            auction_request.user.eids = parse_ts_eids_cookie(cookie_jar.as_ref());
+            let ts_eids_value = cookie_jar
+                .as_ref()
+                .and_then(|j| j.get(COOKIE_TS_EIDS))
+                .map(|c| c.value().to_owned());
+            let client_eids = resolve_client_auction_eids(None, ts_eids_value.as_deref());
+            let kv_eids = resolve_auction_eids(kv, registry, &ec_ctx);
+            let merged_eids = merge_auction_eids(client_eids, kv_eids);
+            let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+            auction_request.user.eids =
+                gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+            if had_eids && auction_request.user.eids.is_none() {
+                log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
+            }
             let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
             if client_ip.is_some() || geo.is_some() {
                 let device = auction_request.device.get_or_insert(DeviceInfo {
@@ -3133,9 +3166,10 @@ mod tests {
             let services = noop_services();
             let req = make_page_bids_request("/2024/01/my-article/");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &[], req)
-                .await
-                .expect("should return ok response");
+            let response =
+                handle_page_bids(&settings, &orchestrator, &services, None, None, &[], req)
+                    .await
+                    .expect("should return ok response");
 
             let body: serde_json::Value =
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
@@ -3170,9 +3204,10 @@ mod tests {
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
-                .await
-                .expect("should return ok response");
+            let response =
+                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
+                    .await
+                    .expect("should return ok response");
 
             let body: serde_json::Value =
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
@@ -3206,9 +3241,10 @@ mod tests {
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("sec-purpose", "prefetch");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
-                .await
-                .expect("should return ok response");
+            let response =
+                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
+                    .await
+                    .expect("should return ok response");
 
             let body: serde_json::Value =
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
@@ -3240,9 +3276,10 @@ mod tests {
             let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
-                .await
-                .expect("should return ok response");
+            let response =
+                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
+                    .await
+                    .expect("should return ok response");
 
             let body: serde_json::Value =
                 serde_json::from_slice(&response.into_body_bytes()).expect("should be json");

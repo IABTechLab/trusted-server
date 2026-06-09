@@ -3,17 +3,18 @@
 //! This module provides functionality for parsing, stripping, and forwarding cookies
 //! used in the trusted server system.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::header;
 use http::Request;
 
-use crate::constants::{
-    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EIDS, COOKIE_US_PRIVACY,
-};
+#[cfg(test)]
+use crate::constants::COOKIE_TS_EIDS;
+use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
 use crate::error::TrustedServerError;
+#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 /// Cookie names carrying privacy consent signals.
 ///
@@ -81,6 +82,7 @@ pub fn handle_request_cookies(
 /// Returns `None` if the cookie is absent, base64-malformed, JSON-malformed,
 /// or the decoded array is empty. Parse failures are logged at `debug` level
 /// so operators can diagnose JS SDK / server mismatches.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn parse_ts_eids_cookie(jar: Option<&CookieJar>) -> Option<Vec<crate::openrtb::Eid>> {
     let value = jar?.get(COOKIE_TS_EIDS)?.value().to_owned();

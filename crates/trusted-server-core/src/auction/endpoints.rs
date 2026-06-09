@@ -208,7 +208,7 @@ pub async fn handle_auction(
 /// Returns `None` when any prerequisite is missing (no KV store, no partner
 /// store, no EC, consent denied). On KV or partner-resolution errors, logs a
 /// warning and returns empty EIDs so the auction can proceed in degraded mode.
-fn resolve_auction_eids(
+pub(crate) fn resolve_auction_eids(
     kv: Option<&KvIdentityGraph>,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
@@ -251,7 +251,7 @@ fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
     None
 }
 
-fn resolve_client_auction_eids(
+pub(crate) fn resolve_client_auction_eids(
     raw: Option<&JsonValue>,
     cookie_value: Option<&str>,
 ) -> Option<Vec<Eid>> {
@@ -347,7 +347,7 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
     Some(Uid { id, atype, ext })
 }
 
-fn merge_auction_eids(
+pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
