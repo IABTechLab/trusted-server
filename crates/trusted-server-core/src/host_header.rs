@@ -1,5 +1,22 @@
+//! Validation for operator-configured outbound `Host` header overrides.
+//!
+//! These helpers intentionally validate only configuration values. Request input
+//! must not flow into this module because outbound `Host` controls origin
+//! routing and SigV4-style signing decisions.
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// Validate an outbound `Host` header override value.
+///
+/// Accepts only a DNS name, IPv4 address, or bracketed IPv6 literal with an
+/// optional port. Rejects schemes, userinfo, paths, queries, fragments,
+/// whitespace, control characters, and malformed ports so a configured override
+/// cannot smuggle additional URL components into the upstream request.
+///
+/// # Errors
+///
+/// Returns a static validation reason when the value is not a valid `Host`
+/// header override.
 pub(crate) fn validate_host_header_override_value(value: &str) -> Result<(), &'static str> {
     if value.is_empty() {
         return Err("must not be empty");

@@ -150,20 +150,22 @@ impl AssetProxyResponse {
         self.cache_policy
     }
 
-    /// Consume this wrapper and return the Fastly response.
+    /// Consume this wrapper and return a buffered Fastly response.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the response carries a streaming body. Use
-    /// [`Self::into_response_and_body`] when the caller needs to handle both
-    /// buffered and streaming asset responses.
-    #[must_use]
-    pub fn into_response(self) -> Response {
-        assert!(
-            self.stream_body.is_none(),
-            "should consume streaming asset responses with into_response_and_body"
-        );
-        self.response
+    /// Returns [`TrustedServerError::Proxy`] when the response carries a
+    /// streaming body. Use [`Self::into_response_and_body`] when the caller
+    /// needs to handle both buffered and streaming asset responses.
+    pub fn into_response(self) -> Result<Response, Report<TrustedServerError>> {
+        if self.stream_body.is_some() {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "streaming asset response cannot be converted into a buffered response"
+                    .to_string(),
+            }));
+        }
+
+        Ok(self.response)
     }
 
     /// Consume this wrapper and return the response headers plus optional stream body.
@@ -973,7 +975,7 @@ async fn preflight_s3_origin_for_image_optimizer(
     }
 
     if request_method == Method::HEAD {
-        let mut response = head_response.into_response();
+        let mut response = head_response.into_response()?;
         strip_asset_proxy_response_headers(&mut response);
         apply_no_store_cache_control(&mut response);
         return Ok(Some(AssetProxyResponse::no_store_private(response)));
@@ -1867,6 +1869,7 @@ fn reconstruct_and_validate_signed_target(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -1917,6 +1920,14 @@ mod tests {
         ) -> Result<PlatformResponse, Report<PlatformError>> {
             let edge_response = edge_response_builder()
                 .status(StatusCode::OK)
+                .header(header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure")
+                .header(header::SET_COOKIE.as_str(), "other=2; Path=/; Secure")
+                .header(
+                    header::STRICT_TRANSPORT_SECURITY.as_str(),
+                    "max-age=31536000; includeSubDomains; preload",
+                )
+                .header("clear-site-data", "\"*\"")
+                .header(header::ETAG.as_str(), "\"stream-etag\"")
                 .body(EdgeBody::stream(futures::stream::iter(vec![
                     Bytes::from_static(b"chunk"),
                 ])))
@@ -2974,7 +2985,8 @@ mod tests {
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy asset request")
-            .into_response();
+            .into_response()
+            .expect("should return buffered asset response");
         assert_eq!(response.get_status(), StatusCode::OK);
 
         let all_headers = stub.recorded_request_headers();
@@ -3066,7 +3078,8 @@ mod tests {
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy asset request")
-            .into_response();
+            .into_response()
+            .expect("should return buffered asset response");
 
         assert!(
             response.get_header(header::SET_COOKIE).is_none(),
@@ -3445,7 +3458,8 @@ mod tests {
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy raw SVG asset through S3 route")
-            .into_response();
+            .into_response()
+            .expect("should return buffered asset response");
 
         assert_eq!(response.take_body_str(), "raw-svg");
         assert_eq!(
@@ -3487,7 +3501,8 @@ mod tests {
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy optimized S3 asset request")
-            .into_response();
+            .into_response()
+            .expect("should return buffered asset response");
 
         assert_eq!(response.get_status(), StatusCode::OK);
         assert_eq!(response.take_body_str(), "optimized");
@@ -3556,7 +3571,9 @@ mod tests {
             AssetProxyCachePolicy::NoStorePrivate,
             "should carry a typed no-store policy for router finalization"
         );
-        let mut response = asset_response.into_response();
+        let mut response = asset_response
+            .into_response()
+            .expect("should return buffered asset response");
 
         assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
         assert_eq!(
@@ -3613,7 +3630,8 @@ mod tests {
         let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy debug S3 asset request")
-            .into_response();
+            .into_response()
+            .expect("should return buffered asset response");
 
         assert_eq!(response.take_body_str(), "raw");
         assert_eq!(
@@ -3681,6 +3699,26 @@ mod tests {
             .expect("should proxy a streaming asset response")
             .into_response_and_body();
         assert_eq!(response.get_status(), StatusCode::OK);
+        assert!(
+            response.get_header(header::SET_COOKIE).is_none(),
+            "should strip upstream Set-Cookie headers from streaming asset responses"
+        );
+        assert!(
+            response
+                .get_header(header::STRICT_TRANSPORT_SECURITY)
+                .is_none(),
+            "should strip upstream HSTS headers from streaming asset responses"
+        );
+        assert!(
+            response.get_header("clear-site-data").is_none(),
+            "should strip upstream Clear-Site-Data headers from streaming asset responses"
+        );
+        assert_eq!(
+            response.get_header_str(header::ETAG),
+            Some("\"stream-etag\""),
+            "should preserve safe cache validator headers on streaming asset responses"
+        );
+
         let mut output = Vec::new();
         stream_asset_body(
             stream_body.expect("should preserve asset body as a stream"),
@@ -3690,6 +3728,49 @@ mod tests {
         .expect("should stream asset body");
 
         assert_eq!(output, b"chunk");
+    }
+
+    #[tokio::test]
+    async fn stream_asset_body_reports_mid_stream_origin_errors() {
+        let body = EdgeBody::from_stream(futures::stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
+            Err(io::Error::other("origin stream failed")),
+        ]));
+        let mut output = Vec::new();
+
+        let err = stream_asset_body(body, &mut output)
+            .await
+            .expect_err("should report mid-stream origin errors");
+
+        assert_eq!(
+            output, b"partial",
+            "should only write chunks received before the stream error"
+        );
+        assert!(
+            format!("{err:?}").contains("streaming platform response body failed"),
+            "should describe the streaming failure: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_proxy_response_into_response_rejects_stream_body() {
+        let services = build_services_with_http_client(
+            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+            .await
+            .expect("should proxy a streaming asset response");
+
+        let err = asset_response
+            .into_response()
+            .expect_err("streaming asset responses should require explicit stream handling");
+        assert!(
+            format!("{err:?}").contains("streaming asset response cannot be converted"),
+            "should describe the buffered conversion failure: {err:?}"
+        );
     }
 
     #[tokio::test]

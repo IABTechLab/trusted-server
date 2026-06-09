@@ -21,6 +21,7 @@ pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Publisher {
     #[validate(custom(function = validate_publisher_domain))]
     pub domain: String,
@@ -2386,6 +2387,22 @@ origin_host_header_override = "www.example.com:8443""#,
     }
 
     #[test]
+    fn publisher_rejects_unknown_fields() {
+        let toml_str = crate_test_settings_str().replace(
+            r#"origin_url = "https://origin.test-publisher.com""#,
+            r#"origin_url = "https://origin.test-publisher.com"
+origin_host_header_overide = "www.example.com""#,
+        );
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("unknown publisher fields should fail configuration loading");
+        assert!(
+            format!("{err:?}").contains("origin_host_header_overide"),
+            "error should identify the misspelled publisher field: {err:?}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_invalid_origin_host_header_overrides() {
         for override_value in [
             "",
@@ -3114,6 +3131,25 @@ origin_host_header_override = "www.example.com:8443""#,
                 Some("www.example.com")
             );
             assert_eq!(settings.publisher.origin_host_header(), "www.example.com");
+        });
+    }
+
+    #[test]
+    fn test_origin_host_header_override_env_typo_fails_closed() {
+        let env_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERIDE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+
+        temp_env::with_var(env_key, Some("www.example.com"), || {
+            let err = Settings::from_toml_and_env(&crate_test_settings_str())
+                .expect_err("misspelled host override env var should fail configuration loading");
+            assert!(
+                format!("{err:?}").contains("origin_host_header_overide"),
+                "error should identify the misspelled publisher env field: {err:?}"
+            );
         });
     }
 

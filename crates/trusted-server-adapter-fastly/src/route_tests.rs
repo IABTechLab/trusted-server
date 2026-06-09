@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
@@ -140,6 +141,10 @@ struct RecordingHttpClient {
     response_headers: Vec<(String, String)>,
 }
 
+struct StreamingRecordingHttpClient {
+    calls: Mutex<Vec<RecordedHttpCall>>,
+}
+
 impl RecordingHttpClient {
     fn new(response_status: StatusCode) -> Self {
         Self {
@@ -161,10 +166,19 @@ impl RecordingHttpClient {
     }
 }
 
+impl StreamingRecordingHttpClient {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 struct RecordedHttpCall {
     method: Method,
     uri: String,
     backend_name: String,
+    stream_response: bool,
 }
 
 struct FixedBackend;
@@ -192,6 +206,7 @@ impl PlatformHttpClient for RecordingHttpClient {
                 method: request.request.method().clone(),
                 uri: request.request.uri().to_string(),
                 backend_name: request.backend_name,
+                stream_response: request.stream_response,
             });
 
         let mut builder = edge_response_builder().status(self.response_status);
@@ -200,6 +215,47 @@ impl PlatformHttpClient for RecordingHttpClient {
         }
         let edge_response = builder
             .body(EdgeBody::from(Vec::new()))
+            .map_err(|_| Report::new(PlatformError::HttpClient))?;
+
+        Ok(PlatformResponse::new(edge_response))
+    }
+
+    async fn send_async(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+
+    async fn select(
+        &self,
+        _pending_requests: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for StreamingRecordingHttpClient {
+    async fn send(
+        &self,
+        request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        self.calls
+            .lock()
+            .expect("should lock calls")
+            .push(RecordedHttpCall {
+                method: request.request.method().clone(),
+                uri: request.request.uri().to_string(),
+                backend_name: request.backend_name,
+                stream_response: request.stream_response,
+            });
+
+        let edge_response = edge_response_builder()
+            .status(StatusCode::OK)
+            .body(EdgeBody::stream(futures::stream::iter(vec![
+                Bytes::from_static(b"streamed-asset"),
+            ])))
             .map_err(|_| Report::new(PlatformError::HttpClient))?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -752,6 +808,72 @@ fn asset_routes_skip_ec_finalization_cookie_mutations() {
         None,
         "should not emit EC identity headers on asset responses"
     );
+}
+
+#[test]
+fn asset_routes_stream_asset_responses_directly() {
+    let mut settings = create_test_settings();
+    settings.proxy.asset_routes = vec![ProxyAssetRoute::new(
+        "/.images/",
+        "https://assets.example.com",
+    )];
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry = test_partner_registry(&settings);
+
+    let mut req = Request::get("https://test.com/.images/logo.png");
+    req.set_header(header::COOKIE, format!("ts-ec={}", valid_ec_id()));
+    req.set_header("sec-gpc", "1");
+    let http_client = Arc::new(StreamingRecordingHttpClient::new());
+    let services = test_runtime_services_with_secret_http_client_and_geo(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::new(NoopSecretStore),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+        Arc::new(FixedGeo(us_california_geo())),
+    );
+
+    let outcome = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &partner_registry,
+        &services,
+        req,
+    ))
+    .expect("should route streaming asset request");
+
+    assert!(
+        outcome.response.is_none(),
+        "streaming asset route should send directly instead of returning a buffered response"
+    );
+    assert!(
+        outcome.pull_sync_context.is_none(),
+        "asset routes should not schedule publisher pull-sync work"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should send exactly one asset request");
+    assert!(
+        calls[0].stream_response,
+        "asset routes should request a streaming origin response from the platform"
+    );
+    assert_eq!(
+        calls[0].backend_name, "https-assets.example.com",
+        "should resolve the configured asset backend, not the publisher origin"
+    );
+    assert_eq!(
+        calls[0].uri, "https://assets.example.com/.images/logo.png",
+        "should send the request to the configured asset origin"
+    );
+    // `stream_to_client` commits headers and bytes into the Fastly host runtime,
+    // leaving no buffered `Response` for this route-level test to inspect. Core
+    // proxy tests assert unsafe header stripping on the real streaming body; this
+    // test pins the adapter contract that successful streaming asset responses
+    // take the `response: None` direct-send path with EC finalization skipped.
 }
 
 #[test]
