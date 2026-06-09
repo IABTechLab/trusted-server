@@ -12,6 +12,7 @@ use glob::Pattern;
 
 use crate::auction::types::{AdFormat, AdSlot, MediaType};
 use crate::price_bucket::PriceGranularity;
+use crate::settings::vec_from_seq_or_map;
 
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,10 +39,22 @@ pub struct CreativeOpportunitiesConfig {
     /// Price granularity for header-bidding price bucketing.
     #[serde(default = "PriceGranularity::dense")]
     pub price_granularity: PriceGranularity,
+    /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
+    #[serde(default, deserialize_with = "vec_from_seq_or_map")]
+    pub slot: Vec<CreativeOpportunitySlot>,
+}
+
+impl CreativeOpportunitiesConfig {
+    /// Pre-compile glob patterns for all slots. Call once after deserialization.
+    pub fn compile_slots(&mut self) {
+        for slot in &mut self.slot {
+            slot.compile_patterns();
+        }
+    }
 }
 
 /// A single ad placement opportunity on the publisher's site.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitySlot {
     /// Unique identifier for the slot (e.g., `"atf"`, `"below-fold-sidebar"`).
@@ -68,10 +81,10 @@ pub struct CreativeOpportunitySlot {
     pub providers: SlotProviders,
     /// Pre-compiled [`page_patterns`](Self::page_patterns) for hot-path matching.
     ///
-    /// Populated by [`compile_patterns`](Self::compile_patterns) once at file
-    /// load time (see [`CreativeOpportunitiesFile::compile`]). When this is
+    /// Populated by [`compile_patterns`](Self::compile_patterns) once at startup
+    /// via [`CreativeOpportunitiesConfig::compile_slots`]. When this is
     /// empty, [`matches_path`](Self::matches_path) falls back to compiling on
-    /// every call so callers that build slots by hand (tests, legacy code)
+    /// every call so callers that build slots by hand in tests
     /// still work.
     ///
     /// `pub(crate)` rather than private so cross-module test helpers in this
@@ -160,6 +173,11 @@ impl CreativeOpportunitySlot {
     ///
     /// Provider-specific params (e.g., APS `slotID`, PBS bidder params) are wired
     /// into the `bidders` map keyed by provider/bidder name.
+    ///
+    /// When [`PrebidSlotParams::bidders`] is empty, a `trustedServer` entry is
+    /// injected so [`PrebidAuctionProvider`] expands all `config.bidders`
+    /// automatically. The slot's `targeting.zone` value is forwarded as
+    /// `trustedServer.zone` so zone-aware bid-param override rules fire correctly.
     #[must_use]
     pub fn to_ad_slot(&self) -> AdSlot {
         let mut bidders: HashMap<String, serde_json::Value> = HashMap::new();
@@ -168,6 +186,24 @@ impl CreativeOpportunitySlot {
                 "aps".to_string(),
                 serde_json::json!({ "slotID": aps.slot_id }),
             );
+        }
+        if let Some(ref prebid) = self.providers.prebid {
+            if prebid.bidders.is_empty() {
+                // No explicit per-bidder override: let the Prebid provider expand
+                // all config.bidders. The "trustedServer" key triggers
+                // expand_trusted_server_bidders in PrebidAuctionProvider, giving
+                // each bidder an empty params object that the override engine then
+                // fills with zone-aware rules.
+                let mut ts = serde_json::json!({ "bidderParams": {} });
+                if let Some(zone) = self.targeting.get("zone") {
+                    ts["zone"] = serde_json::Value::String(zone.clone());
+                }
+                bidders.insert("trustedServer".to_string(), ts);
+            } else {
+                for (name, params) in &prebid.bidders {
+                    bidders.insert(name.clone(), params.clone());
+                }
+            }
         }
         AdSlot {
             id: self.id.clone(),
@@ -188,7 +224,7 @@ impl CreativeOpportunitySlot {
 }
 
 /// An ad format combining a media type with pixel dimensions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreativeOpportunityFormat {
     /// Creative width in pixels.
     pub width: u32,
@@ -210,38 +246,39 @@ impl CreativeOpportunityFormat {
 }
 
 /// Provider-specific slot identifiers for a [`CreativeOpportunitySlot`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SlotProviders {
     /// Amazon Publisher Services (APS/TAM) slot parameters.
     pub aps: Option<ApsSlotParams>,
+    /// Prebid Server inline bidder parameters.
+    ///
+    /// When present, these are forwarded directly as `ext.prebid.bidder.*`
+    /// in the `OpenRTB` request, bypassing PBS stored request lookup for this slot.
+    /// Useful in development environments where stored requests are not available.
+    pub prebid: Option<PrebidSlotParams>,
 }
 
 /// APS-specific parameters for a slot.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApsSlotParams {
     /// The APS slot ID string used when making TAM bid requests.
     pub slot_id: String,
 }
 
-/// TOML file structure for creative opportunity slot definitions.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct CreativeOpportunitiesFile {
-    /// All slot definitions in the file (mapped from `[[slot]]` TOML arrays).
-    #[serde(rename = "slot", default)]
-    pub slots: Vec<CreativeOpportunitySlot>,
-}
-
-impl CreativeOpportunitiesFile {
-    /// Pre-compile every slot's
-    /// [`page_patterns`](CreativeOpportunitySlot::page_patterns) so
-    /// [`matches_path`](CreativeOpportunitySlot::matches_path) runs without
-    /// re-invoking `Pattern::new` on every request. Call once after loading.
-    pub fn compile(&mut self) {
-        for slot in &mut self.slots {
-            slot.compile_patterns();
-        }
-    }
+/// Inline Prebid Server bidder parameters for a slot.
+///
+/// When `bidders` is empty, `to_ad_slot` injects a `trustedServer` entry so
+/// [`PrebidAuctionProvider`] expands all `config.bidders` automatically.
+/// When `bidders` is non-empty the map is forwarded verbatim, bypassing
+/// automatic expansion (useful for slots that need explicit per-bidder params).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PrebidSlotParams {
+    /// Per-bidder inline params map. Bidder name → params object.
+    ///
+    /// Leave empty (or omit `bidders` in config) to auto-expand all
+    /// `config.bidders` with zone-aware param overrides.
+    #[serde(default)]
+    pub bidders: HashMap<String, serde_json::Value>,
 }
 
 /// Validates that a slot ID contains only safe characters.
@@ -326,16 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn file_compile_populates_every_slot() {
-        let mut file = CreativeOpportunitiesFile {
-            slots: vec![make_slot("a", vec!["/a/*"]), make_slot("b", vec!["/b/*"])],
-        };
-        file.compile();
-        for slot in &file.slots {
+    fn compile_slots_populates_every_slot() {
+        let mut slots = vec![make_slot("a", vec!["/a/*"]), make_slot("b", vec!["/b/*"])];
+        for slot in &mut slots {
+            slot.compile_patterns();
+        }
+        for slot in &slots {
             assert_eq!(
                 slot.compiled_patterns.len(),
                 1,
-                "every slot's patterns should be pre-compiled after file.compile()"
+                "every slot's patterns should be pre-compiled after compile_patterns()"
             );
         }
     }
@@ -415,5 +452,85 @@ mod tests {
         assert_eq!(ad_slot.id, "atf");
         assert_eq!(ad_slot.floor_price, Some(0.50));
         assert_eq!(ad_slot.formats.len(), 1);
+    }
+
+    #[test]
+    fn to_ad_slot_injects_trusted_server_when_prebid_bidders_empty() {
+        let mut slot = make_slot("header", vec!["/"]);
+        slot.targeting.insert("zone".to_string(), "header".to_string());
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::new(),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        let ts = ad_slot
+            .bidders
+            .get("trustedServer")
+            .expect("should have trustedServer bidder");
+        assert_eq!(
+            ts.get("zone").and_then(|v| v.as_str()),
+            Some("header"),
+            "should forward zone from targeting"
+        );
+        assert!(
+            ts.get("bidderParams").is_some(),
+            "should include bidderParams key for expand_trusted_server_bidders"
+        );
+    }
+
+    #[test]
+    fn to_ad_slot_injects_trusted_server_without_zone_when_targeting_absent() {
+        let mut slot = make_slot("no-zone", vec!["/"]);
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::new(),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        let ts = ad_slot
+            .bidders
+            .get("trustedServer")
+            .expect("should have trustedServer bidder");
+        assert!(
+            ts.get("zone").is_none(),
+            "should not inject zone when targeting has no zone key"
+        );
+    }
+
+    #[test]
+    fn to_ad_slot_uses_explicit_bidders_when_nonempty() {
+        let mut slot = make_slot("explicit", vec!["/"]);
+        slot.providers.prebid = Some(PrebidSlotParams {
+            bidders: HashMap::from([(
+                "mocktioneer".to_string(),
+                serde_json::json!({"custom": true}),
+            )]),
+        });
+        let ad_slot = slot.to_ad_slot();
+
+        assert!(
+            !ad_slot.bidders.contains_key("trustedServer"),
+            "should not inject trustedServer when explicit bidders are set"
+        );
+        let params = ad_slot
+            .bidders
+            .get("mocktioneer")
+            .expect("should have mocktioneer bidder");
+        assert_eq!(params.get("custom").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn prebid_slot_params_deserializes_without_bidders_field() {
+        let json = r#"{"bidders": {}}"#;
+        let params: PrebidSlotParams =
+            serde_json::from_str(json).expect("should deserialize with empty bidders");
+        assert!(params.bidders.is_empty(), "should have empty bidders map");
+
+        let json_no_field = r#"{}"#;
+        let params2: PrebidSlotParams =
+            serde_json::from_str(json_no_field).expect("should deserialize without bidders field");
+        assert!(
+            params2.bidders.is_empty(),
+            "should default to empty when bidders field absent"
+        );
     }
 }

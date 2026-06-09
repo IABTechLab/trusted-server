@@ -333,9 +333,132 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
   return pbjs;
 }
 
+// ─── Phase B: GPT scroll/refresh auction handler ──────────────────────────
+
+/**
+ * Install the scroll/refresh auction handler.
+ *
+ * Wraps `googletag.pubads().refresh()` so that when the publisher's GPT
+ * refresh policy fires (sticky anchor, viewability dwell, infinite scroll),
+ * Prebid runs a fresh client-side auction for the refreshing slots before
+ * the GAM call. TS-owned first-impression slots (`ts_initial=1`) are excluded
+ * — they are managed server-side and should not re-auction client-side.
+ *
+ * Must be called after `installPrebidNpm()` and after GPT is loaded.
+ * Idempotent: safe to call multiple times — wraps only once via a sentinel.
+ */
+export function installRefreshHandler(timeoutMs = 1500): void {
+  if (typeof window === 'undefined') return;
+  const g = (
+    window as unknown as {
+      googletag?: {
+        cmd?: { push(fn: () => void): void };
+        pubads?(): {
+          refresh(slots?: unknown[], opts?: unknown): void;
+          getTargeting?(key: string): string[];
+        };
+      };
+    }
+  ).googletag;
+  if (!g?.cmd) return;
+
+  g.cmd.push(() => {
+    const pubads = g.pubads?.();
+    if (!pubads || (pubads as { __tsRefreshWrapped?: boolean }).__tsRefreshWrapped) return;
+    (pubads as { __tsRefreshWrapped?: boolean }).__tsRefreshWrapped = true;
+
+    const originalRefresh = pubads.refresh.bind(pubads);
+    pubads.refresh = function (slots?: unknown[], opts?: unknown) {
+      // For bare refresh() calls (no slots arg), get all registered slots from GPT
+      // so we can filter out TS first-impression slots and auction the rest.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const targetSlots: any[] = slots ?? (pubads as any).getSlots?.() ?? [];
+
+      // Filter out TS first-impression slots — they don't need client-side refresh auctions.
+      const nonTsSlots = targetSlots.filter(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (s: any) => !s.getTargeting?.('ts_initial')?.includes('1')
+      );
+
+      if (!nonTsSlots.length) {
+        // All slots are TS-owned — pass through unchanged.
+        return originalRefresh(slots, opts);
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const adUnits = nonTsSlots.map((s: any) => ({
+        code: s.getSlotElementId?.() ?? s,
+        mediaTypes: {
+          banner: {
+            sizes: [
+              [728, 90],
+              [300, 250],
+            ] as [number, number][],
+          },
+        },
+        bids: [{ bidder: ADAPTER_CODE, params: { zone: 'refresh' } }],
+      }));
+
+      pbjs.requestBids({
+        adUnits,
+        bidsBackHandler: () => {
+          pbjs.setTargetingForGPTAsync?.();
+          // Refresh only the non-TS slots (pass explicit list so TS slots are not re-refreshed).
+          originalRefresh(nonTsSlots, opts);
+        },
+        timeout: timeoutMs,
+      });
+    };
+
+    log.info('[tsjs-prebid] GPT refresh handler installed');
+  });
+}
+
+/**
+ * Configure Prebid.js userID modules for identity warm-up.
+ *
+ * Runs post-window.load (called from installPrebidNpm after setup).
+ * Writes identity tokens to 1P cookies so the next server-side request
+ * can harvest them for EC graph enrichment.
+ *
+ * **Current state:** This function only configures `pbjs.userSync` settings.
+ * It does NOT import or register any userID modules. Actual module imports
+ * (ID5, sharedID, LiveRamp ATS, Lockr) must be added to this bundle explicitly
+ * — there is currently no `_userIdModules.generated.ts` build step.
+ * Track as Phase B follow-up: add `TSJS_PREBID_USER_ID_MODULES` handling to
+ * `build-all.mjs` (similar to `TSJS_PREBID_ADAPTERS`) and import generated file.
+ */
+export function installUserIdModules(): void {
+  // NOTE: No userID module imports exist yet. `_userIdModules.generated.ts` and
+  // `TSJS_PREBID_USER_ID_MODULES` handling in `build-all.mjs` are not implemented.
+  // This function only configures pbjs.userSync settings; actual module registration
+  // requires the Phase B follow-up described in the docblock above.
+  // Configure sync behavior so modules will run post-window.load when added.
+  try {
+    pbjs.setConfig({
+      userSync: {
+        syncEnabled: true,
+        filterSettings: {
+          all: { bidders: '*', filter: 'include' },
+        },
+        auctionDelay: 0,
+        syncsPerBidder: 5,
+        syncDelay: 3000,
+      },
+    });
+    log.info('[tsjs-prebid] userID modules configured');
+  } catch {
+    // pbjs not ready — userID modules will use defaults
+  }
+}
+
 // Self-initialize when loaded in a browser (same pattern as other integrations).
 if (typeof window !== 'undefined') {
   installPrebidNpm();
+  installRefreshHandler();
+  window.addEventListener('load', () => {
+    installUserIdModules();
+  });
 }
 
 export { pbjs };

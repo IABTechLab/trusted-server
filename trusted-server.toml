@@ -125,6 +125,7 @@ enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
+# slim_prebid_url = "https://cdn.example.com/tsjs-prebid.min.js"
 
 # Consent forwarding configuration
 # Controls how Trusted Server interprets and forwards privacy consent signals.
@@ -186,7 +187,7 @@ rewrite_script = true
 enabled = true
 providers = ["prebid", "aps"]
 mediator = "adserver_mock"
-timeout_ms = 2000
+timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT_MS
 # Context keys the JS client is allowed to forward into auction requests.
 # Keys not in this list are silently dropped. An empty list blocks all keys.
 allowed_context_keys = ["permutive_segments"]
@@ -195,7 +196,7 @@ allowed_context_keys = ["permutive_segments"]
 enabled = true
 pub_id = "test-pub"
 endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
-timeout_ms = 1000
+timeout_ms = 1000  # override per-publisher via TRUSTED_SERVER__INTEGRATIONS__APS__TIMEOUT_MS
 
 [integrations.google_tag_manager]
 enabled = false
@@ -212,6 +213,10 @@ timeout_ms = 1000
 # Inject <!-- ts-debug: ssp=N mediator=ok(N_bids) winning=N --> before </body>.
 # Visible in page source. Disable after investigation.
 # auction_html_comment = true
+#
+# Inject raw adm creative markup into window.tsjs.bids for GPT/GAM bridge
+# debugging while PBS Cache is unavailable. NEVER enable in production.
+# inject_adm_for_testing = true
 # Enable the JA4/TLS fingerprint debug endpoint at GET /_ts/debug/ja4.
 # Returns a plain-text response with the following fields (Fastly-observed values):
 #   ja4         — JA4 TLS client fingerprint
@@ -242,6 +247,53 @@ gam_network_id = "88059007"
 # drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
 # default; raise only if your SSPs need more headroom and your analytics confirm
 # the DCL slip is acceptable.
-auction_timeout_ms = 1500
+auction_timeout_ms = 1500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
 
+# Slot templates — override entire array via:
+# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'
+
+[[creative_opportunities.slot]]
+id = "atf_sidebar_ad"
+gam_unit_path = "/a/b/news"
+div_id = "div-ad-atf-sidebar"
+page_patterns = ["/20**", "/news/**"]
+formats = [{ width = 300, height = 250 }]
+floor_price = 0.50
+
+[creative_opportunities.slot.targeting]
+pos = "atf"
+zone = "atfSidebar"
+
+[creative_opportunities.slot.providers.aps]
+slot_id = "aps-slot-atf-sidebar"
+
+[[creative_opportunities.slot]]
+id = "homepage_header_ad"
+gam_unit_path = "/a/b/homepage"
+div_id = "div-ad-homepage-header"
+page_patterns = ["/"]
+formats = [{ width = 728, height = 90 }]
+floor_price = 0.50
+
+[creative_opportunities.slot.targeting]
+pos = "atf"
+zone = "header"
+
+[creative_opportunities.slot.providers.aps]
+slot_id = "aps-slot-homepage-header"
+
+[[creative_opportunities.slot]]
+id = "homepage_footer_ad"
+gam_unit_path = "/a/b/homepage"
+div_id = "div-ad-homepage-footer"
+page_patterns = ["/"]
+formats = [{ width = 728, height = 90 }, { width = 768, height = 66 }]
+floor_price = 0.50
+
+[creative_opportunities.slot.targeting]
+pos = "btf"
+zone = "fixedBottom"
+
+[creative_opportunities.slot.providers.aps]
+slot_id = "aps-slot-homepage-footer"

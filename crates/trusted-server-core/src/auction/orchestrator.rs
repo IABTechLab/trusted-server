@@ -1130,6 +1130,9 @@ mod tests {
                 nurl: None,
                 burl: None,
                 ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: HashMap::new(),
             },
         );
@@ -1147,6 +1150,9 @@ mod tests {
                 nurl: None,
                 burl: None,
                 ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: HashMap::new(),
             },
         );
@@ -1287,6 +1293,9 @@ mod tests {
                 nurl: None,
                 burl: None,
                 ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: {
                     let mut m = HashMap::new();
                     m.insert(
@@ -1334,6 +1343,9 @@ mod tests {
                 nurl: None,
                 burl: None,
                 ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: HashMap::new(),
             },
         );
@@ -1367,6 +1379,9 @@ mod tests {
                 nurl: None,
                 burl: None,
                 ad_id: None,
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: HashMap::new(),
             },
         );

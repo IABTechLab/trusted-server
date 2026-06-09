@@ -198,6 +198,22 @@ pub struct Bid {
     pub burl: Option<String>,
     /// Ad ID from the bidder
     pub ad_id: Option<String>,
+    /// Prebid Cache UUID for this bid.
+    ///
+    /// Populated from `ext.prebid.cache.bids.cacheId` in the PBS response.
+    /// Used as `hb_adid` targeting value in `window.tsjs.bids`. `None` for
+    /// non-PBS providers (e.g., APS) and PBS bids without Prebid Cache enabled.
+    pub cache_id: Option<String>,
+    /// Prebid Cache host (e.g., `"openads.adsrvr.org"`).
+    ///
+    /// Populated from the host of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_host` targeting value. `None` when cache is absent.
+    pub cache_host: Option<String>,
+    /// Prebid Cache path (e.g., `"/cache"`).
+    ///
+    /// Populated from the path of `ext.prebid.cache.bids.url`. Used as
+    /// `hb_cache_path` targeting value. `None` when cache is absent.
+    pub cache_path: Option<String>,
     /// Provider-specific bid metadata
     /// For APS bids, contains encoded price in "amznbid" field
     pub metadata: HashMap<String, serde_json::Value>,
@@ -323,6 +339,9 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: HashMap::new(),
         }
     }
@@ -436,6 +455,44 @@ mod tests {
     }
 
     #[test]
+    fn bid_with_cache_fields_round_trips_through_json() {
+        let bid = Bid {
+            slot_id: "atf".to_string(),
+            price: Some(1.50),
+            currency: "USD".to_string(),
+            creative: None,
+            adomain: None,
+            bidder: "thetradedesk".to_string(),
+            width: 300,
+            height: 250,
+            nurl: None,
+            burl: None,
+            ad_id: Some("bid-id".to_string()),
+            cache_id: Some("cache-uuid".to_string()),
+            cache_host: Some("cache.example.com".to_string()),
+            cache_path: Some("/pbc/v1/cache".to_string()),
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&bid).expect("should serialize Bid");
+        let restored: Bid = serde_json::from_str(&json).expect("should deserialize Bid");
+        assert_eq!(
+            restored.cache_id.as_deref(),
+            Some("cache-uuid"),
+            "should round-trip cache_id"
+        );
+        assert_eq!(
+            restored.cache_host.as_deref(),
+            Some("cache.example.com"),
+            "should round-trip cache_host"
+        );
+        assert_eq!(
+            restored.cache_path.as_deref(),
+            Some("/pbc/v1/cache"),
+            "should round-trip cache_path"
+        );
+    }
+
+    #[test]
     fn media_type_banner_fn_returns_banner() {
         assert_eq!(MediaType::banner(), MediaType::Banner);
     }
@@ -454,6 +511,9 @@ mod tests {
             nurl: None,
             burl: None,
             ad_id: Some("prebid-ad-id-abc".to_string()),
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: Default::default(),
         };
         assert_eq!(bid.ad_id.as_deref(), Some("prebid-ad-id-abc"));

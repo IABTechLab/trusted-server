@@ -416,6 +416,15 @@ pub struct DebugConfig {
     /// Never enable in production — visible in page source.
     #[serde(default)]
     pub auction_html_comment: bool,
+
+    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
+    /// debug rendering through the Prebid Universal Creative bridge.
+    ///
+    /// Use this to validate the server-side auction→GAM targeting→creative
+    /// rendering pipeline while PBS Cache is unavailable. Never enable in
+    /// production — injects raw HTML from SSPs.
+    #[serde(default)]
+    pub inject_adm_for_testing: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
@@ -522,12 +531,27 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be prepared.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
             handler.prepare_runtime()?;
         }
 
+        if let Some(co) = &mut self.creative_opportunities {
+            co.compile_slots();
+        }
+
         Ok(())
+    }
+
+    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    #[must_use]
+    pub fn creative_opportunity_slots(
+        &self,
+    ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
+        self.creative_opportunities
+            .as_ref()
+            .map(|co| co.slot.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Resolve the first handler whose regex matches the request path.

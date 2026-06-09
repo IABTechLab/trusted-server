@@ -1,4 +1,5 @@
 import { log } from '../../core/log';
+import type { AuctionSlot, AuctionBidData, TsjsApi } from '../../core/types';
 
 import { installGptGuard } from './script_guard';
 
@@ -23,6 +24,8 @@ import { installGptGuard } from './script_guard';
  *   - Rewrite ad-unit paths for A/B testing.
  */
 
+const TS_INITIAL_TARGETING_KEY = 'ts_initial' as const;
+
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
 // ------------------------------------------------------------------
@@ -46,6 +49,7 @@ interface GoogleTagPubAdsService {
   enableSingleRequest(): void;
   addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
   refresh(slots?: GoogleTagSlot[]): void;
+  getSlots?(): GoogleTagSlot[];
 }
 
 interface GoogleTag {
@@ -180,97 +184,189 @@ export function installGptShim(): boolean {
 }
 
 // ------------------------------------------------------------------
-// Trusted Server ad-init types
+// GAM interceptor (testing only)
 // ------------------------------------------------------------------
 
-interface TsAdSlot {
-  id: string;
-  gam_unit_path: string;
-  div_id: string;
-  formats: Array<number[]>;
-  targeting: Record<string, string>;
+/**
+ * Replace the GAM-rendered creative with the server-side auction adm.
+ *
+ * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
+ * Instead of reading from pbjs, reads adm directly from window.tsjs.bids.
+ * Only active when inject_adm_for_testing injects adm server-side.
+ *
+ * Strategy:
+ * 1. If adm contains an <iframe src="...">, set that src on the GAM iframe
+ *    directly — avoids cross-origin document access.
+ * 2. Otherwise replace the slot element's content with a srcdoc iframe.
+ */
+function injectAdmIntoSlot(divId: string, adm: string): void {
+  try {
+    // divId may be the container div (used by GPT slot) or the inner div.
+    // Search both so we can find the GAM iframe wherever it was rendered.
+    let slotEl = document.getElementById(divId);
+    if (!slotEl) return;
+
+    // Extract the first iframe src from the adm (e.g. mocktioneer creative
+    // wraps a first-party proxy iframe in a div).
+    const srcMatch = adm.match(/<iframe[^>]+\bsrc=["']([^"']+)["']/i);
+    const innerSrc = srcMatch?.[1];
+    const gamIframe = slotEl.querySelector('iframe') as HTMLIFrameElement | null;
+
+    if (innerSrc && gamIframe) {
+      // Set the GAM iframe src — works even cross-origin (no document access needed).
+      gamIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+      log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
+    } else if (innerSrc) {
+      // GAM iframe not yet in DOM (APS renders async after slotRenderEnded).
+      // Retry on next animation frame so APS has a tick to insert its iframe;
+      // if it still isn't there, replace slot content directly.
+      requestAnimationFrame(() => {
+        const retryIframe = slotEl!.querySelector('iframe') as HTMLIFrameElement | null;
+        if (retryIframe) {
+          retryIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          log.debug(`[tsjs-gpt] gam-intercept: set iframe src (retry) for '${divId}'`);
+        } else {
+          slotEl!.innerHTML = '';
+          const f = document.createElement('iframe');
+          f.style.cssText = 'border:none';
+          f.width = String(slotEl!.offsetWidth || 728);
+          f.height = String(slotEl!.offsetHeight || 90);
+          f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
+          f.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          slotEl!.appendChild(f);
+          log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
+        }
+      });
+    } else {
+      // No extractable src — replace slot content with a sandboxed srcdoc iframe.
+      slotEl.innerHTML = '';
+      const f = document.createElement('iframe');
+      f.style.border = 'none';
+      f.width = String(slotEl.offsetWidth || 728);
+      f.height = String(slotEl.offsetHeight || 90);
+      f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
+      f.srcdoc = adm;
+      slotEl.appendChild(f);
+      log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);
+    }
+  } catch (err) {
+    log.warn('[tsjs-gpt] gam-intercept: error injecting adm', err);
+  }
 }
 
-interface TsBidData {
-  hb_pb?: string;
-  hb_bidder?: string;
-  hb_adid?: string;
-  nurl?: string;
-  burl?: string;
-}
-
-type TsWindow = Window & {
-  __ts_ad_slots?: TsAdSlot[];
-  __ts_bids?: Record<string, TsBidData>;
-  __tsAdInit?: () => void;
-  __tsPrevGptSlots?: GoogleTagSlot[];
-  __tsServicesEnabled?: boolean;
-  __tsDivToSlotId?: Record<string, string>;
-};
+// ------------------------------------------------------------------
+// Trusted Server ad-init
+// ------------------------------------------------------------------
 
 /**
- * Install `window.__tsAdInit`.
+ * Install `window.tsjs.adInit`.
  *
- * Reads `window.__ts_ad_slots` (injected at head-open) and `window.__ts_bids`
+ * Reads `window.tsjs.adSlots` (injected at head-open) and `window.tsjs.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
  * targeting to GPT slots, sets the `ts_initial` sentinel, registers
  * `slotRenderEnded` to fire both nurl and burl via sendBeacon when our
  * specific Prebid bid wins the GAM line item match, then calls refresh().
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
- * so it is safe to call again after SPA navigation updates `__ts_ad_slots`/`__ts_bids`.
+ * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.
  */
 export function installTsAdInit(): void {
-  const w = window as TsWindow;
-  w.__tsAdInit = function () {
-    const slots = w.__ts_ad_slots ?? [];
-    const bids = w.__ts_bids ?? {};
+  const ts = (window.tsjs ??= {} as TsjsApi);
+  ts.adInit = function () {
+    const slots = ts.adSlots ?? [];
+    // Snapshot bids at adInit() call time — correct for targeting setup.
+    // The slotRenderEnded listener below reads ts.bids live so SPA navigation
+    // updates (new ts.bids injected before </body>) are picked up at render time.
+    const bids = ts.bids ?? {};
     const g = (window as GptWindow).googletag;
     if (!g) return;
 
     g.cmd?.push(() => {
       // Destroy previously defined TS slots before redefining for the new page.
-      if (w.__tsPrevGptSlots && w.__tsPrevGptSlots.length > 0) {
-        g.destroySlots?.(w.__tsPrevGptSlots);
-        w.__tsPrevGptSlots = [];
+      if (ts.prevGptSlots && ts.prevGptSlots.length > 0) {
+        g.destroySlots?.(ts.prevGptSlots as GoogleTagSlot[]);
+        ts.prevGptSlots = [];
       }
 
+      // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
+      // slots are reused but never destroyed by TS on navigation.
       const newSlots: GoogleTagSlot[] = [];
+      // All slots to refresh (TS-defined + publisher-owned reused).
+      const slotsToRefresh: GoogleTagSlot[] = [];
       const divToSlotId: Record<string, string> = {};
 
       slots.forEach((slot) => {
-        const gptSlot = g.defineSlot?.(
-          slot.gam_unit_path,
-          slot.formats as Array<number | number[]>,
-          slot.div_id
-        );
-        if (!gptSlot) return;
-        gptSlot.addService(g.pubads!());
-        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
+        // Resolve actual div ID: exact match first, then prefix query.
+        // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
+        // the suffix is dynamically generated by the framework at render time.
+        const el =
+          document.getElementById(slot.div_id) ??
+          document.querySelector<HTMLElement>(`[id^='${slot.div_id}']:not([id$='-container'])`);
+        if (!el) return;
+        const actualDivId = el.id;
         const bid = bids[slot.id] ?? {};
-        (['hb_pb', 'hb_bidder', 'hb_adid'] as const).forEach((key) => {
-          if (bid[key]) gptSlot.setTargeting(key, bid[key]!);
-        });
-        gptSlot.setTargeting('ts_initial', '1');
-        divToSlotId[slot.div_id] = slot.id;
-        newSlots.push(gptSlot);
+
+        const existingSlot = g.pubads!()
+          .getSlots?.()
+          ?.find?.((s: GoogleTagSlot) => s.getSlotElementId() === actualDivId);
+        let gptSlot: GoogleTagSlot;
+        let tsOwned = false;
+        if (existingSlot) {
+          gptSlot = existingSlot;
+        } else {
+          // Use outer container div for TS's slot when publisher hasn't defined
+          // theirs yet — keeps both slots on separate divs so publisher's
+          // later defineSlot on the inner div doesn't conflict.
+          const containerEl = document.getElementById(`${actualDivId}-container`);
+          const slotDivId = containerEl?.id ?? actualDivId;
+          const defined = g.defineSlot?.(slot.gam_unit_path, slot.formats, slotDivId);
+          if (!defined) return;
+          defined.addService(g.pubads!());
+          gptSlot = defined;
+          tsOwned = true;
+        }
+
+        Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
+        (['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const).forEach(
+          (key) => {
+            if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
+          }
+        );
+        gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
+        // Map both inner div and container div → slot ID so slotRenderEnded
+        // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
+        // the slot, while adm injection (which targets the inner div) also works.
+        divToSlotId[actualDivId] = slot.id;
+        const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
+        if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
+        if (tsOwned) newSlots.push(gptSlot);
+        slotsToRefresh.push(gptSlot);
+
+        // APS: signal to apstag that bids are ready so Amazon's GAM creative
+        // can render.  apstag must already be initialised on the page (which it
+        // is on production publisher pages).  Safe no-op if apstag is absent.
+        if (bid.hb_bidder === 'aps' || bid.hb_bidder === 'amazon-aps') {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (window as any).apstag?.setDisplayBids?.();
+        }
       });
 
-      w.__tsPrevGptSlots = newSlots;
+      ts.prevGptSlots = newSlots as unknown[];
       // Replace (not merge) so destroyed slots from previous navigation don't linger.
-      w.__tsDivToSlotId = divToSlotId;
+      ts.divToSlotId = divToSlotId;
 
       // enableSingleRequest and enableServices must only be called once per page load.
-      if (!w.__tsServicesEnabled) {
+      if (!ts.servicesEnabled) {
         g.pubads!().enableSingleRequest();
         g.enableServices?.();
-        w.__tsServicesEnabled = true;
+        ts.servicesEnabled = true;
 
         g.pubads!().addEventListener?.('slotRenderEnded', (event: SlotRenderEndedEvent) => {
           const divId: string = event.slot?.getSlotElementId?.() ?? '';
-          const slotId = (w.__tsDivToSlotId ?? {})[divId];
+          const slotId = (ts.divToSlotId ?? {})[divId];
           if (!slotId) return;
-          const bid = (w.__ts_bids ?? {})[slotId] ?? {};
+          // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
+          const bid = (ts.bids ?? {})[slotId] ?? {};
           // Prebid: compare hb_adid targeting to verify the specific creative won.
           // APS: no hb_adid equivalent — fires if bidder exists and slot is non-empty.
           // Known limitation: APS path may over-fire if a non-APS line item wins.
@@ -283,19 +379,26 @@ export function installTsAdInit(): void {
             if (bid.nurl) navigator.sendBeacon(bid.nurl);
             if (bid.burl) navigator.sendBeacon(bid.burl);
           }
+
+          // GAM interceptor (testing): when adm is present, replace the GAM creative.
+          // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
+          // Only active when inject_adm_for_testing injects adm into bids server-side.
+          if (bid.adm) {
+            injectAdmIntoSlot(divId, bid.adm);
+          }
         });
       }
 
-      if (newSlots.length > 0) {
-        g.pubads!().refresh(newSlots);
+      if (slotsToRefresh.length > 0) {
+        g.pubads!().refresh(slotsToRefresh);
       }
     });
   };
 }
 
 interface PageBidsResponse {
-  slots: TsAdSlot[];
-  bids: Record<string, TsBidData>;
+  slots: AuctionSlot[];
+  bids: Record<string, AuctionBidData>;
 }
 
 /**
@@ -304,15 +407,15 @@ interface PageBidsResponse {
  * Patches `history.pushState` and `history.replaceState`, and listens to
  * `popstate`, so that after each client-side route change the trusted server
  * fetches fresh slots + bids from `/__ts/page-bids?path=<new_path>`, updates
- * `window.__ts_ad_slots` / `window.__ts_bids`, and calls `window.__tsAdInit()`.
+ * `window.tsjs.adSlots` / `window.tsjs.bids`, and calls `window.tsjs.adInit()`.
  *
- * Idempotent: guarded by `window.__tsSpaHookInstalled` so multiple calls are safe.
+ * Idempotent: guarded by `window.tsjs.spaHookInstalled` so multiple calls are safe.
  */
 export function installSpaAuctionHook(): void {
   if (typeof window === 'undefined') return;
-  const win = window as TsWindow & { __tsSpaHookInstalled?: boolean };
-  if (win.__tsSpaHookInstalled) return;
-  win.__tsSpaHookInstalled = true;
+  const ts = (window.tsjs ??= {} as TsjsApi);
+  if (ts.spaHookInstalled) return;
+  ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
 
@@ -329,9 +432,9 @@ export function installSpaAuctionHook(): void {
       if (!res.ok) return;
       const data = (await res.json()) as PageBidsResponse;
       if (inflight !== controller) return;
-      win.__ts_ad_slots = data.slots;
-      win.__ts_bids = data.bids;
-      win.__tsAdInit?.();
+      ts.adSlots = data.slots;
+      ts.bids = data.bids;
+      ts.adInit?.();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       log.warn('SPA auction hook: fetch failed', err);
@@ -360,12 +463,11 @@ export function installSpaAuctionHook(): void {
 
 /**
  * Register the slim-Prebid lazy loader. Fires after window.load — off the
- * critical path. slim-Prebid handles refresh auctions and userID module
- * warm-up (ID5, sharedID, LiveRamp ATS, Lockr). It skips initial-render slots
- * (ts_initial=1) and registers as the GPT refresh handler for scroll/sticky auctions.
+ * critical path. Slim-Prebid handles scroll/refresh auctions and userID
+ * module warm-up (ID5, sharedID, LiveRamp ATS, Lockr).
  *
- * Phase 1: no-op unless window.__tsjs_slim_prebid_url is set (it won't be until
- * the slim-Prebid bundle build target ships in a later phase).
+ * Phase 1: no-op unless `window.__tsjs_slim_prebid_url` is set (the slim
+ * bundle build target ships in a later phase).
  */
 export function installSlimPrebidLoader(): void {
   const url = (window as GptWindow).__tsjs_slim_prebid_url;
@@ -375,6 +477,114 @@ export function installSlimPrebidLoader(): void {
     script.src = url;
     script.defer = true;
     document.head.appendChild(script);
+  });
+}
+
+/** Minimal display renderer injected into the ad iframe by pbRender. */
+const TS_DISPLAY_RENDERER =
+  '(function(){window.render=function(d,h,w){' +
+  'var f=h.mkFrame(w.document,{width:d.width||"100%",height:d.height||"100%"});' +
+  'if(d.adUrl&&!d.ad){f.src=d.adUrl;}else{f.srcdoc=d.ad;}' +
+  'w.document.body.appendChild(f);};})();';
+
+/**
+ * Install the TS → pbRender bridge.
+ *
+ * Must be installed synchronously at module init — before `adInit()` fires
+ * `refresh()`, which triggers GAM to serve the Prebid creative. Installing
+ * post-load would miss first-impression `"Prebid Request"` messages.
+ *
+ * When `adId` matches a TS server-side bid in `window.tsjs.bids` AND the bid
+ * has renderable markup, the bridge:
+ *   1. Uses debug `adm` directly when present, otherwise fetches from PBS Cache.
+ *   2. Replies via the MessageChannel port with a `"Prebid Response"`.
+ *   3. Calls `stopImmediatePropagation()` so Prebid.js does not also process
+ *      the message and log spurious failures.
+ *
+ * Lives in gpt/index.ts (not prebid/index.ts) to avoid pulling the full
+ * Prebid bundle into tsjs-gpt.js via inlineDynamicImports.
+ */
+export function installTsRenderBridge(): void {
+  if (typeof window === 'undefined') return;
+
+  window.addEventListener('message', (e: MessageEvent) => {
+    let data: Record<string, unknown>;
+    try {
+      data =
+        typeof e.data === 'object'
+          ? (e.data as Record<string, unknown>)
+          : (JSON.parse(e.data as string) as Record<string, unknown>);
+    } catch {
+      return;
+    }
+
+    if (data['message'] !== 'Prebid Request') return;
+    const adId = data['adId'] as string | undefined;
+    if (!adId) return;
+
+    const port = e.ports?.[0];
+    if (!port) return;
+
+    // Build reverse map adId → slotId from live window.tsjs.bids.
+    const bids = window.tsjs?.bids ?? {};
+    let slotId: string | undefined;
+    let matchedBid: (typeof bids)[string] | undefined;
+    for (const [sid, bid] of Object.entries(bids)) {
+      if (bid.hb_adid === adId) {
+        slotId = sid;
+        matchedBid = bid;
+        break;
+      }
+    }
+
+    // Not a TS bid — let Prebid.js handle it.
+    if (!slotId || !matchedBid) return;
+
+    const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
+    const [width, height] = slot?.formats?.[0] ?? [728, 90];
+
+    if (matchedBid.adm) {
+      e.stopImmediatePropagation();
+      port.postMessage(
+        JSON.stringify({
+          message: 'Prebid Response',
+          adId,
+          ad: matchedBid.adm,
+          renderer: TS_DISPLAY_RENDERER,
+          width,
+          height,
+        })
+      );
+      log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
+      return;
+    }
+
+    // No TS render source — let Prebid.js handle it.
+    if (!matchedBid.hb_cache_host || !matchedBid.hb_cache_path) return;
+
+    // TS owns this adId — stop Prebid from also processing it.
+    e.stopImmediatePropagation();
+
+    const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
+
+    fetch(cacheUrl, { mode: 'cors' })
+      .then((res) => (res.ok ? res.text() : Promise.reject(res.status)))
+      .then((ad) => {
+        port.postMessage(
+          JSON.stringify({
+            message: 'Prebid Response',
+            adId,
+            ad,
+            renderer: TS_DISPLAY_RENDERER,
+            width,
+            height,
+          })
+        );
+        log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
+      })
+      .catch((err) => {
+        log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
+      });
   });
 }
 
@@ -398,4 +608,5 @@ if (typeof window !== 'undefined') {
   installTsAdInit();
   installSpaAuctionHook();
   installSlimPrebidLoader();
+  installTsRenderBridge();
 }

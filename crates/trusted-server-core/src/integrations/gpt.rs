@@ -81,6 +81,16 @@ pub struct GptConfig {
     /// Whether to rewrite GPT script URLs in publisher HTML.
     #[serde(default = "default_rewrite_script")]
     pub rewrite_script: bool,
+
+    /// URL for the slim-Prebid bundle loaded post-window.load.
+    ///
+    /// When set, `installSlimPrebidLoader()` in the GPT bundle will load this
+    /// script after `window.load`, enabling scroll/refresh client-side auctions
+    /// and userID module warm-up. Set to the publisher's tsjs-prebid bundle URL.
+    ///
+    /// Override via env var: `TRUSTED_SERVER__INTEGRATIONS__GPT__SLIM_PREBID_URL`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slim_prebid_url: Option<String>,
 }
 
 impl IntegrationConfig for GptConfig {
@@ -437,11 +447,11 @@ impl IntegrationHeadInjector for GptIntegration {
         GPT_INTEGRATION_ID
     }
 
-    /// Injects the `__tsAdInit` bootstrap script into `<head>`.
+    /// Injects the `tsjs.adInit` bootstrap script into `<head>`.
     ///
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
-    /// `__tsAdInit` handles **initial render only**: it wires server-side bid
+    /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
     /// targeting into GPT slots and fires win beacons (`nurl`/`burl`) via
     /// `slotRenderEnded`. It does **not** trigger refresh auctions or handle
     /// GPT slot refresh events.
@@ -451,22 +461,31 @@ impl IntegrationHeadInjector for GptIntegration {
     /// impressions. SPA pushState navigation is also slim-Prebid's domain.
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        vec![
+        let mut scripts = vec![
             "<script>window.__tsjs_gpt_enabled=true;\
              window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
                 .to_string(),
             format!("<script>{}</script>", GPT_BOOTSTRAP_JS),
-        ]
+        ];
+
+        if let Some(ref url) = self.config.slim_prebid_url {
+            scripts.push(format!(
+                "<script>window.__tsjs_slim_prebid_url={};</script>",
+                serde_json::to_string(url).expect("should serialize string")
+            ));
+        }
+
+        scripts
     }
 }
 
-/// Inline `window.__tsAdInit` bootstrap injected at `<head>` so the bids
+/// Inline `window.tsjs.adInit` bootstrap injected at `<head>` so the bids
 /// script at `</body>` can call it before the TSJS bundle has loaded.
 ///
 /// The bundle's idempotent implementation in
 /// `crates/js/lib/src/integrations/gpt/index.ts` later overwrites this stub.
 /// Both implementations guard the one-time-per-page setup with
-/// `window.__tsServicesEnabled` so neither double-enables services if the
+/// `window.tsjs.servicesEnabled` so neither double-enables services if the
 /// publisher's own init code also calls `googletag.enableServices()`.
 const GPT_BOOTSTRAP_JS: &str = include_str!("gpt_bootstrap.js");
 
@@ -502,6 +521,7 @@ mod tests {
             script_url: default_script_url(),
             cache_ttl_seconds: 3600,
             rewrite_script: true,
+            slim_prebid_url: None,
         }
     }
 
@@ -1062,10 +1082,10 @@ mod tests {
         };
         let inserts = integration.head_inserts(&ctx);
         let combined = inserts.join("");
-        assert!(combined.contains("__tsAdInit"), "should define __tsAdInit");
+        assert!(combined.contains("ts.adInit"), "should define tsjs.adInit");
         assert!(
-            combined.contains("window.__ts_bids"),
-            "should read window.__ts_bids synchronously"
+            combined.contains("ts.bids"),
+            "should read tsjs.bids synchronously"
         );
         assert!(
             combined.contains("ts_initial"),
@@ -1110,13 +1130,10 @@ mod tests {
         };
         let combined = integration.head_inserts(&ctx).join("");
         assert!(
-            combined.contains("__tsServicesEnabled"),
-            "should guard enableServices/enableSingleRequest with the __tsServicesEnabled flag"
+            combined.contains("ts.servicesEnabled"),
+            "should guard enableServices/enableSingleRequest with the tsjs.servicesEnabled flag"
         );
-        assert!(
-            combined.contains("window.__tsAdInit"),
-            "should install __tsAdInit on window"
-        );
+        assert!(combined.contains("ts.adInit"), "should install tsjs.adInit");
         assert!(
             !combined.contains("googletag.pubads().refresh()"),
             "should never call unbounded refresh() — only refresh(newSlots)"
@@ -1129,6 +1146,61 @@ mod tests {
         assert_eq!(
             IntegrationHeadInjector::integration_id(integration.as_ref()),
             "gpt"
+        );
+    }
+
+    #[test]
+    fn head_inserts_emits_slim_prebid_url_when_configured() {
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit three head inserts when slim_prebid_url is set"
+        );
+        assert_eq!(
+            inserts[2],
+            r#"<script>window.__tsjs_slim_prebid_url="https://cdn.example.com/tsjs-prebid.min.js";</script>"#,
+            "should emit the slim-Prebid URL as a JSON-encoded string assignment"
+        );
+    }
+
+    #[test]
+    fn head_inserts_omits_slim_prebid_url_when_not_configured() {
+        let integration = GptIntegration::new(test_config());
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit exactly two head inserts when slim_prebid_url is absent"
+        );
+        assert!(
+            inserts
+                .iter()
+                .all(|s| !s.contains("__tsjs_slim_prebid_url")),
+            "should not emit slim-Prebid URL tag when not configured"
         );
     }
 }

@@ -428,7 +428,7 @@ pub struct OwnedProcessResponseParams {
     /// The streaming phase collects these and writes bids to `ad_bids_state`
     /// before processing the last body chunk, so `</body>` injection sees live bids.
     pub(crate) dispatched_auction: Option<DispatchedAuction>,
-    /// Price granularity used to bucket bids when building `__ts_bids`.
+    /// Price granularity used to bucket bids when building `tsjs.bids`.
     pub(crate) price_granularity: PriceGranularity,
 }
 
@@ -516,6 +516,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             &result.winning_bids,
             params.price_granularity,
             &params.ad_bids_state,
+            settings.debug.inject_adm_for_testing,
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
@@ -611,13 +612,14 @@ pub(crate) fn write_bids_to_state(
     winning_bids: &std::collections::HashMap<String, Bid>,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
+    inject_adm: bool,
 ) {
     log::debug!(
         "write_bids_to_state: {} winning bid(s): [{}]",
         winning_bids.len(),
         winning_bids.keys().cloned().collect::<Vec<_>>().join(", ")
     );
-    let bid_map = build_bid_map(winning_bids, price_granularity);
+    let bid_map = build_bid_map(winning_bids, price_granularity, inject_adm);
     let bids_script = build_bids_script(&bid_map);
     *ad_bids_state.lock().expect("should lock bid state") = Some(bids_script);
 }
@@ -757,7 +759,12 @@ async fn one_behind_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                     "one_behind_loop: collect complete — {} winning bid(s)",
                     result.winning_bids.len()
                 );
-                write_bids_to_state(&result.winning_bids, price_granularity, ad_bids_state);
+                write_bids_to_state(
+                    &result.winning_bids,
+                    price_granularity,
+                    ad_bids_state,
+                    settings.debug.inject_adm_for_testing,
+                );
 
                 if settings.debug.auction_html_comment {
                     prepend_auction_debug_comment("stream", &result, ad_bids_state);
@@ -853,7 +860,7 @@ pub async fn handle_publisher_request(
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
     orchestrator: &AuctionOrchestrator,
-    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
+    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     mut req: Request,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
@@ -939,7 +946,7 @@ pub async fn handle_publisher_request(
     let is_bot = is_bot_user_agent(&req);
 
     let matched_slots: Vec<_> = if settings.creative_opportunities.is_some() && is_get {
-        crate::creative_opportunities::match_slots(&slots_file.slots, &request_path)
+        crate::creative_opportunities::match_slots(slots, &request_path)
             .into_iter()
             .cloned()
             .collect()
@@ -1192,7 +1199,12 @@ pub async fn handle_publisher_request(
                     "BufferedProcessed: auction collected — {} winning bid(s)",
                     result.winning_bids.len()
                 );
-                write_bids_to_state(&result.winning_bids, price_granularity, &ad_bids_state);
+                write_bids_to_state(
+                    &result.winning_bids,
+                    price_granularity,
+                    &ad_bids_state,
+                    settings.debug.inject_adm_for_testing,
+                );
 
                 if settings.debug.auction_html_comment {
                     prepend_auction_debug_comment("buffered", &result, &ad_bids_state);
@@ -1311,6 +1323,7 @@ fn html_escape_for_script(s: &str) -> String {
 pub(crate) fn build_bid_map(
     winning_bids: &std::collections::HashMap<String, Bid>,
     granularity: crate::price_bucket::PriceGranularity,
+    include_adm: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     winning_bids
         .iter()
@@ -1323,10 +1336,30 @@ pub(crate) fn build_bid_map(
                     "hb_bidder".to_string(),
                     serde_json::Value::String(bid.bidder.clone()),
                 );
-                if let Some(ref ad_id) = bid.ad_id {
+                // hb_adid: use PBS Cache UUID when present — the Prebid Universal Creative uses
+                // this as the cache lookup key, NOT the OpenRTB bid ID (bid.ad_id). Fall back to
+                // bid.ad_id for APS and other non-PBS providers.
+                let hb_adid = bid.cache_id.as_deref().or(bid.ad_id.as_deref());
+                if let Some(id) = hb_adid {
                     obj.insert(
                         "hb_adid".to_string(),
-                        serde_json::Value::String(ad_id.clone()),
+                        serde_json::Value::String(id.to_string()),
+                    );
+                }
+
+                // Cache endpoint coordinates — only present for PBS bids with Prebid Cache enabled.
+                // The Prebid Universal Creative constructs:
+                //   https://<hb_cache_host><hb_cache_path>?uuid=<hb_adid>
+                if let Some(ref host) = bid.cache_host {
+                    obj.insert(
+                        "hb_cache_host".to_string(),
+                        serde_json::Value::String(host.clone()),
+                    );
+                }
+                if let Some(ref path) = bid.cache_path {
+                    obj.insert(
+                        "hb_cache_path".to_string(),
+                        serde_json::Value::String(path.clone()),
                     );
                 }
                 if let Some(ref nurl) = bid.nurl {
@@ -1335,13 +1368,40 @@ pub(crate) fn build_bid_map(
                 if let Some(ref burl) = bid.burl {
                     obj.insert("burl".to_string(), serde_json::Value::String(burl.clone()));
                 }
+                // Include raw creative markup only for explicit debug injection.
+                // The pbRender bridge can use it while PBS Cache is unavailable.
+                if include_adm {
+                    if let Some(ref adm) = bid.creative {
+                        obj.insert("adm".to_string(), serde_json::Value::String(adm.clone()));
+                    }
+                    obj.insert(
+                        "debug_bid".to_string(),
+                        serde_json::json!({
+                            "slot_id": bid.slot_id,
+                            "price": bid.price,
+                            "currency": bid.currency,
+                            "creative": bid.creative,
+                            "adomain": bid.adomain,
+                            "bidder": bid.bidder,
+                            "width": bid.width,
+                            "height": bid.height,
+                            "nurl": bid.nurl,
+                            "burl": bid.burl,
+                            "ad_id": bid.ad_id,
+                            "cache_id": bid.cache_id,
+                            "cache_host": bid.cache_host,
+                            "cache_path": bid.cache_path,
+                            "metadata": bid.metadata,
+                        }),
+                    );
+                }
                 (slot_id.clone(), serde_json::Value::Object(obj))
             })
         })
         .collect()
 }
 
-/// Build the `__ts_bids` `<script>` tag from a bucketed bid map.
+/// Build the `tsjs.bids` `<script>` tag from a bucketed bid map.
 ///
 /// The JSON is embedded via `JSON.parse(…)` so the browser parser never sees
 /// raw `</script>` sequences inside the string.
@@ -1350,7 +1410,7 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>window.__ts_bids=JSON.parse(\"{}\");if(typeof window.__tsAdInit===\"function\")window.__tsAdInit();</script>",
+        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");(function(){{var f=window.tsjs.adInit;if(typeof f!==\"function\")return;f();if(!(window.tsjs.prevGptSlots||[]).length){{setTimeout(function(){{if(typeof window.tsjs.adInit===\"function\")window.tsjs.adInit();}},100);}}}})();</script>",
         escaped
     )
 }
@@ -1363,7 +1423,7 @@ pub(crate) fn build_empty_bids_script() -> String {
     build_bids_script(&serde_json::Map::new())
 }
 
-/// Build the `__ts_ad_slots` `<script>` tag from matched slots.
+/// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
 /// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
@@ -1399,7 +1459,7 @@ pub(crate) fn build_ad_slots_script(
         .expect("serde_json::to_string of Vec<Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>window.__ts_ad_slots=JSON.parse(\"{}\");</script>",
+        "<script>(window.tsjs=window.tsjs||{{}}).adSlots=JSON.parse(\"{}\");</script>",
         escaped
     )
 }
@@ -1479,7 +1539,7 @@ pub async fn handle_page_bids(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
-    slots_file: &crate::creative_opportunities::CreativeOpportunitiesFile,
+    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let Some(co_config) = &settings.creative_opportunities else {
@@ -1494,11 +1554,10 @@ pub async fn handle_page_bids(
         .map(|(_, v)| v.into_owned())
         .unwrap_or_else(|| "/".to_string());
 
-    let matched_slots: Vec<_> =
-        crate::creative_opportunities::match_slots(&slots_file.slots, &path_param)
-            .into_iter()
-            .cloned()
-            .collect();
+    let matched_slots: Vec<_> = crate::creative_opportunities::match_slots(slots, &path_param)
+        .into_iter()
+        .cloned()
+        .collect();
 
     let http_req = compat::from_fastly_headers_ref(&req);
     let request_info =
@@ -1600,7 +1659,11 @@ pub async fn handle_page_bids(
             std::collections::HashMap::new()
         };
 
-    let bid_map = build_bid_map(&winning_bids, co_config.price_granularity);
+    let bid_map = build_bid_map(
+        &winning_bids,
+        co_config.price_granularity,
+        settings.debug.inject_adm_for_testing,
+    );
 
     let slots_json: Vec<serde_json::Value> = matched_slots
         .iter()
@@ -2582,6 +2645,7 @@ mod tests {
                 gam_network_id: "21765378893".to_string(),
                 auction_timeout_ms: Some(500),
                 price_granularity: PriceGranularity::Dense,
+                slot: Vec::new(),
             }
         }
 
@@ -2625,6 +2689,9 @@ mod tests {
                 nurl: Some(nurl.to_string()),
                 burl: Some(burl.to_string()),
                 ad_id: Some(ad_id.to_string()),
+                cache_id: None,
+                cache_host: None,
+                cache_path: None,
                 metadata: Default::default(),
             }
         }
@@ -2635,11 +2702,15 @@ mod tests {
             let config = make_config();
             let script = build_ad_slots_script(&slots, &config);
             assert!(
-                script.contains("window.__ts_ad_slots=JSON.parse"),
-                "should use JSON.parse"
+                script.contains("window.tsjs=window.tsjs||{}"),
+                "should initialise tsjs namespace"
+            );
+            assert!(
+                script.contains(".adSlots=JSON.parse"),
+                "should use JSON.parse for adSlots"
             );
             assert!(script.contains("atf_sidebar_ad"), "should include slot id");
-            assert!(!script.contains("__ts_bids"), "must NOT contain bids");
+            assert!(!script.contains("adInit"), "must NOT contain adInit");
             assert!(
                 !script.contains("__ts_request_id"),
                 "must NOT contain request_id"
@@ -2672,7 +2743,7 @@ mod tests {
                     "https://ssp/bill",
                 ),
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             let entry = map.get("atf_sidebar_ad").expect("should have bid entry");
             let obj = entry.as_object().expect("should be object");
             assert_eq!(
@@ -2688,7 +2759,7 @@ mod tests {
             assert_eq!(
                 obj.get("hb_adid").and_then(|v| v.as_str()),
                 Some("abc123"),
-                "should include ad_id"
+                "should fall back to ad_id when no cache_id present"
             );
             assert_eq!(
                 obj.get("nurl").and_then(|v| v.as_str()),
@@ -2699,6 +2770,250 @@ mod tests {
                 obj.get("burl").and_then(|v| v.as_str()),
                 Some("https://ssp/bill"),
                 "should include burl"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_omits_adm_by_default() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert!(
+                obj.get("adm").is_none(),
+                "should omit adm when debug injection is disabled"
+            );
+            assert!(
+                obj.get("debug_bid").is_none(),
+                "should omit debug bid when debug injection is disabled"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_includes_adm_when_debug_injection_enabled() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "kargo",
+                "abc123",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+
+            assert_eq!(
+                obj.get("adm").and_then(|v| v.as_str()),
+                Some("<div>Creative</div>"),
+                "should include adm when debug injection is enabled"
+            );
+        }
+
+        #[test]
+        fn client_bid_map_includes_debug_bid_when_debug_injection_enabled() {
+            let mut winning_bids = HashMap::new();
+            let mut bid = make_bid(
+                "atf_sidebar_ad",
+                1.50,
+                "mocktioneer",
+                "bid-ad-id",
+                "https://ssp/win",
+                "https://ssp/bill",
+            );
+            bid.creative = Some("<div>Creative</div>".to_string());
+            bid.adomain = Some(vec!["example.com".to_string()]);
+            bid.cache_id = Some("cache-uuid".to_string());
+            bid.cache_host = Some("cache.example".to_string());
+            bid.cache_path = Some("/cache".to_string());
+            bid.metadata.insert(
+                "raw_field".to_string(),
+                serde_json::Value::String("raw-value".to_string()),
+            );
+            winning_bids.insert("atf_sidebar_ad".to_string(), bid);
+
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, true);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            let debug_bid = obj
+                .get("debug_bid")
+                .and_then(|v| v.as_object())
+                .expect("should include debug bid when debug injection is enabled");
+
+            assert_eq!(
+                debug_bid.get("slot_id").and_then(|v| v.as_str()),
+                Some("atf_sidebar_ad"),
+                "should expose original slot id"
+            );
+            assert_eq!(
+                debug_bid.get("bidder").and_then(|v| v.as_str()),
+                Some("mocktioneer"),
+                "should expose original bidder"
+            );
+            assert_eq!(
+                debug_bid.get("ad_id").and_then(|v| v.as_str()),
+                Some("bid-ad-id"),
+                "should expose original bid ad id"
+            );
+            assert_eq!(
+                debug_bid.get("cache_id").and_then(|v| v.as_str()),
+                Some("cache-uuid"),
+                "should expose original PBS cache id"
+            );
+            assert_eq!(
+                debug_bid.get("metadata").and_then(|v| v.get("raw_field")),
+                Some(&serde_json::Value::String("raw-value".to_string())),
+                "should expose provider metadata"
+            );
+        }
+
+        #[test]
+        fn bid_map_uses_cache_id_for_hb_adid_when_present() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(1.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "thetradedesk".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: Some("bid-impression-id".to_string()),
+                    cache_id: Some("f47447a0-b759-4f2f-9887-af458b79b570".to_string()),
+                    cache_host: Some("openads.adsrvr.org".to_string()),
+                    cache_path: Some("/cache".to_string()),
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("f47447a0-b759-4f2f-9887-af458b79b570"),
+                "should use cache_id for hb_adid, not ad_id"
+            );
+            assert_eq!(
+                obj.get("hb_cache_host").and_then(|v| v.as_str()),
+                Some("openads.adsrvr.org"),
+                "should emit hb_cache_host"
+            );
+            assert_eq!(
+                obj.get("hb_cache_path").and_then(|v| v.as_str()),
+                Some("/cache"),
+                "should emit hb_cache_path"
+            );
+        }
+
+        #[test]
+        fn bid_map_falls_back_to_ad_id_when_cache_id_absent() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(0.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "amazon-aps".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: Some("aps-bid-token".to_string()),
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert_eq!(
+                obj.get("hb_adid").and_then(|v| v.as_str()),
+                Some("aps-bid-token"),
+                "should fall back to ad_id when cache_id absent"
+            );
+            assert!(
+                obj.get("hb_cache_host").is_none(),
+                "should not emit hb_cache_host when absent"
+            );
+            assert!(
+                obj.get("hb_cache_path").is_none(),
+                "should not emit hb_cache_path when absent"
+            );
+        }
+
+        #[test]
+        fn bid_map_omits_hb_adid_when_both_cache_id_and_ad_id_absent() {
+            let mut winning_bids = HashMap::new();
+            winning_bids.insert(
+                "atf_sidebar_ad".to_string(),
+                Bid {
+                    slot_id: "atf_sidebar_ad".to_string(),
+                    price: Some(0.50),
+                    currency: "USD".to_string(),
+                    creative: None,
+                    adomain: None,
+                    bidder: "amazon-aps".to_string(),
+                    width: 300,
+                    height: 250,
+                    nurl: None,
+                    burl: None,
+                    ad_id: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
+                    metadata: Default::default(),
+                },
+            );
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
+            let obj = map
+                .get("atf_sidebar_ad")
+                .expect("should have bid entry")
+                .as_object()
+                .expect("should be object");
+            assert!(
+                obj.get("hb_adid").is_none(),
+                "should omit hb_adid when no cache_id and no ad_id"
             );
         }
 
@@ -2719,10 +3034,13 @@ mod tests {
                     nurl: None,
                     burl: None,
                     ad_id: None,
+                    cache_id: None,
+                    cache_host: None,
+                    cache_path: None,
                     metadata: Default::default(),
                 },
             );
-            let map = build_bid_map(&winning_bids, PriceGranularity::Dense);
+            let map = build_bid_map(&winning_bids, PriceGranularity::Dense, false);
             assert!(
                 map.is_empty(),
                 "slot with no price should be excluded from bid map"
@@ -2789,9 +3107,7 @@ mod tests {
     mod page_bids_no_match_tests {
         use super::super::*;
         use crate::auction::AuctionOrchestrator;
-        use crate::creative_opportunities::{
-            CreativeOpportunitiesFile, CreativeOpportunityFormat, CreativeOpportunitySlot,
-        };
+        use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::noop_services;
         use crate::test_support::tests::crate_test_settings_str;
         use fastly::http::Method;
@@ -2805,24 +3121,22 @@ mod tests {
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
         }
 
-        fn file_with_article_slot() -> CreativeOpportunitiesFile {
-            CreativeOpportunitiesFile {
-                slots: vec![CreativeOpportunitySlot {
-                    id: "atf".to_string(),
-                    gam_unit_path: None,
-                    div_id: None,
-                    page_patterns: vec!["/20**".to_string()],
-                    formats: vec![CreativeOpportunityFormat {
-                        width: 300,
-                        height: 250,
-                        media_type: crate::auction::types::MediaType::Banner,
-                    }],
-                    floor_price: Some(0.50),
-                    targeting: Default::default(),
-                    providers: Default::default(),
-                    compiled_patterns: Vec::new(),
+        fn article_slot() -> Vec<CreativeOpportunitySlot> {
+            vec![CreativeOpportunitySlot {
+                id: "atf".to_string(),
+                gam_unit_path: None,
+                div_id: None,
+                page_patterns: vec!["/20**".to_string()],
+                formats: vec![CreativeOpportunityFormat {
+                    width: 300,
+                    height: 250,
+                    media_type: crate::auction::types::MediaType::Banner,
                 }],
-            }
+                floor_price: Some(0.50),
+                targeting: Default::default(),
+                providers: Default::default(),
+                compiled_patterns: Vec::new(),
+            }]
         }
 
         fn make_page_bids_request(path: &str) -> Request {
@@ -2839,10 +3153,9 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = CreativeOpportunitiesFile { slots: vec![] };
             let req = make_page_bids_request("/2024/01/my-article/");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &[], req)
                 .await
                 .expect("should return ok response");
 
@@ -2855,7 +3168,7 @@ mod tests {
                     .expect("slots should be array")
                     .len(),
                 0,
-                "empty slots file should produce zero injected slots"
+                "empty slots should produce zero injected slots"
             );
             assert_eq!(
                 body["bids"]
@@ -2863,7 +3176,7 @@ mod tests {
                     .expect("bids should be object")
                     .len(),
                 0,
-                "empty slots file should produce zero bids"
+                "empty slots should produce zero bids"
             );
         }
 
@@ -2875,11 +3188,11 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot();
+            let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
@@ -2911,11 +3224,11 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot();
+            let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("sec-purpose", "prefetch");
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
@@ -2946,10 +3259,10 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let services = noop_services();
-            let slots_file = file_with_article_slot(); // slot matches /20** only
+            let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
-            let response = handle_page_bids(&settings, &orchestrator, &services, &slots_file, req)
+            let response = handle_page_bids(&settings, &orchestrator, &services, &slots, req)
                 .await
                 .expect("should return ok response");
 
