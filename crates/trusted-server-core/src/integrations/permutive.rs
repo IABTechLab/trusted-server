@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::Deserialize;
@@ -80,7 +80,7 @@ impl PermutiveIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: PERMUTIVE_INTEGRATION_ID.to_string(),
+            integration: PERMUTIVE_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -110,7 +110,7 @@ impl PermutiveIntegration {
         log::info!("Handling Permutive SDK request");
 
         let sdk_url = self.sdk_url();
-        log::info!("Fetching Permutive SDK from: {}", sdk_url);
+        log::info!("Fetching Permutive SDK from: {sdk_url}");
 
         // TODO: Check KV store cache first (future enhancement)
 
@@ -126,8 +126,7 @@ impl PermutiveIntegration {
             permutive_req
                 .send(backend_name)
                 .change_context(Self::error(format!(
-                    "Failed to fetch Permutive SDK from {}",
-                    sdk_url
+                    "Failed to fetch Permutive SDK from {sdk_url}"
                 )))?;
 
         if !permutive_response.get_status().is_success() {
@@ -172,26 +171,22 @@ impl PermutiveIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!(
-            "Proxying Permutive API request: {} {}",
-            method,
-            original_path
-        );
+        log::info!("Proxying Permutive API request: {method} {original_path}");
 
         // Extract path after /integrations/permutive/api
         let api_path = original_path
             .strip_prefix("/integrations/permutive/api")
-            .ok_or_else(|| Self::error(format!("Invalid Permutive API path: {}", original_path)))?;
+            .ok_or_else(|| Self::error(format!("Invalid Permutive API path: {original_path}")))?;
 
         // Build full target URL with query parameters
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
         let target_url = format!("{}{}{}", self.config.api_endpoint, api_path, query);
 
-        log::info!("Forwarding to Permutive API: {}", target_url);
+        log::info!("Forwarding to Permutive API: {target_url}");
 
         // Create new request
         let mut target_req = Request::new(method.clone(), &target_url);
@@ -212,8 +207,7 @@ impl PermutiveIntegration {
         let response = target_req
             .send(backend_name)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to {target_url}"
             )))?;
 
         log::info!(
@@ -233,19 +227,14 @@ impl PermutiveIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!(
-            "Proxying Permutive Secure Signals request: {} {}",
-            method,
-            original_path
-        );
+        log::info!("Proxying Permutive Secure Signals request: {method} {original_path}");
 
         // Extract path after /integrations/permutive/secure-signal
         let signal_path = original_path
             .strip_prefix("/integrations/permutive/secure-signal")
             .ok_or_else(|| {
                 Self::error(format!(
-                    "Invalid Permutive Secure Signals path: {}",
-                    original_path
+                    "Invalid Permutive Secure Signals path: {original_path}"
                 ))
             })?;
 
@@ -253,14 +242,14 @@ impl PermutiveIntegration {
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
         let target_url = format!(
             "{}{}{}",
             self.config.secure_signals_endpoint, signal_path, query
         );
 
-        log::info!("Forwarding to Permutive Secure Signals: {}", target_url);
+        log::info!("Forwarding to Permutive Secure Signals: {target_url}");
 
         // Create new request
         let mut target_req = Request::new(method.clone(), &target_url);
@@ -283,8 +272,7 @@ impl PermutiveIntegration {
         let response = target_req
             .send(backend_name)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to {target_url}"
             )))?;
 
         log::info!(
@@ -304,28 +292,24 @@ impl PermutiveIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!(
-            "Proxying Permutive Events request: {} {}",
-            method,
-            original_path
-        );
+        log::info!("Proxying Permutive Events request: {method} {original_path}");
 
         // Extract path after /integrations/permutive/events
         let events_path = original_path
             .strip_prefix("/integrations/permutive/events")
             .ok_or_else(|| {
-                Self::error(format!("Invalid Permutive Events path: {}", original_path))
+                Self::error(format!("Invalid Permutive Events path: {original_path}"))
             })?;
 
         // Build full target URL with query parameters
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
-        let target_url = format!("https://events.permutive.app{}{}", events_path, query);
+        let target_url = format!("https://events.permutive.app{events_path}{query}");
 
-        log::info!("Forwarding to Permutive Events: {}", target_url);
+        log::info!("Forwarding to Permutive Events: {target_url}");
 
         // Create new request
         let mut target_req = Request::new(method.clone(), &target_url);
@@ -346,8 +330,7 @@ impl PermutiveIntegration {
         let response = target_req
             .send(backend_name)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to {target_url}"
             )))?;
 
         log::info!(
@@ -367,28 +350,22 @@ impl PermutiveIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!(
-            "Proxying Permutive Sync request: {} {}",
-            method,
-            original_path
-        );
+        log::info!("Proxying Permutive Sync request: {method} {original_path}");
 
         // Extract path after /integrations/permutive/sync
         let sync_path = original_path
             .strip_prefix("/integrations/permutive/sync")
-            .ok_or_else(|| {
-                Self::error(format!("Invalid Permutive Sync path: {}", original_path))
-            })?;
+            .ok_or_else(|| Self::error(format!("Invalid Permutive Sync path: {original_path}")))?;
 
         // Build full target URL with query parameters
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
-        let target_url = format!("https://sync.permutive.com{}{}", sync_path, query);
+        let target_url = format!("https://sync.permutive.com{sync_path}{query}");
 
-        log::info!("Forwarding to Permutive Sync: {}", target_url);
+        log::info!("Forwarding to Permutive Sync: {target_url}");
 
         // Create new request
         let mut target_req = Request::new(method.clone(), &target_url);
@@ -409,8 +386,7 @@ impl PermutiveIntegration {
         let response = target_req
             .send(backend_name)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to {target_url}"
             )))?;
 
         log::info!(
@@ -430,26 +406,22 @@ impl PermutiveIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!(
-            "Proxying Permutive CDN request: {} {}",
-            method,
-            original_path
-        );
+        log::info!("Proxying Permutive CDN request: {method} {original_path}");
 
         // Extract path after /integrations/permutive/cdn
         let cdn_path = original_path
             .strip_prefix("/integrations/permutive/cdn")
-            .ok_or_else(|| Self::error(format!("Invalid Permutive CDN path: {}", original_path)))?;
+            .ok_or_else(|| Self::error(format!("Invalid Permutive CDN path: {original_path}")))?;
 
         // Build full target URL with query parameters
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
-        let target_url = format!("https://cdn.permutive.com{}{}", cdn_path, query);
+        let target_url = format!("https://cdn.permutive.com{cdn_path}{query}");
 
-        log::info!("Forwarding to Permutive CDN: {}", target_url);
+        log::info!("Forwarding to Permutive CDN: {target_url}");
 
         // Create new request
         let mut target_req = Request::new(method.clone(), &target_url);
@@ -464,8 +436,7 @@ impl PermutiveIntegration {
         let response = target_req
             .send(backend_name)
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to {target_url}"
             )))?;
 
         log::info!(
@@ -578,8 +549,7 @@ impl IntegrationProxy for PermutiveIntegration {
             self.handle_sdk_serving(settings, req).await
         } else {
             Err(Report::new(Self::error(format!(
-                "Unknown Permutive route: {}",
-                path
+                "Unknown Permutive route: {path}"
             ))))
         }
     }
@@ -622,11 +592,11 @@ fn default_enabled() -> bool {
 }
 
 fn default_api_endpoint() -> String {
-    "https://api.permutive.com".to_string()
+    "https://api.permutive.com".to_owned()
 }
 
 fn default_secure_signals_endpoint() -> String {
-    "https://secure-signals.permutive.app".to_string()
+    "https://secure-signals.permutive.app".to_owned()
 }
 
 fn default_cache_ttl() -> u32 {
@@ -646,9 +616,9 @@ mod tests {
     fn test_permutive_sdk_url_generation() {
         let config = PermutiveConfig {
             enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
-            project_id: "project-456".to_string(),
+            organization_id: "myorg".to_owned(),
+            workspace_id: "workspace-123".to_owned(),
+            project_id: "project-456".to_owned(),
             api_endpoint: default_api_endpoint(),
             secure_signals_endpoint: default_secure_signals_endpoint(),
             cache_ttl_seconds: 3600,
@@ -666,8 +636,8 @@ mod tests {
     fn test_permutive_sdk_url_detection() {
         let config = PermutiveConfig {
             enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
+            organization_id: "myorg".to_owned(),
+            workspace_id: "workspace-123".to_owned(),
             project_id: String::new(),
             api_endpoint: default_api_endpoint(),
             secure_signals_endpoint: default_secure_signals_endpoint(),
@@ -692,8 +662,8 @@ mod tests {
     fn test_attribute_rewriter_rewrites_sdk_urls() {
         let config = PermutiveConfig {
             enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
+            organization_id: "myorg".to_owned(),
+            workspace_id: "workspace-123".to_owned(),
             project_id: String::new(),
             api_endpoint: default_api_endpoint(),
             secure_signals_endpoint: default_secure_signals_endpoint(),
@@ -725,8 +695,8 @@ mod tests {
     fn test_attribute_rewriter_noop_when_disabled() {
         let config = PermutiveConfig {
             enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
+            organization_id: "myorg".to_owned(),
+            workspace_id: "workspace-123".to_owned(),
             project_id: String::new(),
             api_endpoint: default_api_endpoint(),
             secure_signals_endpoint: default_secure_signals_endpoint(),
@@ -767,8 +737,8 @@ mod tests {
     fn test_routes_registration() {
         let config = PermutiveConfig {
             enabled: true,
-            organization_id: "myorg".to_string(),
-            workspace_id: "workspace-123".to_string(),
+            organization_id: "myorg".to_owned(),
+            workspace_id: "workspace-123".to_owned(),
             project_id: String::new(),
             api_endpoint: default_api_endpoint(),
             secure_signals_endpoint: default_secure_signals_endpoint(),

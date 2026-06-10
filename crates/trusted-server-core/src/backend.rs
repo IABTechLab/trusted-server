@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
 use url::Url;
 
@@ -26,10 +26,10 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
 /// would generate URLs without the port when the Host header didn't include it.
 #[inline]
 fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
-    if port != default_port_for_scheme(scheme) {
-        format!("{}:{}", host, port)
+    if port == default_port_for_scheme(scheme) {
+        host.to_owned()
     } else {
-        host.to_string()
+        format!("{host}:{port}")
     }
 }
 
@@ -101,17 +101,17 @@ impl<'a> BackendConfig<'a> {
     fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "missing host".to_string(),
+                message: "missing host".to_owned(),
             }));
         }
         if self.host.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "host contains control characters".to_string(),
+                message: "host contains control characters".to_owned(),
             }));
         }
         if self.scheme.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "scheme contains control characters".to_string(),
+                message: "scheme contains control characters".to_owned(),
             }));
         }
 
@@ -181,33 +181,25 @@ impl<'a> BackendConfig<'a> {
                     .sni_hostname(self.host)
                     .check_certificate(self.host);
             } else {
-                log::warn!(
-                    "INSECURE: certificate check disabled for backend: {}",
-                    backend_name
-                );
+                log::warn!("INSECURE: certificate check disabled for backend: {backend_name}");
             }
-            log::info!("enable ssl for backend: {}", backend_name);
+            log::info!("enable ssl for backend: {backend_name}");
         }
 
         match builder.finish() {
             Ok(_) => {
-                log::info!(
-                    "created dynamic backend: {} -> {}",
-                    backend_name,
-                    host_with_port
-                );
+                log::info!("created dynamic backend: {backend_name} -> {host_with_port}");
                 Ok(backend_name)
             }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("NameInUse") || msg.contains("already in use") {
-                    log::info!("reusing existing dynamic backend: {}", backend_name);
+                    log::info!("reusing existing dynamic backend: {backend_name}");
                     Ok(backend_name)
                 } else {
                     Err(Report::new(TrustedServerError::Proxy {
                         message: format!(
-                            "dynamic backend creation failed ({} -> {}): {}",
-                            backend_name, host_with_port, msg
+                            "dynamic backend creation failed ({backend_name} -> {host_with_port}): {msg}"
                         ),
                     }))
                 }
@@ -225,7 +217,7 @@ impl<'a> BackendConfig<'a> {
         origin_url: &str,
     ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
         let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", origin_url),
+            message: format!("Invalid origin_url: {origin_url}"),
         })?;
 
         let scheme = parsed_url.scheme().to_owned();
@@ -233,7 +225,7 @@ impl<'a> BackendConfig<'a> {
             .host_str()
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Proxy {
-                    message: "Missing host in origin_url".to_string(),
+                    message: "Missing host in origin_url".to_owned(),
                 })
             })?
             .to_owned();
@@ -442,7 +434,7 @@ mod tests {
         use std::time::Duration;
 
         let (name_a, _) = BackendConfig::new("https", "origin.example.com")
-            .first_byte_timeout(Duration::from_millis(2000))
+            .first_byte_timeout(Duration::from_secs(2))
             .compute_name()
             .expect("should compute name with 2000ms timeout");
         let (name_b, _) = BackendConfig::new("https", "origin.example.com")

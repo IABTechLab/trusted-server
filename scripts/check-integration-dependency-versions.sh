@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Ensure the excluded integration-tests crate resolves the same shared direct
+# Ensure the excluded trusted-server-integration-tests crate resolves the same shared direct
 # dependency versions as the workspace, and that its own lockfile is current.
 #
 set -euo pipefail
@@ -21,7 +21,7 @@ trap 'rm -f "$workspace_dependencies" "$integration_dependencies" "$workspace_na
 cargo tree --workspace --depth 1 --prefix none \
     | extract_resolved_direct_dependencies >"$workspace_dependencies"
 cargo tree \
-    --manifest-path "$REPO_ROOT/crates/integration-tests/Cargo.toml" \
+    --manifest-path "$REPO_ROOT/crates/trusted-server-integration-tests/Cargo.toml" \
     --depth 1 \
     --prefix none \
     --locked \
@@ -49,7 +49,7 @@ while IFS= read -r dependency_name; do
     fi
 
     if [ "$workspace_versions" != "$integration_versions" ]; then
-        echo "Shared dependency version mismatch for $dependency_name: workspace=$workspace_versions integration-tests=$integration_versions" >&2
+        echo "Shared dependency version mismatch for $dependency_name: workspace=$workspace_versions trusted-server-integration-tests=$integration_versions" >&2
         status=1
     fi
 done <"$shared_names"

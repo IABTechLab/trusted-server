@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use regex::Regex;
@@ -255,7 +255,7 @@ impl SourcepointIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: SOURCEPOINT_INTEGRATION_ID.to_string(),
+            integration: SOURCEPOINT_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -347,14 +347,11 @@ impl SourcepointIntegration {
 
     fn filtered_sourcepoint_cookie_header(&self, original_req: &Request) -> Option<String> {
         let cookie_header = original_req.get_header(header::COOKIE)?;
-        let cookie_header = match cookie_header.to_str() {
-            Ok(value) => value,
-            Err(_) => {
-                log::warn!(
-                    "Sourcepoint: request Cookie header is not valid UTF-8, skipping upstream cookie forwarding"
-                );
-                return None;
-            }
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            log::warn!(
+                "Sourcepoint: request Cookie header is not valid UTF-8, skipping upstream cookie forwarding"
+            );
+            return None;
         };
 
         let filtered = cookie_header
@@ -466,10 +463,7 @@ impl SourcepointIntegration {
                 let open_quote = &caps[1];
                 let path = caps.get(4).map_or("", |m| m.as_str());
                 let close_quote = &caps[5];
-                format!(
-                    "{}{}{}{close_quote}",
-                    open_quote, SOURCEPOINT_CDN_PREFIX, path
-                )
+                format!("{open_quote}{SOURCEPOINT_CDN_PREFIX}{path}{close_quote}")
             })
             .into_owned();
 
@@ -556,12 +550,12 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
     }
 
     // Keep in sync with JS normalization in:
-    // crates/js/lib/src/integrations/sourcepoint/script_guard.ts
+    // crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts
     // (protocol-relative + bare-domain handling + host-validation behavior).
     let normalized = if trimmed.starts_with("//") {
         format!("https:{trimmed}")
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
+        trimmed.to_owned()
     } else if is_sourcepoint_bare_host_reference(trimmed) {
         format!("https://{trimmed}")
     } else {
@@ -643,7 +637,7 @@ impl IntegrationProxy for SourcepointIntegration {
         _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let method = req.get_method().clone();
         let target_path = Self::strip_cdn_prefix(&path).ok_or_else(|| {
             Report::new(Self::error(format!("Unknown Sourcepoint route: {path}")))
@@ -653,7 +647,7 @@ impl IntegrationProxy for SourcepointIntegration {
             .build_target_url(target_path, req.get_query_str())
             .change_context(Self::error("Failed to build Sourcepoint target URL"))?;
 
-        log::info!("Sourcepoint: proxying {method} {path} → {target_url}");
+        log::info!("Sourcepoint: proxying {method} {path} \u{2192} {target_url}");
 
         let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
         let forwarded_cookies = self.copy_headers(req.get_client_ip_addr(), &req, &mut proxy_req);
@@ -726,9 +720,8 @@ impl IntegrationProxy for SourcepointIntegration {
             match content_length {
                 Some(len) if len > MAX_REWRITE_BODY_SIZE => {
                     log::warn!(
-                        "Sourcepoint: response body for {path} exceeds {} bytes \
-                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
-                        MAX_REWRITE_BODY_SIZE
+                        "Sourcepoint: response body for {path} exceeds {MAX_REWRITE_BODY_SIZE} bytes \
+                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)"
                     );
                     self.apply_cache_headers(&mut response, forwarded_cookies);
                     return Ok(response);
@@ -1160,7 +1153,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "http://169.254.169.254".to_string(),
+            cdn_origin: "http://169.254.169.254".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1175,7 +1168,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
+            cdn_origin: "ftp://cdn.privacy-mgmt.com".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1187,7 +1180,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
+            cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1202,7 +1195,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
+            cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1217,7 +1210,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
+            cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1232,7 +1225,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
+            cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1247,7 +1240,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
+            cdn_origin: "https://cdn.privacy-mgmt.com".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1262,7 +1255,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
+            cdn_origin: "http://cdn.privacy-mgmt.com".to_owned(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1279,7 +1272,7 @@ mod tests {
                 enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
-                auth_cookie_name: Some(auth_cookie_name.to_string()),
+                auth_cookie_name: Some(auth_cookie_name.to_owned()),
                 cache_ttl_seconds: default_cache_ttl(),
             };
 
@@ -1310,7 +1303,7 @@ mod tests {
                 enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
-                auth_cookie_name: Some(auth_cookie_name.to_string()),
+                auth_cookie_name: Some(auth_cookie_name.to_owned()),
                 cache_ttl_seconds: default_cache_ttl(),
             };
 
@@ -1405,7 +1398,7 @@ mod tests {
     #[test]
     fn forwards_configured_auth_cookie_name() {
         let mut cfg = config(true);
-        cfg.auth_cookie_name = Some("sp_auth".to_string());
+        cfg.auth_cookie_name = Some("sp_auth".to_owned());
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
         req.set_header(
@@ -1492,7 +1485,7 @@ mod tests {
         response.set_header(header::CACHE_CONTROL, "no-store");
 
         response.set_body("payload");
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
 
         assert_eq!(response.get_status(), StatusCode::OK);
         assert_eq!(
@@ -1527,7 +1520,7 @@ mod tests {
         response.set_header(header::CACHE_CONTROL, "public, max-age=3600");
         response.set_body("payload");
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
 
         assert_eq!(
             response.get_header_str(header::CACHE_CONTROL),
@@ -1547,7 +1540,7 @@ mod tests {
         response.set_header(header::VARY, "Accept-Encoding");
         response.set_body("payload");
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
 
         assert!(
             response.get_header(header::VARY).is_none(),
@@ -1557,11 +1550,11 @@ mod tests {
 
     #[test]
     fn rewrites_single_quoted_origin_plus_unified_pattern() {
-        let input = r#"return t.origin+'/unified/4.40.1/'}"#;
+        let input = "return t.origin+'/unified/4.40.1/'}";
         let output = SourcepointIntegration::rewrite_script_content(input);
 
         assert_eq!(
-            output, r#"return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}"#,
+            output, "return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}",
             "should rewrite single-quoted unified path"
         );
     }

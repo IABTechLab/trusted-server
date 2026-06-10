@@ -5,11 +5,11 @@
 # checked-in generated.rs directly — no protoc required.
 #
 # Usage:
-#   ./crates/openrtb/generate.sh
+#   ./crates/trusted-server-openrtb/generate.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODEGEN_DIR="$SCRIPT_DIR/../openrtb-codegen"
+CODEGEN_DIR="$SCRIPT_DIR/../trusted-server-openrtb-codegen"
 
 # Check for protoc
 if ! command -v protoc &>/dev/null; then

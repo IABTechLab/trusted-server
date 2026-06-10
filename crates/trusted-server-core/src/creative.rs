@@ -74,9 +74,9 @@ pub(super) fn to_abs(settings: &Settings, u: &str) -> Option<String> {
     }
 
     if t.starts_with("//") {
-        Some(format!("https:{}", t))
+        Some(format!("https:{t}"))
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
-        Some(t.to_string())
+        Some(t.to_owned())
     } else {
         None
     }
@@ -87,20 +87,19 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str) -> String {
     // naive url(...) rewrite for absolute/protocol-relative URLs
     let lower = style.to_ascii_lowercase();
     let mut out = String::with_capacity(style.len() + 16);
-    let mut write_pos = 0usize;
-    let mut scan = 0usize;
+    let mut write_pos = 0_usize;
+    let mut scan = 0_usize;
     while let Some(off) = lower[scan..].find("url(") {
         let start = scan + off;
         let open = start + 4; // after 'url('
                               // write prefix including 'url('
         out.push_str(&style[write_pos..open]);
         // find closing ')'
-        let close = match lower[open..].find(')') {
-            Some(c) => open + c,
-            None => {
-                out.push_str(&style[open..]);
-                return out;
-            }
+        let close = if let Some(c) = lower[open..].find(')') {
+            open + c
+        } else {
+            out.push_str(&style[open..]);
+            return out;
         };
         // trim spaces and quotes
         let bytes = style.as_bytes();
@@ -123,7 +122,7 @@ pub(super) fn rewrite_style_urls(settings: &Settings, style: &str) -> String {
         let new_val = if let Some(abs) = to_abs(settings, url_val) {
             build_proxy_url(settings, &abs)
         } else {
-            url_val.to_string()
+            url_val.to_owned()
         };
         if quoted {
             let q = style.as_bytes()[s] as char;
@@ -149,7 +148,7 @@ fn build_signed_url_for(
     extra: &[(String, String)],
 ) -> String {
     let Ok(mut u) = url::Url::parse(clear_url) else {
-        return clear_url.to_string();
+        return clear_url.to_owned();
     };
 
     let mut pairs: Vec<(String, String)> = u
@@ -223,8 +222,8 @@ pub(super) fn proxy_if_abs(settings: &Settings, val: &str) -> Option<String> {
 pub(super) fn split_srcset_candidates(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut items = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
+    let mut start = 0_usize;
+    let mut i = 0_usize;
     while i < bytes.len() {
         if bytes[i] == b',' {
             // Determine if this comma is the mediatype/data separator in a data: URL.
@@ -277,12 +276,12 @@ pub(super) fn rewrite_srcset(settings: &Settings, srcset: &str) -> String {
         let rewritten = if let Some(abs) = to_abs(settings, url) {
             build_proxy_url(settings, &abs)
         } else {
-            url.to_string()
+            url.to_owned()
         };
         if descriptor.is_empty() {
             out_items.push(rewritten);
         } else {
-            out_items.push(format!("{} {}", rewritten, descriptor));
+            out_items.push(format!("{rewritten} {descriptor}"));
         }
     }
     out_items.join(", ")
@@ -388,7 +387,7 @@ pub fn sanitize_creative_html(markup: &str) -> String {
                         .attributes()
                         .iter()
                         .filter(|a| a.name().to_ascii_lowercase().starts_with("on"))
-                        .map(|a| a.name().to_string())
+                        .map(|a| a.name().clone())
                         .collect();
                     for attr in &on_attrs {
                         el.remove_attribute(attr);
@@ -674,7 +673,7 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 
     let _ = rewriter.write(markup.as_bytes());
     let _ = rewriter.end();
-    String::from_utf8(out).unwrap_or_else(|_| markup.to_string())
+    String::from_utf8(out).unwrap_or_else(|_| markup.to_owned())
 }
 
 /// Stream processor for creative HTML that rewrites URLs to first-party proxy.
@@ -701,15 +700,14 @@ impl StreamProcessor for CreativeHtmlProcessor<'_> {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         if self.buffer.len() + chunk.len() > MAX_REWRITABLE_BODY_SIZE {
             return Err(io::Error::other(format!(
-                "HTML response body exceeds maximum rewritable size of {} bytes",
-                MAX_REWRITABLE_BODY_SIZE
+                "HTML response body exceeds maximum rewritable size of {MAX_REWRITABLE_BODY_SIZE} bytes"
             )));
         }
         self.buffer.extend_from_slice(chunk);
 
         if is_last {
             let markup = String::from_utf8(std::mem::take(&mut self.buffer))
-                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in HTML: {e}")))?;
 
             let rewritten = rewrite_creative_html(self.settings, &markup);
             Ok(rewritten.into_bytes())
@@ -747,15 +745,14 @@ impl StreamProcessor for CreativeCssProcessor<'_> {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         if self.buffer.len() + chunk.len() > MAX_REWRITABLE_BODY_SIZE {
             return Err(io::Error::other(format!(
-                "CSS response body exceeds maximum rewritable size of {} bytes",
-                MAX_REWRITABLE_BODY_SIZE
+                "CSS response body exceeds maximum rewritable size of {MAX_REWRITABLE_BODY_SIZE} bytes"
             )));
         }
         self.buffer.extend_from_slice(chunk);
 
         if is_last {
             let css = String::from_utf8(std::mem::take(&mut self.buffer))
-                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("Invalid UTF-8 in CSS: {e}")))?;
 
             let rewritten = rewrite_css_body(self.settings, &css);
             Ok(rewritten.into_bytes())
@@ -777,7 +774,7 @@ mod tests {
 
     fn rewrite_srcset_attr(attr_name: &str, attr_value: &str) -> String {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = format!(r#"<img {}="{}">"#, attr_name, attr_value);
+        let html = format!(r#"<img {attr_name}="{attr_value}">"#);
         rewrite_creative_html(&settings, &html)
     }
 
@@ -839,12 +836,11 @@ mod tests {
     #[test]
     fn injects_tsjs_creative_when_body_present() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<html><body><p>hello</p></body></html>"#;
+        let html = "<html><body><p>hello</p></body></html>";
         let out = rewrite_creative_html(&settings, html);
         assert!(
             out.contains("/static/tsjs=tsjs-unified.min.js"),
-            "expected unified tsjs injection: {}",
-            out
+            "expected unified tsjs injection: {out}"
         );
         // Inject only once
         assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
@@ -853,7 +849,7 @@ mod tests {
     #[test]
     fn injects_tsjs_unified_once_with_multiple_bodies() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"<html><body>one</body><body>two</body></html>"#;
+        let html = "<html><body>one</body><body>two</body></html>";
         let out = rewrite_creative_html(&settings, html);
         assert_eq!(out.matches("/static/tsjs=tsjs-unified.min.js").count(), 1);
     }
@@ -863,20 +859,20 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
             to_abs(&settings, "//cdn.example/x"),
-            Some("https://cdn.example/x".to_string())
+            Some("https://cdn.example/x".to_owned())
         );
         assert_eq!(
             to_abs(&settings, "HTTPS://cdn.example/x"),
-            Some("HTTPS://cdn.example/x".to_string())
+            Some("HTTPS://cdn.example/x".to_owned())
         );
         assert_eq!(
             to_abs(&settings, "http://cdn.example/x"),
-            Some("http://cdn.example/x".to_string())
+            Some("http://cdn.example/x".to_owned())
         );
         assert_eq!(to_abs(&settings, "/local/x"), None);
         assert_eq!(
             to_abs(&settings, "   //cdn.example/y  "),
-            Some("https://cdn.example/y".to_string())
+            Some("https://cdn.example/y".to_owned())
         );
         assert_eq!(to_abs(&settings, "data:image/png;base64,abcd"), None);
         assert_eq!(to_abs(&settings, "javascript:alert(1)"), None);
@@ -888,12 +884,12 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
             to_abs(&settings, "//cdn.example.com:8080/asset.js"),
-            Some("https://cdn.example.com:8080/asset.js".to_string()),
+            Some("https://cdn.example.com:8080/asset.js".to_owned()),
             "should preserve port 8080 in protocol-relative URL"
         );
         assert_eq!(
             to_abs(&settings, "//cdn.example.com:9443/img.png"),
-            Some("https://cdn.example.com:9443/img.png".to_string()),
+            Some("https://cdn.example.com:9443/img.png".to_owned()),
             "should preserve port 9443 in protocol-relative URL"
         );
     }
@@ -916,8 +912,7 @@ mod tests {
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
             out.contains("cdn.example.com%3A9443"),
-            "Port 9443 should be preserved in rewritten URLs: {}",
-            out
+            "Port 9443 should be preserved in rewritten URLs: {out}"
         );
     }
 
@@ -1037,8 +1032,7 @@ mod tests {
         // Two rewritten absolute candidates expected
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "srcset not fully rewritten: {}",
-            out
+            "srcset not fully rewritten: {out}"
         );
         // Relative preserved
         assert!(out.contains("/local/img.webp 1x"));
@@ -1068,7 +1062,7 @@ mod tests {
         "#;
         let out = rewrite_creative_html(&settings, html);
         let cnt = out.matches("/first-party/proxy?tsurl=").count();
-        assert!(cnt >= 3, "expected 3 rewritten links: {}", out);
+        assert!(cnt >= 3, "expected 3 rewritten links: {out}");
     }
 
     #[test]
@@ -1141,8 +1135,7 @@ mod tests {
         let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 4,
-            "svg hrefs not rewritten: {}",
-            out
+            "svg hrefs not rewritten: {out}"
         );
     }
 
@@ -1157,8 +1150,7 @@ mod tests {
         let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 3,
-            "style url() not rewritten: {}",
-            out
+            "style url() not rewritten: {out}"
         );
         assert!(!out.contains("https://cdn.example/bg.png"));
     }
@@ -1166,17 +1158,16 @@ mod tests {
     #[test]
     fn rewrites_style_block_url_variants() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"
+        let html = "
           <style>
             .a{background:url(https://cdn.example/s1.png)}
             .b{background-image:url('//cdn.example/s2.jpg')}
           </style>
-        "#;
+        ";
         let out = rewrite_creative_html(&settings, html);
         assert!(
             out.matches("/first-party/proxy?tsurl=").count() >= 2,
-            "style block url() not rewritten: {}",
-            out
+            "style block url() not rewritten: {out}"
         );
     }
 
@@ -1208,7 +1199,7 @@ mod tests {
     fn split_srcset_handles_no_space_after_commas() {
         let s = "https://cdn.example/a.png 1x,//cdn.example/b.png 2x,/local/c.png 1x";
         let items = super::split_srcset_candidates(s);
-        assert_eq!(items.len(), 3, "{:?}", items);
+        assert_eq!(items.len(), 3, "{items:?}");
         assert!(items[0].contains("a.png 1x"));
         assert!(items[1].contains("b.png 2x"));
         assert!(items[2].contains("/local/c.png 1x"));
@@ -1218,7 +1209,7 @@ mod tests {
     fn split_srcset_preserves_data_url_comma() {
         let s = "data:image/png;base64,AAAA 1x,//cdn.example/b.png 2x";
         let items = super::split_srcset_candidates(s);
-        assert_eq!(items.len(), 2, "{:?}", items);
+        assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0].trim(), "data:image/png;base64,AAAA 1x");
         assert!(items[1].trim().starts_with("//cdn.example/b.png 2x"));
     }
@@ -1226,9 +1217,9 @@ mod tests {
     #[test]
     fn link_rel_case_and_multi_values_rewritten() {
         let settings = crate::test_support::tests::create_test_settings();
-        let html = r#"
+        let html = "
           <link REL='StyleSheet preload' href='https://cdn.example/s.css' imagesrcset='https://cdn.example/a.png 1x, /local.png 1x'>
-        "#;
+        ";
         let out = rewrite_creative_html(&settings, html);
         // href + one imagesrcset candidate should be rewritten
         assert!(
@@ -1300,7 +1291,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
         assert_eq!(
             to_abs(&settings, "   https://cdn.example/a   "),
-            Some("https://cdn.example/a".to_string())
+            Some("https://cdn.example/a".to_owned())
         );
         assert_eq!(to_abs(&settings, "blob:xyz"), None);
         assert_eq!(to_abs(&settings, "tel:+123"), None);
@@ -1324,7 +1315,7 @@ mod tests {
     #[test]
     fn to_abs_respects_exclude_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_owned()];
 
         // Excluded domain should return None (not proxied)
         assert_eq!(
@@ -1335,14 +1326,14 @@ mod tests {
         // Non-excluded domain should return Some
         assert_eq!(
             to_abs(&settings, "https://other-cdn.example.com/lib.js"),
-            Some("https://other-cdn.example.com/lib.js".to_string())
+            Some("https://other-cdn.example.com/lib.js".to_owned())
         );
     }
 
     #[test]
     fn to_abs_respects_wildcard_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_owned()];
 
         // Should exclude base domain
         assert_eq!(to_abs(&settings, "https://cloudflare.com/cdn.js"), None);
@@ -1356,14 +1347,14 @@ mod tests {
         // Should not exclude different domain
         assert_eq!(
             to_abs(&settings, "https://notcloudflare.com/lib.js"),
-            Some("https://notcloudflare.com/lib.js".to_string())
+            Some("https://notcloudflare.com/lib.js".to_owned())
         );
     }
 
     #[test]
     fn rewrite_html_excludes_blacklisted_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["trusted-cdn.example.com".to_owned()];
 
         let html = r#"
             <img src="https://trusted-cdn.example.com/logo.png">
@@ -1383,7 +1374,7 @@ mod tests {
     #[test]
     fn rewrite_srcset_excludes_blacklisted_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["trusted.example.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["trusted.example.com".to_owned()];
 
         let html = r#"
             <img srcset="https://trusted.example.com/img-1x.png 1x, https://cdn.example.com/img-2x.png 2x">
@@ -1402,9 +1393,9 @@ mod tests {
     #[test]
     fn rewrite_style_urls_excludes_blacklisted_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["fonts.googleapis.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["fonts.googleapis.com".to_owned()];
 
-        let html = r#"
+        let html = "
             <style>
                 @font-face {
                     font-family: 'Test';
@@ -1414,7 +1405,7 @@ mod tests {
                     background: url(https://cdn.example.com/bg.png);
                 }
             </style>
-        "#;
+        ";
 
         let out = rewrite_creative_html(&settings, html);
 
@@ -1429,7 +1420,7 @@ mod tests {
     #[test]
     fn rewrite_click_urls_excludes_blacklisted_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["trusted-landing.example.com".to_string()];
+        settings.rewrite.exclude_domains = vec!["trusted-landing.example.com".to_owned()];
 
         let html = r#"
             <a href="https://trusted-landing.example.com/page">Trusted Link</a>
@@ -1729,7 +1720,7 @@ mod tests {
     fn sanitize_removes_style_element() {
         // <style> blocks can carry CSS expressions, @import, and url() payloads.
         // Treated the same as <link>: stripped entirely.
-        let html = r#"<div>ad</div><style>div { background: expression(alert(1)) }</style>"#;
+        let html = "<div>ad</div><style>div { background: expression(alert(1)) }</style>";
         let out = sanitize_creative_html(html);
         assert!(!out.contains("<style"), "should remove style element");
         assert!(

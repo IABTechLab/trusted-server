@@ -28,7 +28,7 @@ Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastl
 ### Install Viceroy (Test Runtime)
 
 ```bash
-cargo install viceroy
+cargo install viceroy --version 0.17.0 --locked --force
 ```
 
 ## Local Development

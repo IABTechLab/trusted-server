@@ -7,9 +7,9 @@ containers using [Testcontainers](https://testcontainers.com/) and
 ## Prerequisites
 
 - **Docker** — running and accessible
-- **Viceroy** — Fastly local simulator (`cargo install viceroy`)
+- **Viceroy** — Fastly local simulator (`cargo install viceroy --version 0.17.0 --locked --force`)
 - **wasm32-wasip1 target** — `rustup target add wasm32-wasip1`
-- **Node.js** (LTS) — for browser tests only
+- **Node.js** — version pinned in `.tool-versions`, for browser tests only
 
 ## Quick start
 
@@ -46,7 +46,7 @@ This script:
 ./scripts/integration-tests.sh test_nextjs_fastly
 
 # Browser — single framework
-cd crates/integration-tests/browser
+cd crates/trusted-server-integration-tests/browser
 TEST_FRAMEWORK=nextjs npx playwright test
 TEST_FRAMEWORK=wordpress npx playwright test
 ```
@@ -73,12 +73,12 @@ var) so the trusted server's URL rewriting can be verified.
 
 ```bash
 docker build -t test-wordpress:latest \
-  crates/integration-tests/fixtures/frameworks/wordpress/
+  crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 
 docker build \
   --build-arg NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')" \
   -t test-nextjs:latest \
-  crates/integration-tests/fixtures/frameworks/nextjs/
+  crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 ```
 
 ## Test scenarios
@@ -200,7 +200,7 @@ crate requires a native target while the workspace default is `wasm32-wasip1`.
 
 ## Dependency maintenance
 
-`crates/integration-tests` is intentionally excluded from the workspace, so it
+`crates/trusted-server-integration-tests` is intentionally excluded from the workspace, so it
 keeps its own `Cargo.lock`.
 
 Shared direct dependency versions are checked in CI by
@@ -209,7 +209,7 @@ that exists in both manifests:
 
 1. Update the version in both `Cargo.toml` files.
 2. Regenerate the nested lockfile with
-   `cargo generate-lockfile --manifest-path crates/integration-tests/Cargo.toml`.
+   `cargo generate-lockfile --manifest-path crates/trusted-server-integration-tests/Cargo.toml`.
 3. Ensure the workspace and integration-test lockfiles resolve the same version
    for that shared dependency.
 

@@ -4,10 +4,10 @@
 //! lifecycle, and storing keys via platform store primitives through
 //! [`RuntimeServices`].
 
-use base64::{engine::general_purpose, Engine};
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use jose_jwk::Jwk;
 use uuid::Uuid;
 
@@ -74,7 +74,7 @@ impl KeyRotationManager {
             Some(kid) => {
                 if self.key_exists(services, &kid, &active_kids) {
                     return Err(Report::new(TrustedServerError::Configuration {
-                        message: format!("kid '{}' already exists; choose a unique kid", kid),
+                        message: format!("kid '{kid}' already exists; choose a unique kid"),
                     }));
                 }
                 kid
@@ -96,9 +96,7 @@ impl KeyRotationManager {
                 .delete(&self.secret_store_id, &new_kid)
             {
                 log::warn!(
-                    "rotate_key: rollback of private key '{}' failed after JWK write error: {}",
-                    new_kid,
-                    rollback_err
+                    "rotate_key: rollback of private key '{new_kid}' failed after JWK write error: {rollback_err}"
                 );
             }
             return Err(err);
@@ -118,9 +116,7 @@ impl KeyRotationManager {
                 .delete(&self.config_store_id, &new_kid)
             {
                 log::warn!(
-                    "rotate_key: rollback of JWK '{}' failed after active-kids write error: {}",
-                    new_kid,
-                    rollback_err
+                    "rotate_key: rollback of JWK '{new_kid}' failed after active-kids write error: {rollback_err}"
                 );
             }
             if let Err(rollback_err) = services
@@ -128,9 +124,7 @@ impl KeyRotationManager {
                 .delete(&self.secret_store_id, &new_kid)
             {
                 log::warn!(
-                    "rotate_key: rollback of private key '{}' failed after active-kids write error: {}",
-                    new_kid,
-                    rollback_err
+                    "rotate_key: rollback of private key '{new_kid}' failed after active-kids write error: {rollback_err}"
                 );
             }
             return Err(err);
@@ -181,7 +175,7 @@ impl KeyRotationManager {
             .secret_store()
             .create(&self.secret_store_id, kid, &key_b64)
             .change_context(TrustedServerError::Configuration {
-                message: format!("failed to store private key '{}'", kid),
+                message: format!("failed to store private key '{kid}'"),
             })
     }
 
@@ -193,7 +187,7 @@ impl KeyRotationManager {
     ) -> Result<(), Report<TrustedServerError>> {
         let jwk_json = serde_json::to_string(jwk).map_err(|e| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("failed to serialize JWK: {}", e),
+                message: format!("failed to serialize JWK: {e}"),
             })
         })?;
 
@@ -201,7 +195,7 @@ impl KeyRotationManager {
             .config_store()
             .put(&self.config_store_id, kid, &jwk_json)
             .change_context(TrustedServerError::Configuration {
-                message: format!("failed to store public JWK '{}'", kid),
+                message: format!("failed to store public JWK '{kid}'"),
             })
     }
 
@@ -428,14 +422,14 @@ mod tests {
             }
             self.inner.puts.lock().expect("should lock puts").push((
                 store_id.to_string(),
-                key.to_string(),
-                value.to_string(),
+                key.to_owned(),
+                value.to_owned(),
             ));
             self.inner
                 .data
                 .lock()
                 .expect("should lock data")
-                .insert(key.to_string(), value.to_string());
+                .insert(key.to_owned(), value.to_owned());
             Ok(())
         }
 
@@ -444,7 +438,7 @@ mod tests {
                 .deletes
                 .lock()
                 .expect("should lock deletes")
-                .push((store_id.to_string(), key.to_string()));
+                .push((store_id.to_string(), key.to_owned()));
             self.inner
                 .data
                 .lock()
@@ -530,7 +524,7 @@ mod tests {
                 .creates
                 .lock()
                 .expect("should lock creates")
-                .push((store_id.to_string(), name.to_string(), value.to_string()));
+                .push((store_id.to_string(), name.to_owned(), value.to_owned()));
             Ok(())
         }
 
@@ -539,7 +533,7 @@ mod tests {
                 .deletes
                 .lock()
                 .expect("should lock deletes")
-                .push((store_id.to_string(), name.to_string()));
+                .push((store_id.to_string(), name.to_owned()));
             Ok(())
         }
     }
@@ -580,13 +574,13 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("new-kid".to_string()));
+        let result = manager.rotate_key(&services, Some("new-kid".to_owned()));
 
         assert!(result.is_ok(), "should succeed when stores accept writes");
         let rotation = result.expect("should produce rotation result");
         assert_eq!(rotation.new_kid, "new-kid", "should use the provided kid");
         assert!(
-            rotation.active_kids.contains(&"new-kid".to_string()),
+            rotation.active_kids.contains(&"new-kid".to_owned()),
             "should include new kid in active kids"
         );
     }
@@ -594,8 +588,8 @@ mod tests {
     #[test]
     fn rotate_key_preserves_existing_active_kids() {
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), "kid-b".to_string());
-        data.insert("active-kids".to_string(), "kid-a, kid-b".to_string());
+        data.insert("current-kid".to_owned(), "kid-b".to_owned());
+        data.insert("active-kids".to_owned(), "kid-a, kid-b".to_owned());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -603,16 +597,12 @@ mod tests {
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
         let rotation = manager
-            .rotate_key(&services, Some("kid-c".to_string()))
+            .rotate_key(&services, Some("kid-c".to_owned()))
             .expect("should rotate key successfully");
 
         assert_eq!(
             rotation.active_kids,
-            vec![
-                "kid-a".to_string(),
-                "kid-b".to_string(),
-                "kid-c".to_string()
-            ],
+            vec!["kid-a".to_owned(), "kid-b".to_owned(), "kid-c".to_owned()],
             "should preserve previously active keys and append the new kid"
         );
 
@@ -621,11 +611,7 @@ mod tests {
             .expect("should read back updated active kids");
         assert_eq!(
             active_kids,
-            vec![
-                "kid-a".to_string(),
-                "kid-b".to_string(),
-                "kid-c".to_string()
-            ],
+            vec!["kid-a".to_owned(), "kid-b".to_owned(), "kid-c".to_owned()],
             "should store the full active kid list after rotation"
         );
     }
@@ -633,8 +619,8 @@ mod tests {
     #[test]
     fn rotate_key_does_not_reactivate_deactivated_previous_kid() {
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), "kid-a".to_string());
-        data.insert("active-kids".to_string(), "kid-b".to_string());
+        data.insert("current-kid".to_owned(), "kid-a".to_owned());
+        data.insert("active-kids".to_owned(), "kid-b".to_owned());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -642,12 +628,12 @@ mod tests {
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
         let rotation = manager
-            .rotate_key(&services, Some("kid-c".to_string()))
+            .rotate_key(&services, Some("kid-c".to_owned()))
             .expect("should rotate key successfully");
 
         assert_eq!(
             rotation.active_kids,
-            vec!["kid-b".to_string(), "kid-c".to_string()],
+            vec!["kid-b".to_owned(), "kid-c".to_owned()],
             "should not resurrect a previous kid that is no longer active"
         );
     }
@@ -655,8 +641,8 @@ mod tests {
     #[test]
     fn rotate_key_rejects_explicit_kid_that_is_already_active() {
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), "kid-b".to_string());
-        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+        data.insert("current-kid".to_owned(), "kid-b".to_owned());
+        data.insert("active-kids".to_owned(), "kid-a,kid-b".to_owned());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -664,7 +650,7 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("kid-a".to_string()));
+        let result = manager.rotate_key(&services, Some("kid-a".to_owned()));
 
         assert!(
             result.is_err(),
@@ -684,8 +670,8 @@ mod tests {
     fn rotate_key_uniquifies_generated_kid_when_date_based_kid_is_active() {
         let base_kid = generate_date_based_kid();
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), base_kid.clone());
-        data.insert("active-kids".to_string(), base_kid.clone());
+        data.insert("current-kid".to_owned(), base_kid.clone());
+        data.insert("active-kids".to_owned(), base_kid.clone());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -717,7 +703,7 @@ mod tests {
     #[test]
     fn deactivate_key_fails_when_only_one_key_remains() {
         let mut data = HashMap::new();
-        data.insert("active-kids".to_string(), "only-key".to_string());
+        data.insert("active-kids".to_owned(), "only-key".to_owned());
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
         let services = build_services_with_config_and_secret(config_store, secret_store);
@@ -733,18 +719,18 @@ mod tests {
 
     #[test]
     fn key_rotation_result_structure_is_valid() {
-        let jwk = Keypair::generate().get_jwk("test-key".to_string());
+        let jwk = Keypair::generate().get_jwk("test-key".to_owned());
         let result = KeyRotationResult {
-            new_kid: "ts-2024-01-01".to_string(),
-            previous_kid: Some("ts-2023-12-31".to_string()),
-            active_kids: vec!["ts-2023-12-31".to_string(), "ts-2024-01-01".to_string()],
+            new_kid: "ts-2024-01-01".to_owned(),
+            previous_kid: Some("ts-2023-12-31".to_owned()),
+            active_kids: vec!["ts-2023-12-31".to_owned(), "ts-2024-01-01".to_owned()],
             jwk: jwk.clone(),
         };
 
         assert_eq!(result.new_kid, "ts-2024-01-01");
-        assert_eq!(result.previous_kid, Some("ts-2023-12-31".to_string()));
+        assert_eq!(result.previous_kid, Some("ts-2023-12-31".to_owned()));
         assert_eq!(result.active_kids.len(), 2);
-        assert_eq!(result.jwk.prm.kid, Some("test-key".to_string()));
+        assert_eq!(result.jwk.prm.kid, Some("test-key".to_owned()));
     }
 
     #[test]
@@ -754,7 +740,7 @@ mod tests {
         let services = build_services_with_config_and_secret(config_store, secret_store);
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("new-kid".to_string()));
+        let result = manager.rotate_key(&services, Some("new-kid".to_owned()));
 
         assert!(
             result.is_err(),
@@ -770,12 +756,12 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("rollback-kid".to_string()));
+        let result = manager.rotate_key(&services, Some("rollback-kid".to_owned()));
 
         assert!(result.is_err(), "should fail when JWK write fails");
         assert_eq!(
             secret_store.deletes(),
-            vec![("sec-id".to_string(), "rollback-kid".to_string())],
+            vec![("sec-id".to_owned(), "rollback-kid".to_owned())],
             "should roll back private key material after JWK write failure"
         );
         assert!(
@@ -792,17 +778,17 @@ mod tests {
             build_services_with_config_and_secret(config_store.clone(), secret_store.clone());
 
         let manager = KeyRotationManager::new("cfg-id", "sec-id");
-        let result = manager.rotate_key(&services, Some("rollback-kid".to_string()));
+        let result = manager.rotate_key(&services, Some("rollback-kid".to_owned()));
 
         assert!(result.is_err(), "should fail when active-kids write fails");
         assert_eq!(
             config_store.deletes(),
-            vec![("cfg-id".to_string(), "rollback-kid".to_string())],
+            vec![("cfg-id".to_owned(), "rollback-kid".to_owned())],
             "should roll back the stored JWK after active-kids write failure"
         );
         assert_eq!(
             secret_store.deletes(),
-            vec![("sec-id".to_string(), "rollback-kid".to_string())],
+            vec![("sec-id".to_owned(), "rollback-kid".to_owned())],
             "should roll back private key material after active-kids write failure"
         );
     }
@@ -810,8 +796,8 @@ mod tests {
     #[test]
     fn deactivate_key_rejects_current_kid() {
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), "kid-a".to_string());
-        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+        data.insert("current-kid".to_owned(), "kid-a".to_owned());
+        data.insert("active-kids".to_owned(), "kid-a,kid-b".to_owned());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -835,8 +821,8 @@ mod tests {
     #[test]
     fn delete_key_rejects_current_kid_before_deleting_storage() {
         let mut data = HashMap::new();
-        data.insert("current-kid".to_string(), "kid-a".to_string());
-        data.insert("active-kids".to_string(), "kid-a,kid-b".to_string());
+        data.insert("current-kid".to_owned(), "kid-a".to_owned());
+        data.insert("active-kids".to_owned(), "kid-a,kid-b".to_owned());
 
         let config_store = SpyConfigStore::new(data);
         let secret_store = SpySecretStore::new();
@@ -860,10 +846,10 @@ mod tests {
     #[test]
     fn delete_key_removes_secret_before_jwk() {
         let mut data = HashMap::new();
-        data.insert("active-kids".to_string(), "kid-a, kid-b".to_string());
+        data.insert("active-kids".to_owned(), "kid-a, kid-b".to_owned());
         data.insert(
-            "kid-a".to_string(),
-            r#"{"kty":"OKP","crv":"Ed25519"}"#.to_string(),
+            "kid-a".to_owned(),
+            r#"{"kty":"OKP","crv":"Ed25519"}"#.to_owned(),
         );
 
         let config_store = SpyConfigStore::new(data);

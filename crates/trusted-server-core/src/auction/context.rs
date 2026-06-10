@@ -57,10 +57,10 @@ pub fn build_url_with_context_params(
 ) -> String {
     let Ok(mut url) = url::Url::parse(base_url) else {
         log::warn!("build_url_with_context_params: failed to parse base URL, returning as-is");
-        return base_url.to_string();
+        return base_url.to_owned();
     };
 
-    let mut appended = 0usize;
+    let mut appended = 0_usize;
 
     for (context_key, param_name) in mapping {
         if let Some(value) = context.get(context_key) {
@@ -73,10 +73,7 @@ pub fn build_url_with_context_params(
     }
 
     if appended > 0 {
-        log::info!(
-            "build_url_with_context_params: appended {} context query params",
-            appended
-        );
+        log::info!("build_url_with_context_params: appended {appended} context query params");
     }
 
     url.to_string()
@@ -100,10 +97,10 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_appends_array() {
         let context = HashMap::from([(
-            "permutive_segments".to_string(),
+            "permutive_segments".to_owned(),
             ContextValue::StringList(vec!["10000001".into(), "10000003".into(), "adv".into()]),
         )]);
-        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_owned(), "permutive".to_owned())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -119,10 +116,10 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_preserves_existing_query() {
         let context = HashMap::from([(
-            "permutive_segments".to_string(),
+            "permutive_segments".to_owned(),
             ContextValue::StringList(vec!["123".into(), "adv".into()]),
         )]);
-        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_owned(), "permutive".to_owned())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate?debug=true",
@@ -138,7 +135,7 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_no_matching_keys() {
         let context = HashMap::new();
-        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_owned(), "permutive".to_owned())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -151,10 +148,10 @@ mod tests {
     #[test]
     fn test_build_url_with_context_params_empty_array_skipped() {
         let context = HashMap::from([(
-            "permutive_segments".to_string(),
+            "permutive_segments".to_owned(),
             ContextValue::StringList(vec![]),
         )]);
-        let mapping = BTreeMap::from([("permutive_segments".to_string(), "permutive".to_string())]);
+        let mapping = BTreeMap::from([("permutive_segments".to_owned(), "permutive".to_owned())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",
@@ -168,17 +165,17 @@ mod tests {
     fn test_build_url_with_context_params_multiple_mappings() {
         let context = HashMap::from([
             (
-                "permutive_segments".to_string(),
+                "permutive_segments".to_owned(),
                 ContextValue::StringList(vec!["seg1".into()]),
             ),
             (
-                "lockr_ids".to_string(),
+                "lockr_ids".to_owned(),
                 ContextValue::Text("lockr-abc-123".into()),
             ),
         ]);
         let mapping = BTreeMap::from([
-            ("lockr_ids".to_string(), "lockr".to_string()),
-            ("permutive_segments".to_string(), "permutive".to_string()),
+            ("lockr_ids".to_owned(), "lockr".to_owned()),
+            ("permutive_segments".to_owned(), "permutive".to_owned()),
         ]);
 
         let url = build_url_with_context_params(
@@ -192,8 +189,8 @@ mod tests {
 
     #[test]
     fn test_build_url_with_context_params_scalar_number() {
-        let context = HashMap::from([("count".to_string(), ContextValue::Number(42.0))]);
-        let mapping = BTreeMap::from([("count".to_string(), "n".to_string())]);
+        let context = HashMap::from([("count".to_owned(), ContextValue::Number(42.0))]);
+        let mapping = BTreeMap::from([("count".to_owned(), "n".to_owned())]);
 
         let url = build_url_with_context_params(
             "http://localhost:6767/adserver/mediate",

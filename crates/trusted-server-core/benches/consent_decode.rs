@@ -40,7 +40,7 @@ fn build_tc_bytes(vendor_count: u16, use_range_encoding: bool) -> Vec<u8> {
         213 + 17 + usize::from(vendor_count)
     };
     let total_bytes = total_bits.div_ceil(8);
-    let mut buf = vec![0u8; total_bytes];
+    let mut buf = vec![0_u8; total_bytes];
 
     // Version (6 bits) = 2
     write_bits(&mut buf, 0, 6, 2);

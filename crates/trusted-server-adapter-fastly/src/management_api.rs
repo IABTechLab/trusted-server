@@ -16,13 +16,13 @@
 //! Credential values are never logged. Log messages include store IDs and
 //! operation names only.
 
-use std::io::Read;
+use std::io::Read as _;
 
 use base64::{engine::general_purpose, Engine as _};
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
-use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
+use trusted_server_core::platform::{PlatformError, PlatformSecretStore as _, StoreName};
 
 use crate::platform::FastlyPlatformSecretStore;
 
@@ -179,7 +179,7 @@ impl FastlyManagementApiClient {
         }
 
         request.send(&self.backend_name).map_err(|e| {
-            Report::new(error_kind()).attach(format!("management API request failed: {}", e))
+            Report::new(error_kind()).attach(format!("management API request failed: {e}"))
         })
     }
 
@@ -205,7 +205,7 @@ impl FastlyManagementApiClient {
             || PlatformError::ConfigStore,
         )?;
 
-        let entity_description = format!("key '{}'", key);
+        let entity_description = format!("key '{key}'");
         check_response(
             &mut response,
             || PlatformError::ConfigStore,
@@ -214,11 +214,7 @@ impl FastlyManagementApiClient {
             store_id,
         )?;
 
-        log::debug!(
-            "FastlyManagementApiClient: updated config key '{}' in store '{}'",
-            key,
-            store_id
-        );
+        log::debug!("FastlyManagementApiClient: updated config key '{key}' in store '{store_id}'");
         Ok(())
     }
 
@@ -246,7 +242,7 @@ impl FastlyManagementApiClient {
             return Ok(());
         }
 
-        let entity_description = format!("key '{}'", key);
+        let entity_description = format!("key '{key}'");
         check_response(
             &mut response,
             || PlatformError::ConfigStore,
@@ -256,9 +252,7 @@ impl FastlyManagementApiClient {
         )?;
 
         log::debug!(
-            "FastlyManagementApiClient: deleted config key '{}' from store '{}'",
-            key,
-            store_id
+            "FastlyManagementApiClient: deleted config key '{key}' from store '{store_id}'"
         );
         Ok(())
     }
@@ -285,7 +279,7 @@ impl FastlyManagementApiClient {
             || PlatformError::SecretStore,
         )?;
 
-        let entity_description = format!("name '{}'", secret_name);
+        let entity_description = format!("name '{secret_name}'");
         check_response(
             &mut response,
             || PlatformError::SecretStore,
@@ -295,9 +289,7 @@ impl FastlyManagementApiClient {
         )?;
 
         log::debug!(
-            "FastlyManagementApiClient: upserted secret '{}' in store '{}'",
-            secret_name,
-            store_id
+            "FastlyManagementApiClient: upserted secret '{secret_name}' in store '{store_id}'"
         );
         Ok(())
     }
@@ -326,7 +318,7 @@ impl FastlyManagementApiClient {
             return Ok(());
         }
 
-        let entity_description = format!("name '{}'", secret_name);
+        let entity_description = format!("name '{secret_name}'");
         check_response(
             &mut response,
             || PlatformError::SecretStore,
@@ -336,9 +328,7 @@ impl FastlyManagementApiClient {
         )?;
 
         log::debug!(
-            "FastlyManagementApiClient: deleted secret '{}' from store '{}'",
-            secret_name,
-            store_id
+            "FastlyManagementApiClient: deleted secret '{secret_name}' from store '{store_id}'"
         );
         Ok(())
     }
@@ -400,9 +390,9 @@ mod tests {
     #[test]
     fn create_secret_uses_secret_store_error_for_transport_failures() {
         let client = FastlyManagementApiClient::with_components(
-            "test-api-key".to_string(),
+            "test-api-key".to_owned(),
             FASTLY_API_HOST,
-            "missing-management-backend".to_string(),
+            "missing-management-backend".to_owned(),
         );
 
         let err = client

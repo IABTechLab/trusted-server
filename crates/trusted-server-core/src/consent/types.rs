@@ -80,13 +80,13 @@ impl fmt::Display for RawConsentSignals {
 
         write!(f, ", __gpp_sid=")?;
         match &self.raw_gpp_sid {
-            Some(s) => write!(f, "\"{}\"", s)?,
+            Some(s) => write!(f, "\"{s}\"")?,
             None => write!(f, "absent")?,
         }
 
         write!(f, ", us_privacy=")?;
         match &self.raw_us_privacy {
-            Some(s) => write!(f, "\"{}\"", s)?,
+            Some(s) => write!(f, "\"{s}\"")?,
             None => write!(f, "absent")?,
         }
 

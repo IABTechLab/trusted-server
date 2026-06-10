@@ -13,7 +13,7 @@
 
 use std::io::Write;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Body, Request, Response};
 
@@ -57,7 +57,7 @@ fn select_supported_accept_encoding(client_accept_encoding: &str) -> String {
         .collect::<Vec<_>>();
 
     if supported_subset.is_empty() {
-        return "identity".to_string();
+        return "identity".to_owned();
     }
 
     supported_subset.join(", ")
@@ -487,19 +487,19 @@ pub fn handle_publisher_request(
     let mut response = req
         .send(&backend_name)
         .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy request to origin".to_string(),
+            message: "Failed to proxy request to origin".to_owned(),
         })?;
 
     log::debug!("Response headers:");
     for (name, value) in response.get_headers() {
-        log::debug!("  {}: {:?}", name, value);
+        log::debug!("  {name}: {value:?}");
     }
 
     let content_type = response
         .get_header(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
-        .to_string();
+        .to_owned();
 
     let status = response.get_status();
     let content_encoding = response
@@ -520,9 +520,7 @@ pub fn handle_publisher_request(
     match route {
         ResponseRoute::PassThrough => {
             log::debug!(
-                "Pass-through binary response - Content-Type: '{}', status: {}",
-                content_type,
-                status,
+                "Pass-through binary response - Content-Type: '{content_type}', status: {status}",
             );
             let body = response.take_body();
             Ok(PublisherResponse::PassThrough { response, body })
@@ -532,32 +530,22 @@ pub fn handle_publisher_request(
             // entirely rather than entering the pipeline as identity bytes.
             if is_processable_content_type(&content_type) && request_host.is_empty() {
                 log::warn!(
-                    "Empty request host — returning processable content unmodified (Content-Type: '{}', status: {}). Check proxy Host header.",
-                    content_type,
-                    status,
+                    "Empty request host \u{2014} returning processable content unmodified (Content-Type: '{content_type}', status: {status}). Check proxy Host header.",
                 );
             } else if !is_supported_content_encoding(&content_encoding) {
                 log::warn!(
-                    "Unsupported Content-Encoding '{}' - returning response unmodified",
-                    content_encoding,
+                    "Unsupported Content-Encoding '{content_encoding}' - returning response unmodified",
                 );
             } else {
                 log::debug!(
-                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
-                    content_type,
-                    request_host,
-                    status,
+                    "Skipping response processing - Content-Type: '{content_type}', request_host: '{request_host}', status: {status}",
                 );
             }
             Ok(PublisherResponse::Buffered(response))
         }
         ResponseRoute::Stream => {
             log::debug!(
-                "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-                content_type,
-                content_encoding,
-                request_host,
-                origin_host,
+                "Streaming response - Content-Type: {content_type}, Content-Encoding: {content_encoding}, Request Host: {request_host}, Origin Host: {origin_host}",
             );
 
             let body = response.take_body();
@@ -570,19 +558,15 @@ pub fn handle_publisher_request(
                     content_encoding,
                     origin_host,
                     origin_url: settings.publisher.origin_url.clone(),
-                    request_host: request_host.to_string(),
-                    request_scheme: request_scheme.to_string(),
+                    request_host: request_host.clone(),
+                    request_scheme: request_scheme.clone(),
                     content_type,
                 },
             })
         }
         ResponseRoute::BufferedProcessed => {
             log::debug!(
-                "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
-                content_type,
-                content_encoding,
-                request_host,
-                origin_host,
+                "Buffered response - Content-Type: {content_type}, Content-Encoding: {content_encoding}, Request Host: {request_host}, Origin Host: {origin_host}",
             );
 
             let body = response.take_body();
@@ -763,7 +747,7 @@ mod tests {
         assert_eq!(origin_host, "origin.test-publisher.com");
 
         let mut settings_with_port = create_test_settings();
-        settings_with_port.publisher.origin_url = "origin.test-publisher.com:8080".to_string();
+        settings_with_port.publisher.origin_url = "origin.test-publisher.com:8080".to_owned();
         assert_eq!(
             settings_with_port.publisher.origin_host(),
             "origin.test-publisher.com:8080"
@@ -773,7 +757,7 @@ mod tests {
     #[test]
     fn test_invalid_utf8_handling() {
         let invalid_utf8_bytes = vec![0xFF, 0xFE, 0xFD];
-        assert!(String::from_utf8(invalid_utf8_bytes.clone()).is_err());
+        String::from_utf8(invalid_utf8_bytes.clone()).unwrap_err();
     }
 
     #[test]
@@ -791,8 +775,7 @@ mod tests {
             assert_eq!(
                 result.is_ok(),
                 should_be_valid,
-                "UTF-8 validation failed for bytes: {:?}",
-                bytes
+                "UTF-8 validation failed for bytes: {bytes:?}"
             );
         }
     }

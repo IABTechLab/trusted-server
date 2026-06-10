@@ -190,22 +190,7 @@ fn decode_vendor_section(
     let max_vendor_id = raw_max_vendor_id.min(MAX_VENDOR_ID);
     let is_range = reader.read_bool(offset + 16);
 
-    if !is_range {
-        // Bitfield: one bit per vendor, 1..=max_vendor_id
-        let mut vendors = Vec::new();
-        let bitfield_start = offset + 17;
-        for i in 0..usize::from(max_vendor_id) {
-            let bit_pos = bitfield_start + i;
-            if bit_pos >= reader.bit_len() {
-                break;
-            }
-            if reader.read_bool(bit_pos) {
-                // Vendor IDs are 1-indexed
-                vendors.push((i + 1) as u16);
-            }
-        }
-        Ok(vendors)
-    } else {
+    if is_range {
         // Range encoding
         let num_entries_offset = offset + 17;
         if num_entries_offset + 12 > reader.bit_len() {
@@ -252,6 +237,21 @@ fn decode_vendor_section(
             }
         }
         Ok(vendors)
+    } else {
+        // Bitfield: one bit per vendor, 1..=max_vendor_id
+        let mut vendors = Vec::new();
+        let bitfield_start = offset + 17;
+        for i in 0..usize::from(max_vendor_id) {
+            let bit_pos = bitfield_start + i;
+            if bit_pos >= reader.bit_len() {
+                break;
+            }
+            if reader.read_bool(bit_pos) {
+                // Vendor IDs are 1-indexed
+                vendors.push((i + 1) as u16);
+            }
+        }
+        Ok(vendors)
     }
 }
 
@@ -270,9 +270,7 @@ fn vendor_section_end_offset(
     let max_vendor_id = reader.read_u16(offset, 16);
     let is_range = reader.read_bool(offset + 16);
 
-    if !is_range {
-        Ok(offset + 17 + usize::from(max_vendor_id))
-    } else {
+    if is_range {
         let num_entries_offset = offset + 17;
         if num_entries_offset + 12 > reader.bit_len() {
             return Ok(num_entries_offset);
@@ -294,6 +292,8 @@ fn vendor_section_end_offset(
             }
         }
         Ok(pos)
+    } else {
+        Ok(offset + 17 + usize::from(max_vendor_id))
     }
 }
 
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn rejects_too_short() {
-        let encoded = URL_SAFE_NO_PAD.encode([0u8; 10]); // only 80 bits
+        let encoded = URL_SAFE_NO_PAD.encode([0_u8; 10]); // only 80 bits
         let result = decode_tc_string(&encoded);
         assert!(result.is_err(), "should reject short bitfield");
     }
@@ -484,7 +484,7 @@ mod tests {
         //   + entry: isRange(1) + start(16) + end(16) = 262 bits
         let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
         let total_bytes = total_bits.div_ceil(8);
-        let mut buf = vec![0u8; total_bytes];
+        let mut buf = vec![0_u8; total_bytes];
         let mut writer = BitWriter::new(&mut buf);
 
         // Write minimal core fields (version=2, rest zeroed/defaults)
@@ -544,7 +544,7 @@ mod tests {
         let core_bits: usize = 213;
         let total_bits = core_bits + 16 + 1 + 12 + 1 + 16 + 16;
         let total_bytes = total_bits.div_ceil(8);
-        let mut buf = vec![0u8; total_bytes];
+        let mut buf = vec![0_u8; total_bytes];
         let mut writer = BitWriter::new(&mut buf);
 
         writer.write(0, 6, 2);
@@ -589,7 +589,7 @@ mod tests {
         // Core fields: 213 bits + 16 (maxVendorId) + 1 (isRange) + max_vendor_id (bitfield)
         let total_bits = 213 + 17 + usize::from(max_vendor_id);
         let total_bytes = total_bits.div_ceil(8);
-        let mut buf = vec![0u8; total_bytes];
+        let mut buf = vec![0_u8; total_bytes];
 
         let mut writer = BitWriter::new(&mut buf);
 

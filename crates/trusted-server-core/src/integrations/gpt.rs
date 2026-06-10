@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::header;
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -105,7 +105,7 @@ impl GptIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: GPT_INTEGRATION_ID.to_string(),
+            integration: GPT_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -118,7 +118,7 @@ impl GptIntegration {
     /// Returns `None` if `request_path` does not start with [`ROUTE_PREFIX`].
     fn build_upstream_url(request_path: &str, query: Option<&str>) -> Option<String> {
         let upstream_path = request_path.strip_prefix(ROUTE_PREFIX)?;
-        let query_part = query.map(|q| format!("?{}", q)).unwrap_or_default();
+        let query_part = query.map(|q| format!("?{q}")).unwrap_or_default();
         Some(format!(
             "https://{SECUREPUBADS_HOST}{upstream_path}{query_part}"
         ))
@@ -163,11 +163,7 @@ impl GptIntegration {
         }
 
         let status = response.get_status();
-        log::error!(
-            "GPT proxy upstream returned status {} for {}",
-            status,
-            context
-        );
+        log::error!("GPT proxy upstream returned status {status} for {context}");
         Err(Report::new(Self::error(format!(
             "{context}: upstream returned {status}"
         ))))
@@ -220,18 +216,18 @@ impl GptIntegration {
 
     fn vary_with_accept_encoding(upstream_vary: Option<&str>) -> String {
         match upstream_vary.map(str::trim) {
-            Some("*") => "*".to_string(),
+            Some("*") => "*".to_owned(),
             Some(vary) if !vary.is_empty() => {
                 if vary
                     .split(',')
                     .any(|header_name| header_name.trim().eq_ignore_ascii_case("accept-encoding"))
                 {
-                    vary.to_string()
+                    vary.to_owned()
                 } else {
                     format!("{vary}, Accept-Encoding")
                 }
             }
-            _ => "Accept-Encoding".to_string(),
+            _ => "Accept-Encoding".to_owned(),
         }
     }
 
@@ -290,7 +286,7 @@ impl GptIntegration {
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let script_url = &self.config.script_url;
-        log::info!("Fetching GPT script from: {}", script_url);
+        log::info!("Fetching GPT script from: {script_url}");
         self.proxy_gpt_asset(
             settings,
             req,
@@ -315,9 +311,9 @@ impl GptIntegration {
         let query = req.get_url().query();
 
         let target_url = Self::build_upstream_url(original_path, query)
-            .ok_or_else(|| Self::error(format!("Invalid GPT pagead path: {}", original_path)))?;
+            .ok_or_else(|| Self::error(format!("Invalid GPT pagead path: {original_path}")))?;
 
-        log::info!("GPT proxy: forwarding to {}", target_url);
+        log::info!("GPT proxy: forwarding to {target_url}");
         self.proxy_gpt_asset(
             settings,
             req,
@@ -388,8 +384,7 @@ impl IntegrationProxy for GptIntegration {
             self.handle_pagead_proxy(settings, req).await
         } else {
             Err(Report::new(Self::error(format!(
-                "Unknown GPT route: {}",
-                path
+                "Unknown GPT route: {path}"
             ))))
         }
     }
@@ -436,8 +431,7 @@ impl IntegrationHeadInjector for GptIntegration {
         // when it sees the pre-set flag, so this works regardless of whether
         // the inline bootstrap runs before or after the TSJS bundle.
         vec![
-            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>"
-                .to_string(),
+            "<script>window.__tsjs_gpt_enabled=true;window.__tsjs_installGptShim&&window.__tsjs_installGptShim();</script>".to_owned(),
         ]
     }
 }
@@ -449,7 +443,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_script_url() -> String {
-    "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()
+    "https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_owned()
 }
 
 fn default_cache_ttl() -> u32 {
@@ -556,7 +550,7 @@ mod tests {
                     "should rewrite to first-party script endpoint"
                 );
             }
-            other => panic!("Expected Replace action, got {:?}", other),
+            other => panic!("Expected Replace action, got {other:?}"),
         }
     }
 

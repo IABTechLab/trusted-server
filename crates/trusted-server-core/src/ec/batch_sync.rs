@@ -12,7 +12,7 @@
 //! semantics: unchanged UIDs are accepted without a write; different UIDs
 //! replace the stored value regardless of timestamp.
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,10 @@ struct SyncMapping {
     partner_uid: String,
     // Retained for API compatibility. The EC KV body no longer stores
     // per-partner timestamps, so this does not order writes.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "legacy request field is accepted for wire compatibility but not persisted"
+    )]
     timestamp: u64,
 }
 

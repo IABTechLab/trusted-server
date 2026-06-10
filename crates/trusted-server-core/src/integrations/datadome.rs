@@ -58,7 +58,7 @@
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use regex::Regex;
@@ -131,11 +131,11 @@ fn default_enabled() -> bool {
 }
 
 fn default_sdk_origin() -> String {
-    "https://js.datadome.co".to_string()
+    "https://js.datadome.co".to_owned()
 }
 
 fn default_api_origin() -> String {
-    "https://api-js.datadome.co".to_string()
+    "https://api-js.datadome.co".to_owned()
 }
 
 fn default_cache_ttl() -> u32 {
@@ -176,7 +176,7 @@ impl DataDomeIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: DATADOME_INTEGRATION_ID.to_string(),
+            integration: DATADOME_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -208,13 +208,10 @@ impl DataDomeIntegration {
                 // The path already includes the leading slash if present
                 if path.is_empty() {
                     // Bare domain reference: "js.datadome.co" or "api-js.datadome.co"
-                    format!("{}/integrations/datadome{}", open_quote, close_quote)
+                    format!("{open_quote}/integrations/datadome{close_quote}")
                 } else {
                     // Domain with path: "js.datadome.co/js/check" or "api-js.datadome.co/js/check"
-                    format!(
-                        "{}/integrations/datadome{}{}",
-                        open_quote, path, close_quote
-                    )
+                    format!("{open_quote}/integrations/datadome{path}{close_quote}")
                 }
             })
             .into_owned()
@@ -224,8 +221,8 @@ impl DataDomeIntegration {
     fn build_sdk_url(&self, path: &str, query: Option<&str>) -> String {
         let base = self.config.sdk_origin.trim_end_matches('/');
         match query {
-            Some(q) => format!("{}{}?{}", base, path, q),
-            None => format!("{}{}", base, path),
+            Some(q) => format!("{base}{path}?{q}"),
+            None => format!("{base}{path}"),
         }
     }
 
@@ -233,8 +230,8 @@ impl DataDomeIntegration {
     fn build_api_url(&self, path: &str, query: Option<&str>) -> String {
         let base = self.config.api_origin.trim_end_matches('/');
         match query {
-            Some(q) => format!("{}{}?{}", base, path, q),
-            None => format!("{}{}", base, path),
+            Some(q) => format!("{base}{path}?{q}"),
+            None => format!("{base}{path}"),
         }
     }
 
@@ -251,7 +248,7 @@ impl DataDomeIntegration {
     async fn handle_tags_js(&self, req: Request) -> Result<Response, Report<TrustedServerError>> {
         let target_url = self.build_sdk_url("/tags.js", req.get_query_str());
 
-        log::info!("[datadome] Fetching tags.js from {}", target_url);
+        log::info!("[datadome] Fetching tags.js from {target_url}");
 
         let backend = BackendConfig::from_url(&target_url, true)
             .change_context(Self::error("Invalid SDK URL"))?;
@@ -371,13 +368,7 @@ impl DataDomeIntegration {
     /// Returns the path (including leading slash) or `/tags.js` as default.
     fn extract_datadome_path(url: &str) -> &str {
         url.split_once("js.datadome.co")
-            .and_then(|(_, after)| {
-                if after.starts_with('/') {
-                    Some(after)
-                } else {
-                    None
-                }
-            })
+            .and_then(|(_, after)| after.starts_with('/').then_some(after))
             .unwrap_or("/tags.js")
     }
 }
@@ -414,8 +405,7 @@ impl IntegrationProxy for DataDomeIntegration {
             self.handle_js_api(req).await
         } else {
             Err(Report::new(Self::error(format!(
-                "Unknown DataDome route: {}",
-                path
+                "Unknown DataDome route: {path}"
             ))))
         }
     }
@@ -450,11 +440,7 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
             ctx.request_scheme, ctx.request_host, path
         );
 
-        log::info!(
-            "[datadome] Rewriting script src from {} to {}",
-            attr_value,
-            new_url
-        );
+        log::info!("[datadome] Rewriting script src from {attr_value} to {new_url}");
 
         AttributeRewriteAction::Replace(new_url)
     }
@@ -506,8 +492,8 @@ mod tests {
     fn test_config() -> DataDomeConfig {
         DataDomeConfig {
             enabled: true,
-            sdk_origin: "https://js.datadome.co".to_string(),
-            api_origin: "https://api-js.datadome.co".to_string(),
+            sdk_origin: "https://js.datadome.co".to_owned(),
+            api_origin: "https://api-js.datadome.co".to_owned(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
         }
@@ -528,24 +514,20 @@ mod tests {
         // All URLs should be rewritten to root-relative /integrations/datadome/...
         assert!(
             rewritten.contains("\"/integrations/datadome/js/\""),
-            "Bare domain with path should be rewritten to root-relative. Got: {}",
-            rewritten
+            "Bare domain with path should be rewritten to root-relative. Got: {rewritten}"
         );
         assert!(
             rewritten.contains("\"/integrations/datadome/js/endpoint\""),
-            "Absolute URL should be rewritten to root-relative. Got: {}",
-            rewritten
+            "Absolute URL should be rewritten to root-relative. Got: {rewritten}"
         );
         assert!(
             rewritten.contains("\"/integrations/datadome\""),
-            "Bare domain should be rewritten to root-relative. Got: {}",
-            rewritten
+            "Bare domain should be rewritten to root-relative. Got: {rewritten}"
         );
         // Original domain should not appear
         assert!(
             !rewritten.contains("js.datadome.co"),
-            "Original domain should be replaced. Got: {}",
-            rewritten
+            "Original domain should be replaced. Got: {rewritten}"
         );
     }
 
@@ -570,14 +552,14 @@ mod tests {
 
         // Check each format is rewritten correctly to root-relative paths
         assert!(rewritten.contains(r#"var a = "/integrations/datadome/js/check""#));
-        assert!(rewritten.contains(r#"var b = '/integrations/datadome/js/check'"#));
+        assert!(rewritten.contains("var b = '/integrations/datadome/js/check'"));
         assert!(rewritten.contains(r#"var c = "/integrations/datadome/js/check""#));
-        assert!(rewritten.contains(r#"var d = '/integrations/datadome/js/check'"#));
+        assert!(rewritten.contains("var d = '/integrations/datadome/js/check'"));
         assert!(rewritten.contains(r#"var e = "/integrations/datadome/js/check""#));
-        assert!(rewritten.contains(r#"var f = '/integrations/datadome/js/check'"#));
+        assert!(rewritten.contains("var f = '/integrations/datadome/js/check'"));
         assert!(rewritten.contains(r#"var g = "/integrations/datadome/js/check""#));
         assert!(rewritten.contains(r#"var h = "/integrations/datadome""#));
-        assert!(rewritten.contains(r#"var i = '/integrations/datadome'"#));
+        assert!(rewritten.contains("var i = '/integrations/datadome'"));
 
         // No original domain should remain
         assert!(!rewritten.contains("js.datadome.co"));
@@ -621,36 +603,30 @@ mod tests {
         // api-js.datadome.co URLs should be rewritten to root-relative paths
         assert!(
             rewritten.contains(r#""/integrations/datadome/js/""#),
-            "Absolute api-js URL should be rewritten. Got: {}",
-            rewritten
+            "Absolute api-js URL should be rewritten. Got: {rewritten}"
         );
         assert!(
             rewritten.contains(r#""/integrations/datadome/js/check""#),
-            "Bare api-js URL should be rewritten. Got: {}",
-            rewritten
+            "Bare api-js URL should be rewritten. Got: {rewritten}"
         );
         assert!(
             rewritten.contains(r#""/integrations/datadome/js/signal""#),
-            "Protocol-relative api-js URL should be rewritten. Got: {}",
-            rewritten
+            "Protocol-relative api-js URL should be rewritten. Got: {rewritten}"
         );
         // js.datadome.co should also be rewritten
         assert!(
             rewritten.contains(r#""/integrations/datadome/tags.js""#),
-            "SDK URL should be rewritten. Got: {}",
-            rewritten
+            "SDK URL should be rewritten. Got: {rewritten}"
         );
 
         // No original DataDome domains should remain
         assert!(
             !rewritten.contains("api-js.datadome.co"),
-            "api-js.datadome.co should be replaced. Got: {}",
-            rewritten
+            "api-js.datadome.co should be replaced. Got: {rewritten}"
         );
         assert!(
             !rewritten.contains("js.datadome.co"),
-            "js.datadome.co should be replaced. Got: {}",
-            rewritten
+            "js.datadome.co should be replaced. Got: {rewritten}"
         );
     }
 

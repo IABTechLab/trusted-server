@@ -1,6 +1,6 @@
 use core::str;
-use error_stack::{Report, ResultExt};
-use validator::Validate;
+use error_stack::{Report, ResultExt as _};
+use validator::Validate as _;
 
 use crate::error::TrustedServerError;
 use crate::settings::Settings;
@@ -22,7 +22,7 @@ const SETTINGS_DATA: &[u8] = include_bytes!("../../../target/trusted-server-out.
 pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
     let toml_bytes = SETTINGS_DATA;
     let toml_str = str::from_utf8(toml_bytes).change_context(TrustedServerError::InvalidUtf8 {
-        message: "embedded trusted-server.toml file".to_string(),
+        message: "embedded trusted-server.toml file".to_owned(),
     })?;
 
     let settings = Settings::from_toml(toml_str)?;
@@ -31,12 +31,12 @@ pub fn get_settings() -> Result<Settings, Report<TrustedServerError>> {
     settings
         .validate()
         .change_context(TrustedServerError::Configuration {
-            message: "Failed to validate configuration".to_string(),
+            message: "Failed to validate configuration".to_owned(),
         })?;
 
     if !settings.proxy.certificate_check {
         log::warn!(
-            "INSECURE: proxy.certificate_check is disabled — TLS certificates will NOT be verified"
+            "INSECURE: proxy.certificate_check is disabled \u{2014} TLS certificates will NOT be verified"
         );
     }
 

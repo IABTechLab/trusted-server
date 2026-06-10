@@ -7,7 +7,7 @@
 
 use core::fmt::Display;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::SecretStore;
 
 use crate::error::TrustedServerError;
@@ -120,7 +120,7 @@ impl FastlySecretStore {
     pub fn get_string(&self, key: &str) -> Result<String, Report<TrustedServerError>> {
         let bytes = self.get(key)?;
         String::from_utf8(bytes).change_context(TrustedServerError::Configuration {
-            message: "failed to decode secret as UTF-8".to_string(),
+            message: "failed to decode secret as UTF-8".to_owned(),
         })
     }
 }

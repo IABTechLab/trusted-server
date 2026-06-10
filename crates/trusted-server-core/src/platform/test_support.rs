@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::SigningKey;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use rand::rngs::OsRng;
 
 use super::{
@@ -178,11 +178,11 @@ pub(crate) struct StubBackend;
 
 impl PlatformBackend for StubBackend {
     fn predict_name(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Ok("stub-backend".to_string())
+        Ok("stub-backend".to_owned())
     }
 
     fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
-        Ok("stub-backend".to_string())
+        Ok("stub-backend".to_owned())
     }
 }
 
@@ -261,7 +261,7 @@ impl PlatformHttpClient for StubHttpClient {
                 value
                     .to_str()
                     .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
+                    .map(|v| (name.as_str().to_owned(), v.to_owned()))
             })
             .collect();
         self.request_headers
@@ -381,17 +381,15 @@ pub(crate) fn build_request_signing_services() -> RuntimeServices {
     let signing_key = SigningKey::generate(&mut OsRng);
     let key_b64 = general_purpose::STANDARD.encode(signing_key.as_bytes());
     let x_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
-    let jwk_json = format!(
-        r#"{{"kty":"OKP","crv":"Ed25519","x":"{}","kid":"test-kid","alg":"EdDSA"}}"#,
-        x_b64
-    );
+    let jwk_json =
+        format!(r#"{{"kty":"OKP","crv":"Ed25519","x":"{x_b64}","kid":"test-kid","alg":"EdDSA"}}"#);
 
     let mut config_data = HashMap::new();
-    config_data.insert("current-kid".to_string(), "test-kid".to_string());
-    config_data.insert("test-kid".to_string(), jwk_json);
+    config_data.insert("current-kid".to_owned(), "test-kid".to_owned());
+    config_data.insert("test-kid".to_owned(), jwk_json);
 
     let mut secret_data = HashMap::new();
-    secret_data.insert("test-kid".to_string(), key_b64.into_bytes());
+    secret_data.insert("test-kid".to_owned(), key_b64.into_bytes());
 
     build_services_with_config_and_secret(
         HashMapConfigStore::new(config_data),
@@ -569,8 +567,8 @@ mod tests {
     fn stub_backend_returns_fixed_name() {
         let stub = StubBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "example.com".to_string(),
+            scheme: "https".to_owned(),
+            host: "example.com".to_owned(),
             port: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
@@ -603,10 +601,10 @@ mod tests {
     #[test]
     fn hash_map_stores_return_preset_values() {
         let mut config = HashMap::new();
-        config.insert("current-kid".to_string(), "test-kid".to_string());
+        config.insert("current-kid".to_owned(), "test-kid".to_owned());
 
         let mut secrets = HashMap::new();
-        secrets.insert("test-kid".to_string(), b"secret-material".to_vec());
+        secrets.insert("test-kid".to_owned(), b"secret-material".to_vec());
 
         let services = build_services_with_config_and_secret(
             HashMapConfigStore::new(config),

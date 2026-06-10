@@ -28,6 +28,7 @@
         clippy::panic,
         clippy::dbg_macro,
         clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
     )
 )]
 

@@ -15,7 +15,7 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
 use regex::Regex;
@@ -43,7 +43,7 @@ enum PayloadSizeError {
 /// Regex pattern for validating GTM container IDs.
 /// Format: GTM-XXXXXX where X is alphanumeric.
 static GTM_CONTAINER_ID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^GTM-[A-Z0-9]{4,20}$").expect("GTM container ID regex should compile")
+    Regex::new("^GTM-[A-Z0-9]{4,20}$").expect("GTM container ID regex should compile")
 });
 
 /// Regex pattern for matching and rewriting GTM and Google Analytics URLs.
@@ -94,7 +94,7 @@ pub struct GoogleTagManagerConfig {
     /// Maximum allowed size for POST beacon bodies in bytes (default: 65536 / 64KB).
     /// Prevents memory pressure from oversized payloads on public /collect endpoints.
     #[serde(default = "default_max_beacon_body_size")]
-    #[validate(range(min = 1024, max = 1048576))]
+    #[validate(range(min = 1024, max = 1_048_576))]
     pub max_beacon_body_size: usize,
 }
 
@@ -109,7 +109,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_upstream() -> String {
-    DEFAULT_UPSTREAM.to_string()
+    DEFAULT_UPSTREAM.to_owned()
 }
 
 fn default_cache_max_age() -> u32 {
@@ -196,7 +196,7 @@ impl GoogleTagManagerIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: GTM_INTEGRATION_ID.to_string(),
+            integration: GTM_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -210,7 +210,7 @@ impl GoogleTagManagerIntegration {
     /// Uses [`GTM_URL_PATTERN`] to handle all URL variants (https, protocol-relative)
     /// for `googletagmanager.com` and `google-analytics.com`.
     fn rewrite_gtm_urls(content: &str) -> String {
-        let replacement = format!("/integrations/{}$2", GTM_INTEGRATION_ID);
+        let replacement = format!("/integrations/{GTM_INTEGRATION_ID}$2");
         GTM_URL_PATTERN
             .replace_all(content, replacement.as_str())
             .into_owned()
@@ -231,9 +231,9 @@ impl GoogleTagManagerIntegration {
         // Parse URL to extract host and path
         // Support both absolute URLs (https://...) and protocol-relative URLs (//...)
         let url_to_parse = if url.starts_with("//") {
-            format!("https:{}", url)
+            format!("https:{url}")
         } else if url.starts_with("http://") || url.starts_with("https://") {
-            url.to_string()
+            url.to_owned()
         } else {
             // Relative URLs or other formats - not rewritable via this integration
             return false;
@@ -246,7 +246,7 @@ impl GoogleTagManagerIntegration {
             .trim_start_matches("http://");
 
         let (host, path_with_query) = match without_protocol.split_once('/') {
-            Some((h, p)) => (h, format!("/{}", p)),
+            Some((h, p)) => (h, format!("/{p}")),
             None => return false, // No path component
         };
 
@@ -281,19 +281,19 @@ impl GoogleTagManagerIntegration {
         let upstream_base = self.upstream_url();
 
         let mut target_url = if path.ends_with("/gtm.js") {
-            format!("{}/gtm.js", upstream_base)
+            format!("{upstream_base}/gtm.js")
         } else if path.ends_with("/gtag/js") || path.ends_with("/gtag.js") {
-            format!("{}/gtag/js", upstream_base) // Always normalize to /gtag/js upstream as it's canonical
+            format!("{upstream_base}/gtag/js") // Always normalize to /gtag/js upstream as it's canonical
         } else if path.ends_with("/g/collect") {
-            "https://www.google-analytics.com/g/collect".to_string()
+            "https://www.google-analytics.com/g/collect".to_owned()
         } else if path.ends_with("/collect") {
-            "https://www.google-analytics.com/collect".to_string()
+            "https://www.google-analytics.com/collect".to_owned()
         } else {
             return None;
         };
 
         if let Some(query) = req.get_url().query() {
-            target_url = format!("{}?{}", target_url, query);
+            target_url = format!("{target_url}?{query}");
         } else if path.ends_with("/gtm.js") {
             target_url = format!("{}?id={}", target_url, self.config.container_id);
         }
@@ -322,7 +322,7 @@ impl GoogleTagManagerIntegration {
 
             for chunk_result in body.read_chunks(CHUNK_SIZE) {
                 let chunk = chunk_result.map_err(|e| {
-                    log::error!("Error reading request body: {}", e);
+                    log::error!("Error reading request body: {e}");
                     // Convert I/O error to size error for uniform handling
                     PayloadSizeError::TooLarge {
                         actual: 0,
@@ -335,9 +335,7 @@ impl GoogleTagManagerIntegration {
                 if body_bytes.len() + chunk.len() > max_size {
                     let total_size = body_bytes.len() + chunk.len();
                     log::warn!(
-                        "POST body size {} exceeds max {} (rejected during chunked read)",
-                        total_size,
-                        max_size
+                        "POST body size {total_size} exceeds max {max_size} (rejected during chunked read)"
                     );
                     return Err(PayloadSizeError::TooLarge {
                         actual: total_size,
@@ -429,9 +427,9 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         settings: &Settings,
         mut req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let method = req.get_method();
-        log::debug!("Handling GTM request: {} {}", method, path);
+        log::debug!("Handling GTM request: {method} {path}");
 
         // Validate body size for POST requests to prevent memory pressure
         // Check Content-Length header if present for early rejection
@@ -439,23 +437,20 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             if let Some(content_length_str) =
                 req.get_header_str(fastly::http::header::CONTENT_LENGTH)
             {
-                match content_length_str.parse::<usize>() {
-                    Ok(content_length) => {
-                        // Early rejection based on Content-Length
-                        if content_length > self.config.max_beacon_body_size {
-                            log::warn!(
-                                "Rejecting POST beacon with Content-Length {} exceeding max {}",
-                                content_length,
-                                self.config.max_beacon_body_size
-                            );
-                            return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
-                        }
+                if let Ok(content_length) = content_length_str.parse::<usize>() {
+                    // Early rejection based on Content-Length
+                    if content_length > self.config.max_beacon_body_size {
+                        log::warn!(
+                            "Rejecting POST beacon with Content-Length {} exceeding max {}",
+                            content_length,
+                            self.config.max_beacon_body_size
+                        );
+                        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
                     }
-                    Err(_) => {
-                        // Invalid Content-Length header
-                        log::warn!("POST request with malformed Content-Length header");
-                        return Ok(Response::from_status(StatusCode::BAD_REQUEST));
-                    }
+                } else {
+                    // Invalid Content-Length header
+                    log::warn!("POST request with malformed Content-Length header");
+                    return Ok(Response::from_status(StatusCode::BAD_REQUEST));
                 }
             }
             // If Content-Length is missing, we'll check actual size after read
@@ -466,7 +461,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             return Ok(Response::from_status(StatusCode::NOT_FOUND));
         };
 
-        log::debug!("Proxying to upstream: {}", target_url);
+        log::debug!("Proxying to upstream: {target_url}");
 
         // Handle payload size errors explicitly to return 413 instead of 502
         let proxy_config = match self.build_proxy_config(&path, &mut req, &target_url) {
@@ -474,9 +469,7 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
             Err(PayloadSizeError::TooLarge { actual, max }) => {
                 // This catches cases where Content-Length was incorrect
                 log::warn!(
-                    "Returning 413: actual body size {} exceeds max {} (Content-Length mismatch)",
-                    actual,
-                    max
+                    "Returning 413: actual body size {actual} exceeds max {max} (Content-Length mismatch)"
                 );
                 return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
             }
@@ -595,7 +588,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         // No GTM content — if we accumulated fragments, emit them unchanged.
         // Intermediate fragments were already suppressed via RemoveNode.
         if full_content.is_some() {
-            return ScriptRewriteAction::replace(text.to_string());
+            return ScriptRewriteAction::replace(text.to_owned());
         }
 
         ScriptRewriteAction::keep()
@@ -698,8 +691,8 @@ mod tests {
     fn test_attribute_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -725,7 +718,7 @@ mod tests {
                 "/integrations/google_tag_manager/gtm.js?id=GTM-TEST1234"
             );
         } else {
-            panic!("Expected Replace action for HTTPS URL, got {:?}", action);
+            panic!("Expected Replace action for HTTPS URL, got {action:?}");
         }
 
         // Case 2: Protocol-relative URL
@@ -741,10 +734,7 @@ mod tests {
                 "/integrations/google_tag_manager/gtm.js?id=GTM-TEST1234"
             );
         } else {
-            panic!(
-                "Expected Replace action for protocol-relative URL, got {:?}",
-                action
-            );
+            panic!("Expected Replace action for protocol-relative URL, got {action:?}");
         }
 
         // Case 3: gtag/js URL in href (preload link)
@@ -760,10 +750,7 @@ mod tests {
                 "/integrations/google_tag_manager/gtag/js?id=G-DQMZGMPHXN"
             );
         } else {
-            panic!(
-                "Expected Replace action for gtag/js preload href, got {:?}",
-                action
-            );
+            panic!("Expected Replace action for gtag/js preload href, got {action:?}");
         }
 
         // Case 4: google-analytics.com URL in href
@@ -776,10 +763,7 @@ mod tests {
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(val, "/integrations/google_tag_manager/g/collect");
         } else {
-            panic!(
-                "Expected Replace action for google-analytics href, got {:?}",
-                action
-            );
+            panic!("Expected Replace action for google-analytics href, got {action:?}");
         }
 
         // Case 5: analytics.google.com URL in href
@@ -792,10 +776,7 @@ mod tests {
         if let AttributeRewriteAction::Replace(val) = action {
             assert_eq!(val, "/integrations/google_tag_manager/g/collect?v=2");
         } else {
-            panic!(
-                "Expected Replace action for analytics.google.com href, got {:?}",
-                action
-            );
+            panic!("Expected Replace action for analytics.google.com href, got {action:?}");
         }
 
         // Case 6: Other URL (should be kept)
@@ -814,8 +795,8 @@ mod tests {
         // This verifies the fix for P2: proper URL parsing instead of substring matching
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -893,8 +874,8 @@ mod tests {
     fn test_script_rewriter() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -911,31 +892,28 @@ mod tests {
         };
 
         // Case 1: Inline GTM snippet
-        let snippet = r#"(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+        let snippet = "(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
 new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
 j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
-})(window,document,'script','dataLayer','GTM-XXXX');"#;
+})(window,document,'script','dataLayer','GTM-XXXX');";
 
         let action = IntegrationScriptRewriter::rewrite(&*integration, snippet, &ctx);
         if let ScriptRewriteAction::Replace(val) = action {
             assert!(val.contains("/integrations/google_tag_manager/gtm.js"));
             assert!(!val.contains("https://www.googletagmanager.com/gtm.js"));
         } else {
-            panic!("Expected Replace action for GTM snippet, got {:?}", action);
+            panic!("Expected Replace action for GTM snippet, got {action:?}");
         }
 
         // Case 2: Protocol relative
-        let snippet_proto = r#"j.src='//www.googletagmanager.com/gtm.js?id='+i+dl;"#;
+        let snippet_proto = "j.src='//www.googletagmanager.com/gtm.js?id='+i+dl;";
         let action = IntegrationScriptRewriter::rewrite(&*integration, snippet_proto, &ctx);
         if let ScriptRewriteAction::Replace(val) = action {
             assert!(val.contains("/integrations/google_tag_manager/gtm.js"));
             assert!(!val.contains("//www.googletagmanager.com/gtm.js"));
         } else {
-            panic!(
-                "Expected Replace action for proto-relative snippet, got {:?}",
-                action
-            );
+            panic!("Expected Replace action for proto-relative snippet, got {action:?}");
         }
 
         // Case 3: Irrelevant script
@@ -948,7 +926,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_default_configuration() {
         let config = GoogleTagManagerConfig {
             enabled: default_enabled(),
-            container_id: "GTM-DEFAULT".to_string(),
+            container_id: "GTM-DEFAULT".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -963,7 +941,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // Default upstream (via serde default)
         let config_default = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234123".to_string(),
+            container_id: "GTM-TEST1234123".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -977,8 +955,8 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // Custom upstream
         let config_custom = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234123".to_string(),
-            upstream_url: "https://gtm.example.com".to_string(),
+            container_id: "GTM-TEST1234123".to_owned(),
+            upstream_url: "https://gtm.example.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -990,7 +968,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_routes_registered() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -1022,7 +1000,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_post_collect_proxy_config_includes_payload() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -1036,7 +1014,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
         req.set_body(payload.clone());
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
@@ -1056,7 +1034,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let max_size = default_max_beacon_body_size();
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: max_size,
@@ -1071,7 +1049,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
         req.set_body(oversized_payload.clone());
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
@@ -1095,7 +1073,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let custom_max_size = 1024; // 1KB
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: custom_max_size,
@@ -1110,7 +1088,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
         req1.set_body(acceptable_payload.clone());
 
-        let path = req1.get_path().to_string();
+        let path = req1.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req1, &path)
             .expect("should resolve collect target URL");
@@ -1144,7 +1122,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let max_size = default_max_beacon_body_size();
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: max_size,
@@ -1164,7 +1142,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             (max_size / 2).to_string(),
         );
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
@@ -1192,7 +1170,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let max_size = 1024; // Use small size for testing
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: max_size,
@@ -1230,7 +1208,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         // Verify that handle() returns 400 Bad Request for malformed Content-Length
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -1267,7 +1245,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         let max_size = default_max_beacon_body_size();
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: max_size,
@@ -1283,7 +1261,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         req.set_body(small_payload);
         // Intentionally NOT setting Content-Length header (HTTP/2 scenario)
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
@@ -1301,7 +1279,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_collect_proxy_config_strips_client_ip_forwarding() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-TEST1234".to_string(),
+            container_id: "GTM-TEST1234".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -1314,7 +1292,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
         );
         req.set_header(crate::constants::HEADER_X_FORWARDED_FOR, "198.51.100.42");
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve collect target URL");
@@ -1340,7 +1318,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     fn test_gtag_proxy_config_requests_identity_encoding() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GT-123".to_string(),
+            container_id: "GT-123".to_owned(),
             upstream_url: default_upstream(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
@@ -1352,7 +1330,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
             "https://edge.example.com/integrations/google_tag_manager/gtag/js?id=G-123",
         );
 
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let target_url = integration
             .build_target_url(&req, &path)
             .expect("should resolve gtag target URL");
@@ -1500,7 +1478,7 @@ container_id = "GTM-DEFAULT"
 
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
+        result.unwrap();
 
         let processed = String::from_utf8_lossy(&output);
 
@@ -1605,7 +1583,7 @@ container_id = "GTM-DEFAULT"
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
         // Synthetic HTML with inline script
-        let html_input = r#"
+        let html_input = "
             <html>
             <head>
                 <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
@@ -1616,7 +1594,7 @@ container_id = "GTM-DEFAULT"
             </head>
             <body></body>
             </html>
-        "#;
+        ";
 
         let mut output = Vec::new();
         pipeline
@@ -1651,7 +1629,7 @@ container_id = "GTM-DEFAULT"
         for container_id in valid_ids {
             let config = GoogleTagManagerConfig {
                 enabled: true,
-                container_id: container_id.to_string(),
+                container_id: container_id.to_owned(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
                 max_beacon_body_size: default_max_beacon_body_size(),
@@ -1659,8 +1637,7 @@ container_id = "GTM-DEFAULT"
 
             assert!(
                 config.validate().is_ok(),
-                "Container ID '{}' should be valid",
-                container_id
+                "Container ID '{container_id}' should be valid"
             );
         }
     }
@@ -1683,7 +1660,7 @@ container_id = "GTM-DEFAULT"
         for (container_id, reason) in invalid_ids {
             let config = GoogleTagManagerConfig {
                 enabled: true,
-                container_id: container_id.to_string(),
+                container_id: container_id.to_owned(),
                 upstream_url: default_upstream(),
                 cache_max_age: default_cache_max_age(),
                 max_beacon_body_size: default_max_beacon_body_size(),
@@ -1691,9 +1668,7 @@ container_id = "GTM-DEFAULT"
 
             assert!(
                 config.validate().is_err(),
-                "Container ID '{}' should be invalid ({})",
-                container_id,
-                reason
+                "Container ID '{container_id}' should be invalid ({reason})"
             );
         }
     }
@@ -1701,7 +1676,7 @@ container_id = "GTM-DEFAULT"
     #[test]
     fn test_container_id_validation_max_length() {
         // Test that max length constraint is enforced
-        let too_long = "GTM-".to_string() + &"X".repeat(50); // 54 chars total
+        let too_long = "GTM-".to_owned() + &"X".repeat(50); // 54 chars total
 
         let config = GoogleTagManagerConfig {
             enabled: true,
@@ -1729,7 +1704,7 @@ container_id = "GTM-DEFAULT"
                 assert_eq!(integration, "google_tag_manager");
                 assert_eq!(message, "test failure");
             }
-            other => panic!("Expected Integration error, got {:?}", other),
+            other => panic!("Expected Integration error, got {other:?}"),
         }
     }
 
@@ -1737,8 +1712,8 @@ container_id = "GTM-DEFAULT"
     fn fragmented_gtm_snippet_is_accumulated_and_rewritten() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-FRAG1".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-FRAG1".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -1747,8 +1722,8 @@ container_id = "GTM-DEFAULT"
         let document_state = IntegrationDocumentState::default();
 
         // Simulate lol_html splitting the GTM snippet mid-domain.
-        let fragment1 = r#"(function(w,d,s,l,i){j.src='https://www.google"#;
-        let fragment2 = r#"tagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-FRAG1');"#;
+        let fragment1 = "(function(w,d,s,l,i){j.src='https://www.google";
+        let fragment2 = "tagmanager.com/gtm.js?id='+i;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','GTM-FRAG1');";
 
         let ctx_intermediate = IntegrationScriptContext {
             selector: "script",
@@ -1797,8 +1772,8 @@ container_id = "GTM-DEFAULT"
         // when selectors overlap (see `GoogleTagManagerIntegration::rewrite`).
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-PASS1".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-PASS1".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -1845,8 +1820,8 @@ container_id = "GTM-DEFAULT"
     fn accumulation_buffer_drains_between_consecutive_script_elements() {
         let config = GoogleTagManagerConfig {
             enabled: true,
-            container_id: "GTM-MULTI1".to_string(),
-            upstream_url: "https://www.googletagmanager.com".to_string(),
+            container_id: "GTM-MULTI1".to_owned(),
+            upstream_url: "https://www.googletagmanager.com".to_owned(),
             cache_max_age: default_cache_max_age(),
             max_beacon_body_size: default_max_beacon_body_size(),
         };
@@ -1854,8 +1829,8 @@ container_id = "GTM-DEFAULT"
         let document_state = IntegrationDocumentState::default();
 
         // --- First <script>: fragmented GTM snippet ---
-        let gtm_frag1 = r#"j.src='https://www.google"#;
-        let gtm_frag2 = r#"tagmanager.com/gtm.js?id=GTM-MULTI1';"#;
+        let gtm_frag1 = "j.src='https://www.google";
+        let gtm_frag2 = "tagmanager.com/gtm.js?id=GTM-MULTI1';";
 
         let ctx_intermediate = IntegrationScriptContext {
             selector: "script",
@@ -1932,7 +1907,7 @@ container_id = "GTM-DEFAULT"
         };
         let mut pipeline = StreamingPipeline::new(pipeline_config, processor);
 
-        let html_input = r#"<html><head><script>j.src='https://www.googletagmanager.com/gtm.js?id=GTM-SMALL1';</script></head><body></body></html>"#;
+        let html_input = "<html><head><script>j.src='https://www.googletagmanager.com/gtm.js?id=GTM-SMALL1';</script></head><body></body></html>";
 
         let mut output = Vec::new();
         pipeline

@@ -1,8 +1,8 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{aead::Aead as _, aead::KeyInit as _, XChaCha20Poly1305, XNonce};
 use edgezero_core::body::Body as EdgeBody;
 use http::{header, Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
@@ -50,7 +50,7 @@ pub(crate) const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
 pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
     for header in SPOOFABLE_FORWARDED_HEADERS {
         if req.headers().contains_key(*header) {
-            log::debug!("Stripped spoofable header: {}", header);
+            log::debug!("Stripped spoofable header: {header}");
             req.headers_mut().remove(*header);
         }
     }
@@ -158,7 +158,7 @@ fn extract_request_host(req: &Request<EdgeBody>) -> String {
                 .and_then(|h| h.to_str().ok())
         })
         .unwrap_or_default()
-        .to_string()
+        .to_owned()
 }
 
 fn parse_forwarded_param<'a>(forwarded: &'a str, param: &str) -> Option<&'a str> {
@@ -201,11 +201,7 @@ fn strip_quotes(value: &str) -> &str {
 
 fn normalize_scheme(value: &str) -> Option<String> {
     let scheme = value.trim().to_ascii_lowercase();
-    if scheme == "https" || scheme == "http" {
-        Some(scheme)
-    } else {
-        None
-    }
+    (scheme == "https" || scheme == "http").then_some(scheme)
 }
 
 /// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
@@ -223,14 +219,14 @@ fn detect_request_scheme(
 ) -> String {
     // 1. First try ClientInfo TLS fields populated at the adapter entry point.
     if let Some(tls_protocol) = tls_protocol {
-        log::debug!("TLS protocol detected: {}", tls_protocol);
-        return "https".to_string();
+        log::debug!("TLS protocol detected: {tls_protocol}");
+        return "https".to_owned();
     }
 
     // Also check TLS cipher - if present, connection is HTTPS.
     if tls_cipher.is_some() {
         log::debug!("TLS cipher detected, using HTTPS");
-        return "https".to_string();
+        return "https".to_owned();
     }
 
     // 2. Try the Forwarded header (RFC 7239)
@@ -259,13 +255,13 @@ fn detect_request_scheme(
     if let Some(ssl) = req.headers().get("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
             if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
-                return "https".to_string();
+                return "https".to_owned();
             }
         }
     }
 
     // Default to HTTP
-    "http".to_string()
+    "http".to_owned()
 }
 
 /// Build a static text response with strong `ETag` and standard caching headers.
@@ -337,7 +333,7 @@ pub fn encode_url(settings: &Settings, plaintext_url: &str) -> String {
     hasher.update(settings.publisher.proxy_secret.expose().as_bytes());
     hasher.update(plaintext_url.as_bytes());
     let nonce_full = hasher.finalize();
-    let mut nonce = [0u8; 24];
+    let mut nonce = [0_u8; 24];
     nonce[..24].copy_from_slice(&nonce_full[..24]);
     let nonce = XNonce::from_slice(&nonce);
 
@@ -368,10 +364,8 @@ pub fn decode_url(settings: &Settings, token: &str) -> Option<String> {
 
     let key_bytes = Sha256::digest(settings.publisher.proxy_secret.expose().as_bytes());
     let cipher = XChaCha20Poly1305::new(&key_bytes);
-    cipher
-        .decrypt(nonce, ciphertext)
-        .ok()
-        .and_then(|pt| String::from_utf8(pt).ok())
+    let pt = cipher.decrypt(nonce, ciphertext).ok()?;
+    String::from_utf8(pt).ok()
 }
 
 /// Compute a deterministic signature token (tstoken) for a clear-text URL using the
@@ -479,11 +473,8 @@ mod tests {
         let src = "https://t.example/p.gif";
         let enc = encode_url(&settings, src);
         assert!(!enc.ends_with('='));
-        let dec = match decode_url(&settings, &enc) {
-            Some(s) => s,
-            None => {
-                panic!("decode failed for token: {}", enc);
-            }
+        let Some(dec) = decode_url(&settings, &enc) else {
+            panic!("decode failed for token: {enc}");
         };
         assert_eq!(dec, src);
     }
@@ -820,7 +811,7 @@ mod tests {
         let req = build_request(Method::GET, "https://test.example.com/page");
         let client_info = ClientInfo {
             client_ip: None,
-            tls_protocol: Some("TLSv1.3".to_string()),
+            tls_protocol: Some("TLSv1.3".to_owned()),
             tls_cipher: None,
         };
 
@@ -838,7 +829,7 @@ mod tests {
         let client_info = ClientInfo {
             client_ip: None,
             tls_protocol: None,
-            tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_string()),
+            tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_owned()),
         };
 
         let info = RequestInfo::from_request(&req, &client_info);

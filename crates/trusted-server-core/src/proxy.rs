@@ -1,5 +1,5 @@
 use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, HeaderValue, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -177,7 +177,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     pipeline
         .process(body, &mut output)
         .change_context(TrustedServerError::Proxy {
-            message: error_context.to_string(),
+            message: error_context.to_owned(),
         })?;
 
     Ok(rebuild_response_with_body(
@@ -200,12 +200,12 @@ fn finalize_proxied_response(
         .get_header(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
-        .to_string();
+        .to_owned();
     let content_encoding = beresp
         .get_header(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
-        .to_string();
+        .to_owned();
     let cl_raw = beresp
         .get_header(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
@@ -222,13 +222,7 @@ fn finalize_proxied_response(
         &content_encoding
     };
     log::info!(
-        "origin response status={} ct={} ce={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        ce_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
+        "origin response status={status_code} ct={ct_for_log} ce={ce_for_log} cl={cl_raw} accept={accept_raw} url={target_url}"
     );
 
     let ct = ct_raw.to_ascii_lowercase();
@@ -260,8 +254,7 @@ fn finalize_proxied_response(
     let req_accept_images = req
         .get_header(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
+        .is_some_and(|s| s.to_ascii_lowercase().contains("image/"));
 
     if ct.starts_with("image/") || req_accept_images {
         if beresp.get_header(header::CONTENT_TYPE).is_none() {
@@ -294,7 +287,7 @@ fn finalize_proxied_response(
         }
 
         if is_pixel {
-            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
+            log::info!("likely pixel image fetched: {target_url} ct={ct}");
         }
 
         return Ok(beresp);
@@ -314,7 +307,7 @@ fn finalize_proxied_response_streaming(
         .get_header(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
-        .to_string();
+        .to_owned();
     let cl_raw = beresp
         .get_header(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
@@ -326,12 +319,7 @@ fn finalize_proxied_response_streaming(
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
     log::info!(
-        "origin response status={} ct={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
+        "origin response status={status_code} ct={ct_for_log} cl={cl_raw} accept={accept_raw} url={target_url}"
     );
 
     let ct = ct_raw.to_ascii_lowercase();
@@ -339,8 +327,7 @@ fn finalize_proxied_response_streaming(
     let req_accept_images = req
         .get_header(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
+        .is_some_and(|s| s.to_ascii_lowercase().contains("image/"));
 
     if ct.starts_with("image/") || req_accept_images {
         if beresp.get_header(header::CONTENT_TYPE).is_none() {
@@ -370,11 +357,7 @@ fn finalize_proxied_response_streaming(
         }
 
         if is_pixel {
-            log::info!(
-                "stream: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
+            log::info!("stream: likely pixel image fetched: {target_url} ct={ct}");
         }
     }
 
@@ -431,7 +414,7 @@ pub async fn proxy_request(
 
     let mut target_url_parsed = url::Url::parse(target_url).map_err(|_| {
         Report::new(TrustedServerError::Proxy {
-            message: "invalid url".to_string(),
+            message: "invalid url".to_owned(),
         })
     })?;
 
@@ -463,7 +446,7 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    pairs.push(("ts-ec".to_string(), ec_id.to_string()));
+    pairs.push(("ts-ec".to_owned(), ec_id.to_owned()));
 
     url.set_query(None);
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -477,7 +460,7 @@ fn append_ec_id(req: &Request, target_url_parsed: &mut url::Url) {
     let ec_id_param = match get_ec_id(req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract EC ID for forwarding: {:?}", e);
+            log::warn!("failed to extract EC ID for forwarding: {e:?}");
             None
         }
     };
@@ -542,31 +525,28 @@ async fn proxy_with_redirects(
     for redirect_attempt in 0..=MAX_REDIRECTS {
         let parsed_url = url::Url::parse(&current_url).map_err(|_| {
             Report::new(TrustedServerError::Proxy {
-                message: "invalid url".to_string(),
+                message: "invalid url".to_owned(),
             })
         })?;
 
         let scheme = parsed_url.scheme().to_ascii_lowercase();
         if scheme != "http" && scheme != "https" {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "unsupported scheme".to_string(),
+                message: "unsupported scheme".to_owned(),
             }));
         }
 
         let host = parsed_url.host_str().unwrap_or("");
         if host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "missing host".to_string(),
+                message: "missing host".to_owned(),
             }));
         }
 
         if !redirect_is_permitted(request_headers.allowed_domains, host) {
-            log::warn!(
-                "request to `{}` blocked: host not in proxy allowed_domains",
-                host
-            );
+            log::warn!("request to `{host}` blocked: host not in proxy allowed_domains");
             return Err(Report::new(TrustedServerError::AllowlistViolation {
-                host: host.to_string(),
+                host: host.to_owned(),
             }));
         }
 
@@ -590,7 +570,7 @@ async fn proxy_with_redirects(
         let beresp = proxy_req
             .send(&backend_name)
             .change_context(TrustedServerError::Proxy {
-                message: "Failed to proxy".to_string(),
+                message: "Failed to proxy".to_owned(),
             })?;
 
         if !follow_redirects {
@@ -620,10 +600,7 @@ async fn proxy_with_redirects(
         };
 
         if redirect_attempt == MAX_REDIRECTS {
-            log::warn!(
-                "redirect limit reached for {}; returning redirect response",
-                current_url
-            );
+            log::warn!("redirect limit reached for {current_url}; returning redirect response");
             return finalize_proxied_response(settings, req, &current_url, beresp);
         }
 
@@ -631,7 +608,7 @@ async fn proxy_with_redirects(
             .or_else(|_| parsed_url.join(location))
             .map_err(|_| {
                 Report::new(TrustedServerError::Proxy {
-                    message: "invalid redirect".to_string(),
+                    message: "invalid redirect".to_owned(),
                 })
             })?;
 
@@ -644,17 +621,14 @@ async fn proxy_with_redirects(
             Some(h) if !h.is_empty() => h,
             _ => {
                 return Err(Report::new(TrustedServerError::Proxy {
-                    message: "missing host in redirect location".to_string(),
+                    message: "missing host in redirect location".to_owned(),
                 }));
             }
         };
         if !redirect_is_permitted(request_headers.allowed_domains, next_host) {
-            log::warn!(
-                "redirect to `{}` blocked: host not in proxy allowed_domains",
-                next_host
-            );
+            log::warn!("redirect to `{next_host}` blocked: host not in proxy allowed_domains");
             return Err(Report::new(TrustedServerError::AllowlistViolation {
-                host: next_host.to_string(),
+                host: next_host.to_owned(),
             }));
         }
 
@@ -672,7 +646,7 @@ async fn proxy_with_redirects(
     }
 
     Err(Report::new(TrustedServerError::Proxy {
-        message: "redirect handling failed".to_string(),
+        message: "redirect handling failed".to_owned(),
     }))
 }
 
@@ -740,7 +714,7 @@ pub async fn handle_first_party_click(
     let ec_id = match get_ec_id(&req) {
         Ok(id) => id,
         Err(e) => {
-            log::warn!("failed to extract EC ID for forwarding: {:?}", e);
+            log::warn!("failed to extract EC ID for forwarding: {e:?}");
             None
         }
     };
@@ -751,10 +725,10 @@ pub async fn handle_first_party_click(
             Ok(mut url) => {
                 upsert_ec_query_param(&mut url, ec_id_value);
                 redirect_target = url.to_string();
-                log::debug!("forwarding EC ID to target url {}", redirect_target);
+                log::debug!("forwarding EC ID to target url {redirect_target}");
             }
             Err(e) => {
-                log::warn!("failed to parse target url for EC ID forwarding: {:?}", e);
+                log::warn!("failed to parse target url for EC ID forwarding: {e:?}");
             }
         }
     }
@@ -802,12 +776,12 @@ pub async fn handle_first_party_proxy_sign(
     let payload = if method == fastly::http::Method::POST {
         let body = req.take_body_str();
         serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
-            message: "invalid JSON".to_string(),
+            message: "invalid JSON".to_owned(),
         })?
     } else {
         let parsed =
             url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
+                message: "Invalid URL".to_owned(),
             })?;
         let url = parsed
             .query_pairs()
@@ -815,7 +789,7 @@ pub async fn handle_first_party_proxy_sign(
             .map(|(_, v)| v.into_owned())
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Proxy {
-                    message: "missing url".to_string(),
+                    message: "missing url".to_owned(),
                 })
             })?;
         ProxySignReq { url }
@@ -827,23 +801,23 @@ pub async fn handle_first_party_proxy_sign(
             .ok()
             .map(|u| u.scheme().to_ascii_lowercase())
             .filter(|scheme| !scheme.is_empty())
-            .unwrap_or_else(|| "https".to_string());
-        format!("{}:{}", default_scheme, trimmed)
+            .unwrap_or_else(|| "https".to_owned());
+        format!("{default_scheme}:{trimmed}")
     } else {
         crate::creative::to_abs(settings, trimmed).ok_or_else(|| {
             Report::new(TrustedServerError::Proxy {
-                message: "unsupported url".to_string(),
+                message: "unsupported url".to_owned(),
             })
         })?
     };
 
     let parsed = url::Url::parse(&abs).change_context(TrustedServerError::Proxy {
-        message: "invalid url".to_string(),
+        message: "invalid url".to_owned(),
     })?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(Report::new(TrustedServerError::Proxy {
-            message: "unsupported scheme".to_string(),
+            message: "unsupported scheme".to_owned(),
         }));
     }
 
@@ -870,7 +844,7 @@ pub async fn handle_first_party_proxy_sign(
     response.set_header(header::CONTENT_TYPE, "application/json; charset=utf-8");
     response.set_body(
         serde_json::to_string(&resp).change_context(TrustedServerError::Proxy {
-            message: "failed to serialize".to_string(),
+            message: "failed to serialize".to_owned(),
         })?,
     );
     Ok(response)
@@ -909,14 +883,14 @@ pub async fn handle_first_party_proxy_rebuild(
         let body = req.take_body_str();
         serde_json::from_str::<ProxyRebuildReq>(&body).change_context(
             TrustedServerError::Proxy {
-                message: "invalid JSON".to_string(),
+                message: "invalid JSON".to_owned(),
             },
         )?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
         let parsed =
             url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
+                message: "Invalid URL".to_owned(),
             })?;
         let mut tsclick: Option<String> = None;
         let mut add: Option<std::collections::HashMap<String, String>> = None;
@@ -942,7 +916,7 @@ pub async fn handle_first_party_proxy_rebuild(
         ProxyRebuildReq {
             tsclick: tsclick.ok_or_else(|| {
                 Report::new(TrustedServerError::Proxy {
-                    message: "missing tsclick".to_string(),
+                    message: "missing tsclick".to_owned(),
                 })
             })?,
             add,
@@ -953,12 +927,12 @@ pub async fn handle_first_party_proxy_rebuild(
     let base = "https://edge.local"; // dummy origin to parse relative path
     let c_url = url::Url::parse(&format!("{}{}", base, payload.tsclick)).change_context(
         TrustedServerError::Proxy {
-            message: "invalid tsclick".to_string(),
+            message: "invalid tsclick".to_owned(),
         },
     )?;
     if c_url.path() != "/first-party/click" {
         return Err(Report::new(TrustedServerError::Proxy {
-            message: "invalid tsclick path".to_string(),
+            message: "invalid tsclick path".to_owned(),
         }));
     }
     // Extract tsurl and original params (exclude tstoken if present)
@@ -969,12 +943,12 @@ pub async fn handle_first_party_proxy_rebuild(
         if key == "tsurl" {
             tsurl = Some(v.into_owned());
         } else if key != "tstoken" {
-            orig.insert(key.to_string(), v.into_owned());
+            orig.insert(key.to_owned(), v.into_owned());
         }
     }
     let tsurl = tsurl.ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
-            message: "missing tsurl".to_string(),
+            message: "missing tsurl".to_owned(),
         })
     })?;
 
@@ -992,7 +966,7 @@ pub async fn handle_first_party_proxy_rebuild(
         for (k, v) in add {
             if orig.contains_key(k) {
                 return Err(Report::new(TrustedServerError::Proxy {
-                    message: format!("cannot modify existing parameter: {}", k),
+                    message: format!("cannot modify existing parameter: {k}"),
                 }));
             }
             orig.insert(k.clone(), v.clone());
@@ -1046,7 +1020,7 @@ pub async fn handle_first_party_proxy_rebuild(
             added,
             removed,
         })
-        .unwrap_or_else(|_| "{}".to_string());
+        .unwrap_or_else(|_| "{}".to_owned());
         Ok(Response::from_status(fastly::http::StatusCode::OK)
             .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
             .with_header(header::CACHE_CONTROL, "no-store, private")
@@ -1081,7 +1055,7 @@ fn reconstruct_and_validate_signed_target(
     req_url: &str,
 ) -> Result<SignedTarget, Report<TrustedServerError>> {
     let parsed = url::Url::parse(req_url).change_context(TrustedServerError::Proxy {
-        message: "Invalid URL".to_string(),
+        message: "Invalid URL".to_owned(),
     })?;
 
     // Extract tsurl and tstoken while preserving original param order for others
@@ -1112,12 +1086,12 @@ fn reconstruct_and_validate_signed_target(
 
     let tsurl = tsurl.ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
-            message: "missing tsurl parameter".to_string(),
+            message: "missing tsurl parameter".to_owned(),
         })
     })?;
     let sig = sig.ok_or_else(|| {
         Report::new(TrustedServerError::Proxy {
-            message: "missing tstoken parameter".to_string(),
+            message: "missing tstoken parameter".to_owned(),
         })
     })?;
 
@@ -1125,7 +1099,7 @@ fn reconstruct_and_validate_signed_target(
     let full_for_token = if finished.is_empty() {
         tsurl.clone()
     } else {
-        format!("{}?{}", tsurl, finished)
+        format!("{tsurl}?{finished}")
     };
 
     let expected = compute_encrypted_sha256_token(settings, &full_for_token);
@@ -1134,14 +1108,14 @@ fn reconstruct_and_validate_signed_target(
     // but we check explicitly to document the invariant.
     if !ct_str_eq(&expected, &sig) {
         return Err(Report::new(TrustedServerError::Forbidden {
-            message: "invalid tstoken".to_string(),
+            message: "invalid tstoken".to_owned(),
         }));
     }
 
     if let Some(exp_str) = tsexp {
         let exp = exp_str.parse::<u64>().map_err(|_| {
             Report::new(TrustedServerError::Proxy {
-                message: "invalid tsexp".to_string(),
+                message: "invalid tsexp".to_owned(),
             })
         })?;
         let now = SystemTime::now()
@@ -1150,7 +1124,7 @@ fn reconstruct_and_validate_signed_target(
             .as_secs();
         if exp < now {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "expired tsexp".to_string(),
+                message: "expired tsexp".to_owned(),
             }));
         }
     }
@@ -1170,7 +1144,7 @@ mod tests {
         rebuild_response_with_body, reconstruct_and_validate_signed_target, redirect_is_permitted,
         ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
-    use crate::error::{IntoHttpResponse, TrustedServerError};
+    use crate::error::{IntoHttpResponse as _, TrustedServerError};
     use crate::test_support::tests::create_test_settings;
     use crate::{
         constants::{
@@ -1263,8 +1237,7 @@ mod tests {
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
             json.contains("%3A9443"),
-            "Port should be preserved in signed URL: {}",
-            json
+            "Port should be preserved in signed URL: {json}"
         );
     }
 
@@ -1311,18 +1284,17 @@ mod tests {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/asset.js";
         let expired = SystemTime::now()
-            .checked_sub(Duration::from_secs(60))
+            .checked_sub(Duration::from_mins(1))
             .unwrap_or(UNIX_EPOCH)
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
-        let canonical = format!("{}?tsexp={}", tsurl, expired);
+        let canonical = format!("{tsurl}?tsexp={expired}");
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &canonical);
         let tsurl_encoded =
             url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>();
         let url = format!(
-            "https://edge.example/first-party/proxy?tsurl={}&tsexp={}&tstoken={}",
-            tsurl_encoded, expired, sig
+            "https://edge.example/first-party/proxy?tsurl={tsurl_encoded}&tsexp={expired}&tstoken={sig}"
         );
 
         let err: Report<TrustedServerError> =
@@ -1340,8 +1312,7 @@ mod tests {
         // Syntactically valid base64url token of the right length, but not the correct signature
         let bad_token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let url = format!(
-            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
-            tsurl_encoded, bad_token
+            "https://edge.example/first-party/proxy?tsurl={tsurl_encoded}&tstoken={bad_token}"
         );
 
         let err: Report<TrustedServerError> =
@@ -1369,7 +1340,7 @@ mod tests {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/a.png";
         let params = "foo=1&bar=2";
-        let full = format!("{}?{}", tsurl, params);
+        let full = format!("{tsurl}?{params}");
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
         let req = Request::new(
             Method::GET,
@@ -1396,7 +1367,7 @@ mod tests {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/a.png";
         let params = "foo=1";
-        let full = format!("{}?{}", tsurl, params);
+        let full = format!("{tsurl}?{params}");
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
         let mut req = Request::new(
             Method::GET,
@@ -1472,7 +1443,7 @@ mod tests {
         u.set_query(None);
         u.set_fragment(None);
         if pairs.is_empty() {
-            u.as_str().to_string()
+            u.as_str().to_owned()
         } else {
             let mut s = url::form_urlencoded::Serializer::new(String::new());
             for (k, v) in &pairs {
@@ -1491,7 +1462,7 @@ mod tests {
         // Reconstruct and validate (need absolute URL for parsing)
         let st = reconstruct_and_validate_signed_target(
             &settings,
-            &format!("https://edge.example{}", first_party),
+            &format!("https://edge.example{first_party}"),
         )
         .expect("reconstruct ok");
         assert_eq!(st.tsurl, "https://cdn.example/asset.js");
@@ -1506,7 +1477,7 @@ mod tests {
         let first_party = creative::build_proxy_url(&settings, clear);
         let st = reconstruct_and_validate_signed_target(
             &settings,
-            &format!("https://edge.example{}", first_party),
+            &format!("https://edge.example{first_party}"),
         )
         .expect("reconstruct ok");
         assert_eq!(st.tsurl, clear);
@@ -1520,7 +1491,7 @@ mod tests {
         let clear = "ftp://cdn.example/file.gif";
         // Build a first-party proxy URL with a token for the unsupported scheme
         let first_party = creative::build_proxy_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = Request::new(Method::GET, format!("https://edge.example{first_party}"));
         let err: Report<TrustedServerError> = handle_first_party_proxy(&settings, req)
             .await
             .expect_err("expected error");
@@ -1533,7 +1504,7 @@ mod tests {
         // Intentionally malformed target (host missing) but signed consistently
         let tsurl = "https://"; // invalid URL
                                 // Manually construct first-party URL matching creative's format
-        let full_for_token = tsurl.to_string();
+        let full_for_token = tsurl.to_owned();
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
         let url = format!(
             "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
@@ -1610,7 +1581,7 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/landing.html?x=1";
         let first_party = creative::build_click_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = Request::new(Method::GET, format!("https://edge.example{first_party}"));
         let resp = handle_first_party_click(&settings, req)
             .await
             .expect("should redirect");
@@ -1643,8 +1614,8 @@ mod tests {
             .get_header(header::CONTENT_TYPE)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("")
-            .to_string();
-        assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
+            .to_owned();
+        assert!(ct_pre.contains("text/html"), "ct_pre={ct_pre}");
         let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
         let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
@@ -1722,8 +1693,7 @@ mod tests {
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
             body.contains("cdn.example.com%3A9443"),
-            "Port 9443 should be preserved in rewritten URLs. Body:\n{}",
-            body
+            "Port 9443 should be preserved in rewritten URLs. Body:\n{body}"
         );
     }
 
@@ -1770,7 +1740,7 @@ mod tests {
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use std::io::{Read, Write};
+        use std::io::{Read as _, Write as _};
 
         let settings = create_test_settings();
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
@@ -1808,7 +1778,7 @@ mod tests {
 
         // Decompress output to verify content was rewritten
         let compressed_output = out.into_body().into_bytes();
-        let mut decoder = GzDecoder::new(&compressed_output[..]);
+        let mut decoder = GzDecoder::new(&*compressed_output);
         let mut decompressed = String::new();
         decoder
             .read_to_string(&mut decompressed)
@@ -1816,8 +1786,7 @@ mod tests {
 
         assert!(
             decompressed.contains("/first-party/proxy?tsurl="),
-            "HTML should be rewritten: {}",
-            decompressed
+            "HTML should be rewritten: {decompressed}"
         );
     }
 
@@ -1825,7 +1794,7 @@ mod tests {
     fn css_brotli_response_is_processed_with_compression_preserved() {
         use brotli::enc::writer::CompressorWriter;
         use brotli::Decompressor;
-        use std::io::{Read, Write};
+        use std::io::{Read as _, Write as _};
 
         let settings = create_test_settings();
         let css = "body{background:url(https://cdn.example/bg.png)}";
@@ -1865,7 +1834,7 @@ mod tests {
 
         // Decompress output to verify content was rewritten
         let compressed_output = out.into_body().into_bytes();
-        let mut decoder = Decompressor::new(&compressed_output[..], 4096);
+        let mut decoder = Decompressor::new(&*compressed_output, 4096);
         let mut decompressed = String::new();
         decoder
             .read_to_string(&mut decompressed)
@@ -1873,8 +1842,7 @@ mod tests {
 
         assert!(
             decompressed.contains("/first-party/proxy?tsurl="),
-            "CSS should be rewritten: {}",
-            decompressed
+            "CSS should be rewritten: {decompressed}"
         );
     }
 
@@ -1945,8 +1913,7 @@ mod tests {
         let body = out.take_body_str();
         assert!(
             body.contains("/first-party/proxy?tsurl="),
-            "HTML should be rewritten: {}",
-            body
+            "HTML should be rewritten: {body}"
         );
     }
 
@@ -2020,7 +1987,7 @@ mod tests {
 
     #[test]
     fn redirect_allowed_exact() {
-        let allowed = ["ad.example.com".to_string()];
+        let allowed = ["ad.example.com".to_owned()];
         assert!(
             allowed.iter().any(|p| is_host_allowed("ad.example.com", p)),
             "should permit exact-match host"
@@ -2029,7 +1996,7 @@ mod tests {
 
     #[test]
     fn redirect_allowed_wildcard() {
-        let allowed = ["*.example.com".to_string()];
+        let allowed = ["*.example.com".to_owned()];
         assert!(
             allowed
                 .iter()
@@ -2040,7 +2007,7 @@ mod tests {
 
     #[test]
     fn redirect_blocked() {
-        let allowed = ["*.example.com".to_string()];
+        let allowed = ["*.example.com".to_owned()];
         assert!(
             !allowed.iter().any(|p| is_host_allowed("evil.com", p)),
             "should block host not in allowlist"
@@ -2063,7 +2030,7 @@ mod tests {
 
     #[test]
     fn redirect_bypass_attempt() {
-        let allowed = ["*.example.com".to_string()];
+        let allowed = ["*.example.com".to_owned()];
         assert!(
             !allowed
                 .iter()
@@ -2076,7 +2043,7 @@ mod tests {
 
     #[test]
     fn redirect_chain_allowed_when_host_matches_allowlist() {
-        let allowed = vec!["ad.example.com".to_string(), "cdn.example.com".to_string()];
+        let allowed = vec!["ad.example.com".to_owned(), "cdn.example.com".to_owned()];
         assert!(
             redirect_is_permitted(&allowed, "ad.example.com"),
             "should permit redirect to exact-match host"
@@ -2089,7 +2056,7 @@ mod tests {
 
     #[test]
     fn redirect_chain_allowed_when_host_matches_wildcard() {
-        let allowed = vec!["*.example.com".to_string()];
+        let allowed = vec!["*.example.com".to_owned()];
         assert!(
             redirect_is_permitted(&allowed, "sub.example.com"),
             "should permit redirect to wildcard-matched subdomain"
@@ -2098,7 +2065,7 @@ mod tests {
 
     #[test]
     fn redirect_chain_blocked_when_host_not_in_allowlist() {
-        let allowed = vec!["ad.example.com".to_string()];
+        let allowed = vec!["ad.example.com".to_owned()];
         assert!(
             !redirect_is_permitted(&allowed, "evil.com"),
             "should block redirect to host not in allowlist"
@@ -2116,7 +2083,7 @@ mod tests {
 
     #[test]
     fn redirect_chain_blocked_when_host_is_empty() {
-        let allowed = vec!["example.com".to_string()];
+        let allowed = vec!["example.com".to_owned()];
         assert!(
             !redirect_is_permitted(&allowed, ""),
             "should block redirect with empty host when allowlist is non-empty"
@@ -2144,7 +2111,7 @@ mod tests {
 
     #[test]
     fn ip_literal_blocked_by_domain_allowlist() {
-        let allowed = vec!["*.example.com".to_string()];
+        let allowed = vec!["*.example.com".to_owned()];
         assert!(
             !redirect_is_permitted(&allowed, "169.254.169.254"),
             "should block cloud metadata IP"
@@ -2177,7 +2144,7 @@ mod tests {
         use crate::http_util::compute_encrypted_sha256_token;
 
         let mut settings = create_test_settings();
-        settings.proxy.allowed_domains = vec!["allowed.com".to_string()];
+        settings.proxy.allowed_domains = vec!["allowed.com".to_owned()];
 
         let target = "https://blocked.com/pixel.gif";
         let token = compute_encrypted_sha256_token(&settings, target);

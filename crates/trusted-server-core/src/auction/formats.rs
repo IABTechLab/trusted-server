@@ -4,7 +4,7 @@
 //! - Parsing incoming tsjs/Prebid.js format requests
 //! - Converting internal auction results to `OpenRTB` 2.x responses
 
-use error_stack::{ensure, Report, ResultExt};
+use error_stack::{ensure, Report, ResultExt as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use serde::Deserialize;
@@ -19,7 +19,9 @@ use crate::creative;
 use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::openrtb::{
+    to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt as _,
+};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -100,7 +102,7 @@ pub fn convert_tsjs_to_auction_request(
                     ensure!(
                         size.len() == 2,
                         TrustedServerError::BadRequest {
-                            message: "Invalid banner size; expected [width, height]".to_string(),
+                            message: "Invalid banner size; expected [width, height]".to_owned(),
                         }
                     );
 
@@ -136,7 +138,10 @@ pub fn convert_tsjs_to_auction_request(
             .get_header_str("user-agent")
             .map(std::string::ToString::to_string),
         ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        #[allow(deprecated)]
+        #[allow(
+            deprecated,
+            reason = "legacy Fastly geo extraction remains supported for auction requests"
+        )]
         geo: GeoInfo::from_request(req),
     });
 
@@ -155,13 +160,12 @@ pub fn convert_tsjs_to_auction_request(
                         }
                         Err(_) => {
                             log::debug!(
-                                "Auction context: dropping key '{}' with unsupported type",
-                                key
+                                "Auction context: dropping key '{key}' with unsupported type"
                             );
                         }
                     }
                 } else {
-                    log::debug!("Auction context: dropping disallowed key '{}'", key);
+                    log::debug!("Auction context: dropping disallowed key '{key}'");
                 }
             }
             if !context.is_empty() {
@@ -236,7 +240,7 @@ pub fn convert_to_openrtb_response(
             let rewritten = creative::rewrite_creative_html(settings, &sanitized);
 
             log::debug!(
-                "Processed creative for auction {} slot {} ({} → {} → {} bytes)",
+                "Processed creative for auction {} slot {} ({} \u{2192} {} \u{2192} {} bytes)",
                 auction_request.id,
                 slot_id,
                 raw_creative.len(),
@@ -257,7 +261,7 @@ pub fn convert_to_openrtb_response(
 
         let openrtb_bid = OpenRtbBid {
             id: Some(format!("{}-{}", bid.bidder, slot_id)),
-            impid: Some(slot_id.to_string()),
+            impid: Some(slot_id.clone()),
             price: Some(price),
             adm: Some(creative_html),
             crid: Some(format!("{}-creative", bid.bidder)),
@@ -289,11 +293,11 @@ pub fn convert_to_openrtb_response(
         .collect();
 
     let response_body = OpenRtbResponse {
-        id: Some(auction_request.id.to_string()),
+        id: Some(auction_request.id.clone()),
         seatbid: seatbids,
         ext: ResponseExt {
             orchestrator: OrchestratorExt {
-                strategy: strategy_name.to_string(),
+                strategy: strategy_name.to_owned(),
                 providers: result.provider_responses.len(),
                 total_bids: result.total_bids(),
                 time_ms: result.total_time_ms,
@@ -306,7 +310,7 @@ pub fn convert_to_openrtb_response(
 
     let body_bytes =
         serde_json::to_vec(&response_body).change_context(TrustedServerError::Auction {
-            message: "Failed to serialize auction response".to_string(),
+            message: "Failed to serialize auction response".to_owned(),
         })?;
 
     let mut response = Response::from_status(StatusCode::OK)

@@ -12,7 +12,10 @@ use http::StatusCode;
 ///
 /// This enum encompasses all possible errors that can occur during
 /// request processing, configuration, and data handling.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "some variants are constructed only under feature-specific or integration paths"
+)]
 #[derive(Debug, Display)]
 pub enum TrustedServerError {
     /// Client-side input/validation error resulting in a 400 Bad Request.
@@ -96,7 +99,10 @@ pub enum TrustedServerError {
 impl Error for TrustedServerError {}
 
 /// Extension trait for converting [`TrustedServerError`] to HTTP responses.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "trait is used by adapter response paths outside build.rs path inclusion"
+)]
 pub trait IntoHttpResponse {
     /// Convert the error into an HTTP status code.
     fn status_code(&self) -> StatusCode;
@@ -111,22 +117,22 @@ pub trait IntoHttpResponse {
 impl IntoHttpResponse for TrustedServerError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::Auction { .. } => StatusCode::BAD_GATEWAY,
-            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Gam { .. } => StatusCode::BAD_GATEWAY,
-            Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Auction { .. }
+            | Self::Gam { .. }
+            | Self::Prebid { .. }
+            | Self::Integration { .. }
+            | Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::BadRequest { .. }
+            | Self::GdprConsent { .. }
+            | Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+            Self::Configuration { .. }
+            | Self::Settings { .. }
+            | Self::InvalidUtf8 { .. }
+            | Self::EdgeCookie { .. }
+            | Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
-            Self::Integration { .. } => StatusCode::BAD_GATEWAY,
-            Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
-            Self::Forbidden { .. } => StatusCode::FORBIDDEN,
-            Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
-            Self::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Forbidden { .. } | Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
-            Self::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -135,11 +141,11 @@ impl IntoHttpResponse for TrustedServerError {
             // Client errors (4xx) — safe to surface a brief description
             Self::BadRequest { message } => format!("Bad request: {message}"),
             // Consent strings may contain user data; return category only.
-            Self::GdprConsent { .. } => "GDPR consent error".to_string(),
-            Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            Self::GdprConsent { .. } => "GDPR consent error".to_owned(),
+            Self::InvalidHeaderValue { .. } => "Invalid header value".to_owned(),
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
-            _ => "An internal error occurred".to_string(),
+            _ => "An internal error occurred".to_owned(),
         }
     }
 }

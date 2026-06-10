@@ -27,8 +27,8 @@ pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
         n => Some(n),
     };
     GeoInfo {
-        city: geo.city().to_string(),
-        country: geo.country_code().to_string(),
+        city: geo.city().to_owned(),
+        country: geo.country_code().to_owned(),
         continent: format!("{:?}", geo.continent()),
         latitude: geo.latitude(),
         longitude: geo.longitude(),
@@ -127,13 +127,13 @@ mod tests {
 
     fn sample_geo_info() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_string(),
-            country: "US".to_string(),
-            continent: "NorthAmerica".to_string(),
+            city: "San Francisco".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
             latitude: 37.7749,
             longitude: -122.4194,
             metro_code: 807,
-            region: Some("CA".to_string()),
+            region: Some("CA".to_owned()),
             asn: Some(7922),
         }
     }

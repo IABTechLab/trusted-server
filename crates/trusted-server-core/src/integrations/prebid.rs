@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method, StatusCode, Url};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,8 @@ use crate::integrations::{
 };
 use crate::openrtb::{
     to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt,
+    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site,
+    ToExt as _, TrustedServerExt, User, UserExt,
 };
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
@@ -223,7 +223,7 @@ fn default_timeout_ms() -> u32 {
 }
 
 fn default_bidders() -> Vec<String> {
-    vec!["mocktioneer".to_string()]
+    vec!["mocktioneer".to_owned()]
 }
 
 fn default_enabled() -> bool {
@@ -362,9 +362,8 @@ fn build(
     for bidder in &config.client_side_bidders {
         if config.bidders.iter().any(|b| b == bidder) {
             log::warn!(
-                "prebid: bidder \"{}\" is in both bidders and client_side_bidders — \
-                 it will run server-side AND be left for client-side, which is likely unintended",
-                bidder
+                "prebid: bidder \"{bidder}\" is in both bidders and client_side_bidders \u{2014} \
+                 it will run server-side AND be left for client-side, which is likely unintended"
             );
         }
     }
@@ -422,7 +421,7 @@ impl IntegrationProxy for PrebidIntegration {
         _settings: &Settings,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path().to_string();
+        let path = req.get_path().to_owned();
         let method = req.get_method().clone();
 
         match method {
@@ -485,12 +484,12 @@ impl IntegrationHeadInjector for PrebidIntegration {
         let config_json = serde_json::to_string(&payload)
             .unwrap_or_else(|e| {
                 log::warn!("Prebid: failed to serialize client config: {e}");
-                "{}".to_string()
+                "{}".to_owned()
             })
             .replace("</", "<\\/");
 
         vec![format!(
-            r#"<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"#
+            "<script>window.pbjs=window.pbjs||{{}};window.pbjs.que=window.pbjs.que||[];window.pbjs.cmd=window.pbjs.cmd||[];window.__tsjs_prebid={config_json};</script>"
         )]
     }
 }
@@ -515,7 +514,7 @@ fn expand_trusted_server_bidders(
                 .unwrap_or_else(|| {
                     // No per-bidder map → use entire params as shared config
                     if per_bidder.is_some() {
-                        Json::Object(Default::default())
+                        Json::Object(serde_json::Map::default())
                     } else {
                         params.clone()
                     }
@@ -557,12 +556,12 @@ fn warn_unconfigured_bidder(config: &PrebidIntegrationConfig, bidder: &str, fiel
         if config.client_side_bidders.iter().any(|b| b == bidder) {
             log::warn!(
                 "prebid: {field} entry targets client-side-only bidder \
-                 '{bidder}' — server-side override will never apply"
+                 '{bidder}' \u{2014} server-side override will never apply"
             );
         } else {
             log::warn!(
                 "prebid: {field} entry references unconfigured bidder \
-                 '{bidder}' — rule will never fire"
+                 '{bidder}' \u{2014} rule will never fire"
             );
         }
     }
@@ -682,9 +681,8 @@ fn merged_rule_indices<'a>(
 
     std::iter::from_fn(move || match (wildcard.peek(), bidder.peek()) {
         (Some(wildcard_idx), Some(bidder_idx)) if wildcard_idx <= bidder_idx => wildcard.next(),
-        (Some(_), Some(_)) => bidder.next(),
+        (Some(_) | None, Some(_)) => bidder.next(),
         (Some(_), None) => wildcard.next(),
-        (None, Some(_)) => bidder.next(),
         (None, None) => None,
     })
 }
@@ -801,7 +799,7 @@ fn validate_override_matcher_string(
         }));
     }
 
-    Ok(trimmed.to_string())
+    Ok(trimmed.to_owned())
 }
 
 fn non_empty_override_object(
@@ -851,12 +849,12 @@ fn copy_request_headers(
 /// Returns the original URL unchanged if params are empty or already present.
 fn append_query_params(url: &str, params: &str) -> String {
     if params.is_empty() || url.contains(params) {
-        return url.to_string();
+        return url.to_owned();
     }
     if url.contains('?') {
-        format!("{}&{}", url, params)
+        format!("{url}&{params}")
     } else {
-        format!("{}?{}", url, params)
+        format!("{url}?{params}")
     }
 }
 
@@ -922,7 +920,7 @@ impl PrebidAuctionProvider {
 
                 if formats.is_empty() {
                     log::warn!(
-                        "prebid: dropping imp '{}' — no valid banner formats after filtering",
+                        "prebid: dropping imp '{}' \u{2014} no valid banner formats after filtering",
                         slot.id
                     );
                     return None;
@@ -972,7 +970,7 @@ impl PrebidAuctionProvider {
                     // NOTE: Currency defaults to DEFAULT_CURRENCY. If
                     // multi-currency support is needed, this should come from
                     // config or the AdSlot itself.
-                    bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_string()),
+                    bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_owned()),
                     secure: Some(true), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
                     ext: ImpExt {
@@ -1024,13 +1022,10 @@ impl PrebidAuctionProvider {
         });
 
         // Extract DNT header and Accept-Language from the original request
-        let dnt = context.request.get_header_str("DNT").and_then(|v| {
-            if v.trim() == "1" {
-                Some(true)
-            } else {
-                None
-            }
-        });
+        let dnt = context
+            .request
+            .get_header_str("DNT")
+            .and_then(|v| (v.trim() == "1").then_some(true));
 
         let language = context
             .request
@@ -1047,7 +1042,7 @@ impl PrebidAuctionProvider {
                             .next()
                             .expect("should have at least one split segment")
                             .trim()
-                            .to_string()
+                            .to_owned()
                     })
                     .filter(|s| !s.is_empty())
             });
@@ -1076,11 +1071,7 @@ impl PrebidAuctionProvider {
                     // Fastly returns 0 for "no metro code"; negative values
                     // are not realistic for DMA codes so the > 0 guard is
                     // sufficient.
-                    metro: if geo.metro_code > 0 {
-                        Some(geo.metro_code.to_string())
-                    } else {
-                        None
-                    },
+                    metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
                     r#type: Some(2),
                     ..Default::default()
                 }),
@@ -1091,15 +1082,11 @@ impl PrebidAuctionProvider {
                 ..Default::default()
             })
             .or_else(|| {
-                if dnt.is_some() || language.is_some() {
-                    Some(Device {
-                        dnt,
-                        language,
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                }
+                (dnt.is_some() || language.is_some()).then(|| Device {
+                    dnt,
+                    language,
+                    ..Default::default()
+                })
             });
 
         // Build regs object from ConsentContext, populating both OpenRTB 2.6
@@ -1109,16 +1096,15 @@ impl PrebidAuctionProvider {
         // Build ext object
         let http_req = compat::from_fastly_headers_ref(context.request);
         let request_info = RequestInfo::from_request(&http_req, &context.services.client_info);
-        let (version, signature, kid, ts) = signer
-            .map(|(s, sig, params)| {
+        let (version, signature, kid, ts) =
+            signer.map_or((None, None, None, None), |(s, sig, params)| {
                 (
-                    Some(SIGNING_VERSION.to_string()),
+                    Some(SIGNING_VERSION.to_owned()),
                     Some(sig),
                     Some(s.kid.clone()),
                     Some(params.timestamp),
                 )
-            })
-            .unwrap_or((None, None, None, None));
+            });
 
         let debug_enabled = self.config.debug;
 
@@ -1164,7 +1150,7 @@ impl PrebidAuctionProvider {
             regs,
             test: self.config.test_mode.then_some(true),
             tmax,
-            cur: vec![DEFAULT_CURRENCY.to_string()],
+            cur: vec![DEFAULT_CURRENCY.to_owned()],
             ext,
             ..Default::default()
         }
@@ -1253,17 +1239,16 @@ impl PrebidAuctionProvider {
 
                 if let Some(bid_array) = seatbid.get("bid").and_then(|v| v.as_array()) {
                     for bid_obj in bid_array {
-                        match self.parse_bid(bid_obj, seat) {
-                            Ok(bid) => bids.push(bid),
-                            Err(()) => {
-                                let impid = bid_obj
-                                    .get("impid")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("<missing>");
-                                log::warn!(
-                                    "Prebid: failed to parse bid from seat '{seat}' for imp '{impid}'"
-                                );
-                            }
+                        if let Ok(bid) = self.parse_bid(bid_obj, seat) {
+                            bids.push(bid);
+                        } else {
+                            let impid = bid_obj
+                                .get("impid")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("<missing>");
+                            log::warn!(
+                                "Prebid: failed to parse bid from seat '{seat}' for imp '{impid}'"
+                            );
                         }
                     }
                 }
@@ -1293,17 +1278,17 @@ impl PrebidAuctionProvider {
         if let Some(rtm) = ext.and_then(|e| e.get("responsetimemillis")) {
             auction_response
                 .metadata
-                .insert("responsetimemillis".to_string(), rtm.clone());
+                .insert("responsetimemillis".to_owned(), rtm.clone());
         }
         if let Some(errors) = ext.and_then(|e| e.get("errors")) {
             auction_response
                 .metadata
-                .insert("errors".to_string(), errors.clone());
+                .insert("errors".to_owned(), errors.clone());
         }
         if let Some(warnings) = ext.and_then(|e| e.get("warnings")) {
             auction_response
                 .metadata
-                .insert("warnings".to_string(), warnings.clone());
+                .insert("warnings".to_owned(), warnings.clone());
         }
 
         // When debug is enabled, surface httpcalls, resolvedrequest, and
@@ -1312,7 +1297,7 @@ impl PrebidAuctionProvider {
             if let Some(debug) = ext.and_then(|e| e.get("debug")) {
                 auction_response
                     .metadata
-                    .insert("debug".to_string(), debug.clone());
+                    .insert("debug".to_owned(), debug.clone());
             }
             if let Some(bidstatus) = ext
                 .and_then(|e| e.get("prebid"))
@@ -1320,7 +1305,7 @@ impl PrebidAuctionProvider {
             {
                 auction_response
                     .metadata
-                    .insert("bidstatus".to_string(), bidstatus.clone());
+                    .insert("bidstatus".to_owned(), bidstatus.clone());
             }
         }
     }
@@ -1331,7 +1316,7 @@ impl PrebidAuctionProvider {
             .get("impid")
             .and_then(|v| v.as_str())
             .ok_or(())?
-            .to_string();
+            .to_owned();
 
         let price = bid_obj
             .get("price")
@@ -1376,10 +1361,10 @@ impl PrebidAuctionProvider {
         Ok(AuctionBid {
             slot_id,
             price: Some(price), // Prebid provides decoded prices
-            currency: DEFAULT_CURRENCY.to_string(),
+            currency: DEFAULT_CURRENCY.to_owned(),
             creative,
             adomain,
-            bidder: seat.to_string(),
+            bidder: seat.to_owned(),
             width,
             height,
             nurl,
@@ -1440,7 +1425,7 @@ impl PrebidAuctionProvider {
                     body_bytes.len()
                 );
                 return Err(Report::new(TrustedServerError::Prebid {
-                    message: "Failed to parse Prebid response JSON".to_string(),
+                    message: "Failed to parse Prebid response JSON".to_owned(),
                 }));
             }
         };
@@ -1517,9 +1502,9 @@ impl AuctionProvider for PrebidAuctionProvider {
         // round-trip. This can happen when all slots are non-Banner or all
         // banner dimensions overflow `i32::MAX`.
         if openrtb.imp.is_empty() {
-            log::info!("Prebid: skipping request — no valid impressions after filtering");
+            log::info!("Prebid: skipping request \u{2014} no valid impressions after filtering");
             return Err(Report::new(TrustedServerError::Prebid {
-                message: "No valid impressions after filtering".to_string(),
+                message: "No valid impressions after filtering".to_owned(),
             }));
         }
 
@@ -1532,7 +1517,7 @@ impl AuctionProvider for PrebidAuctionProvider {
                     json
                 ),
                 Err(e) => {
-                    log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}")
+                    log::warn!("Prebid: failed to serialize OpenRTB request for logging: {e}");
                 }
             }
         }
@@ -1551,7 +1536,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         pbs_req
             .set_body_json(&openrtb)
             .change_context(TrustedServerError::Prebid {
-                message: "Failed to set request body".to_string(),
+                message: "Failed to set request body".to_owned(),
             })?;
 
         // Send request asynchronously with auction-scoped timeout
@@ -1564,7 +1549,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             pbs_req
                 .send_async(backend_name)
                 .change_context(TrustedServerError::Prebid {
-                    message: "Failed to send async request to Prebid Server".to_string(),
+                    message: "Failed to send async request to Prebid Server".to_owned(),
                 })?;
 
         Ok(pending)
@@ -1633,7 +1618,7 @@ pub fn register_auction_provider(
     );
     if integration.config.debug {
         log::warn!(
-            "Prebid debug mode is ON — debug data (httpcalls, resolvedrequest, \
+            "Prebid debug mode is ON \u{2014} debug data (httpcalls, resolvedrequest, \
              bidstatus) will be included in /auction responses"
         );
     }
@@ -1670,10 +1655,10 @@ mod tests {
     fn base_config() -> PrebidIntegrationConfig {
         PrebidIntegrationConfig {
             enabled: true,
-            server_url: "https://prebid.example".to_string(),
-            account_id: Some("test-account".to_string()),
+            server_url: "https://prebid.example".to_owned(),
+            account_id: Some("test-account".to_owned()),
             timeout_ms: 1000,
-            bidders: vec!["exampleBidder".to_string()],
+            bidders: vec!["exampleBidder".to_owned()],
             debug: false,
             test_mode: false,
             debug_query_params: None,
@@ -1688,9 +1673,9 @@ mod tests {
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
-            id: "auction-123".to_string(),
+            id: "auction-123".to_owned(),
             slots: vec![AdSlot {
-                id: "slot-1".to_string(),
+                id: "slot-1".to_owned(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
                     width: 300,
@@ -1701,11 +1686,11 @@ mod tests {
                 bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
-                domain: "pub.example".to_string(),
-                page_url: Some("https://pub.example/article".to_string()),
+                domain: "pub.example".to_owned(),
+                page_url: Some("https://pub.example/article".to_owned()),
             },
             user: UserInfo {
-                id: Some("user-123".to_string()),
+                id: Some("user-123".to_owned()),
                 consent: None,
                 eids: None,
             },
@@ -1760,7 +1745,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
     /// Parse a TOML string containing only the `[integrations.prebid]` section
     /// (plus any sub-tables) into a [`PrebidIntegrationConfig`].
     fn parse_prebid_toml(prebid_section: &str) -> PrebidIntegrationConfig {
-        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let toml_str = format!("{TOML_BASE}{prebid_section}");
         let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
         settings
             .integration_config::<PrebidIntegrationConfig>("prebid")
@@ -1771,13 +1756,13 @@ passphrase = "test-secret-key-32-bytes-minimum"
     fn parse_prebid_toml_result(
         prebid_section: &str,
     ) -> Result<PrebidIntegrationConfig, Report<TrustedServerError>> {
-        let toml_str = format!("{}{}", TOML_BASE, prebid_section);
+        let toml_str = format!("{TOML_BASE}{prebid_section}");
         let settings = Settings::from_toml(&toml_str)?;
         settings
             .integration_config::<PrebidIntegrationConfig>("prebid")?
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Configuration {
-                    message: "prebid integration config should be present and enabled".to_string(),
+                    message: "prebid integration config should be present and enabled".to_owned(),
                 })
             })
     }
@@ -1852,7 +1837,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
 
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
+        result.unwrap();
         let processed = String::from_utf8_lossy(&output);
         assert!(
             processed.contains("tsjs-unified"),
@@ -1902,7 +1887,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
 
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
+        result.unwrap();
         let processed = String::from_utf8_lossy(&output);
         assert!(
             processed.contains("tsjs-unified"),
@@ -1942,10 +1927,10 @@ script_patterns = ["/prebid.js", "/custom/prebid.min.js"]
         );
 
         assert_eq!(config.script_patterns.len(), 2);
-        assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
+        assert!(config.script_patterns.contains(&"/prebid.js".to_owned()));
         assert!(config
             .script_patterns
-            .contains(&"/custom/prebid.min.js".to_string()));
+            .contains(&"/custom/prebid.min.js".to_owned()));
     }
 
     #[test]
@@ -1959,10 +1944,10 @@ server_url = "https://prebid.example"
         );
 
         assert!(!config.script_patterns.is_empty());
-        assert!(config.script_patterns.contains(&"/prebid.js".to_string()));
+        assert!(config.script_patterns.contains(&"/prebid.js".to_owned()));
         assert!(config
             .script_patterns
-            .contains(&"/prebid.min.js".to_string()));
+            .contains(&"/prebid.min.js".to_owned()));
     }
 
     #[test]
@@ -2033,23 +2018,19 @@ server_url = "https://prebid.example"
         );
         assert!(
             script.contains(r#""accountId":"test-account""#),
-            "should include accountId from config: {}",
-            script
+            "should include accountId from config: {script}"
         );
         assert!(
             script.contains(r#""timeout":1000"#),
-            "should include timeout: {}",
-            script
+            "should include timeout: {script}"
         );
         assert!(
             script.contains(r#""debug":false"#),
-            "should include debug flag: {}",
-            script
+            "should include debug flag: {script}"
         );
         assert!(
             script.contains(r#""bidders":["exampleBidder"]"#),
-            "should include bidders array: {}",
-            script
+            "should include bidders array: {script}"
         );
     }
 
@@ -2070,15 +2051,14 @@ server_url = "https://prebid.example"
         let script = &inserts[0];
         assert!(
             script.contains(r#""accountId":"""#),
-            "should emit empty accountId when not configured: {}",
-            script
+            "should emit empty accountId when not configured: {script}"
         );
     }
 
     #[test]
     fn head_injector_escapes_closing_script_tags_in_values() {
         let mut config = base_config();
-        config.account_id = Some("</script><script>alert(1)</script>".to_string());
+        config.account_id = Some("</script><script>alert(1)</script>".to_owned());
         let integration = PrebidIntegration::new(config);
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
@@ -2092,8 +2072,7 @@ server_url = "https://prebid.example"
         let script = &inserts[0];
         assert!(
             script.contains(r#""accountId":"<\/script><script>alert(1)<\/script>""#),
-            "should escape closing script tags inside JSON values: {}",
-            script
+            "should escape closing script tags inside JSON values: {script}"
         );
     }
 
@@ -2112,15 +2091,14 @@ server_url = "https://prebid.example"
         let script = &inserts[0];
         assert!(
             !script.contains("clientSideBidders"),
-            "should omit clientSideBidders when empty: {}",
-            script
+            "should omit clientSideBidders when empty: {script}"
         );
     }
 
     #[test]
     fn head_injector_includes_client_side_bidders_when_configured() {
         let mut config = base_config();
-        config.client_side_bidders = vec!["rubicon".to_string(), "magnite".to_string()];
+        config.client_side_bidders = vec!["rubicon".to_owned(), "magnite".to_owned()];
         let integration = PrebidIntegration::new(config);
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
@@ -2134,8 +2112,7 @@ server_url = "https://prebid.example"
         let script = &inserts[0];
         assert!(
             script.contains(r#""clientSideBidders":["rubicon","magnite"]"#),
-            "should include clientSideBidders array: {}",
-            script
+            "should include clientSideBidders array: {script}"
         );
     }
 
@@ -2228,8 +2205,8 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("test-agent".to_string()),
-            ip: Some("203.0.113.42".to_string()),
+            user_agent: Some("test-agent".to_owned()),
+            ip: Some("203.0.113.42".to_owned()),
             geo: None,
         });
         let settings = make_settings();
@@ -2393,18 +2370,18 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            raw_tc_string: Some("BOtest-consent-string".to_owned()),
             gdpr_applies: true,
             ..Default::default()
         });
         // Set device with EU geo so GDPR applies from geo check
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "Berlin".to_string(),
-                country: "DE".to_string(),
-                continent: "EU".to_string(),
+                city: "Berlin".to_owned(),
+                country: "DE".to_owned(),
+                continent: "EU".to_owned(),
                 latitude: 52.52,
                 longitude: 13.405,
                 metro_code: 0,
@@ -2444,22 +2421,22 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            raw_tc_string: Some("BOtest-consent-string".to_owned()),
             gdpr_applies: true,
             ..Default::default()
         });
         // US geo — but consent string overrides
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
-                country: "US".to_string(),
-                continent: "NA".to_string(),
+                city: "New York".to_owned(),
+                country: "US".to_owned(),
+                continent: "NA".to_owned(),
                 latitude: 40.7128,
                 longitude: -74.006,
                 metro_code: 501,
-                region: Some("NY".to_string()),
+                region: Some("NY".to_owned()),
                 asn: None,
             }),
         });
@@ -2489,16 +2466,16 @@ server_url = "https://prebid.example"
         auction_request.user.consent = None;
         // US geo, no consent string — no consent data to forward
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
-                country: "US".to_string(),
-                continent: "NA".to_string(),
+                city: "New York".to_owned(),
+                country: "US".to_owned(),
+                continent: "NA".to_owned(),
                 latitude: 40.7128,
                 longitude: -74.006,
                 metro_code: 501,
-                region: Some("NY".to_string()),
+                region: Some("NY".to_owned()),
                 asn: None,
             }),
         });
@@ -2525,7 +2502,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOtest-consent-string".to_string()),
+            raw_tc_string: Some("BOtest-consent-string".to_owned()),
             gdpr_applies: true,
             ..Default::default()
         });
@@ -2576,7 +2553,7 @@ server_url = "https://prebid.example"
         // consent extraction pipeline from the Sec-GPC header.
         auction_request.user.consent = Some(ConsentContext {
             gpc: true,
-            raw_us_privacy: Some(GPC_US_PRIVACY.to_string()),
+            raw_us_privacy: Some(GPC_US_PRIVACY.to_owned()),
             ..Default::default()
         });
 
@@ -2625,7 +2602,7 @@ server_url = "https://prebid.example"
     #[test]
     fn build_regs_populates_gpp_and_section_ids() {
         let ctx = ConsentContext {
-            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_owned()),
             gpp_section_ids: Some(vec![2, 6]),
             ..Default::default()
         };
@@ -2640,7 +2617,7 @@ server_url = "https://prebid.example"
         );
         assert_eq!(
             regs.gpp_sid,
-            vec![2i32, 6i32],
+            vec![2_i32, 6_i32],
             "should convert gpp_sid u16 to i32"
         );
 
@@ -2667,7 +2644,7 @@ server_url = "https://prebid.example"
         // based on jurisdiction alone.
         let ctx = ConsentContext {
             gpc: true,
-            raw_us_privacy: Some("1YYN".to_string()),
+            raw_us_privacy: Some("1YYN".to_owned()),
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
             ..Default::default()
         };
@@ -2688,7 +2665,7 @@ server_url = "https://prebid.example"
         // signal. GDPR field should be None (omitted) rather than false.
         let ctx = ConsentContext {
             gpc: true,
-            raw_us_privacy: Some("1YYN".to_string()),
+            raw_us_privacy: Some("1YYN".to_owned()),
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::Unknown,
             ..Default::default()
         };
@@ -2706,7 +2683,7 @@ server_url = "https://prebid.example"
     fn build_regs_sets_gdpr_false_for_non_regulated_jurisdiction() {
         // Non-EU, non-US-state user with a US privacy string.
         let ctx = ConsentContext {
-            raw_us_privacy: Some("1NNN".to_string()),
+            raw_us_privacy: Some("1NNN".to_owned()),
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
             ..Default::default()
         };
@@ -2725,8 +2702,8 @@ server_url = "https://prebid.example"
     fn build_regs_dual_placement_mirrors_all_fields() {
         let ctx = ConsentContext {
             gdpr_applies: true,
-            raw_us_privacy: Some("1YNN".to_string()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_string()),
+            raw_us_privacy: Some("1YNN".to_owned()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfA".to_owned()),
             gpp_section_ids: Some(vec![7]),
             jurisdiction: crate::consent::jurisdiction::Jurisdiction::Gdpr,
             ..Default::default()
@@ -2763,7 +2740,7 @@ server_url = "https://prebid.example"
             "ext.gpp should mirror top-level"
         );
 
-        assert_eq!(regs.gpp_sid, vec![7i32]);
+        assert_eq!(regs.gpp_sid, vec![7_i32]);
         assert_eq!(
             ext.get("gpp_sid"),
             Some(&serde_json::json!([7])),
@@ -2795,7 +2772,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: None,
         });
@@ -2821,7 +2798,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: None,
         });
@@ -2851,7 +2828,7 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
             ip: None,
             geo: None,
         });
@@ -2882,7 +2859,7 @@ server_url = "https://prebid.example"
         // Set dimensions that overflow i32 — they will be filtered out,
         // leaving an empty format list.
         auction_request.slots = vec![AdSlot {
-            id: "oversized-slot".to_string(),
+            id: "oversized-slot".to_owned(),
             formats: vec![AdFormat {
                 media_type: MediaType::Banner,
                 width: i32::MAX as u32 + 1,
@@ -2915,16 +2892,16 @@ server_url = "https://prebid.example"
         let provider = PrebidAuctionProvider::new(base_config());
         let mut auction_request = create_test_auction_request();
         auction_request.device = Some(DeviceInfo {
-            user_agent: Some("TestAgent".to_string()),
-            ip: Some("1.2.3.4".to_string()),
+            user_agent: Some("TestAgent".to_owned()),
+            ip: Some("1.2.3.4".to_owned()),
             geo: Some(GeoInfo {
-                city: "New York".to_string(),
-                country: "US".to_string(),
-                continent: "NA".to_string(),
+                city: "New York".to_owned(),
+                country: "US".to_owned(),
+                continent: "NA".to_owned(),
                 latitude: 40.7128,
                 longitude: -74.006,
                 metro_code: 501,
-                region: Some("NY".to_string()),
+                region: Some("NY".to_owned()),
                 asn: None,
             }),
         });
@@ -2978,11 +2955,7 @@ server_url = "https://prebid.example"
             Some(1000),
             "should set tmax from config timeout_ms"
         );
-        assert_eq!(
-            openrtb.cur,
-            vec!["USD".to_string()],
-            "should set cur to USD"
-        );
+        assert_eq!(openrtb.cur, vec!["USD".to_owned()], "should set cur to USD");
     }
 
     #[test]
@@ -3179,9 +3152,9 @@ server_url = "https://prebid.example"
 
         let expanded = expand_trusted_server_bidders(
             &[
-                "appnexus".to_string(),
-                "rubicon".to_string(),
-                "openx".to_string(),
+                "appnexus".to_owned(),
+                "rubicon".to_owned(),
+                "openx".to_owned(),
             ],
             &params,
         );
@@ -3206,10 +3179,8 @@ server_url = "https://prebid.example"
     #[test]
     fn expand_trusted_server_bidders_falls_back_to_shared_params() {
         let params = json!({ "placementId": 999 });
-        let expanded = expand_trusted_server_bidders(
-            &["appnexus".to_string(), "rubicon".to_string()],
-            &params,
-        );
+        let expanded =
+            expand_trusted_server_bidders(&["appnexus".to_owned(), "rubicon".to_owned()], &params);
 
         assert_eq!(
             expanded.get("appnexus"),
@@ -3297,19 +3268,19 @@ server_url = "https://prebid.example"
 
     fn make_auction_request(slots: Vec<AdSlot>) -> AuctionRequest {
         AuctionRequest {
-            id: "test-auction-1".to_string(),
+            id: "test-auction-1".to_owned(),
             slots,
             publisher: PublisherInfo {
-                domain: "example.com".to_string(),
-                page_url: Some("https://example.com/page".to_string()),
+                domain: "example.com".to_owned(),
+                page_url: Some("https://example.com/page".to_owned()),
             },
             user: UserInfo {
-                id: Some("synth-123".to_string()),
+                id: Some("synth-123".to_owned()),
                 consent: None,
                 eids: None,
             },
             device: Some(DeviceInfo {
-                user_agent: Some("test-agent".to_string()),
+                user_agent: Some("test-agent".to_owned()),
                 ip: None,
                 geo: None,
             }),
@@ -3320,7 +3291,7 @@ server_url = "https://prebid.example"
 
     fn make_slot(id: &str, bidders: HashMap<String, Json>) -> AdSlot {
         AdSlot {
-            id: id.to_string(),
+            id: id.to_owned(),
             formats: vec![AdFormat {
                 media_type: MediaType::Banner,
                 width: 300,
@@ -3626,18 +3597,18 @@ set = { keywords = { genre = "news" } }
         }
         make_slot(
             id,
-            HashMap::from([(TRUSTED_SERVER_BIDDER.to_string(), ts_params)]),
+            HashMap::from([(TRUSTED_SERVER_BIDDER.to_owned(), ts_params)]),
         )
     }
 
     #[test]
     fn zone_override_replaces_placement_id() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string()];
+        config.bidders = vec!["kargo".to_owned()];
         config.bid_param_zone_overrides.insert(
-            "kargo".to_string(),
+            "kargo".to_owned(),
             HashMap::from([(
-                "header".to_string(),
+                "header".to_owned(),
                 json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
@@ -3660,11 +3631,11 @@ set = { keywords = { genre = "news" } }
     #[test]
     fn zone_override_noop_for_unknown_zone() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string()];
+        config.bidders = vec!["kargo".to_owned()];
         config.bid_param_zone_overrides.insert(
-            "kargo".to_string(),
+            "kargo".to_owned(),
             HashMap::from([(
-                "header".to_string(),
+                "header".to_owned(),
                 json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
@@ -3688,11 +3659,11 @@ set = { keywords = { genre = "news" } }
     #[test]
     fn zone_override_noop_when_no_zone() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string()];
+        config.bidders = vec!["kargo".to_owned()];
         config.bid_param_zone_overrides.insert(
-            "kargo".to_string(),
+            "kargo".to_owned(),
             HashMap::from([(
-                "header".to_string(),
+                "header".to_owned(),
                 json_object(json!({ "placementId": "zone_header_id" })),
             )]),
         );
@@ -3716,11 +3687,11 @@ set = { keywords = { genre = "news" } }
     #[test]
     fn zone_override_only_affects_configured_bidders() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string(), "rubicon".to_string()];
+        config.bidders = vec!["kargo".to_owned(), "rubicon".to_owned()];
         config.bid_param_zone_overrides.insert(
-            "kargo".to_string(),
+            "kargo".to_owned(),
             HashMap::from([(
-                "header".to_string(),
+                "header".to_owned(),
                 json_object(json!({ "placementId": "s2s_header_id" })),
             )]),
         );
@@ -3750,11 +3721,11 @@ set = { keywords = { genre = "news" } }
     #[test]
     fn zone_override_merges_with_existing_params() {
         let mut config = base_config();
-        config.bidders = vec!["kargo".to_string()];
+        config.bidders = vec!["kargo".to_owned()];
         config.bid_param_zone_overrides.insert(
-            "kargo".to_string(),
+            "kargo".to_owned(),
             HashMap::from([(
-                "header".to_string(),
+                "header".to_owned(),
                 json_object(json!({ "placementId": "s2s_header" })),
             )]),
         );
@@ -3992,7 +3963,7 @@ set = { placementId = "explicit_header" }
 
         fn params_with(key: &str, value: Json) -> Json {
             let mut map = serde_json::Map::new();
-            map.insert(key.to_string(), value);
+            map.insert(key.to_owned(), value);
             Json::Object(map)
         }
 
@@ -4007,10 +3978,9 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_normalizes_static_compatibility_rule() {
             let mut config = base_config();
-            config.bid_param_overrides.insert(
-                "criteo".to_string(),
-                json_object(json!({ "networkId": 99 })),
-            );
+            config
+                .bid_param_overrides
+                .insert("criteo".to_owned(), json_object(json!({ "networkId": 99 })));
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
                 .expect("should compile static compatibility overrides");
@@ -4036,9 +4006,9 @@ set = { placementId = "explicit_header" }
         fn engine_normalizes_zone_compatibility_rule() {
             let mut config = base_config();
             config.bid_param_zone_overrides.insert(
-                "kargo".to_string(),
+                "kargo".to_owned(),
                 HashMap::from([(
-                    "header".to_string(),
+                    "header".to_owned(),
                     json_object(json!({ "placementId": "zone-header" })),
                 )]),
             );
@@ -4067,10 +4037,9 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_applies_bidder_only_rule() {
             let mut config = base_config();
-            config.bid_param_overrides.insert(
-                "criteo".to_string(),
-                json_object(json!({ "networkId": 42 })),
-            );
+            config
+                .bid_param_overrides
+                .insert("criteo".to_owned(), json_object(json!({ "networkId": 42 })));
 
             let engine = BidParamOverrideEngine::try_from_config(&config)
                 .expect("should compile bidder-only override");
@@ -4094,9 +4063,9 @@ set = { placementId = "explicit_header" }
         fn engine_applies_bidder_and_zone_rule() {
             let mut config = base_config();
             config.bid_param_zone_overrides.insert(
-                "kargo".to_string(),
+                "kargo".to_owned(),
                 HashMap::from([(
-                    "header".to_string(),
+                    "header".to_owned(),
                     json_object(json!({ "placementId": "s2s_h" })),
                 )]),
             );
@@ -4121,9 +4090,9 @@ set = { placementId = "explicit_header" }
         fn engine_noop_when_facts_do_not_match() {
             let mut config = base_config();
             config.bid_param_zone_overrides.insert(
-                "kargo".to_string(),
+                "kargo".to_owned(),
                 HashMap::from([(
-                    "header".to_string(),
+                    "header".to_owned(),
                     json_object(json!({ "placementId": "s2s_h" })),
                 )]),
             );
@@ -4167,10 +4136,9 @@ set = { placementId = "explicit_header" }
         #[test]
         fn engine_apply_is_noop_for_non_object_params() {
             let mut config = base_config();
-            config.bid_param_overrides.insert(
-                "criteo".to_string(),
-                json_object(json!({ "networkId": 42 })),
-            );
+            config
+                .bid_param_overrides
+                .insert("criteo".to_owned(), json_object(json!({ "networkId": 42 })));
 
             let engine = BidParamOverrideEngine::try_from_config(&config).expect("should compile");
             let mut params = json!("client-string");
@@ -4194,13 +4162,13 @@ set = { placementId = "explicit_header" }
         fn engine_applies_later_rule_last_write_wins() {
             let mut config = base_config();
             config.bid_param_overrides.insert(
-                "kargo".to_string(),
+                "kargo".to_owned(),
                 json_object(json!({ "placementId": "compat" })),
             );
             config.bid_param_override_rules.push(BidParamOverrideRule {
                 when: BidParamOverrideWhen {
-                    bidder: Some("kargo".to_string()),
-                    zone: Some("header".to_string()),
+                    bidder: Some("kargo".to_owned()),
+                    zone: Some("header".to_owned()),
                 },
                 set: json_object(json!({ "placementId": "explicit", "extra": "x" })),
             });
@@ -4247,8 +4215,8 @@ set = { placementId = "explicit_header" }
         fn compile_rule_trims_matcher_whitespace() {
             let rule = BidParamOverrideRule {
                 when: BidParamOverrideWhen {
-                    bidder: Some(" kargo ".to_string()),
-                    zone: Some(" header ".to_string()),
+                    bidder: Some(" kargo ".to_owned()),
+                    zone: Some(" header ".to_owned()),
                 },
                 set: json_object(json!({ "placementId": "trimmed" })),
             };
@@ -4289,27 +4257,27 @@ set = { placementId = "explicit_header" }
             for iteration in 0..16 {
                 let mut config = base_config();
                 config.bid_param_overrides = HashMap::from([
-                    ("gamma".to_string(), json_object(json!({ "networkId": 3 }))),
-                    ("alpha".to_string(), json_object(json!({ "networkId": 1 }))),
-                    ("beta".to_string(), json_object(json!({ "networkId": 2 }))),
+                    ("gamma".to_owned(), json_object(json!({ "networkId": 3 }))),
+                    ("alpha".to_owned(), json_object(json!({ "networkId": 1 }))),
+                    ("beta".to_owned(), json_object(json!({ "networkId": 2 }))),
                 ]);
                 config.bid_param_zone_overrides = HashMap::from([
                     (
-                        "openx".to_string(),
+                        "openx".to_owned(),
                         HashMap::from([(
-                            "sidebar".to_string(),
+                            "sidebar".to_owned(),
                             json_object(json!({ "placementId": "openx-sidebar" })),
                         )]),
                     ),
                     (
-                        "kargo".to_string(),
+                        "kargo".to_owned(),
                         HashMap::from([
                             (
-                                "header".to_string(),
+                                "header".to_owned(),
                                 json_object(json!({ "placementId": "kargo-header" })),
                             ),
                             (
-                                "footer".to_string(),
+                                "footer".to_owned(),
                                 json_object(json!({ "placementId": "kargo-footer" })),
                             ),
                         ]),
@@ -4343,7 +4311,7 @@ set = { placementId = "explicit_header" }
         fn compile_rule_rejects_empty_object_set() {
             let rule = BidParamOverrideRule {
                 when: BidParamOverrideWhen {
-                    bidder: Some("kargo".to_string()),
+                    bidder: Some("kargo".to_owned()),
                     zone: None,
                 },
                 set: serde_json::Map::new(),

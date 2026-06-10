@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -43,11 +43,11 @@ fn default_enabled() -> bool {
 }
 
 fn default_sdk_origin() -> String {
-    "https://sdk.privacy-center.org".to_string()
+    "https://sdk.privacy-center.org".to_owned()
 }
 
 fn default_api_origin() -> String {
-    "https://api.privacy-center.org".to_string()
+    "https://api.privacy-center.org".to_owned()
 }
 
 enum DidomiBackend {
@@ -66,7 +66,7 @@ impl DidomiIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: DIDOMI_INTEGRATION_ID.to_string(),
+            integration: DIDOMI_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }

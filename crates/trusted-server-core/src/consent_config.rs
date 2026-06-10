@@ -96,7 +96,7 @@ impl ConsentConfig {
         let clamped = self.max_consent_age_days.clamp(1, 3650);
         if clamped != self.max_consent_age_days {
             log::warn!(
-                "max_consent_age_days={} is outside the valid range 1–3650; clamped to {clamped}",
+                "max_consent_age_days={} is outside the valid range 1\u{2013}3650; clamped to {clamped}",
                 self.max_consent_age_days
             );
             self.max_consent_age_days = clamped;

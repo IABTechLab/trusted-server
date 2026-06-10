@@ -1,6 +1,6 @@
 //! HTTP endpoint handlers for auction requests.
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::StatusCode;
 use fastly::{Request, Response};
 use serde_json::Value as JsonValue;
@@ -72,7 +72,7 @@ pub async fn handle_auction(
     }
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-            message: "Failed to parse auction request body".to_string(),
+            message: "Failed to parse auction request body".to_owned(),
         })?;
 
     log::info!(
@@ -138,7 +138,7 @@ pub async fn handle_auction(
         .run_auction(&auction_request, &context)
         .await
         .change_context(TrustedServerError::Auction {
-            message: "Auction orchestration failed".to_string(),
+            message: "Auction orchestration failed".to_owned(),
         })?;
 
     log::info!(
@@ -311,18 +311,17 @@ fn merge_auction_eids(
             continue;
         }
 
-        let source_index = match merged
+        let source_index = if let Some(index) = merged
             .iter()
             .position(|existing: &Eid| existing.source == eid.source)
         {
-            Some(index) => index,
-            None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
-                merged.len() - 1
-            }
+            index
+        } else {
+            merged.push(Eid {
+                source: eid.source.clone(),
+                uids: Vec::new(),
+            });
+            merged.len() - 1
         };
 
         for uid in eid.uids {
@@ -632,26 +631,26 @@ mod tests {
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
         let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
+            source: "id5-sync.com".to_owned(),
             uids: vec![Uid {
-                id: "ID5_abc".to_string(),
+                id: "ID5_abc".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
         }]);
         let resolved_eids = Some(vec![
             Eid {
-                source: "id5-sync.com".to_string(),
+                source: "id5-sync.com".to_owned(),
                 uids: vec![Uid {
-                    id: "ID5_abc".to_string(),
+                    id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
             },
             Eid {
-                source: "liveramp.com".to_string(),
+                source: "liveramp.com".to_owned(),
                 uids: vec![Uid {
-                    id: "LR_xyz".to_string(),
+                    id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
@@ -670,17 +669,17 @@ mod tests {
     #[test]
     fn merge_auction_eids_preserves_multiple_uids_per_source() {
         let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
+            source: "sharedid.org".to_owned(),
             uids: vec![Uid {
-                id: "shared_client".to_string(),
+                id: "shared_client".to_owned(),
                 atype: None,
                 ext: None,
             }],
         }]);
         let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
+            source: "sharedid.org".to_owned(),
             uids: vec![Uid {
-                id: "shared_server".to_string(),
+                id: "shared_server".to_owned(),
                 atype: Some(3),
                 ext: None,
             }],
@@ -697,17 +696,17 @@ mod tests {
     #[test]
     fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
         let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
+            source: "adserver.org".to_owned(),
             uids: vec![Uid {
-                id: "shared_uid".to_string(),
+                id: "shared_uid".to_owned(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
         }]);
         let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
+            source: "adserver.org".to_owned(),
             uids: vec![Uid {
-                id: "shared_uid".to_string(),
+                id: "shared_uid".to_owned(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],

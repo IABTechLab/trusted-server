@@ -71,7 +71,7 @@ mod tests {
     impl PlatformKvStore for MarkerKvStore {
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
             if key == "marker" {
-                Ok(Some(Bytes::from(self.0.to_string())))
+                Ok(Some(Bytes::from(self.0.to_owned())))
             } else {
                 Ok(None)
             }
@@ -194,13 +194,13 @@ mod tests {
     #[test]
     fn geo_info_coordinates_string_formats_correctly() {
         let geo = GeoInfo {
-            city: "New York".to_string(),
-            country: "US".to_string(),
-            continent: "NorthAmerica".to_string(),
+            city: "New York".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
             latitude: 40.7128,
             longitude: -74.0060,
             metro_code: 501,
-            region: Some("NY".to_string()),
+            region: Some("NY".to_owned()),
             asn: None,
         };
 

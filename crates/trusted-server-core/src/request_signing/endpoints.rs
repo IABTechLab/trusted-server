@@ -3,11 +3,11 @@
 //! This module provides endpoint handlers for JWKS retrieval, signature verification,
 //! key rotation, and key deactivation operations.
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{IntoHttpResponse, TrustedServerError};
+use crate::error::{IntoHttpResponse as _, TrustedServerError};
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
@@ -128,7 +128,7 @@ pub fn handle_verify_signature(
 
     let response_json = serde_json::to_string(&response).map_err(|e| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("failed to serialize response: {}", e),
+            message: format!("failed to serialize response: {e}"),
         })
     })?;
 
@@ -184,7 +184,7 @@ fn signing_store_ids(
         })
         .ok_or_else(|| {
             TrustedServerError::Configuration {
-                message: "missing signing storage configuration".to_string(),
+                message: "missing signing storage configuration".to_owned(),
             }
             .into()
         })
@@ -254,13 +254,13 @@ pub fn handle_rotate_key(
         Ok(result) => {
             let jwk_value = serde_json::to_value(&result.jwk).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize JWK: {}", e),
+                    message: format!("failed to serialize JWK: {e}"),
                 })
             })?;
 
             let response = RotateKeyResponse {
                 success: true,
-                message: "Key rotated successfully".to_string(),
+                message: "Key rotated successfully".to_owned(),
                 new_kid: result.new_kid,
                 previous_kid: result.previous_kid,
                 active_kids: result.active_kids,
@@ -270,7 +270,7 @@ pub fn handle_rotate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {e}"),
                 })
             })?;
 
@@ -282,17 +282,17 @@ pub fn handle_rotate_key(
             let status = e.current_context().status_code();
             let response = RotateKeyResponse {
                 success: false,
-                message: "Key rotation failed".to_string(),
+                message: "Key rotation failed".to_owned(),
                 new_kid: String::new(),
                 previous_kid: None,
                 active_kids: vec![],
                 jwk: serde_json::json!({}),
-                error: Some(format!("{}", e)),
+                error: Some(format!("{e}")),
             };
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {e}"),
                 })
             })?;
 
@@ -374,16 +374,16 @@ pub fn handle_deactivate_key(
     match result {
         Ok(()) => {
             let remaining_keys = manager.list_active_keys(services).unwrap_or_else(|e| {
-                log::warn!("failed to list active keys after deactivation: {}", e);
+                log::warn!("failed to list active keys after deactivation: {e}");
                 vec![]
             });
 
             let response = DeactivateKeyResponse {
                 success: true,
                 message: if deactivate_req.delete {
-                    "Key deleted successfully".to_string()
+                    "Key deleted successfully".to_owned()
                 } else {
-                    "Key deactivated successfully".to_string()
+                    "Key deactivated successfully".to_owned()
                 },
                 deactivated_kid: deactivate_req.kid,
                 deleted: deactivate_req.delete,
@@ -393,7 +393,7 @@ pub fn handle_deactivate_key(
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {e}"),
                 })
             })?;
 
@@ -406,19 +406,19 @@ pub fn handle_deactivate_key(
             let response = DeactivateKeyResponse {
                 success: false,
                 message: if deactivate_req.delete {
-                    "Key deletion failed".to_string()
+                    "Key deletion failed".to_owned()
                 } else {
-                    "Key deactivation failed".to_string()
+                    "Key deactivation failed".to_owned()
                 },
                 deactivated_kid: deactivate_req.kid.clone(),
                 deleted: false,
                 remaining_active_kids: vec![],
-                error: Some(format!("{}", e)),
+                error: Some(format!("{e}")),
             };
 
             let response_json = serde_json::to_string(&response).map_err(|e| {
                 Report::new(TrustedServerError::Configuration {
-                    message: format!("failed to serialize response: {}", e),
+                    message: format!("failed to serialize response: {e}"),
                 })
             })?;
 
@@ -445,10 +445,9 @@ mod tests {
     impl PlatformConfigStore for StubJwksConfigStore {
         fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
             match key {
-                "active-kids" => Ok("test-kid-1".to_string()),
+                "active-kids" => Ok("test-kid-1".to_owned()),
                 "test-kid-1" => Ok(
-                    r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#
-                        .to_string(),
+                    r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#.to_owned(),
                 ),
                 _ => Err(Report::new(PlatformError::ConfigStore)),
             }
@@ -476,7 +475,7 @@ mod tests {
             .expect("should sign payload");
 
         let verify_req = VerifySignatureRequest {
-            payload: payload.to_string(),
+            payload: payload.to_owned(),
             signature,
             kid: signer.kid.clone(),
         };
@@ -516,7 +515,7 @@ mod tests {
             .expect("should sign different payload");
 
         let verify_req = VerifySignatureRequest {
-            payload: "test message".to_string(),
+            payload: "test message".to_owned(),
             signature: wrong_signature,
             kid: signer.kid.clone(),
         };
@@ -551,9 +550,9 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let verify_req = VerifySignatureRequest {
-            payload: "test message".to_string(),
-            signature: "any-signature".to_string(),
-            kid: "missing-kid".to_string(),
+            payload: "test message".to_owned(),
+            signature: "any-signature".to_owned(),
+            kid: "missing-kid".to_owned(),
         };
 
         let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
@@ -631,7 +630,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let req_body = RotateKeyRequest {
-            kid: Some("test-custom-key".to_string()),
+            kid: Some("test-custom-key".to_owned()),
         };
 
         let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
@@ -676,7 +675,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let req_body = RotateKeyRequest {
-            kid: Some("bad,kid".to_string()),
+            kid: Some("bad,kid".to_owned()),
         };
 
         let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
@@ -714,7 +713,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let req_body = DeactivateKeyRequest {
-            kid: "test-old-key".to_string(),
+            kid: "test-old-key".to_owned(),
             delete: false,
         };
 
@@ -751,7 +750,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let req_body = DeactivateKeyRequest {
-            kid: "test-old-key".to_string(),
+            kid: "test-old-key".to_owned(),
             delete: true,
         };
 
@@ -802,7 +801,7 @@ mod tests {
         let settings = crate::test_support::tests::create_test_settings();
 
         let req_body = DeactivateKeyRequest {
-            kid: "bad kid".to_string(),
+            kid: "bad kid".to_owned(),
             delete: false,
         };
 
@@ -868,7 +867,7 @@ mod tests {
         let json = r#"{"kid":"custom-key"}"#;
         let req: RotateKeyRequest =
             serde_json::from_str(json).expect("should deserialize rotate key request");
-        assert_eq!(req.kid, Some("custom-key".to_string()));
+        assert_eq!(req.kid, Some("custom-key".to_owned()));
     }
 
     #[test]

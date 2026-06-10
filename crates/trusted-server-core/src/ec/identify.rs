@@ -3,7 +3,7 @@
 //! Partners authenticate with a Bearer token and receive only their own
 //! synced UID for the active EC ID.
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, StatusCode};
 use fastly::{Request, Response};
 use url::Url;
@@ -75,12 +75,7 @@ pub fn handle_identify(
 
     match kv.get(ec_id) {
         Ok(Some((entry, generation))) => {
-            if !entry.consent.ok {
-                // Tombstone entries preserve the withdrawal signal for 24 hours.
-                // Do not extract IDs or evaluate cluster size because that would
-                // write back with the live-entry TTL.
-                log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
-            } else {
+            if entry.consent.ok {
                 // Extract only this partner's UID.
                 if let Some(partner_uid) = entry.ids.get(&partner.source_domain) {
                     if !partner_uid.uid.is_empty() {
@@ -98,6 +93,11 @@ pub fn handle_identify(
                         log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
                     }
                 }
+            } else {
+                // Tombstone entries preserve the withdrawal signal for 24 hours.
+                // Do not extract IDs or evaluate cluster size because that would
+                // write back with the live-entry TTL.
+                log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             }
         }
         Ok(None) => {}

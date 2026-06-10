@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, HeaderValue};
 use fastly::{Request, Response};
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,7 @@ impl TestlightIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: TESTLIGHT_INTEGRATION_ID.to_string(),
+            integration: TESTLIGHT_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -153,7 +153,7 @@ impl IntegrationProxy for TestlightIntegration {
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "EC ID not found in request header or cookie — \
+                    "EC ID not found in request header or cookie \u{2014} \
                      check that the integration registry propagated it",
                 ))
             })?;
@@ -275,7 +275,7 @@ mod tests {
         let shim_src = tsjs::tsjs_unified_script_src();
         let config = TestlightConfig {
             enabled: true,
-            endpoint: "https://example.com/openrtb".to_string(),
+            endpoint: "https://example.com/openrtb".to_owned(),
             timeout_ms: 1000,
             shim_src: shim_src.clone(),
             rewrite_scripts: true,
@@ -305,7 +305,7 @@ mod tests {
         let shim_src = tsjs::tsjs_unified_script_src();
         let config = TestlightConfig {
             enabled: true,
-            endpoint: "https://example.com/openrtb".to_string(),
+            endpoint: "https://example.com/openrtb".to_owned(),
             timeout_ms: 1000,
             shim_src,
             rewrite_scripts: false,
@@ -330,7 +330,7 @@ mod tests {
         settings
             .integrations
             .insert_config(
-                TESTLIGHT_INTEGRATION_ID.to_string(),
+                TESTLIGHT_INTEGRATION_ID.to_owned(),
                 &json!({
                     "enabled": true,
                     "endpoint": "https://example.com/bid",

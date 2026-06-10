@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
 
@@ -188,7 +188,7 @@ fn edge_request_to_fastly(
 ) -> Result<fastly::Request, Report<PlatformError>> {
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         fastly_req.append_header(name.as_str(), value.as_bytes());
     }
     match body {
@@ -304,7 +304,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                         log::warn!("select: response has no backend name, correlation will fail");
                         ""
                     })
-                    .to_string();
+                    .to_owned();
                 fastly_response_to_platform(fastly_resp, backend_name)
             }
             Err(e) => {
@@ -362,8 +362,12 @@ pub fn build_runtime_services(
         .geo(Arc::new(FastlyPlatformGeo))
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_owned),
+            tls_cipher: req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_owned),
         })
         .build()
 }
@@ -374,7 +378,10 @@ pub fn build_runtime_services(
 ///
 /// Returns [`KvError::Unavailable`] when the store does not exist, or
 /// [`KvError::Internal`] when the Fastly SDK fails to open it.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "helper is retained for direct KV-store construction in adapter tests"
+)]
 pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
     FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
@@ -405,8 +412,8 @@ mod tests {
     fn predict_name_produces_same_name_as_backend_config() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "origin.example.com".to_string(),
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
@@ -426,8 +433,8 @@ mod tests {
     fn predict_name_includes_nocert_suffix_when_cert_check_disabled() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "origin.example.com".to_string(),
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
             port: None,
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
@@ -447,7 +454,7 @@ mod tests {
     fn predict_name_returns_error_for_empty_host() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
+            scheme: "https".to_owned(),
             host: String::new(),
             port: None,
             certificate_check: true,
@@ -463,11 +470,11 @@ mod tests {
     fn predict_name_encodes_custom_timeout() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_string(),
-            host: "origin.example.com".to_string(),
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
             port: None,
             certificate_check: true,
-            first_byte_timeout: Duration::from_millis(2000),
+            first_byte_timeout: Duration::from_secs(2),
         };
 
         let name = backend
@@ -569,7 +576,7 @@ mod tests {
     fn fastly_platform_http_client_select_returns_error_for_wrong_inner_type() {
         let client = FastlyPlatformHttpClient;
         // Wrap a non-PendingRequest type to trigger the downcast failure.
-        let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
+        let wrong = PlatformPendingRequest::new(42_u32).with_backend_name("origin-a");
         let err = futures::executor::block_on(client.select(vec![wrong]))
             .expect_err("should return error for wrong inner type");
 

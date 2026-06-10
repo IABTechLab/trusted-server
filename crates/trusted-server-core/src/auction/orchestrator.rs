@@ -1,6 +1,6 @@
 //! Auction orchestrator for managing multi-provider auctions.
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::request::{select, PendingRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,8 +78,8 @@ impl AuctionOrchestrator {
 
     /// Register an auction provider.
     pub fn register_provider(&mut self, provider: Arc<dyn AuctionProvider>) {
-        let name = provider.provider_name().to_string();
-        log::info!("Registering auction provider: {}", name);
+        let name = provider.provider_name().to_owned();
+        log::info!("Registering auction provider: {name}");
         self.providers.insert(name, provider);
     }
 
@@ -120,8 +120,7 @@ impl AuctionOrchestrator {
         };
 
         log::info!(
-            "Running auction with strategy: {} (auto-detected from mediator config)",
-            strategy_name
+            "Running auction with strategy: {strategy_name} (auto-detected from mediator config)"
         );
 
         Ok(OrchestrationResult {
@@ -163,7 +162,7 @@ impl AuctionOrchestrator {
                 // lgtm[rust/cleartext-logging]
                 // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
-                    "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
+                    "Auction timeout ({}ms) exhausted during bidding phase \u{2014} skipping mediator",
                     context.timeout_ms
                 );
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
@@ -273,7 +272,7 @@ impl AuctionOrchestrator {
 
         if provider_names.is_empty() {
             return Err(Report::new(TrustedServerError::Auction {
-                message: "No providers configured".to_string(),
+                message: "No providers configured".to_owned(),
             }));
         }
 
@@ -293,12 +292,9 @@ impl AuctionOrchestrator {
         let mut responses = Vec::new();
 
         for provider_name in provider_names {
-            let provider = match self.providers.get(provider_name) {
-                Some(p) => p,
-                None => {
-                    log::warn!("Provider '{}' not registered, skipping", provider_name);
-                    continue;
-                }
+            let Some(provider) = self.providers.get(provider_name) else {
+                log::warn!("Provider '{provider_name}' not registered, skipping");
+                continue;
             };
 
             if !provider.is_enabled() {
@@ -320,7 +316,7 @@ impl AuctionOrchestrator {
                 // lgtm[rust/cleartext-logging]
                 // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
-                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
+                    "Auction timeout ({}ms) exhausted before launching '{}' \u{2014} skipping",
                     context.timeout_ms,
                     provider.provider_name()
                 );
@@ -330,15 +326,12 @@ impl AuctionOrchestrator {
             // Get the backend name for this provider to map responses back.
             // Must be computed after effective_timeout since the timeout is
             // part of the backend name.
-            let backend_name = match provider.backend_name(effective_timeout) {
-                Some(name) => name,
-                None => {
-                    log::warn!(
-                        "Provider '{}' has no backend_name, skipping",
-                        provider.provider_name()
-                    );
-                    continue;
-                }
+            let Some(backend_name) = provider.backend_name(effective_timeout) else {
+                log::warn!(
+                    "Provider '{}' has no backend_name, skipping",
+                    provider.provider_name()
+                );
+                continue;
             };
 
             let provider_context = AuctionContext {
@@ -410,7 +403,7 @@ impl AuctionOrchestrator {
             match result {
                 Ok(response) => {
                     // Identify the provider from the backend name
-                    let backend_name = response.get_backend_name().unwrap_or_default().to_string();
+                    let backend_name = response.get_backend_name().unwrap_or_default().to_owned();
 
                     if let Some((provider_name, start_time, provider)) =
                         backend_to_provider.remove(&backend_name)
@@ -436,9 +429,7 @@ impl AuctionOrchestrator {
                                 // lgtm[rust/cleartext-logging]
                                 // This warning reports provider parse failures only; no secret values are logged.
                                 log::warn!(
-                                    "Provider '{}' failed to parse response: {:?}",
-                                    provider_name,
-                                    e
+                                    "Provider '{provider_name}' failed to parse response: {e:?}"
                                 );
                                 responses.push(provider_error_response(
                                     provider_name,
@@ -450,15 +441,14 @@ impl AuctionOrchestrator {
                         }
                     } else {
                         log::warn!(
-                            "Received response from unknown backend '{}', ignoring",
-                            backend_name
+                            "Received response from unknown backend '{backend_name}', ignoring"
                         );
                     }
                 }
                 Err(e) => {
                     // When select() returns an error, we can't easily identify which
                     // provider failed since the PendingRequest is consumed
-                    log::warn!("A provider request failed: {:?}", e);
+                    log::warn!("A provider request failed: {e:?}");
                 }
             }
 
@@ -498,16 +488,13 @@ impl AuctionOrchestrator {
             for bid in &response.bids {
                 // Skip bids without decoded prices (e.g., APS bids)
                 // These require mediation layer to decode
-                let bid_price = match bid.price {
-                    Some(p) => p,
-                    None => {
-                        log::debug!(
-                            "Skipping bid for slot '{}' from '{}' - price requires mediation to decode",
-                            bid.slot_id,
-                            bid.bidder
-                        );
-                        continue;
-                    }
+                let Some(bid_price) = bid.price else {
+                    log::debug!(
+                        "Skipping bid for slot '{}' from '{}' - price requires mediation to decode",
+                        bid.slot_id,
+                        bid.bidder
+                    );
+                    continue;
                 };
 
                 let should_replace = match winning_bids.get(&bid.slot_id) {
@@ -544,15 +531,13 @@ impl AuctionOrchestrator {
                     Some(price) if price >= *floor => true,
                     Some(_) => {
                         log::info!(
-                            "Dropping winning bid below floor price for slot '{}'",
-                            slot_id
+                            "Dropping winning bid below floor price for slot '{slot_id}'"
                         );
                         false
                     }
                     None => {
                         log::debug!(
-                            "Passing bid with encoded price for slot '{}' - floor check deferred to mediation",
-                            slot_id
+                            "Passing bid with encoded price for slot '{slot_id}' - floor check deferred to mediation"
                         );
                         true
                     }
@@ -593,7 +578,7 @@ impl AuctionOrchestrator {
                 self.providers.keys().collect::<Vec<_>>()
             );
             Report::new(TrustedServerError::Auction {
-                message: format!("Provider '{}' not registered", name),
+                message: format!("Provider '{name}' not registered"),
             })
         })
     }
@@ -661,10 +646,10 @@ mod tests {
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
-            id: "test-auction-123".to_string(),
+            id: "test-auction-123".to_owned(),
             slots: vec![
                 AdSlot {
-                    id: "header-banner".to_string(),
+                    id: "header-banner".to_owned(),
                     formats: vec![AdFormat {
                         media_type: MediaType::Banner,
                         width: 728,
@@ -675,7 +660,7 @@ mod tests {
                     bidders: HashMap::new(),
                 },
                 AdSlot {
-                    id: "sidebar".to_string(),
+                    id: "sidebar".to_owned(),
                     formats: vec![AdFormat {
                         media_type: MediaType::Banner,
                         width: 300,
@@ -687,11 +672,11 @@ mod tests {
                 },
             ],
             publisher: PublisherInfo {
-                domain: "test.com".to_string(),
-                page_url: Some("https://test.com/article".to_string()),
+                domain: "test.com".to_owned(),
+                page_url: Some("https://test.com/article".to_owned()),
             },
             user: UserInfo {
-                id: Some("user-123".to_string()),
+                id: Some("user-123".to_owned()),
                 consent: None,
                 eids: None,
             },
@@ -709,7 +694,7 @@ mod tests {
     #[test]
     fn provider_error_response_includes_diagnostic_metadata() {
         let error = Report::new(TrustedServerError::Auction {
-            message: "parse failed".to_string(),
+            message: "parse failed".to_owned(),
         })
         .attach("internal/source.rs:12:34");
 
@@ -785,20 +770,20 @@ mod tests {
     fn filters_winning_bids_below_floor() {
         let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
         let mut floor_prices = HashMap::new();
-        floor_prices.insert("slot-1".to_string(), 1.00);
-        floor_prices.insert("slot-2".to_string(), 2.00);
+        floor_prices.insert("slot-1".to_owned(), 1.00);
+        floor_prices.insert("slot-2".to_owned(), 2.00);
 
         // Arrange winning bids with one below floor.
         let mut winning_bids = HashMap::new();
         winning_bids.insert(
-            "slot-1".to_string(),
+            "slot-1".to_owned(),
             Bid {
-                slot_id: "slot-1".to_string(),
+                slot_id: "slot-1".to_owned(),
                 price: Some(0.50),
-                currency: "USD".to_string(),
-                creative: Some("<div>Ad</div>".to_string()),
+                currency: "USD".to_owned(),
+                creative: Some("<div>Ad</div>".to_owned()),
                 adomain: None,
-                bidder: "test-bidder".to_string(),
+                bidder: "test-bidder".to_owned(),
                 width: 300,
                 height: 250,
                 nurl: None,
@@ -807,14 +792,14 @@ mod tests {
             },
         );
         winning_bids.insert(
-            "slot-2".to_string(),
+            "slot-2".to_owned(),
             Bid {
-                slot_id: "slot-2".to_string(),
+                slot_id: "slot-2".to_owned(),
                 price: Some(2.00),
-                currency: "USD".to_string(),
-                creative: Some("<div>Ad</div>".to_string()),
+                currency: "USD".to_owned(),
+                creative: Some("<div>Ad</div>".to_owned()),
                 adomain: None,
-                bidder: "test-bidder".to_string(),
+                bidder: "test-bidder".to_owned(),
                 width: 300,
                 height: 250,
                 nurl: None,
@@ -859,8 +844,8 @@ mod tests {
             providers: vec![],
             mediator: None,
             timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-            allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+            creative_store: "creative_store".to_owned(),
+            allowed_context_keys: HashSet::from(["permutive_segments".to_owned()]),
         };
 
         let orchestrator = AuctionOrchestrator::new(config);
@@ -874,7 +859,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(format!("{}", err).contains("No providers configured"));
+        assert!(format!("{err}").contains("No providers configured"));
     }
 
     #[test]
@@ -935,18 +920,18 @@ mod tests {
         // This is correct behavior for parallel-only strategy where mediation happens later
         let orchestrator = AuctionOrchestrator::new(AuctionConfig::default());
         let mut floor_prices = HashMap::new();
-        floor_prices.insert("slot-1".to_string(), 1.00);
+        floor_prices.insert("slot-1".to_owned(), 1.00);
 
         let mut winning_bids = HashMap::new();
         winning_bids.insert(
-            "slot-1".to_string(),
+            "slot-1".to_owned(),
             Bid {
-                slot_id: "slot-1".to_string(),
+                slot_id: "slot-1".to_owned(),
                 price: None, // APS bid with encoded price
-                currency: "USD".to_string(),
-                creative: Some("<div>Ad</div>".to_string()),
+                currency: "USD".to_owned(),
+                creative: Some("<div>Ad</div>".to_owned()),
                 adomain: None,
-                bidder: "aps".to_string(),
+                bidder: "aps".to_owned(),
                 width: 300,
                 height: 250,
                 nurl: None,
@@ -954,7 +939,7 @@ mod tests {
                 metadata: {
                     let mut m = HashMap::new();
                     m.insert(
-                        "amznbid".to_string(),
+                        "amznbid".to_owned(),
                         serde_json::json!("encoded_price_data"),
                     );
                     m

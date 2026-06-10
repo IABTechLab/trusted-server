@@ -34,7 +34,7 @@ derivation) — both client and server changes ship together.
 
 ### 1. Client-side: Sourcepoint JS integration
 
-New JS-only integration at `crates/js/lib/src/integrations/sourcepoint/index.ts`.
+New JS-only integration at `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`.
 No Rust-side `IntegrationRegistration` (same pattern as `creative`).
 
 **On page load:**
@@ -128,8 +128,8 @@ raise that as a separate consent-policy configuration change.
 
 | File                                                        | Change                                              |
 | ----------------------------------------------------------- | --------------------------------------------------- |
-| `crates/js/lib/src/integrations/sourcepoint/index.ts`       | New — localStorage auto-discovery, cookie mirroring |
-| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | New — Vitest tests                                  |
+| `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`       | New — localStorage auto-discovery, cookie mirroring |
+| `crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts` | New — Vitest tests                                  |
 | `crates/trusted-server-core/src/consent/types.rs`           | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
 | `crates/trusted-server-core/src/consent/gpp.rs`             | Add US section decoding, extract `sale_opt_out`     |
 | `crates/trusted-server-core/src/consent/mod.rs`             | Add GPP US branch in `allows_ec_creation()`, tests  |

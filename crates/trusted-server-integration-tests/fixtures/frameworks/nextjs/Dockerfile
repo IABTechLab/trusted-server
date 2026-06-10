@@ -3,13 +3,13 @@
 #
 # Build:
 #   docker build -t test-nextjs:latest \
-#     crates/integration-tests/fixtures/frameworks/nextjs/
+#     crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 #
 # Run manually:
 #   docker build \
 #     --build-arg NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')" \
 #     -t test-nextjs:latest \
-#     crates/integration-tests/fixtures/frameworks/nextjs/
+#     crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 #   docker run -p 3000:3000 test-nextjs:latest
 
 # --- Build stage ---

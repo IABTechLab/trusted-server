@@ -195,12 +195,11 @@ pub fn parse_gpp_sid_cookie(raw: &str) -> Option<Vec<u16>> {
         .split(',')
         .filter_map(|s| {
             let s = s.trim();
-            match s.parse::<u16>() {
-                Ok(id) => Some(id),
-                Err(_) => {
-                    log::debug!("Ignoring invalid __gpp_sid entry: {s:?}");
-                    None
-                }
+            if let Ok(id) = s.parse::<u16>() {
+                Some(id)
+            } else {
+                log::debug!("Ignoring invalid __gpp_sid entry: {s:?}");
+                None
             }
         })
         .collect();

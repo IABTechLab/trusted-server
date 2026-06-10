@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::http::{header, Method, StatusCode};
 use fastly::{Request, Response};
 use serde::Deserialize;
@@ -88,7 +88,7 @@ impl LockrIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: LOCKR_INTEGRATION_ID.to_string(),
+            integration: LOCKR_INTEGRATION_ID.to_owned(),
             message: message.into(),
         }
     }
@@ -108,7 +108,7 @@ impl LockrIntegration {
         _req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let sdk_url = &self.config.sdk_url;
-        log::info!("Fetching Lockr SDK from {}", sdk_url);
+        log::info!("Fetching Lockr SDK from {sdk_url}");
 
         // TODO: Check KV store cache first (future enhancement)
 
@@ -123,8 +123,7 @@ impl LockrIntegration {
             lockr_req
                 .send(backend_name)
                 .change_context(Self::error(format!(
-                    "Failed to fetch Lockr SDK from {}",
-                    sdk_url
+                    "Failed to fetch Lockr SDK from {sdk_url}"
                 )))?;
 
         if !lockr_response.get_status().is_success() {
@@ -167,22 +166,22 @@ impl LockrIntegration {
         let original_path = req.get_path();
         let method = req.get_method();
 
-        log::info!("Proxying Lockr API request: {} {}", method, original_path);
+        log::info!("Proxying Lockr API request: {method} {original_path}");
 
         // Extract path after /integrations/lockr/api and pass through directly.
         // This allows the Lockr SDK to use any API endpoint without hardcoded mappings.
         let target_path = original_path
             .strip_prefix("/integrations/lockr/api")
-            .ok_or_else(|| Self::error(format!("Invalid Lockr API path: {}", original_path)))?;
+            .ok_or_else(|| Self::error(format!("Invalid Lockr API path: {original_path}")))?;
 
         let query = req
             .get_url()
             .query()
-            .map(|q| format!("?{}", q))
+            .map(|q| format!("?{q}"))
             .unwrap_or_default();
         let target_url = format!("{}{}{}", self.config.api_endpoint, target_path, query);
 
-        log::info!("Forwarding to Lockr API: {}", target_url);
+        log::info!("Forwarding to Lockr API: {target_url}");
 
         let mut target_req = Request::new(method.clone(), &target_url);
         self.copy_request_headers(&req, &mut target_req);
@@ -313,8 +312,7 @@ impl IntegrationProxy for LockrIntegration {
             self.handle_api_proxy(settings, req).await
         } else {
             Err(Report::new(Self::error(format!(
-                "Unknown Lockr route: {}",
-                path
+                "Unknown Lockr route: {path}"
             ))))
         }
     }
@@ -344,7 +342,7 @@ impl IntegrationAttributeRewriter for LockrIntegration {
                 "{}://{}/integrations/lockr/sdk",
                 ctx.request_scheme, ctx.request_host
             );
-            log::debug!("Rewriting Lockr SDK URL to {}", replacement);
+            log::debug!("Rewriting Lockr SDK URL to {replacement}");
             AttributeRewriteAction::Replace(replacement)
         } else {
             AttributeRewriteAction::Keep
@@ -357,11 +355,11 @@ fn default_enabled() -> bool {
 }
 
 fn default_api_endpoint() -> String {
-    "https://identity.loc.kr".to_string()
+    "https://identity.loc.kr".to_owned()
 }
 
 fn default_sdk_url() -> String {
-    "https://aim.loc.kr/identity-lockr-trust-server.js".to_string()
+    "https://aim.loc.kr/identity-lockr-trust-server.js".to_owned()
 }
 
 fn default_cache_ttl() -> u32 {
@@ -382,7 +380,7 @@ mod tests {
     fn test_config() -> LockrConfig {
         LockrConfig {
             enabled: true,
-            app_id: "test-app-id".to_string(),
+            app_id: "test-app-id".to_owned(),
             api_endpoint: default_api_endpoint(),
             sdk_url: default_sdk_url(),
             cache_ttl_seconds: 3600,
@@ -450,7 +448,7 @@ mod tests {
         assert_eq!(
             result,
             AttributeRewriteAction::Replace(
-                "https://edge.example.com/integrations/lockr/sdk".to_string()
+                "https://edge.example.com/integrations/lockr/sdk".to_owned()
             ),
             "should rewrite Lockr SDK URL to first-party proxy"
         );
@@ -509,11 +507,7 @@ mod tests {
             let result = input
                 .strip_prefix("/integrations/lockr/api")
                 .expect("should strip prefix");
-            assert_eq!(
-                result, expected,
-                "should preserve casing for path: {}",
-                input
-            );
+            assert_eq!(result, expected, "should preserve casing for path: {input}");
         }
     }
 

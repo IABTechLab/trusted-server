@@ -268,10 +268,7 @@ fn drain_pull_batch(kv: &KvIdentityGraph, ec_id: &str, in_flight: &mut Vec<InFli
         let response = match pending.pending.wait() {
             Ok(response) => response,
             Err(err) => {
-                log::warn!(
-                    "Pull sync: request failed for partner '{}': {err:?}",
-                    source_domain
-                );
+                log::warn!("Pull sync: request failed for partner '{source_domain}': {err:?}");
                 continue;
             }
         };
@@ -303,25 +300,21 @@ fn response_content_length_exceeds_limit(response: &fastly::Response, source_dom
 
     let Some(value) = value.to_str().ok() else {
         log::warn!(
-            "Pull sync: partner '{}' returned invalid Content-Length header, rejecting",
-            source_domain
+            "Pull sync: partner '{source_domain}' returned invalid Content-Length header, rejecting"
         );
         return true;
     };
 
     let Ok(length) = value.parse::<usize>() else {
         log::warn!(
-            "Pull sync: partner '{}' returned malformed Content-Length header, rejecting",
-            source_domain
+            "Pull sync: partner '{source_domain}' returned malformed Content-Length header, rejecting"
         );
         return true;
     };
 
     if length > MAX_PULL_RESPONSE_BYTES {
         log::warn!(
-            "Pull sync: partner '{}' returned oversized Content-Length ({} bytes), rejecting",
-            source_domain,
-            length
+            "Pull sync: partner '{source_domain}' returned oversized Content-Length ({length} bytes), rejecting"
         );
         return true;
     }
@@ -333,19 +326,12 @@ fn extract_pull_uid(mut response: fastly::Response, source_domain: &str) -> Opti
     let status = response.get_status();
 
     if status == StatusCode::NOT_FOUND {
-        log::debug!(
-            "Pull sync: partner '{}' returned 404, treating as no-op",
-            source_domain
-        );
+        log::debug!("Pull sync: partner '{source_domain}' returned 404, treating as no-op");
         return None;
     }
 
     if !status.is_success() {
-        log::warn!(
-            "Pull sync: partner '{}' returned non-success status {}",
-            source_domain,
-            status
-        );
+        log::warn!("Pull sync: partner '{source_domain}' returned non-success status {status}");
         return None;
     }
 
@@ -365,10 +351,7 @@ fn extract_pull_uid(mut response: fastly::Response, source_domain: &str) -> Opti
     let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
         Ok(payload) => payload,
         Err(err) => {
-            log::warn!(
-                "Pull sync: partner '{}' returned invalid JSON body: {err}",
-                source_domain
-            );
+            log::warn!("Pull sync: partner '{source_domain}' returned invalid JSON body: {err}");
             return None;
         }
     };
@@ -379,8 +362,7 @@ fn extract_pull_uid(mut response: fastly::Response, source_domain: &str) -> Opti
     match uid {
         None => {
             log::debug!(
-                "Pull sync: partner '{}' returned null/empty uid, treating as no-op",
-                source_domain
+                "Pull sync: partner '{source_domain}' returned null/empty uid, treating as no-op"
             );
             None
         }
@@ -634,15 +616,15 @@ mod tests {
         assert_eq!(offset_h0, 0, "hour 0 should start at index 0");
 
         // Hour 1: offset = (3600 / 3600) % 3 = 1 → [beta, gamma, alpha]
-        let offset_h1 = (3600u64 / 3600) as usize % ids.len();
+        let offset_h1 = (3600_u64 / 3600) as usize % ids.len();
         assert_eq!(offset_h1, 1, "hour 1 should start at index 1");
 
         // Hour 2: offset = (7200 / 3600) % 3 = 2 → [gamma, alpha, beta]
-        let offset_h2 = (7200u64 / 3600) as usize % ids.len();
+        let offset_h2 = (7200_u64 / 3600) as usize % ids.len();
         assert_eq!(offset_h2, 2, "hour 2 should start at index 2");
 
         // Hour 3: offset = (10800 / 3600) % 3 = 0 → wraps back to [alpha, beta, gamma]
-        let offset_h3 = (10800u64 / 3600) as usize % ids.len();
+        let offset_h3 = (10800_u64 / 3600) as usize % ids.len();
         assert_eq!(offset_h3, 0, "hour 3 should wrap back to index 0");
 
         // Verify rotate_left produces expected ordering

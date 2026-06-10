@@ -13,7 +13,7 @@ use std::rc::Rc;
 use brotli::enc::writer::CompressorWriter;
 use brotli::enc::BrotliEncoderParams;
 use brotli::Decompressor;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::{GzEncoder, ZlibEncoder};
 
@@ -135,7 +135,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 let mut encoder = GzEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
                 encoder.finish().change_context(TrustedServerError::Proxy {
-                    message: "Failed to finalize gzip encoder".to_string(),
+                    message: "Failed to finalize gzip encoder".to_owned(),
                 })?;
                 Ok(())
             }
@@ -147,7 +147,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 let mut encoder = ZlibEncoder::new(output, flate2::Compression::default());
                 self.process_chunks(decoder, &mut encoder)?;
                 encoder.finish().change_context(TrustedServerError::Proxy {
-                    message: "Failed to finalize deflate encoder".to_string(),
+                    message: "Failed to finalize deflate encoder".to_owned(),
                 })?;
                 Ok(())
             }
@@ -175,7 +175,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                 self.process_chunks(Decompressor::new(input, 4096), output)
             }
             _ => Err(Report::new(TrustedServerError::Proxy {
-                message: "Unsupported compression transformation".to_string(),
+                message: "Unsupported compression transformation".to_owned(),
             })),
         }
     }
@@ -199,20 +199,20 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         mut reader: R,
         mut writer: W,
     ) -> Result<(), Report<TrustedServerError>> {
-        let mut buffer = vec![0u8; self.config.chunk_size];
+        let mut buffer = vec![0_u8; self.config.chunk_size];
 
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     let final_chunk = self.processor.process_chunk(&[], true).change_context(
                         TrustedServerError::Proxy {
-                            message: "Failed to process final chunk".to_string(),
+                            message: "Failed to process final chunk".to_owned(),
                         },
                     )?;
                     if !final_chunk.is_empty() {
                         writer.write_all(&final_chunk).change_context(
                             TrustedServerError::Proxy {
-                                message: "Failed to write final chunk".to_string(),
+                                message: "Failed to write final chunk".to_owned(),
                             },
                         )?;
                     }
@@ -223,13 +223,13 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
                         .processor
                         .process_chunk(&buffer[..n], false)
                         .change_context(TrustedServerError::Proxy {
-                            message: "Failed to process chunk".to_string(),
+                            message: "Failed to process chunk".to_owned(),
                         })?;
                     if !processed.is_empty() {
                         writer
                             .write_all(&processed)
                             .change_context(TrustedServerError::Proxy {
-                                message: "Failed to write processed chunk".to_string(),
+                                message: "Failed to write processed chunk".to_owned(),
                             })?;
                     }
                 }
@@ -242,7 +242,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
         }
 
         writer.flush().change_context(TrustedServerError::Proxy {
-            message: "Failed to flush output".to_string(),
+            message: "Failed to flush output".to_owned(),
         })?;
 
         Ok(())
@@ -291,22 +291,20 @@ impl HtmlRewriterAdapter {
 
 impl StreamProcessor for HtmlRewriterAdapter {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        match &mut self.rewriter {
-            Some(rewriter) => {
-                if !chunk.is_empty() {
-                    rewriter.write(chunk).map_err(|e| {
-                        log::error!("Failed to process HTML chunk: {e}");
-                        io::Error::other(format!("HTML processing failed: {e}"))
-                    })?;
-                }
+        match (&mut self.rewriter, chunk.is_empty()) {
+            (Some(rewriter), false) => {
+                rewriter.write(chunk).map_err(|e| {
+                    log::error!("Failed to process HTML chunk: {e}");
+                    io::Error::other(format!("HTML processing failed: {e}"))
+                })?;
             }
-            None if !chunk.is_empty() => {
+            (None, false) => {
                 log::warn!(
                     "HtmlRewriterAdapter: {} bytes received after finalization, data will be lost",
                     chunk.len()
                 );
             }
-            None => {}
+            _ => {}
         }
 
         if is_last {
@@ -359,7 +357,7 @@ mod tests {
                 element_content_handlers: vec![lol_html::text!("script", move |text| {
                     fragments_clone
                         .borrow_mut()
-                        .push((text.as_str().to_string(), text.last_in_text_node()));
+                        .push((text.as_str().to_owned(), text.last_in_text_node()));
                     Ok(())
                 })],
                 ..lol_html::Settings::default()
@@ -397,8 +395,8 @@ mod tests {
     #[test]
     fn test_uncompressed_pipeline() {
         let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_string(),
-            replace_with: "hi".to_string(),
+            find: "hello".to_owned(),
+            replace_with: "hi".to_owned(),
         }]);
 
         let config = PipelineConfig::default();
@@ -503,7 +501,7 @@ mod tests {
         // Create a large HTML document
         let mut large_html = String::from("<html><body>");
         for i in 0..1000 {
-            large_html.push_str(&format!("<p>Paragraph {}</p>", i));
+            large_html.push_str(&format!("<p>Paragraph {i}</p>"));
         }
         large_html.push_str("</body></html>");
 
@@ -581,8 +579,8 @@ mod tests {
         }
 
         let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_string(),
-            replace_with: "hi".to_string(),
+            find: "hello".to_owned(),
+            replace_with: "hi".to_owned(),
         }]);
 
         let config = PipelineConfig {
@@ -595,14 +593,14 @@ mod tests {
         let mut output = Vec::new();
 
         pipeline
-            .process(&compressed_input[..], &mut output)
+            .process(&*compressed_input, &mut output)
             .expect("should process deflate-to-deflate");
 
         // Decompress output and verify correctness
         let mut decompressed = Vec::new();
-        ZlibDecoder::new(&output[..])
+        ZlibDecoder::new(&*output)
             .read_to_end(&mut decompressed)
-            .expect("should decompress output — implies encoder was finalized correctly");
+            .expect("should decompress output \u{2014} implies encoder was finalized correctly");
 
         assert_eq!(
             String::from_utf8(decompressed).expect("should be valid UTF-8"),
@@ -629,8 +627,8 @@ mod tests {
         }
 
         let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_string(),
-            replace_with: "hi".to_string(),
+            find: "hello".to_owned(),
+            replace_with: "hi".to_owned(),
         }]);
 
         let config = PipelineConfig {
@@ -644,14 +642,14 @@ mod tests {
 
         // Act
         pipeline
-            .process(&compressed_input[..], &mut output)
+            .process(&*compressed_input, &mut output)
             .expect("should process gzip-to-gzip");
 
         // Assert
         let mut decompressed = Vec::new();
-        GzDecoder::new(&output[..])
+        GzDecoder::new(&*output)
             .read_to_end(&mut decompressed)
-            .expect("should decompress output — implies encoder was finalized correctly");
+            .expect("should decompress output \u{2014} implies encoder was finalized correctly");
 
         assert_eq!(
             String::from_utf8(decompressed).expect("should be valid UTF-8"),
@@ -677,8 +675,8 @@ mod tests {
         }
 
         let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_string(),
-            replace_with: "hi".to_string(),
+            find: "hello".to_owned(),
+            replace_with: "hi".to_owned(),
         }]);
 
         let config = PipelineConfig {
@@ -692,7 +690,7 @@ mod tests {
 
         // Act
         pipeline
-            .process(&compressed_input[..], &mut output)
+            .process(&*compressed_input, &mut output)
             .expect("should process gzip-to-none");
 
         // Assert
@@ -721,8 +719,8 @@ mod tests {
         }
 
         let replacer = StreamingReplacer::new(vec![Replacement {
-            find: "hello".to_string(),
-            replace_with: "hi".to_string(),
+            find: "hello".to_owned(),
+            replace_with: "hi".to_owned(),
         }]);
 
         let config = PipelineConfig {
@@ -735,14 +733,14 @@ mod tests {
         let mut output = Vec::new();
 
         pipeline
-            .process(&compressed_input[..], &mut output)
+            .process(&*compressed_input, &mut output)
             .expect("should process brotli-to-brotli");
 
         // Decompress output and verify correctness
         let mut decompressed = Vec::new();
-        Decompressor::new(&output[..], 4096)
+        Decompressor::new(&*output, 4096)
             .read_to_end(&mut decompressed)
-            .expect("should decompress output — implies encoder was finalized correctly");
+            .expect("should decompress output \u{2014} implies encoder was finalized correctly");
 
         assert_eq!(
             String::from_utf8(decompressed).expect("should be valid UTF-8"),
@@ -874,11 +872,11 @@ mod tests {
         let mut output = Vec::new();
 
         pipeline
-            .process(&compressed_input[..], &mut output)
+            .process(&*compressed_input, &mut output)
             .expect("pipeline should process gzip HTML");
 
         let mut decompressed = Vec::new();
-        GzDecoder::new(&output[..])
+        GzDecoder::new(&*output)
             .read_to_end(&mut decompressed)
             .expect("should decompress output");
 

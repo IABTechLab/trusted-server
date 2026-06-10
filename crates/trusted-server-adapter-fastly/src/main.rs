@@ -68,7 +68,7 @@ fn main() -> Result<(), Error> {
     let settings = match get_settings() {
         Ok(s) => s,
         Err(e) => {
-            log::error!("Failed to load settings: {:?}", e);
+            log::error!("Failed to load settings: {e:?}");
             to_error_response(&e).send_to_client();
             return Ok(());
         }
@@ -92,7 +92,7 @@ fn main() -> Result<(), Error> {
     let orchestrator = match build_orchestrator(&settings) {
         Ok(orchestrator) => orchestrator,
         Err(e) => {
-            log::error!("Failed to build auction orchestrator: {:?}", e);
+            log::error!("Failed to build auction orchestrator: {e:?}");
             to_error_response(&e).send_to_client();
             return Ok(());
         }
@@ -101,7 +101,7 @@ fn main() -> Result<(), Error> {
     let integration_registry = match IntegrationRegistry::new(&settings) {
         Ok(r) => r,
         Err(e) => {
-            log::error!("Failed to create integration registry: {:?}", e);
+            log::error!("Failed to create integration registry: {e:?}");
             to_error_response(&e).send_to_client();
             return Ok(());
         }
@@ -110,7 +110,7 @@ fn main() -> Result<(), Error> {
     let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
         Ok(registry) => registry,
         Err(e) => {
-            log::error!("Failed to build partner registry: {:?}", e);
+            log::error!("Failed to build partner registry: {e:?}");
             to_error_response(&e).send_to_client();
             return Ok(());
         }
@@ -166,8 +166,14 @@ fn build_ja4_debug_response(req: &Request) -> Response {
         .unwrap_or(FALLBACK_UNAVAILABLE);
     let cipher = req
         .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
         .unwrap_or(FALLBACK_UNAVAILABLE);
-    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req
+        .get_tls_protocol()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
     let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
     let ch_mobile = req
         .get_header_str("sec-ch-ua-mobile")
@@ -210,7 +216,10 @@ async fn route_request(
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     // Extract geo info before auth check or routing consumes the request.
-    #[allow(deprecated)]
+    #[allow(
+        deprecated,
+        reason = "Fastly adapter still reads legacy request geo metadata"
+    )]
     let geo_info = GeoInfo::from_request(&req);
 
     // Extract the Prebid EIDs cookie before routing consumes the request.
@@ -245,7 +254,7 @@ async fn route_request(
                 .and_then(|r| r)
                 .unwrap_or_else(|e| to_error_response(&e)),
             Err(e) => {
-                log::error!("Failed to evaluate basic auth: {:?}", e);
+                log::error!("Failed to evaluate basic auth: {e:?}");
                 to_error_response(&e)
             }
         };
@@ -311,7 +320,7 @@ async fn route_request(
         }
         Ok(None) => {}
         Err(e) => {
-            log::error!("Failed to evaluate basic auth: {:?}", e);
+            log::error!("Failed to evaluate basic auth: {e:?}");
             let mut response = to_error_response(&e);
             finalize_response(settings, geo_info.as_ref(), &mut response);
             return Ok(RouteOutcome {
@@ -322,7 +331,7 @@ async fn route_request(
     }
 
     // Get path and method for routing
-    let path = req.get_path().to_string();
+    let path = req.get_path().to_owned();
     let method = req.get_method().clone();
 
     // Match known routes and handle them
@@ -346,15 +355,13 @@ async fn route_request(
 
         // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") | (Method::POST, "/_ts/admin/keys/rotate") => {
+        (Method::POST, "/admin/keys/rotate" | "/_ts/admin/keys/rotate") => {
             (handle_rotate_key(settings, runtime_services, req), false)
         }
-        (Method::POST, "/admin/keys/deactivate") | (Method::POST, "/_ts/admin/keys/deactivate") => {
-            (
-                handle_deactivate_key(settings, runtime_services, req),
-                false,
-            )
-        }
+        (Method::POST, "/admin/keys/deactivate" | "/_ts/admin/keys/deactivate") => (
+            handle_deactivate_key(settings, runtime_services, req),
+            false,
+        ),
         (Method::GET, "/_ts/api/v1/identify") => (
             require_identity_graph(settings)
                 .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context)),
@@ -393,7 +400,7 @@ async fn route_request(
         (Method::GET, "/first-party/click") => {
             (handle_first_party_click(settings, req).await, false)
         }
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => {
+        (Method::GET | Method::POST, "/first-party/sign") => {
             (handle_first_party_proxy_sign(settings, req).await, false)
         }
         (Method::POST, "/first-party/proxy-rebuild") => {
@@ -420,10 +427,7 @@ async fn route_request(
 
         // No known route matched, proxy to publisher origin as fallback
         _ => {
-            log::info!(
-                "No known route matched for path: {}, proxying to publisher origin",
-                path
-            );
+            log::info!("No known route matched for path: {path}, proxying to publisher origin");
 
             match handle_publisher_request(
                 settings,
@@ -488,7 +492,7 @@ async fn route_request(
                 }
                 Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
                 Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
+                    log::error!("Failed to proxy to publisher origin: {e:?}");
                     (Err(e), true)
                 }
             }

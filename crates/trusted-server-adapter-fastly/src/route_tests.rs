@@ -24,10 +24,9 @@ struct StubJwksConfigStore;
 impl PlatformConfigStore for StubJwksConfigStore {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         match key {
-            "active-kids" => Ok("test-kid-1".to_string()),
+            "active-kids" => Ok("test-kid-1".to_owned()),
             "test-kid-1" => Ok(
-                r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#
-                    .to_string(),
+                r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#.to_owned(),
             ),
             _ => Err(Report::new(PlatformError::ConfigStore)),
         }
@@ -170,8 +169,12 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_owned),
+            tls_cipher: req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_owned),
         })
         .build()
 }

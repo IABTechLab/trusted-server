@@ -139,16 +139,13 @@ impl NextJsHtmlPostProcessor {
         let expected = rewritten_payloads.len();
         if replaced != expected {
             log::warn!(
-                "NextJs post-process placeholder substitution count mismatch: expected={}, replaced={}",
-                expected,
-                replaced
+                "NextJs post-process placeholder substitution count mismatch: expected={expected}, replaced={replaced}"
             );
         }
 
         if contains_rsc_payload_placeholders(&updated) {
             log::error!(
-                "NextJs post-process left RSC placeholders in output; attempting fallback substitution (scripts={})",
-                expected
+                "NextJs post-process left RSC placeholders in output; attempting fallback substitution (scripts={expected})"
             );
 
             let fallback =
@@ -156,8 +153,7 @@ impl NextJsHtmlPostProcessor {
 
             if contains_rsc_payload_placeholders(&fallback) {
                 log::error!(
-                    "NextJs post-process fallback substitution still left RSC placeholders in output; hydration may break (scripts={})",
-                    expected
+                    "NextJs post-process fallback substitution still left RSC placeholders in output; hydration may break (scripts={expected})"
                 );
             }
 
@@ -171,7 +167,7 @@ impl NextJsHtmlPostProcessor {
 }
 
 fn contains_rsc_payload_placeholders(html: &str) -> bool {
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     while let Some(next) = html[cursor..].find(RSC_PAYLOAD_PLACEHOLDER_PREFIX) {
         let start = cursor + next;
         let after_prefix = start + RSC_PAYLOAD_PLACEHOLDER_PREFIX.len();
@@ -189,8 +185,8 @@ fn contains_rsc_payload_placeholders(html: &str) -> bool {
 
 fn substitute_rsc_payload_placeholders(html: &str, replacements: &[String]) -> (String, usize) {
     let mut output = String::with_capacity(html.len());
-    let mut cursor = 0usize;
-    let mut replaced = 0usize;
+    let mut cursor = 0_usize;
+    let mut replaced = 0_usize;
 
     while let Some(next) = html[cursor..].find(RSC_PAYLOAD_PLACEHOLDER_PREFIX) {
         let start = cursor + next;
@@ -237,7 +233,7 @@ fn substitute_rsc_payload_placeholders(html: &str, replacements: &[String]) -> (
 }
 
 fn substitute_rsc_payload_placeholders_exact(html: &str, replacements: &[String]) -> String {
-    let mut out = html.to_string();
+    let mut out = html.to_owned();
     for (index, replacement) in replacements.iter().enumerate() {
         let placeholder =
             format!("{RSC_PAYLOAD_PLACEHOLDER_PREFIX}{index}{RSC_PAYLOAD_PLACEHOLDER_SUFFIX}");
@@ -260,7 +256,7 @@ fn find_rsc_push_scripts(html: &str) -> Vec<RscPushScriptRange> {
     let ranges: Rc<RefCell<Vec<RscPushScriptRange>>> = Rc::new(RefCell::new(Vec::new()));
     let buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let buffering = Rc::new(Cell::new(false));
-    let buffer_start = Rc::new(Cell::new(0usize));
+    let buffer_start = Rc::new(Cell::new(0_usize));
 
     let settings = RewriterSettings {
         element_content_handlers: vec![text!("script", {
@@ -353,8 +349,8 @@ pub fn post_process_rsc_html(
     request_host: &str,
     request_scheme: &str,
 ) -> String {
-    let mut result = html.to_string();
-    #[allow(deprecated)]
+    let mut result = html.to_owned();
+    #[allow(deprecated, reason = "wrapper preserves the deprecated legacy API")]
     post_process_rsc_html_in_place(&mut result, origin_host, request_host, request_scheme);
     result
 }
@@ -400,7 +396,7 @@ fn post_process_rsc_html_in_place_with_limit(
     }
 
     scripts.sort_by_key(|s| s.payload_start);
-    let mut previous_end = 0usize;
+    let mut previous_end = 0_usize;
     for script in &scripts {
         if script.payload_start > script.payload_end {
             log::warn!(
@@ -507,7 +503,10 @@ fn post_process_rsc_html_in_place_with_limit(
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // Tests use deprecated post_process_rsc_html for legacy API coverage
+#[allow(
+    deprecated,
+    reason = "tests cover deprecated post_process_rsc_html legacy API"
+)]
 mod tests {
     use super::*;
 
@@ -522,7 +521,7 @@ mod tests {
         let ranges: Rc<RefCell<Vec<RscPushScriptRange>>> = Rc::new(RefCell::new(Vec::new()));
         let buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let buffering = Rc::new(Cell::new(false));
-        let buffer_start = Rc::new(Cell::new(0usize));
+        let buffer_start = Rc::new(Cell::new(0_usize));
         let saw_partial = Rc::new(Cell::new(false));
 
         let settings = RewriterSettings {
@@ -617,13 +616,11 @@ mod tests {
 
         assert!(
             result.contains("test.example.com/page"),
-            "URL should be rewritten. Got: {}",
-            result
+            "URL should be rewritten. Got: {result}"
         );
         assert!(
             result.contains(":T3c,"),
-            "T-chunk length should be updated. Got: {}",
-            result
+            "T-chunk length should be updated. Got: {result}"
         );
         assert!(result.contains("<html>") && result.contains("</html>"));
         assert!(result.contains("self.__next_f.push"));
@@ -676,7 +673,7 @@ mod tests {
 
     #[test]
     fn finds_window_next_f_push_with_case_insensitive_script_tags() {
-        let html = r#"<SCRIPT>window.__next_f.push([1,'payload']);</SCRIPT>"#;
+        let html = "<SCRIPT>window.__next_f.push([1,'payload']);</SCRIPT>";
         let scripts = find_rsc_push_scripts(html);
         assert_eq!(
             scripts.len(),
@@ -708,18 +705,15 @@ mod tests {
 
         assert!(
             result.contains("test.example.com/news"),
-            "First URL should be rewritten. Got: {}",
-            result
+            "First URL should be rewritten. Got: {result}"
         );
         assert!(
             result.contains("test.example.com/reviews"),
-            "Second URL should be rewritten. Got: {}",
-            result
+            "Second URL should be rewritten. Got: {result}"
         );
         assert!(
             !result.contains("origin.example.com"),
-            "No origin URLs should remain. Got: {}",
-            result
+            "No origin URLs should remain. Got: {result}"
         );
         assert!(result.contains("<html>") && result.contains("</html>"));
         assert!(result.contains("self.__next_f.push"));
@@ -729,8 +723,8 @@ mod tests {
     fn post_process_rewrites_html_href_inside_tchunk() {
         fn calculate_unescaped_byte_length_for_test(s: &str) -> usize {
             let bytes = s.as_bytes();
-            let mut pos = 0usize;
-            let mut count = 0usize;
+            let mut pos = 0_usize;
+            let mut count = 0_usize;
 
             while pos < bytes.len() {
                 if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
@@ -773,7 +767,7 @@ mod tests {
                                     }
                                 }
 
-                                let c = char::from_u32(code_unit as u32).unwrap_or('\u{FFFD}');
+                                let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
                                 pos += 6;
                                 count += c.len_utf8();
                                 continue;
@@ -801,14 +795,14 @@ mod tests {
             calculate_unescaped_byte_length_for_test(tchunk_content)
         );
         let html = format!(
-            r#"<html><body>
+            "<html><body>
     <script>
       self.__next_f.push([
         1,
         '53d:T{declared_len_hex},{tchunk_content}'
       ]);
     </script>
-</body></html>"#
+</body></html>"
         );
 
         let result =
@@ -816,18 +810,15 @@ mod tests {
 
         assert!(
             result.contains("test.example.com/about-us"),
-            "HTML href URL in T-chunk should be rewritten. Got: {}",
-            result
+            "HTML href URL in T-chunk should be rewritten. Got: {result}"
         );
         assert!(
             !result.contains("origin.example.com"),
-            "No origin URLs should remain. Got: {}",
-            result
+            "No origin URLs should remain. Got: {result}"
         );
         assert!(
             !result.contains(&format!(":T{declared_len_hex},")),
-            "T-chunk length should have been recalculated. Got: {}",
-            result
+            "T-chunk length should have been recalculated. Got: {result}"
         );
     }
 

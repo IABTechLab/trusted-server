@@ -5,9 +5,9 @@
 
 use std::net::IpAddr;
 
-use error_stack::{Report, ResultExt};
-use hmac::{Hmac, Mac};
-use rand::Rng;
+use error_stack::{Report, ResultExt as _};
+use hmac::{Hmac, Mac as _};
+use rand::Rng as _;
 use sha2::Sha256;
 
 use crate::error::TrustedServerError;
@@ -86,7 +86,7 @@ pub fn generate_ec_id(
 ) -> Result<String, Report<TrustedServerError>> {
     let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
         .change_context(TrustedServerError::EdgeCookie {
-            message: "Failed to create HMAC instance".to_string(),
+            message: "Failed to create HMAC instance".to_owned(),
         })?;
     mac.update(client_ip.as_bytes());
     let hmac_hash = hex::encode(mac.finalize().into_bytes());
@@ -112,7 +112,7 @@ pub fn generate_ec_id(
 pub fn extract_client_ip(req: &fastly::Request) -> Result<String, Report<TrustedServerError>> {
     req.get_client_ip_addr().map(normalize_ip).ok_or_else(|| {
         Report::new(TrustedServerError::EdgeCookie {
-            message: "Client IP required for EC generation but unavailable".to_string(),
+            message: "Client IP required for EC generation but unavailable".to_owned(),
         })
     })
 }
