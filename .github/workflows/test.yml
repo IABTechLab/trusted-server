@@ -66,6 +66,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          # wasm32-wasip1 is required by the "Verify Fastly WASM release
+          # build" step below; the axum build and tests are native.
+          target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Build Axum adapter
