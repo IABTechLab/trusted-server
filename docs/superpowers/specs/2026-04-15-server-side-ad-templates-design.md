@@ -487,10 +487,11 @@ The `hb_adid` match confirms two things: that the slot was filled (`!event.isEmp
 **and** that **our** Prebid bid (not a direct deal or backfill) won the GAM line item
 match. Only then are SSP win/billing pixels fired.
 
-**Per-bidder suppression** (`[integrations.<bidder>].suppress_nurl`, default `false`)
-is retained as an escape hatch in case a specific PBS deployment fires `nurl`
-internally and wants to avoid double-firing. APS `burl` follows the same client-side
-path.
+**Per-bidder suppression** (`[integrations.prebid].suppress_nurl_bidders`, default
+`[]`) is retained as an escape hatch in case a specific PBS seat fires `nurl`
+internally and wants to avoid double-firing. `[integrations.prebid].suppress_nurl =
+true` remains a deployment-wide compatibility switch. APS `burl` follows the same
+client-side path.
 
 > **Operational note:** Client-side firing introduces a small (~50–200ms) delay in
 > win-pixel arrival vs server-side firing. SSPs accept this — it's identical to
@@ -1047,7 +1048,7 @@ saving.
   synchronous bid read, `slotRenderEnded` nurl + burl firing, `ts_initial` sentinel;
   add lazy slim-Prebid loader scheduled for post-`window.load`
 - **`crates/trusted-server-core/src/integrations/prebid.rs`** — add
-  `suppress_nurl` per-bidder config (default `false`); **no server-side nurl firing
+  `suppress_nurl_bidders` per-bidder config (default `[]`); **no server-side nurl firing
   in the page-load path** (firing is client-side from `slotRenderEnded`)
 - **`trusted-server.toml`** — add `[creative_opportunities]` section
 - **`crates/trusted-server-core/src/settings.rs`** — add `CreativeOpportunitiesConfig`

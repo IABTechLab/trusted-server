@@ -62,6 +62,7 @@ import {
   getInjectedConfig,
   auctionBidsToPrebidBids,
   installPrebidNpm,
+  installRefreshHandler,
 } from '../../../src/integrations/prebid/index';
 import type { AuctionBid } from '../../../src/core/auction';
 
@@ -762,6 +763,75 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
 
     expect(mockSetConfig).toHaveBeenCalledWith(expect.objectContaining({ debug: false }));
     expect(mockProcessQueue).toHaveBeenCalled();
+  });
+});
+
+describe('prebid/installRefreshHandler', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPbjs.requestBids = mockRequestBids;
+    mockPbjs.adUnits = [];
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  afterEach(() => {
+    (window as any).tsjs = undefined;
+    delete (window as any).googletag;
+  });
+
+  it('builds refresh ad units from injected slot metadata', () => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [
+            [970, 250],
+            [728, 90],
+          ],
+          targeting: { zone: 'homepage', pos: 'atf' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeout: 750,
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            mediaTypes: {
+              banner: {
+                name: 'homepage',
+                sizes: [
+                  [970, 250],
+                  [728, 90],
+                ],
+              },
+            },
+            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+          }),
+        ],
+      })
+    );
   });
 });
 

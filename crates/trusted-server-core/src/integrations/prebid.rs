@@ -189,6 +189,14 @@ pub struct PrebidIntegrationConfig {
     /// client does not double-fire them via `sendBeacon`. Default: `false`.
     #[serde(default)]
     pub suppress_nurl: bool,
+    /// Bidder seats whose `nurl` and `burl` should be stripped before they reach
+    /// `window.tsjs.bids`.
+    ///
+    /// Use this when only specific PBS seats fire win/billing notifications
+    /// internally. The global [`suppress_nurl`](Self::suppress_nurl) switch still
+    /// suppresses every bidder when set.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub suppress_nurl_bidders: Vec<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -1341,6 +1349,15 @@ impl PrebidAuctionProvider {
         }
     }
 
+    fn should_suppress_bid_notifications(&self, bidder: &str) -> bool {
+        self.config.suppress_nurl
+            || self
+                .config
+                .suppress_nurl_bidders
+                .iter()
+                .any(|suppressed_bidder| suppressed_bidder == bidder)
+    }
+
     /// Parse a single bid from `OpenRTB` response.
     fn parse_bid(&self, bid_obj: &Json, seat: &str) -> Result<AuctionBid, ()> {
         let slot_id = bid_obj
@@ -1370,7 +1387,8 @@ impl PrebidAuctionProvider {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
 
-        let nurl = if self.config.suppress_nurl {
+        let suppress_bid_notifications = self.should_suppress_bid_notifications(seat);
+        let nurl = if suppress_bid_notifications {
             None
         } else {
             bid_obj
@@ -1379,7 +1397,7 @@ impl PrebidAuctionProvider {
                 .map(std::string::ToString::to_string)
         };
 
-        let burl = if self.config.suppress_nurl {
+        let burl = if suppress_bid_notifications {
             None
         } else {
             bid_obj
@@ -1761,6 +1779,7 @@ mod tests {
             bid_param_override_rules: Vec::new(),
             consent_forwarding: ConsentForwardingMode::Both,
             suppress_nurl: false,
+            suppress_nurl_bidders: Vec::new(),
         }
     }
 
@@ -4841,6 +4860,49 @@ set = { networkId = 42 }
         assert_eq!(
             bid.burl, None,
             "should strip burl when suppress_nurl is true"
+        );
+    }
+
+    #[test]
+    fn parse_bid_strips_nurl_and_burl_for_configured_suppressed_bidder_only() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let config = PrebidIntegrationConfig {
+            suppress_nurl_bidders: vec!["appnexus".to_string()],
+            ..base_config()
+        };
+        let provider = PrebidAuctionProvider::new(config);
+
+        let suppressed_bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse suppressed bidder bid");
+        let preserved_bid = provider
+            .parse_bid(&bid_json, "openx")
+            .expect("should parse unsuppressed bidder bid");
+
+        assert_eq!(
+            suppressed_bid.nurl, None,
+            "should strip nurl only for the configured bidder"
+        );
+        assert_eq!(
+            suppressed_bid.burl, None,
+            "should strip burl only for the configured bidder"
+        );
+        assert_eq!(
+            preserved_bid.nurl.as_deref(),
+            Some("https://ssp.example/win?id=abc123"),
+            "should preserve nurl for bidders not configured for suppression"
+        );
+        assert_eq!(
+            preserved_bid.burl.as_deref(),
+            Some("https://ssp.example/bill?id=abc123"),
+            "should preserve burl for bidders not configured for suppression"
         );
     }
 

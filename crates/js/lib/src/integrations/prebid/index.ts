@@ -32,6 +32,7 @@ import './_user_ids.generated';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
+import type { AuctionSlot } from '../../core/types';
 
 import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from './user_id_modules';
 
@@ -212,7 +213,13 @@ export function auctionBidsToPrebidBids(auctionBids: AuctionBid[], bidRequests: 
 type PbjsConfig = Parameters<typeof pbjs.setConfig>[0];
 
 type TrustedServerBid = { bidder?: string; params?: Record<string, unknown> };
-type TrustedServerAdUnit = { code?: string; bids?: TrustedServerBid[] };
+type BannerSize = [number, number];
+type TrustedServerBanner = { sizes: BannerSize[]; name?: string };
+type TrustedServerAdUnit = {
+  code?: string;
+  mediaTypes?: { banner?: TrustedServerBanner };
+  bids?: TrustedServerBid[];
+};
 type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
@@ -231,6 +238,17 @@ type PrebidUserIdEid = {
   source?: unknown;
   uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
 };
+
+type RefreshGptSlot = {
+  getSlotElementId?: () => string;
+  getTargeting?: (key: string) => string[];
+  getSizes?: () => unknown[];
+};
+
+const DEFAULT_REFRESH_SIZES: BannerSize[] = [
+  [728, 90],
+  [300, 250],
+];
 
 function sanitizeAuctionUid(uid: {
   id?: unknown;
@@ -256,6 +274,63 @@ function sanitizeAuctionUid(uid: {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+function isPositiveFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function parseBannerSize(size: unknown): BannerSize | undefined {
+  if (Array.isArray(size) && isPositiveFiniteNumber(size[0]) && isPositiveFiniteNumber(size[1])) {
+    return [size[0], size[1]];
+  }
+
+  const gptSize = size as { getWidth?: () => unknown; getHeight?: () => unknown };
+  const width = gptSize?.getWidth?.();
+  const height = gptSize?.getHeight?.();
+  if (isPositiveFiniteNumber(width) && isPositiveFiniteNumber(height)) {
+    return [width, height];
+  }
+
+  return undefined;
+}
+
+function bannerSizesFromGptSlot(slot: RefreshGptSlot): BannerSize[] | undefined {
+  const sizes = slot.getSizes?.();
+  if (!Array.isArray(sizes)) {
+    return undefined;
+  }
+
+  const parsedSizes = sizes.map(parseBannerSize).filter(isDefined);
+  return parsedSizes.length > 0 ? parsedSizes : undefined;
+}
+
+function bannerSizesFromInjectedSlot(slot: AuctionSlot | undefined): BannerSize[] | undefined {
+  const parsedSizes = slot?.formats?.map(parseBannerSize).filter(isDefined) ?? [];
+  return parsedSizes.length > 0 ? parsedSizes : undefined;
+}
+
+function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {
+  const elementId = slot.getSlotElementId?.();
+  return elementId && elementId.length > 0 ? elementId : undefined;
+}
+
+function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefined {
+  const elementId = refreshSlotElementId(slot);
+  if (!elementId) {
+    return undefined;
+  }
+
+  return window.tsjs?.adSlots?.find(
+    (adSlot) =>
+      elementId === adSlot.div_id ||
+      elementId === `${adSlot.div_id}-container` ||
+      elementId.startsWith(adSlot.div_id)
+  );
+}
+
+function firstTargetingValue(values: string[] | undefined): string | undefined {
+  return values?.find((value) => value.length > 0);
 }
 
 function collectAuctionEids(): AuctionEid[] | undefined {
@@ -524,13 +599,15 @@ export function installRefreshHandler(timeoutMs = 1500): void {
     pubads.refresh = function (slots?: unknown[], opts?: unknown) {
       // For bare refresh() calls (no slots arg), get all registered slots from GPT
       // so we can filter out TS first-impression slots and auction the rest.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const targetSlots: any[] = slots ?? (pubads as any).getSlots?.() ?? [];
+      const targetSlots = (
+        slots ??
+        (pubads as { getSlots?: () => unknown[] }).getSlots?.() ??
+        []
+      ).filter((slot): slot is RefreshGptSlot => typeof slot === 'object' && slot !== null);
 
       // Filter out TS first-impression slots — they don't need client-side refresh auctions.
       const nonTsSlots = targetSlots.filter(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (s: any) => !s.getTargeting?.('ts_initial')?.includes('1')
+        (slot) => !slot.getTargeting?.('ts_initial')?.includes('1')
       );
 
       if (!nonTsSlots.length) {
@@ -538,19 +615,24 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         return originalRefresh(slots, opts);
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const adUnits = nonTsSlots.map((s: any) => ({
-        code: s.getSlotElementId?.() ?? s,
-        mediaTypes: {
-          banner: {
-            sizes: [
-              [728, 90],
-              [300, 250],
-            ] as [number, number][],
-          },
-        },
-        bids: [{ bidder: ADAPTER_CODE, params: { zone: 'refresh' } }],
-      }));
+      const adUnits = nonTsSlots.map((slot) => {
+        const injectedSlot = findInjectedSlotForRefresh(slot);
+        const zone =
+          injectedSlot?.targeting?.[ZONE_KEY] ?? firstTargetingValue(slot.getTargeting?.(ZONE_KEY));
+        const banner: TrustedServerBanner = {
+          sizes:
+            bannerSizesFromInjectedSlot(injectedSlot) ??
+            bannerSizesFromGptSlot(slot) ??
+            DEFAULT_REFRESH_SIZES,
+          ...(zone ? { name: zone } : {}),
+        };
+
+        return {
+          code: refreshSlotElementId(slot) ?? 'refresh-slot',
+          mediaTypes: { banner },
+          bids: [{ bidder: ADAPTER_CODE, params: zone ? { [ZONE_KEY]: zone } : {} }],
+        };
+      });
 
       pbjs.requestBids({
         adUnits,
