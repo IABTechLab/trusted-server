@@ -1418,6 +1418,25 @@ impl ProxyAssetRoute {
             })
         })?;
 
+        if matches!(&self.auth, Some(AssetOriginAuth::S3SigV4(_))) {
+            let parsed_origin = Url::parse(&self.origin_url).map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "proxy.asset_routes origin_url `{}` is invalid: {err}",
+                        self.origin_url
+                    ),
+                })
+            })?;
+            if parsed_origin.scheme() != "https" {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "proxy.asset_routes origin_url `{}` must use https when auth type is s3_sigv4",
+                        self.origin_url
+                    ),
+                }));
+            }
+        }
+
         match (&self.path_pattern, &self.target_path) {
             (None, None) | (Some(_), Some(_)) => {}
             _ => {
@@ -3826,6 +3845,30 @@ origin_host_header_overide = "www.example.com""#,
                 assert_eq!(config.secret_access_key, "secret_access_key");
             }
         }
+    }
+
+    #[test]
+    fn proxy_asset_route_validation_rejects_s3_sigv4_http_origin_url() {
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "http://bucket.s3.us-east-1.amazonaws.com"
+
+            [proxy.asset_routes.auth]
+            type = "s3_sigv4"
+            region = "us-east-1"
+            "#;
+
+        let err = Settings::from_toml(&toml_str)
+            .expect_err("should reject cleartext S3 SigV4 origin URLs");
+
+        assert!(
+            format!("{err:?}").contains("must use https when auth type is s3_sigv4"),
+            "should mention the S3 SigV4 HTTPS requirement: {err:?}"
+        );
     }
 
     #[test]
