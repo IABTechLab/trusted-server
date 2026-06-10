@@ -89,6 +89,32 @@ impl AuctionOrchestrator {
         self.providers.len()
     }
 
+    /// Validate that every configured provider name has an enabled provider integration.
+    pub(crate) fn validate_configured_provider_names(
+        &self,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        for provider_name in self
+            .config
+            .providers
+            .iter()
+            .chain(self.config.mediator.iter())
+        {
+            if !self.providers.contains_key(provider_name) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Auction provider `{provider_name}` is listed in [auction] but no enabled integration provides it"
+                    ),
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute an auction using the auto-detected strategy.
     ///
     /// Strategy is determined by mediator configuration:
@@ -384,6 +410,15 @@ impl AuctionOrchestrator {
             }
         }
 
+        if pending_requests.is_empty() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "All {} configured provider(s) skipped or failed to launch",
+                    provider_names.len()
+                ),
+            }));
+        }
+
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
         // lgtm[rust/cleartext-logging]
         // This info log reports request counts and timeout budget only; no secret settings are logged.
@@ -647,15 +682,19 @@ impl OrchestrationResult {
 #[cfg(test)]
 mod tests {
     use crate::auction::config::AuctionConfig;
+    use crate::auction::provider::AuctionProvider;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
-        AdFormat, AdSlot, AuctionRequest, Bid, BidStatus, MediaType, PublisherInfo, UserInfo,
+        AdFormat, AdSlot, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus,
+        MediaType, PublisherInfo, UserInfo,
     };
     use crate::error::TrustedServerError;
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::Report;
-    use fastly::Request;
+    use fastly::http::request::PendingRequest;
+    use fastly::{Request, Response};
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use super::AuctionOrchestrator;
 
@@ -704,6 +743,42 @@ mod tests {
     fn create_test_settings() -> crate::settings::Settings {
         let settings_str = crate_test_settings_str();
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
+    }
+
+    struct LaunchFailingProvider;
+
+    impl AuctionProvider for LaunchFailingProvider {
+        fn provider_name(&self) -> &'static str {
+            "launch-failing"
+        }
+
+        fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<PendingRequest, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "launch failed in test provider".to_string(),
+            }))
+        }
+
+        fn parse_response(
+            &self,
+            _response: Response,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "launch-failing provider should not parse responses".to_string(),
+            }))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("launch-failing-backend".to_string())
+        }
     }
 
     #[test]
@@ -875,6 +950,32 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(format!("{}", err).contains("No providers configured"));
+    }
+
+    #[tokio::test]
+    async fn provider_launch_failures_error_when_no_requests_launch() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["launch-failing".to_string()],
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(LaunchFailingProvider));
+
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = Request::get("https://test.com/test");
+        let context = create_test_auction_context(&settings, &req, 2000);
+
+        let result = orchestrator.run_auction(&request, &context).await;
+
+        let err = result.expect_err("should fail when every provider launch fails");
+        assert!(
+            err.to_string()
+                .contains("All 1 configured provider(s) skipped or failed to launch"),
+            "should explain that no configured provider request launched"
+        );
     }
 
     #[test]

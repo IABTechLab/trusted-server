@@ -73,10 +73,89 @@ pub fn build_orchestrator(
         }
     }
 
+    orchestrator.validate_configured_provider_names()?;
+
     log::info!(
         "Auction orchestrator built with {} providers",
         orchestrator.provider_count()
     );
 
     Ok(orchestrator)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::settings::Settings;
+    use crate::test_support::tests::crate_test_settings_str;
+
+    use super::build_orchestrator;
+
+    fn settings_with_auction_config(auction_config: &str) -> Settings {
+        let settings_str = format!("{}\n{auction_config}", crate_test_settings_str());
+        Settings::from_toml(&settings_str)
+            .expect("should parse auction provider validation test settings")
+    }
+
+    fn assert_orchestrator_error_contains(settings: &Settings, expected: &str) {
+        let err = match build_orchestrator(settings) {
+            Ok(_) => panic!("build_orchestrator should reject invalid auction providers"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(expected),
+            "should include expected validation message: {expected}"
+        );
+    }
+
+    #[test]
+    fn configured_unregistered_provider_fails_startup() {
+        let settings = settings_with_auction_config(
+            r#"
+            [auction]
+            enabled = true
+            providers = ["missing-provider"]
+            timeout_ms = 2000
+        "#,
+        );
+
+        assert_orchestrator_error_contains(
+            &settings,
+            "Auction provider `missing-provider` is listed in [auction] but no enabled integration provides it",
+        );
+    }
+
+    #[test]
+    fn mixed_registered_and_unregistered_providers_fail_startup() {
+        let settings = settings_with_auction_config(
+            r#"
+            [auction]
+            enabled = true
+            providers = ["prebid", "missing-provider"]
+            timeout_ms = 2000
+        "#,
+        );
+
+        assert_orchestrator_error_contains(
+            &settings,
+            "Auction provider `missing-provider` is listed in [auction] but no enabled integration provides it",
+        );
+    }
+
+    #[test]
+    fn configured_unregistered_mediator_fails_startup() {
+        let settings = settings_with_auction_config(
+            r#"
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            mediator = "missing-mediator"
+            timeout_ms = 2000
+        "#,
+        );
+
+        assert_orchestrator_error_contains(
+            &settings,
+            "Auction provider `missing-mediator` is listed in [auction] but no enabled integration provides it",
+        );
+    }
 }
