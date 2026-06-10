@@ -70,14 +70,10 @@ toml = { workspace = true }
 url = { workspace = true }
 validator = { workspace = true }
 
-[features]
-default = []
-
 [dev-dependencies]
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
-tokio = { workspace = true }
 
 [[bench]]
 name = "consent_decode"

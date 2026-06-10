@@ -13,7 +13,8 @@ use rand::Rng;
 use sha2::Sha256;
 
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
-use crate::cookies::{ec_id_has_only_allowed_chars, handle_request_cookies};
+use crate::cookies::handle_request_cookies;
+use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -81,10 +82,10 @@ pub fn generate_ec_id(
 
     log::trace!("Input for fresh EC ID: client_ip={}", client_ip);
 
-    let mut mac = HmacSha256::new_from_slice(settings.edge_cookie.secret_key.expose().as_bytes())
-        .change_context(TrustedServerError::Ec {
-        message: "Failed to create HMAC instance".to_string(),
-    })?;
+    let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
+        .change_context(TrustedServerError::EdgeCookie {
+            message: "Failed to create HMAC instance".to_string(),
+        })?;
     mac.update(client_ip.as_bytes());
     let hmac_hash = hex::encode(mac.finalize().into_bytes());
 
@@ -171,6 +172,7 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
 /// # Errors
 ///
 /// Returns an error if ID generation fails.
+#[cfg(test)]
 pub fn get_or_generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,

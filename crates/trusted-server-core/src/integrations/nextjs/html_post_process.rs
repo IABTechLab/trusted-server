@@ -120,6 +120,8 @@ impl NextJsHtmlPostProcessor {
                 .iter()
                 .map(|p| p.matches(ctx.origin_host).count())
                 .sum();
+            // lgtm[rust/cleartext-logging]
+            // This debug log reports rewrite counts and hostnames only; no secret material is emitted.
             log::debug!(
                 "NextJs post-processor substituting RSC payloads: scripts={}, origin_urls={}, origin={}, proxy={}://{}, html_len={}",
                 rewritten_payloads.len(),
@@ -453,6 +455,8 @@ fn post_process_rsc_html_in_place_with_limit(
                 .iter()
                 .map(|p| p.matches(origin_host).count())
                 .sum();
+            // lgtm[rust/cleartext-logging]
+            // This debug log reports rewrite counts and hostnames only; no secret material is emitted.
             log::debug!(
                 "post_process_rsc_html: {} scripts, {} origin URLs, origin={}, proxy={}://{}",
                 payloads.len(),

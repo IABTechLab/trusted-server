@@ -21,7 +21,7 @@ If you cannot read `CLAUDE.md`, follow these rules:
    - `cargo test-fastly` — Fastly adapter + core (wasm32-wasip1 via Viceroy)
    - `cargo test-axum` — Axum dev server adapter (native)
    Do NOT use bare `cargo test --workspace` — it will attempt to compile the Fastly adapter for the host target.
-4. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+4. Run `cargo fmt --all -- --check` and `cargo clippy-fastly && cargo clippy-axum`.
 5. Run JS tests with `cd crates/js/lib && npx vitest run` when touching JS/TS code.
 6. Use `error-stack` (`Report<E>`) for error handling — not anyhow, eyre, or thiserror.
 7. Use `log` macros (not `println!`) and `expect("should ...")` (not `unwrap()`).

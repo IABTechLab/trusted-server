@@ -10,15 +10,16 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -104,35 +105,17 @@ where
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Buffers streaming and pass-through variants in memory (acceptable for a
-/// Workers invocation which processes one request at a time).
+/// Delegates to the shared [`buffer_publisher_response`], which enforces
+/// `settings.publisher.max_buffered_body_bytes`, then removes any
+/// `Transfer-Encoding` header since the buffered body is no longer chunked.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, registry)?;
-            response.headers_mut().remove(header::TRANSFER_ENCODING);
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                edgezero_core::http::HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = edgezero_core::body::Body::from(output);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
+    let mut response = buffer_publisher_response(publisher_response, settings, registry)?;
+    response.headers_mut().remove(header::TRANSFER_ENCODING);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,9 +205,18 @@ impl Hooks for TrustedServerApp {
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
+                let mut ec_context = EcContext::default();
                 state
                     .registry
-                    .handle_proxy(&method, &path, &state.settings, &services, req)
+                    .handle_proxy(ProxyDispatchInput {
+                        method: &method,
+                        path: &path,
+                        settings: &state.settings,
+                        kv: None,
+                        ec_context: &mut ec_context,
+                        services: &services,
+                        req,
+                    })
                     .await
                     .unwrap_or_else(|| {
                         Err(Report::new(TrustedServerError::BadRequest {
@@ -285,7 +277,17 @@ impl Hooks for TrustedServerApp {
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_auction(&s.settings, &s.orchestrator, &services, req).await
+                    let ec_context = EcContext::default();
+                    handle_auction(
+                        &s.settings,
+                        &s.orchestrator,
+                        None,
+                        None,
+                        &ec_context,
+                        &services,
+                        req,
+                    )
+                    .await
                 }),
             )
             .get(

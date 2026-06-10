@@ -37,18 +37,6 @@ pub(crate) fn from_fastly_request(mut req: fastly::Request) -> HttpRequest {
     build_http_request(&req, body)
 }
 
-/// Convert a `fastly::Response` into an [`HttpResponse`].
-pub(crate) fn from_fastly_response(mut resp: fastly::Response) -> HttpResponse {
-    let status = resp.get_status();
-    let mut builder = edgezero_core::http::response_builder().status(status);
-    for (name, value) in resp.get_headers() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-    builder
-        .body(EdgeBody::from(resp.take_body_bytes()))
-        .expect("should build http response from fastly response")
-}
-
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     let (parts, body) = resp.into_parts();
@@ -64,6 +52,17 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
             }
         }
         EdgeBody::Stream(_) => {
+            // Streaming bodies cannot cross the compat boundary. Both audited call sites
+            // (legacy_main buffered arm and edgezero_main after EdgeZero collapses bodies
+            // to Once) only pass Once bodies — a Stream here is a caller error.
+            // The assert is suppressed in test builds where the behavior-documentation
+            // test deliberately exercises this path.
+            #[cfg(not(test))]
+            debug_assert!(
+                false,
+                "to_fastly_response: streaming body will be silently dropped; \
+                 use to_fastly_response_skeleton + stream_to_client for streaming responses"
+            );
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }

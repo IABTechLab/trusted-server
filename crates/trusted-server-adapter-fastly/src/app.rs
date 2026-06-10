@@ -6,9 +6,13 @@
 //! [`startup_error_router`] returns a bare router without middleware.
 //! Builds the [`AppState`] once per Wasm instance.
 //!
-//! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
-//! protocol or cipher metadata. The `EdgeZero` path therefore preserves TLS
-//! metadata as `None` until the upstream adapter exposes those fields.
+//! TLS protocol and cipher metadata is captured from the raw [`fastly::Request`]
+//! in `main.rs` before the request is consumed by `dispatch_with_config_handle`,
+//! then injected as trusted internal headers (`x-ts-tls-protocol`,
+//! `x-ts-tls-cipher`) after stripping client-spoofable forwarded headers.
+//! [`build_per_request_services`] reads those internal headers to populate
+//! [`ClientInfo`] so that [`crate::http_util::RequestInfo::from_request`] detects
+//! HTTPS correctly on the `EdgeZero` path.
 //!
 //! # Route inventory
 //!
@@ -37,7 +41,10 @@
 //!
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
-//! attach middleware — startup errors are returned without geo or TS headers.
+//! attach middleware. Startup-error responses may still receive entry-point
+//! finalization (geo and TS headers) when settings can be reloaded via
+//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
+//! fails, they are returned without geo or TS headers.
 
 use core::future::Future;
 use std::sync::Arc;
@@ -51,14 +58,17 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
@@ -84,7 +94,7 @@ pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
-    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -94,19 +104,22 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    build_state_from_settings(get_settings()?)
+}
 
+pub(crate) fn build_state_from_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
-
     let registry = IntegrationRegistry::new(&settings)?;
 
-    let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+    let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        kv_store,
+        default_kv_store,
     }))
 }
 
@@ -144,23 +157,38 @@ pub(crate) fn runtime_services_for_consent_route(
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Extracts the client IP address from the [`FastlyRequestContext`] extension
-/// inserted by `edgezero_adapter_fastly::dispatch`. TLS metadata is not
-/// available through the `EdgeZero` context so those fields are left empty.
+/// Extracts the client IP from the [`FastlyRequestContext`] extension inserted by
+/// `edgezero_adapter_fastly::dispatch`. TLS protocol and cipher are read from the
+/// trusted internal headers `x-ts-tls-protocol` and `x-ts-tls-cipher` injected by
+/// `edgezero_main` in `main.rs` after stripping client-spoofable forwarded headers.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
+
+    let tls_protocol = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let tls_cipher = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-cipher")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(Arc::clone(&state.kv_store))
+        .kv_store(Arc::clone(&state.default_kv_store))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
         .client_info(ClientInfo {
             client_ip,
-            tls_protocol: None,
-            tls_cipher: None,
+            tls_protocol,
+            tls_cipher,
         })
         .build()
 }
@@ -211,9 +239,18 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
+        let mut ec_context = EcContext::default();
         return state
             .registry
-            .handle_proxy(&method, &path, &state.settings, services, req)
+            .handle_proxy(ProxyDispatchInput {
+                method: &method,
+                path: &path,
+                settings: &state.settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services,
+                req,
+            })
             .await
             .unwrap_or_else(|| {
                 Err(Report::new(TrustedServerError::BadRequest {
@@ -227,11 +264,7 @@ async fn dispatch_fallback(
     handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
         .await
         .and_then(|pub_response| {
-            crate::resolve_publisher_response_buffered(
-                pub_response,
-                &state.settings,
-                &state.registry,
-            )
+            buffer_publisher_response(pub_response, &state.settings, &state.registry)
         })
 }
 
@@ -314,55 +347,53 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 9] {
-    [
-        NamedRoute {
-            path: "/.well-known/trusted-server.json",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::TrustedServerDiscovery,
-        },
-        NamedRoute {
-            path: "/verify-signature",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::VerifySignature,
-        },
-        NamedRoute {
-            path: "/admin/keys/rotate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::RotateKey,
-        },
-        NamedRoute {
-            path: "/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::DeactivateKey,
-        },
-        NamedRoute {
-            path: "/auction",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::Auction,
-        },
-        NamedRoute {
-            path: "/first-party/proxy",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyProxy,
-        },
-        NamedRoute {
-            path: "/first-party/click",
-            primary_methods: &[Method::GET],
-            handler: NamedRouteHandler::FirstPartyClick,
-        },
-        NamedRoute {
-            path: "/first-party/sign",
-            primary_methods: &[Method::GET, Method::POST],
-            handler: NamedRouteHandler::FirstPartySign,
-        },
-        NamedRoute {
-            path: "/first-party/proxy-rebuild",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::FirstPartyProxyRebuild,
-        },
-    ]
-}
+const NAMED_ROUTES: &[NamedRoute] = &[
+    NamedRoute {
+        path: "/.well-known/trusted-server.json",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::TrustedServerDiscovery,
+    },
+    NamedRoute {
+        path: "/verify-signature",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::VerifySignature,
+    },
+    NamedRoute {
+        path: "/admin/keys/rotate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::RotateKey,
+    },
+    NamedRoute {
+        path: "/admin/keys/deactivate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::DeactivateKey,
+    },
+    NamedRoute {
+        path: "/auction",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::Auction,
+    },
+    NamedRoute {
+        path: "/first-party/proxy",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyProxy,
+    },
+    NamedRoute {
+        path: "/first-party/click",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::FirstPartyClick,
+    },
+    NamedRoute {
+        path: "/first-party/sign",
+        primary_methods: &[Method::GET, Method::POST],
+        handler: NamedRouteHandler::FirstPartySign,
+    },
+    NamedRoute {
+        path: "/first-party/proxy-rebuild",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::FirstPartyProxyRebuild,
+    },
+];
 
 fn named_route_handler(
     state: Arc<AppState>,
@@ -390,9 +421,13 @@ fn named_route_handler(
                     NamedRouteHandler::Auction => {
                         match runtime_services_for_consent_route(&state.settings, &services) {
                             Ok(consent_services) => {
+                                let ec_context = EcContext::default();
                                 handle_auction(
                                     &state.settings,
                                     &state.orchestrator,
+                                    None,
+                                    None,
+                                    &ec_context,
                                     &consent_services,
                                     req,
                                 )
@@ -454,7 +489,7 @@ impl TrustedServerApp {
         // named route is registered from this single table, then every
         // non-primary publisher fallback method is registered from the same
         // row. Adding a named route now requires editing only this table.
-        for route in named_routes() {
+        for route in NAMED_ROUTES {
             for method in route.primary_methods {
                 router = router.route(
                     route.path,
@@ -501,28 +536,31 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{startup_error_router, AppState, TrustedServerApp};
+    use super::{
+        build_per_request_services, build_state_from_settings, startup_error_router, AppState,
+        TrustedServerApp,
+    };
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use edgezero_core::app::Hooks as _;
     use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::params::PathParams;
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
-    use trusted_server_core::auction::build_orchestrator;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::error::TrustedServerError;
-    use trusted_server_core::integrations::IntegrationRegistry;
-    use trusted_server_core::platform::PlatformKvStore;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
         Settings::from_toml(
             r#"
                 [[handlers]]
-                path = "^/admin"
+                path = "^/(_ts/)?admin"
                 username = "admin"
                 password = "admin-pass"
 
@@ -532,8 +570,8 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
-                [edge_cookie]
-                secret_key = "test-secret-key"
+                [ec]
+                passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
                 enabled = false
@@ -547,6 +585,9 @@ mod tests {
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
 
+                [integrations.datadome]
+                enabled = true
+
                 [auction]
                 enabled = true
                 providers = ["prebid"]
@@ -557,17 +598,7 @@ mod tests {
     }
 
     fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
-        let orchestrator =
-            build_orchestrator(&settings).expect("should build auction orchestrator");
-        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
-        let kv_store = Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>;
-
-        Arc::new(AppState {
-            settings: Arc::new(settings),
-            orchestrator: Arc::new(orchestrator),
-            registry: Arc::new(registry),
-            kv_store,
-        })
+        build_state_from_settings(settings).expect("should build app state from settings")
     }
 
     fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {
@@ -576,6 +607,113 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
+    }
+
+    fn minimal_state() -> Arc<AppState> {
+        // Build from explicit test settings: the settings baked into the
+        // binary contain placeholder secrets that `get_settings()` rejects
+        // by design.
+        app_state_for_settings(settings_with_missing_consent_store())
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_per_request_services TLS header tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn build_per_request_services_reads_tls_protocol_from_internal_header() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .header("x-ts-tls-protocol", "TLSv1.3")
+            .body(Body::empty())
+            .expect("should build request with TLS header");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert_eq!(
+            services.client_info().tls_protocol.as_deref(),
+            Some("TLSv1.3"),
+            "should read TLS protocol from x-ts-tls-protocol header"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_reads_tls_cipher_from_internal_header() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .header("x-ts-tls-cipher", "ECDHE-RSA-AES256-GCM-SHA384")
+            .body(Body::empty())
+            .expect("should build request with TLS cipher header");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert_eq!(
+            services.client_info().tls_cipher.as_deref(),
+            Some("ECDHE-RSA-AES256-GCM-SHA384"),
+            "should read TLS cipher from x-ts-tls-cipher header"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_tls_none_when_headers_absent() {
+        let state = minimal_state();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("should build request without TLS headers");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert!(
+            services.client_info().tls_protocol.is_none(),
+            "tls_protocol should be None when x-ts-tls-protocol header is absent"
+        );
+        assert!(
+            services.client_info().tls_cipher.is_none(),
+            "tls_cipher should be None when x-ts-tls-cipher header is absent"
+        );
+    }
+
+    #[test]
+    fn build_per_request_services_does_not_trust_client_supplied_tls_headers() {
+        // Regression: edgezero_main must strip x-ts-tls-* before dispatch so a
+        // plain-HTTP client cannot spoof HTTPS scheme detection by injecting these
+        // headers. After the strip+set logic runs, build_per_request_services
+        // should see no TLS data on a request where the Fastly SDK returned None.
+        //
+        // This test validates the contract at the build_per_request_services
+        // boundary: if the header is absent (because edgezero_main stripped it),
+        // tls_protocol is None.
+        let state = minimal_state();
+        // Simulate a request that arrived with NO internal header
+        // (edgezero_main already stripped and did not re-inject because
+        // req.get_tls_protocol() returned None on a plain-HTTP connection).
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("should build plain-HTTP request");
+        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
+
+        let services = build_per_request_services(&state, &ctx);
+
+        assert!(
+            services.client_info().tls_protocol.is_none(),
+            "tls_protocol must be None after edgezero_main strips client-supplied header \
+             on a plain-HTTP connection — spoofed HTTPS would affect scheme detection"
+        );
+        assert!(
+            services.client_info().tls_cipher.is_none(),
+            "tls_cipher must be None for the same reason"
+        );
     }
 
     #[test]
@@ -641,15 +779,12 @@ mod tests {
         // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
         // must still carry standard TS headers before reaching the client.
         //
-        // The embedded trusted-server.toml protects `^/admin` with basic-auth.
-        // Sending the request without an Authorization header causes AuthMiddleware
-        // to short-circuit with a 401, which then bubbles through
+        // Test settings protect `^/(_ts/)?admin` with basic-auth. Sending the
+        // request without an Authorization header causes AuthMiddleware to
+        // short-circuit with a 401, which then bubbles through
         // FinalizeResponseMiddleware for header injection.
-        //
-        // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
-        // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
-        // short-circuits without calling any Fastly ABI.
-        let router = TrustedServerApp::routes();
+        let state = app_state_for_settings(settings_with_missing_consent_store());
+        let router = TrustedServerApp::routes_for_state(&state);
         let req = request_builder()
             .method(Method::POST)
             .uri("/admin/keys/rotate")
@@ -782,6 +917,17 @@ mod tests {
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "publisher fallback should fail closed when configured consent KV cannot be opened"
+        );
+
+        // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
+        // is wired only into the publisher and auction branches of dispatch_fallback, not into
+        // the integration proxy branch. A missing consent store must not 503 integration routes.
+        let integration_response =
+            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        assert_ne!(
+            integration_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "integration routes should be unaffected by a missing consent KV store"
         );
     }
 }

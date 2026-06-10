@@ -1,4 +1,4 @@
-use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
+use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
@@ -198,13 +198,23 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     ))
 }
 
-fn finalize_proxied_response(
-    settings: &Settings,
+/// Extracted content-type and content-encoding from an origin response.
+struct OriginResponseMeta {
+    ct_raw: String,
+    content_encoding: String,
+}
+
+/// Extract content-type and content-encoding and log origin response metadata.
+///
+/// When `log_encoding` is `true`, the `ce=` field is included in the log line
+/// (used by the buffered finalizer which performs content-encoding processing).
+/// The streaming finalizer omits it since it never decodes the body.
+fn origin_response_metadata(
     req: &Request<EdgeBody>,
+    beresp: &Response<EdgeBody>,
     target_url: &str,
-    mut beresp: Response<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Determine content-type and content-encoding from response headers
+    log_encoding: bool,
+) -> OriginResponseMeta {
     let status_code = beresp.status().as_u16();
     let ct_raw = beresp
         .headers()
@@ -230,23 +240,111 @@ fn finalize_proxied_response(
         .unwrap_or("-");
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    let ce_for_log: &str = if content_encoding.is_empty() {
-        "-"
-    } else {
-        &content_encoding
-    };
-    log::info!(
-        "origin response status={} ct={} ce={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        ce_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
 
-    let ct = ct_raw.to_ascii_lowercase();
-    let compression = Compression::from_content_encoding(&content_encoding);
+    if log_encoding {
+        let ce_for_log: &str = if content_encoding.is_empty() {
+            "-"
+        } else {
+            &content_encoding
+        };
+        log::info!(
+            "origin response status={} ct={} ce={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            ce_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    } else {
+        log::info!(
+            "origin response status={} ct={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    }
+
+    OriginResponseMeta {
+        ct_raw,
+        content_encoding,
+    }
+}
+
+/// Apply image content-type header and log pixel heuristics.
+///
+/// Sets a generic `image/*` content-type when the response has none, then logs
+/// a warning if size or path heuristics suggest a tracking pixel.
+/// Returns `true` when the response is identified as image content so callers
+/// can apply early-return passthrough logic.
+fn apply_image_passthrough_metadata(
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    ct: &str,
+    beresp: &mut Response<EdgeBody>,
+    log_prefix: &str,
+) -> bool {
+    let req_accept_images = req
+        .headers()
+        .get(HEADER_ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("image/"))
+        .unwrap_or(false);
+
+    if !ct.starts_with("image/") && !req_accept_images {
+        return false;
+    }
+
+    if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
+    }
+
+    let mut is_pixel = false;
+    if let Some(cl) = beresp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl <= 256 {
+            is_pixel = true;
+        }
+    }
+    if !is_pixel {
+        let lower = target_url.to_ascii_lowercase();
+        if lower.contains("/pixel")
+            || lower.ends_with("/p.gif")
+            || lower.contains("1x1")
+            || lower.contains("/track")
+        {
+            is_pixel = true;
+        }
+    }
+    if is_pixel {
+        log::info!(
+            "{}likely pixel image fetched: {} ct={}",
+            log_prefix,
+            target_url,
+            ct
+        );
+    }
+
+    true
+}
+
+fn finalize_proxied_response(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    mut beresp: Response<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let meta = origin_response_metadata(req, &beresp, target_url, true);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    let compression = Compression::from_content_encoding(&meta.content_encoding);
 
     if ct.contains("text/html") {
         let processor = CreativeHtmlProcessor::new(settings);
@@ -270,55 +368,10 @@ fn finalize_proxied_response(
         );
     }
 
-    // Image handling: set generic content-type if missing and log pixel heuristics
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
-        }
-
-        // Heuristics to log likely tracking pixels without altering response
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                // typical 1x1 PNG/GIF are very small
-                is_pixel = true;
-            }
-        }
-
-        // Path heuristics: common pixel patterns
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
-        }
-
+    if apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "") {
         return Ok(beresp);
     }
 
-    // Passthrough for non-text, non-image responses
     Ok(beresp)
 }
 
@@ -327,82 +380,9 @@ fn finalize_proxied_response_streaming(
     target_url: &str,
     mut beresp: Response<EdgeBody>,
 ) -> Response<EdgeBody> {
-    let status_code = beresp.status().as_u16();
-    let ct_raw = beresp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let cl_raw = beresp
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-    let accept_raw = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-
-    let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    log::info!(
-        "origin response status={} ct={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
-
-    let ct = ct_raw.to_ascii_lowercase();
-
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
-        }
-
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                is_pixel = true;
-            }
-        }
-
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!(
-                "stream: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
-        }
-    }
-
+    let meta = origin_response_metadata(req, &beresp, target_url, false);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "stream: ");
     beresp
 }
 
@@ -917,15 +897,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > SIGN_MAX_BODY_BYTES {
-            return Err(Report::new(TrustedServerError::RequestTooLarge {
-                message: format!(
-                    "payload size {} exceeds limit of {} bytes",
-                    body_bytes.len(),
-                    SIGN_MAX_BODY_BYTES,
-                ),
-            }));
-        }
+        enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party sign request body should be valid UTF-8".to_string(),
@@ -1040,15 +1012,7 @@ pub async fn handle_first_party_proxy_rebuild(
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
         let body_bytes = req.into_body().into_bytes();
-        if body_bytes.len() > REBUILD_MAX_BODY_BYTES {
-            return Err(Report::new(TrustedServerError::RequestTooLarge {
-                message: format!(
-                    "payload size {} exceeds limit of {} bytes",
-                    body_bytes.len(),
-                    REBUILD_MAX_BODY_BYTES,
-                ),
-            }));
-        }
+        enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
                 message: "first-party rebuild request body should be valid UTF-8".to_string(),
@@ -1497,9 +1461,9 @@ mod tests {
 
     /// Test double that always returns a streaming (non-buffered) response body.
     ///
-    /// Used to exercise the `Body::Stream` error path in
-    /// `platform_response_to_fastly`, which cannot materialise a streaming body
-    /// into a `fastly::Response`. Only `send` is implemented; `send_async` and
+    /// Used to exercise the `Body::Stream` pass-through path in
+    /// `proxy_request`, which returns the response body without materialising it.
+    /// Only `send` is implemented; `send_async` and
     /// `select` return `PlatformError::Unsupported`.
     struct StreamingResponseHttpClient;
 
@@ -1534,85 +1498,95 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn proxy_missing_param_returns_400() {
-        let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://example.com/first-party/proxy");
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn proxy_missing_or_invalid_token_returns_400() {
-        let settings = create_test_settings();
-        // missing tstoken should 400
-        let req = build_http_request(
-            Method::GET,
-            "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
-        );
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn proxy_sign_returns_signed_url() {
-        let settings = create_test_settings();
-        let body = serde_json::json!({
-            "url": "https://cdn.example/asset.js?c=3&b=2",
+    #[test]
+    fn proxy_missing_param_returns_400() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://example.com/first-party/proxy");
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
-        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
-        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
-            .await
-            .expect("sign ok");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = response_body_string(resp);
-        assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
-        assert!(json.contains("tsexp"), "{}", json);
-        assert!(
-            json.contains("\"base\":\"https://cdn.example/asset.js\""),
-            "{}",
-            json
-        );
     }
 
-    #[tokio::test]
-    async fn proxy_sign_rejects_invalid_url() {
-        let settings = create_test_settings();
-        let body = serde_json::json!({
-            "url": "data:image/png;base64,AAAA",
+    #[test]
+    fn proxy_missing_or_invalid_token_returns_400() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            // missing tstoken should 400
+            let req = build_http_request(
+                Method::GET,
+                "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
+            );
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
-        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy_sign(&settings, &noop_services(), req)
+    }
+
+    #[test]
+    fn proxy_sign_returns_signed_url() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let body = serde_json::json!({
+                "url": "https://cdn.example/asset.js?c=3&b=2",
+            });
+            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+                .expect("sign ok");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
+            assert!(json.contains("tsexp"), "{}", json);
+            assert!(
+                json.contains("\"base\":\"https://cdn.example/asset.js\""),
+                "{}",
+                json
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_sign_preserves_non_standard_port() {
-        let settings = create_test_settings();
-        let body = serde_json::json!({
-            "url": "https://cdn.example.com:9443/img/300x250.svg",
+    #[test]
+    fn proxy_sign_rejects_invalid_url() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let body = serde_json::json!({
+                "url": "data:image/png;base64,AAAA",
+            });
+            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
-        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
-        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
-            .await
-            .expect("should sign URL with non-standard port");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = response_body_string(resp);
-        // Port 9443 should be preserved (URL-encoded as %3A9443)
-        assert!(
-            json.contains("%3A9443"),
-            "Port should be preserved in signed URL: {}",
-            json
-        );
+    }
+
+    #[test]
+    fn proxy_sign_preserves_non_standard_port() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let body = serde_json::json!({
+                "url": "https://cdn.example.com:9443/img/300x250.svg",
+            });
+            let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+            let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect("should sign URL with non-standard port");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            // Port 9443 should be preserved (URL-encoded as %3A9443)
+            assert!(
+                json.contains("%3A9443"),
+                "Port should be preserved in signed URL: {}",
+                json
+            );
+        });
     }
 
     #[test]
@@ -1651,8 +1625,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn reconstruct_rejects_expired_tsexp() {
+    #[test]
+    fn reconstruct_rejects_expired_tsexp() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
         let settings = create_test_settings();
@@ -1678,8 +1652,8 @@ mod tests {
         assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
     }
 
-    #[tokio::test]
-    async fn reconstruct_rejects_tampered_tstoken() {
+    #[test]
+    fn reconstruct_rejects_tampered_tstoken() {
         let settings = create_test_settings();
         let tsurl = "https://cdn.example/asset.js";
         let tsurl_encoded =
@@ -1701,117 +1675,125 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn click_missing_params_returns_400() {
-        let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://edge.example/first-party/click");
-        let err: Report<TrustedServerError> =
-            handle_first_party_click(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn click_valid_token_redirects() {
-        let settings = create_test_settings();
-        let tsurl = "https://cdn.example/a.png";
-        let params = "foo=1&bar=2";
-        let full = format!("{}?{}", tsurl, params);
-        let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let req = build_http_request(
-            Method::GET,
-            format!(
-                "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
-                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
-                params,
-                sig
-            ),
-        );
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
-            .await
-            .expect("should redirect");
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let loc = resp
-            .headers()
-            .get(http::header::LOCATION)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(loc, full);
-    }
-
-    #[tokio::test]
-    async fn click_appends_ec_id_when_present() {
-        let settings = create_test_settings();
-        let tsurl = "https://cdn.example/a.png";
-        let params = "foo=1";
-        let full = format!("{}?{}", tsurl, params);
-        let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let mut req = build_http_request(
-            Method::GET,
-            format!(
-                "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
-                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
-                params,
-                sig
-            ),
-        );
-        req.headers_mut().insert(
-            crate::constants::HEADER_X_TS_EC,
-            HeaderValue::from_static("ec-123"),
-        );
-
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
-            .await
-            .expect("should redirect");
-
-        let loc = resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|h| h.to_str().ok())
-            .expect("Location header should be present and valid");
-        let parsed = url::Url::parse(loc).expect("Location should be a valid URL");
-        let mut pairs: std::collections::HashMap<String, String> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
-        assert!(pairs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn proxy_rebuild_adds_and_removes_params() {
-        let settings = create_test_settings();
-        // Original canonical (no token)
-        let tsclick = "/first-party/click?tsurl=https%3A%2F%2Fcdn.example%2Flanding.html&x=1";
-        let body = serde_json::json!({
-            "tsclick": tsclick,
-            "add": {"y": "2"},
-            "del": ["x"],
+    #[test]
+    fn click_missing_params_returns_400() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://edge.example/first-party/click");
+            let err: Report<TrustedServerError> =
+                handle_first_party_click(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
         });
-        let req = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("https://edge.example/first-party/proxy-rebuild")
-            .body(EdgeBody::from(
-                serde_json::to_string(&body).expect("test JSON should serialize"),
-            ))
-            .expect("should build proxy rebuild request");
-        let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
-            .await
-            .expect("rebuild ok");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = response_body_string(resp);
-        assert!(json.contains("/first-party/click?tsurl="));
-        assert!(json.contains("tstoken"));
-        // Diagnostics
-        assert!(
-            json.contains("\"base\":\"https://cdn.example/landing.html\""),
-            "{}",
-            json
-        );
-        assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
-        assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+    }
+
+    #[test]
+    fn click_valid_token_redirects() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/a.png";
+            let params = "foo=1&bar=2";
+            let full = format!("{}?{}", tsurl, params);
+            let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
+            let req = build_http_request(
+                Method::GET,
+                format!(
+                    "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
+                    url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                    params,
+                    sig
+                ),
+            );
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("should redirect");
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            let loc = resp
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(loc, full);
+        });
+    }
+
+    #[test]
+    fn click_appends_ec_id_when_present() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let tsurl = "https://cdn.example/a.png";
+            let params = "foo=1";
+            let full = format!("{}?{}", tsurl, params);
+            let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
+            let mut req = build_http_request(
+                Method::GET,
+                format!(
+                    "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
+                    url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                    params,
+                    sig
+                ),
+            );
+            req.headers_mut().insert(
+                crate::constants::HEADER_X_TS_EC,
+                HeaderValue::from_static("ec-123"),
+            );
+
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("should redirect");
+
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|h| h.to_str().ok())
+                .expect("Location header should be present and valid");
+            let parsed = url::Url::parse(loc).expect("Location should be a valid URL");
+            let mut pairs: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
+            assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
+            assert!(pairs.is_empty());
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_adds_and_removes_params() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            // Original canonical (no token)
+            let tsclick = "/first-party/click?tsurl=https%3A%2F%2Fcdn.example%2Flanding.html&x=1";
+            let body = serde_json::json!({
+                "tsclick": tsclick,
+                "add": {"y": "2"},
+                "del": ["x"],
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("rebuild ok");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(json.contains("/first-party/click?tsurl="));
+            assert!(json.contains("tstoken"));
+            // Diagnostics
+            assert!(
+                json.contains("\"base\":\"https://cdn.example/landing.html\""),
+                "{}",
+                json
+            );
+            assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
+            assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
     }
 
     // --- Additional tests covering helper + edge cases ---
@@ -1836,8 +1818,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reconstruct_valid_with_params_preserves_order() {
+    #[test]
+    fn reconstruct_valid_with_params_preserves_order() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js?c=3&b=2&a=1";
         // Simulate creative-generated first-party URL
@@ -1853,8 +1835,8 @@ mod tests {
         assert_eq!(st.target_url, canonical_clear_url(clear));
     }
 
-    #[tokio::test]
-    async fn reconstruct_valid_without_params() {
+    #[test]
+    fn reconstruct_valid_without_params() {
         let settings = create_test_settings();
         let clear = "https://cdn.example/asset.js";
         let first_party = creative::build_proxy_url(&settings, clear);
@@ -1868,54 +1850,62 @@ mod tests {
         assert_eq!(st.target_url, clear);
     }
 
-    #[tokio::test]
-    async fn proxy_rejects_unsupported_scheme() {
-        let settings = create_test_settings();
-        let clear = "ftp://cdn.example/file.gif";
-        // Build a first-party proxy URL with a token for the unsupported scheme
-        let first_party = creative::build_proxy_url(&settings, clear);
-        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    #[test]
+    fn proxy_rejects_unsupported_scheme() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let clear = "ftp://cdn.example/file.gif";
+            // Build a first-party proxy URL with a token for the unsupported scheme
+            let first_party = creative::build_proxy_url(&settings, clear);
+            let req =
+                build_http_request(Method::GET, format!("https://edge.example{}", first_party));
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_invalid_target_url_errors() {
-        let settings = create_test_settings();
-        // Intentionally malformed target (host missing) but signed consistently
-        let tsurl = "https://"; // invalid URL
-                                // Manually construct first-party URL matching creative's format
-        let full_for_token = tsurl.to_string();
-        let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
-        let url = format!(
-            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
-            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
-            sig
-        );
-        let req = build_http_request(Method::GET, &url);
-        let err: Report<TrustedServerError> =
-            handle_first_party_proxy(&settings, &noop_services(), req)
-                .await
-                .expect_err("expected error");
-        assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+    #[test]
+    fn proxy_invalid_target_url_errors() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            // Intentionally malformed target (host missing) but signed consistently
+            let tsurl = "https://"; // invalid URL
+                                    // Manually construct first-party URL matching creative's format
+            let full_for_token = tsurl.to_string();
+            let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+            let url = format!(
+                "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                sig
+            );
+            let req = build_http_request(Method::GET, &url);
+            let err: Report<TrustedServerError> =
+                handle_first_party_proxy(&settings, &noop_services(), req)
+                    .await
+                    .expect_err("expected error");
+            assert_eq!(err.current_context().status_code(), StatusCode::BAD_GATEWAY);
+        });
     }
 
-    #[tokio::test]
-    async fn click_sets_cache_control_no_store_private() {
-        let settings = create_test_settings();
-        let clear = "https://cdn.example/landing.html?x=1";
-        let first_party = creative::build_click_url(&settings, clear);
-        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
-        let resp = handle_first_party_click(&settings, &noop_services(), req)
-            .await
-            .expect("should redirect");
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let cc = response_header(&resp, header::CACHE_CONTROL).unwrap_or("");
-        assert!(cc.contains("no-store"));
-        assert!(cc.contains("private"));
+    #[test]
+    fn click_sets_cache_control_no_store_private() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let clear = "https://cdn.example/landing.html?x=1";
+            let first_party = creative::build_click_url(&settings, clear);
+            let req =
+                build_http_request(Method::GET, format!("https://edge.example{}", first_party));
+            let resp = handle_first_party_click(&settings, &noop_services(), req)
+                .await
+                .expect("should redirect");
+            assert_eq!(resp.status(), StatusCode::FOUND);
+            let cc = response_header(&resp, header::CACHE_CONTROL).unwrap_or("");
+            assert!(cc.contains("no-store"));
+            assert!(cc.contains("private"));
+        });
     }
 
     // --- Finalization path tests (no network) ---
@@ -2209,234 +2199,243 @@ mod tests {
 
     // --- Platform HTTP client integration ---
 
-    #[tokio::test]
-    async fn proxy_request_calls_platform_http_client_send() {
-        use crate::platform::test_support::StubHttpClient;
+    #[test]
+    fn proxy_request_calls_platform_http_client_send() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
 
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let req = build_http_request(Method::GET, "https://example.com/");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://example.com/");
 
-        let result = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await;
+            let result = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://example.com/resource",
+                    follow_redirects: false,
+                    forward_ec_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await;
 
-        assert!(result.is_ok(), "should proxy successfully");
-        let calls = stub.recorded_backend_names();
-        assert_eq!(calls.len(), 1, "should call send exactly once");
-        assert_eq!(
-            calls[0], "stub-backend",
-            "should use backend name from StubBackend"
-        );
+            assert!(result.is_ok(), "should proxy successfully");
+            let calls = stub.recorded_backend_names();
+            assert_eq!(calls.len(), 1, "should call send exactly once");
+            assert_eq!(
+                calls[0], "stub-backend",
+                "should use backend name from StubBackend"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_request_allows_open_mode_when_settings_allowlist_is_non_empty() {
-        let mut settings = create_test_settings();
-        settings.proxy.allowed_domains = vec!["allowed.example".to_string()];
+    #[test]
+    fn proxy_request_allows_open_mode_when_settings_allowlist_is_non_empty() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.proxy.allowed_domains = vec!["allowed.example".to_string()];
 
-        let stub = Arc::new(HeaderAwareStubHttpClient::new());
-        stub.push_response(200, Vec::new(), b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = build_http_request(Method::GET, "https://edge.example/");
+            let stub = Arc::new(HeaderAwareStubHttpClient::new());
+            stub.push_response(200, Vec::new(), b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = build_http_request(Method::GET, "https://edge.example/");
 
-        let response = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://blocked.example/resource.js",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await
-        .expect("open mode should ignore settings.proxy.allowed_domains");
+            let response = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://blocked.example/resource.js",
+                    follow_redirects: false,
+                    forward_ec_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await
+            .expect("open mode should ignore settings.proxy.allowed_domains");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "ok");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "ok");
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_request_uses_config_allowlist_for_redirect_hops() {
-        let mut settings = create_test_settings();
-        settings.proxy.allowed_domains = vec!["origin.example".to_string()];
+    #[test]
+    fn proxy_request_uses_config_allowlist_for_redirect_hops() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.proxy.allowed_domains = vec!["origin.example".to_string()];
 
-        let stub = Arc::new(HeaderAwareStubHttpClient::new());
-        stub.push_response(
-            302,
-            vec![(
-                header::LOCATION,
-                HeaderValue::from_static("https://redirected.example/final.js"),
-            )],
-            Vec::new(),
-        );
-        stub.push_response(200, Vec::new(), b"redirected".to_vec());
+            let stub = Arc::new(HeaderAwareStubHttpClient::new());
+            stub.push_response(
+                302,
+                vec![(
+                    header::LOCATION,
+                    HeaderValue::from_static("https://redirected.example/final.js"),
+                )],
+                Vec::new(),
+            );
+            stub.push_response(200, Vec::new(), b"redirected".to_vec());
 
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = build_http_request(Method::GET, "https://edge.example/");
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = build_http_request(Method::GET, "https://edge.example/");
 
-        let response = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://origin.example/start.js",
-                follow_redirects: true,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await
-        .expect("open mode should allow redirect hops outside settings allowlist");
+            let response = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://origin.example/start.js",
+                    follow_redirects: true,
+                    forward_ec_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await
+            .expect("open mode should allow redirect hops outside settings allowlist");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "redirected");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "redirected");
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
-        use crate::platform::test_support::StubHttpClient;
+    #[test]
+    fn proxy_request_forwards_curated_headers_when_copy_request_headers_is_true() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
 
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"ok".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let mut req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://example.com/")
-            .body(EdgeBody::empty())
-            .expect("should build test request");
-        req.headers_mut().insert(
-            header::USER_AGENT,
-            HeaderValue::from_static("test-agent/1.0"),
-        );
-        req.headers_mut()
-            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
-        req.headers_mut()
-            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://example.com/")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static("test-agent/1.0"),
+            );
+            req.headers_mut()
+                .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+            req.headers_mut()
+                .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
 
-        let result = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: true,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await;
+            let result = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://example.com/resource",
+                    follow_redirects: false,
+                    forward_ec_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: true,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await;
 
-        assert!(result.is_ok(), "should proxy successfully");
-        let all_headers = stub.recorded_request_headers();
-        assert_eq!(all_headers.len(), 1, "should have captured one request");
-        let sent = &all_headers[0];
+            assert!(result.is_ok(), "should proxy successfully");
+            let all_headers = stub.recorded_request_headers();
+            assert_eq!(all_headers.len(), 1, "should have captured one request");
+            let sent = &all_headers[0];
 
-        let header_value = |name: &str| -> Option<String> {
-            sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
-        };
+            let header_value = |name: &str| -> Option<String> {
+                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+            };
 
-        assert_eq!(
-            header_value("user-agent").as_deref(),
-            Some("test-agent/1.0"),
-            "should forward User-Agent"
-        );
-        assert_eq!(
-            header_value("accept").as_deref(),
-            Some("text/html"),
-            "should forward Accept"
-        );
-        assert_eq!(
-            header_value("accept-language").as_deref(),
-            Some("en-US"),
-            "should forward Accept-Language"
-        );
-        assert_eq!(
-            header_value("accept-encoding").as_deref(),
-            Some(SUPPORTED_ENCODINGS),
-            "should override Accept-Encoding with supported encodings"
-        );
+            assert_eq!(
+                header_value("user-agent").as_deref(),
+                Some("test-agent/1.0"),
+                "should forward User-Agent"
+            );
+            assert_eq!(
+                header_value("accept").as_deref(),
+                Some("text/html"),
+                "should forward Accept"
+            );
+            assert_eq!(
+                header_value("accept-language").as_deref(),
+                Some("en-US"),
+                "should forward Accept-Language"
+            );
+            assert_eq!(
+                header_value("accept-encoding").as_deref(),
+                Some(SUPPORTED_ENCODINGS),
+                "should override Accept-Encoding with supported encodings"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn proxy_request_passes_through_streaming_platform_response_body() {
-        // HTTP types can carry streaming bodies; proxy_request returns Ok even when
-        // the origin sends a streaming body (unlike the old Fastly path which required
-        // materialising the body before wrapping it in fastly::Response).
-        let services = build_services_with_http_client(
-            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://example.com/")
-            .body(EdgeBody::empty())
-            .expect("should build test request");
+    #[test]
+    fn proxy_request_passes_through_streaming_platform_response_body() {
+        futures::executor::block_on(async {
+            // HTTP types can carry streaming bodies; proxy_request returns Ok even when
+            // the origin sends a streaming body.
+            let services = build_services_with_http_client(
+                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://example.com/")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
 
-        let result = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await;
+            let result = proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig {
+                    target_url: "https://example.com/resource",
+                    follow_redirects: false,
+                    forward_ec_id: false,
+                    body: None,
+                    headers: Vec::new(),
+                    copy_request_headers: false,
+                    stream_passthrough: false,
+                    allowed_domains: &[],
+                },
+                &services,
+            )
+            .await;
 
-        assert!(
-            result.is_ok(),
-            "should pass streaming body through with HTTP types: {result:?}"
-        );
-        assert_eq!(
-            result.expect("should succeed").status(),
-            StatusCode::OK,
-            "should preserve the origin status code"
-        );
+            assert!(
+                result.is_ok(),
+                "should pass streaming body through with HTTP types: {result:?}"
+            );
+            assert_eq!(
+                result.expect("should succeed").status(),
+                StatusCode::OK,
+                "should preserve the origin status code"
+            );
+        });
     }
 
     #[test]
@@ -2700,76 +2699,82 @@ mod tests {
     // below verify that proxy_request threads config.allowed_domains through
     // the initial target check and redirect hops.
 
-    #[tokio::test]
-    async fn proxy_initial_target_blocked_by_allowlist() {
-        use crate::http_util::compute_encrypted_sha256_token;
+    #[test]
+    fn proxy_initial_target_blocked_by_allowlist() {
+        futures::executor::block_on(async {
+            use crate::http_util::compute_encrypted_sha256_token;
 
-        let mut settings = create_test_settings();
-        settings.proxy.allowed_domains = vec!["allowed.com".to_string()];
+            let mut settings = create_test_settings();
+            settings.proxy.allowed_domains = vec!["allowed.com".to_string()];
 
-        let target = "https://blocked.com/pixel.gif";
-        let token = compute_encrypted_sha256_token(&settings, target);
-        let url = format!(
-            "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
-            urlencoding::encode(target),
-            token,
-        );
-        let req = build_http_request(Method::GET, url);
-        let services = crate::platform::test_support::noop_services();
-        let err = handle_first_party_proxy(&settings, &services, req)
-            .await
-            .expect_err("should block initial target not in allowlist");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::FORBIDDEN,
-            "should return 403 for allowlist violation"
-        );
-        assert!(
-            matches!(
-                err.current_context(),
-                TrustedServerError::AllowlistViolation { .. }
-            ),
-            "should be AllowlistViolation error"
-        );
+            let target = "https://blocked.com/pixel.gif";
+            let token = compute_encrypted_sha256_token(&settings, target);
+            let url = format!(
+                "https://edge.example/first-party/proxy?tsurl={}&tstoken={}",
+                urlencoding::encode(target),
+                token,
+            );
+            let req = build_http_request(Method::GET, url);
+            let services = crate::platform::test_support::noop_services();
+            let err = handle_first_party_proxy(&settings, &services, req)
+                .await
+                .expect_err("should block initial target not in allowlist");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::FORBIDDEN,
+                "should return 403 for allowlist violation"
+            );
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::AllowlistViolation { .. }
+                ),
+                "should be AllowlistViolation error"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn sign_rejects_oversized_body() {
-        let settings = create_test_settings();
-        let oversized = vec![b'x'; 65537];
-        let req = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("https://edge.example/first-party/sign")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(oversized))
-            .expect("should build request");
-        let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
-            .await
-            .expect_err("should reject oversized body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "should return 413 for oversized sign body"
-        );
+    #[test]
+    fn sign_rejects_oversized_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let oversized = vec![b'x'; 65537];
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/sign")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(oversized))
+                .expect("should build request");
+            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject oversized body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should return 413 for oversized sign body"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn rebuild_rejects_oversized_body() {
-        let settings = create_test_settings();
-        let oversized = vec![b'x'; 65537];
-        let req = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("https://edge.example/first-party/proxy-rebuild")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(EdgeBody::from(oversized))
-            .expect("should build request");
-        let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
-            .await
-            .expect_err("should reject oversized body");
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "should return 413 for oversized rebuild body"
-        );
+    #[test]
+    fn rebuild_rejects_oversized_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let oversized = vec![b'x'; 65537];
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from(oversized))
+                .expect("should build request");
+            let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject oversized body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should return 413 for oversized rebuild body"
+            );
+        });
     }
 }

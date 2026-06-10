@@ -7,7 +7,8 @@ use error_stack::Report;
 use fastly::http::StatusCode;
 use fastly::Request;
 use trusted_server_core::auction::build_orchestrator;
-use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
+use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -18,14 +19,7 @@ use trusted_server_core::platform::{
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
 use trusted_server_core::settings::Settings;
 
-use super::{route_request, HandlerOutcome};
-
-fn outcome_status(result: &Result<HandlerOutcome, Report<TrustedServerError>>) -> StatusCode {
-    match result {
-        Ok(outcome) => outcome.status(),
-        Err(e) => e.current_context().status_code(),
-    }
-}
+use super::route_request;
 
 struct StubJwksConfigStore;
 
@@ -130,7 +124,7 @@ fn create_test_settings() -> Settings {
     let settings = Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -140,16 +134,13 @@ fn create_test_settings() -> Settings {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
-            [edge_cookie]
-            secret_key = "test-secret-key"
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
             enabled = false
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
-
-            [consent]
-            consent_store = "missing-consent-store"
 
             [integrations.prebid]
             enabled = true
@@ -188,11 +179,12 @@ fn test_runtime_services(req: &Request) -> RuntimeServices {
 }
 
 #[test]
-fn configured_missing_consent_store_only_breaks_consent_routes() {
+fn routes_use_request_local_consent() {
     let settings = create_test_settings();
     let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
     let integration_registry =
         IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry = PartnerRegistry::empty();
 
     let discovery_fastly_req = Request::get("https://test.com/.well-known/trusted-server.json");
     let discovery_services = test_runtime_services(&discovery_fastly_req);
@@ -200,62 +192,36 @@ fn configured_missing_consent_store_only_breaks_consent_routes() {
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &discovery_services,
         compat::from_fastly_request(discovery_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route discovery request");
     assert_eq!(
-        discovery_resp.status(),
+        discovery_resp.outcome.status(),
         StatusCode::OK,
-        "should keep discovery available when the consent store is unavailable"
+        "should keep discovery available with request-local consent"
     );
 
-    let admin_fastly_req = Request::post("https://test.com/admin/keys/rotate");
+    let admin_fastly_req = Request::post("https://test.com/_ts/admin/keys/rotate");
     let admin_services = test_runtime_services(&admin_fastly_req);
     let admin_resp = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
+        &partner_registry,
         &admin_services,
         compat::from_fastly_request(admin_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route admin request");
     assert_eq!(
-        admin_resp.status(),
+        admin_resp.outcome.status(),
         StatusCode::UNAUTHORIZED,
-        "should keep admin auth behavior unchanged when the consent store is unavailable"
+        "should keep admin auth behavior unchanged with request-local consent"
     );
 
-    let auction_fastly_req =
-        Request::post("https://test.com/auction").with_body(r#"{"adUnits":[]}"#);
-    let auction_services = test_runtime_services(&auction_fastly_req);
-    let auction_result = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &auction_services,
-        compat::from_fastly_request(auction_fastly_req),
-    ));
-    let auction_status = outcome_status(&auction_result);
-    assert_eq!(
-        auction_status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should fail auction requests when consent persistence is configured but unavailable"
-    );
-
-    let publisher_fastly_req = Request::get("https://test.com/articles/example");
-    let publisher_services = test_runtime_services(&publisher_fastly_req);
-    let publisher_result = futures::executor::block_on(route_request(
-        &settings,
-        &orchestrator,
-        &integration_registry,
-        &publisher_services,
-        compat::from_fastly_request(publisher_fastly_req),
-    ));
-    let publisher_status = outcome_status(&publisher_result);
-    assert_eq!(
-        publisher_status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "should scope consent store failures to the consent-dependent routes"
-    );
+    // Routes no longer depend on a separate consent KV store. Live consent is
+    // request-local, and EC lifecycle state uses the EC identity store only.
 }

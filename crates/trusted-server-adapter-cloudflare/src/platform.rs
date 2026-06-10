@@ -345,6 +345,7 @@ impl PlatformHttpClient for CloudflareHttpClient {
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
+            failed_backend_name: None,
         })
     }
 }
@@ -495,6 +496,7 @@ impl PlatformGeo for CloudflareGeo {
             longitude: self.longitude,
             metro_code: 0,
             region: None,
+            asn: None,
         }))
     }
 }
