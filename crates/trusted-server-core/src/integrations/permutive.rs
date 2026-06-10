@@ -539,6 +539,7 @@ mod tests {
 
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
@@ -572,6 +573,7 @@ mod tests {
 
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",

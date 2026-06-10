@@ -296,6 +296,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut href) = el.get_attribute("href") {
                     let original_href = href.clone();
+                    let element_name = el.tag_name();
                     if let Some(rewritten) = patterns.rewrite_url_value(&href) {
                         href = rewritten;
                     }
@@ -305,6 +306,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &href,
                         &IntegrationAttributeContext {
                             attribute_name: "href",
+                            element_name: &element_name,
                             request_host: &patterns.request_host,
                             request_scheme: &patterns.request_scheme,
                             origin_host: &patterns.origin_host,
@@ -334,6 +336,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut src) = el.get_attribute("src") {
                     let original_src = src.clone();
+                    let element_name = el.tag_name();
                     if let Some(rewritten) = patterns.rewrite_url_value(&src) {
                         src = rewritten;
                     }
@@ -342,6 +345,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &src,
                         &IntegrationAttributeContext {
                             attribute_name: "src",
+                            element_name: &element_name,
                             request_host: &patterns.request_host,
                             request_scheme: &patterns.request_scheme,
                             origin_host: &patterns.origin_host,
@@ -371,6 +375,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut action) = el.get_attribute("action") {
                     let original_action = action.clone();
+                    let element_name = el.tag_name();
                     if let Some(rewritten) = patterns.rewrite_url_value(&action) {
                         action = rewritten;
                     }
@@ -380,6 +385,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &action,
                         &IntegrationAttributeContext {
                             attribute_name: "action",
+                            element_name: &element_name,
                             request_host: &patterns.request_host,
                             request_scheme: &patterns.request_scheme,
                             origin_host: &patterns.origin_host,
@@ -409,6 +415,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut srcset) = el.get_attribute("srcset") {
                     let original_srcset = srcset.clone();
+                    let element_name = el.tag_name();
                     let new_srcset = srcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -426,6 +433,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &srcset,
                         &IntegrationAttributeContext {
                             attribute_name: "srcset",
+                            element_name: &element_name,
                             request_host: &patterns.request_host,
                             request_scheme: &patterns.request_scheme,
                             origin_host: &patterns.origin_host,
@@ -455,6 +463,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             move |el| {
                 if let Some(mut imagesrcset) = el.get_attribute("imagesrcset") {
                     let original_imagesrcset = imagesrcset.clone();
+                    let element_name = el.tag_name();
                     let new_imagesrcset = imagesrcset
                         .replace(&patterns.https_origin(), &patterns.replacement_url())
                         .replace(&patterns.http_origin(), &patterns.replacement_url())
@@ -471,6 +480,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                         &imagesrcset,
                         &IntegrationAttributeContext {
                             attribute_name: "imagesrcset",
+                            element_name: &element_name,
                             request_host: &patterns.request_host,
                             request_scheme: &patterns.request_scheme,
                             origin_host: &patterns.origin_host,

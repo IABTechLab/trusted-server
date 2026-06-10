@@ -17,6 +17,7 @@ pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
+pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
 pub mod osano;
@@ -289,5 +290,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         google_tag_manager::register,
         datadome::register,
         gpt::register,
+        js_asset_proxy::register,
     ]
 }
