@@ -104,6 +104,15 @@ script_url = "https://ads.example.com/gpt.js"
 cache_ttl_seconds = 3600
 rewrite_script = true
 
+[integrations.js_asset_proxy]
+enabled = false
+cache_ttl_seconds = 3600
+
+[[integrations.js_asset_proxy.assets]]
+path = "/assets/example-vendor-loader.js"
+origin_url = "https://cdn.example.com/vendor-loader.js"
+proxy = "enabled"
+
 [proxy]
 # certificate_check = true
 # Required for integrations.prebid.external_bundle_url and first-party proxy redirects.

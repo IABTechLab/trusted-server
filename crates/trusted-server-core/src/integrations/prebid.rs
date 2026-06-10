@@ -2525,6 +2525,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
         let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "src",
+            element_name: "script",
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
@@ -2542,6 +2543,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
         let integration = PrebidIntegration::new(base_config());
         let ctx = IntegrationAttributeContext {
             attribute_name: "href",
+            element_name: "a",
             request_host: "pub.example",
             request_scheme: "https",
             origin_host: "origin.example",
