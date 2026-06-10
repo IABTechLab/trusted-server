@@ -85,7 +85,7 @@ secret_store_id = "01GYYY"
 
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.com/openrtb2/auction"
+server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "appnexus", "openx"]
 client_side_bidders = ["rubicon"]
@@ -901,8 +901,8 @@ timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "5128"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 
 [integrations.prebid]
 enabled = true

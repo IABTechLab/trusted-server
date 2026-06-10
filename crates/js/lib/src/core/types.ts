@@ -98,6 +98,8 @@ export interface TsjsApi {
   servicesEnabled?: boolean;
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
+  /** Slot-level GPT targeting keys TS applied on the previous route. */
+  prevSlotTargetingKeys?: Record<string, string[]>;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
 }

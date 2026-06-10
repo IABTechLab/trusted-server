@@ -39,6 +39,14 @@ import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from '
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
 const ZONE_KEY = 'zone';
+const TS_REFRESH_TARGETING_KEYS = [
+  'ts_initial',
+  'hb_pb',
+  'hb_bidder',
+  'hb_adid',
+  'hb_cache_host',
+  'hb_cache_path',
+] as const;
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -242,6 +250,7 @@ type PrebidUserIdEid = {
 type RefreshGptSlot = {
   getSlotElementId?: () => string;
   getTargeting?: (key: string) => string[];
+  clearTargeting?: (key?: string) => RefreshGptSlot;
   getSizes?: () => unknown[];
 };
 
@@ -331,6 +340,14 @@ function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefin
 
 function firstTargetingValue(values: string[] | undefined): string | undefined {
   return values?.find((value) => value.length > 0);
+}
+
+function clearRefreshTargeting(slot: RefreshGptSlot): void {
+  if (typeof slot.clearTargeting !== 'function') return;
+
+  for (const key of TS_REFRESH_TARGETING_KEYS) {
+    slot.clearTargeting(key);
+  }
 }
 
 function collectAuctionEids(): AuctionEid[] | undefined {
@@ -569,8 +586,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
  * Wraps `googletag.pubads().refresh()` so that when the publisher's GPT
  * refresh policy fires (sticky anchor, viewability dwell, infinite scroll),
  * Prebid runs a fresh client-side auction for the refreshing slots before
- * the GAM call. TS-owned first-impression slots (`ts_initial=1`) are excluded
- * — they are managed server-side and should not re-auction client-side.
+ * the GAM call. TS-owned first-impression slots (`ts_initial=1`) are included
+ * on later publisher refreshes, but stale TS server-side targeting is cleared
+ * before fresh Prebid targeting is applied.
  *
  * Must be called after `installPrebidNpm()` and after GPT is loaded.
  * Idempotent: safe to call multiple times — wraps only once via a sentinel.
@@ -598,24 +616,20 @@ export function installRefreshHandler(timeoutMs = 1500): void {
     const originalRefresh = pubads.refresh.bind(pubads);
     pubads.refresh = function (slots?: unknown[], opts?: unknown) {
       // For bare refresh() calls (no slots arg), get all registered slots from GPT
-      // so we can filter out TS first-impression slots and auction the rest.
+      // so we can auction the same concrete slot list and avoid stale targeting.
       const targetSlots = (
         slots ??
         (pubads as { getSlots?: () => unknown[] }).getSlots?.() ??
         []
       ).filter((slot): slot is RefreshGptSlot => typeof slot === 'object' && slot !== null);
 
-      // Filter out TS first-impression slots — they don't need client-side refresh auctions.
-      const nonTsSlots = targetSlots.filter(
-        (slot) => !slot.getTargeting?.('ts_initial')?.includes('1')
-      );
-
-      if (!nonTsSlots.length) {
-        // All slots are TS-owned — pass through unchanged.
+      if (!targetSlots.length) {
         return originalRefresh(slots, opts);
       }
 
-      const adUnits = nonTsSlots.map((slot) => {
+      targetSlots.forEach(clearRefreshTargeting);
+
+      const adUnits = targetSlots.map((slot) => {
         const injectedSlot = findInjectedSlotForRefresh(slot);
         const zone =
           injectedSlot?.targeting?.[ZONE_KEY] ?? firstTargetingValue(slot.getTargeting?.(ZONE_KEY));
@@ -638,8 +652,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         adUnits,
         bidsBackHandler: () => {
           pbjs.setTargetingForGPTAsync?.();
-          // Refresh only the non-TS slots (pass explicit list so TS slots are not re-refreshed).
-          originalRefresh(nonTsSlots, opts);
+          originalRefresh(targetSlots, opts);
         },
         timeout: timeoutMs,
       });

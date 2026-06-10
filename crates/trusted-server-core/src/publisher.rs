@@ -1034,10 +1034,7 @@ pub async fn handle_publisher_request(
     );
 
     let consent_context = ec_context.consent().clone();
-    let ec_id = ec_context
-        .ec_value()
-        .map(str::to_string)
-        .unwrap_or_default();
+    let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
     let cookie_jar = handle_request_cookies(&http_req)?;
     let geo = ec_context.geo_info().cloned();
 
@@ -1120,7 +1117,7 @@ pub async fn handle_publisher_request(
         };
         let mut auction_request = build_auction_request(
             &slots_ctx,
-            &ec_id,
+            ec_id,
             &consent_context,
             &request_info,
             req.get_header_str("user-agent"),
@@ -1129,7 +1126,11 @@ pub async fn handle_publisher_request(
             .as_ref()
             .and_then(|j| j.get(COOKIE_TS_EIDS))
             .map(|c| c.value().to_owned());
-        let client_eids = resolve_client_auction_eids(None, ts_eids_value.as_deref());
+        let client_eids = if ec_id.is_some() {
+            resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        } else {
+            None
+        };
         let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
         let merged_eids = merge_auction_eids(client_eids, kv_eids);
         let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
@@ -1316,7 +1317,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
 pub(crate) fn build_auction_request(
     slots_ctx: &MatchedSlotsContext<'_>,
-    ec_id: &str,
+    ec_id: Option<&str>,
     consent_context: &crate::consent::ConsentContext,
     request_info: &crate::http_util::RequestInfo,
     user_agent: Option<&str>,
@@ -1330,15 +1331,20 @@ pub(crate) fn build_auction_request(
         "{}://{}{}",
         request_info.scheme, request_info.host, slots_ctx.request_path
     );
+    let ec_id = ec_id.filter(|id| !id.is_empty());
+    let request_id = ec_id.map_or_else(
+        || format!("ts-req-{}", uuid::Uuid::new_v4().simple()),
+        |id| format!("ts-{id}"),
+    );
     AuctionRequest {
-        id: format!("ts-{}", ec_id),
+        id: request_id,
         slots,
         publisher: PublisherInfo {
             domain: request_info.host.clone(),
             page_url: Some(page_url.clone()),
         },
         user: UserInfo {
-            id: Some(ec_id.to_string()),
+            id: ec_id.map(str::to_string),
             consent: Some(consent_context.clone()),
             eids: None,
         },
@@ -1477,7 +1483,7 @@ pub(crate) fn build_bids_script(bid_map: &serde_json::Map<String, serde_json::Va
         .expect("serde_json::to_string of Map<String,Value> should be infallible");
     let escaped = html_escape_for_script(&json);
     format!(
-        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");(function(){{var f=window.tsjs.adInit;if(typeof f!==\"function\")return;f();if(!(window.tsjs.prevGptSlots||[]).length){{setTimeout(function(){{if(typeof window.tsjs.adInit===\"function\")window.tsjs.adInit();}},100);}}}})();</script>",
+        "<script>(window.tsjs=window.tsjs||{{}}).bids=JSON.parse(\"{}\");(function(){{var f=window.tsjs.adInit;if(typeof f===\"function\")f();}})();</script>",
         escaped
     )
 }
@@ -1592,7 +1598,7 @@ pub async fn handle_page_bids(
         EcContext::read_from_request(settings, &req).change_context(TrustedServerError::Proxy {
             message: "page-bids: failed to read EC context".to_string(),
         })?;
-    let ec_id = ec_ctx.ec_value().map(str::to_string).unwrap_or_default();
+    let ec_id = ec_ctx.ec_value().filter(|_| ec_ctx.ec_allowed());
     let consent_context = ec_ctx.consent().clone();
     let geo = ec_ctx.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&http_req)?;
@@ -1631,7 +1637,7 @@ pub async fn handle_page_bids(
             };
             let mut auction_request = build_auction_request(
                 &slots_ctx,
-                &ec_id,
+                ec_id,
                 &consent_context,
                 &request_info,
                 req.get_header_str("user-agent"),
@@ -1640,7 +1646,11 @@ pub async fn handle_page_bids(
                 .as_ref()
                 .and_then(|j| j.get(COOKIE_TS_EIDS))
                 .map(|c| c.value().to_owned());
-            let client_eids = resolve_client_auction_eids(None, ts_eids_value.as_deref());
+            let client_eids = if ec_id.is_some() {
+                resolve_client_auction_eids(None, ts_eids_value.as_deref())
+            } else {
+                None
+            };
             let kv_eids = resolve_auction_eids(kv, registry, &ec_ctx);
             let merged_eids = merge_auction_eids(client_eids, kv_eids);
             let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
@@ -2922,12 +2932,15 @@ mod tests {
     #[cfg(test)]
     mod creative_opportunities_tests {
         use super::super::{
-            build_ad_slots_script, build_bid_map, build_bids_script, html_escape_for_script,
+            build_ad_slots_script, build_auction_request, build_bid_map, build_bids_script,
+            html_escape_for_script, MatchedSlotsContext,
         };
         use crate::auction::types::{Bid, MediaType};
+        use crate::consent::ConsentContext;
         use crate::creative_opportunities::{
             CreativeOpportunitiesConfig, CreativeOpportunityFormat, CreativeOpportunitySlot,
         };
+        use crate::http_util::RequestInfo;
         use crate::price_bucket::PriceGranularity;
         use std::collections::HashMap;
 
@@ -3348,6 +3361,88 @@ mod tests {
                 .trim_end_matches("</script>");
             assert!(!inner.contains('<'), "no unescaped < in bids script");
             assert!(!inner.contains('>'), "no unescaped > in bids script");
+        }
+
+        #[test]
+        fn bids_script_calls_ad_init_without_retry_timer() {
+            let mut map = serde_json::Map::new();
+            map.insert("atf".to_string(), serde_json::json!({"hb_pb": "1.00"}));
+
+            let script = build_bids_script(&map);
+
+            assert!(
+                script.contains("window.tsjs.adInit"),
+                "should hand off bids to adInit"
+            );
+            assert!(
+                !script.contains("setTimeout"),
+                "should not retry adInit on a timer"
+            );
+            assert!(
+                !script.contains("prevGptSlots"),
+                "should not use TS-owned slots as adInit success signal"
+            );
+        }
+
+        #[test]
+        fn auction_request_without_ec_id_omits_user_id_and_uses_non_ec_request_id() {
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/",
+            };
+            let request_info = RequestInfo {
+                host: "publisher.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+
+            let request = build_auction_request(
+                &slots_ctx,
+                None,
+                &ConsentContext::default(),
+                &request_info,
+                Some("Mozilla/5.0"),
+            );
+
+            assert_eq!(request.user.id, None, "should not forward an EC user id");
+            assert!(
+                request.id.starts_with("ts-req-"),
+                "should use a non-EC request id, got {}",
+                request.id
+            );
+        }
+
+        #[test]
+        fn auction_request_with_ec_id_sets_user_id_and_ec_request_id() {
+            let slot = make_slot();
+            let slots = [slot];
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &slots,
+                request_path: "/2024/01/my-article/",
+            };
+            let request_info = RequestInfo {
+                host: "publisher.example.com".to_string(),
+                scheme: "https".to_string(),
+            };
+
+            let request = build_auction_request(
+                &slots_ctx,
+                Some("ec-abc"),
+                &ConsentContext::default(),
+                &request_info,
+                Some("Mozilla/5.0"),
+            );
+
+            assert_eq!(
+                request.user.id.as_deref(),
+                Some("ec-abc"),
+                "should forward EC id when identity consent allows it"
+            );
+            assert_eq!(
+                request.id, "ts-ec-abc",
+                "should preserve existing EC-derived request id when present"
+            );
         }
 
         #[test]

@@ -216,6 +216,103 @@ describe('GPT – installSlimPrebidLoader', () => {
   });
 });
 
+describe('GPT – installTsAdInit', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    delete (window as any).tsjs;
+    delete (window as any).googletag;
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    delete (window as any).tsjs;
+    delete (window as any).googletag;
+  });
+
+  it('clears stale TS-managed targeting before applying a new route to a reused GPT slot', async () => {
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    const slotTargeting = new Map<string, string[]>([
+      ['hb_pb', ['1.20']],
+      ['hb_bidder', ['kargo']],
+      ['hb_adid', ['old-ad']],
+      ['hb_cache_host', ['cache.example.com']],
+      ['hb_cache_path', ['/cache']],
+      ['ts_initial', ['1']],
+      ['pos', ['old-pos']],
+    ]);
+    const gptSlot: any = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn((key: string) => slotTargeting.get(key) ?? []),
+      setTargeting: vi.fn((key: string, value: string | string[]) => {
+        slotTargeting.set(key, Array.isArray(value) ? value : [value]);
+        return gptSlot;
+      }),
+      clearTargeting: vi.fn((key?: string) => {
+        if (key) {
+          slotTargeting.delete(key);
+        } else {
+          slotTargeting.clear();
+        }
+        return gptSlot;
+      }),
+    };
+    const pubads = {
+      getSlots: vi.fn(() => [gptSlot]),
+      enableSingleRequest: vi.fn(),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const cmd: Array<() => void> = [];
+    cmd.push = (...callbacks: Array<() => void>) => {
+      callbacks.forEach((callback) => callback());
+      return cmd.length;
+    };
+
+    document.body.innerHTML = '<div id="div-ad-homepage-header"></div>';
+    (window as any).googletag = {
+      cmd,
+      pubads: () => pubads,
+      defineSlot: vi.fn(),
+      destroySlots: vi.fn(),
+      enableServices: vi.fn(),
+    };
+    (window as any).tsjs = {
+      prevSlotTargetingKeys: {
+        'div-ad-homepage-header': ['pos'],
+      },
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+      bids: {},
+    };
+
+    installTsAdInit();
+    (window as any).tsjs.adInit();
+
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(gptSlot.clearTargeting).toHaveBeenCalledWith('pos');
+    expect(slotTargeting.get('hb_pb')).toBeUndefined();
+    expect(slotTargeting.get('hb_bidder')).toBeUndefined();
+    expect(slotTargeting.get('hb_adid')).toBeUndefined();
+    expect(slotTargeting.get('hb_cache_host')).toBeUndefined();
+    expect(slotTargeting.get('hb_cache_path')).toBeUndefined();
+    expect(slotTargeting.get('pos')).toBeUndefined();
+    expect(slotTargeting.get('zone')).toEqual(['homepage']);
+    expect(slotTargeting.get('ts_initial')).toEqual(['1']);
+  });
+});
+
 describe('GPT shim – runtime gating', () => {
   type GatedWindow = Window & {
     __tsjs_gpt_enabled?: boolean;

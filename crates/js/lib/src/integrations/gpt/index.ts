@@ -25,6 +25,14 @@ import { installGptGuard } from './script_guard';
  */
 
 const TS_INITIAL_TARGETING_KEY = 'ts_initial' as const;
+const TS_BID_TARGETING_KEYS = [
+  'hb_pb',
+  'hb_bidder',
+  'hb_adid',
+  'hb_cache_host',
+  'hb_cache_path',
+] as const;
+const TS_BASE_TARGETING_KEYS = [...TS_BID_TARGETING_KEYS, TS_INITIAL_TARGETING_KEY] as const;
 
 // ------------------------------------------------------------------
 // googletag type stubs (minimal surface needed by the shim)
@@ -34,6 +42,7 @@ interface GoogleTagSlot {
   getAdUnitPath(): string;
   getSlotElementId(): string;
   setTargeting(key: string, value: string | string[]): GoogleTagSlot;
+  clearTargeting?(key?: string): GoogleTagSlot;
   addService(service: GoogleTagPubAdsService): GoogleTagSlot;
   getTargeting?(key: string): string[];
 }
@@ -80,6 +89,14 @@ function messageSourceBelongsToConfiguredSlot(source: MessageEventSource | null)
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
     )
   );
+}
+
+function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
+  if (typeof slot.clearTargeting !== 'function') return;
+
+  for (const key of new Set(keys)) {
+    slot.clearTargeting(key);
+  }
 }
 
 interface GoogleTagPubAdsService {
@@ -333,6 +350,8 @@ export function installTsAdInit(): void {
       // All slots to refresh (TS-defined + publisher-owned reused).
       const slotsToRefresh: GoogleTagSlot[] = [];
       const divToSlotId: Record<string, string> = {};
+      const prevSlotTargetingKeys = ts.prevSlotTargetingKeys ?? {};
+      const nextSlotTargetingKeys: Record<string, string[]> = {};
 
       slots.forEach((slot) => {
         // Resolve actual div ID: exact match first, then prefix query.
@@ -363,19 +382,26 @@ export function installTsAdInit(): void {
           tsOwned = true;
         }
 
+        const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
+        clearTargetingKeys(gptSlot, [
+          ...TS_BASE_TARGETING_KEYS,
+          ...(prevSlotTargetingKeys[actualDivId] ?? []),
+          ...(prevSlotTargetingKeys[slotDivId2] ?? []),
+        ]);
+
         Object.entries(slot.targeting ?? {}).forEach(([k, v]) => gptSlot.setTargeting(k, v));
-        (['hb_pb', 'hb_bidder', 'hb_adid', 'hb_cache_host', 'hb_cache_path'] as const).forEach(
-          (key) => {
-            if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
-          }
-        );
+        TS_BID_TARGETING_KEYS.forEach((key) => {
+          if (bid[key]) gptSlot.setTargeting(key, String(bid[key]!));
+        });
         gptSlot.setTargeting(TS_INITIAL_TARGETING_KEY, '1');
         // Map both inner div and container div → slot ID so slotRenderEnded
         // (which reports the GPT slot's div, i.e. slotDivId/container) can look up
         // the slot, while adm injection (which targets the inner div) also works.
         divToSlotId[actualDivId] = slot.id;
-        const slotDivId2 = gptSlot.getSlotElementId?.() ?? actualDivId;
         if (slotDivId2 !== actualDivId) divToSlotId[slotDivId2] = slot.id;
+        const slotTargetingKeys = Object.keys(slot.targeting ?? {});
+        nextSlotTargetingKeys[actualDivId] = slotTargetingKeys;
+        if (slotDivId2 !== actualDivId) nextSlotTargetingKeys[slotDivId2] = slotTargetingKeys;
         if (tsOwned) newSlots.push(gptSlot);
         slotsToRefresh.push(gptSlot);
 
@@ -391,6 +417,7 @@ export function installTsAdInit(): void {
       ts.prevGptSlots = newSlots as unknown[];
       // Replace (not merge) so destroyed slots from previous navigation don't linger.
       ts.divToSlotId = divToSlotId;
+      ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
       // enableSingleRequest and enableServices must only be called once per page load.
       if (!ts.servicesEnabled) {

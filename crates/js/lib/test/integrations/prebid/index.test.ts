@@ -769,6 +769,7 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
 describe('prebid/installRefreshHandler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRequestBids.mockReset();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
     (window as any).tsjs = undefined;
@@ -832,6 +833,85 @@ describe('prebid/installRefreshHandler', () => {
         ],
       })
     );
+  });
+
+  it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn((key: string) => {
+        if (key === 'ts_initial') return ['1'];
+        if (key === 'zone') return ['homepage'];
+        return [];
+      }),
+      getSizes: vi.fn(() => [
+        { getWidth: () => 970, getHeight: () => 250 },
+        { getWidth: () => 728, getHeight: () => 90 },
+      ]),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [
+            [970, 250],
+            [728, 90],
+          ],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeout: 750,
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            mediaTypes: {
+              banner: {
+                name: 'homepage',
+                sizes: [
+                  [970, 250],
+                  [728, 90],
+                ],
+              },
+            },
+            bids: [{ bidder: 'trustedServer', params: { zone: 'homepage' } }],
+          }),
+        ],
+      })
+    );
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(originalRefresh).not.toHaveBeenCalled();
+
+    const bidsBackHandler = mockRequestBids.mock.calls[0][0].bidsBackHandler;
+    bidsBackHandler();
+
+    expect(setTargetingForGPTAsync).toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
 });
 

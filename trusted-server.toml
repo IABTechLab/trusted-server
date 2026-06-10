@@ -57,8 +57,8 @@ config_store_id = "<fastly-config-store-id>" # set config/secret store ids for k
 secret_store_id = "<fastly-secret-store-id>"
 
 [integrations.prebid]
-enabled = true
-server_url = "http://68.183.113.79:8000"
+enabled = false
+server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1000
 bidders = ["kargo", "appnexus", "openx"]
 debug = false
@@ -215,8 +215,8 @@ rewrite_script = true
 # ]
 
 [auction]
-enabled = true
-providers = ["prebid", "aps"]
+enabled = false
+providers = ["prebid"]
 # mediator = "adserver_mock"
 timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT_MS
 # Context keys the JS client is allowed to forward into auction requests.
@@ -224,9 +224,9 @@ timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT
 allowed_context_keys = ["permutive_segments"]
 
 [integrations.aps]
-enabled = true
-pub_id = "test-pub"
-endpoint = "https://origin-mocktioneer.cdintel.com/e/dtb/bid"
+enabled = false
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 timeout_ms = 1000  # override per-publisher via TRUSTED_SERVER__INTEGRATIONS__APS__TIMEOUT_MS
 
 [integrations.google_tag_manager]
@@ -235,8 +235,8 @@ container_id = "GTM-XXXXXX"
 # upstream_url = "https://www.googletagmanager.com"
 
 [integrations.adserver_mock]
-enabled = true
-endpoint = "https://origin-mocktioneer.cdintel.com/adserver/mediate"
+enabled = false
+endpoint = "https://mediator.example.com/adserver/mediate"
 timeout_ms = 1000
 
 # Debug configuration (all flags default to false — do not enable in production)
@@ -271,7 +271,7 @@ timeout_ms = 1000
 permutive_segments = "permutive"
 
 [creative_opportunities]
-gam_network_id = "88059007"
+gam_network_id = "123456789"
 # FCP is not affected by this value — body content above </body> has already
 # streamed and painted before the hold begins. What this caps is the slip on
 # DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
@@ -281,50 +281,7 @@ gam_network_id = "88059007"
 auction_timeout_ms = 1500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
 price_granularity = "dense"
 
-# Slot templates — override entire array via:
+# No slot templates are enabled in the checked-in default config. Add
+# `[[creative_opportunities.slot]]` entries via private config or override the
+# entire array via:
 # TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'
-
-[[creative_opportunities.slot]]
-id = "atf_sidebar_ad"
-gam_unit_path = "/a/b/news"
-div_id = "div-ad-atf-sidebar"
-page_patterns = ["/20**", "/news/**"]
-formats = [{ width = 300, height = 250 }]
-floor_price = 0.50
-
-[creative_opportunities.slot.targeting]
-pos = "atf"
-zone = "atfSidebar"
-
-[creative_opportunities.slot.providers.aps]
-slot_id = "aps-slot-atf-sidebar"
-
-[[creative_opportunities.slot]]
-id = "homepage_header_ad"
-gam_unit_path = "/a/b/homepage"
-div_id = "div-ad-homepage-header"
-page_patterns = ["/"]
-formats = [{ width = 728, height = 90 }]
-floor_price = 0.50
-
-[creative_opportunities.slot.targeting]
-pos = "atf"
-zone = "header"
-
-[creative_opportunities.slot.providers.aps]
-slot_id = "aps-slot-homepage-header"
-
-[[creative_opportunities.slot]]
-id = "homepage_footer_ad"
-gam_unit_path = "/a/b/homepage"
-div_id = "div-ad-homepage-footer"
-page_patterns = ["/"]
-formats = [{ width = 728, height = 90 }, { width = 768, height = 66 }]
-floor_price = 0.50
-
-[creative_opportunities.slot.targeting]
-pos = "btf"
-zone = "fixedBottom"
-
-[creative_opportunities.slot.providers.aps]
-slot_id = "aps-slot-homepage-footer"
