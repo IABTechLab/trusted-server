@@ -61,6 +61,7 @@ describe('installTsAdInit', () => {
 
   afterEach(() => {
     document.getElementById('div-atf-sidebar')?.remove();
+    document.getElementById("ad'prefix-real")?.remove();
   });
 
   it('reads window.tsjs.bids synchronously and applies bid targeting before refresh', async () => {
@@ -537,6 +538,49 @@ describe('installTsAdInit', () => {
 
     expect(mockPubads.refresh).toHaveBeenCalled();
   });
+
+  it('resolves dynamic div prefixes without interpolating div_id into a CSS selector', async () => {
+    const dynamicDiv = document.createElement('div');
+    dynamicDiv.id = "ad'prefix-real";
+    document.body.appendChild(dynamicDiv);
+
+    const dynamicSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue("ad'prefix-real"),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([dynamicSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(dynamicSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'dynamic_slot',
+          gam_unit_path: '/123/dynamic',
+          div_id: "ad'prefix-",
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+
+    expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
+    expect(mockPubads.refresh).toHaveBeenCalledWith([dynamicSlot]);
+  });
 });
 
 describe('installTsRenderBridge', () => {
@@ -578,8 +622,18 @@ describe('installTsRenderBridge', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    document.getElementById('div-header')?.remove();
     delete (window as TestWindow).tsjs;
   });
+
+  function createTrustedSlotIframe(): Window {
+    const slot = document.createElement('div');
+    slot.id = 'div-header';
+    const iframe = document.createElement('iframe');
+    slot.appendChild(iframe);
+    document.body.appendChild(slot);
+    return iframe.contentWindow!;
+  }
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
     const mockAd = '<div>Test Creative</div>';
@@ -608,6 +662,7 @@ describe('installTsRenderBridge', () => {
     const stopSpy = vi.fn();
     const portMessages: string[] = [];
     const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
 
     // Dispatch the fake event — bridge listener fires synchronously, then runs
     // fire-and-forget fetch().then() chains asynchronously.
@@ -615,6 +670,7 @@ describe('installTsRenderBridge', () => {
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
         ports: [fakePort],
+        source,
         stopImmediatePropagation: stopSpy,
       }) as unknown as MessageEvent
     );
@@ -676,11 +732,13 @@ describe('installTsRenderBridge', () => {
     const stopSpy = vi.fn();
     const portMessages: string[] = [];
     const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
 
     bridgeListener!(
       Object.assign(new Event('message'), {
         data: JSON.stringify({ message: 'Prebid Request', adId: 'debug-adid' }),
         ports: [fakePort],
+        source,
         stopImmediatePropagation: stopSpy,
       }) as unknown as MessageEvent
     );
@@ -712,6 +770,31 @@ describe('installTsRenderBridge', () => {
 
     await new Promise<void>((r) => setTimeout(r, 100));
     expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('ignores matching adId messages from outside configured slot iframes', async () => {
+    await import('./index');
+    fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    const foreignIframe = document.createElement('iframe');
+    document.body.appendChild(foreignIframe);
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const stopSpy = vi.fn();
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort as MessagePort],
+        source: foreignIframe.contentWindow,
+      })
+    );
+
+    await new Promise<void>((r) => setTimeout(r, 50));
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(portMessages).toHaveLength(0);
+    foreignIframe.remove();
   });
 
   it('ignores non-Prebid messages', async () => {

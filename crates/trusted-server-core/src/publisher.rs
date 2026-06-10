@@ -579,12 +579,18 @@ pub(crate) fn is_prefetch_request(req: &Request) -> bool {
 /// server-side ad stack: auction dispatch plus initial ad-slot injection.
 pub(crate) fn should_run_server_side_ad_stack(
     is_get: bool,
+    is_navigation: bool,
     is_prefetch: bool,
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
 ) -> bool {
-    is_get && !is_prefetch && !is_bot && has_matched_slots && consent_allows_auction
+    is_get
+        && is_navigation
+        && !is_prefetch
+        && !is_bot
+        && has_matched_slots
+        && consent_allows_auction
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -737,6 +743,10 @@ impl BodyCloseHoldBuffer {
         self.buffered.drain(..split_at).collect()
     }
 
+    fn found_close(&self) -> bool {
+        self.found_close
+    }
+
     fn finish(self) -> Vec<u8> {
         self.buffered
     }
@@ -754,8 +764,9 @@ fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 /// Core close-body hold loop.
 ///
 /// Streams processed output until the first case-insensitive `</body` prefix is
-/// seen, then holds that tail. On EOF, the auction is collected, bids are
-/// written, and the held tail is processed before finalization.
+/// seen, then collects the auction, writes bids, and processes the held tail
+/// before reading post-body chunks. If no close-body tag is found, collection
+/// happens at EOF before finalization.
 async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     mut reader: R,
     writer: &mut W,
@@ -771,46 +782,35 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
         settings,
     } = ctx;
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
-    let mut hold = BodyCloseHoldBuffer::new();
+    let mut hold = Some(BodyCloseHoldBuffer::new());
+    let mut dispatched = Some(dispatched);
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                log::info!("body_close_hold_loop: EOF - collecting dispatched auction");
-                let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
-                let collect_ctx = make_collect_context(settings, services, &placeholder);
-                let result = orchestrator
-                    .collect_dispatched_auction(dispatched, services, &collect_ctx)
+                if let Some(hold) = hold.take() {
+                    let dispatched = dispatched
+                        .take()
+                        .expect("should have dispatched auction to collect");
+                    collect_stream_auction(
+                        dispatched,
+                        price_granularity,
+                        ad_bids_state,
+                        orchestrator,
+                        services,
+                        settings,
+                    )
                     .await;
-                log::info!(
-                    "body_close_hold_loop: collect complete - {} winning bid(s)",
-                    result.winning_bids.len()
-                );
-                write_bids_to_state(
-                    &result.winning_bids,
-                    price_granularity,
-                    ad_bids_state,
-                    settings.debug.inject_adm_for_testing,
-                );
 
-                if settings.debug.auction_html_comment {
-                    prepend_auction_debug_comment("stream", &result, ad_bids_state);
-                }
-
-                let held = hold.finish();
-                if !held.is_empty() {
-                    let out = processor.process_chunk(&held, false).change_context(
-                        TrustedServerError::Proxy {
-                            message: "Failed to process held body close".to_string(),
-                        },
+                    let held = hold.finish();
+                    write_processed_chunk(
+                        writer,
+                        processor,
+                        &held,
+                        false,
+                        "Failed to process held body close",
+                        "Failed to write held body close",
                     )?;
-                    if !out.is_empty() {
-                        writer
-                            .write_all(&out)
-                            .change_context(TrustedServerError::Proxy {
-                                message: "Failed to write held body close".to_string(),
-                            })?;
-                    }
                 }
                 // Signal EOF to lol_html (fires end() which flushes remaining state).
                 let final_out = processor.process_chunk(&[], true).change_context(
@@ -828,20 +828,53 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 break;
             }
             Ok(n) => {
-                let ready = hold.push(&buffer[..n]);
-                if !ready.is_empty() {
-                    let out = processor.process_chunk(&ready, false).change_context(
-                        TrustedServerError::Proxy {
-                            message: "Failed to process chunk".to_string(),
-                        },
+                if let Some(hold_buffer) = hold.as_mut() {
+                    let ready = hold_buffer.push(&buffer[..n]);
+                    write_processed_chunk(
+                        writer,
+                        processor,
+                        &ready,
+                        false,
+                        "Failed to process chunk",
+                        "Failed to write chunk",
                     )?;
-                    if !out.is_empty() {
-                        writer
-                            .write_all(&out)
-                            .change_context(TrustedServerError::Proxy {
-                                message: "Failed to write chunk".to_string(),
-                            })?;
+
+                    if hold_buffer.found_close() {
+                        let dispatched = dispatched
+                            .take()
+                            .expect("should have dispatched auction to collect");
+                        collect_stream_auction(
+                            dispatched,
+                            price_granularity,
+                            ad_bids_state,
+                            orchestrator,
+                            services,
+                            settings,
+                        )
+                        .await;
+
+                        let held = hold
+                            .take()
+                            .expect("should have close-body hold buffer")
+                            .finish();
+                        write_processed_chunk(
+                            writer,
+                            processor,
+                            &held,
+                            false,
+                            "Failed to process held body close",
+                            "Failed to write held body close",
+                        )?;
                     }
+                } else {
+                    write_processed_chunk(
+                        writer,
+                        processor,
+                        &buffer[..n],
+                        false,
+                        "Failed to process chunk",
+                        "Failed to write chunk",
+                    )?;
                 }
             }
             Err(e) => {
@@ -855,6 +888,65 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     writer.flush().change_context(TrustedServerError::Proxy {
         message: "Failed to flush output".to_string(),
     })?;
+    Ok(())
+}
+
+async fn collect_stream_auction(
+    dispatched: DispatchedAuction,
+    price_granularity: PriceGranularity,
+    ad_bids_state: &Arc<Mutex<Option<String>>>,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+    settings: &Settings,
+) {
+    log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
+    let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
+    let collect_ctx = make_collect_context(settings, services, &placeholder);
+    let result = orchestrator
+        .collect_dispatched_auction(dispatched, services, &collect_ctx)
+        .await;
+    log::info!(
+        "body_close_hold_loop: collect complete - {} winning bid(s)",
+        result.winning_bids.len()
+    );
+    write_bids_to_state(
+        &result.winning_bids,
+        price_granularity,
+        ad_bids_state,
+        settings.debug.inject_adm_for_testing,
+    );
+
+    if settings.debug.auction_html_comment {
+        prepend_auction_debug_comment("stream", &result, ad_bids_state);
+    }
+}
+
+fn write_processed_chunk<W: Write, P: StreamProcessor>(
+    writer: &mut W,
+    processor: &mut P,
+    chunk: &[u8],
+    is_last: bool,
+    process_error: &str,
+    write_error: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if chunk.is_empty() && !is_last {
+        return Ok(());
+    }
+
+    let out =
+        processor
+            .process_chunk(chunk, is_last)
+            .change_context(TrustedServerError::Proxy {
+                message: process_error.to_string(),
+            })?;
+    if !out.is_empty() {
+        writer
+            .write_all(&out)
+            .change_context(TrustedServerError::Proxy {
+                message: write_error.to_string(),
+            })?;
+    }
+
     Ok(())
 }
 
@@ -918,11 +1010,13 @@ pub async fn handle_publisher_request(
         req.get_header("x-forwarded-proto"),
     );
 
+    let is_navigation = is_navigation_request(&http_req);
+
     // Generate a new EC ID only for document navigations. Subresource
     // requests (fonts, images, CSS) may lack consent signals such as the
     // Sec-GPC header, so we skip generation to avoid setting identity
     // cookies when the user's consent preference is unknown.
-    if is_navigation_request(&http_req) {
+    if is_navigation {
         if let Err(err) = ec_context.generate_if_needed(settings, kv) {
             log::warn!("EC generation failed: {err:?}");
         }
@@ -986,6 +1080,7 @@ pub async fn handle_publisher_request(
 
     let should_run_ad_stack = should_run_server_side_ad_stack(
         is_get,
+        is_navigation,
         is_prefetch,
         is_bot,
         !matched_slots.is_empty(),
@@ -1638,7 +1733,9 @@ pub async fn handle_page_bids(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::{self, Read as _, Write as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use brotli::enc::writer::CompressorWriter;
     use brotli::Decompressor;
@@ -1646,9 +1743,52 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::*;
+    use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
     use fastly::http::{header, Method, StatusCode};
+
+    struct ChunkedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        read_count: Arc<AtomicUsize>,
+    }
+
+    impl ChunkedReader {
+        fn new(chunks: &[&[u8]], read_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+                read_count,
+            }
+        }
+    }
+
+    impl io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            self.read_count.fetch_add(1, Ordering::SeqCst);
+            let len = chunk.len().min(buf.len());
+            buf[..len].copy_from_slice(&chunk[..len]);
+            Ok(len)
+        }
+    }
+
+    struct RecordingProcessor {
+        read_count: Arc<AtomicUsize>,
+        body_close_processed_at: Arc<AtomicUsize>,
+    }
+
+    impl StreamProcessor for RecordingProcessor {
+        fn process_chunk(&mut self, chunk: &[u8], _is_last: bool) -> Result<Vec<u8>, io::Error> {
+            if find_ascii_case_insensitive(chunk, BODY_CLOSE_PREFIX).is_some() {
+                self.body_close_processed_at
+                    .store(self.read_count.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            Ok(chunk.to_vec())
+        }
+    }
 
     fn gzip_encode(input: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1699,6 +1839,35 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dispatched_auction: None,
             price_granularity: Default::default(),
+        }
+    }
+
+    fn test_auction_request() -> AuctionRequest {
+        AuctionRequest {
+            id: "test-auction".to_string(),
+            slots: vec![AdSlot {
+                id: "atf".to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: Default::default(),
+                bidders: Default::default(),
+            }],
+            publisher: PublisherInfo {
+                domain: "test-publisher.com".to_string(),
+                page_url: Some("https://test-publisher.com/article".to_string()),
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: Default::default(),
         }
     }
 
@@ -1759,29 +1928,80 @@ mod tests {
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
         assert!(
-            should_run_server_side_ad_stack(true, false, false, true, true),
+            should_run_server_side_ad_stack(true, true, false, false, true, true),
             "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, false, false, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true),
+            "non-document requests should skip TS ad stack"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, true, true, false, true, true),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, true, false),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false),
             "requests without required consent should skip TS ad stack and injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_close_hold_loop_processes_close_tail_before_reading_post_body_chunks() {
+        let settings = create_test_settings();
+        let services = noop_services();
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let body_close_processed_at = Arc::new(AtomicUsize::new(0));
+        let reader = ChunkedReader::new(
+            &[
+                b"<html><body>painted</body>",
+                b"<script>late()</script>",
+                b"</html>",
+            ],
+            Arc::clone(&read_count),
+        );
+        let mut processor = RecordingProcessor {
+            read_count: Arc::clone(&read_count),
+            body_close_processed_at: Arc::clone(&body_close_processed_at),
+        };
+        let ad_bids_state = Arc::new(Mutex::new(None));
+        let ctx = AuctionCollectCtx {
+            dispatched,
+            price_granularity: PriceGranularity::default(),
+            ad_bids_state: &ad_bids_state,
+            orchestrator: &orchestrator,
+            services: &services,
+            settings: &settings,
+        };
+        let mut output = Vec::new();
+
+        body_close_hold_loop(reader, &mut output, &mut processor, ctx)
+            .await
+            .expect("should stream body with auction hold");
+
+        assert_eq!(
+            body_close_processed_at.load(Ordering::SeqCst),
+            1,
+            "close-body tail should be processed as soon as it is found, before later chunks are read"
+        );
+        assert_eq!(
+            std::str::from_utf8(&output).expect("should be utf8"),
+            "<html><body>painted</body><script>late()</script></html>",
+            "post-body chunks should still stream in order"
         );
     }
 

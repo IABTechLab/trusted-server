@@ -215,7 +215,7 @@ rewrite_script = true
 [auction]
 enabled = true
 providers = ["prebid", "aps"]
-mediator = "adserver_mock"
+# mediator = "adserver_mock"
 timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT_MS
 # Context keys the JS client is allowed to forward into auction requests.
 # Keys not in this list are silently dropped. An empty list blocks all keys.

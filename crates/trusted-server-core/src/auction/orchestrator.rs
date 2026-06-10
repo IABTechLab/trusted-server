@@ -30,6 +30,20 @@ pub struct DispatchedAuction {
     request: AuctionRequest,
 }
 
+#[cfg(test)]
+impl DispatchedAuction {
+    pub(crate) fn empty_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
+        Self {
+            pending_requests: Vec::new(),
+            backend_to_provider: HashMap::new(),
+            auction_start: Instant::now(),
+            timeout_ms,
+            floor_prices: HashMap::new(),
+            request,
+        }
+    }
+}
+
 const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
 pub(crate) const ERROR_TYPE_HTTP_STATUS: &str = "http_status";
