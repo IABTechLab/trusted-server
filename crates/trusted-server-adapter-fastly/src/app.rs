@@ -610,9 +610,10 @@ mod tests {
     }
 
     fn minimal_state() -> Arc<AppState> {
-        app_state_for_settings(
-            trusted_server_core::settings_data::get_settings().expect("should load test settings"),
-        )
+        // Build from explicit test settings: the settings baked into the
+        // binary contain placeholder secrets that `get_settings()` rejects
+        // by design.
+        app_state_for_settings(settings_with_missing_consent_store())
     }
 
     // ---------------------------------------------------------------------------

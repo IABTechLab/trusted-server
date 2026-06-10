@@ -51,6 +51,18 @@ pub struct AppState {
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = get_settings()?;
+    build_state_with_settings(settings)
+}
+
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration
+/// registry fail to initialise.
+fn build_state_with_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -356,42 +368,65 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        let fallback = fallback_handler(Arc::clone(&state));
-
-        let mut router = RouterService::builder()
-            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
-
-        router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
-            Ok::<Response, EdgeError>(
-                edgezero_core::http::response_builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
-                    .body(edgezero_core::body::Body::from("ok"))
-                    .expect("should build health response"),
-            )
-        });
-
-        for route in named_routes() {
-            for method in route.primary_methods {
-                router = router.route(
-                    route.path,
-                    method.clone(),
-                    named_route_handler(Arc::clone(&state), route.handler),
-                );
-            }
-            for method in publisher_fallback_methods() {
-                if !route.primary_methods.contains(&method) {
-                    router = router.route(route.path, method, fallback.clone());
-                }
-            }
-        }
-
-        for method in publisher_fallback_methods() {
-            router = router.route("/", method.clone(), fallback.clone());
-            router = router.route("/{*rest}", method, fallback.clone());
-        }
-
-        router.build()
+        build_router(&state)
     }
+}
+
+impl TrustedServerApp {
+    /// Build the full application router from explicit settings.
+    ///
+    /// Testing seam: integration tests use this to drive the router with
+    /// known-good settings instead of the baked `get_settings()` result,
+    /// whose embedded placeholder secrets fail validation by design.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    pub fn routes_with_settings(
+        settings: Settings,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+}
+
+fn build_router(state: &Arc<AppState>) -> RouterService {
+    let fallback = fallback_handler(Arc::clone(state));
+
+    let mut router = RouterService::builder()
+        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+
+    router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
+        Ok::<Response, EdgeError>(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
+                .body(edgezero_core::body::Body::from("ok"))
+                .expect("should build health response"),
+        )
+    });
+
+    for route in named_routes() {
+        for method in route.primary_methods {
+            router = router.route(
+                route.path,
+                method.clone(),
+                named_route_handler(Arc::clone(state), route.handler),
+            );
+        }
+        for method in publisher_fallback_methods() {
+            if !route.primary_methods.contains(&method) {
+                router = router.route(route.path, method, fallback.clone());
+            }
+        }
+    }
+
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), fallback.clone());
+        router = router.route("/{*rest}", method, fallback.clone());
+    }
+
+    router.build()
 }
