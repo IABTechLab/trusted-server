@@ -283,6 +283,22 @@ impl AuctionOrchestrator {
             }));
         }
 
+        // Reject multi-provider fan-out before any request launches when the
+        // platform executes `send_async` eagerly (e.g. Cloudflare Workers):
+        // sequential execution would accrue the sum of provider latencies and
+        // blow the auction budget before a later `select` could reject it.
+        if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
+        {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "{} auction providers configured, but this platform's HTTP \
+                     client executes requests sequentially — configure a single \
+                     provider, or use an adapter with concurrent fan-out support",
+                    provider_names.len(),
+                ),
+            }));
+        }
+
         log::info!(
             "Running {} providers in parallel using select",
             provider_names.len()
@@ -1131,6 +1147,68 @@ mod tests {
                 provider_b.status,
                 BidStatus::Success,
                 "provider-b should succeed — error was correctly isolated to provider-a"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_multi_provider_fanout_before_launch_on_sequential_platform() {
+        futures::executor::block_on(async {
+            // Arrange: two configured providers on a platform whose HTTP
+            // client executes send_async eagerly (no concurrent fan-out).
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_concurrent_fanout(false);
+            let stub_for_assertion = Arc::clone(&stub);
+
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-a",
+                backend: "backend-a",
+            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-b",
+                backend: "backend-b",
+            }));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            // Act
+            let result = orchestrator.run_auction(&request, &context).await;
+
+            // Assert: rejected before any provider request launches.
+            let err = result.expect_err("should reject multi-provider fan-out");
+            assert!(
+                format!("{err}").contains("sequentially"),
+                "should explain the sequential-execution limitation"
+            );
+            assert!(
+                stub_for_assertion.recorded_backend_names().is_empty(),
+                "should not launch any provider request before rejecting"
             );
         });
     }

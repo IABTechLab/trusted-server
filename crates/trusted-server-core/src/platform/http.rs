@@ -229,6 +229,19 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>>;
 
+    /// Whether [`send_async`](Self::send_async) defers execution so multiple
+    /// pending requests progress concurrently and [`select`](Self::select)
+    /// races them.
+    ///
+    /// Platforms where `send_async` executes each request eagerly before
+    /// returning (e.g. Cloudflare Workers) return `false`. On such platforms
+    /// multi-request fan-out runs sequentially and accrues the sum of the
+    /// individual latencies, so callers with a latency budget (the auction
+    /// orchestrator) must check this before launching more than one request.
+    fn supports_concurrent_fanout(&self) -> bool {
+        true
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors
