@@ -3576,7 +3576,6 @@ dependencies = [
  "ed25519-dalek",
  "edgezero-core",
  "error-stack",
- "fastly",
  "flate2",
  "futures",
  "getrandom 0.2.17",

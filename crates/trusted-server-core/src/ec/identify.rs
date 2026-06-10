@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn handle_identify_rejects_missing_bearer_token() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let registry = PartnerRegistry::empty();
         let req = Request::builder()
             .method("GET")
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn handle_identify_denied_consent_returns_403() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn handle_identify_denies_mismatched_browser_origin() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()

@@ -24,7 +24,6 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
-use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
@@ -51,18 +50,22 @@ use trusted_server_core::settings_data::get_settings;
 mod app;
 mod backend;
 mod compat;
+mod ec_kv;
 mod error;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+mod rate_limiter;
 #[cfg(test)]
 mod route_tests;
 
 use crate::app::{build_state, TrustedServerApp};
+use crate::ec_kv::FastlyEcKvStore;
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, FastlyPlatformGeo};
+use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
@@ -808,7 +811,11 @@ async fn route_request(
 }
 
 fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
+    settings
+        .ec
+        .ec_store
+        .as_ref()
+        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
 }
 
 fn run_pull_sync_after_send(
@@ -866,7 +873,7 @@ fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })?;
-    Ok(KvIdentityGraph::new(store_name))
+    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.

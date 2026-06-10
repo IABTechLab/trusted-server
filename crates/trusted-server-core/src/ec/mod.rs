@@ -18,11 +18,12 @@
 //! - [`consent`] — EC-specific consent gating wrapper
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
+//! - [`kv_backend`] — Platform-neutral KV primitives implemented by adapters
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
 //! - [`partner`] — Partner validation helpers (ID format, pull sync config)
 //! - [`registry`] — In-memory partner registry built from config
-//! - [`rate_limiter`] — Rate limiting abstraction (Fastly Edge Rate Limiting)
+//! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
@@ -39,6 +40,7 @@ pub mod finalize;
 pub mod generation;
 pub mod identify;
 pub mod kv;
+pub mod kv_backend;
 pub mod kv_types;
 pub mod partner;
 pub mod prebid_eids;

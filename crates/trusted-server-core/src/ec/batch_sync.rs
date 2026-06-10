@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn handle_batch_sync_rejects_missing_auth() {
-        let kv = KvIdentityGraph::new("test_store");
+        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let limiter = MockRateLimiter {
             should_exceed: false,
