@@ -394,15 +394,59 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
+/// Growable byte buffer that rejects writes past a configured limit.
+///
+/// Used by [`buffer_publisher_response`] to enforce
+/// `settings.publisher.max_buffered_body_bytes` so a large processable
+/// origin response fails safely instead of exhausting the Wasm heap.
+struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Buffer a [`PublisherResponse`] into a single [`Response`].
 ///
 /// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
 /// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
 /// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
 ///
+/// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
+/// when set, so processable origin responses cannot grow the buffer without
+/// bound and exhaust the Wasm heap.
+///
 /// # Errors
 ///
-/// Returns an error if the streaming pipeline fails to process the response body.
+/// Returns an error if the streaming pipeline fails to process the response
+/// body, or if the processed body exceeds the configured buffer cap.
 pub fn buffer_publisher_response(
     publisher_response: PublisherResponse,
     settings: &Settings,
@@ -415,13 +459,35 @@ pub fn buffer_publisher_response(
             body,
             params,
         } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = match settings.publisher.max_buffered_body_bytes {
+                Some(limit) => {
+                    let mut output = BoundedWriter::new(limit);
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output.into_inner()
+                }
+                None => {
+                    let mut output = Vec::new();
+                    stream_publisher_body(
+                        body,
+                        &mut output,
+                        &params,
+                        settings,
+                        integration_registry,
+                    )?;
+                    output
+                }
+            };
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
-                http::HeaderValue::from(output.len() as u64),
+                http::HeaderValue::from(bytes.len() as u64),
             );
-            *response.body_mut() = EdgeBody::from(output);
+            *response.body_mut() = EdgeBody::from(bytes);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {
@@ -1868,6 +1934,41 @@ mod tests {
         assert!(
             !processed.contains("origin.example.com"),
             "origin host must not leak. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_accepts_writes_within_limit() {
+        let mut writer = BoundedWriter::new(10);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        writer
+            .write_all(b"67890")
+            .expect("should accept write up to exact limit");
+
+        assert_eq!(
+            writer.into_inner(),
+            b"1234567890",
+            "should preserve all written bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_writes_exceeding_limit() {
+        let mut writer = BoundedWriter::new(8);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        let err = writer
+            .write_all(b"6789")
+            .expect_err("should reject write that exceeds the limit");
+
+        assert!(
+            err.to_string().contains("maximum buffered size"),
+            "should report the buffer cap in the error message"
         );
     }
 }

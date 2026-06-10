@@ -1,5 +1,8 @@
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -235,6 +238,25 @@ struct AxumPendingHandle {
     handle: tokio::task::JoinHandle<SpawnedRequestResult>,
 }
 
+/// Resolves to the backend name together with the task result so that
+/// [`futures::future::select_all`] callers never have to reconstruct which
+/// backend a completion belongs to by position. `select_all` removes the
+/// ready future with `swap_remove` and makes no ordering guarantee for the
+/// remaining futures, so positional bookkeeping would mislabel them.
+impl Future for AxumPendingHandle {
+    type Output = (String, Result<SpawnedRequestResult, tokio::task::JoinError>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Ready(result) => {
+                let backend_name = std::mem::take(&mut self.backend_name);
+                Poll::Ready((backend_name, result))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
 /// `send_async` buffers any `Body::Stream` in the calling context, then spawns
@@ -411,7 +433,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        let mut handles: Vec<AxumPendingHandle> = pending_requests
+        let handles: Vec<AxumPendingHandle> = pending_requests
             .into_iter()
             .map(|pr| {
                 pr.downcast::<AxumPendingHandle>().map_err(|_| {
@@ -421,27 +443,20 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let backend_names: Vec<String> = handles.iter().map(|h| h.backend_name.clone()).collect();
-        let join_handles: Vec<_> = handles.drain(..).map(|h| h.handle).collect();
-
-        let (result, ready_idx, remaining_handles) =
-            futures::future::select_all(join_handles).await;
+        // Each AxumPendingHandle resolves to (backend_name, result), so the
+        // remaining handles keep their own backend names — no positional
+        // reconstruction (select_all does not preserve the order of the
+        // remaining futures).
+        let ((backend_name, result), _ready_idx, remaining_handles) =
+            futures::future::select_all(handles).await;
 
         let remaining: Vec<PlatformPendingRequest> = remaining_handles
             .into_iter()
-            .enumerate()
-            .map(|(i, handle)| {
-                let original_idx = if i < ready_idx { i } else { i + 1 };
-                let bn = backend_names[original_idx].clone();
-                PlatformPendingRequest::new(AxumPendingHandle {
-                    backend_name: bn.clone(),
-                    handle,
-                })
-                .with_backend_name(bn)
+            .map(|handle| {
+                let backend_name = handle.backend_name.clone();
+                PlatformPendingRequest::new(handle).with_backend_name(backend_name)
             })
             .collect();
-
-        let backend_name = backend_names[ready_idx].clone();
 
         // Map join panics and per-request errors into ready: Err(...) so that the
         // auction orchestrator can log the failure and continue with remaining providers
