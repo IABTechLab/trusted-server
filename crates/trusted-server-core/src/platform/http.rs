@@ -145,7 +145,16 @@ pub struct PlatformSelectResult {
     /// Completed response, or the error returned by the ready request.
     pub ready: Result<PlatformResponse, Report<PlatformError>>,
     /// Requests still in flight after the ready result is removed.
+    ///
+    /// Note: entries in this list may have `backend_name == None` on some
+    /// adapters (e.g., Fastly), because the adapter cannot preserve input
+    /// identifiers across the platform `select()` call. Orchestrators must
+    /// not rely on `backend_name()` being set on remaining entries.
     pub remaining: Vec<PlatformPendingRequest>,
+    /// Backend name of the request that became ready with an error, when
+    /// `ready` is `Err`. `None` on the success path and when the adapter
+    /// cannot identify the failed backend.
+    pub failed_backend_name: Option<String>,
 }
 
 /// A [`PlatformHttpClient`] stand-in used when outbound HTTP is not available
@@ -219,6 +228,19 @@ pub trait PlatformHttpClient: Send + Sync {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>>;
+
+    /// Whether [`send_async`](Self::send_async) defers execution so multiple
+    /// pending requests progress concurrently and [`select`](Self::select)
+    /// races them.
+    ///
+    /// Platforms where `send_async` executes each request eagerly before
+    /// returning (e.g. Cloudflare Workers) return `false`. On such platforms
+    /// multi-request fan-out runs sequentially and accrues the sum of the
+    /// individual latencies, so callers with a latency budget (the auction
+    /// orchestrator) must check this before launching more than one request.
+    fn supports_concurrent_fanout(&self) -> bool {
+        true
+    }
 
     /// Wait for one of the in-flight requests to complete.
     ///

@@ -25,8 +25,7 @@
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
 //!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
-//!   accepts any reader, including `fastly::Body` (which implements
-//!   `std::io::Read`).
+//!   accepts any reader that implements `std::io::Read`.
 //!
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
@@ -206,6 +205,7 @@ mod tests {
             longitude: -74.0060,
             metro_code: 501,
             region: Some("NY".to_string()),
+            asn: None,
         };
 
         assert_eq!(
@@ -225,6 +225,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 807,
             region: None,
+            asn: None,
         };
         assert!(
             geo.has_metro_code(),
@@ -242,6 +243,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 0,
             region: None,
+            asn: None,
         };
         assert!(
             !geo.has_metro_code(),

@@ -23,8 +23,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
-[edge_cookie]
-secret_key = "your-hmac-secret"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 ### Environment Variable Overrides
@@ -37,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
+export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ### Generate Secure Secrets
@@ -60,7 +60,7 @@ openssl rand -base64 32
 | Section             | Purpose                                      |
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
-| `[edge_cookie]`     | Edge Cookie (EC) ID generation               |
+| `[ec]`              | Edge Cookie (EC) ID generation               |
 | `[proxy]`           | Proxy SSRF allowlist                         |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
@@ -75,8 +75,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
-[edge_cookie]
-secret_key = "your-hmac-secret-key"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
 
 [request_signing]
 enabled = true
@@ -153,19 +153,22 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field           | Type   | Required | Description                                             |
-| --------------- | ------ | -------- | ------------------------------------------------------- |
-| `domain`        | String | Yes      | Publisher's domain name                                 |
-| `cookie_domain` | String | Yes      | Domain for setting cookies (typically with leading dot) |
-| `origin_url`    | String | Yes      | Full URL of publisher origin server                     |
-| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs            |
+| Field           | Type   | Required | Description                                            |
+| --------------- | ------ | -------- | ------------------------------------------------------ |
+| `domain`        | String | Yes      | Publisher's apex domain name                           |
+| `cookie_domain` | String | Yes      | Domain for non-EC cookies (typically with leading dot) |
+| `origin_url`    | String | Yes      | Full URL of publisher origin server                    |
+| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs           |
+
+> **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
+> do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
 
 **Example**:
 
 ```toml
 [publisher]
 domain = "publisher.com"
-cookie_domain = ".publisher.com"  # Includes subdomains
+cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-random-value"
 ```
@@ -199,12 +202,12 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 #### `cookie_domain`
 
-**Purpose**: Domain scope for EC cookies.
+**Purpose**: Domain scope for non-EC cookies.
 
 **Usage**:
 
-- Set on `ts-ec` cookie
-- Controls cookie sharing across subdomains
+- Used by non-EC cookie helpers for domain scoping
+- EC cookies (`ts-ec`) use a separate computed domain derived from `domain`
 
 **Format**: Domain with optional leading dot
 
@@ -263,32 +266,49 @@ Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations car
 
 ## EC Configuration
 
-Settings for generating privacy-preserving Edge Cookie identifiers.
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
 
-### `[edge_cookie]`
+### `[ec]`
 
-| Field        | Type   | Required | Description                   |
-| ------------ | ------ | -------- | ----------------------------- |
-| `secret_key` | String | Yes      | HMAC secret for ID generation |
+| Field                     | Type           | Required | Description                                                             |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
+| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `partners`                | Array          | No       | Static partner registry entries                                         |
+
+::: tip Partner keying
+`source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
+:::
 
 **Example**:
 
 ```toml
-[edge_cookie]
-secret_key = "your-secure-hmac-secret"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
+ec_store = "ec_identity_store"
+
+[[ec.partners]]
+name = "Mocktioneer SSP"
+source_domain = "mocktioneer.example"
+api_token = "partner-api-token-32-bytes-minimum"
+bidstream_enabled = true
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
+TRUSTED_SERVER__EC__PASSPHRASE=your-secret
+TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
 ### Field Details
 
-#### `secret_key`
+#### `passphrase`
 
-**Purpose**: HMAC secret for EC ID base generation.
+**Purpose**: Publisher passphrase used as HMAC key for EC ID generation.
 
 **Security**:
 
@@ -436,7 +456,7 @@ Path-based HTTP Basic Authentication.
 ```toml
 # Single handler
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "secure-password"
 
@@ -456,7 +476,7 @@ password = "api-pass"
 
 ```bash
 # Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/admin"
+TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
 TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
 TRUSTED_SERVER__HANDLERS__0__PASSWORD="secure-password"
 
@@ -474,10 +494,10 @@ TRUSTED_SERVER__HANDLERS__1__PASSWORD="api-pass"
 
 ```toml
 # Exact path
-path = "^/admin$"  # Only /admin
+path = "^/_ts/admin$"  # Only /_ts/admin
 
 # Prefix match
-path = "^/admin"   # /admin, /admin/users, /admin/settings
+path = "^/_ts/admin"   # /_ts/admin, /_ts/admin/users, /_ts/admin/settings
 
 # Multiple paths
 path = "^/(admin|secure|private)"
@@ -912,8 +932,8 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `secret_key` ≥ 1 character
-- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
+- `passphrase` ≥ 1 character
+- `passphrase` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 
 **Handler Validation**:
 
@@ -970,7 +990,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=$(cat /run/secrets/ec_secret)
+TRUSTED_SERVER__EC__PASSPHRASE=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1024,7 +1044,7 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- `edge_cookie.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `ec.passphrase` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
 - Change to a secure random value (see generation commands above)
@@ -1032,7 +1052,7 @@ trusted-server.dev.toml      # Development overrides
 **"Invalid regex"**:
 
 - Handler `path` must be valid regex
-- Test pattern: `echo "^/admin" | grep -E "^/admin"`
+- Test pattern: `echo "^/_ts/admin" | grep -E "^/_ts/admin"`
 - Escape special characters: `\.`, `\$`, etc.
 
 **"Integration configuration could not be parsed"**:

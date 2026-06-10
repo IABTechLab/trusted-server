@@ -31,8 +31,5 @@ trusted-server-core = { path = "../trusted-server-core" }
 axum = "0.8"
 base64 = { workspace = true }
 temp-env = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
-edgezero-core = { workspace = true }
-reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tower = { version = "0.4", features = ["util"] }

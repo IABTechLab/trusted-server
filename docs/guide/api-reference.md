@@ -5,6 +5,7 @@ Quick reference for all Trusted Server HTTP endpoints.
 ## Endpoint Categories
 
 - [First-Party Endpoints](#first-party-endpoints) - Core ad serving and proxying
+- [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
@@ -37,13 +38,84 @@ curl "https://edge.example.com/first-party/ad?slot=header-banner&w=728&h=90"
 
 **Response Headers:**
 
-- `x-ts-ec` - EC ID (`64hex.6alnum` format)
+No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
 
 **Use Cases:**
 
 - Server-side ad rendering
 - Direct iframe embedding
 - First-party ad delivery
+
+---
+
+## Edge Cookie Endpoints
+
+Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no runtime partner-registration endpoint and the legacy browser pixel sync endpoint has been removed; browser-resolved IDs are ingested through Prebid EID cookies.
+
+---
+
+### GET /\_ts/api/v1/identify
+
+Returns EC identity plus the authenticated partner's UID and EID for the current user.
+
+**Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
+
+**Request:**
+
+- Uses `ts-ec` cookie and consent signals
+
+**Response (example):**
+
+```json
+{
+  "ec": "954d...e0c3.nZ1GxL",
+  "consent": "ok",
+  "degraded": false,
+  "source_domain": "formally-vital-lion.edgecompute.app",
+  "uid": "mock-user-123",
+  "eid": {
+    "source": "formally-vital-lion.edgecompute.app",
+    "uids": [{ "id": "mock-user-123", "atype": 3 }]
+  },
+  "cluster_size": 3
+}
+```
+
+`uid`, `eid`, and `cluster_size` are optional and omitted when unavailable
+(e.g. no partner UID synced yet, KV read degraded, or cluster size not
+re-evaluated within the recheck window).
+
+---
+
+### POST /\_ts/api/v1/batch-sync
+
+Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. Mapping timestamps are retained in the request schema for compatibility, but they no longer order writes because EC identity entries do not store per-partner sync timestamps. Valid mappings use idempotent last-write-wins semantics.
+
+**Auth:** Bearer token (`Authorization: Bearer <partner-api-key>`)
+
+**Request Body:**
+
+```json
+{
+  "mappings": [
+    {
+      "ec_id": "954d8e7398dd993f78e3875ca1ef7841249781240e913157c1f2d6a6c960e0c3.nZ1GxL",
+      "partner_uid": "mock-user-123",
+      "timestamp": 1775147300
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "accepted": 1,
+  "rejected": 0,
+  "errors": []
+}
+```
 
 ---
 
@@ -329,7 +401,7 @@ curl -X POST https://edge.example.com/verify-signature \
 
 ---
 
-### POST /admin/keys/rotate
+### POST /\_ts/admin/keys/rotate
 
 Generates and activates a new signing key.
 
@@ -359,7 +431,7 @@ If omitted, auto-generates date-based ID (e.g., `ts-2025-01-15-A`).
 **Example:**
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/rotate \
+curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
   -u admin:password \
   -H "Content-Type: application/json"
 ```
@@ -374,7 +446,7 @@ See [Key Rotation Guide](./key-rotation.md) for workflow details.
 
 ---
 
-### POST /admin/keys/deactivate
+### POST /\_ts/admin/keys/deactivate
 
 Deactivates or deletes a signing key.
 
@@ -407,7 +479,7 @@ Deactivates or deletes a signing key.
 **Example:**
 
 ```bash
-curl -X POST https://edge.example.com/admin/keys/deactivate \
+curl -X POST https://edge.example.com/_ts/admin/keys/deactivate \
   -u admin:password \
   -H "Content-Type: application/json" \
   -d '{"kid":"ts-2025-01-14-A","delete":true}'
@@ -547,7 +619,7 @@ Proxies to configured endpoint with `user.id` populated with EC ID.
 
 **Response Headers:**
 
-- `x-ts-ec` - EC ID (`64hex.6alnum` format)
+No EC ID response header is emitted. EC identity is maintained with the `ts-ec` cookie.
 
 ---
 
@@ -588,7 +660,7 @@ Endpoints under protected paths require HTTP Basic Authentication:
 
 ```toml
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "secure-password"
 ```
@@ -596,13 +668,13 @@ password = "secure-password"
 **Usage:**
 
 ```bash
-curl -u admin:secure-password https://edge.example.com/admin/keys/rotate
+curl -u admin:secure-password https://edge.example.com/_ts/admin/keys/rotate
 ```
 
 **Protected Endpoints:**
 
-- `/admin/keys/rotate`
-- `/admin/keys/deactivate`
+- `/_ts/admin/keys/rotate`
+- `/_ts/admin/keys/deactivate`
 - Any paths matching configured `handlers` patterns
 
 ---

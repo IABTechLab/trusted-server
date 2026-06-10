@@ -107,6 +107,7 @@ mod tests {
             longitude: -122.4194,
             metro_code: 807,
             region: Some("CA".to_string()),
+            asn: None,
         }
     }
 

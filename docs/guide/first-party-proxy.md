@@ -357,9 +357,8 @@ When proxying, Trusted Server automatically appends the `ts-ec` parameter:
 
 **Source Priority**:
 
-1. `x-ts-ec` request header
-2. `ts-ec` cookie
-3. Generate new ID if missing
+1. `ts-ec` cookie
+2. Generate new ID if missing
 
 **Example**:
 
@@ -420,9 +419,9 @@ Configure proxy behavior in `trusted-server.toml`:
 ```toml
 [publisher]
 domain = "publisher.com"
+cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-random-secret"
-cookie_domain = ".publisher.com"  # For ts-ec cookies
 ```
 
 ### Proxy Allowlist

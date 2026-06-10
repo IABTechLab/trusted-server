@@ -11,16 +11,57 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
 use edgezero_adapter_axum::EdgeZeroAxumService;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::http::request_builder;
+use edgezero_core::router::RouterService;
 use http::HeaderMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
+use trusted_server_core::settings::Settings;
+
+/// Shared test settings for both adapters.
+///
+/// The settings baked into the binaries contain placeholder secrets that
+/// `get_settings()` rejects by design, so both routers are built through
+/// their `routes_with_settings` testing seams from this known-good config.
+/// The handler regex covers both the adapter-level `/admin/...` routes and
+/// the `/_ts/admin/...` paths required by settings validation.
+fn test_settings() -> Settings {
+    Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/(_ts/)?admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "parity-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+        "#,
+    )
+    .expect("should parse parity test settings")
+}
+
+/// Build the Axum adapter router from the shared test settings.
+fn axum_router() -> RouterService {
+    AxumApp::routes_with_settings(test_settings())
+        .expect("should build Axum router from parity test settings")
+}
+
+/// Build the Cloudflare adapter router from the shared test settings.
+fn cf_router() -> RouterService {
+    CloudflareApp::routes_with_settings(test_settings())
+        .expect("should build Cloudflare router from parity test settings")
+}
 
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("GET")
         .uri(uri)
@@ -39,7 +80,7 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("POST")
         .uri(uri)
@@ -72,7 +113,7 @@ async fn axum_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Cloudflare adapter and return (status, headers).
 async fn cf_get(uri: &str) -> (u16, HeaderMap) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("GET")
         .uri(uri)
@@ -84,7 +125,7 @@ async fn cf_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("POST")
         .uri(uri)
@@ -128,7 +169,7 @@ async fn discovery_route_body_is_json_parity() {
     use serde_json::Value;
 
     let (axum_status, axum_body_bytes) = {
-        let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+        let mut svc = EdgeZeroAxumService::new(axum_router());
         let req = AxumRequest::builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
@@ -152,7 +193,7 @@ async fn discovery_route_body_is_json_parity() {
     };
 
     let (cf_status, cf_body_bytes) = {
-        let router = CloudflareApp::routes();
+        let router = cf_router();
         let req = request_builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
