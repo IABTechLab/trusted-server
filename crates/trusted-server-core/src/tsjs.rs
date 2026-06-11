@@ -22,7 +22,7 @@ pub fn tsjs_script_tag(module_ids: &[&str]) -> String {
 /// Hashes all compiled module IDs so the cache invalidates whenever any module
 /// changes. Over-invalidates slightly (includes deferred modules in the hash)
 /// but never serves stale content. Use [`tsjs_script_src`] with exact module
-/// IDs when the [`IntegrationRegistry`] is available.
+/// IDs when `IntegrationRegistry` is available.
 #[must_use]
 pub fn tsjs_unified_script_src() -> String {
     let ids = all_module_ids();

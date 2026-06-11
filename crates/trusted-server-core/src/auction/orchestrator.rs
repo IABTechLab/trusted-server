@@ -186,12 +186,7 @@ impl AuctionOrchestrator {
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
 
             if remaining_ms == 0 {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
-                log::warn!(
-                    "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
-                    context.timeout_ms
-                );
+                log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                 return Ok(OrchestrationResult {
                     provider_responses,
@@ -343,13 +338,7 @@ impl AuctionOrchestrator {
             let effective_timeout = remaining_ms.min(provider.timeout_ms());
 
             if effective_timeout == 0 {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
-                log::warn!(
-                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
-                    context.timeout_ms,
-                    provider.provider_name()
-                );
+                log::warn!("Auction timeout exhausted before launching provider request; skipping");
                 continue;
             }
 
@@ -420,12 +409,9 @@ impl AuctionOrchestrator {
         }
 
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
-        // lgtm[rust/cleartext-logging]
-        // This info log reports request counts and timeout budget only; no secret settings are logged.
         log::info!(
-            "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
-            pending_requests.len(),
-            context.timeout_ms
+            "Launched {} concurrent provider request(s); waiting for responses",
+            pending_requests.len()
         );
 
         // Phase 2: Wait for responses using select() to process as they become ready.
@@ -501,11 +487,8 @@ impl AuctionOrchestrator {
             // Remaining PendingRequests are dropped, which abandons the
             // in-flight HTTP calls on the Fastly host.
             if auction_start.elapsed() >= deadline && !remaining.is_empty() {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
-                    "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
-                    context.timeout_ms,
+                    "Auction timeout reached; dropping {} remaining request(s)",
                     remaining.len()
                 );
                 break;
