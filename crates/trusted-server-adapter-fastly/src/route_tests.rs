@@ -7,13 +7,13 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::Request;
 use fastly::http::request::PendingRequest;
-use fastly::http::{Method, StatusCode, header};
+use fastly::http::{header, Method, StatusCode};
+use fastly::Request;
 use serde_json::json;
 use trusted_server_core::auction::{
-    AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest, AuctionResponse,
-    build_orchestrator,
+    build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
+    AuctionResponse,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
