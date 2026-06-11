@@ -103,9 +103,8 @@ pub trait IntoHttpResponse {
 
     /// Get a safe, user-facing error message.
     ///
-    /// Selected client errors return a brief description; forbidden and
-    /// server/integration errors return a generic message. Full error details
-    /// are preserved in server logs.
+    /// Selected client errors return a brief description; all other errors
+    /// return a generic message. Full error details are preserved in server logs.
     fn user_message(&self) -> String;
 }
 

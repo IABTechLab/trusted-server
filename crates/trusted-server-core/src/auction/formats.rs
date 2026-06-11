@@ -78,9 +78,8 @@ pub struct BannerUnit {
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - Fresh EC ID generation fails
-/// - Request contains invalid banner sizes (must be [width, height])
+/// Returns an error if the request contains invalid banner sizes
+/// (must be `[width, height]`).
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
@@ -341,16 +340,12 @@ mod tests {
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::openrtb::{Eid, Uid};
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::HeaderValue;
     use serde_json::json;
     use std::collections::HashSet;
 
     fn make_request() -> Request {
         let mut req = Request::new("POST", "https://publisher.example.com/auction");
-        req.set_header(
-            header::USER_AGENT,
-            HeaderValue::from_str("Mozilla/5.0 test").expect("should create user-agent header"),
-        );
+        req.set_header(header::USER_AGENT, "Mozilla/5.0 test");
         req
     }
 
@@ -656,6 +651,25 @@ mod tests {
     }
 
     #[test]
+    fn convert_tsjs_to_auction_request_propagates_missing_ec_id() {
+        let settings = make_settings();
+        let req = make_request();
+        let auction_request = convert_tsjs_to_auction_request(
+            &make_banner_body(None),
+            &settings,
+            &req,
+            ConsentContext::default(),
+            None,
+        )
+        .expect("should convert request without EC ID");
+
+        assert!(
+            auction_request.user.id.is_none(),
+            "should leave user ID unset when caller provides no EC ID"
+        );
+    }
+
+    #[test]
     fn convert_tsjs_to_auction_request_filters_context_values() {
         let mut settings = make_settings();
         settings.auction.allowed_context_keys = HashSet::from([
@@ -698,6 +712,38 @@ mod tests {
         assert!(
             !auction_request.context.contains_key("blocked"),
             "should drop disallowed context keys"
+        );
+    }
+
+    #[test]
+    fn convert_tsjs_to_auction_request_allows_empty_banner_sizes() {
+        let settings = make_settings();
+        let req = make_request();
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "div-gpt-top".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit { sizes: vec![] }),
+                }),
+                bids: None,
+            }],
+            config: None,
+            eids: None,
+        };
+
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &req,
+            ConsentContext::default(),
+            Some("existing-ec-id"),
+        )
+        .expect("should convert request with empty banner sizes");
+
+        assert_eq!(auction_request.slots.len(), 1, "should create one slot");
+        assert!(
+            auction_request.slots[0].formats.is_empty(),
+            "should preserve current behavior by allowing empty formats"
         );
     }
 

@@ -94,6 +94,14 @@ mod tests {
     }
 
     #[test]
+    fn does_not_rewrite_differently_cased_host() {
+        assert_no_rewrite(
+            "ORIGIN.EXAMPLE.COM/news",
+            "should not rewrite differently-cased host occurrences",
+        );
+    }
+
+    #[test]
     fn rewrites_exact_bare_host() {
         assert_rewrite("origin.example.com", "proxy.example.com");
     }
