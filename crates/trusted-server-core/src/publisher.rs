@@ -10,6 +10,17 @@
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
+//!
+//! **Note on platform coupling:** This module is currently coupled to
+//! `fastly::Body`/`Request`/`Response` at its handler boundaries — the entry
+//! points ([`handle_publisher_request`], [`stream_publisher_body`]) still
+//! accept and return `fastly::Body` and `fastly::Response`. The streaming
+//! processor itself is generic: `process_response_streaming` writes into
+//! any [`Write`] (a `Vec<u8>` for buffered routes, a `StreamingBody` for the
+//! streaming route). The HTTP-type coupling will be addressed in the
+//! platform HTTP-type migration alongside all other
+//! `fastly::Request`/`Response`/`Body` migrations. It is not a
+//! content-rewriting concern.
 
 use std::io::Write;
 
@@ -206,15 +217,12 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
-    // lgtm[rust/cleartext-logging]
-    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
         params.content_encoding,
         is_html,
-        is_rsc_flight,
-        params.origin_host
+        is_rsc_flight
     );
 
     let compression = Compression::from_content_encoding(params.content_encoding);
@@ -438,12 +446,9 @@ pub fn handle_publisher_request(
     let request_scheme = &request_info.scheme;
 
     log::debug!(
-        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
-        request_host,
-        request_scheme,
-        req.get_header("x-forwarded-host"),
-        req.get_header(header::HOST),
-        req.get_header("x-forwarded-proto"),
+        "Request info extracted: has_host={}, scheme={}",
+        !request_host.is_empty(),
+        request_scheme
     );
 
     // Generate a new EC ID only for document navigations. Subresource
@@ -455,34 +460,27 @@ pub fn handle_publisher_request(
             log::warn!("EC generation failed: {err:?}");
         }
     } else {
-        log::debug!(
-            "EC generation skipped: non-document request (path={})",
-            req.get_path(),
-        );
+        log::debug!("EC generation skipped: non-document request");
     }
 
     let ec_allowed = ec_context.ec_allowed();
     log::debug!(
-        "Proxy EC ID: {:?}, ec_allowed: {ec_allowed}",
-        ec_context.ec_value(),
+        "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}",
+        ec_context.ec_value().is_some(),
     );
 
-    let backend_name = BackendConfig::from_url(
+    let backend_name = BackendConfig::from_url_with_host_header_override(
         &settings.publisher.origin_url,
         settings.proxy.certificate_check,
+        settings.publisher.origin_host_header_override.as_deref(),
     )?;
     let origin_host = settings.publisher.origin_host();
+    let origin_host_header = settings.publisher.origin_host_header();
 
-    // lgtm[rust/cleartext-logging]
-    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
-    log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
-        backend_name,
-        settings.publisher.origin_url
-    );
+    log::debug!("Proxying request to configured publisher backend");
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
-    req.set_header("host", &origin_host);
+    req.set_header("host", &origin_host_header);
 
     let mut response = req
         .send(&backend_name)
@@ -490,10 +488,11 @@ pub fn handle_publisher_request(
             message: "Failed to proxy request to origin".to_owned(),
         })?;
 
-    log::debug!("Response headers:");
-    for (name, value) in response.get_headers() {
-        log::debug!("  {name}: {value:?}");
-    }
+    log::debug!(
+        "Publisher origin response received: status={}, header_count={}",
+        response.get_status(),
+        response.get_headers().count()
+    );
 
     let content_type = response
         .get_header(header::CONTENT_TYPE)
@@ -533,19 +532,17 @@ pub fn handle_publisher_request(
                     "Empty request host \u{2014} returning processable content unmodified (Content-Type: '{content_type}', status: {status}). Check proxy Host header.",
                 );
             } else if !is_supported_content_encoding(&content_encoding) {
-                log::warn!(
-                    "Unsupported Content-Encoding '{content_encoding}' - returning response unmodified",
-                );
+                log::warn!("Unsupported Content-Encoding; returning response unmodified");
             } else {
                 log::debug!(
-                    "Skipping response processing - Content-Type: '{content_type}', request_host: '{request_host}', status: {status}",
+                    "Skipping response processing - Content-Type: '{content_type}', status: {status}",
                 );
             }
             Ok(PublisherResponse::Buffered(response))
         }
         ResponseRoute::Stream => {
             log::debug!(
-                "Streaming response - Content-Type: {content_type}, Content-Encoding: {content_encoding}, Request Host: {request_host}, Origin Host: {origin_host}",
+                "Streaming response - Content-Type: {content_type}, Content-Encoding: {content_encoding}",
             );
 
             let body = response.take_body();
@@ -566,7 +563,7 @@ pub fn handle_publisher_request(
         }
         ResponseRoute::BufferedProcessed => {
             log::debug!(
-                "Buffered response - Content-Type: {content_type}, Content-Encoding: {content_encoding}, Request Host: {request_host}, Origin Host: {origin_host}",
+                "Buffered response - Content-Type: {content_type}, Content-Encoding: {content_encoding}",
             );
 
             let body = response.take_body();

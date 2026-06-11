@@ -115,7 +115,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     ///
     /// Handles all supported compression transformations by wrapping the raw
     /// reader/writer in the appropriate decoder/encoder, then delegating to
-    /// [`Self::process_chunks`].
+    /// `Self::process_chunks`.
     ///
     /// # Errors
     ///

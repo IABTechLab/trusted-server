@@ -42,7 +42,7 @@
 //!
 //! 1. **SDK Loading**: Browser requests `/integrations/datadome/tags.js`
 //! 2. **Proxy & Rewrite**: Trusted Server fetches from `js.datadome.co`, rewrites internal
-//!    URLs to first-party paths using [`DATADOME_URL_PATTERN`]
+//!    URLs to first-party paths using `DATADOME_URL_PATTERN`
 //! 3. **Signal Collection**: SDK sends signals to `/integrations/datadome/js/`
 //! 4. **Transparent Proxy**: Trusted Server forwards to `api-js.datadome.co`, returns response
 //!
@@ -71,6 +71,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
@@ -395,6 +396,7 @@ impl IntegrationProxy for DataDomeIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();

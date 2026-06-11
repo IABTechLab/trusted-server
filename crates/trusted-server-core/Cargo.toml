@@ -45,7 +45,6 @@ toml = { workspace = true }
 trusted-server-js = { path = "../trusted-server-js" }
 trusted-server-openrtb = { path = "../trusted-server-openrtb" }
 url = { workspace = true }
-urlencoding = { workspace = true }
 uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -71,6 +70,7 @@ default = []
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
+urlencoding = { workspace = true }
 
 [[bench]]
 name = "consent_decode"
