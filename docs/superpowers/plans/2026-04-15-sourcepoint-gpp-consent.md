@@ -14,11 +14,11 @@
 
 ## File Map
 
-| File                                                        | Action | Responsibility                                      |
-| ----------------------------------------------------------- | ------ | --------------------------------------------------- |
-| `crates/trusted-server-core/src/consent/types.rs`           | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
-| `crates/trusted-server-core/src/consent/gpp.rs`             | Modify | Decode US sections, extract `sale_opt_out`          |
-| `crates/trusted-server-core/src/consent/mod.rs`             | Modify | Add GPP US branch in `allows_ec_creation()`, tests  |
+| File                                                                       | Action | Responsibility                                      |
+| -------------------------------------------------------------------------- | ------ | --------------------------------------------------- |
+| `crates/trusted-server-core/src/consent/types.rs`                          | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
+| `crates/trusted-server-core/src/consent/gpp.rs`                            | Modify | Decode US sections, extract `sale_opt_out`          |
+| `crates/trusted-server-core/src/consent/mod.rs`                            | Modify | Add GPP US branch in `allows_ec_creation()`, tests  |
 | `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`       | Create | localStorage auto-discovery, cookie mirroring       |
 | `crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts` | Create | Vitest tests for cookie mirroring                   |
 
