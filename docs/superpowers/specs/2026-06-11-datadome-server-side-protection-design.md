@@ -44,9 +44,9 @@ JavaScript SDK.
 - No automatic de-duplication when a publisher already manually loads the
   DataDome tag. The explicit `inject_client_side_tag = false` escape hatch is
   sufficient for v1.
-- No Fastly Secret Store lookup for `server_side_key` in v1. The first
-  implementation uses redacted `trusted-server.toml` / environment
-  configuration.
+- No literal DataDome server-side secret value in `trusted-server.toml`.
+  Operators configure the runtime secret store and secret name, and the key is
+  read from Secret Store at request time with process-local caching.
 
 ## Decisions from Design Discussion
 
@@ -60,8 +60,9 @@ JavaScript SDK.
 5. **Client-side tag:** auto-inject when a client-side key is configured.
 6. **Methods:** protect every non-`OPTIONS` method, including `HEAD`, when the
    URL is otherwise in scope.
-7. **Secret handling:** use redacted `trusted-server.toml` / environment
-   configuration for `server_side_key` in v1.
+7. **Secret handling:** read the DataDome server-side key from runtime Secret
+   Store using configured store/name fields. Do not store the literal key in
+   `trusted-server.toml`.
 8. **Timeout:** use `1500ms` as the default Protection API timeout for v1.
 9. **Duplicate tag handling:** do not attempt automatic duplicate-tag
    detection in v1; operators can disable injection with
@@ -292,7 +293,8 @@ rewrite_sdk = true
 
 # New server-side protection layer
 enable_protection = false
-server_side_key = ""
+server_side_key_secret_store = "datadome"
+server_side_key_secret_name = "server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
 url_pattern_exclusion = "\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"
@@ -308,9 +310,13 @@ client_side_configuration = { ajaxListenerPath = true }
 
 Notes:
 
-- `server_side_key` should use `Redacted<String>` in Rust config and be loaded
-  from redacted TOML/env configuration in v1.
-- `server_side_key` is required only when `enable_protection = true`.
+- The literal server-side key is not stored in Rust config. Rust config stores
+  only `server_side_key_secret_store` and `server_side_key_secret_name`.
+- `server_side_key_secret_store` and `server_side_key_secret_name` are required
+  only when `enable_protection = true`.
+- The DataDome server-side key is read from Secret Store through
+  `RuntimeServices::secret_store()` and cached per process by configured
+  store/name.
 - `client_side_key` is optional. Auto-injection emits a tag only when
   `inject_client_side_tag = true` and `client_side_key` is non-empty; an empty
   key is a valid no-op.
@@ -628,8 +634,9 @@ Update after implementation to describe:
 ### DataDome Config Tests
 
 - existing first-party proxy config still parses
-- protection disabled does not require `server_side_key`
-- protection enabled requires `server_side_key`
+- protection disabled does not require server-side key secret store/name fields
+- protection enabled requires non-empty server-side key secret store/name fields
+- protection fails open when the configured server-side key secret cannot be read
 - invalid regex fails startup
 - injection disabled allows empty `client_side_key`
 - injection enabled with empty `client_side_key` emits no head insert and does
@@ -714,8 +721,8 @@ passes.
 
 1. DataDome protection applies to all non-`OPTIONS` HTTP methods, including
    `HEAD`, when the URL is otherwise in scope.
-2. `server_side_key` uses redacted `trusted-server.toml` / environment
-   configuration in v1. Fastly Secret Store lookup is deferred.
+2. The DataDome server-side key is loaded from runtime Secret Store in v1. The
+   config contains only the secret store and secret name.
 3. The default Protection API timeout is `1500ms` for v1.
 4. Auto-injection does not attempt duplicate-tag detection in v1. The explicit
    `inject_client_side_tag = false` escape hatch is sufficient.

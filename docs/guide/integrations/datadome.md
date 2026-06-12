@@ -43,7 +43,8 @@ rewrite_sdk = true
 
 # Server-side Protection API layer
 enable_protection = false
-server_side_key = ""
+server_side_key_secret_store = "datadome"
+server_side_key_secret_name = "server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
 url_pattern_exclusion = "\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"
@@ -59,24 +60,25 @@ client_side_configuration = { ajaxListenerPath = true }
 
 ### Configuration options
 
-| Option                      | Type    | Default                          | Description                                                                             |
-| --------------------------- | ------- | -------------------------------- | --------------------------------------------------------------------------------------- |
-| `enabled`                   | boolean | `false`                          | Enable the DataDome integration                                                         |
-| `sdk_origin`                | string  | `https://js.datadome.co`         | DataDome SDK origin URL for `tags.js`                                                   |
-| `api_origin`                | string  | `https://api-js.datadome.co`     | DataDome signal collection API origin URL for `/js/*`                                   |
-| `cache_ttl_seconds`         | integer | `3600`                           | Cache TTL for `tags.js`                                                                 |
-| `rewrite_sdk`               | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths                               |
-| `enable_protection`         | boolean | `false`                          | Call the Protection API before route matching                                           |
-| `server_side_key`           | string  | `""`                             | DataDome server-side key; required when `enable_protection = true`                      |
-| `protection_api_origin`     | string  | `https://api-fastly.datadome.co` | Protection API origin                                                                   |
-| `timeout_ms`                | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls                             |
-| `url_pattern_exclusion`     | string  | Static asset extension regex     | Case-insensitive regex matched against `host + pathname` to skip protection             |
-| `url_pattern_inclusion`     | string  | `""`                             | Optional case-insensitive regex matched against `host + pathname` to include protection |
-| `enable_graphql_support`    | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1                              |
-| `client_side_key`           | string  | `""`                             | DataDome client-side JavaScript key used for tag injection                              |
-| `inject_client_side_tag`    | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty                         |
-| `client_side_tag_url`       | string  | `/integrations/datadome/tags.js` | Script URL used by auto-injection                                                       |
-| `client_side_configuration` | object  | `{ ajaxListenerPath = true }`    | Options assigned to `window.ddoptions`                                                  |
+| Option                         | Type    | Default                          | Description                                                                             |
+| ------------------------------ | ------- | -------------------------------- | --------------------------------------------------------------------------------------- |
+| `enabled`                      | boolean | `false`                          | Enable the DataDome integration                                                         |
+| `sdk_origin`                   | string  | `https://js.datadome.co`         | DataDome SDK origin URL for `tags.js`                                                   |
+| `api_origin`                   | string  | `https://api-js.datadome.co`     | DataDome signal collection API origin URL for `/js/*`                                   |
+| `cache_ttl_seconds`            | integer | `3600`                           | Cache TTL for `tags.js`                                                                 |
+| `rewrite_sdk`                  | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths                               |
+| `enable_protection`            | boolean | `false`                          | Call the Protection API before route matching                                           |
+| `server_side_key_secret_store` | string  | `datadome`                       | Runtime secret store containing the DataDome server-side key                            |
+| `server_side_key_secret_name`  | string  | `server_side_key`                | Secret name containing the DataDome server-side key                                     |
+| `protection_api_origin`        | string  | `https://api-fastly.datadome.co` | Protection API origin                                                                   |
+| `timeout_ms`                   | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls                             |
+| `url_pattern_exclusion`        | string  | Static asset extension regex     | Case-insensitive regex matched against `host + pathname` to skip protection             |
+| `url_pattern_inclusion`        | string  | `""`                             | Optional case-insensitive regex matched against `host + pathname` to include protection |
+| `enable_graphql_support`       | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1                              |
+| `client_side_key`              | string  | `""`                             | DataDome client-side JavaScript key used for tag injection                              |
+| `inject_client_side_tag`       | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty                         |
+| `client_side_tag_url`          | string  | `/integrations/datadome/tags.js` | Script URL used by auto-injection                                                       |
+| `client_side_configuration`    | object  | `{ ajaxListenerPath = true }`    | Options assigned to `window.ddoptions`                                                  |
 
 ## Client-side setup
 
@@ -141,7 +143,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 - **Challenge**: return the DataDome response directly without contacting the publisher origin.
 - **Fail-open condition**: continue routing without DataDome effects when the Protection API times out, returns malformed instructions, or returns an unexpected status.
 
-`server_side_key` is required when server-side protection is enabled.
+The configured `server_side_key_secret_store` and `server_side_key_secret_name` must resolve to a non-empty secret when server-side protection is enabled. If the secret cannot be read, DataDome protection fails open for that request.
 
 ### Protected traffic
 
@@ -234,7 +236,8 @@ TRUSTED_SERVER__INTEGRATIONS__DATADOME__API_ORIGIN=https://api-js.datadome.co
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CACHE_TTL_SECONDS=3600
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__REWRITE_SDK=true
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__ENABLE_PROTECTION=true
-TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY=your-server-side-key
+TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_STORE=datadome
+TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=server_side_key
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CLIENT_SIDE_KEY=your-client-side-key
 ```
 
@@ -279,7 +282,8 @@ Check that both fields are configured:
 [integrations.datadome]
 enabled = true
 enable_protection = true
-server_side_key = "YOUR_DATADOME_SERVER_SIDE_KEY"
+server_side_key_secret_store = "datadome"
+server_side_key_secret_name = "server_side_key"
 ```
 
 Also verify the request is not excluded by the default internal/static route exclusions or your custom inclusion/exclusion regexes.

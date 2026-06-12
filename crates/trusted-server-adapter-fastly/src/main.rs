@@ -522,7 +522,7 @@ async fn route_request(
         Ok(RequestFilterRegistryOutcome::Continue(effects)) => effects,
         Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => {
             return Ok(RouteResult {
-                outcome: HandlerOutcome::Buffered(response),
+                outcome: HandlerOutcome::Buffered(*response),
                 ec_context,
                 finalize_kv_graph,
                 eids_cookie,

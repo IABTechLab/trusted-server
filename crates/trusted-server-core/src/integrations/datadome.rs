@@ -76,7 +76,6 @@ use crate::integrations::{
     INTEGRATION_MAX_BODY_BYTES, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
-use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
@@ -107,6 +106,7 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Configuration for `DataDome` integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct DataDomeConfig {
     /// Enable/disable the integration
     #[serde(default = "default_enabled")]
@@ -133,15 +133,19 @@ pub struct DataDomeConfig {
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
 
-    /// Whether to call DataDome Protection API before route matching.
+    /// Whether to call `DataDome` Protection API before route matching.
     #[serde(default)]
     pub enable_protection: bool,
 
-    /// DataDome server-side key used for Protection API validation.
-    #[serde(default)]
-    pub server_side_key: Redacted<String>,
+    /// Runtime secret store containing the `DataDome` server-side key.
+    #[serde(default = "default_server_side_key_secret_store")]
+    pub server_side_key_secret_store: String,
 
-    /// Base URL for the DataDome Protection API.
+    /// Secret name containing the `DataDome` server-side key.
+    #[serde(default = "default_server_side_key_secret_name")]
+    pub server_side_key_secret_name: String,
+
+    /// Base URL for the `DataDome` Protection API.
     #[serde(default = "default_protection_api_origin")]
     #[validate(url)]
     pub protection_api_origin: String,
@@ -163,15 +167,15 @@ pub struct DataDomeConfig {
     #[serde(default)]
     pub enable_graphql_support: bool,
 
-    /// DataDome client-side key used for auto-injecting the browser tag.
+    /// `DataDome` client-side key used for auto-injecting the browser tag.
     #[serde(default)]
     pub client_side_key: String,
 
-    /// Whether to auto-inject the DataDome browser tag when a client-side key exists.
+    /// Whether to auto-inject the `DataDome` browser tag when a client-side key exists.
     #[serde(default = "default_inject_client_side_tag")]
     pub inject_client_side_tag: bool,
 
-    /// URL used for the injected DataDome browser tag.
+    /// URL used for the injected `DataDome` browser tag.
     #[serde(default = "default_client_side_tag_url")]
     pub client_side_tag_url: String,
 
@@ -204,6 +208,14 @@ fn default_protection_api_origin() -> String {
     "https://api-fastly.datadome.co".to_string()
 }
 
+fn default_server_side_key_secret_store() -> String {
+    "datadome".to_string()
+}
+
+fn default_server_side_key_secret_name() -> String {
+    "server_side_key".to_string()
+}
+
 fn default_timeout_ms() -> u32 {
     1500
 }
@@ -233,7 +245,8 @@ impl Default for DataDomeConfig {
             cache_ttl_seconds: default_cache_ttl(),
             rewrite_sdk: default_rewrite_sdk(),
             enable_protection: false,
-            server_side_key: Redacted::default(),
+            server_side_key_secret_store: default_server_side_key_secret_store(),
+            server_side_key_secret_name: default_server_side_key_secret_name(),
             protection_api_origin: default_protection_api_origin(),
             timeout_ms: default_timeout_ms(),
             url_pattern_exclusion: default_url_pattern_exclusion(),
@@ -266,10 +279,17 @@ impl DataDomeIntegration {
         Self::try_new(config).expect("should create DataDome integration")
     }
 
-    fn try_new(config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
-        if config.enable_protection && config.server_side_key.expose().trim().is_empty() {
+    fn try_new(mut config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        config.server_side_key_secret_store =
+            config.server_side_key_secret_store.trim().to_string();
+        config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
+
+        if config.enable_protection
+            && (config.server_side_key_secret_store.is_empty()
+                || config.server_side_key_secret_name.is_empty())
+        {
             return Err(Report::new(Self::error(
-                "server_side_key is required when enable_protection is true",
+                "server_side_key_secret_store and server_side_key_secret_name are required when enable_protection is true",
             )));
         }
 
@@ -916,6 +936,38 @@ mod tests {
         assert_eq!(
             integration.build_api_url("/js/check", Some("foo=bar")),
             "https://api-js.datadome.co/js/check?foo=bar"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_server_side_key_secret_store() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_store = " ".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject empty store"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:?}").contains("server_side_key_secret_store"),
+            "should mention secret store config"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_server_side_key_secret_name() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_name = " ".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject empty name"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:?}").contains("server_side_key_secret_name"),
+            "should mention secret name config"
         );
     }
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
@@ -10,7 +12,8 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     HeaderMutation, RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
 };
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, StoreName};
+use crate::redacted::Redacted;
 
 use super::DataDomeIntegration;
 
@@ -23,6 +26,16 @@ const HEADER_DATADOME_HEADERS: &str = "x-datadome-headers";
 const HEADER_DATADOME_CLIENT_ID: &str = "x-datadome-clientid";
 const HEADER_DATADOME_X_SET_COOKIE: &str = "x-datadome-x-set-cookie";
 const DATADOME_COOKIE_NAME: &str = "datadome";
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct DataDomeServerSideKeyCacheKey {
+    secret_store: String,
+    secret_name: String,
+}
+
+static DATADOME_SERVER_SIDE_KEY_CACHE: LazyLock<
+    Mutex<HashMap<DataDomeServerSideKeyCacheKey, Arc<Redacted<String>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl DataDomeIntegration {
     pub(super) async fn filter_protection_request(
@@ -48,7 +61,8 @@ impl DataDomeIntegration {
     ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
         let api_url = self.protection_validate_url();
         let backend_name = self.ensure_protection_backend(input.services, &api_url)?;
-        let payload = self.build_protection_payload(&input);
+        let server_side_key = self.load_server_side_key(input.services)?;
+        let payload = self.build_protection_payload(&input, server_side_key.as_ref());
         let encoded_body = form_encode(&payload.fields);
 
         let mut builder = request_builder()
@@ -141,7 +155,46 @@ impl DataDomeIntegration {
         ))
     }
 
-    fn build_protection_payload(&self, input: &RequestFilterInput<'_>) -> ProtectionPayload {
+    fn load_server_side_key(
+        &self,
+        services: &RuntimeServices,
+    ) -> Result<Arc<Redacted<String>>, Report<TrustedServerError>> {
+        let cache_key = server_side_key_cache_key(self);
+        if let Some(key) = DATADOME_SERVER_SIDE_KEY_CACHE
+            .lock()
+            .expect("should lock DataDome server-side key cache")
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(key);
+        }
+
+        let store_name = StoreName::from(self.config.server_side_key_secret_store.as_str());
+        let key = services
+            .secret_store()
+            .get_string(&store_name, &self.config.server_side_key_secret_name)
+            .change_context(Self::error(
+                "Failed to read DataDome server-side key from secret store",
+            ))?;
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return Err(Report::new(Self::error(
+                "DataDome server-side key secret must not be empty",
+            )));
+        }
+
+        let key = Arc::new(Redacted::new(key));
+        let mut cache = DATADOME_SERVER_SIDE_KEY_CACHE
+            .lock()
+            .expect("should lock DataDome server-side key cache");
+        Ok(Arc::clone(cache.entry(cache_key).or_insert(key)))
+    }
+
+    fn build_protection_payload(
+        &self,
+        input: &RequestFilterInput<'_>,
+        server_side_key: &Redacted<String>,
+    ) -> ProtectionPayload {
         let req = input.request;
         let client_info = input.services.client_info();
         let mut fields = Vec::new();
@@ -154,7 +207,7 @@ impl DataDomeIntegration {
             header_client_id.clone()
         };
 
-        push_field(&mut fields, "Key", self.config.server_side_key.expose());
+        push_field(&mut fields, "Key", server_side_key.expose());
         push_field(
             &mut fields,
             "IP",
@@ -340,7 +393,7 @@ impl DataDomeIntegration {
                 .body(EdgeBody::from(body_bytes.as_ref().to_vec()))
                 .expect("should build DataDome challenge response");
             return RequestFilterDecision::Respond {
-                response: challenge,
+                response: Box::new(challenge),
                 effects,
             };
         }
@@ -356,6 +409,21 @@ impl DataDomeIntegration {
 struct ProtectionPayload {
     fields: Vec<(String, String)>,
     uses_header_client_id: bool,
+}
+
+fn server_side_key_cache_key(integration: &DataDomeIntegration) -> DataDomeServerSideKeyCacheKey {
+    DataDomeServerSideKeyCacheKey {
+        secret_store: integration.config.server_side_key_secret_store.clone(),
+        secret_name: integration.config.server_side_key_secret_name.clone(),
+    }
+}
+
+#[cfg(test)]
+fn clear_datadome_server_side_key_cache_for_tests() {
+    DATADOME_SERVER_SIDE_KEY_CACHE
+        .lock()
+        .expect("should lock DataDome server-side key cache")
+        .clear();
 }
 
 fn is_internal_path(path: &str) -> bool {
@@ -411,13 +479,13 @@ fn push_header_field(
     push_field(fields, field_name, header_value(req, header_name));
 }
 
-fn push_field(fields: &mut Vec<(String, String)>, key: &'static str, value: impl ToString) {
-    let value = value.to_string();
+fn push_field(fields: &mut Vec<(String, String)>, key: &'static str, value: impl AsRef<str>) {
+    let value = value.as_ref();
     if value.is_empty() {
         return;
     }
 
-    fields.push((key.to_string(), truncate_field(key, &value)));
+    fields.push((key.to_string(), truncate_field(key, value)));
 }
 
 fn form_encode(fields: &[(String, String)]) -> String {
@@ -491,7 +559,7 @@ fn parse_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
             let unquoted = cookie_value.trim_matches('"');
             return Some(
                 urlencoding::decode(unquoted)
-                    .map(|decoded| decoded.into_owned())
+                    .map(std::borrow::Cow::into_owned)
                     .unwrap_or_else(|_| unquoted.to_string()),
             );
         }
@@ -584,7 +652,58 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::integrations::datadome::DataDomeConfig;
+    use crate::platform::test_support::{
+        build_services_with_config_and_secret, HashMapSecretStore, NoopConfigStore, NoopSecretStore,
+    };
+
     use super::*;
+
+    fn protection_integration() -> Arc<DataDomeIntegration> {
+        let config = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            ..DataDomeConfig::default()
+        };
+        DataDomeIntegration::try_new(config).expect("should create integration")
+    }
+
+    #[test]
+    fn load_server_side_key_reads_secret_store() {
+        clear_datadome_server_side_key_cache_for_tests();
+        let mut secrets = HashMap::new();
+        secrets.insert("server_side_key".to_string(), b"secret-from-store".to_vec());
+        let services = build_services_with_config_and_secret(
+            NoopConfigStore,
+            HashMapSecretStore::new(secrets),
+        );
+        let integration = protection_integration();
+
+        let key = integration
+            .load_server_side_key(&services)
+            .expect("should load server-side key");
+
+        assert_eq!(key.expose(), "secret-from-store");
+    }
+
+    #[test]
+    fn load_server_side_key_errors_when_secret_missing() {
+        clear_datadome_server_side_key_cache_for_tests();
+        let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
+        let config = DataDomeConfig {
+            enabled: true,
+            enable_protection: true,
+            server_side_key_secret_name: "missing_server_side_key".to_string(),
+            ..DataDomeConfig::default()
+        };
+        let integration = DataDomeIntegration::try_new(config).expect("should create integration");
+
+        let result = integration.load_server_side_key(&services);
+
+        assert!(result.is_err(), "should error when secret is missing");
+    }
 
     #[test]
     fn parse_cookie_value_decodes_datadome_cookie() {

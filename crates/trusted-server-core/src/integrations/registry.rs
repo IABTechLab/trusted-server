@@ -395,7 +395,7 @@ impl RequestFilterEffects {
 pub enum RequestFilterDecision {
     Continue(RequestFilterEffects),
     Respond {
-        response: Response<EdgeBody>,
+        response: Box<Response<EdgeBody>>,
         effects: RequestFilterEffects,
     },
 }
@@ -411,7 +411,7 @@ pub struct RequestFilterRegistryInput<'a> {
 pub enum RequestFilterRegistryOutcome {
     Continue(RequestFilterEffects),
     Respond {
-        response: Response<EdgeBody>,
+        response: Box<Response<EdgeBody>>,
         effects: RequestFilterEffects,
     },
 }
@@ -865,6 +865,10 @@ impl IntegrationRegistry {
     /// Request header mutations are applied immediately so later filters and
     /// route handlers observe enriched headers. Response mutations are returned
     /// to the adapter so it can apply them after normal response finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an integration request filter returns an error.
     pub async fn filter_request(
         &self,
         input: RequestFilterRegistryInput<'_>,
