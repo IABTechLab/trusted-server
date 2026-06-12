@@ -215,7 +215,7 @@ rewrite_script = true
 # ]
 
 [auction]
-enabled = false
+enabled = true
 providers = ["prebid"]
 # mediator = "adserver_mock"
 timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT_MS
