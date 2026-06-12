@@ -1,10 +1,7 @@
 //! Edge Cookie (EC) ID generation using HMAC.
 //!
 //! This module generates EC IDs from the client IP address and a configured
-//! secret key. Trusted Server is technology. It is neutral on policy.
-//! Whether the resulting cookie is set is gated by the consent
-//! evaluation for the detected jurisdiction. How the value is used by
-//! downstream integrations is determined by integration configuration.
+//! secret key. 
 
 use std::net::IpAddr;
 

@@ -212,7 +212,7 @@ impl IntegrationScriptRewriter for MyIntegration {
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
 ::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects its own replacement. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
 :::
 
 ### 5b. Implement Head Injection (Optional)

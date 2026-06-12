@@ -174,7 +174,7 @@ A comprehensive creative forensics engine for ad behavior monitoring and fraud p
 
 - **Compliance Support**: Detect and block creative behavior that conflicts with the publisher's consent policy (potential $2.3M+ fine risk reduction)
 - **Revenue Protection**: Detect bid manipulation and auction fraud ($400K+ annual recovery potential)
-- **User Retention**: Block malvertising before it reaches users (prevent user exodus, retain 100K+ users)
+- **User Trust**: Block malvertising before it reaches users (prevent user exodus, retain 100K+ users)
 - **Brand Safety**: Real-time creative quality assurance
 
 **Technical Implementation:**
