@@ -22,6 +22,10 @@ config = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
+# Still required by ec/kv.rs (KV Store compare-and-swap via InsertMode +
+# generation preconditions, which the EdgeZero KvStore trait does not expose
+# yet) and ec/rate_limiter.rs (fastly::erl Edge Rate Limiting). Removal is
+# deferred until EdgeZero grows equivalent APIs — tracked in issue #495.
 fastly = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
