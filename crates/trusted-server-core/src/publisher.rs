@@ -204,6 +204,8 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
+    // lgtm[rust/cleartext-logging]
+    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
         "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
         params.content_type,
@@ -546,6 +548,8 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
+    // lgtm[rust/cleartext-logging]
+    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
     log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
