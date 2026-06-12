@@ -7,7 +7,6 @@
 //! - [`UsPrivacy`] / [`PrivacyFlag`] — decoded US Privacy (CCPA) 4-char string
 //! - [`TcfConsent`] — decoded TCF v2 core consent data
 //! - [`GppConsent`] — decoded GPP consent data
-//! - [`Jurisdiction`] — the privacy regime applicable to the request
 //! - [`ConsentSource`] — how consent was sourced (cookie, KV store, etc.)
 
 use core::fmt;

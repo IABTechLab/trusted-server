@@ -31,6 +31,16 @@ mod consent_config;
 #[path = "src/price_bucket.rs"]
 mod price_bucket;
 
+#[path = "src/host_header.rs"]
+mod host_header;
+
+#[path = "src/platform/image_optimizer.rs"]
+mod platform_image_optimizer;
+
+mod platform {
+    pub use crate::platform_image_optimizer::PlatformImageOptimizerRegion;
+}
+
 // CreativeOpportunitiesConfig for build.rs deserialization only
 mod creative_opportunities {
     use serde::{Deserialize, Serialize};

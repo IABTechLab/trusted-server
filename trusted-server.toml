@@ -12,6 +12,8 @@ password = "replace-with-admin-password-32-bytes"
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
 origin_url = "https://origin.test-publisher.com"
+# Optional: override outbound Host header while connecting to origin_url.
+# origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
@@ -192,6 +194,36 @@ rewrite_script = true
 #     "*.edgecompute.app",
 # ]
 
+# Reusable Fastly Image Optimizer profile sets for asset routes.
+# Keep production/customer-specific profile names and tables in private deployment config.
+# Profile values intentionally support a strict subset of IO params: quality,
+# resize-filter, format, width, height, and crop. Client query parameters are
+# mapped through this table instead of being passed through as arbitrary IO options.
+# [image_optimizer.profile_sets.default_images]
+# base_params = "quality=70&resize-filter=bicubic"
+# default_profile = "default"
+# unknown_profile = "use_default" # "use_default" or "reject"
+# profile_param = "profile"
+# aspect_ratio_param = "ar"
+# debug_param = "_io_debug" # _io_debug=1 bypasses IO for one request
+#
+# [image_optimizer.profile_sets.default_images.profiles]
+# default = "width=1920"
+# thumbnail = "width=150&crop=1:1,smart"
+# medium = "format=auto&width=828"
+# large = "format=auto&width=1536"
+#
+# [image_optimizer.profile_sets.default_images.aspect_ratios]
+# allowed = ["1-1", "16-9", "4-3"]
+# profiles = ["medium", "large"]
+#
+# [image_optimizer.profile_sets.default_images.crop_offsets]
+# enabled = true
+# x_param = "x"
+# y_param = "y"
+# buckets = [10, 30, 50, 70, 90]
+# default = 50
+# when_missing = "smart"
 
 # Proxy configuration
 [proxy]
@@ -199,6 +231,53 @@ rewrite_script = true
 # Defaults to true. Set to false only for local development with self-signed certificates.
 # certificate_check = true
 
+# Configure first-party asset paths that should proxy to a different backend origin.
+# Matching is path-prefix-based and the longest matching prefix wins.
+# Include a trailing / unless you intentionally want /static to also match paths such as /staticfile.js.
+# Only GET/HEAD requests participate. Built-in and integration routes still take precedence.
+# Trusted Server preserves the incoming query string. By default it also preserves
+# the incoming path, but path_pattern/target_path can generically rewrite paths
+# before sending them upstream.
+#
+# [[proxy.asset_routes]]
+# prefix = "/.images/"
+# origin_url = "https://some.fastly-service.example.com"
+#
+# Example: private S3 origin with Fastly IO profile-table conversion.
+# [[proxy.asset_routes]]
+# prefix = "/.image/"
+# origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+#
+# [proxy.asset_routes.auth]
+# type = "s3_sigv4"
+# region = "us-east-1"
+# origin_query = "strip" # Strip transform query params before S3 signing
+# secret_store = "s3-auth"
+# access_key_id = "access_key_id"
+# secret_access_key = "secret_access_key"
+# # session_token = "session_token"
+#
+# [proxy.asset_routes.image_optimizer]
+# enabled = true
+# region = "us_east"
+# profile_set = "default_images"
+# # Enabled IO routes strip origin queries by default. origin_query = "preserve"
+# # is rejected while IO is enabled because Fastly can treat query params as transforms.
+#
+# Example: CDN-style first-party image path rewrite.
+# [[proxy.asset_routes]]
+# prefix = "/.image/"
+# origin_url = "https://assets-cdn.example.com"
+# path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
+# target_path = "/image/upload/$1.$2"
+#
+# Example: shared static assets stored under an upstream /_network prefix.
+# [[proxy.asset_routes]]
+# prefix = "/_next/static/"
+# origin_url = "https://static-assets.example.com"
+# path_pattern = "^(.*)$"
+# target_path = "/_network$1"
+#
 # Restrict redirect destinations for the first-party proxy to an explicit domain allowlist.
 # Supports exact match ("example.com") and subdomain wildcard prefix ("*.example.com").
 # Wildcard prefix also matches the apex domain ("*.example.com" matches "example.com").

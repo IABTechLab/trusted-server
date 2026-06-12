@@ -4,6 +4,7 @@ use std::fmt;
 use edgezero_core::http::{Request as EdgeRequest, Response as EdgeResponse};
 use error_stack::Report;
 
+use super::image_optimizer::PlatformImageOptimizerOptions;
 use super::PlatformError;
 
 /// Outbound HTTP request paired with a pre-resolved backend name.
@@ -17,6 +18,16 @@ pub struct PlatformHttpRequest {
     pub request: EdgeRequest,
     /// Backend name resolved ahead of time via `PlatformBackend`.
     pub backend_name: String,
+    /// Optional Image Optimizer metadata for platforms that support it.
+    ///
+    /// Adapters that cannot attach this metadata to their send path should
+    /// return an error rather than silently dropping transformations.
+    pub image_optimizer: Option<PlatformImageOptimizerOptions>,
+    /// Whether the response body should stay streaming in the platform response.
+    ///
+    /// Adapters that cannot preserve streaming response bodies should return an
+    /// error rather than silently buffering large asset responses.
+    pub stream_response: bool,
 }
 
 impl PlatformHttpRequest {
@@ -26,7 +37,30 @@ impl PlatformHttpRequest {
         Self {
             request,
             backend_name: backend_name.into(),
+            image_optimizer: None,
+            stream_response: false,
         }
+    }
+
+    /// Attach Image Optimizer metadata to the request.
+    ///
+    /// The current Fastly adapter supports this on [`PlatformHttpClient::send`]
+    /// and rejects it on [`PlatformHttpClient::send_async`] because Fastly IO is
+    /// not available through the fan-out helper path.
+    #[must_use]
+    pub fn with_image_optimizer(mut self, options: PlatformImageOptimizerOptions) -> Self {
+        self.image_optimizer = Some(options);
+        self
+    }
+
+    /// Preserve the upstream response body as a stream when the adapter supports it.
+    ///
+    /// Asset routes use this to avoid materializing large image/static responses
+    /// into WASM memory before returning them to the client.
+    #[must_use]
+    pub fn with_stream_response(mut self) -> Self {
+        self.stream_response = true;
+        self
     }
 }
 
