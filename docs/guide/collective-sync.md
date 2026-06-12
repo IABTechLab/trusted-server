@@ -1,6 +1,6 @@
 # Collective Sync Architecture
 
-Trusted Server supports cross-publisher data sharing through a **Collective Sync** model. Publishers who share the same EC secret key can synchronize user data across their properties, enabling privacy-preserving audience insights without third-party cookies.
+Trusted Server supports cross-publisher data sharing through a **Collective Sync** model. Publishers who share the same EC secret key can synchronize user data across their properties, enabling audience insights via a shared first-party identifier without cross-domain script execution.
 
 ## Overview
 
@@ -191,8 +191,8 @@ The sync endpoint handles:
 
 ## Privacy Considerations
 
-- **No PII**: EC IDs contain no personally identifiable information
-- **Consent-gated**: Only users with GDPR consent are included
+- **Identifier content**: EC IDs are one-way HMAC values with a random suffix and embed no readable personal fields
+- **Consent-gated**: Inclusion follows the consent signals and policy the publisher configures
 - **Publisher control**: Each publisher controls what segments they share
 - **Audit trail**: Object Store maintains full history of data sources
 
@@ -210,4 +210,4 @@ The sync endpoint handles:
 
 - [Edge Cookies](/guide/edge-cookies) - Understand ID generation
 - [Configuration Reference](/guide/configuration) - Full config options
-- [GDPR Compliance](/guide/gdpr-compliance) - Privacy requirements
+- [GDPR Compliance](/guide/gdpr-compliance) - Consent signal handling

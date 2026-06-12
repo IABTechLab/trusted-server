@@ -19,7 +19,7 @@
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
 //! - [`kv_types`] — Schema types for KV identity graph entries
-//! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
+//! - [`device`]: Device signal derivation (UA, JA4, H2 SETTINGS)
 //! - [`partner`] — Partner validation helpers (ID format, pull sync config)
 //! - [`registry`] — In-memory partner registry built from config
 //! - [`rate_limiter`] — Rate limiting abstraction (Fastly Edge Rate Limiting)

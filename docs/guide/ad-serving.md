@@ -1,10 +1,10 @@
 # Ad Serving
 
-Learn how Trusted Server handles privacy-compliant ad serving.
+Learn how Trusted Server handles consent-aware ad serving.
 
 ## Overview
 
-Trusted Server provides edge-based ad serving with built-in GDPR compliance and real-time bidding support.
+Trusted Server provides edge-based ad serving with consent signal enforcement and real-time bidding support.
 
 ## Supported Integrations
 
@@ -29,8 +29,8 @@ Real-time bidding integration:
 ## Ad Request Flow
 
 1. Request validation
-2. GDPR consent check
-3. EC ID generation (if consented)
+2. Consent signal check
+3. EC ID generation (when the consent evaluation permits)
 4. Ad server request
 5. Response processing
 6. Creative delivery
@@ -59,7 +59,7 @@ Creatives can be proxied through Trusted Server for:
 - Security scanning
 - Content modification
 - Click tracking injection
-- GDPR compliance
+- Consent signal enforcement
 
 ### Direct Mode
 
@@ -84,10 +84,10 @@ trustedServer.trackImpression({
 
 ### Click Tracking
 
-Click tracking with privacy preservation:
+Click tracking via first-party context:
 
-- No PII in URLs
-- EC ID only (with consent)
+- URLs carry no name, email, or account identifier fields supplied by the user
+- EC ID when issued under the consent gate
 - Encrypted parameters
 
 ## Performance

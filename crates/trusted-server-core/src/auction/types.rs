@@ -18,7 +18,7 @@ pub struct AuctionRequest {
     pub slots: Vec<AdSlot>,
     /// Publisher information
     pub publisher: PublisherInfo,
-    /// User information (privacy-preserving)
+    /// User information (consent-aware)
     pub user: UserInfo,
     /// Device information
     pub device: Option<DeviceInfo>,
@@ -67,7 +67,7 @@ pub struct PublisherInfo {
     pub page_url: Option<String>,
 }
 
-/// Privacy-preserving user information.
+/// Consent-aware user information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     /// Stable EC ID (from cookie or freshly generated).

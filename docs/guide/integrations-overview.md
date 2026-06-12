@@ -1,6 +1,6 @@
 # Integrations Overview
 
-Trusted Server provides built-in integrations with popular third-party services, enabling first-party data collection and privacy-preserving advertising. This page provides a comparison of all available integrations.
+Trusted Server provides built-in integrations with third-party services for first-party data collection and consent-aware advertising. The available integrations are compared below.
 
 ## Quick Comparison
 
@@ -21,7 +21,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 **Key Features:**
 
 - OpenRTB 2.x protocol conversion
-- EC ID injection for privacy
+- EC ID injection into bid requests
 - First-party creative resource proxying
 - CDN URL rewriting (7+ major SSPs)
 - GPC signal support
@@ -45,7 +45,7 @@ debug = false
 - `POST /third-party/ad` - Client-side auction endpoint
 - `GET /prebid.js` - Optional empty script override
 
-**When to use:** You want to monetize your site with programmatic advertising while maintaining privacy and first-party context.
+**When to use:** You want to monetize your site with programmatic advertising while maintaining first-party context.
 
 **Learn more:** [Ad Serving Guide](./ad-serving.md)
 
@@ -73,7 +73,7 @@ rewrite_attributes = ["href", "link", "url"]
 
 **Endpoints:** None (pure HTML/script rewriting)
 
-**When to use:** You have a Next.js application and want to ensure all links and assets route through your first-party domain for better tracking and privacy.
+**When to use:** You have a Next.js application and want to ensure all links and assets route through your first-party domain.
 
 **Learn more:** [Integration Guide](./integration-guide.md)
 
@@ -88,7 +88,7 @@ rewrite_attributes = ["href", "link", "url"]
 - Complete first-party SDK serving
 - Multi-endpoint proxying (API, Events, Sync, Secure Signals, CDN)
 - SDK caching for performance
-- Privacy compliance (first-party cookies)
+- Cookies set on the publisher's domain
 - Header forwarding for authentication
 
 **Configuration:**
@@ -110,11 +110,11 @@ rewrite_sdk = true
 - `GET /integrations/permutive/sdk` - SDK serving
 - `GET/POST /integrations/permutive/api/*` - API proxy
 - `GET/POST /integrations/permutive/secure-signal/*` - Secure Signals
-- `GET/POST /integrations/permutive/events/*` - Event tracking
+- `GET/POST /integrations/permutive/events/*` - Event collection
 - `GET/POST /integrations/permutive/sync/*` - ID synchronization
 - `GET /integrations/permutive/cdn/*` - CDN proxy
 
-**When to use:** You use Permutive for audience segmentation and want to maintain first-party data collection in a privacy-compliant way.
+**When to use:** You use Permutive for audience segmentation and want to maintain first-party data collection.
 
 **Learn more:** [Integration Guide](./integration-guide.md)
 

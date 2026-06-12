@@ -247,7 +247,7 @@ The orchestrator collects all bids and creates an OpenRTB response:
 }
 ```
 
-Note that creative HTML is rewritten to use the first-party proxy (`/first-party/proxy`) for privacy and security.
+Note that creative HTML is rewritten to use the first-party proxy (`/first-party/proxy`) for security.
 
 ## Route Registration & Endpoints
 

@@ -504,7 +504,7 @@ fn finalize_proxied_response(
             beresp.set_header(header::CONTENT_TYPE, "image/*");
         }
 
-        // Heuristics to log likely tracking pixels without altering response
+        // Heuristics to log likely pixel images without altering response
         let mut is_pixel = false;
         if let Some(cl) = beresp
             .get_header(header::CONTENT_LENGTH)

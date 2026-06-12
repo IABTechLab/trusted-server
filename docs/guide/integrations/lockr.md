@@ -6,15 +6,15 @@
 
 ## Overview
 
-The Lockr integration enables first-party identity resolution and privacy-compliant data management through Lockr's identity vault platform. This integration provides secure, consented identity synchronization while maintaining GDPR compliance.
+The Lockr integration enables first-party identity resolution and data management through Lockr's identity vault platform. This integration provides identity synchronization, with downstream forwarding subject to available consent signals.
 
 ## What is Lockr?
 
-Lockr is an identity resolution and privacy platform that helps publishers manage user identities across fragmented environments (cookieless browsers, multiple devices, etc.) while respecting user privacy and consent.
+Lockr is an identity resolution and privacy platform that helps publishers manage user identities across fragmented environments (cookieless browsers, multiple devices, etc.) subject to user consent.
 
 **Key Capabilities**:
 
-- Privacy-preserving identity graphs
+- Identity graph management
 - Consent-based data sharing
 - Secure identity vault
 - Cross-device user recognition
@@ -118,7 +118,7 @@ Lockr identities are injected into OpenRTB bid requests as Extended Identifiers:
 
 **Solution**: Lockr provides first-party identity resolution that works across cookieless environments.
 
-**Benefit**: Maintain user recognition and monetization in privacy-focused browsers.
+**Benefit**: Maintain user recognition and monetization in browsers that restrict third-party cookies.
 
 ### 2. Cross-Device User Recognition
 
@@ -128,13 +128,13 @@ Lockr identities are injected into OpenRTB bid requests as Extended Identifiers:
 
 **Benefit**: Better audience targeting and frequency capping across devices.
 
-### 3. Privacy-Compliant Data Sharing
+### 3. Consent-Based Data Sharing
 
 **Problem**: Sharing user data with partners raises GDPR/CCPA compliance risks.
 
 **Solution**: Lockr enforces consent-based access to identity data.
 
-**Benefit**: Compliant data monetization without regulatory risk.
+**Benefit**: Data monetization gated on recorded consent.
 
 ## Implementation Details
 
@@ -156,7 +156,7 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 
 **Consent Validation**:
 
-- Checks GDPR consent before syncing
+- Checks consent signals before syncing
 - Integrates with CMP (e.g., Didomi)
 - Respects user withdrawal of consent
 

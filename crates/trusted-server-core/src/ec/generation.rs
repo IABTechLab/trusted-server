@@ -1,7 +1,10 @@
 //! Edge Cookie (EC) ID generation using HMAC.
 //!
-//! This module provides functionality for generating privacy-preserving EC IDs
-//! based on the client IP address and a secret key.
+//! This module generates EC IDs from the client IP address and a configured
+//! secret key. Trusted Server is technology. It is neutral on policy.
+//! Whether the resulting cookie is set is gated by the consent
+//! evaluation for the detected jurisdiction. How the value is used by
+//! downstream integrations is determined by integration configuration.
 
 use std::net::IpAddr;
 
@@ -65,9 +68,9 @@ fn generate_random_suffix(length: usize) -> String {
 /// Generates a fresh EC ID from a pre-captured client IP string.
 ///
 /// Uses only the client IP (not user-agent or other headers) intentionally:
-/// EC IDs are meant to be simple, privacy-preserving identifiers — not
-/// high-entropy fingerprints. The random suffix provides per-cookie
-/// uniqueness for users behind the same NAT/proxy.
+/// EC IDs are deterministic identifiers (HMAC base plus random suffix),
+/// not high-entropy probabilistic identifiers. The random suffix provides
+/// per-cookie uniqueness for users behind the same NAT or proxy.
 ///
 /// Creates an HMAC-SHA256-based ID using the configured secret key and
 /// the client IP address, then appends a random suffix for additional

@@ -6,11 +6,11 @@
 
 ## Overview
 
-The Didomi integration enables first-party serving of Didomi's consent management platform (CMP) through Trusted Server. By proxying Didomi's SDK and API through your domain, you maintain first-party context while ensuring GDPR/TCF 2.2 compliance.
+The Didomi integration enables first-party serving of Didomi's consent management platform (CMP) through Trusted Server. By proxying Didomi's SDK and API through your domain, you maintain first-party context for Didomi's GDPR/TCF 2.2 consent flows.
 
 ## What is Didomi?
 
-Didomi is a Consent Management Platform that helps publishers comply with GDPR, CCPA, and other privacy regulations by managing user consent for data collection and processing.
+Didomi is a Consent Management Platform that manages user consent for data collection and processing under GDPR, CCPA, and other regulations.
 
 **Key Capabilities**:
 
@@ -130,17 +130,17 @@ Proxied:  https://your-domain.com/integrations/didomi/consent/api/v1/events
 
 ### Consent Validation
 
-Didomi consent status is checked before:
+Consent signals, such as the TCF v2 format string recorded by the Didomi CMP, are checked before:
 
 - Generating EC IDs
 - Syncing with identity partners (Lockr)
-- Activating tracking pixels
+- Activating measurement pixels
 - Sharing data with third parties
 
 ```rust
 // Example consent check
-if !has_didomi_consent(&request, Purpose::Tracking) {
-    return reject_tracking();
+if !tcf_consent.has_purpose_consent(1) {
+    return skip_collection();
 }
 ```
 
@@ -161,7 +161,7 @@ Didomi integration supports IAB's Transparency & Consent Framework 2.2:
 
 **Solution**: Serve Didomi SDK from your domain via Trusted Server proxy.
 
-**Benefit**: Consent notice loads reliably, compliance maintained.
+**Benefit**: Consent notice loads reliably and consent collection continues.
 
 ### 2. Regional Consent Enforcement
 
@@ -169,7 +169,7 @@ Didomi integration supports IAB's Transparency & Consent Framework 2.2:
 
 **Solution**: Didomi provides region-specific consent flows, Trusted Server forwards geo data.
 
-**Benefit**: Automatic compliance with regional privacy laws.
+**Benefit**: Region-appropriate consent flows driven by forwarded geo data.
 
 ### 3. Consent-Based Data Activation
 
@@ -177,7 +177,7 @@ Didomi integration supports IAB's Transparency & Consent Framework 2.2:
 
 **Solution**: Check Didomi consent status in Trusted Server before data processing.
 
-**Benefit**: Provable compliance, reduced regulatory risk.
+**Benefit**: Consent status checked before data processing.
 
 ## Implementation
 
@@ -353,13 +353,13 @@ Content-Security-Policy:
 ### Data Privacy
 
 - Didomi consent data stays first-party
-- No PII shared without consent
+- Data sharing follows recorded consent status
 - Consent strings stored locally
 - User can withdraw consent anytime
 
 ## Next Steps
 
-- Review [GDPR Compliance](/guide/gdpr-compliance) for consent enforcement
+- Review [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
 - Explore [Lockr Integration](/guide/integrations/lockr) for consent-based identity
 - Check [Configuration](/guide/configuration) for advanced setup
 - Read [First-Party Proxy](/guide/first-party-proxy) for proxy architecture

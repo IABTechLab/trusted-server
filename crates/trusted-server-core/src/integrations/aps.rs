@@ -99,7 +99,7 @@ struct ApsContextual {
     #[serde(default)]
     slots: Vec<ApsSlotResponse>,
 
-    /// Event tracking host
+    /// Event collection endpoint
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
 
@@ -111,7 +111,7 @@ struct ApsContextual {
     #[serde(skip_serializing_if = "Option::is_none")]
     cfe: Option<bool>,
 
-    /// Event tracking enabled
+    /// Event collection enabled
     #[serde(skip_serializing_if = "Option::is_none")]
     ev: Option<bool>,
 
@@ -123,7 +123,7 @@ struct ApsContextual {
     #[serde(skip_serializing_if = "Option::is_none")]
     cb: Option<String>,
 
-    /// Campaign tracking URL
+    /// Campaign attribution URL
     #[serde(skip_serializing_if = "Option::is_none")]
     cmp: Option<String>,
 }
