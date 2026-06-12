@@ -140,8 +140,17 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
         "EC ID must be validated before cookie creation: got '{ec_id}'"
     );
 
-    if let Ok(val) = HeaderValue::from_str(&create_ec_cookie(settings, ec_id)) {
-        response.headers_mut().append(header::SET_COOKIE, val);
+    match HeaderValue::from_str(&create_ec_cookie(settings, ec_id)) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice — is_safe_cookie_value and the debug
+            // assertion above gate the value, and format_set_cookie emits
+            // only controlled bytes. Logged for defense-in-depth symmetry
+            // with the rejection logging above.
+            log::warn!("Skipping EC Set-Cookie: invalid header value: {e}");
+        }
     }
 }
 
@@ -150,12 +159,19 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_
 /// Used when a user revokes consent — the browser will delete the cookie
 /// on receipt of this header.
 pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
-    if let Ok(val) = HeaderValue::from_str(&format_set_cookie(
+    match HeaderValue::from_str(&format_set_cookie(
         &settings.publisher.ec_cookie_domain(),
         "",
         0,
     )) {
-        response.headers_mut().append(header::SET_COOKIE, val);
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice: format_set_cookie emits only
+            // controlled bytes from operator-trusted configuration.
+            log::warn!("Skipping EC cookie expiry Set-Cookie: invalid header value: {e}");
+        }
     }
 }
 

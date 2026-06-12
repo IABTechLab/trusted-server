@@ -270,6 +270,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         }
     };
 
+    // Pop the EC finalize state that route handlers thread out via response
+    // extensions. Must happen before the fastly conversion, which drops
+    // extensions.
+    let ec_state = response
+        .extensions_mut()
+        .remove::<crate::app::EcFinalizeState>();
+
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
@@ -292,6 +299,58 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         }
     }
 
+    // EC response lifecycle, mirroring legacy_main: finalize EC cookies and
+    // request headers on the response, send it, then run pull sync for
+    // recognized browsers. When settings or the partner registry cannot be
+    // loaded the response is sent without EC finalization rather than
+    // dropped.
+    if let Some(ec_state) = ec_state {
+        match get_settings() {
+            Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
+                Ok(partner_registry) => {
+                    // KvIdentityGraph cannot ride in response extensions
+                    // (non-Sync dyn EcKvStore), so rebuild it from settings
+                    // when the handler enabled the KV write path.
+                    let finalize_kv_graph = if ec_state.use_finalize_kv {
+                        maybe_identity_graph(&settings)
+                    } else {
+                        None
+                    };
+                    ec_finalize_response(
+                        &settings,
+                        &ec_state.ec_context,
+                        finalize_kv_graph.as_ref(),
+                        &partner_registry,
+                        ec_state.eids_cookie.as_deref(),
+                        ec_state.sharedid_cookie.as_deref(),
+                        &mut response,
+                    );
+                    compat::to_fastly_response(response).send_to_client();
+
+                    if ec_state.is_real_browser {
+                        if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
+                            run_pull_sync_after_send(
+                                &settings,
+                                &partner_registry,
+                                &context,
+                                &ec_state.services,
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    log::error!(
+                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
+                    );
+                }
+            },
+            Err(e) => {
+                log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
+            }
+        }
+    }
+
     compat::to_fastly_response(response).send_to_client();
 }
 
@@ -304,7 +363,12 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 
 /// Handles a request using the original Fastly-native entry point.
 ///
-/// Preserves identical semantics to the pre-PR14 `main()`. Called whenever
+/// Preserves identical semantics to the pre-PR14 `main()`, with one
+/// relocation: `GET /health` is short-circuited in [`main`] before the flag
+/// dispatch, so it never reaches this function. The pre-PR14 entry point
+/// answered `/health` with the same `200 ok` before settings loading and
+/// routing; the only difference is that the probe now also skips logger
+/// initialization. Called whenever
 /// the `EdgeZero` flag is disabled or cannot be read/parsed as enabled — that
 /// includes config-store open failures, key-read errors, missing keys, and
 /// any value other than the accepted `"true"` / `"1"` forms.
@@ -810,7 +874,7 @@ async fn route_request(
     })
 }
 
-fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
     settings
         .ec
         .ec_store
@@ -864,7 +928,7 @@ fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
-fn require_identity_graph(
+pub(crate) fn require_identity_graph(
     settings: &Settings,
 ) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
     let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
@@ -877,7 +941,7 @@ fn require_identity_graph(
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
-fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
+pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
     let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
@@ -894,7 +958,7 @@ fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
 ///
 /// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
 /// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
+pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
     let ua = req.get_header_str("user-agent").unwrap_or("");
     let ja4 = req.get_tls_ja4();
     let h2_fp = req.get_client_h2_fingerprint();

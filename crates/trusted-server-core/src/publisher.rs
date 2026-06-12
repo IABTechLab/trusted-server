@@ -204,6 +204,8 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
+    // lgtm[rust/cleartext-logging]
+    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
         "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
         params.content_type,
@@ -440,8 +442,8 @@ impl Write for BoundedWriter {
 /// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
 ///
 /// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
-/// when set, so processable origin responses cannot grow the buffer without
-/// bound and exhaust the Wasm heap.
+/// (16 MiB by default), so processable origin responses cannot grow the
+/// buffer without bound and exhaust the Wasm heap.
 ///
 /// # Errors
 ///
@@ -459,30 +461,9 @@ pub fn buffer_publisher_response(
             body,
             params,
         } => {
-            let bytes = match settings.publisher.max_buffered_body_bytes {
-                Some(limit) => {
-                    let mut output = BoundedWriter::new(limit);
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output.into_inner()
-                }
-                None => {
-                    let mut output = Vec::new();
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output
-                }
-            };
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = output.into_inner();
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
                 http::HeaderValue::from(bytes.len() as u64),
@@ -647,6 +628,8 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
+    // lgtm[rust/cleartext-logging]
+    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
     log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,

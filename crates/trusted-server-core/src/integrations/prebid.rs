@@ -1536,7 +1536,13 @@ impl AuctionProvider for PrebidAuctionProvider {
             &self.config.server_url,
             "prebid",
             Duration::from_millis(u64::from(context.timeout_ms)),
-        )?;
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for Prebid Server endpoint: {}",
+                self.config.server_url
+            ),
+        })?;
         let pending = context
             .services
             .http_client()
