@@ -65,6 +65,7 @@ use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
@@ -283,14 +284,17 @@ impl DataDomeIntegration {
         config.server_side_key_secret_store =
             config.server_side_key_secret_store.trim().to_string();
         config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
+        config.protection_api_origin = config.protection_api_origin.trim().to_string();
 
-        if config.enable_protection
-            && (config.server_side_key_secret_store.is_empty()
-                || config.server_side_key_secret_name.is_empty())
-        {
-            return Err(Report::new(Self::error(
-                "server_side_key_secret_store and server_side_key_secret_name are required when enable_protection is true",
-            )));
+        if config.enable_protection {
+            if config.server_side_key_secret_store.is_empty()
+                || config.server_side_key_secret_name.is_empty()
+            {
+                return Err(Report::new(Self::error(
+                    "server_side_key_secret_store and server_side_key_secret_name are required when enable_protection is true",
+                )));
+            }
+            Self::validate_protection_api_origin(&config.protection_api_origin)?;
         }
 
         if config.enable_graphql_support {
@@ -307,6 +311,38 @@ impl DataDomeIntegration {
             protection_exclusion,
             protection_inclusion,
         }))
+    }
+
+    fn validate_protection_api_origin(origin: &str) -> Result<(), Report<TrustedServerError>> {
+        let parsed = Url::parse(origin).map_err(|err| {
+            Report::new(Self::error(format!("Invalid protection_api_origin: {err}")))
+        })?;
+
+        if !parsed.scheme().eq_ignore_ascii_case("https") {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must use https when enable_protection is true",
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must include a host",
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must not include credentials",
+            )));
+        }
+        if !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must be an origin URL without path, query, or fragment",
+            )));
+        }
+
+        Ok(())
     }
 
     fn compile_optional_regex(
@@ -939,6 +975,17 @@ mod tests {
         );
     }
 
+    fn html_context_for_tests(
+        document_state: &crate::integrations::IntegrationDocumentState,
+    ) -> IntegrationHtmlContext<'_> {
+        IntegrationHtmlContext {
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state,
+        }
+    }
+
     #[test]
     fn protection_enabled_requires_server_side_key_secret_store() {
         let mut config = test_config();
@@ -968,6 +1015,105 @@ mod tests {
         assert!(
             format!("{err:?}").contains("server_side_key_secret_name"),
             "should mention secret name config"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_https_protection_api_origin() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.protection_api_origin = "http://api-fastly.datadome.co".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject plaintext Protection API origin"),
+            Err(err) => err,
+        };
+
+        assert!(
+            format!("{err:?}").contains("must use https"),
+            "should require HTTPS for the server-side key transport"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_origin_only_protection_api_origin() {
+        for origin in [
+            "https://api-fastly.datadome.co/custom",
+            "https://api-fastly.datadome.co?region=test",
+            "https://api-fastly.datadome.co#fragment",
+            "https://user:pass@api-fastly.datadome.co",
+        ] {
+            let mut config = test_config();
+            config.enable_protection = true;
+            config.protection_api_origin = origin.to_string();
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject non-origin Protection API URL: {origin}"),
+                Err(err) => err,
+            };
+
+            assert!(
+                format!("{err:?}").contains("protection_api_origin"),
+                "should explain rejected Protection API origin {origin}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protection_enabled_accepts_https_protection_api_origin_with_trailing_slash() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.protection_api_origin = "https://api-fastly.datadome.co/".to_string();
+
+        DataDomeIntegration::try_new(config)
+            .expect("should accept HTTPS origin URL with optional trailing slash");
+    }
+
+    #[test]
+    fn head_injector_emits_client_side_tag_when_key_configured() {
+        let mut config = test_config();
+        config.client_side_key = "test-client-key".to_string();
+        config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
+        let integration = DataDomeIntegration::new(config);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 1, "should emit one combined DataDome insert");
+        assert!(
+            inserts[0].contains("window.ddjskey=\"test-client-key\""),
+            "should serialize the configured client-side key"
+        );
+        assert!(
+            inserts[0].contains("window.ddoptions={\"ajaxListenerPath\":true}"),
+            "should serialize DataDome client-side options"
+        );
+        assert!(
+            inserts[0].contains("<script src=\"/integrations/datadome/tags.js\" async></script>"),
+            "should load the configured DataDome tag URL"
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+        let mut blank_key = test_config();
+        blank_key.client_side_key = " ".to_string();
+        let integration = DataDomeIntegration::new(blank_key);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+        assert!(
+            integration.head_inserts(&ctx).is_empty(),
+            "should not inject a tag without a client-side key"
+        );
+
+        let mut disabled = test_config();
+        disabled.client_side_key = "test-client-key".to_string();
+        disabled.inject_client_side_tag = false;
+        let integration = DataDomeIntegration::new(disabled);
+        assert!(
+            integration.head_inserts(&ctx).is_empty(),
+            "should not inject a tag when injection is disabled"
         );
     }
 

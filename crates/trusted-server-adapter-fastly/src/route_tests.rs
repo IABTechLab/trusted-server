@@ -141,6 +141,7 @@ struct RecordingHttpClient {
     calls: Mutex<Vec<RecordedHttpCall>>,
     response_status: StatusCode,
     response_headers: Vec<(String, String)>,
+    response_body: Vec<u8>,
 }
 
 struct StreamingRecordingHttpClient {
@@ -153,6 +154,7 @@ impl RecordingHttpClient {
             calls: Mutex::new(Vec::new()),
             response_status,
             response_headers: Vec::new(),
+            response_body: Vec::new(),
         }
     }
 
@@ -164,6 +166,11 @@ impl RecordingHttpClient {
             .into_iter()
             .map(|(name, value)| (name.into(), value.into()))
             .collect();
+        self
+    }
+
+    fn with_response_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.response_body = body.into();
         self
     }
 }
@@ -216,7 +223,7 @@ impl PlatformHttpClient for RecordingHttpClient {
             builder = builder.header(name, value);
         }
         let edge_response = builder
-            .body(EdgeBody::from(Vec::new()))
+            .body(EdgeBody::from(self.response_body.clone()))
             .map_err(|_| Report::new(PlatformError::HttpClient))?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -445,6 +452,41 @@ fn create_auction_test_settings(providers: &str) -> Settings {
     Settings::from_toml(&config).expect("should parse adapter auction route test settings")
 }
 
+fn datadome_protection_toml() -> &'static str {
+    r#"
+            [integrations.datadome]
+            enabled = true
+            enable_protection = true
+            server_side_key_secret_store = "datadome"
+            server_side_key_secret_name = "server_side_key"
+        "#
+}
+
+fn create_datadome_auction_test_settings(providers: &str) -> Settings {
+    let base = base_route_settings_toml();
+    let datadome = datadome_protection_toml();
+    let config = format!(
+        r#"{base}
+
+{datadome}
+
+            [auction]
+            enabled = true
+            providers = {providers}
+            timeout_ms = 2000
+        "#,
+    );
+
+    Settings::from_toml(&config).expect("should parse DataDome route test settings")
+}
+
+fn datadome_secret_store() -> Arc<dyn PlatformSecretStore> {
+    Arc::new(HashMapSecretStore::new(HashMap::from([(
+        "server_side_key".to_string(),
+        b"datadome-server-side-key".to_vec(),
+    )])))
+}
+
 fn build_route_stack(settings: &Settings) -> (AuctionOrchestrator, IntegrationRegistry) {
     let orchestrator = build_orchestrator(settings).expect("should build auction orchestrator");
     let integration_registry =
@@ -639,6 +681,229 @@ fn valid_banner_ad_unit_body() -> Vec<u8> {
         ]
     }))
     .expect("should serialize valid auction route test body")
+}
+
+#[test]
+fn datadome_challenge_short_circuits_before_publisher_origin() {
+    let settings = create_datadome_auction_test_settings("[]");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/protected-page");
+    let http_client = Arc::new(
+        RecordingHttpClient::new(StatusCode::FORBIDDEN)
+            .with_response_headers(vec![
+                ("x-datadomeresponse", "403"),
+                ("x-datadome-headers", "Set-Cookie X-DD-B"),
+                ("set-cookie", "datadome=challenge; Path=/; HttpOnly"),
+                ("x-dd-b", "1"),
+            ])
+            .with_response_body(b"blocked by datadome".to_vec()),
+    );
+    let services = test_runtime_services_with_secret_and_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let mut response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route DataDome challenge response",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::FORBIDDEN,
+        "should return the DataDome challenge status instead of contacting publisher origin"
+    );
+    assert_eq!(
+        response.get_header_str("x-dd-b"),
+        Some("1"),
+        "should apply DataDome downstream challenge headers"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        Some("datadome=challenge; Path=/; HttpOnly"),
+        "should append the DataDome challenge cookie"
+    );
+    assert_eq!(
+        response.take_body_str(),
+        "blocked by datadome",
+        "should return the DataDome challenge body"
+    );
+
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should call only the Protection API");
+    assert_eq!(calls[0].method, Method::POST, "should POST to DataDome");
+    assert_eq!(
+        calls[0].uri, "https://api-fastly.datadome.co/validate-request",
+        "should call the default DataDome Protection API endpoint"
+    );
+}
+
+#[test]
+fn datadome_allow_applies_downstream_headers_and_protects_auction() {
+    let settings = create_datadome_auction_test_settings("[]");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::post("https://test.com/auction")
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_body(valid_banner_ad_unit_body());
+    let http_client = Arc::new(
+        RecordingHttpClient::new(StatusCode::OK).with_response_headers(vec![
+            ("x-datadomeresponse", "200"),
+            ("x-datadome-headers", "Set-Cookie X-DD-B"),
+            ("set-cookie", "datadome=allow; Path=/; HttpOnly"),
+            ("x-dd-b", "allowed"),
+        ]),
+    );
+    let services = test_runtime_services_with_secret_and_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route DataDome-allowed auction request",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "empty-provider auction should still run after DataDome allows the request"
+    );
+    assert_eq!(
+        response.get_header_str("x-dd-b"),
+        Some("allowed"),
+        "should apply DataDome downstream headers after route finalization"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        Some("datadome=allow; Path=/; HttpOnly"),
+        "should preserve DataDome downstream Set-Cookie on allowed requests"
+    );
+
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "should protect /auction through DataDome by default"
+    );
+    assert_eq!(calls[0].method, Method::POST, "should POST to DataDome");
+}
+
+#[test]
+fn datadome_api_error_fails_open_before_routing() {
+    let settings = create_datadome_auction_test_settings("[]");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::post("https://test.com/auction")
+        .with_header(header::CONTENT_TYPE, "application/json")
+        .with_body(b"{not-json".to_vec());
+    let services = test_runtime_services_with_secret_and_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::new(NoopHttpClient) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should fail open when DataDome API call fails",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_REQUEST,
+        "malformed auction JSON should be handled by the route after DataDome fails open"
+    );
+    assert_eq!(
+        response.get_header_str("x-dd-b"),
+        None,
+        "should not apply DataDome headers when the Protection API call fails"
+    );
+}
+
+#[test]
+fn datadome_skips_internal_and_static_asset_routes_by_default() {
+    let mut settings = create_datadome_auction_test_settings("[]");
+    settings.publisher.origin_url = "https://".to_string();
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let http_client = Arc::new(
+        RecordingHttpClient::new(StatusCode::OK).with_response_headers(vec![
+            ("x-datadomeresponse", "200"),
+            ("x-datadome-headers", "X-DD-B"),
+            ("x-dd-b", "should-not-apply"),
+        ]),
+    );
+
+    let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
+    let discovery_services = test_runtime_services_with_secret_and_http_client(
+        &discovery_req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+    let discovery_response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &discovery_services,
+        discovery_req,
+        "should route internal discovery request without DataDome",
+    );
+    assert_eq!(
+        discovery_response.get_status(),
+        StatusCode::OK,
+        "discovery endpoint should stay internal"
+    );
+
+    let image_req = Request::get("https://test.com/logo.png");
+    let image_services = test_runtime_services_with_secret_and_http_client(
+        &image_req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+    let image_response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &image_services,
+        image_req,
+        "should route static asset request without DataDome",
+    );
+    assert_eq!(
+        image_response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "static asset should skip DataDome then fail at the intentionally invalid publisher origin"
+    );
+
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert!(
+        calls.is_empty(),
+        "should not call DataDome for internal routes or default-excluded static assets"
+    );
 }
 
 #[test]

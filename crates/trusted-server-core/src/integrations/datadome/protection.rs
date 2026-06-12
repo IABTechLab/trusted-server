@@ -706,6 +706,31 @@ mod tests {
     }
 
     #[test]
+    fn extract_header_mutations_appends_set_cookie_and_sets_other_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_DATADOME_HEADERS,
+            edgezero_core::http::HeaderValue::from_static("Set-Cookie X-DD-B"),
+        );
+        headers.append(
+            header::SET_COOKIE.as_str(),
+            edgezero_core::http::HeaderValue::from_static("datadome=abc; Path=/"),
+        );
+        headers.insert("x-dd-b", edgezero_core::http::HeaderValue::from_static("1"));
+
+        let mutations = extract_header_mutations(&headers, HEADER_DATADOME_HEADERS);
+
+        assert_eq!(
+            mutations,
+            vec![
+                HeaderMutation::append("set-cookie", "datadome=abc; Path=/"),
+                HeaderMutation::set("x-dd-b", "1"),
+            ],
+            "should append Set-Cookie while replacing non-cookie headers"
+        );
+    }
+
+    #[test]
     fn parse_cookie_value_decodes_datadome_cookie() {
         let value = parse_cookie_value("a=1; datadome=abc%20123; b=2", "datadome")
             .expect("should parse datadome cookie");

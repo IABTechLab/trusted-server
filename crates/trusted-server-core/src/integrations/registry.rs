@@ -1170,6 +1170,29 @@ impl IntegrationRegistry {
 
     #[cfg(test)]
     #[must_use]
+    pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
+                head_router: Router::new(),
+                options_router: Router::new(),
+                routes: Vec::new(),
+                html_rewriters: Vec::new(),
+                script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
+                request_filters,
+                deferred_js_ids: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
     /// Test helper to create a registry from routes.
     ///
     /// # Panics
@@ -1259,6 +1282,25 @@ mod tests {
             _req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    struct EnrichingRequestFilter;
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for EnrichingRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "enriching"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
+                response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
+            }))
         }
     }
 
@@ -1356,6 +1398,45 @@ mod tests {
             "/integrations/test/echo",
             "should expose the HTTP request path to the proxy"
         );
+    }
+
+    #[test]
+    fn filter_request_applies_request_headers_and_returns_response_headers() {
+        let registry =
+            IntegrationRegistry::from_request_filters(vec![Arc::new(EnrichingRequestFilter)]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let outcome =
+            futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+                settings: &settings,
+                services: &services,
+                req: &mut req,
+            }))
+            .expect("should run request filter");
+
+        assert_eq!(
+            req.headers()
+                .get("x-datadome-isbot")
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "should apply DataDome-style request enrichment before routing"
+        );
+        match outcome {
+            RequestFilterRegistryOutcome::Continue(effects) => {
+                assert_eq!(
+                    effects.response_headers,
+                    vec![HeaderMutation::set("x-dd-b", "allowed")],
+                    "should return downstream response header effects for finalization"
+                );
+            }
+            RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
+        }
     }
 
     #[test]

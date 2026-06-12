@@ -690,32 +690,32 @@ Checkboxes should be marked complete only when the behavior is implemented,
 covered by targeted tests where practical, and the relevant verification command
 passes.
 
-- [ ] Trusted Server can validate configured traffic through DataDome before
-      route matching. Current code path is implemented; targeted route coverage
-      is still needed.
-- [ ] DataDome API timeouts/errors fail open. Current code path is implemented;
-      targeted platform-client failure coverage is still needed.
-- [ ] DataDome challenge responses return without contacting the origin. Current
-      code path is implemented; route coverage is still needed.
-- [ ] Allowed requests receive DataDome request-enrichment headers. Current code
-      path is implemented; registry/route coverage is still needed.
-- [ ] Final responses receive DataDome downstream headers/cookies. Current code
-      path is implemented for buffered and streaming responses; route coverage
-      is still needed.
-- [ ] `Set-Cookie` is appended, not coalesced or overwritten. Current code path
-      is implemented; pointer-header tests are still needed.
-- [ ] Static assets and internal Trusted Server routes are excluded by default.
-      Current code path is implemented; protection-matching tests are still
-      needed.
-- [ ] `/auction` is protected by default. Current code path is implemented;
-      protection-matching tests are still needed.
-- [ ] Client-side DataDome tag is auto-injected when configured. Current code
-      path is implemented; config/head-injector tests are still needed.
+- [x] Trusted Server can validate configured traffic through DataDome before
+      route matching. Covered by adapter route tests for challenged and allowed
+      DataDome-protected requests.
+- [x] DataDome API timeouts/errors fail open. Covered by an adapter route test
+      that lets malformed auction JSON reach the route after a platform-client
+      failure.
+- [x] DataDome challenge responses return without contacting the origin. Covered
+      by an adapter route test that returns the DataDome challenge response even
+      with no publisher-origin fallback.
+- [x] Allowed requests receive DataDome request-enrichment headers. Covered by a
+      registry test that applies DataDome-style request mutations before routing.
+- [x] Final responses receive DataDome downstream headers/cookies. Covered by
+      adapter route tests for allowed and challenged responses.
+- [x] `Set-Cookie` is appended, not coalesced or overwritten. Covered by pointer
+      header route tests for DataDome downstream cookies.
+- [x] Static assets and internal Trusted Server routes are excluded by default.
+      Covered by adapter route tests for discovery and default static-extension
+      exclusions.
+- [x] `/auction` is protected by default. Covered by the DataDome-allowed auction
+      route test.
+- [x] Client-side DataDome tag is auto-injected when configured. Covered by
+      DataDome head-injector tests.
 - [x] GraphQL body parsing is not implemented in v1 and is clearly documented.
-- [ ] Existing DataDome first-party proxy behavior remains unchanged. Existing
-      DataDome proxy/rewrite tests pass; full workspace verification still
-      needs to pass after formatting and clippy fixes.
-- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` pass after implementation. Current snapshot: tests pass, fmt and clippy fail.
+- [x] Existing DataDome first-party proxy behavior remains unchanged. Existing
+      DataDome proxy/rewrite tests pass as part of full workspace verification.
+- [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` pass after implementation. Verified on 2026-06-12.
 
 ## Resolved Questions
 
