@@ -1,7 +1,7 @@
 // NOTE: This file is also included in build.rs via #[path].
 // It must remain self-contained (no `crate::` imports).
 
-//! A wrapper type that redacts sensitive values in [`Debug`] and [`Display`] output.
+//! A wrapper type that redacts sensitive values in [`Debug`] and [`fmt::Display`] output.
 //!
 //! Use [`Redacted`] for secrets, passwords, API keys, and other sensitive values
 //! that must never appear in logs or error messages.
@@ -10,7 +10,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Wraps a value so that [`Debug`] and [`Display`] print `[REDACTED]`
+/// Wraps a value so that [`Debug`] and [`fmt::Display`] print `[REDACTED]`
 /// instead of the inner contents.
 ///
 /// Access the real value via [`expose`](Redacted::expose). Callers must

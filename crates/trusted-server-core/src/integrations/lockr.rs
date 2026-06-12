@@ -23,6 +23,7 @@ use crate::integrations::{
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
     IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
 };
+use crate::platform::RuntimeServices;
 use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
@@ -303,6 +304,7 @@ impl IntegrationProxy for LockrIntegration {
     async fn handle(
         &self,
         settings: &Settings,
+        _services: &RuntimeServices,
         req: Request,
     ) -> Result<Response, Report<TrustedServerError>> {
         let path = req.get_path();

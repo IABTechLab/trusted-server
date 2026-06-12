@@ -94,13 +94,7 @@ impl StreamProcessor for HtmlWithPostProcessing {
         }
 
         if changed {
-            // lgtm[rust/cleartext-logging]
-            // This debug log records hostnames and output length only; no sensitive values are logged.
-            log::debug!(
-                "HTML post-processing complete: origin_host={}, output_len={}",
-                self.origin_host,
-                html.len()
-            );
+            log::debug!("HTML post-processing complete: output_len={}", html.len());
         }
 
         Ok(html.into_bytes())
