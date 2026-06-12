@@ -1560,6 +1560,28 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
 /// The SPA hook sends `location.pathname`, but the parameter is
 /// client-controlled: strip any query string or fragment and force a leading
 /// `/` so slot `page_patterns` always match against a canonical path shape.
+/// Same-origin gate for `/__ts/page-bids`.
+///
+/// The endpoint is a side-effecting GET: it dispatches real PBS/APS auctions
+/// and forwards request-derived signals (IP, UA, geo, consent) to partners.
+/// Without a gate, any third-party page could trigger it from a visitor's
+/// browser (it cannot read the JSON, but it burns SSP quota and leaks
+/// outbound partner calls).
+///
+/// A request is allowed when:
+/// - `Sec-Fetch-Site` is `same-origin` or `same-site` (all modern browsers
+///   send Fetch Metadata on same-origin `fetch()`), or
+/// - `Sec-Fetch-Site` is absent (legacy client) **and** the request carries
+///   the non-simple `X-TSJS-Page-Bids` header set by the tsjs SPA hook —
+///   cross-origin callers cannot attach it without a CORS preflight, which
+///   this endpoint never grants.
+fn page_bids_request_allowed(req: &Request) -> bool {
+    match req.get_header_str("sec-fetch-site") {
+        Some(site) => matches!(site, "same-origin" | "same-site"),
+        None => req.get_header("x-tsjs-page-bids").is_some(),
+    }
+}
+
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
     if path.starts_with('/') {
@@ -1590,6 +1612,18 @@ pub async fn handle_page_bids(
         return Ok(Response::from_status(StatusCode::NOT_FOUND)
             .with_body_text_plain("Creative opportunities not configured"));
     };
+
+    // CSRF-style gate: refuse cross-site invocations before any auction work.
+    if !page_bids_request_allowed(&req) {
+        log::debug!(
+            "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
+            req.get_header_str("sec-fetch-site"),
+            req.get_header("x-tsjs-page-bids").is_some()
+        );
+        return Ok(Response::from_status(StatusCode::FORBIDDEN)
+            .with_header(header::CACHE_CONTROL, "private, no-store")
+            .with_body_text_plain("Forbidden"));
+    }
 
     let path_param = req
         .get_url()
@@ -3540,23 +3574,7 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request,
         ) -> serde_json::Value {
-            let services = noop_services();
-            let ec_context =
-                EcContext::read_from_request(settings, &req).expect("should read EC context");
-            let response = handle_page_bids(
-                settings,
-                &services,
-                None,
-                AuctionDispatch {
-                    orchestrator,
-                    slots,
-                    registry: None,
-                },
-                &ec_context,
-                req,
-            )
-            .await
-            .expect("should return ok response");
+            let response = run_page_bids_response(settings, orchestrator, slots, req).await;
             serde_json::from_slice(&response.into_body_bytes()).expect("should be json")
         }
 
@@ -3579,10 +3597,108 @@ mod tests {
         }
 
         fn make_page_bids_request(path: &str) -> Request {
-            Request::new(
+            let mut req = Request::new(
                 Method::GET,
                 format!("https://test-publisher.com/_ts/page-bids?path={path}"),
+            );
+            // Pass the same-origin gate the way a browser fetch from the
+            // publisher page does.
+            req.set_header("sec-fetch-site", "same-origin");
+            req
+        }
+
+        async fn run_page_bids_response(
+            settings: &Settings,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request,
+        ) -> Response {
+            let services = noop_services();
+            let ec_context =
+                EcContext::read_from_request(settings, &req).expect("should read EC context");
+            handle_page_bids(
+                settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator,
+                    slots,
+                    registry: None,
+                },
+                &ec_context,
+                req,
             )
+            .await
+            .expect("should return ok response")
+        }
+
+        #[tokio::test]
+        async fn cross_site_fetch_metadata_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.set_header("sec-fetch-site", "cross-site");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.get_status(),
+                StatusCode::FORBIDDEN,
+                "cross-site request should be rejected before any auction work"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_fetch_metadata_without_tsjs_header_is_rejected() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.remove_header("sec-fetch-site");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.get_status(),
+                StatusCode::FORBIDDEN,
+                "request with neither fetch metadata nor tsjs header should be rejected"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_fetch_metadata_with_tsjs_header_is_allowed() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.remove_header("sec-fetch-site");
+            req.set_header("x-tsjs-page-bids", "1");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.get_status(),
+                StatusCode::OK,
+                "legacy client carrying the tsjs header should pass the gate"
+            );
+        }
+
+        #[tokio::test]
+        async fn same_site_fetch_metadata_is_allowed() {
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.set_header("sec-fetch-site", "same-site");
+
+            let response =
+                run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
+
+            assert_eq!(
+                response.get_status(),
+                StatusCode::OK,
+                "same-site request should pass the gate"
+            );
         }
 
         #[tokio::test]

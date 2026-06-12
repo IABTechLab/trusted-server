@@ -57,7 +57,10 @@ describe('installSpaAuctionHook', () => {
 
     expect(fetchStub).toHaveBeenCalledWith(
       '/__ts/page-bids?path=%2Fnext-page',
-      expect.objectContaining({ credentials: 'include' })
+      expect.objectContaining({
+        credentials: 'include',
+        headers: { 'X-TSJS-Page-Bids': '1' },
+      })
     );
     expect(ts.adSlots).toEqual([{ id: 's1' }]);
     expect(ts.bids).toEqual({ s1: { hb_pb: '1.00' } });

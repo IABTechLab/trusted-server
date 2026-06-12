@@ -533,6 +533,11 @@ export function installSpaAuctionHook(): void {
     try {
       const res = await fetch(`/__ts/page-bids?path=${encodeURIComponent(path)}`, {
         credentials: 'include',
+        // Non-simple header doubles as a CSRF token: the server rejects
+        // requests that carry neither same-origin Fetch Metadata nor this
+        // header, and cross-origin pages cannot send it without a CORS
+        // preflight the endpoint never grants.
+        headers: { 'X-TSJS-Page-Bids': '1' },
         signal: controller.signal,
       });
       if (!res.ok) return;

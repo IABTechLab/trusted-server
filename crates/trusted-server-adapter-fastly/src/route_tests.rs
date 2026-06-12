@@ -974,6 +974,116 @@ fn asset_handler_error_stays_uncacheable_after_global_headers() {
 }
 
 #[test]
+fn page_bids_response_cannot_regain_surrogate_headers_from_settings() {
+    let base = base_route_settings_toml();
+    let prebid = prebid_integration_toml();
+    let config = format!(
+        r#"{base}
+
+{prebid}
+
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            timeout_ms = 2000
+
+            [creative_opportunities]
+            gam_network_id = "1234"
+        "#,
+    );
+    let mut settings =
+        Settings::from_toml(&config).expect("should parse page-bids route test settings");
+    settings
+        .response_headers
+        .insert("Surrogate-Control".to_string(), "max-age=86400".to_string());
+    settings.response_headers.insert(
+        "Fastly-Surrogate-Control".to_string(),
+        "max-age=86400".to_string(),
+    );
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+
+    let mut req = Request::get("https://test-publisher.com/__ts/page-bids?path=/2024/article/");
+    req.set_header("sec-fetch-site", "same-origin");
+    let services = test_runtime_services(&req);
+
+    let resp = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route page-bids request",
+    );
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::OK,
+        "should serve the page-bids response"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "should keep the per-user cache directive despite operator Cache-Control"
+    );
+    assert_eq!(
+        resp.get_header_str("surrogate-control"),
+        None,
+        "should not let operator headers re-enable shared surrogate caching"
+    );
+    assert_eq!(
+        resp.get_header_str("fastly-surrogate-control"),
+        None,
+        "should not let operator headers re-enable Fastly surrogate caching"
+    );
+}
+
+#[test]
+fn page_bids_cross_site_request_is_rejected_at_the_route() {
+    let base = base_route_settings_toml();
+    let prebid = prebid_integration_toml();
+    let config = format!(
+        r#"{base}
+
+{prebid}
+
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            timeout_ms = 2000
+
+            [creative_opportunities]
+            gam_network_id = "1234"
+        "#,
+    );
+    let settings =
+        Settings::from_toml(&config).expect("should parse page-bids route test settings");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+
+    let mut req = Request::get("https://test-publisher.com/__ts/page-bids?path=/2024/article/");
+    req.set_header("sec-fetch-site", "cross-site");
+    let services = test_runtime_services(&req);
+
+    let resp = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route cross-site page-bids request",
+    );
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::FORBIDDEN,
+        "should reject cross-site page-bids requests"
+    );
+}
+
+#[test]
 fn s3_asset_origin_error_stays_uncacheable_after_global_headers() {
     let mut settings = create_test_settings();
     settings.response_headers.insert(

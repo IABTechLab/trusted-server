@@ -660,14 +660,20 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
         response.set_header(HEADER_X_TS_ENV, "staging");
     }
 
+    // Per-user responses (assembled HTML, page-bids) carry a private Cache-Control
+    // directive. Operator headers must not re-enable shared caching for them —
+    // neither by replacing Cache-Control nor by reintroducing the surrogate cache
+    // headers the publisher path stripped.
+    let response_is_private = response
+        .get_header(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("private"));
+
     for (key, value) in &settings.response_headers {
-        // Never overwrite a privacy-critical Cache-Control header (private, no-store, etc.)
-        // that was set for per-user responses (HTML or page-bids).
-        if **key == header::CACHE_CONTROL
-            && response
-                .get_header(header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.contains("private"))
+        if response_is_private
+            && (**key == header::CACHE_CONTROL
+                || key.eq_ignore_ascii_case("surrogate-control")
+                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
         {
             continue;
         }
