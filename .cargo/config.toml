@@ -26,11 +26,12 @@ clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "
 clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--", "-D", "warnings"]
 
 # Build — target-matched, same split as test/clippy
-build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--target", "wasm32-wasip1"]
+build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
 build-axum = ["build", "-p", "trusted-server-adapter-axum"]
+build-cloudflare = ["build", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
 
 # Check — fast compile validation, same split
-check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--target", "wasm32-wasip1"]
+check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
 check-axum = ["check", "-p", "trusted-server-adapter-axum"]
 
 [target.'cfg(all(target_arch = "wasm32"))']
