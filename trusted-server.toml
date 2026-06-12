@@ -146,6 +146,21 @@ api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
 
+# Server-side Protection API validation (fails open on timeout/error)
+enable_protection = false
+server_side_key = ""
+protection_api_origin = "https://api-fastly.datadome.co"
+timeout_ms = 1500
+url_pattern_exclusion = "\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"
+url_pattern_inclusion = ""
+enable_graphql_support = false
+
+# Client-side tag auto-injection (emits only when client_side_key is non-empty)
+client_side_key = ""
+inject_client_side_tag = true
+client_side_tag_url = "/integrations/datadome/tags.js"
+client_side_configuration = { ajaxListenerPath = true }
+
 [integrations.gpt]
 enabled = false
 script_url = "https://securepubads.g.doubleclick.net/tag/js/gpt.js"

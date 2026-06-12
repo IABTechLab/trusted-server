@@ -64,17 +64,22 @@ use http::header;
 use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, IntegrationRequestFilter, RequestFilterDecision, RequestFilterInput,
+    INTEGRATION_MAX_BODY_BYTES, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
+use crate::redacted::Redacted;
 use crate::settings::{IntegrationConfig, Settings};
+
+mod protection;
 
 const DATADOME_INTEGRATION_ID: &str = "datadome";
 
@@ -127,6 +132,52 @@ pub struct DataDomeConfig {
     /// Whether to rewrite `DataDome` script URLs in HTML to first-party paths
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
+
+    /// Whether to call DataDome Protection API before route matching.
+    #[serde(default)]
+    pub enable_protection: bool,
+
+    /// DataDome server-side key used for Protection API validation.
+    #[serde(default)]
+    pub server_side_key: Redacted<String>,
+
+    /// Base URL for the DataDome Protection API.
+    #[serde(default = "default_protection_api_origin")]
+    #[validate(url)]
+    pub protection_api_origin: String,
+
+    /// First-byte timeout for Protection API calls, in milliseconds.
+    #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 10000))]
+    pub timeout_ms: u32,
+
+    /// Regex for URLs to exclude from Protection API validation.
+    #[serde(default = "default_url_pattern_exclusion")]
+    pub url_pattern_exclusion: String,
+
+    /// Regex for URLs to include in Protection API validation.
+    #[serde(default)]
+    pub url_pattern_inclusion: String,
+
+    /// Reserved flag for future GraphQL payload extraction.
+    #[serde(default)]
+    pub enable_graphql_support: bool,
+
+    /// DataDome client-side key used for auto-injecting the browser tag.
+    #[serde(default)]
+    pub client_side_key: String,
+
+    /// Whether to auto-inject the DataDome browser tag when a client-side key exists.
+    #[serde(default = "default_inject_client_side_tag")]
+    pub inject_client_side_tag: bool,
+
+    /// URL used for the injected DataDome browser tag.
+    #[serde(default = "default_client_side_tag_url")]
+    pub client_side_tag_url: String,
+
+    /// Options assigned to `window.ddoptions` before loading the browser tag.
+    #[serde(default = "default_client_side_configuration")]
+    pub client_side_configuration: JsonValue,
 }
 
 fn default_enabled() -> bool {
@@ -149,6 +200,30 @@ fn default_rewrite_sdk() -> bool {
     true
 }
 
+fn default_protection_api_origin() -> String {
+    "https://api-fastly.datadome.co".to_string()
+}
+
+fn default_timeout_ms() -> u32 {
+    1500
+}
+
+fn default_url_pattern_exclusion() -> String {
+    r"\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$".to_string()
+}
+
+fn default_inject_client_side_tag() -> bool {
+    true
+}
+
+fn default_client_side_tag_url() -> String {
+    "/integrations/datadome/tags.js".to_string()
+}
+
+fn default_client_side_configuration() -> JsonValue {
+    serde_json::json!({ "ajaxListenerPath": true })
+}
+
 impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
@@ -157,6 +232,17 @@ impl Default for DataDomeConfig {
             api_origin: default_api_origin(),
             cache_ttl_seconds: default_cache_ttl(),
             rewrite_sdk: default_rewrite_sdk(),
+            enable_protection: false,
+            server_side_key: Redacted::default(),
+            protection_api_origin: default_protection_api_origin(),
+            timeout_ms: default_timeout_ms(),
+            url_pattern_exclusion: default_url_pattern_exclusion(),
+            url_pattern_inclusion: String::new(),
+            enable_graphql_support: false,
+            client_side_key: String::new(),
+            inject_client_side_tag: default_inject_client_side_tag(),
+            client_side_tag_url: default_client_side_tag_url(),
+            client_side_configuration: default_client_side_configuration(),
         }
     }
 }
@@ -170,11 +256,50 @@ impl IntegrationConfig for DataDomeConfig {
 /// `DataDome` integration implementation.
 pub struct DataDomeIntegration {
     config: DataDomeConfig,
+    protection_exclusion: Option<Regex>,
+    protection_inclusion: Option<Regex>,
 }
 
 impl DataDomeIntegration {
+    #[cfg(test)]
     fn new(config: DataDomeConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        Self::try_new(config).expect("should create DataDome integration")
+    }
+
+    fn try_new(config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        if config.enable_protection && config.server_side_key.expose().trim().is_empty() {
+            return Err(Report::new(Self::error(
+                "server_side_key is required when enable_protection is true",
+            )));
+        }
+
+        if config.enable_graphql_support {
+            log::warn!("[datadome] enable_graphql_support is reserved and ignored in v1");
+        }
+
+        let protection_exclusion =
+            Self::compile_optional_regex(&config.url_pattern_exclusion, "url_pattern_exclusion")?;
+        let protection_inclusion =
+            Self::compile_optional_regex(&config.url_pattern_inclusion, "url_pattern_inclusion")?;
+
+        Ok(Arc::new(Self {
+            config,
+            protection_exclusion,
+            protection_inclusion,
+        }))
+    }
+
+    fn compile_optional_regex(
+        pattern: &str,
+        name: &str,
+    ) -> Result<Option<Regex>, Report<TrustedServerError>> {
+        if pattern.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Regex::new(&format!("(?i:{pattern})"))
+            .map(Some)
+            .map_err(|err| Report::new(Self::error(format!("Invalid {name}: {err}"))))
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -473,6 +598,55 @@ impl IntegrationProxy for DataDomeIntegration {
     }
 }
 
+#[async_trait(?Send)]
+impl IntegrationRequestFilter for DataDomeIntegration {
+    fn integration_id(&self) -> &'static str {
+        DATADOME_INTEGRATION_ID
+    }
+
+    async fn filter_request(
+        &self,
+        input: RequestFilterInput<'_>,
+    ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+        Ok(self.filter_protection_request(input).await)
+    }
+}
+
+impl IntegrationHeadInjector for DataDomeIntegration {
+    fn integration_id(&self) -> &'static str {
+        DATADOME_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        if !self.config.inject_client_side_tag || self.config.client_side_key.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let key = serde_json::to_string(&self.config.client_side_key)
+            .unwrap_or_else(|err| {
+                log::warn!("[datadome] Failed to serialize client-side key: {err}");
+                "\"\"".to_string()
+            })
+            .replace("</", "<\\/");
+        let tag_url = serde_json::to_string(&self.config.client_side_tag_url)
+            .unwrap_or_else(|err| {
+                log::warn!("[datadome] Failed to serialize client-side tag URL: {err}");
+                "\"/integrations/datadome/tags.js\"".to_string()
+            })
+            .replace("</", "<\\/");
+        let options = serde_json::to_string(&self.config.client_side_configuration)
+            .unwrap_or_else(|err| {
+                log::warn!("[datadome] Failed to serialize client-side configuration: {err}");
+                "{}".to_string()
+            })
+            .replace("</", "<\\/");
+
+        vec![format!(
+            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src={tag_url} async></script>"
+        )]
+    }
+}
+
 impl IntegrationAttributeRewriter for DataDomeIntegration {
     fn integration_id(&self) -> &'static str {
         DATADOME_INTEGRATION_ID
@@ -527,7 +701,7 @@ fn build(
         config.rewrite_sdk
     );
 
-    Ok(Some(DataDomeIntegration::new(config)))
+    Ok(Some(DataDomeIntegration::try_new(config)?))
 }
 
 /// Register the `DataDome` integration with Trusted Server.
@@ -543,12 +717,16 @@ pub fn register(
         return Ok(None);
     };
 
-    Ok(Some(
-        IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
-            .build(),
-    ))
+    let mut builder = IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_attribute_rewriter(integration.clone())
+        .with_head_injector(integration.clone());
+
+    if integration.config.enable_protection {
+        builder = builder.with_request_filter(integration);
+    }
+
+    Ok(Some(builder.build()))
 }
 
 #[cfg(test)]
@@ -566,6 +744,7 @@ mod tests {
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
+            ..DataDomeConfig::default()
         }
     }
 
