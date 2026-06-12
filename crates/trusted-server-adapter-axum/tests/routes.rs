@@ -114,10 +114,12 @@ async fn admin_rotate_key_is_routed() {
         .await
         .expect("should respond");
 
-    assert_ne!(
+    // The admin handler is a fixed 501 responder with no I/O, and the test
+    // settings protect only ^/_ts/admin, so this path reaches the handler.
+    assert_eq!(
         resp.status().as_u16(),
-        404,
-        "admin/keys/rotate must be routed"
+        501,
+        "admin/keys/rotate must reach the not-supported handler"
     );
 }
 
@@ -140,10 +142,11 @@ async fn admin_deactivate_key_is_routed() {
         .await
         .expect("should respond");
 
-    assert_ne!(
+    // Same fixed 501 contract as admin/keys/rotate.
+    assert_eq!(
         resp.status().as_u16(),
-        404,
-        "admin/keys/deactivate must be routed"
+        501,
+        "admin/keys/deactivate must reach the not-supported handler"
     );
 }
 
@@ -170,10 +173,9 @@ async fn admin_rotate_key_returns_non_5xx() {
         .expect("should respond");
     let status = resp.status().as_u16();
 
-    assert_ne!(status, 404, "admin/keys/rotate must be routed");
-    assert_ne!(
-        status, 500,
-        "admin/keys/rotate must not panic: got {status}"
+    assert_eq!(
+        status, 501,
+        "admin/keys/rotate must return the fixed not-supported status"
     );
 }
 

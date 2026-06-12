@@ -19,5 +19,13 @@ test-axum = ["test", "-p", "trusted-server-adapter-axum"]
 clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
 clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--", "-D", "warnings"]
 
+# Build — target-matched, same split as test/clippy
+build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--target", "wasm32-wasip1"]
+build-axum = ["build", "-p", "trusted-server-adapter-axum"]
+
+# Check — fast compile validation, same split
+check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--target", "wasm32-wasip1"]
+check-axum = ["check", "-p", "trusted-server-adapter-axum"]
+
 [target.'cfg(all(target_arch = "wasm32"))']
 runner = "viceroy run -C ../../fastly.toml -- "

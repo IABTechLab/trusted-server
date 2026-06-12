@@ -1,7 +1,7 @@
 Run the full test suite for both Rust and JavaScript.
 
 ```bash
-cargo test --workspace
+cargo test-fastly && cargo test-axum
 ```
 
 Then run JS tests:

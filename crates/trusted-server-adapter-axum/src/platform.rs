@@ -238,6 +238,16 @@ struct AxumPendingHandle {
     handle: tokio::task::JoinHandle<SpawnedRequestResult>,
 }
 
+impl Drop for AxumPendingHandle {
+    fn drop(&mut self) {
+        // Abort instead of detaching: when the orchestrator hits the auction
+        // deadline and drops the remaining pending requests, the abandoned
+        // bidder tasks would otherwise keep running for up to the 30s
+        // transport timeout.
+        self.handle.abort();
+    }
+}
+
 /// Resolves to the backend name together with the task result so that
 /// [`futures::future::select_all`] callers never have to reconstruct which
 /// backend a completion belongs to by position. `select_all` removes the
@@ -349,6 +359,13 @@ impl AxumPlatformHttpClient {
             .bytes()
             .await
             .change_context(PlatformError::HttpClient)?;
+        // Upstream responses are buffered whole with no cap — acceptable for
+        // the dev server, but log the size so a large or hostile upstream is
+        // visible instead of silently growing the heap.
+        log::debug!(
+            "buffered {} upstream response bytes from {uri}",
+            resp_bytes.len()
+        );
         let edge_resp = edge_builder
             .body(edgezero_core::body::Body::from(resp_bytes.to_vec()))
             .change_context(PlatformError::HttpClient)?;
@@ -414,6 +431,9 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .await
                 .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
                 .to_vec();
+            // Same unbounded-buffering note as the synchronous path: log the
+            // size so large upstream responses are visible in dev.
+            log::debug!("buffered {} upstream response bytes from {uri}", body.len());
             Ok::<_, Report<PlatformError>>((status, resp_headers, body))
         });
 
@@ -476,12 +496,20 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                     .body(edgezero_core::body::Body::from(body))
                     .change_context(PlatformError::HttpClient)
             })
-            .map(|edge_resp| PlatformResponse::new(edge_resp).with_backend_name(backend_name));
+            .map(|edge_resp| {
+                PlatformResponse::new(edge_resp).with_backend_name(backend_name.clone())
+            });
+
+        // Attribute the failure to its backend so the orchestrator can remove
+        // the provider and record a BidStatus::Error, matching the Fastly
+        // adapter. Without this, a failed provider silently vanishes through
+        // the orchestrator's "backend not identified" branch.
+        let failed_backend_name = ready.as_ref().err().map(|_| backend_name);
 
         Ok(PlatformSelectResult {
             ready,
             remaining,
-            failed_backend_name: None,
+            failed_backend_name,
         })
     }
 }
@@ -706,6 +734,47 @@ mod tests {
             response.into_body().into_bytes().as_ref(),
             b"ok",
             "should preserve decoded response body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_attributes_failed_backend_name() {
+        // Bind and immediately drop a listener so the port is closed — the
+        // request fails with connection refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind probe listener");
+        let addr = listener.local_addr().expect("should read local address");
+        drop(listener);
+
+        let request = edgezero_core::http::request_builder()
+            .uri(format!("http://{addr}/"))
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let client = AxumPlatformHttpClient::new();
+        let pending = client
+            .send_async(PlatformHttpRequest::new(request, "failing_backend"))
+            .await
+            .expect("should spawn async request");
+
+        let result = client
+            .select(vec![pending])
+            .await
+            .expect("select should surface the failure via ready, not a fatal error");
+
+        assert!(
+            result.ready.is_err(),
+            "request to a closed port should fail"
+        );
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("failing_backend"),
+            "failed provider must be attributed to its backend so the orchestrator can record BidStatus::Error"
+        );
+        assert!(
+            result.remaining.is_empty(),
+            "no remaining requests expected"
         );
     }
 
