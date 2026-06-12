@@ -353,6 +353,27 @@ export function installTsAdInit(): void {
       const prevSlotTargetingKeys = ts.prevSlotTargetingKeys ?? {};
       const nextSlotTargetingKeys: Record<string, string[]> = {};
 
+      // Clear TS-managed targeting from every previously TS-touched GPT slot
+      // before applying the current route. Without this sweep, navigating to a
+      // route with no matching TS slots (or one where a previously touched
+      // publisher-owned slot is absent from the new slot list) leaves stale
+      // hb_* / ts_initial / route targeting that later publisher refreshes
+      // would reuse.
+      const prevTouchedDivIds = new Set([
+        ...Object.keys(prevSlotTargetingKeys),
+        ...Object.keys(ts.divToSlotId ?? {}),
+      ]);
+      if (prevTouchedDivIds.size > 0) {
+        (g.pubads!().getSlots?.() ?? []).forEach((gptSlot: GoogleTagSlot) => {
+          const elementId = gptSlot.getSlotElementId();
+          if (!prevTouchedDivIds.has(elementId)) return;
+          clearTargetingKeys(gptSlot, [
+            ...TS_BASE_TARGETING_KEYS,
+            ...(prevSlotTargetingKeys[elementId] ?? []),
+          ]);
+        });
+      }
+
       slots.forEach((slot) => {
         // Resolve actual div ID: exact match first, then prefix query.
         // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
@@ -451,7 +472,17 @@ export function installTsAdInit(): void {
       }
 
       if (slotsToRefresh.length > 0) {
-        g.pubads!().refresh(slotsToRefresh);
+        // One-shot bypass: this internal refresh delivers the just-applied
+        // server-side targeting to GAM. If slim-Prebid has wrapped refresh(),
+        // it must pass this call straight through — not clear the targeting
+        // and run a duplicate client-side auction. Later publisher-initiated
+        // refreshes of the same slots still go through the wrapper normally.
+        ts.adInitRefreshInProgress = true;
+        try {
+          g.pubads!().refresh(slotsToRefresh);
+        } finally {
+          ts.adInitRefreshInProgress = false;
+        }
       }
     });
   };

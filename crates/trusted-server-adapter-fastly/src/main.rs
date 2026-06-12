@@ -392,11 +392,14 @@ async fn route_request(
         (Method::GET, "/__ts/page-bids") => (
             handle_page_bids(
                 settings,
-                orchestrator,
                 runtime_services,
                 kv_graph.as_ref(),
-                registry_ref,
-                slots,
+                trusted_server_core::publisher::AuctionDispatch {
+                    orchestrator,
+                    slots,
+                    registry: registry_ref,
+                },
+                &ec_context,
                 req,
             )
             .await,

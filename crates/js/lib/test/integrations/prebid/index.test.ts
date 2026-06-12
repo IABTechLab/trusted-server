@@ -913,6 +913,56 @@ describe('prebid/installRefreshHandler', () => {
     expect(setTargetingForGPTAsync).toHaveBeenCalled();
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
   });
+
+  it('passes the adInit internal refresh straight to GPT without a client-side auction', () => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting,
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = { adInitRefreshInProgress: true };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(clearTargeting).not.toHaveBeenCalled();
+    expect(originalRefresh).toHaveBeenCalledWith([gptSlot], undefined);
+  });
+
+  it('runs a client-side auction for publisher refreshes after adInit completes', () => {
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn(),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = { adInitRefreshInProgress: false };
+
+    installRefreshHandler(750);
+    pubads.refresh([gptSlot]);
+
+    expect(mockRequestBids).toHaveBeenCalled();
+    expect(originalRefresh).not.toHaveBeenCalled();
+  });
 });
 
 describe('prebid/client-side bidders', () => {

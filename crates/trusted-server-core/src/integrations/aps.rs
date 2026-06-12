@@ -309,7 +309,15 @@ impl ApsAuctionProvider {
     /// creative-opportunity slot ID so the caller can remap bids in the response.
     /// Populates consent fields (GDPR, US Privacy, GPP) from the
     /// [`ConsentContext`](crate::consent::ConsentContext) attached to the request.
-    fn to_aps_request(&self, request: &AuctionRequest) -> (ApsBidRequest, HashMap<String, String>) {
+    ///
+    /// `timeout_ms` is the effective auction budget for this provider (already
+    /// capped by the orchestrator) — advertised to APS so it never expects more
+    /// time than the edge will actually wait.
+    fn to_aps_request(
+        &self,
+        request: &AuctionRequest,
+        timeout_ms: u32,
+    ) -> (ApsBidRequest, HashMap<String, String>) {
         let mut slot_id_map: HashMap<String, String> = HashMap::new();
         let slots: Vec<ApsSlot> = request
             .slots
@@ -364,7 +372,7 @@ impl ApsAuctionProvider {
             slots,
             page_url: request.publisher.page_url.clone(),
             user_agent: request.device.as_ref().and_then(|d| d.user_agent.clone()),
-            timeout: Some(self.config.timeout_ms),
+            timeout: Some(timeout_ms),
             gdpr,
             us_privacy,
             gpp,
@@ -539,7 +547,10 @@ impl AuctionProvider for ApsAuctionProvider {
 
         // Transform to APS format; store the APS-slot-ID → creative-slot-ID map so
         // parse_response can remap bids back to the creative opportunity slot ID.
-        let (aps_request, slot_id_map) = self.to_aps_request(request);
+        // `context.timeout_ms` is the effective budget the orchestrator granted
+        // this provider — the payload must advertise the same deadline the edge
+        // backend enforces below.
+        let (aps_request, slot_id_map) = self.to_aps_request(request, context.timeout_ms);
         *self
             .slot_id_map
             .lock()
@@ -760,7 +771,7 @@ mod tests {
 
         let provider = ApsAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&auction_request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&auction_request, 800);
 
         // Verify basic fields
         assert_eq!(aps_request.pub_id, "5128");
@@ -830,7 +841,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let (aps_request, slot_id_map) = provider.to_aps_request(&request);
+        let (aps_request, slot_id_map) = provider.to_aps_request(&request, 800);
         assert_eq!(
             aps_request.slots[0].slot_id, "aps-slot-atf-sidebar",
             "should send configured APS slot ID to APS"
@@ -1070,6 +1081,28 @@ mod tests {
     }
 
     #[test]
+    fn aps_payload_timeout_uses_effective_auction_budget_not_provider_config() {
+        // Provider config says 1000ms but the auction budget grants only 500ms —
+        // the payload must advertise the tighter effective deadline.
+        let config = ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 1000,
+        };
+        let provider = ApsAuctionProvider::new(config);
+        let request = create_test_auction_request();
+
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 500);
+
+        assert_eq!(
+            aps_request.timeout,
+            Some(500),
+            "should advertise the effective auction budget, not the provider config timeout"
+        );
+    }
+
+    #[test]
     fn test_aps_request_includes_consent_fields() {
         use crate::consent::ConsentContext;
 
@@ -1091,7 +1124,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
 
         // Verify GDPR consent
         let gdpr = aps_request.gdpr.expect("should have gdpr");
@@ -1120,7 +1153,7 @@ mod tests {
         let provider = ApsAuctionProvider::new(config);
         let request = create_test_auction_request(); // consent is None
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
 
         assert!(aps_request.gdpr.is_none());
         assert!(aps_request.us_privacy.is_none());
@@ -1147,7 +1180,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request);
+        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
         let json = serde_json::to_value(&aps_request).expect("should serialize");
 
         // GDPR fields present

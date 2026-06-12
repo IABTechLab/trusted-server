@@ -904,6 +904,21 @@ impl PrebidAuctionProvider {
         })
     }
 
+    /// Returns the full Prebid Server `OpenRTB2` auction endpoint URL.
+    ///
+    /// Backward-compatible normalization: `server_url` may be configured as
+    /// either the PBS origin (path is appended here) or the full endpoint
+    /// already ending in `/openrtb2/auction` (used as-is, ignoring a trailing
+    /// slash) — both shapes produce the same request URL.
+    fn auction_endpoint_url(&self) -> String {
+        let base = self.config.server_url.trim_end_matches('/');
+        if base.ends_with("/openrtb2/auction") {
+            base.to_string()
+        } else {
+            format!("{base}/openrtb2/auction")
+        }
+    }
+
     /// Convert auction request to `OpenRTB` format with all enrichments.
     fn to_openrtb(
         &self,
@@ -1168,7 +1183,12 @@ impl PrebidAuctionProvider {
             .get_header_str(header::REFERER)
             .map(std::string::ToString::to_string);
 
-        let tmax = to_openrtb_i32(self.config.timeout_ms, "tmax", "request");
+        // Advertise the effective auction budget, not the raw provider config:
+        // the orchestrator caps `context.timeout_ms` to the remaining auction
+        // budget, and the edge backend stops waiting after that long. Telling
+        // PBS it has more time than the edge will wait turns partial bids into
+        // edge timeouts.
+        let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request");
 
         OpenRtbRequest {
             id: Some(request.id.clone()),
@@ -1622,8 +1642,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         if log::log_enabled!(log::Level::Debug) {
             match serde_json::to_string_pretty(&openrtb) {
                 Ok(json) => log::debug!(
-                    "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
-                    self.config.server_url,
+                    "Prebid OpenRTB request to {}:\n{}",
+                    self.auction_endpoint_url(),
                     json
                 ),
                 Err(e) => {
@@ -1633,10 +1653,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         // Create HTTP request
-        let mut pbs_req = Request::new(
-            Method::POST,
-            format!("{}/openrtb2/auction", self.config.server_url),
-        );
+        let mut pbs_req = Request::new(Method::POST, self.auction_endpoint_url());
         copy_request_headers(
             context.request,
             &mut pbs_req,
@@ -3073,7 +3090,7 @@ server_url = "https://prebid.example"
         assert_eq!(
             openrtb.tmax,
             Some(1000),
-            "should set tmax from config timeout_ms"
+            "should set tmax from the effective auction context timeout"
         );
         assert_eq!(
             openrtb.cur,
@@ -3083,15 +3100,72 @@ server_url = "https://prebid.example"
     }
 
     #[test]
-    fn to_openrtb_omits_tmax_when_timeout_exceeds_i32_max() {
+    fn auction_endpoint_url_appends_path_to_base_origin() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should append /openrtb2/auction to a base origin"
+        );
+    }
+
+    #[test]
+    fn auction_endpoint_url_does_not_double_append_full_endpoint() {
         let mut config = base_config();
-        config.timeout_ms = i32::MAX as u32 + 1;
+        config.server_url = "https://prebid.example/openrtb2/auction".to_string();
+        let provider = PrebidAuctionProvider::new(config);
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should use a full endpoint URL as-is"
+        );
+
+        let mut config = base_config();
+        config.server_url = "https://prebid.example/openrtb2/auction/".to_string();
+        let provider = PrebidAuctionProvider::new(config);
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should normalize a trailing slash on a full endpoint URL"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_tmax_uses_effective_context_timeout_not_provider_config() {
+        // Provider config says 1000ms but the auction budget is only 500ms —
+        // PBS must be told the tighter effective deadline, otherwise the edge
+        // gives up before PBS responds.
+        let config = base_config();
+        assert_eq!(config.timeout_ms, 1000, "should start from 1000ms config");
         let provider = PrebidAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
         let request = Request::get("https://pub.example/auction");
-        let context = create_test_auction_context(&settings, &request);
+        let context = shared_test_auction_context(&settings, &request, 500);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert_eq!(
+            openrtb.tmax,
+            Some(500),
+            "should set tmax from the effective auction context timeout, not provider config"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_tmax_when_timeout_exceeds_i32_max() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = Request::get("https://pub.example/auction");
+        let context = shared_test_auction_context(&settings, &request, i32::MAX as u32 + 1);
 
         let openrtb = provider.to_openrtb(
             &auction_request,

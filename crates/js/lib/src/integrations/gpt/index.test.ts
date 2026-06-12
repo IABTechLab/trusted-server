@@ -125,6 +125,98 @@ describe('installTsAdInit', () => {
     fetchSpy.mockRestore();
   });
 
+  it('sets adInitRefreshInProgress only for the duration of the internal refresh', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    let flagDuringRefresh: boolean | undefined;
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(() => {
+        flagDuringRefresh = (window as TestWindow).tsjs!.adInitRefreshInProgress;
+      }),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.refresh).toHaveBeenCalled();
+    expect(flagDuringRefresh).toBe(true);
+    expect((window as TestWindow).tsjs!.adInitRefreshInProgress).toBe(false);
+  });
+
+  it('clears stale TS targeting from previously touched slots when the new route has no TS slots', async () => {
+    const clearTargeting = vi.fn().mockReturnThis();
+    const staleSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      clearTargeting,
+      getSlotElementId: vi.fn().mockReturnValue('div-old-route'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([staleSlot]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn(),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      // New route has no matching TS slots.
+      adSlots: [],
+      bids: {},
+      // Previous route touched the publisher-owned slot on div-old-route.
+      divToSlotId: { 'div-old-route': 'old_slot' },
+      prevSlotTargetingKeys: { 'div-old-route': ['pos'] },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('./index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_bidder');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
+    expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(clearTargeting).toHaveBeenCalledWith('ts_initial');
+    expect(clearTargeting).toHaveBeenCalledWith('pos');
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+    expect((window as TestWindow).tsjs!.divToSlotId).toEqual({});
+    expect((window as TestWindow).tsjs!.prevSlotTargetingKeys).toEqual({});
+  });
+
   it('keeps the GAM path when debug adm is present', async () => {
     const slotEl = document.getElementById('div-atf-sidebar')!;
     const mockSlot = {

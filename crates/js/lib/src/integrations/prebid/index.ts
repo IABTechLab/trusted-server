@@ -615,6 +615,15 @@ export function installRefreshHandler(timeoutMs = 1500): void {
 
     const originalRefresh = pubads.refresh.bind(pubads);
     pubads.refresh = function (slots?: unknown[], opts?: unknown) {
+      // One-shot bypass for adInit()'s internal refresh: that refresh delivers
+      // freshly applied server-side targeting to GAM and must not be turned
+      // into a client-side auction (which would clear the TS targeting).
+      // Publisher-initiated refreshes of the same slots are not flagged and
+      // still run a fresh client-side auction below.
+      if (window.tsjs?.adInitRefreshInProgress) {
+        return originalRefresh(slots, opts);
+      }
+
       // For bare refresh() calls (no slots arg), get all registered slots from GPT
       // so we can auction the same concrete slot list and avoid stale targeting.
       const targetSlots = (

@@ -100,6 +100,13 @@ export interface TsjsApi {
   divToSlotId?: Record<string, string>;
   /** Slot-level GPT targeting keys TS applied on the previous route. */
   prevSlotTargetingKeys?: Record<string, string[]>;
+  /**
+   * One-shot bypass for the slim-Prebid refresh wrapper: true only while
+   * adInit() runs its internal refresh of server-side-targeted slots, so the
+   * wrapper passes that refresh straight to GPT instead of starting a
+   * client-side auction that would clear the just-applied TS targeting.
+   */
+  adInitRefreshInProgress?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
 }

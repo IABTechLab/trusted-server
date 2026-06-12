@@ -75,7 +75,15 @@
         });
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
+        // Map both the inner div and the GPT slot's element ID (the
+        // "-container" div when TS defined the slot there) so slotRenderEnded
+        // — which reports the GPT slot element ID — can find the slot for
+        // nurl/burl beacon firing.
         divToSlotId[actualDivId] = slot.id;
+        var slotElementId = s.getSlotElementId();
+        if (slotElementId && slotElementId !== actualDivId) {
+          divToSlotId[slotElementId] = slot.id;
+        }
         if (tsOwned) newSlots.push(s);
         slotsToRefresh.push(s);
       });

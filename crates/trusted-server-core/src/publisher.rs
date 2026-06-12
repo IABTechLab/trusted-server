@@ -26,7 +26,7 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::compat;
-use crate::consent::gate_eids_by_consent;
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::ec::kv::KvIdentityGraph;
@@ -577,6 +577,9 @@ pub(crate) fn is_prefetch_request(req: &Request) -> bool {
 
 /// Returns true only when the publisher request should run the full
 /// server-side ad stack: auction dispatch plus initial ad-slot injection.
+///
+/// `auction_enabled` is the global `[auction].enabled` kill switch — when
+/// false, no automatic server-side auction or ad-slot injection runs.
 pub(crate) fn should_run_server_side_ad_stack(
     is_get: bool,
     is_navigation: bool,
@@ -584,6 +587,7 @@ pub(crate) fn should_run_server_side_ad_stack(
     is_bot: bool,
     has_matched_slots: bool,
     consent_allows_auction: bool,
+    auction_enabled: bool,
 ) -> bool {
     is_get
         && is_navigation
@@ -591,6 +595,7 @@ pub(crate) fn should_run_server_side_ad_stack(
         && !is_bot
         && has_matched_slots
         && consent_allows_auction
+        && auction_enabled
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
@@ -1067,13 +1072,10 @@ pub async fn handle_publisher_request(
         Vec::new()
     };
 
-    // Non-GDPR regions (US, etc.) have no TCF string — auction is freely allowed.
-    // GDPR regions require TCF Purpose 1 (storage/access) before firing.
-    let consent_allows_auction = !consent_context.gdpr_applies
-        || consent_context
-            .tcf
-            .as_ref()
-            .is_some_and(|tcf| tcf.has_purpose_consent(1));
+    // Fail closed for GDPR-relevant traffic: GDPR/unknown jurisdictions and
+    // requests carrying an EU TCF signal require effective TCF Purpose 1
+    // (storage/access) before firing. Known non-GDPR jurisdictions are free.
+    let consent_allows_auction = consent_allows_server_side_auction(&consent_context);
 
     let should_run_ad_stack = should_run_server_side_ad_stack(
         is_get,
@@ -1082,6 +1084,7 @@ pub async fn handle_publisher_request(
         is_bot,
         !matched_slots.is_empty(),
         consent_allows_auction,
+        auction.orchestrator.is_enabled(),
     );
     let should_run_auction = should_run_ad_stack;
 
@@ -1567,11 +1570,10 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
 /// Returns [`TrustedServerError`] if cookie parsing or EC ID generation fails.
 pub async fn handle_page_bids(
     settings: &Settings,
-    orchestrator: &AuctionOrchestrator,
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
-    registry: Option<&PartnerRegistry>,
-    slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
+    auction: AuctionDispatch<'_>,
+    ec_context: &EcContext,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
     let Some(co_config) = &settings.creative_opportunities else {
@@ -1586,28 +1588,23 @@ pub async fn handle_page_bids(
         .map(|(_, v)| v.into_owned())
         .unwrap_or_else(|| "/".to_string());
 
-    let matched_slots: Vec<_> = crate::creative_opportunities::match_slots(slots, &path_param)
-        .into_iter()
-        .cloned()
-        .collect();
+    let matched_slots: Vec<_> =
+        crate::creative_opportunities::match_slots(auction.slots, &path_param)
+            .into_iter()
+            .cloned()
+            .collect();
 
     let http_req = compat::from_fastly_headers_ref(&req);
     let request_info =
         crate::http_util::RequestInfo::from_request(&http_req, &services.client_info);
-    let ec_ctx =
-        EcContext::read_from_request(settings, &req).change_context(TrustedServerError::Proxy {
-            message: "page-bids: failed to read EC context".to_string(),
-        })?;
-    let ec_id = ec_ctx.ec_value().filter(|_| ec_ctx.ec_allowed());
-    let consent_context = ec_ctx.consent().clone();
-    let geo = ec_ctx.geo_info().cloned();
+    let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
+    let consent_context = ec_context.consent();
+    let geo = ec_context.geo_info().cloned();
     let cookie_jar = handle_request_cookies(&http_req)?;
 
-    let consent_allows_auction = !consent_context.gdpr_applies
-        || consent_context
-            .tcf
-            .as_ref()
-            .is_some_and(|tcf| tcf.has_purpose_consent(1));
+    // Same fail-closed jurisdiction-aware gate the publisher navigation path
+    // uses — relies on the adapter's geo-aware EC context.
+    let consent_allows_auction = consent_allows_server_side_auction(consent_context);
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -1615,7 +1612,10 @@ pub async fn handle_page_bids(
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
 
-    if matched_slots.is_empty() {
+    let auction_enabled = auction.orchestrator.is_enabled();
+    if !auction_enabled {
+        log::debug!("page-bids: [auction].enabled is false — skipping auction");
+    } else if matched_slots.is_empty() {
         log::debug!(
             "No creative opportunity slots matched path '{}' — skipping auction",
             path_param
@@ -1629,69 +1629,74 @@ pub async fn handle_page_bids(
         );
     }
 
-    let winning_bids =
-        if !matched_slots.is_empty() && consent_allows_auction && !is_bot && !is_prefetch {
-            let slots_ctx = MatchedSlotsContext {
-                matched_slots: &matched_slots,
-                request_path: &path_param,
-            };
-            let mut auction_request = build_auction_request(
-                &slots_ctx,
-                ec_id,
-                &consent_context,
-                &request_info,
-                req.get_header_str("user-agent"),
-            );
-            let ts_eids_value = cookie_jar
-                .as_ref()
-                .and_then(|j| j.get(COOKIE_TS_EIDS))
-                .map(|c| c.value().to_owned());
-            let client_eids = if ec_id.is_some() {
-                resolve_client_auction_eids(None, ts_eids_value.as_deref())
-            } else {
-                None
-            };
-            let kv_eids = resolve_auction_eids(kv, registry, &ec_ctx);
-            let merged_eids = merge_auction_eids(client_eids, kv_eids);
-            let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-            auction_request.user.eids =
-                gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-            if had_eids && auction_request.user.eids.is_none() {
-                log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
-            }
-            let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
-            if client_ip.is_some() || geo.is_some() {
-                let device = auction_request.device.get_or_insert(DeviceInfo {
-                    user_agent: None,
-                    ip: None,
-                    geo: None,
-                });
-                device.ip = client_ip;
-                device.geo = geo.clone();
-            }
-            let timeout_ms = co_config
-                .auction_timeout_ms
-                .unwrap_or(settings.auction.timeout_ms);
-            let auction_context = AuctionContext {
-                settings,
-                request: &req,
-                timeout_ms,
-                provider_responses: None,
-                services,
-            };
-            match orchestrator
-                .run_auction(&auction_request, &auction_context)
-                .await
-            {
-                Ok(result) => result.winning_bids,
-                Err(e) => {
-                    log::warn!("page-bids auction failed: {e:?}");
-                    std::collections::HashMap::new()
-                }
-            }
-        } else {
-            std::collections::HashMap::new()
+    let winning_bids = if auction_enabled
+        && !matched_slots.is_empty()
+        && consent_allows_auction
+        && !is_bot
+        && !is_prefetch
+    {
+        let slots_ctx = MatchedSlotsContext {
+            matched_slots: &matched_slots,
+            request_path: &path_param,
         };
+        let mut auction_request = build_auction_request(
+            &slots_ctx,
+            ec_id,
+            consent_context,
+            &request_info,
+            req.get_header_str("user-agent"),
+        );
+        let ts_eids_value = cookie_jar
+            .as_ref()
+            .and_then(|j| j.get(COOKIE_TS_EIDS))
+            .map(|c| c.value().to_owned());
+        let client_eids = if ec_id.is_some() {
+            resolve_client_auction_eids(None, ts_eids_value.as_deref())
+        } else {
+            None
+        };
+        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
+        let merged_eids = merge_auction_eids(client_eids, kv_eids);
+        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+        auction_request.user.eids =
+            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+        if had_eids && auction_request.user.eids.is_none() {
+            log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
+        }
+        let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
+        if client_ip.is_some() || geo.is_some() {
+            let device = auction_request.device.get_or_insert(DeviceInfo {
+                user_agent: None,
+                ip: None,
+                geo: None,
+            });
+            device.ip = client_ip;
+            device.geo = geo.clone();
+        }
+        let timeout_ms = co_config
+            .auction_timeout_ms
+            .unwrap_or(settings.auction.timeout_ms);
+        let auction_context = AuctionContext {
+            settings,
+            request: &req,
+            timeout_ms,
+            provider_responses: None,
+            services,
+        };
+        match auction
+            .orchestrator
+            .run_auction(&auction_request, &auction_context)
+            .await
+        {
+            Ok(result) => result.winning_bids,
+            Err(e) => {
+                log::warn!("page-bids auction failed: {e:?}");
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let bid_map = build_bid_map(
         &winning_bids,
@@ -1938,33 +1943,37 @@ mod tests {
     #[test]
     fn server_side_ad_stack_runs_only_when_all_auction_gates_pass() {
         assert!(
-            should_run_server_side_ad_stack(true, true, false, false, true, true),
+            should_run_server_side_ad_stack(true, true, false, false, true, true, true),
             "GET, real navigation, matched slots, and consent should run TS ad stack"
         );
 
         assert!(
-            !should_run_server_side_ad_stack(false, true, false, false, true, true),
+            !should_run_server_side_ad_stack(false, true, false, false, true, true, true),
             "non-GET requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, false, false, false, true, true),
+            !should_run_server_side_ad_stack(true, false, false, false, true, true, true),
             "non-document requests should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, true, false, true, true),
+            !should_run_server_side_ad_stack(true, true, true, false, true, true, true),
             "prefetch requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, true, true, true),
+            !should_run_server_side_ad_stack(true, true, false, true, true, true, true),
             "bot requests should skip TS ad stack and injection"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, false, true),
+            !should_run_server_side_ad_stack(true, true, false, false, false, true, true),
             "requests with no matching slots should skip TS ad stack"
         );
         assert!(
-            !should_run_server_side_ad_stack(true, true, false, false, true, false),
+            !should_run_server_side_ad_stack(true, true, false, false, true, false, true),
             "requests without required consent should skip TS ad stack and injection"
+        );
+        assert!(
+            !should_run_server_side_ad_stack(true, true, false, false, true, true, false),
+            "disabled [auction].enabled kill switch should skip TS ad stack and injection"
         );
     }
 
@@ -3501,10 +3510,44 @@ mod tests {
 
         fn settings_with_co() -> Settings {
             let toml = format!(
-                "{}\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                "{}\n[auction]\nenabled = true\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
                 crate_test_settings_str()
             );
             Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
+        }
+
+        fn settings_with_co_auction_disabled() -> Settings {
+            let toml = format!(
+                "{}\n[auction]\nenabled = false\n\n[creative_opportunities]\ngam_network_id = \"12345\"\n",
+                crate_test_settings_str()
+            );
+            Settings::from_toml(&toml).expect("should parse settings with creative_opportunities")
+        }
+
+        async fn run_page_bids(
+            settings: &Settings,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request,
+        ) -> serde_json::Value {
+            let services = noop_services();
+            let ec_context =
+                EcContext::read_from_request(settings, &req).expect("should read EC context");
+            let response = handle_page_bids(
+                settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator,
+                    slots,
+                    registry: None,
+                },
+                &ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+            serde_json::from_slice(&response.into_body_bytes()).expect("should be json")
         }
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
@@ -3538,16 +3581,9 @@ mod tests {
             // all server-side auction activity and injection.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
             let req = make_page_bids_request("/2024/01/my-article/");
 
-            let response =
-                handle_page_bids(&settings, &orchestrator, &services, None, None, &[], req)
-                    .await
-                    .expect("should return ok response");
-
-            let body: serde_json::Value =
-                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+            let body = run_page_bids(&settings, &orchestrator, &[], req).await;
 
             assert_eq!(
                 body["slots"]
@@ -3574,18 +3610,11 @@ mod tests {
             // for them. Same gate the publisher path applies.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
 
-            let response =
-                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
-                    .await
-                    .expect("should return ok response");
-
-            let body: serde_json::Value =
-                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
@@ -3611,18 +3640,11 @@ mod tests {
             // SSP auctions — the user has not yet visited the page.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
             req.set_header("sec-purpose", "prefetch");
 
-            let response =
-                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
-                    .await
-                    .expect("should return ok response");
-
-            let body: serde_json::Value =
-                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
@@ -3647,17 +3669,10 @@ mod tests {
             // Slots exist but request path does not match — no auction, no injection.
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-            let services = noop_services();
             let slots = article_slot(); // slot matches /20** only
             let req = make_page_bids_request("/about"); // does not match
 
-            let response =
-                handle_page_bids(&settings, &orchestrator, &services, None, None, &slots, req)
-                    .await
-                    .expect("should return ok response");
-
-            let body: serde_json::Value =
-                serde_json::from_slice(&response.into_body_bytes()).expect("should be json");
+            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
@@ -3674,6 +3689,36 @@ mod tests {
                     .len(),
                 0,
                 "non-matching URL should produce zero bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn disabled_auction_returns_slots_but_no_bids() {
+            // [auction].enabled = false is a global kill switch: slot definitions
+            // are still returned (HTML structure unchanged) but no server-side
+            // auction may be dispatched.
+            let settings = settings_with_co_auction_disabled();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                1,
+                "disabled auction should still return slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "disabled auction must not produce bids"
             );
         }
     }
