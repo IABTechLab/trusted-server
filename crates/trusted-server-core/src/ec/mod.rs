@@ -135,7 +135,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
 /// Created via [`read_from_request`](Self::read_from_request) during
 /// pre-routing, then optionally mutated by
 /// [`generate_if_needed`](Self::generate_if_needed) in organic handlers.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EcContext {
     /// The EC ID value, if one exists (from request) or was generated.
     ec_value: Option<String>,
