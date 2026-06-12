@@ -653,18 +653,10 @@ impl KvIdentityGraph {
         hash_prefix: &str,
     ) -> Result<u32, Report<TrustedServerError>> {
         // The prefix ensures we only match EC IDs derived from the same
-        // IP+passphrase (i.e. same 64-hex hash).
+        // IP+passphrase (i.e. same 64-hex hash). The backend already attaches
+        // store context to list failures, so propagate without re-wrapping.
         self.store
             .count_keys_with_prefix(hash_prefix, CLUSTER_LIST_LIMIT)
-            .map_err(|report| {
-                report.change_context(TrustedServerError::KvStore {
-                    store_name: self.store_name().to_owned(),
-                    message: format!(
-                        "Failed to list keys with prefix '{}'",
-                        &hash_prefix[..hash_prefix.len().min(8)],
-                    ),
-                })
-            })
     }
 
     /// Evaluates the cluster size for an EC entry.
@@ -756,12 +748,9 @@ impl KvIdentityGraph {
     ///
     /// Returns [`TrustedServerError::KvStore`] on store error.
     pub fn delete(&self, ec_id: &str) -> Result<(), Report<TrustedServerError>> {
-        self.store.delete(ec_id).map_err(|report| {
-            report.change_context(TrustedServerError::KvStore {
-                store_name: self.store_name().to_owned(),
-                message: format!("Failed to delete key '{ec_id}'"),
-            })
-        })
+        // The backend's delete already attaches store context, so propagate
+        // without re-wrapping the same message.
+        self.store.delete(ec_id)
     }
 }
 
@@ -875,6 +864,160 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.consent.ok = true;
         entry
+    }
+
+    // -----------------------------------------------------------------------
+    // CAS-conflict injection tests
+    // -----------------------------------------------------------------------
+
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::EcKvLookup;
+
+    /// [`EcKvStore`] wrapper that injects generation conflicts: the first
+    /// `conflicts_remaining` `IfGenerationMatch` inserts return
+    /// [`EcKvWriteOutcome::PreconditionFailed`] without writing, optionally
+    /// reviving the underlying entry to simulate a concurrent writer.
+    struct ConflictInjectingEcKv {
+        inner: InMemoryEcKv,
+        conflicts_remaining: std::sync::Mutex<u32>,
+        revive_on_conflict: bool,
+    }
+
+    impl ConflictInjectingEcKv {
+        fn new(conflicts: u32, revive_on_conflict: bool) -> Self {
+            Self {
+                inner: InMemoryEcKv::new("conflict-store"),
+                conflicts_remaining: std::sync::Mutex::new(conflicts),
+                revive_on_conflict,
+            }
+        }
+
+        fn seed_tombstone(&self, ec_id: &str) {
+            let (body, meta) = KvIdentityGraph::serialize_entry(
+                &KvEntry::tombstone(1000),
+                self.inner.store_name(),
+            )
+            .expect("should serialize tombstone");
+            self.inner
+                .insert(
+                    ec_id,
+                    EcKvWrite {
+                        body: &body,
+                        metadata: &meta,
+                        ttl: TOMBSTONE_TTL,
+                        mode: EcKvWriteMode::Add,
+                    },
+                )
+                .expect("should seed tombstone");
+        }
+    }
+
+    impl EcKvStore for ConflictInjectingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.inner.lookup(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+                let mut remaining = self
+                    .conflicts_remaining
+                    .lock()
+                    .expect("should lock conflict counter");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    if self.revive_on_conflict {
+                        // Simulate a concurrent writer reviving the entry
+                        // between this writer's read and its CAS write.
+                        let (body, meta) = KvIdentityGraph::serialize_entry(
+                            &live_entry(),
+                            self.inner.store_name(),
+                        )
+                        .expect("should serialize concurrent live entry");
+                        self.inner
+                            .insert(
+                                key,
+                                EcKvWrite {
+                                    body: &body,
+                                    metadata: &meta,
+                                    ttl: ENTRY_TTL,
+                                    mode: EcKvWriteMode::Overwrite,
+                                },
+                            )
+                            .expect("should apply concurrent revive");
+                    }
+                    return Ok(EcKvWriteOutcome::PreconditionFailed);
+                }
+            }
+            self.inner.insert(key, write)
+        }
+
+        fn count_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<u32, Report<TrustedServerError>> {
+            self.inner.count_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn create_or_revive_retries_cas_conflict_and_succeeds() {
+        let store = ConflictInjectingEcKv::new(2, false);
+        store.seed_tombstone("ec-1");
+        let graph = KvIdentityGraph::new(store);
+
+        graph
+            .create_or_revive("ec-1", &live_entry())
+            .expect("should revive after re-reading a fresh generation");
+
+        let (entry, _) = graph
+            .get("ec-1")
+            .expect("should read entry")
+            .expect("entry should exist");
+        assert!(
+            entry.consent.ok,
+            "tombstone should be revived after CAS retries"
+        );
+    }
+
+    #[test]
+    fn create_or_revive_short_circuits_on_concurrent_revive() {
+        // Inject more conflicts than MAX_CAS_RETRIES so the only way the call
+        // can succeed is the concurrent-revive short-circuit on re-read.
+        let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, true);
+        store.seed_tombstone("ec-2");
+        let graph = KvIdentityGraph::new(store);
+
+        graph
+            .create_or_revive("ec-2", &live_entry())
+            .expect("should return Ok when a concurrent writer already revived the entry");
+    }
+
+    #[test]
+    fn create_or_revive_errors_after_cas_exhaustion() {
+        let store = ConflictInjectingEcKv::new(MAX_CAS_RETRIES + 1, false);
+        store.seed_tombstone("ec-3");
+        let graph = KvIdentityGraph::new(store);
+
+        let err = graph
+            .create_or_revive("ec-3", &live_entry())
+            .expect_err("should fail after exhausting CAS retries");
+        assert!(
+            format!("{err}").contains("CAS conflict after"),
+            "should report CAS exhaustion as the terminal error"
+        );
     }
 
     #[test]

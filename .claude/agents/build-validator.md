@@ -8,10 +8,10 @@ Validate that the project builds correctly across all targets.
 
 ## Steps
 
-1. **Native build**
+1. **Per-target builds** (no global target — fastly is wasm-only, axum is native)
 
    ```bash
-   cargo build --workspace
+   cargo build-fastly && cargo build-axum
    ```
 
 2. **WASM build** (production target)
@@ -23,7 +23,7 @@ Validate that the project builds correctly across all targets.
 3. **Clippy**
 
    ```bash
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo clippy-fastly && cargo clippy-axum
    ```
 
 4. **Format check**

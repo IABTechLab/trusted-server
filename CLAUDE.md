@@ -40,8 +40,8 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 ### Rust
 
 ```bash
-# Build
-cargo build
+# Build (per-target aliases — bare `cargo build` fails at the workspace root)
+cargo build-fastly && cargo build-axum
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -83,8 +83,8 @@ cargo fmt --all -- --check
 # Lint
 cargo clippy-fastly && cargo clippy-axum
 
-# Check compilation
-cargo check
+# Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
+cargo check-fastly && cargo check-axum
 
 # JS tests
 cd crates/js/lib && npx vitest run
