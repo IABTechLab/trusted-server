@@ -984,6 +984,13 @@ impl PrebidAuctionProvider {
                 // When no inline PBS bidder params exist (e.g. creative-opportunity slots
                 // whose PBS params live in stored requests), tell PBS to resolve bidder
                 // config from the stored request keyed by this slot ID.
+                //
+                // This cannot fire for the client /auction path: the JS adapter
+                // injects a `trustedServer` entry into every ad unit, so `bidder`
+                // is only empty for server-side creative-opportunity slots with
+                // no inline provider params (or when `config.bidders` is empty,
+                // where PBS previously received an empty bidder map and returned
+                // no bids — a stored-request miss is the same no-bid outcome).
                 let storedrequest = if bidder.is_empty() {
                     Some(ImpStoredRequest {
                         id: slot.id.clone(),

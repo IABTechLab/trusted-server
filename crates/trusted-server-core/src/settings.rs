@@ -776,7 +776,8 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any cached runtime artifact cannot be prepared.
+    /// Returns a configuration error if any cached runtime artifact cannot be
+    /// prepared, or if a creative opportunity slot has an invalid ID.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         for handler in &self.handlers {
             handler.prepare_runtime()?;
@@ -784,6 +785,16 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
+            // Slot IDs flow into injected HTML/JS and provider payloads, and
+            // can arrive via TRUSTED_SERVER__ env overrides that bypass any
+            // static config review — validate them on every load path.
+            for slot in &co.slot {
+                crate::creative_opportunities::validate_slot_id(&slot.id).map_err(|err| {
+                    Report::new(TrustedServerError::Configuration {
+                        message: format!("Invalid creative opportunity slot id: {err}"),
+                    })
+                })?;
+            }
         }
 
         Ok(())
@@ -2705,6 +2716,38 @@ auction_timeout_ms = 500
             .expect("should have creative_opportunities");
         assert_eq!(co.gam_network_id, "21765378893");
         assert_eq!(co.auction_timeout_ms, Some(500));
+    }
+
+    #[test]
+    fn settings_rejects_invalid_creative_opportunity_slot_id() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+id = "xss<script>"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#;
+        let err = Settings::from_toml(toml).expect_err("should reject invalid slot id");
+        assert!(
+            format!("{err:?}").contains("Invalid creative opportunity slot id"),
+            "error should mention the invalid slot id, got: {err:?}"
+        );
     }
 
     #[test]

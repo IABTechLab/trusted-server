@@ -36,8 +36,8 @@ pub struct CreativeOpportunitiesConfig {
     /// When absent, falls back to `[auction].timeout_ms` from global config.
     #[serde(default)]
     pub auction_timeout_ms: Option<u32>,
-    /// Price granularity for header-bidding price bucketing.
-    #[serde(default = "PriceGranularity::dense")]
+    /// Price granularity for header-bidding price bucketing. Defaults to `Dense`.
+    #[serde(default)]
     pub price_granularity: PriceGranularity,
     /// Slot templates. Empty vec = feature disabled (no auction fired, no globals injected).
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -230,8 +230,8 @@ pub struct CreativeOpportunityFormat {
     pub width: u32,
     /// Creative height in pixels.
     pub height: u32,
-    /// Media type for this format.
-    #[serde(default = "MediaType::banner")]
+    /// Media type for this format. Defaults to `Banner`.
+    #[serde(default)]
     pub media_type: MediaType,
 }
 

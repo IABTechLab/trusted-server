@@ -453,13 +453,27 @@ export function installTsAdInit(): void {
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
           // Compare hb_adid targeting to verify the specific creative won.
+          // APS bids carry no hb_adid — fall back to hb_bidder presence
+          // (same heuristic as the inline bootstrap) so APS wins still bill.
           const ourBidWon =
             !event.isEmpty &&
-            !!bid.hb_adid &&
-            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
-          if (ourBidWon) {
-            if (bid.nurl) navigator.sendBeacon(bid.nurl);
-            if (bid.burl) navigator.sendBeacon(bid.burl);
+            (bid.hb_adid
+              ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
+              : !!bid.hb_bidder);
+          if (ourBidWon && (bid.nurl || bid.burl)) {
+            // Fire win/billing beacons at most once per bid: GAM re-renders
+            // (publisher refreshes, repeated slotRenderEnded for the same
+            // line item) must not re-bill. New auctions produce new bid
+            // identities, so post-navigation bids still fire. Keyed in
+            // shared tsjs state so the inline-bootstrap listener and this
+            // one can never double-fire the same bid.
+            const beaconKey = `${slotId}|${bid.hb_adid ?? bid.nurl ?? bid.burl ?? ''}`;
+            const fired = (ts.firedBeacons ??= {});
+            if (!fired[beaconKey]) {
+              fired[beaconKey] = true;
+              if (bid.nurl) navigator.sendBeacon(bid.nurl);
+              if (bid.burl) navigator.sendBeacon(bid.burl);
+            }
           }
 
           // GAM interceptor (testing): when adm is present, replace the GAM creative.

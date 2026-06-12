@@ -10,7 +10,7 @@ use fastly::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use validator::Validate;
 
@@ -88,28 +88,42 @@ impl IntegrationConfig for AdServerMockConfig {
 // Provider
 // ============================================================================
 
-/// Lookup index built from original SSP bids during `request_bids`, consumed
-/// during `parse_response` to restore render/accounting fields that the mock
+/// Lookup index built from the original SSP bids, used while parsing the
+/// mediation response to restore render/accounting fields that the mock
 /// mediator endpoint does not echo back.
 ///
 /// Keyed by `(provider_name, slot_id, bidder_name)`.
 type BidIndex = HashMap<(String, String, String), Bid>;
 
+/// Builds the SSP-bid lookup index from the orchestrator-provided
+/// bidder responses on the auction context.
+fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
+    let mut index = BidIndex::new();
+    for response in bidder_responses {
+        for bid in &response.bids {
+            index.insert(
+                (
+                    response.provider.clone(),
+                    bid.slot_id.clone(),
+                    bid.bidder.clone(),
+                ),
+                bid.clone(),
+            );
+        }
+    }
+    index
+}
+
 /// Mock ad server mediator provider.
 pub struct AdServerMockProvider {
     config: AdServerMockConfig,
-    /// Bridges SSP bid metadata from `request_bids` to `parse_response`.
-    bid_index: Mutex<Option<BidIndex>>,
 }
 
 impl AdServerMockProvider {
     /// Create a new mock ad server provider.
     #[must_use]
     pub fn new(config: AdServerMockConfig) -> Self {
-        Self {
-            config,
-            bid_index: Mutex::new(None),
-        }
+        Self { config }
     }
 
     /// Build the mediation endpoint URL, appending context values as query
@@ -225,9 +239,10 @@ impl AdServerMockProvider {
     /// Parse `OpenRTB` response from mediation endpoint.
     /// Mediation returns decoded prices for all bids (including APS bids that were encoded).
     ///
-    /// `bid_index` is the SSP-bid lookup built in `request_bids`. The mock mediator
-    /// does not echo render/accounting fields back, so they are restored from the index
-    /// using `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
+    /// `bid_index` is the SSP-bid lookup built from the auction context's
+    /// bidder responses. The mock mediator does not echo render/accounting
+    /// fields back, so they are restored from the index using
+    /// `(seat, impid, bidder)` where bidder is recovered from the echoed `crid`
     /// field (`"{bidder}-creative"` format set during request construction).
     fn parse_mediation_response(
         &self,
@@ -301,6 +316,45 @@ impl AdServerMockProvider {
             AuctionResponse::success("adserver_mock", all_bids, response_time_ms)
         }
     }
+
+    /// Shared parse body for the context-aware and context-less trait methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mediation response body is not valid JSON.
+    fn parse_response_inner(
+        &self,
+        mut response: fastly::Response,
+        response_time_ms: u64,
+        bid_index: &BidIndex,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        if !response.get_status().is_success() {
+            log::warn!(
+                "AdServer Mock returned non-success: {}",
+                response.get_status()
+            );
+            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
+        }
+
+        let body_bytes = response.take_body_bytes();
+        let response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
+                message: "Failed to parse mediation response".to_string(),
+            })?;
+
+        log::trace!("AdServer Mock response: {:?}", response_json);
+
+        let auction_response =
+            self.parse_mediation_response(&response_json, response_time_ms, bid_index);
+
+        log::info!(
+            "AdServer Mock returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
 }
 
 impl AuctionProvider for AdServerMockProvider {
@@ -321,23 +375,6 @@ impl AuctionProvider for AdServerMockProvider {
             request.slots.len(),
             bidder_responses.len()
         );
-
-        // Build bid index so parse_response can restore nurl/burl/ad_id from
-        // the original SSP bids (the mock mediator does not echo these fields).
-        let mut index = BidIndex::new();
-        for response in bidder_responses {
-            for bid in &response.bids {
-                index.insert(
-                    (
-                        response.provider.clone(),
-                        bid.slot_id.clone(),
-                        bid.bidder.clone(),
-                    ),
-                    bid.clone(),
-                );
-            }
-        }
-        *self.bid_index.lock().expect("should lock bid index") = Some(index);
 
         // Build mediation request
         let mediation_req = self
@@ -395,42 +432,28 @@ impl AuctionProvider for AdServerMockProvider {
 
     fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: fastly::Response,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        if !response.get_status().is_success() {
-            log::warn!(
-                "AdServer Mock returned non-success: {}",
-                response.get_status()
-            );
-            return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
-        }
+        // No auction context available — nurl/burl/ad_id restoration from the
+        // original SSP bids is skipped. The orchestrator always calls
+        // [`parse_response_with_context`], so this path only serves callers
+        // outside the orchestration flow.
+        log::debug!("adserver_mock: parsing without context — SSP bid metadata unavailable");
+        self.parse_response_inner(response, response_time_ms, &BidIndex::new())
+    }
 
-        let body_bytes = response.take_body_bytes();
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse mediation response".to_string(),
-            })?;
-
-        log::trace!("AdServer Mock response: {:?}", response_json);
-
-        let bid_index = self
-            .bid_index
-            .lock()
-            .expect("should lock bid index")
-            .take()
-            .unwrap_or_default();
-
-        let auction_response =
-            self.parse_mediation_response(&response_json, response_time_ms, &bid_index);
-
-        log::info!(
-            "AdServer Mock returned {} bids in {}ms",
-            auction_response.bids.len(),
-            response_time_ms
-        );
-
-        Ok(auction_response)
+    fn parse_response_with_context(
+        &self,
+        response: fastly::Response,
+        response_time_ms: u64,
+        context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // Rebuild the SSP-bid lookup from the orchestrator-provided bidder
+        // responses so nurl/burl/ad_id survive mediation. Request-scoped data
+        // travels on the context instead of provider-instance state.
+        let bid_index = build_bid_index(context.provider_responses.unwrap_or(&[]));
+        self.parse_response_inner(response, response_time_ms, &bid_index)
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {

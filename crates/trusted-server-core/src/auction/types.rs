@@ -52,20 +52,13 @@ pub struct AdFormat {
 }
 
 /// Media type enumeration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {
+    #[default]
     Banner,
     Video,
     Native,
-}
-
-impl MediaType {
-    /// Returns the Banner media type.
-    #[must_use]
-    pub fn banner() -> Self {
-        Self::Banner
-    }
 }
 
 /// Publisher information.
@@ -492,8 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn media_type_banner_fn_returns_banner() {
-        assert_eq!(MediaType::banner(), MediaType::Banner);
+    fn media_type_defaults_to_banner() {
+        assert_eq!(
+            MediaType::default(),
+            MediaType::Banner,
+            "should default to Banner for serde field defaults"
+        );
     }
 
     #[test]

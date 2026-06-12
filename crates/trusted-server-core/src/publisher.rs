@@ -1208,7 +1208,10 @@ pub async fn handle_publisher_request(
     };
 
     // §4.7: assembled HTML responses must never be shared-cached — per-user bid data
-    // travels inline. Apply regardless of slot match or auction outcome (§8).
+    // travels inline. `private, max-age=0` is deliberate (not `no-store`): it keeps
+    // the page BFCache-eligible while restricting reuse to the same user's browser
+    // with revalidation; `Surrogate-Control` removal handles the Fastly shared
+    // cache. Apply regardless of slot match or auction outcome (§8).
     let origin_content_type = response
         .get_header(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
@@ -1559,6 +1562,20 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
+/// Normalizes the client-supplied `path` query parameter before glob matching.
+///
+/// The SPA hook sends `location.pathname`, but the parameter is
+/// client-controlled: strip any query string or fragment and force a leading
+/// `/` so slot `page_patterns` always match against a canonical path shape.
+fn normalize_page_bids_path(raw: &str) -> String {
+    let path = raw.split(['?', '#']).next().unwrap_or("");
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// Handle `GET /__ts/page-bids?path=<path>` — server-side auction for SPA navigation.
 ///
 /// Matches creative opportunity slots for the given path, runs a server-side
@@ -1585,7 +1602,7 @@ pub async fn handle_page_bids(
         .get_url()
         .query_pairs()
         .find(|(k, _)| k == "path")
-        .map(|(_, v)| v.into_owned())
+        .map(|(_, v)| normalize_page_bids_path(&v))
         .unwrap_or_else(|| "/".to_string());
 
     let matched_slots: Vec<_> =
@@ -3689,6 +3706,35 @@ mod tests {
                     .len(),
                 0,
                 "non-matching URL should produce zero bids"
+            );
+        }
+
+        #[test]
+        fn normalize_page_bids_path_strips_query_fragment_and_forces_leading_slash() {
+            assert_eq!(
+                normalize_page_bids_path("/2024/01/article/"),
+                "/2024/01/article/",
+                "canonical path should pass through unchanged"
+            );
+            assert_eq!(
+                normalize_page_bids_path("/2024/01/article/?utm_source=x"),
+                "/2024/01/article/",
+                "query string should be stripped before glob matching"
+            );
+            assert_eq!(
+                normalize_page_bids_path("/2024/01/article/#section"),
+                "/2024/01/article/",
+                "fragment should be stripped before glob matching"
+            );
+            assert_eq!(
+                normalize_page_bids_path("2024/01/article/"),
+                "/2024/01/article/",
+                "missing leading slash should be added"
+            );
+            assert_eq!(
+                normalize_page_bids_path(""),
+                "/",
+                "empty path should normalize to root"
             );
         }
 

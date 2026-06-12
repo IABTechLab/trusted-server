@@ -68,6 +68,14 @@ mod creative_opportunities {
         pub fn compile_slots(&mut self) {}
     }
 
+    /// Stub — the typed `slot` vec is always empty in the build context (see
+    /// `#[serde(skip)]` above), so `Settings::prepare_runtime` never reaches
+    /// this. Build-time slot-id validation happens in `main()` against
+    /// `slot_raw` instead.
+    pub fn validate_slot_id(_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn default_price_granularity() -> String {
         "dense".to_string()
     }

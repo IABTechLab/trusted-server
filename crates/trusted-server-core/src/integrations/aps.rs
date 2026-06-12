@@ -290,6 +290,11 @@ pub struct ApsAuctionProvider {
     // Written by request_bids before the async send; read by parse_response when the
     // response arrives. Safe because Fastly Compute runs each request in an isolated
     // single-threaded Wasm instance — the Mutex never contends in practice.
+    //
+    // Unlike adserver_mock's bid index (rebuilt in parse_response_with_context
+    // from context.provider_responses), this map derives from the AuctionRequest,
+    // which AuctionContext does not carry — migrating it off provider-instance
+    // state needs the request threaded through the context first.
     slot_id_map: std::sync::Mutex<HashMap<String, String>>,
 }
 

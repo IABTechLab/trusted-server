@@ -11,13 +11,6 @@ pub enum PriceGranularity {
     Auto,
 }
 
-impl PriceGranularity {
-    #[must_use]
-    pub fn dense() -> Self {
-        Self::Dense
-    }
-}
-
 #[must_use]
 pub fn price_bucket(cpm: f64, granularity: PriceGranularity) -> String {
     // Reject NaN / Inf early so the `(x * 100.0).floor() as u64` cast below

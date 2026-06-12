@@ -98,6 +98,12 @@ export interface TsjsApi {
   servicesEnabled?: boolean;
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
+  /**
+   * Win/billing beacons already fired, keyed by `slotId|bidIdentity`.
+   * Shared between the inline GPT bootstrap and the bundle listener so a
+   * bid's nurl/burl fire at most once even across GAM re-renders.
+   */
+  firedBeacons?: Record<string, boolean>;
   /** Slot-level GPT targeting keys TS applied on the previous route. */
   prevSlotTargetingKeys?: Record<string, string[]>;
   /**

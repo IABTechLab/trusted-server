@@ -1,23 +1,36 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 
 // Track every 'message' EventListener added to window across the entire test
 // file.  This lets the installTsRenderBridge suite remove all accumulated
-// handlers (registered by each vi.resetModules() + import('./index') in the
-// installTsAdInit suite) before dispatching its own events.
+// handlers (registered by each vi.resetModules() + module re-import in the
+// installTsAdInit suite) before dispatching its own events. The spy is
+// restored and remaining handlers are detached in the afterAll below so the
+// patch never leaks past this file.
 const allMessageHandlers: EventListener[] = [];
-const _origWindowAddEventListener = window.addEventListener.bind(window);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(window as any).addEventListener = function (
+const originalWindowAddEventListener = window.addEventListener.bind(window);
+// Plain wrapper, deliberately not vi.spyOn: the render-bridge suite spies on
+// window.addEventListener itself, and vi.spyOn on an already-spied method
+// returns the same mock instance — its "original" would alias the inner
+// implementation and recurse.
+(window as { addEventListener: typeof window.addEventListener }).addEventListener = ((
   type: string,
   handler: EventListenerOrEventListenerObject,
-  options?: unknown
-) {
-  if (type === 'message') {
+  options?: boolean | AddEventListenerOptions
+) => {
+  if (type === 'message' && handler) {
     allMessageHandlers.push(handler as EventListener);
   }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return _origWindowAddEventListener(type, handler as EventListener, options as any);
-};
+  return originalWindowAddEventListener(type, handler, options);
+}) as typeof window.addEventListener;
+
+afterAll(() => {
+  for (const handler of allMessageHandlers) {
+    window.removeEventListener('message', handler);
+  }
+  allMessageHandlers.length = 0;
+  (window as { addEventListener: typeof window.addEventListener }).addEventListener =
+    originalWindowAddEventListener;
+});
 
 interface SlotRenderEvent {
   isEmpty: boolean;
@@ -109,7 +122,7 @@ describe('installTsAdInit', () => {
 
     const fetchSpy = vi.spyOn(global, 'fetch');
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -161,7 +174,7 @@ describe('installTsAdInit', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -201,7 +214,7 @@ describe('installTsAdInit', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -259,7 +272,7 @@ describe('installTsAdInit', () => {
       },
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -317,7 +330,7 @@ describe('installTsAdInit', () => {
       },
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -326,10 +339,17 @@ describe('installTsAdInit', () => {
 
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp/win');
     expect(beaconSpy).toHaveBeenCalledWith('https://ssp/bill');
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+
+    // GAM re-rendering the same line item (same hb_adid) must not re-fire
+    // the same bid's win/billing beacons.
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+
     beaconSpy.mockRestore();
   });
 
-  it('does not fire beacons when a rendered bid has no hb_adid confirmation', async () => {
+  it('fires APS-style beacons once via hb_bidder fallback and dedupes repeat renders', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
@@ -373,17 +393,26 @@ describe('installTsAdInit', () => {
       },
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
     expect(capturedListener).toBeDefined();
-    capturedListener!({ isEmpty: false, slot: mockSlot });
 
-    expect(beaconSpy).not.toHaveBeenCalled();
-
+    // Empty render never fires.
     capturedListener!({ isEmpty: true, slot: mockSlot });
     expect(beaconSpy).not.toHaveBeenCalled();
+
+    // First real render fires both beacons via the hb_bidder fallback
+    // (APS bids carry no hb_adid to confirm against).
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    expect(beaconSpy).toHaveBeenCalledWith('https://aps/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://aps/bill');
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+
+    // Re-render of the same bid (publisher refresh) must not re-bill.
+    capturedListener!({ isEmpty: false, slot: mockSlot });
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
 
     beaconSpy.mockRestore();
   });
@@ -433,7 +462,7 @@ describe('installTsAdInit', () => {
       },
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
     capturedListener!({ isEmpty: false, slot: mockSlotNoMatch });
@@ -485,7 +514,7 @@ describe('installTsAdInit', () => {
       },
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -533,7 +562,7 @@ describe('installTsAdInit', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -580,7 +609,7 @@ describe('installTsAdInit', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -624,7 +653,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
     (window as TestWindow).tsjs!.adInit!();
 
@@ -667,7 +696,7 @@ describe('installTsAdInit', () => {
       bids: {},
     };
 
-    const { installTsAdInit } = await import('./index');
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
     installTsAdInit();
 
     expect(() => (window as TestWindow).tsjs!.adInit!()).not.toThrow();
@@ -746,7 +775,7 @@ describe('installTsRenderBridge', () => {
           origAdd(type, handler as EventListener, opts as any);
         }
       );
-    await import('./index');
+    await import('../../../src/integrations/gpt/index');
     addSpy.mockRestore(); // Restore only addEventListener — fetchStub must stay stubbed
 
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
@@ -816,7 +845,7 @@ describe('installTsRenderBridge', () => {
           origAdd(type, handler as EventListener, opts as any);
         }
       );
-    await import('./index');
+    await import('../../../src/integrations/gpt/index');
     addSpy.mockRestore();
 
     expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
@@ -850,7 +879,7 @@ describe('installTsRenderBridge', () => {
   });
 
   it('ignores message when adId does not match any TS bid', async () => {
-    await import('./index');
+    await import('../../../src/integrations/gpt/index');
     fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
 
     window.dispatchEvent(
@@ -865,7 +894,7 @@ describe('installTsRenderBridge', () => {
   });
 
   it('ignores matching adId messages from outside configured slot iframes', async () => {
-    await import('./index');
+    await import('../../../src/integrations/gpt/index');
     fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
 
     const foreignIframe = document.createElement('iframe');
@@ -890,7 +919,7 @@ describe('installTsRenderBridge', () => {
   });
 
   it('ignores non-Prebid messages', async () => {
-    await import('./index');
+    await import('../../../src/integrations/gpt/index');
     window.dispatchEvent(
       new MessageEvent('message', { data: JSON.stringify({ message: 'Other' }) })
     );

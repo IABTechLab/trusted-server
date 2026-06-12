@@ -103,9 +103,18 @@
             (b.hb_adid
               ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
               : !!b.hb_bidder);
-          if (ourBidWon) {
-            if (b.nurl) navigator.sendBeacon(b.nurl);
-            if (b.burl) navigator.sendBeacon(b.burl);
+          if (ourBidWon && (b.nurl || b.burl)) {
+            // Fire each bid's win/billing beacons at most once — GAM can
+            // re-render the same line item on publisher refreshes. Keep the
+            // key format in sync with the bundle listener in index.ts; the
+            // map lives on tsjs so both listeners share dedupe state.
+            var beaconKey = slotId + "|" + (b.hb_adid || b.nurl || b.burl || "");
+            var fired = (ts.firedBeacons = ts.firedBeacons || {});
+            if (!fired[beaconKey]) {
+              fired[beaconKey] = true;
+              if (b.nurl) navigator.sendBeacon(b.nurl);
+              if (b.burl) navigator.sendBeacon(b.burl);
+            }
           }
         });
       }
