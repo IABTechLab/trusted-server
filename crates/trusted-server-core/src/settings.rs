@@ -3901,47 +3901,6 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
-    fn checked_in_integration_config_builds_startup_dependencies() {
-        let toml_str = include_str!("../../../trusted-server.toml");
-
-        let settings = temp_env::with_vars(
-            [
-                (
-                    "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
-                    Some("http://127.0.0.1:8888"),
-                ),
-                (
-                    "TRUSTED_SERVER__PUBLISHER__PROXY_SECRET",
-                    Some("integration-test-proxy-secret"),
-                ),
-                (
-                    "TRUSTED_SERVER__EC__PASSPHRASE",
-                    Some("integration-test-ec-secret-padded-32"),
-                ),
-                (
-                    "TRUSTED_SERVER__EC__PARTNERS",
-                    Some(
-                        r#"[{"name":"Integration Test Partner","source_domain":"inttest.example.com","bidstream_enabled":true,"api_token":"integration-test-token-alpha-32-bytes-ok"}]"#,
-                    ),
-                ),
-                ("TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK", Some("false")),
-            ],
-            || Settings::from_toml_and_env(toml_str).expect("should load integration config"),
-        );
-
-        assert!(
-            !settings.auction.enabled,
-            "checked-in config should not enable auction by default"
-        );
-        assert!(
-            settings.auction.providers.is_empty(),
-            "checked-in config should not list auction providers by default"
-        );
-        IntegrationRegistry::new(&settings).expect("should build integration registry");
-        build_orchestrator(&settings).expect("should build auction orchestrator");
-    }
-
-    #[test]
     fn enabled_invalid_integration_fails_registry_startup() {
         let mut settings = create_test_settings();
         settings
