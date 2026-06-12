@@ -535,7 +535,7 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let json = assert_json_response(resp, 200)
         .attach("EC full lifecycle: batch sync should return 200")?;
 
-    let accepted = json.get("accepted").and_then(|v| v.as_u64());
+    let accepted = json.get("accepted").and_then(serde_json::Value::as_u64);
     if accepted != Some(1) {
         return Err(Report::new(TestError::JsonFieldMismatch {
             field: "accepted".to_owned(),
@@ -725,7 +725,7 @@ fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let resp = batch_sync(&client, INTTEST_API_TOKEN, &mappings)?;
     let json = assert_json_response(resp, 200).attach("batch sync should return 200")?;
 
-    let accepted = json.get("accepted").and_then(|v| v.as_u64());
+    let accepted = json.get("accepted").and_then(serde_json::Value::as_u64);
     if accepted != Some(1) {
         return Err(Report::new(TestError::JsonFieldMismatch {
             field: "accepted".to_owned(),
