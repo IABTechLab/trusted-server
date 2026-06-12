@@ -288,7 +288,12 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 
 /// Handles a request using the original Fastly-native entry point.
 ///
-/// Preserves identical semantics to the pre-PR14 `main()`. Called whenever
+/// Preserves identical semantics to the pre-PR14 `main()`, with one
+/// relocation: `GET /health` is short-circuited in [`main`] before the flag
+/// dispatch, so it never reaches this function. The pre-PR14 entry point
+/// answered `/health` with the same `200 ok` before settings loading and
+/// routing; the only difference is that the probe now also skips logger
+/// initialization. Called whenever
 /// the `EdgeZero` flag is disabled or cannot be read/parsed as enabled — that
 /// includes config-store open failures, key-read errors, missing keys, and
 /// any value other than the accepted `"true"` / `"1"` forms.
@@ -859,30 +864,9 @@ pub(crate) fn resolve_publisher_response_buffered(
             body,
             params,
         } => {
-            let bytes = match settings.publisher.max_buffered_body_bytes {
-                Some(limit) => {
-                    let mut output = BoundedWriter::new(limit);
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output.into_inner()
-                }
-                None => {
-                    let mut output = Vec::new();
-                    stream_publisher_body(
-                        body,
-                        &mut output,
-                        &params,
-                        settings,
-                        integration_registry,
-                    )?;
-                    output
-                }
-            };
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = output.into_inner();
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
                 HeaderValue::from(bytes.len() as u64),

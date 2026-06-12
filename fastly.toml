@@ -61,6 +61,8 @@ build = """
             # "true" / "1" (case-insensitive) enable the EdgeZero path. Missing,
             # unreadable, or any other value falls back to the legacy entry point.
             # Keep "false" until EdgeZero reaches full functional parity with legacy.
+            # Remaining gaps (EC API routes, EC identity lifecycle) are listed in the
+            # "Not yet ported" section of adapter-fastly/src/app.rs and tracked in issue #495.
             edgezero_enabled = "false"
 
         [local_server.config_stores.jwks_store]

@@ -19,6 +19,8 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
+//! | POST | `/admin/keys/rotate` (legacy alias) | [`handle_rotate_key`] |
+//! | POST | `/admin/keys/deactivate` (legacy alias) | [`handle_deactivate_key`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -33,6 +35,33 @@
 //! > router-level 405. Legacy routing proxied *every* method through to the publisher origin.
 //! > This is a known intentional restriction of the EdgeZero router; the entry-point
 //! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
+//!
+//! # Not yet ported (legacy-only) — tracked in issue #495
+//!
+//! The following legacy `route_request` behavior is **not** available on the
+//! `EdgeZero` path. The `edgezero_enabled` flag must stay `false` in production
+//! until every item below is ported (see `fastly.toml`):
+//!
+//! - **EC API routes** — these fall through to the publisher fallback instead
+//!   of their legacy handlers:
+//!   - `GET /_ts/api/v1/identify` (`handle_identify`)
+//!   - `OPTIONS /_ts/api/v1/identify` (`cors_preflight_identify`)
+//!   - `POST /_ts/api/v1/batch-sync` (`handle_batch_sync`, with partner
+//!     Bearer auth and rate limiting)
+//! - **EC identity lifecycle** — handlers receive a default [`EcContext`]
+//!   with no KV identity graph or partner registry:
+//!   - `EcContext::read_from_request_with_geo` (cookies, consent, geo,
+//!     device signals)
+//!   - bot gate (`DeviceSignals::looks_like_browser`) suppressing KV-backed
+//!     EC writes for unrecognized clients
+//!   - EC ID generation on browser navigation requests before the publisher
+//!     proxy (`EcContext::generate_if_needed`)
+//!   - `KvIdentityGraph` / `PartnerRegistry` wiring into `handle_auction` and
+//!     integration proxy dispatch (EC ID forwarding, partner EID decoration)
+//!   - `ec_finalize_response` on the way out (EC cookie set/expire, EC request
+//!     header clearing, consent-withdrawal tombstones)
+//!   - pull sync after successful browser responses
+//!     (`build_pull_sync_context` / `dispatch_pull_sync`)
 //!
 //! # Startup error handling
 //!
@@ -326,6 +355,19 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
     },
+    // Legacy aliases without the `/_ts` prefix, kept for parity with
+    // route_request in main.rs. Auth coverage comes from settings.handlers
+    // (enforced by AuthMiddleware), same as on the legacy path.
+    NamedRoute {
+        path: "/admin/keys/rotate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::RotateKey,
+    },
+    NamedRoute {
+        path: "/admin/keys/deactivate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::DeactivateKey,
+    },
     NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
@@ -516,6 +558,11 @@ mod tests {
             username = "admin"
             password = "admin-pass"
 
+            [[handlers]]
+            path = "^/admin"
+            username = "admin"
+            password = "admin-pass"
+
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -638,6 +685,31 @@ mod tests {
             Some("false"),
             "FinalizeResponseMiddleware must run even for auth-rejected responses"
         );
+    }
+
+    #[test]
+    fn dispatch_admin_alias_routes_are_registered_and_auth_gated() {
+        // Parity guard for the legacy non-`/_ts` admin aliases: both alias
+        // paths must be registered (no router-level 405) and protected by the
+        // `^/admin` handler in the test settings, mirroring how legacy
+        // route_request applies enforce_basic_auth before its route match.
+        let router = test_router();
+
+        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+            let req = request_builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(Body::empty())
+                .expect("should build alias request");
+
+            let response = block_on(router.oneshot(req));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path} without credentials should be rejected by AuthMiddleware"
+            );
+        }
     }
 
     #[test]

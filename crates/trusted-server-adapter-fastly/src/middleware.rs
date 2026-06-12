@@ -218,9 +218,10 @@ pub(crate) fn apply_finalize_headers(
 
     for (key, value) in &settings.response_headers {
         let header_name = HeaderName::from_bytes(key.as_bytes())
-            .expect("settings.response_headers validated at load time");
-        let header_value =
-            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
+            .expect("should be a valid header name: response_headers validated in prepare_runtime");
+        let header_value = HeaderValue::from_str(value).expect(
+            "should be a valid header value: response_headers validated in prepare_runtime",
+        );
         response.headers_mut().insert(header_name, header_value);
     }
 }
