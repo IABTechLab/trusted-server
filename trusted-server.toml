@@ -59,8 +59,8 @@ config_store_id = "<fastly-config-store-id>" # set config/secret store ids for k
 secret_store_id = "<fastly-secret-store-id>"
 
 [integrations.prebid]
-enabled = false
-server_url = "https://prebid-server.example.com/openrtb2/auction"
+enabled = true
+server_url = "http://68.183.113.79:8000"
 timeout_ms = 1000
 bidders = ["kargo", "appnexus", "openx"]
 debug = false
