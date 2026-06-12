@@ -246,6 +246,13 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
+/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
@@ -1315,7 +1322,6 @@ mod tests {
         req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
-
         let services = crate::platform::test_support::noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
@@ -1359,8 +1365,8 @@ mod tests {
         req.set_header(HEADER_X_TS_EC, "evil;injected");
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
-
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
             path: "/integrations/test/ec",
@@ -1398,8 +1404,8 @@ mod tests {
         req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
-
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
             path: "/integrations/test/ec",
@@ -1439,8 +1445,8 @@ mod tests {
         req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
         let mut ec_context =
             EcContext::read_from_request(&settings, &req).expect("should read EC context");
-
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::POST,
             path: "/integrations/test/ec",
