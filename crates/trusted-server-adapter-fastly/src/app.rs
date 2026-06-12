@@ -21,6 +21,9 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | POST | `/admin/keys/rotate` (legacy alias) | [`handle_rotate_key`] |
 //! | POST | `/admin/keys/deactivate` (legacy alias) | [`handle_deactivate_key`] |
+//! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
+//! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
+//! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -36,32 +39,33 @@
 //! > This is a known intentional restriction of the EdgeZero router; the entry-point
 //! > `apply_finalize_headers` call in `main.rs` still adds TS headers to those 405 responses.
 //!
-//! # Not yet ported (legacy-only) — tracked in issue #495
+//! # EC identity lifecycle
 //!
-//! The following legacy `route_request` behavior is **not** available on the
-//! `EdgeZero` path. The `edgezero_enabled` flag must stay `false` in production
-//! until every item below is ported (see `fastly.toml`):
+//! The `EdgeZero` path mirrors the EC identity lifecycle of the legacy
+//! `route_request` (tracked in issue #495):
 //!
-//! - **EC API routes** — these fall through to the publisher fallback instead
-//!   of their legacy handlers:
-//!   - `GET /_ts/api/v1/identify` (`handle_identify`)
-//!   - `OPTIONS /_ts/api/v1/identify` (`cors_preflight_identify`)
-//!   - `POST /_ts/api/v1/batch-sync` (`handle_batch_sync`, with partner
-//!     Bearer auth and rate limiting)
-//! - **EC identity lifecycle** — handlers receive a default [`EcContext`]
-//!   with no KV identity graph or partner registry:
-//!   - `EcContext::read_from_request_with_geo` (cookies, consent, geo,
-//!     device signals)
-//!   - bot gate (`DeviceSignals::looks_like_browser`) suppressing KV-backed
-//!     EC writes for unrecognized clients
-//!   - EC ID generation on browser navigation requests before the publisher
-//!     proxy (`EcContext::generate_if_needed`)
-//!   - `KvIdentityGraph` / `PartnerRegistry` wiring into `handle_auction` and
-//!     integration proxy dispatch (EC ID forwarding, partner EID decoration)
-//!   - `ec_finalize_response` on the way out (EC cookie set/expire, EC request
-//!     header clearing, consent-withdrawal tombstones)
-//!   - pull sync after successful browser responses
-//!     (`build_pull_sync_context` / `dispatch_pull_sync`)
+//! - [`build_ec_request_state`] runs before every dispatched route (except
+//!   batch-sync, which uses Bearer auth) and reproduces the legacy
+//!   pre-routing prelude: device signals, bot gate, `ts-eids`/`sharedid`
+//!   cookie capture, geo lookup, [`EcContext`] creation, and KV-graph gating.
+//! - `handle_auction` and integration proxy dispatch receive the same
+//!   [`EcContext`], [`KvIdentityGraph`], and [`PartnerRegistry`] inputs as
+//!   legacy; the publisher fallback generates EC IDs for browser navigations.
+//! - Handlers attach an [`EcFinalizeState`] to the response via extensions;
+//!   `edgezero_main` pops it and runs `ec_finalize_response` plus the
+//!   pull-sync hook on the converted fastly response before sending.
+//!
+//! ## Intentional deviations from legacy
+//!
+//! - **401 auth challenges**: [`AuthMiddleware`] short-circuits before the
+//!   handler runs, so no EC state is built and `ec_finalize_response` does not
+//!   run on these responses. Legacy ran EC finalization on its own auth
+//!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
+//!   cookies are issued to unauthenticated callers.
+//! - **Streaming publisher responses** are buffered (bounded by
+//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
+//! - **Router-level 405s** (unregistered verbs) skip EC finalization along
+//!   with the middleware chain; the entry point still adds TS headers.
 //!
 //! # Startup error handling
 //!
@@ -72,7 +76,6 @@
 //! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
 //! fails, they are returned without geo or TS headers.
 
-use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::FastlyRequestContext;
@@ -84,8 +87,17 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
+use trusted_server_core::compat;
+use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::ec::batch_sync::handle_batch_sync;
+use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
@@ -189,49 +201,289 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
     *method == Method::GET && path.starts_with("/static/tsjs=")
 }
 
-async fn execute_handler<F, Fut>(
+// ---------------------------------------------------------------------------
+// EC request state
+// ---------------------------------------------------------------------------
+
+/// EC state threaded from route handlers to the `main.rs` entry point via
+/// response extensions.
+///
+/// `edgezero_main` pops this from the response after dispatch and runs
+/// [`trusted_server_core::ec::finalize::ec_finalize_response`] plus the
+/// pull-sync hook on the converted fastly response — the same EC response
+/// lifecycle the legacy path drives through `RouteResult`.
+#[derive(Clone)]
+pub(crate) struct EcFinalizeState {
+    pub(crate) ec_context: EcContext,
+    pub(crate) finalize_kv_graph: Option<KvIdentityGraph>,
+    pub(crate) eids_cookie: Option<String>,
+    pub(crate) sharedid_cookie: Option<String>,
+    pub(crate) is_real_browser: bool,
+}
+
+/// Per-request EC identity state built before dispatch, mirroring the
+/// pre-routing prelude of the legacy `route_request` (device signals, bot
+/// gate, cookie capture, consent/geo-aware [`EcContext`], and KV graph
+/// gating).
+struct EcRequestState {
+    ec_context: EcContext,
+    kv_graph: Option<KvIdentityGraph>,
+    finalize_kv_graph: Option<KvIdentityGraph>,
+    eids_cookie: Option<String>,
+    sharedid_cookie: Option<String>,
+    is_real_browser: bool,
+    /// Error from [`EcContext`] creation. When set, handlers return this as
+    /// the response without running the route handler (legacy parity: the
+    /// legacy path short-circuits with an error response and a default
+    /// context).
+    setup_error: Option<Report<TrustedServerError>>,
+}
+
+impl EcRequestState {
+    fn into_finalize_state(self) -> EcFinalizeState {
+        EcFinalizeState {
+            ec_context: self.ec_context,
+            finalize_kv_graph: self.finalize_kv_graph,
+            eids_cookie: self.eids_cookie,
+            sharedid_cookie: self.sharedid_cookie,
+            is_real_browser: self.is_real_browser,
+        }
+    }
+}
+
+/// Builds the per-request EC state from a headers-only fastly request copy,
+/// mirroring the legacy `route_request` prelude step by step.
+fn build_ec_request_state(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: &Request,
+) -> EcRequestState {
+    let fastly_ref = compat::to_fastly_request_ref(req);
+
+    let device_signals = crate::derive_device_signals(&fastly_ref);
+    let is_real_browser = device_signals.looks_like_browser();
+    if !is_real_browser {
+        log::info!(
+            "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
+            device_signals.ja4_class,
+            device_signals.platform_class,
+            device_signals.is_mobile,
+        );
+    }
+
+    let eids_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_TS_EIDS);
+    let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
+
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed during EC setup: {e}");
+            None
+        });
+
+    let (ec_context, setup_error) =
+        match EcContext::read_from_request_with_geo(settings, &fastly_ref, geo_info.as_ref()) {
+            Ok(mut context) => {
+                context.set_device_signals(device_signals);
+                (context, None)
+            }
+            Err(report) => (EcContext::default(), Some(report)),
+        };
+
+    // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
+    // consent withdrawals. Revocations keep the write path so tombstones stay
+    // authoritative even for privacy-extension-heavy clients.
+    let kv_graph = crate::maybe_identity_graph(settings);
+    let finalize_kv_graph = if setup_error.is_none()
+        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
+    {
+        kv_graph.clone()
+    } else {
+        None
+    };
+    let kv_graph = if is_real_browser { kv_graph } else { None };
+
+    EcRequestState {
+        ec_context,
+        kv_graph,
+        finalize_kv_graph,
+        eids_cookie,
+        sharedid_cookie,
+        is_real_browser,
+        setup_error,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+async fn execute_named(
     state: Arc<AppState>,
     ctx: RequestContext,
-    handler: F,
-) -> Result<Response, EdgeError>
-where
-    F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
-    Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
-{
+    handler: NamedRouteHandler,
+) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
     let req = ctx.into_request();
 
-    Ok(handler(state, services, req)
-        .await
-        .unwrap_or_else(|e| http_error(&e)))
+    // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
+    // context creation entirely — mirroring the dedicated early arm in the
+    // legacy route_request.
+    if matches!(handler, NamedRouteHandler::BatchSync) {
+        return Ok(run_batch_sync(&state, req));
+    }
+
+    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut response = match ec.setup_error.take() {
+        Some(report) => http_error(&report),
+        None => run_named_route(&state, &services, req, handler, &mut ec)
+            .await
+            .unwrap_or_else(|e| http_error(&e)),
+    };
+    response.extensions_mut().insert(ec.into_finalize_state());
+    Ok(response)
 }
 
-async fn dispatch_fallback(
+async fn run_named_route(
     state: &AppState,
     services: &RuntimeServices,
     req: Request,
+    handler: NamedRouteHandler,
+    ec: &mut EcRequestState,
 ) -> Result<Response, Report<TrustedServerError>> {
+    match handler {
+        NamedRouteHandler::TrustedServerDiscovery => {
+            handle_trusted_server_discovery(&state.settings, services, req)
+        }
+        NamedRouteHandler::VerifySignature => {
+            handle_verify_signature(&state.settings, services, req)
+        }
+        NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
+        NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::BatchSync => {
+            // Dispatched by execute_named before EC state is built.
+            unreachable!("batch-sync should be handled by run_batch_sync")
+        }
+        NamedRouteHandler::Identify => {
+            let fastly_ref = compat::to_fastly_request_ref(&req);
+            if req.method() == Method::OPTIONS {
+                cors_preflight_identify(&state.settings, &fastly_ref)
+                    .map(compat::from_fastly_response)
+            } else {
+                let kv = crate::require_identity_graph(&state.settings)?;
+                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+                handle_identify(
+                    &state.settings,
+                    &kv,
+                    &partner_registry,
+                    &fastly_ref,
+                    &ec.ec_context,
+                )
+                .map(compat::from_fastly_response)
+            }
+        }
+        NamedRouteHandler::Auction => {
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(&partner_registry)
+            };
+            handle_auction(
+                &state.settings,
+                &state.orchestrator,
+                ec.kv_graph.as_ref(),
+                registry_ref,
+                &ec.ec_context,
+                services,
+                req,
+            )
+            .await
+        }
+        NamedRouteHandler::FirstPartyProxy => {
+            handle_first_party_proxy(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartyClick => {
+            handle_first_party_click(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartySign => {
+            handle_first_party_proxy_sign(&state.settings, services, req).await
+        }
+        NamedRouteHandler::FirstPartyProxyRebuild => {
+            handle_first_party_proxy_rebuild(&state.settings, services, req).await
+        }
+    }
+}
+
+/// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
+/// graph + partner registry + rate limiter, with a default EC context for
+/// response finalization.
+fn run_batch_sync(state: &AppState, req: Request) -> Response {
+    // Device signals and cookies come from a headers-only fastly copy taken
+    // before the conversion below consumes the request body.
+    let fastly_ref = compat::to_fastly_request_ref(&req);
+    let device_signals = crate::derive_device_signals(&fastly_ref);
+    let is_real_browser = device_signals.looks_like_browser();
+    let eids_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_TS_EIDS);
+    let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
+
+    let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
+        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+        let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+        let fastly_req = compat::to_fastly_request(req);
+        handle_batch_sync(&kv, &partner_registry, &limiter, fastly_req)
+            .map(compat::from_fastly_response)
+    });
+
+    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    // Legacy parity: batch-sync responses still pass through
+    // ec_finalize_response with a default EC context and no finalize KV graph.
+    response.extensions_mut().insert(EcFinalizeState {
+        ec_context: EcContext::default(),
+        finalize_kv_graph: None,
+        eids_cookie,
+        sharedid_cookie,
+        is_real_browser,
+    });
+    response
+}
+
+async fn execute_fallback(
+    state: Arc<AppState>,
+    ctx: RequestContext,
+) -> Result<Response, EdgeError> {
+    let services = build_per_request_services(&state, &ctx);
+    let req = ctx.into_request();
+    Ok(dispatch_fallback(&state, &services, req).await)
+}
+
+async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    if uses_dynamic_tsjs_fallback(&method, &path) {
-        return handle_tsjs_dynamic(&req, &state.registry);
+    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    if let Some(report) = ec.setup_error.take() {
+        let mut response = http_error(&report);
+        response.extensions_mut().insert(ec.into_finalize_state());
+        return response;
     }
 
-    if state.registry.has_route(&method, &path) {
+    let result = if uses_dynamic_tsjs_fallback(&method, &path) {
+        handle_tsjs_dynamic(&req, &state.registry)
+    } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
         // Only the handle_publisher_request branch below routes through
         // resolve_publisher_response_buffered. Integration responses are small in practice
         // and the EdgeZero flag is off by default; extend the cap here if that changes.
-        let mut ec_context = EcContext::default();
-        return state
+        state
             .registry
             .handle_proxy(ProxyDispatchInput {
                 method: &method,
                 path: &path,
                 settings: &state.settings,
-                kv: None,
-                ec_context: &mut ec_context,
+                kv: ec.kv_graph.as_ref(),
+                ec_context: &mut ec.ec_context,
                 services,
                 req,
             })
@@ -240,18 +492,34 @@ async fn dispatch_fallback(
                 Err(Report::new(TrustedServerError::BadRequest {
                     message: format!("Unknown integration route: {path}"),
                 }))
-            });
-    }
+            })
+    } else {
+        // Generate an EC ID if needed — mirrors the legacy catch-all arm.
+        // Only for document navigations by recognised browsers; subresource
+        // requests may lack consent signals such as Sec-GPC.
+        if ec.is_real_browser && is_navigation_request(&req) {
+            if let Err(err) = ec
+                .ec_context
+                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
+            {
+                log::warn!("EC generation failed for publisher proxy: {err:?}");
+            }
+        }
 
-    handle_publisher_request(&state.settings, &state.registry, services, req)
-        .await
-        .and_then(|pub_response| {
-            crate::resolve_publisher_response_buffered(
-                pub_response,
-                &state.settings,
-                &state.registry,
-            )
-        })
+        handle_publisher_request(&state.settings, &state.registry, services, req)
+            .await
+            .and_then(|pub_response| {
+                crate::resolve_publisher_response_buffered(
+                    pub_response,
+                    &state.settings,
+                    &state.registry,
+                )
+            })
+    };
+
+    let mut response = result.unwrap_or_else(|e| http_error(&e));
+    response.extensions_mut().insert(ec.into_finalize_state());
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +589,8 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
+    BatchSync,
+    Identify,
     Auction,
     FirstPartyProxy,
     FirstPartyClick,
@@ -369,6 +639,16 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         handler: NamedRouteHandler::DeactivateKey,
     },
     NamedRoute {
+        path: "/_ts/api/v1/batch-sync",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::BatchSync,
+    },
+    NamedRoute {
+        path: "/_ts/api/v1/identify",
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::Identify,
+    },
+    NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
@@ -401,51 +681,7 @@ fn named_route_handler(
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
         let state = Arc::clone(&state);
-        Box::pin(execute_handler(
-            state,
-            ctx,
-            move |state, services, req| async move {
-                match handler {
-                    NamedRouteHandler::TrustedServerDiscovery => {
-                        handle_trusted_server_discovery(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::VerifySignature => {
-                        handle_verify_signature(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::RotateKey => {
-                        handle_rotate_key(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::DeactivateKey => {
-                        handle_deactivate_key(&state.settings, &services, req)
-                    }
-                    NamedRouteHandler::Auction => {
-                        let ec_context = EcContext::default();
-                        handle_auction(
-                            &state.settings,
-                            &state.orchestrator,
-                            None,
-                            None,
-                            &ec_context,
-                            &services,
-                            req,
-                        )
-                        .await
-                    }
-                    NamedRouteHandler::FirstPartyProxy => {
-                        handle_first_party_proxy(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartyClick => {
-                        handle_first_party_click(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartySign => {
-                        handle_first_party_proxy_sign(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::FirstPartyProxyRebuild => {
-                        handle_first_party_proxy_rebuild(&state.settings, &services, req).await
-                    }
-                }
-            },
-        ))
+        Box::pin(execute_named(state, ctx, handler))
     }
 }
 
@@ -454,11 +690,7 @@ fn fallback_route_handler(
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
     move |ctx: RequestContext| {
         let state = Arc::clone(&state);
-        Box::pin(execute_handler(
-            state,
-            ctx,
-            |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
-        ))
+        Box::pin(execute_fallback(state, ctx))
     }
 }
 
@@ -542,7 +774,11 @@ mod tests {
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::settings::Settings;
 
-    fn empty_request(method: Method, uri: &str) -> edgezero_core::http::Request {
+    fn empty_request(method: Method, path: &str) -> edgezero_core::http::Request {
+        // EC request-state construction converts requests to fastly requests,
+        // which require absolute URLs — mirror the absolute URIs that the
+        // fastly adapter provides in production.
+        let uri = format!("https://test-publisher.com{path}");
         request_builder()
             .method(method)
             .uri(uri)
@@ -664,11 +900,7 @@ mod tests {
         // (reads settings + request headers only) and FastlyPlatformGeo.lookup(None)
         // short-circuits without calling any Fastly ABI.
         let router = test_router();
-        let req = request_builder()
-            .method(Method::POST)
-            .uri("/_ts/admin/keys/rotate")
-            .body(Body::empty())
-            .expect("should build test request");
+        let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
         let response = block_on(router.oneshot(req));
 
@@ -696,11 +928,7 @@ mod tests {
         let router = test_router();
 
         for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-            let req = request_builder()
-                .method(Method::POST)
-                .uri(path)
-                .body(Body::empty())
-                .expect("should build alias request");
+            let req = empty_request(Method::POST, path);
 
             let response = block_on(router.oneshot(req));
 
@@ -713,6 +941,90 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_identify_options_routes_to_cors_preflight() {
+        // Parity guard: OPTIONS /_ts/api/v1/identify must reach
+        // cors_preflight_identify (200 for a request without an Origin
+        // header), not the publisher fallback, which would fail with a
+        // gateway error without a live backend.
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "OPTIONS identify should be answered by the CORS preflight handler"
+        );
+    }
+
+    #[test]
+    fn dispatch_identify_get_routes_to_identity_handler() {
+        // Parity guard: GET /_ts/api/v1/identify must reach the identify
+        // handler chain. The test settings configure no ec.ec_store, so
+        // require_identity_graph fails with a KvStore error (503) — proving
+        // the request was NOT proxied to the publisher origin.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GET identify without ec_store should fail with the KvStore error, not a publisher proxy error"
+        );
+    }
+
+    #[test]
+    fn dispatch_batch_sync_routes_to_batch_sync_handler() {
+        // Parity guard: POST /_ts/api/v1/batch-sync must reach the batch-sync
+        // handler chain instead of forwarding the request (body and
+        // Authorization header included) to the publisher origin. With no
+        // ec.ec_store configured, require_identity_graph fails with a KvStore
+        // error (503).
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "POST batch-sync without ec_store should fail with the KvStore error, not reach the publisher"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_attaches_ec_finalize_state() {
+        // The publisher fallback must thread EC finalize state to the entry
+        // point via response extensions — even on error responses — so that
+        // edgezero_main can run ec_finalize_response and pull sync.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        assert!(
+            response.extensions().get::<super::EcFinalizeState>().is_some(),
+            "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn dispatch_named_route_attaches_ec_finalize_state() {
+        // Named routes must also thread EC finalize state, mirroring how the
+        // legacy path finalizes every response with the pre-routing EcContext.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(
+            Method::GET,
+            "/.well-known/trusted-server.json",
+        )));
+
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_some(),
+            "named-route responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
         // fallback, not return a router-level 405. Legacy route_request proxies
@@ -722,11 +1034,7 @@ mod tests {
         // Without a live backend the publisher proxy errors (502/503), but the
         // important invariant is that the status is NOT 405.
         let router = test_router();
-        let req = request_builder()
-            .method(Method::HEAD)
-            .uri("/first-party/proxy")
-            .body(Body::empty())
-            .expect("should build HEAD request");
+        let req = empty_request(Method::HEAD, "/first-party/proxy");
 
         let response = block_on(router.oneshot(req));
 
@@ -747,11 +1055,10 @@ mod tests {
         // The full-system guarantee (TS headers on ALL responses including these 405s)
         // is maintained by the entry-point apply_finalize_headers call in main.rs.
         let router = test_router();
-        let req = request_builder()
-            .method(Method::from_bytes(b"TRACE").expect("should parse TRACE"))
-            .uri("/")
-            .body(Body::empty())
-            .expect("should build TRACE request");
+        let req = empty_request(
+            Method::from_bytes(b"TRACE").expect("should parse TRACE"),
+            "/",
+        );
 
         let response = block_on(router.oneshot(req));
 
