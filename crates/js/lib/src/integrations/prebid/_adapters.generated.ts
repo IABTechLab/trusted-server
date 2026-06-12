@@ -3,6 +3,4 @@
 // Controls which Prebid.js bid adapters are included in the bundle.
 // Set the TSJS_PREBID_ADAPTERS environment variable to a comma-separated list
 // of adapter names (e.g. "rubicon,appnexus,openx") before building.
-// Default: "rubicon"
-
-import 'prebid.js/modules/rubiconBidAdapter.js';
+// Default: no adapters

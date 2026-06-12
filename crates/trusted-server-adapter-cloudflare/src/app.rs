@@ -1,22 +1,25 @@
+use core::future::Future;
+use core::pin::Pin;
 use std::sync::Arc;
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, header};
+use edgezero_core::http::{HeaderValue, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -47,6 +50,18 @@ pub struct AppState {
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = get_settings()?;
+    build_state_with_settings(settings)
+}
+
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration
+/// registry fail to initialise.
+fn build_state_with_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -66,39 +81,53 @@ fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
 }
 
 // ---------------------------------------------------------------------------
+// Handler factory
+// ---------------------------------------------------------------------------
+
+/// Wraps a core handler function in the standard request-scoped boilerplate:
+/// build `RuntimeServices`, extract the `Request`, invoke the handler, and
+/// convert any error into an HTTP error response.
+///
+/// Accepts both sync (`|s, svc, req| { ... }`) and async
+/// (`|s, svc, req| async move { ... }`) closures.
+type BoxedHandlerFuture = Pin<Box<dyn Future<Output = Result<Response, EdgeError>>>>;
+
+fn make_handler<F, Fut>(
+    state: Arc<AppState>,
+    f: F,
+) -> impl Fn(RequestContext) -> BoxedHandlerFuture + Clone + 'static
+where
+    F: Fn(Arc<AppState>, RuntimeServices, Request) -> Fut + Clone + 'static,
+    Fut: Future<Output = Result<Response, Report<TrustedServerError>>> + 'static,
+{
+    move |ctx: RequestContext| {
+        let s = Arc::clone(&state);
+        let f = f.clone();
+        Box::pin(async move {
+            let services = build_per_request_services(&ctx);
+            let req = ctx.into_request();
+            Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Publisher response helper
 // ---------------------------------------------------------------------------
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Buffers streaming and pass-through variants in memory (acceptable for a
-/// Workers invocation which processes one request at a time).
+/// Delegates to the shared [`buffer_publisher_response`], which enforces
+/// `settings.publisher.max_buffered_body_bytes`, then removes any
+/// `Transfer-Encoding` header since the buffered body is no longer chunked.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                edgezero_core::http::HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = edgezero_core::body::Body::from(output);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
+    let mut response = buffer_publisher_response(publisher_response, settings, registry)?;
+    response.headers_mut().remove(header::TRANSFER_ENCODING);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -174,133 +203,32 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // /.well-known/trusted-server.json
-        let s = Arc::clone(&state);
-        let discovery_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_trusted_server_discovery(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+        build_router(&state)
+    }
+}
 
-        // /verify-signature
-        let s = Arc::clone(&state);
-        let verify_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_verify_signature(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
+impl TrustedServerApp {
+    /// Build the full application router from explicit settings.
+    ///
+    /// Testing seam: cross-adapter parity tests use this to drive the router
+    /// with known-good settings instead of the baked `get_settings()` result,
+    /// whose embedded placeholder secrets fail validation by design.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    pub fn routes_with_settings(
+        settings: Settings,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+}
 
-        // /admin/keys/rotate
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_rotate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /admin/keys/deactivate
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_deactivate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /auction
-        let s = Arc::clone(&state);
-        let auction_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // GET /first-party/proxy
-        let s = Arc::clone(&state);
-        let fp_proxy_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /first-party/click
-        let s = Arc::clone(&state);
-        let fp_click_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_click(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // GET /first-party/sign
-        let s = Arc::clone(&state);
-        let fp_sign_get_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // POST /first-party/sign
-        let s = Arc::clone(&state);
-        let fp_sign_post_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /first-party/proxy-rebuild
-        let s = Arc::clone(&state);
-        let fp_rebuild_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_per_request_services(&ctx);
-                let req = ctx.into_request();
-                Ok(
-                    handle_first_party_proxy_rebuild(&s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|e| http_error(&e)),
-                )
-            }
-        };
+fn build_router(state: &Arc<AppState>) -> RouterService {
+    {
+        let state = Arc::clone(state);
 
         // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
         async fn dispatch(
@@ -316,9 +244,18 @@ impl Hooks for TrustedServerApp {
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
+                let mut ec_context = EcContext::default();
                 state
                     .registry
-                    .handle_proxy(&method, &path, &state.settings, &services, req)
+                    .handle_proxy(ProxyDispatchInput {
+                        method: &method,
+                        path: &path,
+                        settings: &state.settings,
+                        kv: None,
+                        ec_context: &mut ec_context,
+                        services: &services,
+                        req,
+                    })
                     .await
                     .unwrap_or_else(|| {
                         Err(Report::new(TrustedServerError::BadRequest {
@@ -334,33 +271,94 @@ impl Hooks for TrustedServerApp {
             Ok(result.unwrap_or_else(|e| http_error(&e)))
         }
 
-        // GET /{*rest} — tsjs, integration proxy, or publisher fallback
-        let s = Arc::clone(&state);
-        let get_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            dispatch(s, ctx, true)
+        let get_fallback = {
+            let s = Arc::clone(&state);
+            move |ctx: RequestContext| {
+                let s = Arc::clone(&s);
+                dispatch(s, ctx, true)
+            }
         };
-
-        // POST /{*rest} — integration proxy or publisher origin fallback
-        let s = Arc::clone(&state);
-        let post_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            dispatch(s, ctx, false)
+        let post_fallback = {
+            let s = Arc::clone(&state);
+            move |ctx: RequestContext| {
+                let s = Arc::clone(&s);
+                dispatch(s, ctx, false)
+            }
         };
 
         RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
-            .get("/.well-known/trusted-server.json", discovery_handler)
-            .post("/verify-signature", verify_handler)
-            .post("/admin/keys/rotate", rotate_handler)
-            .post("/admin/keys/deactivate", deactivate_handler)
-            .post("/auction", auction_handler)
-            .get("/first-party/proxy", fp_proxy_handler)
-            .get("/first-party/click", fp_click_handler)
-            .get("/first-party/sign", fp_sign_get_handler)
-            .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler)
+            .get(
+                "/.well-known/trusted-server.json",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_trusted_server_discovery(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/verify-signature",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_verify_signature(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/admin/keys/rotate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_rotate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/admin/keys/deactivate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_deactivate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/auction",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    let ec_context = EcContext::default();
+                    handle_auction(
+                        &s.settings,
+                        &s.orchestrator,
+                        None,
+                        None,
+                        &ec_context,
+                        &services,
+                        req,
+                    )
+                    .await
+                }),
+            )
+            .get(
+                "/first-party/proxy",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy(&s.settings, &services, req).await
+                }),
+            )
+            .get(
+                "/first-party/click",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_click(&s.settings, &services, req).await
+                }),
+            )
+            .get(
+                "/first-party/sign",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_sign(&s.settings, &services, req).await
+                }),
+            )
+            .post(
+                "/first-party/sign",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_sign(&s.settings, &services, req).await
+                }),
+            )
+            .post(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            )
             .get("/", get_fallback.clone())
             .post("/", post_fallback.clone())
             .get("/{*rest}", get_fallback)

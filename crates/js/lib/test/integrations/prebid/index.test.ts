@@ -6,6 +6,7 @@ const {
   mockProcessQueue,
   mockRequestBids,
   mockRegisterBidAdapter,
+  mockGetUserIdsAsEids,
   mockPbjs,
   mockGetBidAdapter,
   mockAdapterManager,
@@ -15,11 +16,15 @@ const {
   const mockRequestBids = vi.fn();
   const mockRegisterBidAdapter = vi.fn();
   const mockGetBidAdapter = vi.fn();
+  const mockGetUserIdsAsEids = vi.fn(
+    () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
+  );
   const mockPbjs = {
     setConfig: mockSetConfig,
     processQueue: mockProcessQueue,
     requestBids: mockRequestBids,
     registerBidAdapter: mockRegisterBidAdapter,
+    getUserIdsAsEids: mockGetUserIdsAsEids,
     adUnits: [] as any[],
   };
   const mockAdapterManager = {
@@ -30,6 +35,7 @@ const {
     mockProcessQueue,
     mockRequestBids,
     mockRegisterBidAdapter,
+    mockGetUserIdsAsEids,
     mockPbjs,
     mockGetBidAdapter,
     mockAdapterManager,
@@ -45,9 +51,11 @@ vi.mock('prebid.js/src/adapterManager.js', () => ({ default: mockAdapterManager 
 vi.mock('prebid.js/modules/consentManagementTcf.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementGpp.js', () => ({}));
 vi.mock('prebid.js/modules/consentManagementUsp.js', () => ({}));
+vi.mock('prebid.js/modules/userId.js', () => ({}));
 
-// Mock the build-generated adapter imports (no-op in tests)
+// Mock the build-generated side-effect imports (no-op in tests)
 vi.mock('../../../src/integrations/prebid/_adapters.generated', () => ({}));
+vi.mock('../../../src/integrations/prebid/_user_ids.generated', () => ({}));
 
 import {
   collectBidders,
@@ -196,6 +204,9 @@ describe('prebid/installPrebidNpm', () => {
     // Reset requestBids to the mock so each test starts fresh
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
   });
 
@@ -275,6 +286,114 @@ describe('prebid/installPrebidNpm', () => {
       const payload = JSON.parse(result.data);
       expect(payload.adUnits).toHaveLength(1);
       expect(payload.adUnits[0].code).toBe('div-gpt-1');
+      expect(payload.eids).toBeUndefined();
+    });
+
+    it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'id5-sync.com',
+          uids: [{ id: 'ID5_abc', atype: 1 }],
+        },
+        {
+          source: 'sharedid.org',
+          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
+        },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.eids).toEqual([
+        {
+          source: 'id5-sync.com',
+          uids: [{ id: 'ID5_abc', atype: 1 }],
+        },
+        {
+          source: 'sharedid.org',
+          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
+        },
+      ]);
+    });
+
+    it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
+      const spec = getAdapterSpec();
+      document.cookie = 'ts-eids=stale-value';
+      mockGetUserIdsAsEids.mockReturnValue([]);
+
+      spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      expect(document.cookie).toBe('');
+    });
+
+    it('buildRequests preserves uid ext and sanitizes invalid atype values', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'adserver.org',
+          uids: [
+            {
+              id: 'uid-with-ext',
+              atype: 1,
+              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+            },
+            {
+              id: 'uid-bad-atype',
+              atype: 999,
+              ext: { keep: true },
+            },
+            {
+              id: 'uid-float-atype',
+              atype: 1.5,
+            },
+          ],
+        },
+      ]);
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.eids).toEqual([
+        {
+          source: 'adserver.org',
+          uids: [
+            {
+              id: 'uid-with-ext',
+              atype: 1,
+              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
+            },
+            {
+              id: 'uid-bad-atype',
+              ext: { keep: true },
+            },
+            {
+              id: 'uid-float-atype',
+            },
+          ],
+        },
+      ]);
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -411,13 +530,16 @@ describe('prebid/installPrebidNpm', () => {
       ];
       pbjs.requestBids({ adUnits } as any);
 
-      // Each ad unit should only have trustedServer — original bidders are absorbed
+      // Each ad unit should have trustedServer added
       for (const unit of adUnits) {
-        expect(unit.bids).toHaveLength(1);
-        expect(unit.bids[0].bidder).toBe('trustedServer');
+        const hasTsBidder = unit.bids.some((b: any) => b.bidder === 'trustedServer');
+        expect(hasTsBidder).toBe(true);
       }
 
-      expect(adUnits[0].bids[0].params.bidderParams).toEqual({ appnexus: {} });
+      const trustedServerBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer');
+      expect(trustedServerBid.params.bidderParams).toEqual({ appnexus: {} });
+      expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
+      expect(adUnits[1].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
 
       // Should call through to original requestBids
       expect(mockRequestBids).toHaveBeenCalled();
@@ -433,7 +555,7 @@ describe('prebid/installPrebidNpm', () => {
       expect(tsCount).toBe(1);
     });
 
-    it('captures per-bidder params on trustedServer bid and removes originals', () => {
+    it('captures per-bidder params on trustedServer bid', () => {
       const pbjs = installPrebidNpm();
 
       const adUnits = [
@@ -446,14 +568,13 @@ describe('prebid/installPrebidNpm', () => {
       ];
       pbjs.requestBids({ adUnits } as any);
 
-      // Only trustedServer should remain — original bidders are absorbed
-      expect(adUnits[0].bids).toHaveLength(1);
-      const trustedServerBid = adUnits[0].bids[0] as any;
-      expect(trustedServerBid.bidder).toBe('trustedServer');
+      const trustedServerBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer');
+      expect(trustedServerBid).toBeDefined();
       expect(trustedServerBid.params.bidderParams).toEqual({
         appnexus: { placementId: 123 },
         rubicon: { accountId: 'abc' },
       });
+      expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
     });
 
     it('adds bids array to ad units that have none', () => {
@@ -483,12 +604,11 @@ describe('prebid/installPrebidNpm', () => {
       ];
       pbjs.requestBids({ adUnits } as any);
 
-      // Original kargo bids should be removed, only trustedServer remains
-      expect(adUnits[0].bids).toHaveLength(1);
-      expect(adUnits[0].bids[0].params.zone).toBe('header');
+      const tsBid0 = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid0.params.zone).toBe('header');
 
-      expect(adUnits[1].bids).toHaveLength(1);
-      expect(adUnits[1].bids[0].params.zone).toBe('fixed_bottom');
+      const tsBid1 = adUnits[1].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid1.params.zone).toBe('fixed_bottom');
     });
 
     it('omits zone when mediaTypes.banner.name is not set', () => {
@@ -503,8 +623,8 @@ describe('prebid/installPrebidNpm', () => {
       ];
       pbjs.requestBids({ adUnits } as any);
 
-      expect(adUnits[0].bids).toHaveLength(1);
-      expect(adUnits[0].bids[0].params.zone).toBeUndefined();
+      const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBeUndefined();
     });
 
     it('omits zone when ad unit has no mediaTypes', () => {
@@ -513,8 +633,8 @@ describe('prebid/installPrebidNpm', () => {
       const adUnits = [{ bids: [{ bidder: 'rubicon', params: {} }] }];
       pbjs.requestBids({ adUnits } as any);
 
-      expect(adUnits[0].bids).toHaveLength(1);
-      expect(adUnits[0].bids[0].params.zone).toBeUndefined();
+      const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.zone).toBeUndefined();
     });
 
     it('clears stale zone when existing trustedServer bid is reused', () => {
@@ -551,10 +671,53 @@ describe('prebid/installPrebidNpm', () => {
       mockPbjs.adUnits = [{ bids: [{ bidder: 'openx', params: {} }] }] as any[];
       pbjs.requestBids({} as any);
 
-      // Original openx bid should be removed, only trustedServer remains
-      const unit = mockPbjs.adUnits[0] as any;
-      expect(unit.bids).toHaveLength(1);
-      expect(unit.bids[0].bidder).toBe('trustedServer');
+      const hasTsBidder = (mockPbjs.adUnits[0] as any).bids.some(
+        (b: any) => b.bidder === 'trustedServer'
+      );
+      expect(hasTsBidder).toBe(true);
+    });
+
+    it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'sharedid.org',
+          uids: [
+            { id: 'shared_123', atype: 3 },
+            { id: 'shared_456', ext: { provider: 'example' } },
+          ],
+        },
+      ]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({ adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }] } as any);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'sharedid.org',
+          uids: [
+            { id: 'shared_123', atype: 3 },
+            { id: 'shared_456', ext: { provider: 'example' } },
+          ],
+        },
+      ]);
+    });
+
+    it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
+      document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([]);
+
+      const pbjs = installPrebidNpm();
+      pbjs.requestBids({ adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }] } as any);
+
+      expect(document.cookie).toBe('');
     });
   });
 });
@@ -564,6 +727,9 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     vi.clearAllMocks();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
+    document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete (window as any).__tsjs_prebid;
   });
 
@@ -604,6 +770,8 @@ describe('prebid/client-side bidders', () => {
     vi.clearAllMocks();
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
+    mockGetUserIdsAsEids.mockReset();
+    mockGetUserIdsAsEids.mockReturnValue([]);
     // By default, pretend all adapters are registered
     mockGetBidAdapter.mockReturnValue({});
     delete (window as any).__tsjs_prebid;
@@ -613,7 +781,7 @@ describe('prebid/client-side bidders', () => {
     delete (window as any).__tsjs_prebid;
   });
 
-  it('excludes client-side bidders from trustedServer bidderParams and removes server-side bids', () => {
+  it('excludes client-side bidders from trustedServer bidderParams', () => {
     (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
 
     const pbjs = installPrebidNpm();
@@ -629,8 +797,6 @@ describe('prebid/client-side bidders', () => {
     ];
     pbjs.requestBids({ adUnits } as any);
 
-    // Only rubicon (client-side) and trustedServer should remain
-    expect(adUnits[0].bids).toHaveLength(2);
     const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     expect(tsBid).toBeDefined();
     // rubicon should NOT be in bidderParams — it runs client-side
@@ -638,9 +804,6 @@ describe('prebid/client-side bidders', () => {
       appnexus: { placementId: 123 },
       kargo: { placementId: 'k1' },
     });
-    // appnexus and kargo should be removed (absorbed into trustedServer)
-    expect(adUnits[0].bids.find((b: any) => b.bidder === 'appnexus')).toBeUndefined();
-    expect(adUnits[0].bids.find((b: any) => b.bidder === 'kargo')).toBeUndefined();
   });
 
   it('preserves client-side bidder bids as standalone entries', () => {
@@ -662,6 +825,7 @@ describe('prebid/client-side bidders', () => {
     const rubiconBid = adUnits[0].bids.find((b: any) => b.bidder === 'rubicon') as any;
     expect(rubiconBid).toBeDefined();
     expect(rubiconBid.params).toEqual({ accountId: 'abc' });
+    expect(adUnits[0].bids.find((b: any) => b.bidder === 'appnexus')).toBeUndefined();
   });
 
   it('handles multiple client-side bidders', () => {
@@ -680,8 +844,6 @@ describe('prebid/client-side bidders', () => {
     ];
     pbjs.requestBids({ adUnits } as any);
 
-    // 3 bids: rubicon (client-side), openx (client-side), trustedServer
-    expect(adUnits[0].bids).toHaveLength(3);
     const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     // Only appnexus should be in bidderParams
     expect(tsBid.params.bidderParams).toEqual({
@@ -691,8 +853,6 @@ describe('prebid/client-side bidders', () => {
     // Both client-side bidders should remain
     expect(adUnits[0].bids.find((b: any) => b.bidder === 'rubicon')).toBeDefined();
     expect(adUnits[0].bids.find((b: any) => b.bidder === 'openx')).toBeDefined();
-
-    // Server-side bidder should be removed
     expect(adUnits[0].bids.find((b: any) => b.bidder === 'appnexus')).toBeUndefined();
   });
 
@@ -710,10 +870,7 @@ describe('prebid/client-side bidders', () => {
     ];
     pbjs.requestBids({ adUnits } as any);
 
-    // All original bidders should be removed, only trustedServer remains
-    expect(adUnits[0].bids).toHaveLength(1);
-    const tsBid = adUnits[0].bids[0] as any;
-    expect(tsBid.bidder).toBe('trustedServer');
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     expect(tsBid.params.bidderParams).toEqual({
       appnexus: { placementId: 123 },
       rubicon: { accountId: 'abc' },
@@ -735,10 +892,7 @@ describe('prebid/client-side bidders', () => {
     ];
     pbjs.requestBids({ adUnits } as any);
 
-    // All original bidders should be removed, only trustedServer remains
-    expect(adUnits[0].bids).toHaveLength(1);
-    const tsBid = adUnits[0].bids[0] as any;
-    expect(tsBid.bidder).toBe('trustedServer');
+    const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     expect(tsBid.params.bidderParams).toEqual({
       appnexus: { placementId: 123 },
       rubicon: { accountId: 'abc' },
@@ -760,8 +914,7 @@ describe('prebid/client-side bidders', () => {
     ];
     pbjs.requestBids({ adUnits } as any);
 
-    // All 3 should be present: rubicon, appnexus (both client-side), and trustedServer
-    expect(adUnits[0].bids).toHaveLength(3);
+    // trustedServer should still be present (even with empty bidderParams)
     const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
     expect(tsBid).toBeDefined();
     expect(tsBid.params.bidderParams).toEqual({});

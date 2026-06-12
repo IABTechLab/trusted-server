@@ -389,9 +389,11 @@ struct SpinPendingResponse {
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
-/// `send_async` eagerly executes each request before returning. Multi-provider
-/// fan-out is rejected in `select`, matching the conservative Cloudflare
-/// adapter behavior.
+/// `send_async` eagerly executes each request before returning, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
+/// auction orchestrator rejects multi-provider configurations before any
+/// request launches. `select` keeps a defense-in-depth rejection for more
+/// than one pending request, matching the Cloudflare adapter behavior.
 ///
 /// # Known MVP limits
 ///
@@ -478,6 +480,13 @@ impl SpinPlatformHttpClient {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
+    fn supports_concurrent_fanout(&self) -> bool {
+        // `send_async` executes each request eagerly, so multiple pending
+        // requests run sequentially. The auction orchestrator checks this
+        // before launching more than one provider request.
+        false
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -554,6 +563,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
+            failed_backend_name: None,
         })
     }
 }

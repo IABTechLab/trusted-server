@@ -11,17 +11,64 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
 use edgezero_adapter_axum::EdgeZeroAxumService;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::http::request_builder;
+use edgezero_core::router::RouterService;
 use http::HeaderMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
+use trusted_server_core::settings::Settings;
+
+/// Shared test settings for all adapters.
+///
+/// The settings baked into the binaries contain placeholder secrets that
+/// `get_settings()` rejects by design, so all routers are built through
+/// their `routes_with_settings` testing seams from this known-good config.
+/// The handler regex covers both the adapter-level `/admin/...` routes and
+/// the `/_ts/admin/...` paths required by settings validation.
+fn test_settings() -> Settings {
+    Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/(_ts/)?admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "parity-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+        "#,
+    )
+    .expect("should parse parity test settings")
+}
+
+/// Build the Axum adapter router from the shared test settings.
+fn axum_router() -> RouterService {
+    AxumApp::routes_with_settings(test_settings())
+        .expect("should build Axum router from parity test settings")
+}
+
+/// Build the Cloudflare adapter router from the shared test settings.
+fn cf_router() -> RouterService {
+    CloudflareApp::routes_with_settings(test_settings())
+        .expect("should build Cloudflare router from parity test settings")
+}
+
+/// Build the Spin adapter router from the shared test settings.
+fn spin_router() -> RouterService {
+    SpinApp::routes_with_settings(test_settings())
+        .expect("should build Spin router from parity test settings")
+}
 
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("GET")
         .uri(uri)
@@ -40,7 +87,7 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("POST")
         .uri(uri)
@@ -73,7 +120,7 @@ async fn axum_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Cloudflare adapter and return (status, headers).
 async fn cf_get(uri: &str) -> (u16, HeaderMap) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("GET")
         .uri(uri)
@@ -85,7 +132,7 @@ async fn cf_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("POST")
         .uri(uri)
@@ -107,7 +154,7 @@ async fn cf_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Spin adapter and return (status, headers, body bytes).
 async fn spin_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = SpinApp::routes();
+    let router = spin_router();
     let req = request_builder()
         .method("GET")
         .uri(uri)
@@ -128,7 +175,7 @@ async fn spin_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Spin adapter and return (status, headers, body bytes).
 async fn spin_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = SpinApp::routes();
+    let router = spin_router();
     let req = request_builder()
         .method("POST")
         .uri(uri)
@@ -177,7 +224,7 @@ async fn discovery_route_body_is_json_parity() {
     use serde_json::Value;
 
     let (axum_status, axum_body_bytes) = {
-        let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+        let mut svc = EdgeZeroAxumService::new(axum_router());
         let req = AxumRequest::builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
@@ -201,7 +248,7 @@ async fn discovery_route_body_is_json_parity() {
     };
 
     let (cf_status, cf_body_bytes) = {
-        let router = CloudflareApp::routes();
+        let router = cf_router();
         let req = request_builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
@@ -232,6 +279,36 @@ async fn discovery_route_body_is_json_parity() {
         "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
          (cf_status={cf_status} spin_status={spin_status})"
     );
+
+    // When adapters return JSON objects, top-level key sets must also match.
+    fn sorted_keys(value: &Value) -> Option<Vec<&str>> {
+        match value {
+            Value::Object(obj) => {
+                let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                Some(keys)
+            }
+            _ => None,
+        }
+    }
+    if let (Some(axum_keys), Some(cf_keys)) = (
+        axum_json.as_ref().and_then(sorted_keys),
+        cf_json.as_ref().and_then(sorted_keys),
+    ) {
+        assert_eq!(
+            axum_keys, cf_keys,
+            "/.well-known/trusted-server.json top-level JSON keys must match across adapters"
+        );
+    }
+    if let (Some(cf_keys), Some(spin_keys)) = (
+        cf_json.as_ref().and_then(sorted_keys),
+        spin_json.as_ref().and_then(sorted_keys),
+    ) {
+        assert_eq!(
+            cf_keys, spin_keys,
+            "/.well-known/trusted-server.json top-level JSON keys must match across adapters"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -408,14 +485,22 @@ async fn geo_header_parity_on_all_responses() {
             spin_post_headers(path, body).await
         };
 
+        assert!(
+            axum_headers.contains_key("x-geo-info-available"),
+            "Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"
+        );
+        assert!(
+            cf_headers.contains_key("x-geo-info-available"),
+            "Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"
+        );
         let axum_geo = axum_headers
             .get("x-geo-info-available")
-            .unwrap_or_else(|| panic!("Axum: {method} {path} (status={axum_status}) must have X-Geo-Info-Available"))
+            .expect("should have x-geo-info-available after assert")
             .to_str()
             .expect("should be valid UTF-8");
         let cf_geo = cf_headers
             .get("x-geo-info-available")
-            .unwrap_or_else(|| panic!("Cloudflare: {method} {path} (status={cf_status}) must have X-Geo-Info-Available"))
+            .expect("should have x-geo-info-available after assert")
             .to_str()
             .expect("should be valid UTF-8");
         assert_eq!(

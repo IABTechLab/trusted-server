@@ -72,9 +72,6 @@ pub struct ConsentConfig {
     /// but disagree on consent status.
     #[serde(default)]
     pub conflict_resolution: ConflictResolutionConfig,
-
-    /// Name of the KV Store used for consent persistence.
-    ///
     /// When set, consent data is persisted per Edge Cookie (EC) ID so that
     /// returning users without consent cookies can still have their
     /// consent preferences applied. Set to `None` to disable.

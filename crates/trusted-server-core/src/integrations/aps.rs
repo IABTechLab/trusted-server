@@ -22,6 +22,7 @@ use crate::integrations::{
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
 };
+
 use crate::settings::IntegrationConfig;
 
 // ============================================================================
@@ -602,7 +603,6 @@ impl AuctionProvider for ApsAuctionProvider {
             services,
             &self.config.endpoint,
             "aps",
-            true,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {
@@ -704,9 +704,9 @@ mod tests {
                 page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: "user-123".to_string(),
-                fresh_id: "fresh-456".to_string(),
+                id: Some("user-123".to_string()),
                 consent: None,
+                eids: None,
             },
             device: Some(DeviceInfo {
                 user_agent: Some("Mozilla/5.0".to_string()),

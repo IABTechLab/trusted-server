@@ -3769,7 +3769,6 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "temp-env",
- "tokio",
  "toml",
  "trusted-server-js",
  "trusted-server-openrtb",

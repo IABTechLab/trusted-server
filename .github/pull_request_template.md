@@ -23,8 +23,8 @@ Closes #
 
 <!-- How did you verify this works? Check all that apply -->
 
-- [ ] `cargo test --workspace`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo test-fastly && cargo test-axum`
+- [ ] `cargo clippy-fastly && cargo clippy-axum`
 - [ ] `cargo fmt --all -- --check`
 - [ ] JS tests: `cd crates/js/lib && npx vitest run`
 - [ ] JS format: `cd crates/js/lib && npm run format`

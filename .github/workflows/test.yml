@@ -66,6 +66,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          # wasm32-wasip1 is required by the "Verify Fastly WASM release
+          # build" step below; the axum build and tests are native.
+          target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Build Axum adapter
@@ -77,6 +80,14 @@ jobs:
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
+
+      - name: Verify Fastly WASM release build
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
+          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+        run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)

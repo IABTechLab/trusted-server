@@ -17,4 +17,5 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # worker-build must run from the crate root (where Cargo.toml lives) regardless
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
+# worker-build ^0.8 matches the `worker = "0.8"` dependency in Cargo.toml.
 cargo install -q --version '^0.8' worker-build && worker-build --release

@@ -29,7 +29,7 @@ cargo test-axum
 Tests are organized alongside source code in `#[cfg(test)]` modules:
 
 ```rust
-// crates/trusted-server-core/src/edge_cookie.rs
+// crates/trusted-server-core/src/ec/generation.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,14 +61,17 @@ cargo test-fastly
 # Run Axum adapter tests (native)
 cargo test-axum
 
-# Run specific test by name
-cargo test test_generate_ec_id
+# Run a specific test by name (Fastly/WASM)
+cargo test-fastly test_generate_ec_id
 
-# Run tests for a specific crate
+# Run a specific test by name (Axum native)
+cargo test-axum test_generate_ec_id
+
+# Run tests for a specific crate (native)
 cargo test -p trusted-server-core
 
-# Run tests matching a pattern
-cargo test ec
+# Run tests matching a pattern (Fastly/WASM)
+cargo test-fastly ec
 ```
 
 ### Integration Tests
@@ -110,7 +113,7 @@ curl http://localhost:7676/.well-known/trusted-server.json
 
 ### EC ID Tests
 
-From `crates/trusted-server-core/src/edge_cookie.rs`:
+From `crates/trusted-server-core/src/ec/mod.rs`:
 
 ```rust
 #[test]
@@ -261,11 +264,14 @@ cargo fmt
 ### Linting
 
 ```bash
-# Run clippy with all checks
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Run clippy for Fastly/WASM adapter
+cargo clippy-fastly
 
-# Fix clippy warnings automatically
-cargo clippy --fix --allow-dirty
+# Run clippy for Axum native adapter
+cargo clippy-axum
+
+# Fix clippy warnings automatically (Axum)
+cargo clippy-axum --fix --allow-dirty
 ```
 
 ### Code Coverage
@@ -296,7 +302,7 @@ jobs:
       - name: Run tests
         run: cargo test-fastly
       - name: Run clippy
-        run: cargo clippy --workspace --exclude trusted-server-adapter-axum --target wasm32-wasip1 -- -D warnings
+        run: cargo clippy-fastly
 
   test-axum: # Axum native adapter — no Viceroy needed
     runs-on: ubuntu-latest
@@ -313,13 +319,13 @@ jobs:
 ### Enable Debug Logging
 
 ```bash
-RUST_LOG=debug cargo test -- --nocapture
+RUST_LOG=debug cargo test-axum -- --nocapture
 ```
 
 ### Run Single Test with Full Output
 
 ```bash
-cargo test test_name -- --nocapture --test-threads=1
+cargo test-axum test_name -- --nocapture --test-threads=1
 ```
 
 ### Viceroy Limitations

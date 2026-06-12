@@ -8,14 +8,15 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -46,6 +47,18 @@ pub struct AppState {
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = get_settings()?;
+    build_state_with_settings(settings)
+}
+
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration
+/// registry fail to initialise.
+fn build_state_with_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -62,34 +75,15 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Buffers streaming and pass-through variants in memory (acceptable for a
-/// Spin invocation which processes one request at a time).
+/// Delegates to the shared [`buffer_publisher_response`], which enforces
+/// `settings.publisher.max_buffered_body_bytes` so a large processable
+/// origin response fails safely instead of exhausting the Wasm heap.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                edgezero_core::http::HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = edgezero_core::body::Body::from(output);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
+    buffer_publisher_response(publisher_response, settings, registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +178,33 @@ impl Hooks for TrustedServerApp {
             }
         };
 
+        build_router(&state)
+    }
+}
+
+impl TrustedServerApp {
+    /// Build the full application router from explicit settings.
+    ///
+    /// Testing seam: cross-adapter parity tests use this to drive the router
+    /// with known-good settings instead of the baked `get_settings()` result,
+    /// whose embedded placeholder secrets fail validation by design.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    pub fn routes_with_settings(
+        settings: Settings,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+}
+
+fn build_router(state: &Arc<AppState>) -> RouterService {
+    {
+        let state = Arc::clone(state);
+
         // /.well-known/trusted-server.json
         let s = Arc::clone(&state);
         let discovery_handler = move |ctx: RequestContext| {
@@ -239,9 +260,18 @@ impl Hooks for TrustedServerApp {
             async move {
                 let services = build_runtime_services(&ctx);
                 let req = ctx.into_request();
-                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
+                let ec_context = EcContext::default();
+                Ok(handle_auction(
+                    &s.settings,
+                    &s.orchestrator,
+                    None,
+                    None,
+                    &ec_context,
+                    &services,
+                    req,
+                )
+                .await
+                .unwrap_or_else(|e| http_error(&e)))
             }
         };
 
@@ -332,9 +362,18 @@ impl Hooks for TrustedServerApp {
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
+                let mut ec_context = EcContext::default();
                 state
                     .registry
-                    .handle_proxy(&method, &path, &state.settings, &services, req)
+                    .handle_proxy(ProxyDispatchInput {
+                        method: &method,
+                        path: &path,
+                        settings: &state.settings,
+                        kv: None,
+                        ec_context: &mut ec_context,
+                        services: &services,
+                        req,
+                    })
                     .await
                     .unwrap_or_else(|| {
                         Err(Report::new(TrustedServerError::BadRequest {

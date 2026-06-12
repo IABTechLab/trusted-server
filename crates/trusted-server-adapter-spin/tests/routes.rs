@@ -8,7 +8,40 @@
 
 use edgezero_core::app::Hooks as _;
 use edgezero_core::http::request_builder;
+use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
+use trusted_server_core::settings::Settings;
+
+/// Build the full application router from explicit test settings.
+///
+/// The settings baked into the binary contain placeholder secrets that
+/// `get_settings()` rejects by design, which would turn every route into a
+/// startup error page (and its route table into the fallback-only set).
+/// The handler regex covers both the adapter-level `/admin/...` routes and
+/// the `/_ts/admin/...` paths required by settings validation.
+fn test_router() -> RouterService {
+    let settings = Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/(_ts/)?admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "route-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+        "#,
+    )
+    .expect("should parse route test settings");
+
+    TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router from test settings")
+}
 
 #[test]
 fn routes_build_without_panic() {
@@ -47,7 +80,7 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
 async fn finalize_middleware_injects_geo_header() {
     // The X-Geo-Info-Available header is injected by FinalizeResponseMiddleware.
     // Its absence on any response means the middleware was not wired.
-    let router = TrustedServerApp::routes();
+    let router = test_router();
 
     let req = request_builder()
         .method("GET")
@@ -72,7 +105,7 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
     // CI settings may not have basic_auth configured, so this test does not
     // assert 401 — it asserts that both middleware layers ran (X-Geo-Info-Available
     // present) and that the route is actually reached (status != 404).
-    let router = TrustedServerApp::routes();
+    let router = test_router();
 
     let req = request_builder()
         .method("POST")
@@ -102,7 +135,7 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_is_routed_not_5xx() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("GET")
         .uri("/static/tsjs=0000000000000000")
@@ -117,7 +150,7 @@ async fn tsjs_route_is_routed_not_5xx() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/verify-signature")
@@ -134,7 +167,7 @@ async fn verify_signature_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_put_returns_405() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("PUT")
         .uri("/verify-signature")
@@ -151,7 +184,7 @@ async fn verify_signature_put_returns_405() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/rotate")
@@ -168,7 +201,7 @@ async fn admin_rotate_key_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/deactivate")
@@ -185,7 +218,7 @@ async fn admin_deactivate_key_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auction_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/auction")
@@ -198,7 +231,7 @@ async fn auction_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("GET")
         .uri("/first-party/proxy")
@@ -214,7 +247,7 @@ async fn first_party_proxy_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_click_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("GET")
         .uri("/first-party/click")
@@ -230,7 +263,7 @@ async fn first_party_click_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_get_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("GET")
         .uri("/first-party/sign")
@@ -246,7 +279,7 @@ async fn first_party_sign_get_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_sign_post_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/first-party/sign")
@@ -263,7 +296,7 @@ async fn first_party_sign_post_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_party_proxy_rebuild_is_routed() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/first-party/proxy-rebuild")
@@ -284,7 +317,7 @@ async fn first_party_proxy_rebuild_is_routed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_without_credentials_returns_401() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/rotate")
@@ -301,7 +334,7 @@ async fn admin_route_without_credentials_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_route_without_credentials_includes_www_authenticate_header() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/rotate")
@@ -334,7 +367,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
 async fn admin_route_with_wrong_credentials_returns_401() {
     use base64::Engine as _;
     let creds = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/rotate")
@@ -352,7 +385,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_does_not_require_auth() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("GET")
         .uri("/.well-known/trusted-server.json")
@@ -368,7 +401,7 @@ async fn discovery_endpoint_does_not_require_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auction_endpoint_does_not_require_auth() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/auction")
@@ -389,7 +422,7 @@ async fn auction_endpoint_does_not_require_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_key_auth_fail_returns_401() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/rotate")
@@ -406,7 +439,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_key_auth_fail_returns_401() {
-    let router = TrustedServerApp::routes();
+    let router = test_router();
     let req = request_builder()
         .method("POST")
         .uri("/admin/keys/deactivate")

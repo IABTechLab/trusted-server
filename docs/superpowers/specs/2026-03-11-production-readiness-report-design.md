@@ -51,10 +51,10 @@ match config.
 
 ### C-2: Admin endpoints unprotected unless handler regex covers them
 
-`/admin/keys/rotate` and `/admin/keys/deactivate` are always routed. The
+`/_ts/admin/keys/rotate` and `/_ts/admin/keys/deactivate` are always routed. The
 `enforce_basic_auth` gate only triggers for paths that match a configured
 `handlers[].path` regex. The default config (`^/secure`) does not cover
-`/admin/*`. An operator who doesn't add an explicit admin handler has
+`/_ts/admin/*`. An operator who doesn't add an explicit admin handler has
 **publicly-accessible key rotation/deletion endpoints**.
 
 **Refs:**
@@ -64,7 +64,7 @@ match config.
 - `settings.rs:381` -- `handlers` parsing
 - `trusted-server.toml:1` -- default handler only covers `^/secure`
 
-**Recommendation:** Either hard-require auth for `/admin/*` paths regardless of
+**Recommendation:** Either hard-require auth for `/_ts/admin/*` paths regardless of
 handler config, or validate at startup that an admin handler exists.
 
 ---

@@ -1,5 +1,8 @@
 name = "trusted-server"
 main = "build/index.js"
+# Pins the Workers runtime API surface. Bump to a recent date and re-run
+# integration tests to pick up free runtime fixes. Keep in sync with the
+# minimum date supported by the worker crate version in Cargo.toml.
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
@@ -8,6 +11,9 @@ command = "bash build.sh"
 
 [[kv_namespaces]]
 binding = "TRUSTED_SERVER_KV"
+# Run `wrangler kv:namespace create TRUSTED_SERVER_KV` and paste the returned
+# id here before `wrangler deploy` or `wrangler dev --remote`.
+# `wrangler dev --local` (Miniflare default) tolerates this placeholder.
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
