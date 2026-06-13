@@ -38,13 +38,20 @@ describe('installSpaAuctionHook', () => {
     history.replaceState = originalReplaceState;
     // Reset jsdom location back to root for the next test.
     originalReplaceState({}, '', '/');
+    // Drop any ad containers inserted by a test so DOM state does not leak.
+    document.body.innerHTML = '';
     vi.unstubAllGlobals();
   });
 
   it('fetches page-bids on pushState and applies slots/bids via adInit', async () => {
+    // The route's ad container already exists, so bids apply immediately.
+    document.body.innerHTML = '<div id="div-s1"></div>';
     fetchStub.mockResolvedValue({
       ok: true,
-      json: async () => ({ slots: [{ id: 's1' }], bids: { s1: { hb_pb: '1.00' } } }),
+      json: async () => ({
+        slots: [{ id: 's1', div_id: 'div-s1' }],
+        bids: { s1: { hb_pb: '1.00' } },
+      }),
     });
     const { installSpaAuctionHook } = await importGptModule();
     installSpaAuctionHook();
@@ -62,8 +69,37 @@ describe('installSpaAuctionHook', () => {
         headers: { 'X-TSJS-Page-Bids': '1' },
       })
     );
-    expect(ts.adSlots).toEqual([{ id: 's1' }]);
+    expect(ts.adSlots).toEqual([{ id: 's1', div_id: 'div-s1' }]);
     expect(ts.bids).toEqual({ s1: { hb_pb: '1.00' } });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers applying bids until the route ad container is inserted', async () => {
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 'late', div_id: 'div-late' }],
+        bids: { late: { hb_pb: '2.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    // Navigate before the new route's container has rendered.
+    history.pushState({}, '', '/late-route');
+    await flushAsync();
+    expect(adInit).not.toHaveBeenCalled();
+    expect(ts.adSlots).toBeUndefined();
+
+    // Container commits — the hook should now apply bids exactly once.
+    document.body.innerHTML = '<div id="div-late"></div>';
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([{ id: 'late', div_id: 'div-late' }]);
+    expect(ts.bids).toEqual({ late: { hb_pb: '2.00' } });
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
@@ -109,8 +145,10 @@ describe('installSpaAuctionHook', () => {
       )
       .mockResolvedValueOnce({
         ok: true,
-        json: async () => ({ slots: [{ id: 'newer' }], bids: {} }),
+        json: async () => ({ slots: [{ id: 'newer', div_id: 'div-newer' }], bids: {} }),
       });
+    // Container for the newer route exists so its bids apply without waiting.
+    document.body.innerHTML = '<div id="div-newer"></div>';
     const { installSpaAuctionHook } = await importGptModule();
     installSpaAuctionHook();
     const ts = (window as TestWindow).tsjs!;
@@ -121,7 +159,7 @@ describe('installSpaAuctionHook', () => {
     history.pushState({}, '', '/second');
     await flushAsync();
 
-    expect(ts.adSlots).toEqual([{ id: 'newer' }]);
+    expect(ts.adSlots).toEqual([{ id: 'newer', div_id: 'div-newer' }]);
     expect(adInit).toHaveBeenCalledTimes(1);
 
     // First navigation's response arrives late — it must not overwrite the
@@ -132,7 +170,7 @@ describe('installSpaAuctionHook', () => {
     });
     await flushAsync();
 
-    expect(ts.adSlots).toEqual([{ id: 'newer' }]);
+    expect(ts.adSlots).toEqual([{ id: 'newer', div_id: 'div-newer' }]);
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 

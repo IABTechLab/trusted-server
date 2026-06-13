@@ -508,6 +508,50 @@ interface PageBidsResponse {
 }
 
 /**
+ * Upper bound (ms) on how long the SPA hook waits for a route's ad containers
+ * to appear before applying bids anyway.
+ */
+const SPA_SLOT_WAIT_MS = 2000;
+
+/**
+ * Resolve once at least one of `slots` has a container element in the DOM, or
+ * after `SPA_SLOT_WAIT_MS`, whichever comes first.
+ *
+ * Many SPA routers update `history` before the new route's markup commits. If
+ * bids were applied immediately, `adInit()` would look up each slot element
+ * once and silently skip every not-yet-rendered slot, dropping that route's
+ * server-side bids with no retry. Waiting via `MutationObserver` lets the apply
+ * step run as soon as the containers exist; the timeout guarantees a slot that
+ * never renders cannot hang the hook (the subsequent `adInit()` skips missing
+ * elements exactly as before). Resolves immediately when there is nothing to
+ * wait for, or when `MutationObserver` is unavailable.
+ */
+function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise<void> {
+  const anyPresent = (): boolean => slots.some((slot) => !!findSlotElementByDivId(slot.div_id));
+  if (slots.length === 0 || anyPresent() || typeof MutationObserver === 'undefined') {
+    return Promise.resolve();
+  }
+
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    const observer = new MutationObserver(() => {
+      if (anyPresent()) finish();
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    const timer = setTimeout(finish, SPA_SLOT_WAIT_MS);
+    signal.addEventListener('abort', finish);
+  });
+}
+
+/**
  * Install SPA navigation hook.
  *
  * Patches `history.pushState` and `history.replaceState`, and listens to
@@ -542,6 +586,10 @@ export function installSpaAuctionHook(): void {
       });
       if (!res.ok) return;
       const data = (await res.json()) as PageBidsResponse;
+      if (inflight !== controller) return;
+      // Defer applying bids until the new route's ad containers exist, so a
+      // fast edge response cannot beat the DOM and drop server-side bids.
+      await waitForSlotElements(data.slots, controller.signal);
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;

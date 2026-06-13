@@ -578,6 +578,35 @@ describe('prebid/installPrebidNpm', () => {
       expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
     });
 
+    it('preserves captured bidder params when requestBids runs twice on the same ad unit', () => {
+      const pbjs = installPrebidNpm();
+
+      // First auction: inline server-side params supplied by the publisher.
+      const adUnits = [
+        {
+          code: 'div-1',
+          bids: [
+            { bidder: 'appnexus', params: { placementId: 123 } },
+            { bidder: 'rubicon', params: { accountId: 'abc' } },
+          ],
+        },
+      ];
+      pbjs.requestBids({ adUnits } as any);
+
+      // Second auction (refresh/re-auction) with the SAME ad unit object: the
+      // server-side bidder entries were already pruned, so the shim must not
+      // overwrite the captured params with an empty object.
+      pbjs.requestBids({ adUnits } as any);
+
+      const trustedServerBid = adUnits[0].bids.find(
+        (b: any) => b.bidder === 'trustedServer'
+      ) as any;
+      expect(trustedServerBid.params.bidderParams).toEqual({
+        appnexus: { placementId: 123 },
+        rubicon: { accountId: 'abc' },
+      });
+    });
+
     it('adds bids array to ad units that have none', () => {
       const pbjs = installPrebidNpm();
 

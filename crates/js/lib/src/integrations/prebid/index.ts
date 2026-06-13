@@ -492,23 +492,36 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const zone = (unit as any).mediaTypes?.banner?.name as string | undefined;
 
-      const tsParams: Record<string, unknown> = {
-        [BIDDER_PARAMS_KEY]: bidderParams,
-        ...(zone ? { [ZONE_KEY]: zone } : {}),
-      };
       const existingTsBid = unit.bids.find((b) => b.bidder === ADAPTER_CODE);
       if (existingTsBid) {
-        const paramsWithoutZone = {
-          ...(existingTsBid.params ?? {}),
-        };
-        delete paramsWithoutZone[ZONE_KEY];
+        const prevParams = { ...(existingTsBid.params ?? {}) };
+        delete prevParams[ZONE_KEY];
+
+        // On a second requestBids() with the same ad unit object, the
+        // server-side bidder entries were already filtered out of unit.bids
+        // by the prior call, so `bidderParams` is now empty. Retain the
+        // params captured on the first call instead of overwriting them with
+        // `{}`, which would drop the publisher's inline PBS params on refresh.
+        const prevBidderParams = (prevParams[BIDDER_PARAMS_KEY] ?? {}) as Record<
+          string,
+          Record<string, unknown>
+        >;
+        const effectiveBidderParams =
+          Object.keys(bidderParams).length > 0 ? bidderParams : prevBidderParams;
 
         existingTsBid.params = {
-          ...paramsWithoutZone,
-          ...tsParams,
+          ...prevParams,
+          [BIDDER_PARAMS_KEY]: effectiveBidderParams,
+          ...(zone ? { [ZONE_KEY]: zone } : {}),
         };
       } else {
-        unit.bids.push({ bidder: ADAPTER_CODE, params: tsParams });
+        unit.bids.push({
+          bidder: ADAPTER_CODE,
+          params: {
+            [BIDDER_PARAMS_KEY]: bidderParams,
+            ...(zone ? { [ZONE_KEY]: zone } : {}),
+          },
+        });
       }
     }
 

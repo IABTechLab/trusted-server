@@ -1569,15 +1569,18 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
 /// outbound partner calls).
 ///
 /// A request is allowed when:
-/// - `Sec-Fetch-Site` is `same-origin` or `same-site` (all modern browsers
-///   send Fetch Metadata on same-origin `fetch()`), or
-/// - `Sec-Fetch-Site` is absent (legacy client) **and** the request carries
-///   the non-simple `X-TSJS-Page-Bids` header set by the tsjs SPA hook —
-///   cross-origin callers cannot attach it without a CORS preflight, which
-///   this endpoint never grants.
+/// - `Sec-Fetch-Site` is `same-origin` (the tsjs SPA hook fetches a relative
+///   URL, so a genuine same-origin navigation always reports this). `same-site`
+///   is intentionally rejected: it admits sibling origins under the same
+///   registrable domain, which are not trusted to spend SSP quota on the
+///   visitor's behalf.
+/// - `Sec-Fetch-Site` is absent (legacy client predating Fetch Metadata) **and**
+///   the request carries the non-simple `X-TSJS-Page-Bids` header set by the
+///   tsjs SPA hook — cross-origin callers cannot attach it without a CORS
+///   preflight, which this endpoint never grants.
 fn page_bids_request_allowed(req: &Request) -> bool {
     match req.get_header_str("sec-fetch-site") {
-        Some(site) => matches!(site, "same-origin" | "same-site"),
+        Some(site) => site == "same-origin",
         None => req.get_header("x-tsjs-page-bids").is_some(),
     }
 }
@@ -3685,10 +3688,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn same_site_fetch_metadata_is_allowed() {
+        async fn same_site_fetch_metadata_is_rejected() {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
+            // `same-site` admits sibling origins under the same registrable
+            // domain — not trusted to spend SSP quota.
             req.set_header("sec-fetch-site", "same-site");
 
             let response =
@@ -3696,8 +3701,8 @@ mod tests {
 
             assert_eq!(
                 response.get_status(),
-                StatusCode::OK,
-                "same-site request should pass the gate"
+                StatusCode::FORBIDDEN,
+                "same-site request should be rejected; only same-origin is trusted"
             );
         }
 
