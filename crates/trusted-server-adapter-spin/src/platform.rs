@@ -294,6 +294,15 @@ fn apply_spin_response_policy(
     body: Vec<u8>,
 ) -> Result<BufferedResponseParts, Report<PlatformError>> {
     let mut headers = sanitize_response_headers(headers);
+
+    // Bound the buffered body on every path, not just decompressed ones. An
+    // identity response or an unsupported encoding (e.g. zstd) is returned as-is,
+    // so without this check a large origin/ad-server/proxy response would be
+    // forwarded after being fully buffered instead of failing with a typed error.
+    // For gzip/br this also rejects an overlarge compressed body before
+    // decompression; `decompress_body` separately bounds the expanded size.
+    enforce_response_size(body.len())?;
+
     let Some(encoding) = content_encoding(&headers) else {
         return Ok((headers, body));
     };
@@ -308,6 +317,16 @@ fn apply_spin_response_policy(
             && !name.eq_ignore_ascii_case("content-length")
     });
     Ok((headers, body))
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn enforce_response_size(len: usize) -> Result<(), Report<PlatformError>> {
+    if len > MAX_DECOMPRESSED_SIZE {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "response body exceeded maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -1033,6 +1052,44 @@ mod tests {
         );
 
         assert!(result.is_err(), "should reject invalid gzip payload");
+    }
+
+    #[test]
+    fn response_policy_rejects_oversized_identity_body() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
+        let result = apply_spin_response_policy(Vec::new(), oversized);
+
+        assert!(
+            result.is_err(),
+            "should reject an identity response larger than the size ceiling"
+        );
+    }
+
+    #[test]
+    fn response_policy_rejects_oversized_unsupported_encoding_body() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
+        let result = apply_spin_response_policy(
+            vec![("content-encoding".to_string(), b"zstd".to_vec())],
+            oversized,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject an unsupported-encoding response larger than the size ceiling"
+        );
+    }
+
+    #[test]
+    fn response_policy_allows_body_at_size_ceiling() {
+        let at_limit = vec![0u8; MAX_DECOMPRESSED_SIZE];
+        let (_, body) = apply_spin_response_policy(Vec::new(), at_limit)
+            .expect("should accept an identity body exactly at the ceiling");
+
+        assert_eq!(
+            body.len(),
+            MAX_DECOMPRESSED_SIZE,
+            "should pass through a body at the ceiling unchanged"
+        );
     }
 
     #[test]
