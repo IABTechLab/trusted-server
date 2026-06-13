@@ -25,9 +25,20 @@ check-spin = ["check", "-p", "trusted-server-adapter-spin", "--target", "wasm32-
 # Clippy — target-matched to avoid cross-target compile failures
 clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
 clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--", "-D", "warnings"]
-clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--all-features", "--", "-D", "warnings"]
+# No --all-features: the `cloudflare` feature has a compile_error! guard on
+# non-wasm32 targets. WASM-feature coverage comes from `cargo check-cloudflare`.
+clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--", "-D", "warnings"]
 clippy-spin-native = ["clippy", "-p", "trusted-server-adapter-spin", "--all-targets", "--no-default-features", "--", "-D", "warnings"]
 clippy-spin-wasm = ["clippy", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin", "--lib", "--", "-D", "warnings"]
+
+# Build — target-matched, same split as test/clippy
+build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
+build-axum = ["build", "-p", "trusted-server-adapter-axum"]
+build-cloudflare = ["build", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
+
+# Check — fast compile validation, same split
+check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
+check-axum = ["check", "-p", "trusted-server-adapter-axum"]
 
 [target.'cfg(all(target_arch = "wasm32"))']
 runner = "viceroy run -C ../../fastly.toml -- "

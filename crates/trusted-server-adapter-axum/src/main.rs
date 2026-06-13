@@ -1,46 +1,44 @@
 use edgezero_core::app::Hooks as _;
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
+#[allow(clippy::print_stderr)]
 fn main() {
-    // When PORT is set, use a dynamic address so integration tests can allocate
-    // a fresh OS port each run and avoid TIME_WAIT flakiness. The standard
-    // `run_app` path is kept for normal development (reads config from axum.toml).
-    if let Some(port) = port_from_env() {
-        let _ = simple_logger::SimpleLogger::new().init();
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        log::info!("Listening on http://{addr}");
-        let config = edgezero_adapter_axum::AxumDevServerConfig {
-            addr,
+    if let Err(e) = simple_logger::SimpleLogger::new().init() {
+        eprintln!("warning: logger init failed: {e}");
+    }
+
+    let config = match port_from_env() {
+        // When PORT is set, bind to a specific address so integration tests
+        // can allocate a fresh OS port each run and avoid TIME_WAIT flakiness.
+        Some(port) => edgezero_adapter_axum::AxumDevServerConfig {
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             enable_ctrl_c: true,
-        };
-        let router = TrustedServerApp::routes();
-        if let Err(err) = edgezero_adapter_axum::AxumDevServer::with_config(router, config).run() {
-            log::error!("trusted-server-adapter-axum failed: {err}");
-            std::process::exit(1);
-        }
-    } else {
-        let addr = edgezero_adapter_axum::AxumDevServerConfig::default().addr;
-        let _ = simple_logger::SimpleLogger::new().init();
-        log::info!("Listening on http://{addr}");
-        if let Err(err) =
-            edgezero_adapter_axum::run_app::<TrustedServerApp>(include_str!("../axum.toml"))
-        {
-            log::error!("trusted-server-adapter-axum failed: {err}");
-            std::process::exit(1);
-        }
+        },
+        // Normal development path: read bind address from axum.toml.
+        None => edgezero_adapter_axum::AxumDevServerConfig::default(),
+    };
+
+    log::info!("Listening on http://{}", config.addr);
+    let router = TrustedServerApp::routes();
+    if let Err(err) = edgezero_adapter_axum::AxumDevServer::with_config(router, config).run() {
+        log::error!("trusted-server-adapter-axum failed: {err}");
+        std::process::exit(1);
     }
 }
 
 /// Read a port number from the `PORT` environment variable.
 ///
-/// Returns `None` when the variable is unset or cannot be parsed as `u16`.
+/// Returns `None` when the variable is unset. Exits non-zero if the value
+/// is set but cannot be parsed — silently falling back to a different port
+/// would surprise tooling that expects the server at the requested address.
+#[allow(clippy::print_stderr)]
 fn port_from_env() -> Option<u16> {
     let raw = std::env::var("PORT").ok()?;
     match raw.parse() {
         Ok(port) => Some(port),
         Err(e) => {
-            log::warn!("PORT env var '{raw}' is not a valid u16: {e}; falling back to axum.toml");
-            None
+            eprintln!("error: PORT env var '{raw}' is not a valid u16: {e}");
+            std::process::exit(1);
         }
     }
 }

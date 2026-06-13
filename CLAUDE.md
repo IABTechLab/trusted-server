@@ -41,8 +41,8 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 ### Rust
 
 ```bash
-# Check default workspace member
-cargo check
+# Build (per-target aliases — bare `cargo build` fails at the workspace root)
+cargo build-fastly && cargo build-axum && cargo build-cloudflare
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -62,8 +62,8 @@ cargo test-axum
 # Check Cloudflare adapter (native)
 cargo check -p trusted-server-adapter-cloudflare
 
-# Check Cloudflare adapter (WASM target)
-cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+# Check Cloudflare adapter (WASM target — alias for the full command)
+cargo check-cloudflare
 
 # Test Cloudflare adapter (native host)
 cargo test-cloudflare
@@ -97,19 +97,18 @@ cargo test-spin        # Spin adapter route tests (native host)
 # Format
 cargo fmt --all -- --check
 
-# Lint by adapter target
+# Lint by adapter target — target-matched clippy is the blocking gate because
+# the workspace has multiple wasm runtimes and runtime-specific SDKs. A plain
+# `cargo clippy --workspace --all-features` would trip the cloudflare
+# feature's non-wasm32 compile_error! guard.
 cargo clippy-fastly
 cargo clippy-axum
 cargo clippy-cloudflare
 cargo clippy-spin-native
 cargo clippy-spin-wasm
 
-# Optional compatibility check; target-matched clippy above is the blocking gate
-# because the workspace has multiple wasm runtimes and runtime-specific SDKs.
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-# Check compilation
-cargo check
+# Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
+cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
 cd crates/js/lib && npx vitest run
@@ -198,6 +197,7 @@ pub struct UserId(Uuid);
 ## Error Handling
 
 - Use `error-stack` (`Report<MyError>`) — not anyhow or eyre.
+  - **Exception**: `crates/trusted-server-adapter-spin/src/lib.rs` entry point returns `anyhow::Result` because `edgezero_adapter_spin::run_app` forces this type at the WASM FFI boundary. Do not use `anyhow` anywhere else.
 - Use `Box<dyn Error>` only in tests or prototyping.
 - Use concrete error types with `Report<E>`.
 - Use `ensure!()` / `bail!()` macros for early returns.
@@ -253,6 +253,14 @@ impl core::error::Error for MyError {}
 - Provide context in log messages with format strings.
 - Format messages with present-tense verbs.
 - Use `log-fastly` as the backend for Fastly Compute.
+
+## Other guidelines
+
+- Use only example or fictional information in comments, tests, docs, examples,
+  and similar non-runtime materials. (eg. for urls use: example.com domains only)
+- Do not write or commit real domains, customer names, credentials,
+  configuration values, or other potentially sensitive real-world information in
+  comments, tests, docs, or examples.
 
 ---
 
@@ -413,7 +421,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/tsjs.rs`                  | Script tag generation with module IDs             |
 | `crates/trusted-server-core/src/html_processor.rs`        | Injects `<script>` at `<head>` start              |
 | `crates/trusted-server-core/src/publisher.rs`             | `/static/tsjs=` handler, concatenates modules     |
-| `crates/trusted-server-core/src/edge_cookie.rs`           | Edge Cookie (EC) ID generation                    |
+| `crates/trusted-server-core/src/ec/`                      | EC identity subsystem (generation, consent, cookies) |
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
@@ -429,6 +437,7 @@ both runtime behavior and build/tooling changes.
 - Do not use `unwrap()` in production code — use `expect("should ...")`.
 - Do not use thiserror — use `derive_more::Display` + `impl Error`.
 - Do not use wildcard imports (except `use super::*` in test modules).
-- Do not commit `.env` files or secrets.
+- Do not commit `.env` files, secrets, or potentially sensitive real-world
+  information in comments, tests, docs, examples, or configuration files.
 - Do not make large refactors without approval.
 - Always run tests and linting before committing.

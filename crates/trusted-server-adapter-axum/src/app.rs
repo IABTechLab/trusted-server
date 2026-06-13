@@ -1,27 +1,33 @@
+use core::future::Future;
 use std::sync::Arc;
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response, StatusCode, header};
+use edgezero_core::http::{
+    HandlerFuture, HeaderValue, Method, Request, Response, StatusCode, header,
+};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
+
+use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -45,6 +51,18 @@ pub struct AppState {
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let settings = get_settings()?;
+    build_state_with_settings(settings)
+}
+
+/// Build the application state from explicit settings.
+///
+/// # Errors
+///
+/// Returns an error when the auction orchestrator or the integration
+/// registry fail to initialise.
+fn build_state_with_settings(
+    settings: Settings,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -53,43 +71,6 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
     }))
-}
-
-// ---------------------------------------------------------------------------
-// Publisher response helper
-// ---------------------------------------------------------------------------
-
-/// Collapse a [`PublisherResponse`] into a plain [`Response`].
-///
-/// Mirrors the Fastly adapter's `resolve_publisher_response`: buffers streaming
-/// and pass-through variants in memory (acceptable for a dev server) so the
-/// Axum handler can return a single `Response`.
-fn resolve_publisher_response(
-    publisher_response: PublisherResponse,
-    settings: &Settings,
-    registry: &IntegrationRegistry,
-) -> Result<Response, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                edgezero_core::http::HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = edgezero_core::body::Body::from(output);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -112,8 +93,245 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Shared handler executor
+// ---------------------------------------------------------------------------
+
+async fn execute_handler<F, Fut>(
+    state: Arc<AppState>,
+    ctx: RequestContext,
+    handler: F,
+) -> Result<Response, EdgeError>
+where
+    F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
+    Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
+{
+    let services = build_runtime_services(&ctx);
+    let req = ctx.into_request();
+    Ok(handler(state, services, req)
+        .await
+        .unwrap_or_else(|e| http_error(&e)))
+}
+
+// ---------------------------------------------------------------------------
+// Fallback dispatcher (tsjs / integration proxy / publisher)
+// ---------------------------------------------------------------------------
+
+async fn dispatch_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+) -> Result<Response, Report<TrustedServerError>> {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    if method == Method::GET && path.starts_with("/static/tsjs=") {
+        return handle_tsjs_dynamic(&req, &state.registry);
+    }
+
+    if state.registry.has_route(&method, &path) {
+        let mut ec_context = EcContext::default();
+        return state
+            .registry
+            .handle_proxy(ProxyDispatchInput {
+                method: &method,
+                path: &path,
+                settings: &state.settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services,
+                req,
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(Report::new(TrustedServerError::BadRequest {
+                    message: format!("Unknown integration route: {path}"),
+                }))
+            });
+    }
+
+    handle_publisher_request(&state.settings, &state.registry, services, req)
+        .await
+        .and_then(|pr| buffer_publisher_response(pr, &state.settings, &state.registry))
+}
+
+fn fallback_handler(
+    state: Arc<AppState>,
+) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(execute_handler(
+            state,
+            ctx,
+            |state, services, req| async move { dispatch_fallback(&state, &services, req).await },
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named route table
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum NamedRouteHandler {
+    TrustedServerDiscovery,
+    VerifySignature,
+    AdminNotSupported,
+    Auction,
+    FirstPartyProxy,
+    FirstPartyClick,
+    FirstPartySign,
+    FirstPartyProxyRebuild,
+}
+
+struct NamedRoute {
+    path: &'static str,
+    primary_methods: &'static [Method],
+    handler: NamedRouteHandler,
+}
+
+fn named_routes() -> [NamedRoute; 11] {
+    [
+        NamedRoute {
+            path: "/.well-known/trusted-server.json",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::TrustedServerDiscovery,
+        },
+        NamedRoute {
+            path: "/verify-signature",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::VerifySignature,
+        },
+        // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+        // and the production basic-auth handler regex (`^/_ts/admin`), so they
+        // are auth-gated under a production-shaped config.
+        NamedRoute {
+            path: "/_ts/admin/keys/rotate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        NamedRoute {
+            path: "/_ts/admin/keys/deactivate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
+        NamedRoute {
+            path: "/admin/keys/rotate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        NamedRoute {
+            path: "/admin/keys/deactivate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        NamedRoute {
+            path: "/auction",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::Auction,
+        },
+        NamedRoute {
+            path: "/first-party/proxy",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::FirstPartyProxy,
+        },
+        NamedRoute {
+            path: "/first-party/click",
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::FirstPartyClick,
+        },
+        NamedRoute {
+            path: "/first-party/sign",
+            primary_methods: &[Method::GET, Method::POST],
+            handler: NamedRouteHandler::FirstPartySign,
+        },
+        NamedRoute {
+            path: "/first-party/proxy-rebuild",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::FirstPartyProxyRebuild,
+        },
+    ]
+}
+
+fn named_route_handler(
+    state: Arc<AppState>,
+    handler: NamedRouteHandler,
+) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(execute_handler(
+            state,
+            ctx,
+            move |state, services, req| async move {
+                match handler {
+                    NamedRouteHandler::TrustedServerDiscovery => {
+                        handle_trusted_server_discovery(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::VerifySignature => {
+                        handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::AdminNotSupported => {
+                        // Config/secret-store writes are backed by read-only env vars on the
+                        // Axum dev server. Returning 501 is clearer than failing on the first
+                        // store write.
+                        let body = edgezero_core::body::Body::from(
+                            "Admin key management is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
+                    }
+                    NamedRouteHandler::Auction => {
+                        let ec_context = EcContext::default();
+                        handle_auction(
+                            &state.settings,
+                            &state.orchestrator,
+                            None,
+                            None,
+                            &ec_context,
+                            &services,
+                            req,
+                        )
+                        .await
+                    }
+                    NamedRouteHandler::FirstPartyProxy => {
+                        handle_first_party_proxy(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartyClick => {
+                        handle_first_party_click(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartySign => {
+                        handle_first_party_proxy_sign(&state.settings, &services, req).await
+                    }
+                    NamedRouteHandler::FirstPartyProxyRebuild => {
+                        handle_first_party_proxy_rebuild(&state.settings, &services, req).await
+                    }
+                }
+            },
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
+
+fn publisher_fallback_methods() -> [Method; 7] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ]
+}
 
 /// Returns a [`RouterService`] that responds to every route with the startup error.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
@@ -133,15 +351,14 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         }
     };
 
-    RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::new(
-            Settings::default(),
-        )))
-        .get("/", make_handler(Arc::clone(&message)))
-        .post("/", make_handler(Arc::clone(&message)))
-        .get("/{*rest}", make_handler(Arc::clone(&message)))
-        .post("/{*rest}", make_handler(Arc::clone(&message)))
-        .build()
+    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+        Arc::new(Settings::default()),
+    ));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), make_handler(Arc::clone(&message)));
+        router = router.route("/{*rest}", method, make_handler(Arc::clone(&message)));
+    }
+    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -165,205 +382,65 @@ impl Hooks for TrustedServerApp {
             }
         };
 
-        // /.well-known/trusted-server.json
-        let s = Arc::clone(&state);
-        let discovery_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_trusted_server_discovery(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /verify-signature
-        let s = Arc::clone(&state);
-        let verify_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_verify_signature(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /admin/keys/rotate and /admin/keys/deactivate
-        //
-        // Config/secret-store writes are not supported on the Axum dev server
-        // (backed by read-only env vars). Exposing these routes and returning 500
-        // on the first store write is misleading, so we explicitly return 501.
-        let admin_not_supported = |_ctx: RequestContext| async {
-            let body = edgezero_core::body::Body::from(
-                "Admin key management is not supported on the Axum dev server.\n\
-                 Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-            );
-            let mut resp = Response::new(body);
-            *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            );
-            Ok::<Response, EdgeError>(resp)
-        };
-        // /auction
-        let s = Arc::clone(&state);
-        let auction_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_auction(&s.settings, &s.orchestrator, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /first-party/proxy
-        let s = Arc::clone(&state);
-        let fp_proxy_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /first-party/click
-        let s = Arc::clone(&state);
-        let fp_click_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_click(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // GET /first-party/sign
-        let s = Arc::clone(&state);
-        let fp_sign_get_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // POST /first-party/sign
-        let s = Arc::clone(&state);
-        let fp_sign_post_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
-                    .await
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /first-party/proxy-rebuild
-        let s = Arc::clone(&state);
-        let fp_rebuild_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(
-                    handle_first_party_proxy_rebuild(&s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|e| http_error(&e)),
-                )
-            }
-        };
-
-        // GET /{*rest} — tsjs, integration proxy, or publisher fallback
-        let s = Arc::clone(&state);
-        let get_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
-
-                let result = if path.starts_with("/static/tsjs=") {
-                    handle_tsjs_dynamic(&req, &s.registry)
-                } else if s.registry.has_route(&method, &path) {
-                    s.registry
-                        .handle_proxy(&method, &path, &s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|| {
-                            Err(Report::new(TrustedServerError::BadRequest {
-                                message: format!("Unknown integration route: {path}"),
-                            }))
-                        })
-                } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req)
-                        .await
-                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
-                };
-
-                Ok(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // POST /{*rest} — integration proxy or publisher origin fallback
-        let s = Arc::clone(&state);
-        let post_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                let path = req.uri().path().to_string();
-                let method = req.method().clone();
-
-                let result = if s.registry.has_route(&method, &path) {
-                    s.registry
-                        .handle_proxy(&method, &path, &s.settings, &services, req)
-                        .await
-                        .unwrap_or_else(|| {
-                            Err(Report::new(TrustedServerError::BadRequest {
-                                message: format!("Unknown integration route: {path}"),
-                            }))
-                        })
-                } else {
-                    handle_publisher_request(&s.settings, &s.registry, &services, req)
-                        .await
-                        .and_then(|pr| resolve_publisher_response(pr, &s.settings, &s.registry))
-                };
-
-                Ok(result.unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        RouterService::builder()
-            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
-            .get("/.well-known/trusted-server.json", discovery_handler)
-            .post("/verify-signature", verify_handler)
-            .post("/admin/keys/rotate", admin_not_supported)
-            .post("/admin/keys/deactivate", admin_not_supported)
-            .post("/auction", auction_handler)
-            .get("/first-party/proxy", fp_proxy_handler)
-            .get("/first-party/click", fp_click_handler)
-            .get("/first-party/sign", fp_sign_get_handler)
-            .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler)
-            .get("/", get_fallback.clone())
-            .post("/", post_fallback.clone())
-            .get("/{*rest}", get_fallback)
-            .post("/{*rest}", post_fallback)
-            .build()
+        build_router(&state)
     }
+}
+
+impl TrustedServerApp {
+    /// Build the full application router from explicit settings.
+    ///
+    /// Testing seam: integration tests use this to drive the router with
+    /// known-good settings instead of the baked `get_settings()` result,
+    /// whose embedded placeholder secrets fail validation by design.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or the integration
+    /// registry fail to initialise.
+    pub fn routes_with_settings(
+        settings: Settings,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+}
+
+fn build_router(state: &Arc<AppState>) -> RouterService {
+    let fallback = fallback_handler(Arc::clone(state));
+
+    let mut router = RouterService::builder()
+        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
+
+    router = router.route("/health", Method::GET, |_ctx: RequestContext| async {
+        Ok::<Response, EdgeError>(
+            edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"))
+                .body(edgezero_core::body::Body::from("ok"))
+                .expect("should build health response"),
+        )
+    });
+
+    for route in named_routes() {
+        for method in route.primary_methods {
+            router = router.route(
+                route.path,
+                method.clone(),
+                named_route_handler(Arc::clone(state), route.handler),
+            );
+        }
+        for method in publisher_fallback_methods() {
+            if !route.primary_methods.contains(&method) {
+                router = router.route(route.path, method, fallback.clone());
+            }
+        }
+    }
+
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), fallback.clone());
+        router = router.route("/{*rest}", method, fallback.clone());
+    }
+
+    router.build()
 }

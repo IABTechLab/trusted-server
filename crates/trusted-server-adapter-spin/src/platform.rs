@@ -23,8 +23,11 @@ use trusted_server_core::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
+// 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
+// the Spin WASM component heap. Larger responses from misbehaving origins are
+// rejected with a typed error rather than OOMing the component.
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 type HeaderPairs = Vec<(String, Vec<u8>)>;
@@ -143,22 +146,20 @@ fn spin_variable_name(
         return Err(Report::new(error_context).attach("Spin variable key must not be empty"));
     }
 
-    let mut chars = key.chars().peekable();
-    let digit_leading = chars.peek().is_some_and(char::is_ascii_digit);
-
-    // `v_` prefix + optional `n` for digit-leading keys + encoded body.
-    let mut out = String::with_capacity(key.len() + 2 + usize::from(digit_leading));
-    out.push_str("v_");
-
     // Spin requires each _-separated word to start with an ASCII letter.
-    // If the key starts with a digit, prefix with 'n' so the first word is letter-led.
-    // `validate_kid` rejects digit-leading KIDs, so this branch is unreachable for
-    // all operator-supplied and system-generated keys; it is kept as a safety net.
-    if digit_leading {
-        out.push('n');
+    // Reject at the encoder boundary so no caller can accidentally produce aliasing
+    // (e.g. "1foo" and "n1foo" both encoding to the same variable name).
+    if !key.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(Report::new(error_context).attach(format!(
+            "Spin variable key `{key}` must start with a lowercase ASCII letter"
+        )));
     }
 
-    for ch in chars {
+    // `v_` prefix + worst-case 4 bytes per char for escape sequences.
+    let mut out = String::with_capacity(key.len() * 4 + 3);
+    out.push_str("v_");
+
+    for ch in key.chars() {
         match ch {
             'a'..='z' | '0'..='9' => out.push(ch),
             'A'..='Z' | '-' | '_' | '.' | ':' => {
@@ -293,6 +294,15 @@ fn apply_spin_response_policy(
     body: Vec<u8>,
 ) -> Result<BufferedResponseParts, Report<PlatformError>> {
     let mut headers = sanitize_response_headers(headers);
+
+    // Bound the buffered body on every path, not just decompressed ones. An
+    // identity response or an unsupported encoding (e.g. zstd) is returned as-is,
+    // so without this check a large origin/ad-server/proxy response would be
+    // forwarded after being fully buffered instead of failing with a typed error.
+    // For gzip/br this also rejects an overlarge compressed body before
+    // decompression; `decompress_body` separately bounds the expanded size.
+    enforce_response_size(body.len())?;
+
     let Some(encoding) = content_encoding(&headers) else {
         return Ok((headers, body));
     };
@@ -307,6 +317,16 @@ fn apply_spin_response_policy(
             && !name.eq_ignore_ascii_case("content-length")
     });
     Ok((headers, body))
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn enforce_response_size(len: usize) -> Result<(), Report<PlatformError>> {
+    if len > MAX_DECOMPRESSED_SIZE {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "response body exceeded maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
@@ -388,9 +408,19 @@ struct SpinPendingResponse {
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
-/// `send_async` eagerly executes each request before returning. Multi-provider
-/// fan-out is rejected in `select`, matching the conservative Cloudflare
-/// adapter behavior.
+/// `send_async` eagerly executes each request before returning, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
+/// auction orchestrator rejects multi-provider configurations before any
+/// request launches. `select` keeps a defense-in-depth rejection for more
+/// than one pending request, matching the Cloudflare adapter behavior.
+///
+/// # Known MVP limits
+///
+/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
+/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
+/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
+/// invocation for whatever default the Spin runtime imposes. Operators requiring
+/// deterministic timeout behaviour should use the Fastly adapter.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
@@ -430,6 +460,9 @@ impl SpinPlatformHttpClient {
         let body_bytes = match body {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
             edgezero_core::body::Body::Stream(_) => {
+                // TODO: streaming request bodies unsupported; large proxy POBs (e.g.
+                // /first-party/proxy-rebuild) will fail until Spin WASI HTTP buffering
+                // is added to this client.
                 return Err(Report::new(PlatformError::HttpClient)
                     .attach("streaming request bodies are not supported on Spin outbound HTTP"));
             }
@@ -466,6 +499,13 @@ impl SpinPlatformHttpClient {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
+    fn supports_concurrent_fanout(&self) -> bool {
+        // `send_async` executes each request eagerly, so multiple pending
+        // requests run sequentially. The auction orchestrator checks this
+        // before launching more than one provider request.
+        false
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,
@@ -542,6 +582,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
+            failed_backend_name: None,
         })
     }
 }
@@ -567,6 +608,18 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 // ---------------------------------------------------------------------------
 
 /// Bridges Spin component variables to [`PlatformSecretStore`].
+///
+/// # Limitations
+///
+/// - **UTF-8 only.** `spin_sdk::variables::get` returns a `String`, so all
+///   secret values must be valid UTF-8. JSON-encoded signing keys work today;
+///   raw binary secrets (e.g. bare Ed25519 bytes) would silently fail at the
+///   Spin runtime layer.
+///
+/// - **Plaintext at rest.** Spin component variables are unencrypted in the
+///   application manifest by default. Production deployments must back variables
+///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
+///   storing signing keys in plaintext on disk.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 struct SpinSecretStoreAdapter;
 
@@ -767,11 +820,49 @@ mod tests {
                 .expect("should encode generated kid"),
             "v_ts_x2d2026_x2d05_x2d25"
         );
-        assert_eq!(
-            spin_variable_name("2026-key", PlatformError::ConfigStore)
-                .expect("should encode leading digits under the stable prefix"),
-            "v_n2026_x2dkey"
+        // Digit-leading keys are rejected at the encoder boundary.
+        assert!(
+            spin_variable_name("2026-key", PlatformError::ConfigStore).is_err(),
+            "should reject digit-leading key"
         );
+    }
+
+    #[test]
+    fn spin_encoder_accepts_every_creatable_kid() {
+        // Portability contract: core's create/rotate validation (kid_is_creatable)
+        // must never admit a kid the Spin variable encoder rejects — otherwise such
+        // a kid would 400 on create across every adapter yet 5xx at storage on Spin.
+        // This pins core >= encoder strictness so the duplicated lowercase-leading
+        // rule in validate_kid and spin_variable_name cannot silently drift.
+        use trusted_server_core::request_signing::kid_is_creatable;
+
+        let samples = [
+            "a",
+            "kid",
+            "ts-2026-05-25",
+            "azAZ09-_.:",
+            "k.id:with_all-chars",
+            "KidA",
+            "_kid",
+            "-kid",
+            ".kid",
+            ":kid",
+            "1foo",
+            "0abc",
+            "",
+            "a,b",
+            "a b",
+            "kid/name",
+        ];
+        for kid in samples {
+            if kid_is_creatable(kid) {
+                assert!(
+                    spin_variable_name(kid, PlatformError::ConfigStore).is_ok(),
+                    "core accepts kid `{kid}` but the Spin encoder rejects it \
+                     (portability contract broken)"
+                );
+            }
+        }
     }
 
     #[test]
@@ -794,9 +885,8 @@ mod tests {
     #[test]
     fn spin_variable_name_does_not_collapse_distinct_allowed_kids() {
         let mut names = std::collections::BTreeSet::new();
-        for kid in [
-            "kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "KidA", "kida",
-        ] {
+        // Only lowercase-leading keys are accepted; "KidA" is rejected at the boundary.
+        for kid in ["kid-a", "kid.a", "kid:a", "kid_a", "kid_2da", "kida"] {
             let variable_name = spin_variable_name(kid, PlatformError::ConfigStore)
                 .expect("should encode allowed kid characters");
             assert!(
@@ -804,6 +894,10 @@ mod tests {
                 "Spin variable mapping must not collide for kid `{kid}` as `{variable_name}`"
             );
         }
+        assert!(
+            spin_variable_name("KidA", PlatformError::ConfigStore).is_err(),
+            "should reject uppercase-leading kid at the encoder boundary"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -961,6 +1055,44 @@ mod tests {
     }
 
     #[test]
+    fn response_policy_rejects_oversized_identity_body() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
+        let result = apply_spin_response_policy(Vec::new(), oversized);
+
+        assert!(
+            result.is_err(),
+            "should reject an identity response larger than the size ceiling"
+        );
+    }
+
+    #[test]
+    fn response_policy_rejects_oversized_unsupported_encoding_body() {
+        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
+        let result = apply_spin_response_policy(
+            vec![("content-encoding".to_string(), b"zstd".to_vec())],
+            oversized,
+        );
+
+        assert!(
+            result.is_err(),
+            "should reject an unsupported-encoding response larger than the size ceiling"
+        );
+    }
+
+    #[test]
+    fn response_policy_allows_body_at_size_ceiling() {
+        let at_limit = vec![0u8; MAX_DECOMPRESSED_SIZE];
+        let (_, body) = apply_spin_response_policy(Vec::new(), at_limit)
+            .expect("should accept an identity body exactly at the ceiling");
+
+        assert_eq!(
+            body.len(),
+            MAX_DECOMPRESSED_SIZE,
+            "should pass through a body at the ceiling unchanged"
+        );
+    }
+
+    #[test]
     fn decompression_limit_is_enforced() {
         let compressed = gzip_bytes(b"expanded body");
         let result = decompress_body(&compressed, "gzip", 4);
@@ -971,25 +1103,28 @@ mod tests {
         );
         assert_eq!(
             MAX_DECOMPRESSED_SIZE,
-            64 * 1024 * 1024,
-            "production limit should match EdgeZero Spin proxy"
+            8 * 1024 * 1024,
+            "production limit must stay within Spin WASM heap budget"
         );
     }
 
     #[test]
-    fn spin_variable_name_digit_prefix_aliasing_is_unreachable_for_valid_kids() {
-        // The `n`-prefix for digit-leading keys would alias with keys starting with
-        // 'n' + the same digit sequence (e.g. "1foo" and "n1foo" both → "v_n1foo").
-        // `validate_kid` rejects digit-leading KIDs, so this branch is only reachable
-        // if `spin_variable_name` is called directly with an invalid key.
-        let digit_leading = spin_variable_name("1foo", PlatformError::ConfigStore)
-            .expect("should encode digit-leading key");
-        let n_prefixed = spin_variable_name("n1foo", PlatformError::ConfigStore)
-            .expect("should encode n-prefixed key");
-        assert_eq!(
-            digit_leading, n_prefixed,
-            "aliasing is expected for invalid digit-leading keys; validate_kid prevents \
-             these from reaching this function in production"
+    fn spin_variable_name_rejects_digit_leading_key() {
+        // Encoder enforces the lowercase-letter start contract at the boundary so
+        // no caller can produce aliasing (e.g. "1foo" and "n1foo" would collide).
+        let result = spin_variable_name("1foo", PlatformError::ConfigStore);
+        assert!(
+            result.is_err(),
+            "should reject digit-leading key at the encoder boundary"
+        );
+    }
+
+    #[test]
+    fn spin_variable_name_rejects_uppercase_leading_key() {
+        let result = spin_variable_name("Foo", PlatformError::ConfigStore);
+        assert!(
+            result.is_err(),
+            "should reject uppercase-leading key at the encoder boundary"
         );
     }
 
