@@ -17,13 +17,14 @@ use trusted_server_core::settings::Settings;
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-/// The handler regex covers both the adapter-level `/admin/...` routes and
-/// the `/_ts/admin/...` paths required by settings validation.
+/// The handler regex is the production-shaped `^/_ts/admin`, matching
+/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
+/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
     let settings = Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/(_ts/)?admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -187,7 +188,7 @@ async fn admin_rotate_key_is_routed() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -204,7 +205,7 @@ async fn admin_deactivate_key_is_routed() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/deactivate")
+        .uri("/_ts/admin/keys/deactivate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -320,7 +321,7 @@ async fn admin_route_without_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -337,7 +338,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -370,7 +371,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .header("authorization", format!("Basic {creds}"))
         .body(edgezero_core::body::Body::from("{}"))
@@ -425,7 +426,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
@@ -442,7 +443,7 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/deactivate")
+        .uri("/_ts/admin/keys/deactivate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");

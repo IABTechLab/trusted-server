@@ -37,11 +37,11 @@ pub struct Publisher {
     /// Wasm-heap OOM at flag-flip. Set explicitly to a larger integer value
     /// when the deployment serves publisher pages larger than 16 MiB.
     #[serde(default = "default_max_buffered_body_bytes")]
-    pub max_buffered_body_bytes: Option<usize>,
+    pub max_buffered_body_bytes: usize,
 }
 
-fn default_max_buffered_body_bytes() -> Option<usize> {
-    Some(16 * 1024 * 1024)
+fn default_max_buffered_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 impl Publisher {
@@ -80,7 +80,7 @@ impl Publisher {
     ///     cookie_domain: ".example.com".to_string(),
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
-    ///     max_buffered_body_bytes: None,
+    ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -1952,7 +1952,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -1962,7 +1962,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "https://origin.example.com".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -1972,7 +1972,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://localhost:9090".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -1982,7 +1982,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "localhost:9090".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -1992,7 +1992,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://192.168.1.1:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -2002,7 +2002,7 @@ mod tests {
             cookie_domain: ".example.com".to_string(),
             origin_url: "http://[::1]:8080".to_string(),
             proxy_secret: Redacted::new("test-secret".to_string()),
-            max_buffered_body_bytes: None,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }

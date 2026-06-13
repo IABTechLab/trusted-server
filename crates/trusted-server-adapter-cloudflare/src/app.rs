@@ -301,6 +301,22 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_verify_signature(&s.settings, &services, req)
                 }),
             )
+            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+            // and the production basic-auth handler regex (`^/_ts/admin`), so they
+            // are auth-gated under a production-shaped config.
+            .post(
+                "/_ts/admin/keys/rotate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_rotate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/_ts/admin/keys/deactivate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_deactivate_key(&s.settings, &services, req)
+                }),
+            )
+            // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
             .post(
                 "/admin/keys/rotate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

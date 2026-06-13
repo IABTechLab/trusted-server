@@ -408,6 +408,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
+            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+            // and the production basic-auth handler regex (`^/_ts/admin`), so they
+            // are auth-gated under a production-shaped config.
+            .post("/_ts/admin/keys/rotate", rotate_handler.clone())
+            .post("/_ts/admin/keys/deactivate", deactivate_handler.clone())
+            // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
             .post("/admin/keys/rotate", rotate_handler)
             .post("/admin/keys/deactivate", deactivate_handler)
             .post("/auction", auction_handler)

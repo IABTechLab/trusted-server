@@ -201,9 +201,6 @@ fn test_ec_lifecycle_fastly() {
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
         let result = scenario.run(&process.base_url);
-        assert!(
-            result.is_ok(),
-            "EC scenario {scenario:?} failed: {result:?}"
-        );
+        assert!(result.is_ok(), "EC scenario {scenario:?} should succeed: {result:?}");
     }
 }

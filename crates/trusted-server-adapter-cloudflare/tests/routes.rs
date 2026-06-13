@@ -15,13 +15,14 @@ use trusted_server_core::settings::Settings;
 /// The settings baked into the binary contain placeholder secrets that
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
-/// The handler regex covers both the adapter-level `/admin/...` routes and
-/// the `/_ts/admin/...` paths required by settings validation.
+/// The handler regex is the production-shaped `^/_ts/admin`, matching
+/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
+/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
     let settings = Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/(_ts/)?admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -93,13 +94,13 @@ async fn finalize_middleware_injects_geo_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_middleware_runs_in_chain_for_protected_routes() {
     // Verifies that AuthMiddleware is wired by asserting the 401 + WWW-Authenticate
-    // challenge on a protected route (/admin/keys/rotate). Only AuthMiddleware
+    // challenge on a protected route (/_ts/admin/keys/rotate). Only AuthMiddleware
     // short-circuits with this response — FinalizeResponseMiddleware alone would not.
     let router = test_router();
 
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -146,6 +147,8 @@ fn all_explicit_routes_are_registered() {
     let expected: &[(&str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json"),
         ("POST", "/verify-signature"),
+        ("POST", "/_ts/admin/keys/rotate"),
+        ("POST", "/_ts/admin/keys/deactivate"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
@@ -170,7 +173,7 @@ async fn admin_route_without_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -187,7 +190,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from("{}"))
         .expect("should build request");
@@ -220,7 +223,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .header("authorization", format!("Basic {creds}"))
         .body(edgezero_core::body::Body::from("{}"))
@@ -277,7 +280,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
@@ -294,7 +297,7 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
     let router = test_router();
     let req = request_builder()
         .method("POST")
-        .uri("/admin/keys/deactivate")
+        .uri("/_ts/admin/keys/deactivate")
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");

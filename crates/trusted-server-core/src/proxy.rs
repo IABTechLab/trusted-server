@@ -276,16 +276,16 @@ fn origin_response_metadata(
 /// Apply image content-type header and log pixel heuristics.
 ///
 /// Sets a generic `image/*` content-type when the response has none, then logs
-/// a warning if size or path heuristics suggest a tracking pixel.
-/// Returns `true` when the response is identified as image content so callers
-/// can apply early-return passthrough logic.
+/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// sites pass the response through unchanged afterwards, so this returns
+/// nothing.
 fn apply_image_passthrough_metadata(
     req: &Request<EdgeBody>,
     target_url: &str,
     ct: &str,
     beresp: &mut Response<EdgeBody>,
     log_prefix: &str,
-) -> bool {
+) {
     let req_accept_images = req
         .headers()
         .get(HEADER_ACCEPT)
@@ -294,7 +294,7 @@ fn apply_image_passthrough_metadata(
         .unwrap_or(false);
 
     if !ct.starts_with("image/") && !req_accept_images {
-        return false;
+        return;
     }
 
     if beresp.headers().get(header::CONTENT_TYPE).is_none() {
@@ -332,8 +332,6 @@ fn apply_image_passthrough_metadata(
             ct
         );
     }
-
-    true
 }
 
 fn finalize_proxied_response(
@@ -368,10 +366,7 @@ fn finalize_proxied_response(
         );
     }
 
-    if apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "") {
-        return Ok(beresp);
-    }
-
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
     Ok(beresp)
 }
 
