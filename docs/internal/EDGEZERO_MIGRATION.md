@@ -50,8 +50,10 @@ Before advancing any stage, activate the canary switch:
 1. Confirm `edgezero_rollout_pct = "0"` is already set in the production config store
    (set it now if not — the pre-condition above explains why this must come first).
 2. Set `edgezero_enabled = "true"` in the production config store.
-3. Verify via log tailing that `routing request through legacy path (bucket=N, rollout_pct=0)`
-   appears — this confirms the flag is live and all traffic is still on the legacy path.
+3. Confirm the flag is live and all traffic is still on the legacy path. With
+   debug-level logging enabled (see [Monitoring](#monitoring)) this appears as
+   `routing request through legacy path (rollout_pct=0)`; otherwise verify via the
+   Fastly real-time stats that no EdgeZero traffic is flowing.
 
 ### Stage 1 — 1%
 
@@ -127,9 +129,17 @@ Fastly real-time stats dashboard. Key signals at each canary stage:
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> Log lines in Viceroy / Fastly log tailing:
-> `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
-> `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
+> **The routing log lines are emitted at `log::debug!`, while the Fastly logger
+> is capped at `Info` in production.** Verifying the canary via log tailing
+> therefore requires a debug-level logging deployment (or another equivalent
+> observability signal, such as the Fastly real-time stats traffic split). With
+> debug logging enabled, the log lines in Viceroy / Fastly log tailing are:
+>
+> - `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — partial-stage canary traffic.
+> - `routing request through legacy path (bucket=N, rollout_pct=M)` — partial-stage legacy traffic.
+> - At the degenerate values the bucket is not computed:
+>   `routing request through legacy path (rollout_pct=0)` (full rollback) and
+>   `routing request through EdgeZero path (rollout_pct=100)` (full cutover).
 
 ---
 
