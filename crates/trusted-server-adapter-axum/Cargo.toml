@@ -28,8 +28,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 trusted-server-core = { path = "../trusted-server-core" }
 
 [dev-dependencies]
-axum = "0.8"
+axum = { workspace = true }
 base64 = { workspace = true }
 temp-env = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tower = { version = "0.4", features = ["util"] }
+tower = { workspace = true, features = ["util"] }

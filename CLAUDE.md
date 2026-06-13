@@ -40,8 +40,8 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 ### Rust
 
 ```bash
-# Build
-cargo build
+# Build (per-target aliases — bare `cargo build` fails at the workspace root)
+cargo build-fastly && cargo build-axum && cargo build-cloudflare
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -61,8 +61,8 @@ cargo test-axum
 # Check Cloudflare adapter (native)
 cargo check -p trusted-server-adapter-cloudflare
 
-# Check Cloudflare adapter (WASM target)
-cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+# Check Cloudflare adapter (WASM target — alias for the full command)
+cargo check-cloudflare
 
 # Test Cloudflare adapter (native host)
 cargo test-cloudflare
@@ -81,10 +81,10 @@ cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy-fastly && cargo clippy-axum
+cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
 
-# Check compilation
-cargo check
+# Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
+cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
 cd crates/js/lib && npx vitest run

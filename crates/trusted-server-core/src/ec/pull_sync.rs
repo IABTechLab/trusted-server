@@ -291,28 +291,19 @@ fn drain_pull_batch(
 ) {
     for pending in in_flight.drain(..) {
         let source_domain = pending.source_domain;
-        let select_result =
-            match futures::executor::block_on(services.http_client().select(vec![pending.pending]))
-            {
-                Ok(result) => result,
+        // All requests were dispatched up front via send_async, so waiting on
+        // each in turn does not change concurrency.
+        let response =
+            match futures::executor::block_on(services.http_client().wait(pending.pending)) {
+                Ok(response) => response,
                 Err(err) => {
                     log::warn!(
-                        "Pull sync: select failed for partner '{}': {err:?}",
+                        "Pull sync: request failed for partner '{}': {err:?}",
                         source_domain
                     );
                     continue;
                 }
             };
-        let response = match select_result.ready {
-            Ok(response) => response,
-            Err(err) => {
-                log::warn!(
-                    "Pull sync: request failed for partner '{}': {err:?}",
-                    source_domain
-                );
-                continue;
-            }
-        };
 
         let Some(uid) = extract_pull_uid(response, &source_domain) else {
             continue;
