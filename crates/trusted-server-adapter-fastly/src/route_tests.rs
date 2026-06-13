@@ -974,6 +974,102 @@ fn asset_handler_error_stays_uncacheable_after_global_headers() {
 }
 
 #[test]
+fn finalize_response_preserves_origin_cache_headers_for_plain_html() {
+    // Reviewer P1.2: a zero-slot / non-matching navigation injects no per-user
+    // data and sets no cookie, so the publisher path leaves Cache-Control alone.
+    // finalize_response must not downgrade shared cacheability for it.
+    let settings = create_test_settings();
+    let mut response = fastly::Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "public, max-age=3600")
+        .with_header("surrogate-control", "max-age=86400");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("public, max-age=3600"),
+        "plain cookieless HTML should keep its shared cache directive"
+    );
+    assert_eq!(
+        response.get_header_str("surrogate-control"),
+        Some("max-age=86400"),
+        "plain cookieless HTML should keep its surrogate cache directive"
+    );
+}
+
+#[test]
+fn finalize_response_makes_cookie_bearing_responses_private() {
+    // A first-visit navigation that only sets the EC identity cookie must not be
+    // shared-cached, even though no ad data was injected.
+    let settings = create_test_settings();
+    let mut response = fastly::Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::CACHE_CONTROL, "public, max-age=3600")
+        .with_header("surrogate-control", "max-age=86400")
+        .with_header(header::SET_COOKIE, "ec=abc; Path=/; HttpOnly");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, max-age=0"),
+        "a Set-Cookie response must be downgraded to private"
+    );
+    assert_eq!(
+        response.get_header_str("surrogate-control"),
+        None,
+        "a Set-Cookie response must not retain surrogate cacheability"
+    );
+}
+
+#[test]
+fn finalize_response_leaves_stricter_no_store_untouched() {
+    let settings = create_test_settings();
+    let mut response = fastly::Response::from_status(StatusCode::OK)
+        .with_header(header::CACHE_CONTROL, "no-store")
+        .with_header(header::SET_COOKIE, "ec=abc; Path=/");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("no-store"),
+        "an already-uncacheable response should keep its stricter directive"
+    );
+}
+
+#[test]
+fn finalize_response_cookie_net_blocks_operator_surrogate_reenable() {
+    // Operator response_headers must not re-add surrogate caching once the
+    // cookie net has marked the response private.
+    let mut settings = create_test_settings();
+    settings
+        .response_headers
+        .insert("Surrogate-Control".to_string(), "max-age=86400".to_string());
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    let mut response = fastly::Response::from_status(StatusCode::OK)
+        .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .with_header(header::SET_COOKIE, "ec=abc; Path=/");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response.get_header_str(header::CACHE_CONTROL),
+        Some("private, max-age=0"),
+        "operator Cache-Control must not override the cookie privacy directive"
+    );
+    assert_eq!(
+        response.get_header_str("surrogate-control"),
+        None,
+        "operator Surrogate-Control must not re-enable shared caching for a cookie response"
+    );
+}
+
+#[test]
 fn page_bids_response_cannot_regain_surrogate_headers_from_settings() {
     let base = base_route_settings_toml();
     let prebid = prebid_integration_toml();

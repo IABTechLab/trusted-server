@@ -98,11 +98,12 @@
           var slotId = (ts.divToSlotId || {})[divId];
           if (!slotId) return;
           var b = (ts.bids || {})[slotId] || {};
+          // Only fire when the rendered slot's hb_adid matches our bid's
+          // hb_adid. The prior `!!b.hb_bidder` fallback fired for ANY non-empty
+          // render when an (APS) bid existed, over-reporting wins/billing for
+          // other GAM demand. Kept in sync with the bundle listener in index.ts.
           var ourBidWon =
-            !ev.isEmpty &&
-            (b.hb_adid
-              ? ev.slot.getTargeting("hb_adid")[0] === b.hb_adid
-              : !!b.hb_bidder);
+            !ev.isEmpty && !!b.hb_adid && ev.slot.getTargeting("hb_adid")[0] === b.hb_adid;
           if (ourBidWon && (b.nurl || b.burl)) {
             // Fire each bid's win/billing beacons at most once — GAM can
             // re-render the same line item on publisher refreshes. Keep the

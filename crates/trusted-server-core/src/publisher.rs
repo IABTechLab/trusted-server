@@ -1206,16 +1206,23 @@ pub async fn handle_publisher_request(
         None
     };
 
-    // §4.7: assembled HTML responses must never be shared-cached — per-user bid data
-    // travels inline. `private, max-age=0` is deliberate (not `no-store`): it keeps
-    // the page BFCache-eligible while restricting reuse to the same user's browser
-    // with revalidation; `Surrogate-Control` removal handles the Fastly shared
-    // cache. Apply regardless of slot match or auction outcome (§8).
+    // §4.7: HTML carrying inline per-user bid data must never be shared-cached.
+    // `private, max-age=0` is deliberate (not `no-store`): it keeps the page
+    // BFCache-eligible while restricting reuse to the same user's browser with
+    // revalidation; `Surrogate-Control` removal handles the Fastly shared cache.
+    //
+    // Gate on `should_run_ad_stack` rather than content-type alone: when no slot
+    // matched, the feature is disabled, or this is not an ad-eligible navigation,
+    // no per-user `tsjs.adSlots`/`tsjs.bids` are injected, so forcing private
+    // here would needlessly strip shared cacheability from ordinary publisher
+    // HTML. Applies regardless of the auction *outcome* (empty bids still inject
+    // per-user slot state). The separate EC-cookie cache net in the adapter's
+    // `finalize_response` keeps first-visit identity responses private.
     let origin_content_type = response
         .get_header(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if origin_content_type.contains("text/html") {
+    if should_run_ad_stack && origin_content_type.contains("text/html") {
         response.set_header(header::CACHE_CONTROL, "private, max-age=0");
         response.remove_header("surrogate-control");
         response.remove_header("fastly-surrogate-control");

@@ -452,14 +452,17 @@ export function installTsAdInit(): void {
           if (!slotId) return;
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
-          // Compare hb_adid targeting to verify the specific creative won.
-          // APS bids carry no hb_adid — fall back to hb_bidder presence
-          // (same heuristic as the inline bootstrap) so APS wins still bill.
+          // Only fire when the rendered slot's hb_adid targeting matches our
+          // bid's hb_adid. The previous `!!bid.hb_bidder` fallback fired a
+          // beacon for ANY non-empty render whenever an (APS) bid existed for
+          // the slot, over-reporting wins/billing for impressions won by other
+          // GAM demand. Requiring an hb_adid match is still not airtight
+          // (slot targeting is request state, not proof of the winning GAM
+          // line item), but it removes the unconditional false positive.
           const ourBidWon =
             !event.isEmpty &&
-            (bid.hb_adid
-              ? event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid
-              : !!bid.hb_bidder);
+            !!bid.hb_adid &&
+            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
           if (ourBidWon && (bid.nurl || bid.burl)) {
             // Fire win/billing beacons at most once per bid: GAM re-renders
             // (publisher refreshes, repeated slotRenderEnded for the same

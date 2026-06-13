@@ -660,10 +660,27 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
         response.set_header(HEADER_X_TS_ENV, "staging");
     }
 
-    // Per-user responses (assembled HTML, page-bids) carry a private Cache-Control
-    // directive. Operator headers must not re-enable shared caching for them —
-    // neither by replacing Cache-Control nor by reintroducing the surrogate cache
-    // headers the publisher path stripped.
+    // Any response that sets a per-user cookie (notably the EC identity cookie
+    // minted on a visitor's first navigation) must never be shared-cached, or a
+    // shared cache could replay one user's Set-Cookie to others. The publisher
+    // path only forces `private` for HTML that carries inline ad data, so this
+    // net covers ordinary navigations whose sole per-user payload is the cookie.
+    // Skip when the response is already uncacheable so we don't clobber a
+    // stricter directive (e.g. `no-store`).
+    let already_uncacheable = response
+        .get_header(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    if !already_uncacheable && response.get_header(header::SET_COOKIE).is_some() {
+        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
+        response.remove_header("surrogate-control");
+        response.remove_header("fastly-surrogate-control");
+    }
+
+    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
+    // carry a private Cache-Control directive. Operator headers must not
+    // re-enable shared caching for them — neither by replacing Cache-Control nor
+    // by reintroducing the surrogate cache headers the privacy paths stripped.
     let response_is_private = response
         .get_header(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())

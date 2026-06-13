@@ -349,7 +349,7 @@ describe('installTsAdInit', () => {
     beaconSpy.mockRestore();
   });
 
-  it('fires APS-style beacons once via hb_bidder fallback and dedupes repeat renders', async () => {
+  it('does not fire beacons for an APS-style bid that carries no hb_adid', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
@@ -399,20 +399,11 @@ describe('installTsAdInit', () => {
 
     expect(capturedListener).toBeDefined();
 
-    // Empty render never fires.
-    capturedListener!({ isEmpty: true, slot: mockSlot });
+    // Without an hb_adid to confirm the rendered creative is ours, a non-empty
+    // render is not proof of a TS win: the slot could have been filled by other
+    // GAM demand. The beacon must not fire, so we never over-report billing.
+    capturedListener!({ isEmpty: false, slot: mockSlot });
     expect(beaconSpy).not.toHaveBeenCalled();
-
-    // First real render fires both beacons via the hb_bidder fallback
-    // (APS bids carry no hb_adid to confirm against).
-    capturedListener!({ isEmpty: false, slot: mockSlot });
-    expect(beaconSpy).toHaveBeenCalledWith('https://aps/win');
-    expect(beaconSpy).toHaveBeenCalledWith('https://aps/bill');
-    expect(beaconSpy).toHaveBeenCalledTimes(2);
-
-    // Re-render of the same bid (publisher refresh) must not re-bill.
-    capturedListener!({ isEmpty: false, slot: mockSlot });
-    expect(beaconSpy).toHaveBeenCalledTimes(2);
 
     beaconSpy.mockRestore();
   });
