@@ -195,6 +195,47 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
     }
 }
 
+/// Decides whether a request routes to the `EdgeZero` path for the given rollout state.
+///
+/// `rollout_pct` must be in `0..=100` (as produced by [`read_rollout_pct`]).
+///
+/// The degenerate rollout values short-circuit the per-request routing-key
+/// allocation and FNV hash, which together cover most of the canary's lifetime:
+/// `0` always routes to legacy (full rollback) and `100` always routes to
+/// `EdgeZero` (full cutover). Only the partial-rollout path hashes the client IP
+/// (or the empty string when absent) into a `0..100` bucket via [`fnv1a_bucket`]
+/// and compares it against `rollout_pct` with [`routes_to_edgezero`].
+fn should_route_to_edgezero(rollout_pct: u8, client_ip: Option<IpAddr>) -> bool {
+    match rollout_pct {
+        0 => {
+            log::debug!("routing request through legacy path (rollout_pct=0)");
+            false
+        }
+        100 => {
+            log::debug!("routing request through EdgeZero path (rollout_pct=100)");
+            true
+        }
+        pct => {
+            let routing_key = match client_ip {
+                Some(ip) => ip.to_string(),
+                None => {
+                    log::debug!(
+                        "no client IP available, using empty routing key (deterministic bucket 61)"
+                    );
+                    String::new()
+                }
+            };
+            let bucket = fnv1a_bucket(&routing_key);
+            let routed = routes_to_edgezero(bucket, pct);
+            log::debug!(
+                "routing request through {} path (bucket={bucket}, rollout_pct={pct})",
+                if routed { "EdgeZero" } else { "legacy" }
+            );
+            routed
+        }
+    }
+}
+
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
         return Some(FastlyResponse::from_status(200).with_body_text_plain("ok"));
@@ -238,38 +279,7 @@ fn main() {
     }
 
     let rollout_pct = read_rollout_pct(&edgezero_config_store);
-
-    // Skip the per-request routing-key allocation and FNV hash for the degenerate
-    // rollout values (0 = full rollback, 100 = full cutover), which together cover
-    // most of the canary's lifetime. Only the partial-rollout path needs a bucket.
-    let route_to_edgezero = match rollout_pct {
-        0 => {
-            log::debug!("routing request through legacy path (rollout_pct=0)");
-            false
-        }
-        100 => {
-            log::debug!("routing request through EdgeZero path (rollout_pct=100)");
-            true
-        }
-        pct => {
-            let routing_key = match req.get_client_ip_addr() {
-                Some(ip) => ip.to_string(),
-                None => {
-                    log::debug!(
-                        "no client IP available, using empty routing key (deterministic bucket 61)"
-                    );
-                    String::new()
-                }
-            };
-            let bucket = fnv1a_bucket(&routing_key);
-            let routed = routes_to_edgezero(bucket, pct);
-            log::debug!(
-                "routing request through {} path (bucket={bucket}, rollout_pct={pct})",
-                if routed { "EdgeZero" } else { "legacy" }
-            );
-            routed
-        }
-    };
+    let route_to_edgezero = should_route_to_edgezero(rollout_pct, req.get_client_ip_addr());
 
     if route_to_edgezero {
         edgezero_main(req, edgezero_config_store);
@@ -852,6 +862,63 @@ mod tests {
         assert_eq!(
             edgezero_count, 1,
             "pct=1 should route exactly 1 out of 100 buckets to EdgeZero"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // should_route_to_edgezero — entry-point dispatch matrix
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn should_route_zero_pct_always_routes_to_legacy() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            !should_route_to_edgezero(0, Some(ip)),
+            "rollout_pct=0 should route to legacy regardless of client IP"
+        );
+        assert!(
+            !should_route_to_edgezero(0, None),
+            "rollout_pct=0 should route to legacy when client IP is absent"
+        );
+    }
+
+    #[test]
+    fn should_route_hundred_pct_always_routes_to_edgezero() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            should_route_to_edgezero(100, Some(ip)),
+            "rollout_pct=100 should route to EdgeZero regardless of client IP"
+        );
+        assert!(
+            should_route_to_edgezero(100, None),
+            "rollout_pct=100 should route to EdgeZero when client IP is absent"
+        );
+    }
+
+    #[test]
+    fn should_route_partial_buckets_client_ip() {
+        // "1.2.3.4" hashes to bucket 85 (pinned FNV-1a vector).
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            should_route_to_edgezero(86, Some(ip)),
+            "bucket 85 < 86 should route to EdgeZero (hit)"
+        );
+        assert!(
+            !should_route_to_edgezero(85, Some(ip)),
+            "bucket 85 is not < 85 should route to legacy (miss)"
+        );
+    }
+
+    #[test]
+    fn should_route_partial_absent_ip_uses_empty_key_bucket() {
+        // The empty routing key hashes to bucket 61 (pinned FNV-1a vector).
+        assert!(
+            should_route_to_edgezero(62, None),
+            "bucket 61 < 62 should route to EdgeZero (hit)"
+        );
+        assert!(
+            !should_route_to_edgezero(61, None),
+            "bucket 61 is not < 61 should route to legacy (miss)"
         );
     }
 
