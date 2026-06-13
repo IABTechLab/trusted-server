@@ -1101,15 +1101,32 @@ pub async fn handle_first_party_proxy_rebuild(
     // Keep a snapshot before modifications for diagnostics
     let orig_before = orig.clone();
 
+    // Signing-control parameters that callers must not add or remove during a
+    // rebuild. `tsexp` is the short-lived replay bound that
+    // handle_first_party_proxy_sign attaches; `tstoken`/`tsurl` are the signature
+    // and target. Allowing del/add here would let a public rebuild request strip
+    // the expiration from a still-valid click URL and re-sign a non-expiring one.
+    const RESERVED_SIGNING_PARAMS: &[&str] = &["tsexp", "tstoken", "tsurl"];
+
     // Apply removals
     if let Some(del) = &payload.del {
         for k in del {
+            if RESERVED_SIGNING_PARAMS.contains(&k.as_str()) {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("cannot delete reserved signing parameter: {k}"),
+                }));
+            }
             orig.remove(k);
         }
     }
     // Apply additions (must be new keys only)
     if let Some(add) = &payload.add {
         for (k, v) in add {
+            if RESERVED_SIGNING_PARAMS.contains(&k.as_str()) {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("cannot add reserved signing parameter: {k}"),
+                }));
+            }
             if orig.contains_key(k) {
                 return Err(Report::new(TrustedServerError::Proxy {
                     message: format!("cannot modify existing parameter: {}", k),
@@ -1814,6 +1831,83 @@ mod tests {
             );
             assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
             assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
+    }
+
+    // Build a signed `/first-party/click` URL carrying a future `tsexp` replay
+    // bound, returning (tsclick, tsexp_value).
+    fn signed_click_with_tsexp(settings: &crate::settings::Settings) -> (String, String) {
+        let tsurl = "https://cdn.example/landing.html";
+        let tsexp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("should compute unix time")
+            .as_secs()
+            + 3600)
+            .to_string();
+        // Token is computed over tsurl + params in order, including tsexp.
+        let full_for_token = format!("{tsurl}?x=1&tsexp={tsexp}");
+        let token = crate::http_util::compute_encrypted_sha256_token(settings, &full_for_token);
+        let tsclick = format!(
+            "/first-party/click?tsurl={}&x=1&tsexp={}&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            tsexp,
+            token,
+        );
+        (tsclick, tsexp)
+    }
+
+    #[test]
+    fn proxy_rebuild_rejects_deleting_tsexp() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let (tsclick, _) = signed_click_with_tsexp(&settings);
+            let body = serde_json::json!({
+                "tsclick": tsclick,
+                "del": ["tsexp"],
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+            let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect_err("deleting tsexp must be rejected");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "rejecting a reserved-param deletion should surface as a proxy error"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_retains_tsexp_when_not_deleted() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let (tsclick, tsexp) = signed_click_with_tsexp(&settings);
+            let body = serde_json::json!({
+                "tsclick": tsclick,
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("rebuild ok");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(
+                json.contains(&format!("tsexp={tsexp}")),
+                "rebuilt URL must retain the original tsexp replay bound: {json}"
+            );
         });
     }
 
