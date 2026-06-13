@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
