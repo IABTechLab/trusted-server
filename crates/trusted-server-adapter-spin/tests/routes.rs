@@ -167,7 +167,11 @@ async fn verify_signature_is_routed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_signature_put_returns_405() {
+async fn verify_signature_put_falls_through_to_publisher_fallback() {
+    // PUT is one of the publisher-fallback methods, and /verify-signature only
+    // handles POST directly. Mirroring Fastly/Axum, a non-primary method on a
+    // named path must fall through to the publisher/integration fallback (which
+    // 502s here without a live origin) rather than returning a router-level 405.
     let router = test_router();
     let req = request_builder()
         .method("PUT")
@@ -176,10 +180,14 @@ async fn verify_signature_put_returns_405() {
         .expect("should build request");
     let resp = router.oneshot(req).await;
 
-    assert_eq!(
-        resp.status().as_u16(),
-        405,
-        "PUT /verify-signature must return method-not-allowed, not route miss"
+    let status = resp.status().as_u16();
+    assert_ne!(
+        status, 405,
+        "PUT /verify-signature must fall through to publisher fallback, not 405"
+    );
+    assert_ne!(
+        status, 404,
+        "PUT /verify-signature must be routed to the fallback, not a route miss"
     );
 }
 
@@ -228,6 +236,61 @@ async fn auction_is_routed() {
         .expect("should build request");
     let resp = router.oneshot(req).await;
     assert_ne!(resp.status().as_u16(), 404, "/auction must be routed");
+}
+
+// ---------------------------------------------------------------------------
+// Publisher fallback method parity — non-GET/POST methods must reach the
+// publisher origin fallback (not a router-level 405), matching Fastly/Axum.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_root_reaches_publisher_fallback() {
+    let router = test_router();
+    let req = request_builder()
+        .method("HEAD")
+        .uri("/")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        405,
+        "HEAD / must reach the publisher fallback, not return 405"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn options_page_reaches_publisher_fallback() {
+    let router = test_router();
+    let req = request_builder()
+        .method("OPTIONS")
+        .uri("/some/page")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        405,
+        "OPTIONS /some/page (CORS preflight) must reach the publisher fallback, not 405"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_named_get_route_reaches_publisher_fallback() {
+    // /first-party/proxy handles GET directly; HEAD is non-primary and must fall
+    // through to the publisher fallback rather than returning a router-level 405.
+    let router = test_router();
+    let req = request_builder()
+        .method("HEAD")
+        .uri("/first-party/proxy")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_ne!(
+        resp.status().as_u16(),
+        405,
+        "HEAD /first-party/proxy must reach the publisher fallback, not 405"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

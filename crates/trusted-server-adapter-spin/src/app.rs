@@ -3,7 +3,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Request, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -85,6 +85,44 @@ fn resolve_publisher_response(
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
     buffer_publisher_response(publisher_response, settings, registry)
+}
+
+// ---------------------------------------------------------------------------
+// Publisher fallback method table
+// ---------------------------------------------------------------------------
+
+// Methods routed through the publisher/integration fallback, matching the
+// Fastly and Axum adapters so legacy origin behaviour (HEAD, OPTIONS/CORS
+// preflight, PUT/PATCH/DELETE) is preserved instead of returning 405.
+fn publisher_fallback_methods() -> [Method; 7] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ]
+}
+
+// Named routes paired with the methods they handle directly. Every other
+// publisher-fallback method on these paths is routed to the fallback so it
+// reaches the publisher origin rather than a router-level 405.
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
+    [
+        ("/.well-known/trusted-server.json", &[Method::GET]),
+        ("/verify-signature", &[Method::POST]),
+        ("/_ts/admin/keys/rotate", &[Method::POST]),
+        ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/admin/keys/rotate", &[Method::POST]),
+        ("/admin/keys/deactivate", &[Method::POST]),
+        ("/auction", &[Method::POST]),
+        ("/first-party/proxy", &[Method::GET]),
+        ("/first-party/click", &[Method::GET]),
+        ("/first-party/sign", &[Method::GET, Method::POST]),
+        ("/first-party/proxy-rebuild", &[Method::POST]),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +412,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         async fn dispatch(
             state: Arc<AppState>,
             ctx: RequestContext,
-            allow_tsjs: bool,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
             let mut req = ctx.into_request();
@@ -384,7 +421,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
 
-            let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
+            // Dynamic tsjs serving is GET-only; other methods fall through to the
+            // integration/publisher fallback.
+            let result = if method == Method::GET && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
             } else if state.registry.has_route(&method, &path) {
                 let mut ec_context = EcContext::default();
@@ -414,21 +453,16 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok(result.unwrap_or_else(|e| http_error(&e)))
         }
 
-        // GET /{*rest} — tsjs, integration proxy, or publisher fallback
+        // Single publisher/integration fallback used for every method. The method
+        // is read inside `dispatch`, so the same closure serves GET (tsjs/publisher)
+        // and the other supported methods (integration proxy / publisher origin).
         let s = Arc::clone(&state);
-        let get_fallback = move |ctx: RequestContext| {
+        let fallback = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
-            dispatch(s, ctx, true)
+            dispatch(s, ctx)
         };
 
-        // POST /{*rest} — integration proxy or publisher origin fallback
-        let s = Arc::clone(&state);
-        let post_fallback = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            dispatch(s, ctx, false)
-        };
-
-        RouterService::builder()
+        let mut builder = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get("/.well-known/trusted-server.json", discovery_handler)
@@ -446,12 +480,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
-            .post("/first-party/proxy-rebuild", fp_rebuild_handler)
-            .get("/", get_fallback.clone())
-            .post("/", post_fallback.clone())
-            .get("/{*rest}", get_fallback)
-            .post("/{*rest}", post_fallback)
-            .build()
+            .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+
+        // Mirror the Fastly/Axum publisher fallback: every supported method that is
+        // not a named route's primary method falls through to the publisher origin
+        // (e.g. HEAD /, OPTIONS /page preflight, HEAD /first-party/proxy) instead of
+        // returning a router-level 405. tsjs handling stays GET-only (see dispatch).
+        for (path, primary_methods) in named_fallback_paths() {
+            for method in publisher_fallback_methods() {
+                if !primary_methods.contains(&method) {
+                    builder = builder.route(path, method, fallback.clone());
+                }
+            }
+        }
+        for method in publisher_fallback_methods() {
+            builder = builder.route("/", method.clone(), fallback.clone());
+            builder = builder.route("/{*rest}", method, fallback.clone());
+        }
+
+        builder.build()
     }
 }
 
