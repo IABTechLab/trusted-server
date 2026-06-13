@@ -24,13 +24,14 @@ use trusted_server_core::settings::Settings;
 /// The settings baked into the binaries contain placeholder secrets that
 /// `get_settings()` rejects by design, so both routers are built through
 /// their `routes_with_settings` testing seams from this known-good config.
-/// The handler regex covers both the adapter-level `/admin/...` routes and
-/// the `/_ts/admin/...` paths required by settings validation.
+/// The handler regex is the production-shaped `^/_ts/admin`, matching
+/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
+/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/(_ts/)?admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -205,27 +206,15 @@ async fn discovery_route_body_is_json_parity() {
         (status, body)
     };
 
-    // Both adapters must agree on whether the response is JSON.
+    // This endpoint serves a static config document, so the parsed JSON bodies
+    // must be identical across adapters (not merely both parsable as JSON).
     let axum_json: Option<Value> = serde_json::from_slice(&axum_body_bytes).ok();
     let cf_json: Option<Value> = serde_json::from_slice(&cf_body_bytes).ok();
     assert_eq!(
-        axum_json.is_some(),
-        cf_json.is_some(),
-        "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
+        axum_json, cf_json,
+        "/.well-known/trusted-server.json body must match across adapters \
          (axum_status={axum_status} cf_status={cf_status})"
     );
-
-    // When both return JSON objects, top-level key sets must also match.
-    if let (Some(Value::Object(axum_obj)), Some(Value::Object(cf_obj))) = (&axum_json, &cf_json) {
-        let mut axum_keys: Vec<&str> = axum_obj.keys().map(String::as_str).collect();
-        let mut cf_keys: Vec<&str> = cf_obj.keys().map(String::as_str).collect();
-        axum_keys.sort_unstable();
-        cf_keys.sort_unstable();
-        assert_eq!(
-            axum_keys, cf_keys,
-            "/.well-known/trusted-server.json top-level JSON keys must match across adapters"
-        );
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -249,11 +238,12 @@ async fn verify_signature_route_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_unauthenticated_parity() {
-    // Both adapters must return 401 for unauthenticated admin requests.
+    // Both adapters must return 401 for unauthenticated admin requests on the
+    // canonical `/_ts/admin/keys/*` path that production config auth-gates.
     // The authenticated-path divergence (Axum→501 no-KV, CF→4xx no-KV)
     // is separate and not covered here.
-    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/rotate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/admin/keys/rotate", "{}").await;
+    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/rotate", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/rotate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -291,8 +281,8 @@ async fn admin_rotate_unauthenticated_parity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_unauthenticated_parity() {
     // Mirror of admin_rotate_unauthenticated_parity for the deactivate endpoint.
-    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/deactivate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/admin/keys/deactivate", "{}").await;
+    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/deactivate", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/deactivate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -380,6 +370,13 @@ async fn auction_not_challenged_by_auth_parity() {
 
     assert_ne!(axum_status, 401, "Axum /auction must not 401");
     assert_ne!(cf_status, 401, "Cloudflare /auction must not 401");
+    assert_ne!(axum_status, 404, "Axum /auction must be routed (not 404)");
+    assert_ne!(cf_status, 404, "Cloudflare /auction must be routed (not 404)");
+    assert_eq!(
+        axum_status, cf_status,
+        "/auction must return the same status across adapters: \
+         axum={axum_status} cf={cf_status}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

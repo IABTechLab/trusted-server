@@ -19,7 +19,7 @@ fn test_router() -> edgezero_core::router::RouterService {
     let settings = trusted_server_core::settings::Settings::from_toml(
         r#"
             [[handlers]]
-            path = "^/(_ts/)?admin"
+            path = "^/_ts/admin"
             username = "admin"
             password = "admin-pass"
 
@@ -69,6 +69,8 @@ fn all_explicit_routes_are_registered() {
     let expected: &[(&str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json"),
         ("POST", "/verify-signature"),
+        ("POST", "/_ts/admin/keys/rotate"),
+        ("POST", "/_ts/admin/keys/deactivate"),
         ("POST", "/admin/keys/rotate"),
         ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
@@ -160,12 +162,13 @@ async fn admin_rotate_key_is_routed() {
         .await
         .expect("should respond");
 
-    // The admin handler is a fixed 501 responder with no I/O, and the test
-    // settings protect only ^/_ts/admin, so this path reaches the handler.
+    // The admin handler is a fixed 501 responder with no I/O. The production-shaped
+    // test settings protect only `^/_ts/admin`, so the legacy `/admin/keys/rotate`
+    // alias is not auth-gated and reaches the handler directly.
     assert_eq!(
         resp.status().as_u16(),
         501,
-        "admin/keys/rotate must reach the not-supported handler"
+        "legacy admin/keys/rotate alias must reach the not-supported handler"
     );
 }
 
@@ -294,7 +297,7 @@ async fn admin_route_without_credentials_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(AxumBody::from("{}"))
         .expect("should build request");
@@ -317,7 +320,7 @@ async fn admin_route_without_credentials_includes_www_authenticate_header() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(AxumBody::from("{}"))
         .expect("should build request");
@@ -356,7 +359,7 @@ async fn admin_route_with_wrong_credentials_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .header("authorization", format!("Basic {creds}"))
         .body(AxumBody::from("{}"))
@@ -457,7 +460,7 @@ async fn admin_rotate_key_auth_fail_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");
@@ -480,7 +483,7 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
     let mut svc = make_service();
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/deactivate")
+        .uri("/_ts/admin/keys/deactivate")
         .header("content-type", "application/json")
         .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
         .expect("should build request");

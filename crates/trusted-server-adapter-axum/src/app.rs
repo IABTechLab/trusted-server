@@ -189,7 +189,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 9] {
+fn named_routes() -> [NamedRoute; 11] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -201,6 +201,20 @@ fn named_routes() -> [NamedRoute; 9] {
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::VerifySignature,
         },
+        // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+        // and the production basic-auth handler regex (`^/_ts/admin`), so they
+        // are auth-gated under a production-shaped config.
+        NamedRoute {
+            path: "/_ts/admin/keys/rotate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        NamedRoute {
+            path: "/_ts/admin/keys/deactivate",
+            primary_methods: &[Method::POST],
+            handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
         NamedRoute {
             path: "/admin/keys/rotate",
             primary_methods: &[Method::POST],
