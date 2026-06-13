@@ -306,10 +306,11 @@ pub fn assert_json_response(resp: Response, expected_status: u16) -> TestResult<
 /// Checks whether the response expires (deletes) the `ts-ec` cookie.
 pub fn is_ec_cookie_expired(resp: &Response) -> bool {
     for value in resp.headers().get_all("set-cookie") {
-        if let Ok(cookie_str) = value.to_str() {
-            if cookie_str.starts_with("ts-ec=") && cookie_str.contains("Max-Age=0") {
-                return true;
-            }
+        if let Ok(cookie_str) = value.to_str()
+            && cookie_str.starts_with("ts-ec=")
+            && cookie_str.contains("Max-Age=0")
+        {
+            return true;
         }
     }
     false
