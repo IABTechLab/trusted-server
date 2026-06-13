@@ -376,6 +376,106 @@ async fn first_party_proxy_rebuild_is_routed() {
 }
 
 // ---------------------------------------------------------------------------
+// First-party absolute-URI regression — Spin delivers a path-only request URI
+// (built from IncomingRequest::path_with_query), so the shared proxy/click/sign
+// handlers, which parse `req.uri()` with `url::Url::parse`, would fail with
+// "Invalid URL" unless the adapter rebuilds an absolute URI from spin-full-url.
+// ---------------------------------------------------------------------------
+
+/// Extract a top-level JSON string field value. The sign response only contains
+/// url-encoded values (no quotes or backslash escapes), so a substring scan is
+/// sufficient and avoids pulling in a JSON dependency for the test crate.
+fn json_string_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_sign_get_with_path_only_uri_signs_target() {
+    // The router sees a path-only URI (as Spin produces); spin-full-url carries
+    // the trusted absolute URL the adapter uses to reconstruct req.uri(). Without
+    // the reconstruction, the GET sign handler cannot parse its own ?url= query
+    // and returns a 400 "Invalid URL" instead of a signed href.
+    let router = test_router();
+    let req = request_builder()
+        .method("GET")
+        .uri("/first-party/sign?url=https://cdn.example/a.png")
+        .header(
+            "spin-full-url",
+            "https://www.publisher.example/first-party/sign?url=https://cdn.example/a.png",
+        )
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let resp = router.oneshot(req).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GET /first-party/sign must parse its query from the reconstructed absolute URI"
+    );
+    let body = String::from_utf8(resp.into_body().into_bytes().to_vec())
+        .expect("sign response body should be UTF-8");
+    assert!(
+        body.contains("\"href\""),
+        "sign response must contain a signed href, got: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_party_proxy_round_trip_through_spin_router() {
+    // Sign a target, then route the emitted /first-party/proxy?... href back
+    // through the Spin router. With a path-only URI the proxy handler would fail
+    // signed-target reconstruction with a 400 "Invalid URL"; with the absolute
+    // URI it validates the token and proceeds to the (native-unavailable)
+    // outbound fetch, so the status is anything but the 400/404 it would be if
+    // the request never passed validation/routing.
+    let router = test_router();
+
+    let sign_req = request_builder()
+        .method("GET")
+        .uri("/first-party/sign?url=https://cdn.example/a.png")
+        .header(
+            "spin-full-url",
+            "https://www.publisher.example/first-party/sign?url=https://cdn.example/a.png",
+        )
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+    let sign_resp = router.oneshot(sign_req).await;
+    assert_eq!(
+        sign_resp.status().as_u16(),
+        200,
+        "sign step must succeed before the proxy round-trip"
+    );
+    let sign_body = String::from_utf8(sign_resp.into_body().into_bytes().to_vec())
+        .expect("sign response body should be UTF-8");
+    let href = json_string_field(&sign_body, "href")
+        .expect("sign response must include a signed href path");
+    assert!(
+        href.starts_with("/first-party/proxy?"),
+        "signed href must target the proxy path, got: {href}"
+    );
+
+    let proxy_req = request_builder()
+        .method("GET")
+        .uri(href.clone())
+        .header(
+            "spin-full-url",
+            format!("https://www.publisher.example{href}"),
+        )
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build proxy request");
+    let proxy_resp = router.oneshot(proxy_req).await;
+    let status = proxy_resp.status().as_u16();
+    assert_ne!(
+        status, 400,
+        "proxy must pass signed-target validation, not fail URL parsing (400)"
+    );
+    assert_ne!(status, 404, "proxy path must be routed, not a route miss");
+}
+
+// ---------------------------------------------------------------------------
 // Basic-auth parity tests
 // ---------------------------------------------------------------------------
 

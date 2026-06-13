@@ -143,15 +143,23 @@ fn scheme_host_from_spin_url(url: &str) -> Option<(String, String)> {
     }
 }
 
-// Strips client-spoofable forwarded headers and reconstructs the trusted Host
-// and scheme from Spin's `spin-full-url` synthetic header.
+// Strips client-spoofable forwarded headers, reconstructs the trusted Host and
+// scheme from Spin's `spin-full-url` synthetic header, and rebuilds the core
+// request URI into an absolute form.
 //
 // A client can spoof `Forwarded`/`X-Forwarded-*` to hijack the host and scheme
 // that publisher HTML rewriting, integration URL rewriting, and request-signing
 // context consume. Stripping them first (mirroring the Fastly/Axum edge
 // sanitization) means the value `detect_request_scheme`/`extract_request_host`
 // read originates from the trusted runtime URL rather than the client.
-fn apply_trusted_host_and_scheme(req: &mut Request) {
+//
+// Spin builds the core request URI from `IncomingRequest::path_with_query()`, so
+// it is path-only (e.g. "/first-party/proxy?..."). The shared first-party
+// proxy/click/sign handlers parse `req.uri().to_string()` with `url::Url::parse`,
+// which rejects a relative path. Rebuilding an absolute URI from the trusted
+// scheme+host lets those handlers validate the signed target instead of failing
+// with "Invalid URL".
+fn normalize_spin_request(req: &mut Request) {
     sanitize_forwarded_headers(req);
 
     let Some((scheme, host)) = req
@@ -177,6 +185,17 @@ fn apply_trusted_host_and_scheme(req: &mut Request) {
     // rewrites HTTPS URLs as http.
     if let Ok(pval) = HeaderValue::from_str(&scheme) {
         req.headers_mut().insert("x-forwarded-proto", pval);
+    }
+
+    // Promote the path-only URI to an absolute one so the shared first-party
+    // proxy/click/sign handlers can parse `req.uri()` as a full URL.
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_string());
+    if let Ok(uri) = format!("{scheme}://{host}{path_and_query}").parse() {
+        *req.uri_mut() = uri;
     }
 }
 
@@ -220,19 +239,18 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         async move { Ok::<Response, EdgeError>(resp) }
     };
 
-    RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::new(
-            Settings::default(),
-        )))
-        .get("/", handler)
-        .post("/", handler)
-        .put("/", handler)
-        .delete("/", handler)
-        .get("/{*rest}", handler)
-        .post("/{*rest}", handler)
-        .put("/{*rest}", handler)
-        .delete("/{*rest}", handler)
-        .build()
+    // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
+    // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
+    // healthy router: every method on `/` and `/{*rest}` returns the generic
+    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
+    let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+        Arc::new(Settings::default()),
+    ));
+    for method in publisher_fallback_methods() {
+        builder = builder.route("/", method.clone(), handler);
+        builder = builder.route("/{*rest}", method, handler);
+    }
+    builder.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +377,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                normalize_spin_request(&mut req);
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -372,7 +391,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                normalize_spin_request(&mut req);
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -385,7 +405,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                normalize_spin_request(&mut req);
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -399,7 +420,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                normalize_spin_request(&mut req);
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
                         .await
@@ -416,7 +438,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let services = build_runtime_services(&ctx);
             let mut req = ctx.into_request();
 
-            apply_trusted_host_and_scheme(&mut req);
+            normalize_spin_request(&mut req);
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
@@ -555,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_trusted_host_and_scheme_strips_spoofed_headers_and_uses_runtime_url() {
+    fn normalize_spin_request_strips_spoofed_headers_and_uses_runtime_url() {
         // Client sends an HTTPS spin-full-url but tries to spoof a downgraded
         // http scheme and an attacker-controlled host via forwarded headers.
         let mut req = request_with(&[
@@ -565,7 +587,7 @@ mod tests {
             ("forwarded", "host=evil.example;proto=http"),
         ]);
 
-        apply_trusted_host_and_scheme(&mut req);
+        normalize_spin_request(&mut req);
 
         // Spoofable host overrides are stripped, leaving only the trusted Host.
         assert!(
@@ -591,16 +613,24 @@ mod tests {
             Some("https"),
             "should override spoofed scheme with the trusted https scheme"
         );
+        // The path-only request URI is promoted to an absolute URI using the
+        // trusted scheme+host so the first-party proxy/click/sign handlers can
+        // parse it with url::Url::parse.
+        assert_eq!(
+            req.uri().to_string(),
+            "https://www.publisher.example/",
+            "should absolutize the path-only URI from the trusted scheme+host"
+        );
     }
 
     #[test]
-    fn apply_trusted_host_and_scheme_preserves_existing_host() {
+    fn normalize_spin_request_preserves_existing_host() {
         let mut req = request_with(&[
             ("host", "real-host.example"),
             ("spin-full-url", "https://www.publisher.example/cars/"),
         ]);
 
-        apply_trusted_host_and_scheme(&mut req);
+        normalize_spin_request(&mut req);
 
         assert_eq!(
             req.headers()
@@ -616,5 +646,32 @@ mod tests {
             Some("https"),
             "should still inject the trusted scheme"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_error_router_serves_503_for_all_fallback_methods() {
+        // The degraded router must answer every publisher-fallback method
+        // (including HEAD/OPTIONS/PATCH) on both "/" and nested paths with the
+        // generic 503, never a router-level 405, so startup-failure behaviour
+        // stays consistent with the healthy router.
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failure".to_string(),
+        });
+        let router = startup_error_router(&report);
+
+        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            for path in ["/", "/some/nested/page"] {
+                let req = edgezero_core::http::request_builder()
+                    .method(method)
+                    .uri(path)
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build request");
+                let status = router.oneshot(req).await.status().as_u16();
+                assert_eq!(
+                    status, 503,
+                    "{method} {path} must return 503 from the startup fallback, got {status}"
+                );
+            }
+        }
     }
 }
