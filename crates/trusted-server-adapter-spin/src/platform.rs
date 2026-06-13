@@ -809,6 +809,44 @@ mod tests {
     }
 
     #[test]
+    fn spin_encoder_accepts_every_creatable_kid() {
+        // Portability contract: core's create/rotate validation (kid_is_creatable)
+        // must never admit a kid the Spin variable encoder rejects — otherwise such
+        // a kid would 400 on create across every adapter yet 5xx at storage on Spin.
+        // This pins core >= encoder strictness so the duplicated lowercase-leading
+        // rule in validate_kid and spin_variable_name cannot silently drift.
+        use trusted_server_core::request_signing::kid_is_creatable;
+
+        let samples = [
+            "a",
+            "kid",
+            "ts-2026-05-25",
+            "azAZ09-_.:",
+            "k.id:with_all-chars",
+            "KidA",
+            "_kid",
+            "-kid",
+            ".kid",
+            ":kid",
+            "1foo",
+            "0abc",
+            "",
+            "a,b",
+            "a b",
+            "kid/name",
+        ];
+        for kid in samples {
+            if kid_is_creatable(kid) {
+                assert!(
+                    spin_variable_name(kid, PlatformError::ConfigStore).is_ok(),
+                    "core accepts kid `{kid}` but the Spin encoder rejects it \
+                     (portability contract broken)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spin_secret_variable_name_prefixes_store_name() {
         assert_eq!(
             spin_secret_variable_name(&StoreName::from("signing_keys"), "ts-2026-05-25")

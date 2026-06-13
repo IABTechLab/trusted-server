@@ -224,26 +224,46 @@ fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
 
 /// Validates a kid for creation/rotation.
 ///
-/// In addition to the structural [`validate_kid_format`] checks, rejects
-/// digit-leading KIDs because the Spin variable encoder aliases them (`1foo` and
-/// `n1foo` both map to `v_n1foo`). Applying this on the create/rotate path keeps
-/// all adapters consistent. System-generated KIDs (`ts-YYYY-MM-DD`) start with
-/// `t` and are unaffected.
+/// Enforces the **portable-KID contract**: a kid created through any adapter must
+/// be storable by every platform's key-name encoder, so create/rotate validates
+/// against the strictest common denominator. Concretely the kid must start with a
+/// lowercase ASCII letter, on top of the structural [`validate_kid_format`]
+/// charset checks.
+///
+/// That floor is currently set by the Fermyon Spin variable encoder
+/// (`spin_variable_name` in the Spin adapter's `platform.rs`), which requires a
+/// lowercase ASCII leading character: it would otherwise alias digit-leading keys
+/// (`1foo` and `n1foo` both map to `v_n1foo`) or reject uppercase/punctuation
+/// leading keys (`KidA`, `_kid`, `-kid`, `.kid`, `:kid`) at storage time.
+/// Enforcing the floor here turns those into a client-correctable 400 on every
+/// adapter instead of a runtime 5xx on Spin. [`kid_is_creatable`] exposes this
+/// predicate so adapter crates can pin the contract with a test — core must never
+/// accept a kid its encoder rejects. System-generated KIDs (`ts-YYYY-MM-DD`)
+/// start with `t` and are unaffected.
 ///
 /// Deactivation/deletion deliberately uses the looser [`validate_kid_format`] so
-/// legacy digit-leading KIDs created under earlier validation rules remain
-/// removable.
+/// legacy KIDs created under earlier validation rules remain removable.
 fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     validate_kid_format(kid)?;
 
-    if kid.starts_with(|c: char| c.is_ascii_digit()) {
+    if !kid.starts_with(|c: char| c.is_ascii_lowercase()) {
         return Err(Report::new(TrustedServerError::BadRequest {
-            message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
-                .into(),
+            message: "kid must start with a lowercase ASCII letter".into(),
         }));
     }
 
     Ok(())
+}
+
+/// Returns whether `kid` satisfies the create/rotate portable-KID contract
+/// enforced by [`validate_kid`].
+///
+/// Exposed so platform adapter crates can assert their key-name encoder accepts
+/// every kid this validation admits, pinning the cross-adapter contract against
+/// silent drift between this validation floor and an adapter's storage encoder.
+#[must_use]
+pub fn kid_is_creatable(kid: &str) -> bool {
+    validate_kid(kid).is_ok()
 }
 
 /// Rotates the current active kid by generating and saving a new one.
@@ -398,9 +418,10 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    // Use the looser format validation here so legacy digit-leading KIDs created
-    // under earlier validation rules can still be deactivated or deleted. The
-    // stricter validate_kid only gates new key creation/rotation.
+    // Use the looser format validation here so legacy KIDs created under earlier
+    // validation rules (e.g. digit- or uppercase-leading) can still be
+    // deactivated or deleted. The stricter validate_kid only gates new key
+    // creation/rotation.
     let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
         if deactivate_req.delete {
             manager.delete_key(services, &deactivate_req.kid)
@@ -1016,6 +1037,21 @@ mod tests {
                 validate_kid(kid).is_err(),
                 "should reject digit-leading kid value: {kid}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_kid_rejects_non_lowercase_leading_ids() {
+        // The Spin variable encoder requires a lowercase ASCII leading character,
+        // so uppercase- and punctuation-leading KIDs that pass validate_kid_format
+        // must be rejected on the create/rotate path to avoid a runtime 5xx on Spin.
+        for kid in &["KidA", "_kid", "-kid", ".kid", ":kid"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject non-lowercase-leading kid value: {kid}"
+            );
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should still accept {kid}: {e:?}"));
         }
     }
 
