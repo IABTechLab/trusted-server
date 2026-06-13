@@ -518,6 +518,13 @@ pub async fn handle_publisher_request(
     );
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
+    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
+    // origin. On the EdgeZero path the entry point re-injects this header from
+    // trusted Fastly TLS metadata so in-process scheme detection
+    // (`RequestInfo::from_request`, computed above) works; the legacy path never
+    // sets it. Either way it is an internal edge signal that must not leak to
+    // publisher backends, matching legacy outbound-header behavior.
+    req.headers_mut().remove("fastly-ssl");
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -1316,6 +1323,43 @@ mod tests {
             stub.recorded_backend_names(),
             vec!["stub-backend".to_string()],
             "should proxy through the platform http client"
+        );
+    }
+
+    #[tokio::test]
+    async fn publisher_request_strips_fastly_ssl_before_forwarding() {
+        // The EdgeZero entry point re-injects `fastly-ssl` from trusted TLS
+        // metadata so in-process scheme detection works. It must not leak to the
+        // origin: the legacy path never forwarded it.
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"origin response".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .header("fastly-ssl", "1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        handle_publisher_request(&settings, &registry, &services, req)
+            .await
+            .expect("should proxy publisher request");
+
+        let recorded = stub.recorded_request_headers();
+        let outbound = recorded
+            .first()
+            .expect("should record one outbound request");
+        assert!(
+            !outbound
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("fastly-ssl")),
+            "internal fastly-ssl signal must not be forwarded to the origin, got: {outbound:?}"
         );
     }
 

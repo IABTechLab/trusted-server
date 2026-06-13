@@ -32,10 +32,20 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
-    /// Maximum number of bytes buffered when the `EdgeZero` publisher fallback processes
-    /// a streaming response. Defaults to 16 MiB — a conservative cap that prevents
-    /// Wasm-heap OOM at flag-flip. Set explicitly to a larger integer value
-    /// when the deployment serves publisher pages larger than 16 MiB.
+    /// Maximum number of bytes buffered when the `EdgeZero` publisher fallback
+    /// processes an origin response. This caps the *decoded, post-rewrite*
+    /// output buffer. Defaults to 16 MiB — a conservative cap that prevents
+    /// Wasm-heap OOM at flag-flip.
+    ///
+    /// On Fastly the *effective* ceiling for a publisher page is lower: the
+    /// platform HTTP client rejects any origin response whose raw (still
+    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
+    /// raising this value only helps highly compressible pages whose decoded
+    /// size exceeds the 16 MiB default while their compressed origin body stays
+    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
+    /// uncompressed pages. That platform limit is removed once true streaming
+    /// lands (tracked for PR 15, issue #495), after which this setting becomes
+    /// the sole ceiling.
     #[serde(default = "default_max_buffered_body_bytes")]
     pub max_buffered_body_bytes: usize,
 }
