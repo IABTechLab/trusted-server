@@ -17,5 +17,20 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # worker-build must run from the crate root (where Cargo.toml lives) regardless
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
-# worker-build ^0.8 matches the `worker = "0.8"` dependency in Cargo.toml.
-cargo install -q --version '^0.8' worker-build && worker-build --release
+
+# Pin worker-build to the exact `worker` crate version resolved in Cargo.lock.
+# worker-build is released in lockstep with worker and downloads the wasm-bindgen
+# CLI matching the locked `wasm-bindgen`. A floating `^0.8` install pulled
+# worker-build 0.8.5, which passes `--force-enable-abort-handler` to wasm-bindgen
+# — a flag the CLI matching the pinned wasm-bindgen (0.2.123, via worker 0.8.4)
+# does not understand. Tracking the locked worker version keeps the toolchain in
+# lockstep, and the pin advances automatically when the lockfile bumps.
+WORKER_VERSION="$(
+  grep -A1 '^name = "worker"$' "$SCRIPT_DIR/../../Cargo.lock" |
+    sed -nE 's/^version = "(.*)"/\1/p' | head -1
+)"
+if [ -z "$WORKER_VERSION" ]; then
+  echo "error: could not determine the worker crate version from Cargo.lock" >&2
+  exit 1
+fi
+cargo install -q --version "=$WORKER_VERSION" worker-build && worker-build --release
