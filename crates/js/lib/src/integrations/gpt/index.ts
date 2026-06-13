@@ -310,6 +310,18 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
   }
 }
 
+function fireWinBillingBeacons(slotId: string, bid: AuctionBidData): void {
+  if (!slotId || (!bid.nurl && !bid.burl)) return;
+
+  const beaconKey = `${slotId}|${bid.hb_adid ?? bid.nurl ?? bid.burl ?? ''}`;
+  const fired = (window.tsjs!.firedBeacons ??= {});
+  if (fired[beaconKey]) return;
+
+  fired[beaconKey] = true;
+  if (bid.nurl) navigator.sendBeacon(bid.nurl);
+  if (bid.burl) navigator.sendBeacon(bid.burl);
+}
+
 // ------------------------------------------------------------------
 // Trusted Server ad-init
 // ------------------------------------------------------------------
@@ -319,9 +331,9 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
  *
  * Reads `window.tsjs.adSlots` (injected at head-open) and `window.tsjs.bids`
  * (injected before </body>) synchronously — no fetch, no Promise. Applies bid
- * targeting to GPT slots, sets the `ts_initial` sentinel, registers
- * `slotRenderEnded` to fire both nurl and burl via sendBeacon when our
- * specific Prebid bid wins the GAM line item match, then calls refresh().
+ * targeting to GPT slots, sets the `ts_initial` sentinel, then calls refresh().
+ * Win/billing beacons fire from the TS render bridge, where a matching Prebid
+ * Universal Creative request proves the TS creative actually rendered.
  *
  * Idempotent: destroys previously created TS-managed slots before redefining them,
  * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.
@@ -452,32 +464,6 @@ export function installTsAdInit(): void {
           if (!slotId) return;
           // Read ts.bids live (not the snapshot above) so post-navigation bid data is used.
           const bid = (ts.bids ?? {})[slotId] ?? {};
-          // Only fire when the rendered slot's hb_adid targeting matches our
-          // bid's hb_adid. The previous `!!bid.hb_bidder` fallback fired a
-          // beacon for ANY non-empty render whenever an (APS) bid existed for
-          // the slot, over-reporting wins/billing for impressions won by other
-          // GAM demand. Requiring an hb_adid match is still not airtight
-          // (slot targeting is request state, not proof of the winning GAM
-          // line item), but it removes the unconditional false positive.
-          const ourBidWon =
-            !event.isEmpty &&
-            !!bid.hb_adid &&
-            event.slot?.getTargeting?.('hb_adid')?.[0] === bid.hb_adid;
-          if (ourBidWon && (bid.nurl || bid.burl)) {
-            // Fire win/billing beacons at most once per bid: GAM re-renders
-            // (publisher refreshes, repeated slotRenderEnded for the same
-            // line item) must not re-bill. New auctions produce new bid
-            // identities, so post-navigation bids still fire. Keyed in
-            // shared tsjs state so the inline-bootstrap listener and this
-            // one can never double-fire the same bid.
-            const beaconKey = `${slotId}|${bid.hb_adid ?? bid.nurl ?? bid.burl ?? ''}`;
-            const fired = (ts.firedBeacons ??= {});
-            if (!fired[beaconKey]) {
-              fired[beaconKey] = true;
-              if (bid.nurl) navigator.sendBeacon(bid.nurl);
-              if (bid.burl) navigator.sendBeacon(bid.burl);
-            }
-          }
 
           // GAM interceptor (testing): when adm is present, replace the GAM creative.
           // Adapted from PR #241 — uses window.tsjs.bids[slotId].adm instead of pbjs.
@@ -517,21 +503,21 @@ interface PageBidsResponse {
 const SPA_SLOT_WAIT_MS = 2000;
 
 /**
- * Resolve once at least one of `slots` has a container element in the DOM, or
+ * Resolve once every configured `slots` entry has a container element in the DOM, or
  * after `SPA_SLOT_WAIT_MS`, whichever comes first.
  *
  * Many SPA routers update `history` before the new route's markup commits. If
  * bids were applied immediately, `adInit()` would look up each slot element
  * once and silently skip every not-yet-rendered slot, dropping that route's
  * server-side bids with no retry. Waiting via `MutationObserver` lets the apply
- * step run as soon as the containers exist; the timeout guarantees a slot that
- * never renders cannot hang the hook (the subsequent `adInit()` skips missing
- * elements exactly as before). Resolves immediately when there is nothing to
- * wait for, or when `MutationObserver` is unavailable.
+ * step run as soon as the route's full slot set exists; the timeout guarantees
+ * a slot that never renders cannot hang the hook (the subsequent `adInit()`
+ * skips missing elements exactly as before). Resolves immediately when there is
+ * nothing to wait for, or when `MutationObserver` is unavailable.
  */
 function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise<void> {
-  const anyPresent = (): boolean => slots.some((slot) => !!findSlotElementByDivId(slot.div_id));
-  if (slots.length === 0 || anyPresent() || typeof MutationObserver === 'undefined') {
+  const allPresent = (): boolean => slots.every((slot) => !!findSlotElementByDivId(slot.div_id));
+  if (slots.length === 0 || allPresent() || typeof MutationObserver === 'undefined') {
     return Promise.resolve();
   }
 
@@ -546,7 +532,7 @@ function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise
       resolve();
     };
     const observer = new MutationObserver(() => {
-      if (anyPresent()) finish();
+      if (allPresent()) finish();
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     const timer = setTimeout(finish, SPA_SLOT_WAIT_MS);
@@ -718,6 +704,7 @@ export function installTsRenderBridge(): void {
           height,
         })
       );
+      fireWinBillingBeacons(slotId, matchedBid);
       log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from debug adm`);
       return;
     }
@@ -743,6 +730,7 @@ export function installTsRenderBridge(): void {
             height,
           })
         );
+        fireWinBillingBeacons(slotId, matchedBid);
         log.debug(`[tsjs-gpt] pbRender bridge served '${slotId}' from PBS Cache`);
       })
       .catch((err) => {

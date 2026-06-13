@@ -100,8 +100,8 @@ export interface TsjsApi {
   divToSlotId?: Record<string, string>;
   /**
    * Win/billing beacons already fired, keyed by `slotId|bidIdentity`.
-   * Shared between the inline GPT bootstrap and the bundle listener so a
-   * bid's nurl/burl fire at most once even across GAM re-renders.
+   * Used by the GPT render bridge so a bid's nurl/burl fire at most once even
+   * across repeated Prebid Universal Creative requests for the same adId.
    */
   firedBeacons?: Record<string, boolean>;
   /** Slot-level GPT targeting keys TS applied on the previous route. */

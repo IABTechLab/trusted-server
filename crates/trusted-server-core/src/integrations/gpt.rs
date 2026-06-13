@@ -452,9 +452,10 @@ impl IntegrationHeadInjector for GptIntegration {
     /// ## Scroll / refresh handoff contract (Phase 1)
     ///
     /// `tsjs.adInit` handles **initial render only**: it wires server-side bid
-    /// targeting into GPT slots and fires win beacons (`nurl`/`burl`) via
-    /// `slotRenderEnded`. It does **not** trigger refresh auctions or handle
-    /// GPT slot refresh events.
+    /// targeting into GPT slots and refreshes them. Win/billing beacons fire
+    /// only from the TS render bridge in the JS bundle, where a matching
+    /// Prebid Universal Creative request proves the TS creative rendered.
+    /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
     ///
     /// Post-`window.load`, slim-Prebid takes over: it listens for GPT refresh
     /// events, runs client-side auctions, and sets targeting for subsequent
@@ -1092,16 +1093,16 @@ mod tests {
             "should set ts_initial sentinel"
         );
         assert!(
-            combined.contains("slotRenderEnded"),
-            "should register slotRenderEnded"
+            !combined.contains("addEventListener(\"slotRenderEnded\""),
+            "inline bootstrap cannot prove TS creative rendering from GPT slotRenderEnded"
         );
         assert!(
-            combined.contains("sendBeacon"),
-            "should fire nurl and burl via sendBeacon"
+            !combined.contains("sendBeacon"),
+            "inline bootstrap must not fire win/billing beacons from GPT slotRenderEnded"
         );
         assert!(
-            combined.contains("nurl"),
-            "should fire nurl on confirmed render"
+            !combined.contains("getTargeting(\"hb_adid\")"),
+            "inline bootstrap must not treat GPT targeting as winner proof"
         );
         assert!(
             !combined.contains("/ts-bids"),

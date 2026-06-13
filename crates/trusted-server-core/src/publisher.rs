@@ -233,8 +233,9 @@ fn process_response_streaming<W: Write>(
     output: &mut W,
     params: &ProcessResponseParams,
 ) -> Result<(), Report<TrustedServerError>> {
-    let is_html = params.content_type.contains("text/html");
-    let is_rsc_flight = params.content_type.contains("text/x-component");
+    let is_html = is_html_content_type(params.content_type);
+    let is_rsc_flight =
+        content_type_contains_ascii_case_insensitive(params.content_type, "text/x-component");
     log::debug!(
         "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
@@ -476,7 +477,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         return stream_publisher_body(body, output, params, settings, integration_registry);
     };
 
-    let is_html = params.content_type.contains("text/html");
+    let is_html = is_html_content_type(&params.content_type);
 
     if !is_html {
         // Non-HTML: collect auction first, then stream.  There is no </body>
@@ -1222,7 +1223,7 @@ pub async fn handle_publisher_request(
         .get_header(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if should_run_ad_stack && origin_content_type.contains("text/html") {
+    if should_run_ad_stack && is_html_content_type(origin_content_type) {
         response.set_header(header::CACHE_CONTROL, "private, max-age=0");
         response.remove_header("surrogate-control");
         response.remove_header("fastly-surrogate-control");
@@ -1548,9 +1549,18 @@ pub(crate) fn build_ad_slots_script(
 /// Text-based and JavaScript/JSON responses are processable; binary types
 /// (images, fonts, video, etc.) pass through unchanged.
 fn is_processable_content_type(content_type: &str) -> bool {
-    content_type.contains("text/")
-        || content_type.contains("application/javascript")
-        || content_type.contains("application/json")
+    let normalized = content_type.to_ascii_lowercase();
+    normalized.contains("text/")
+        || normalized.contains("application/javascript")
+        || normalized.contains("application/json")
+}
+
+fn is_html_content_type(content_type: &str) -> bool {
+    content_type_contains_ascii_case_insensitive(content_type, "text/html")
+}
+
+fn content_type_contains_ascii_case_insensitive(content_type: &str, needle: &str) -> bool {
+    content_type.to_ascii_lowercase().contains(needle)
 }
 
 /// Whether the `Content-Encoding` is one the streaming pipeline can handle.
@@ -1945,11 +1955,15 @@ mod tests {
         let test_cases = vec![
             ("text/html", true),
             ("text/html; charset=utf-8", true),
+            ("Text/HTML; Charset=utf-8", true),
             ("text/css", true),
+            ("Text/CSS", true),
             ("text/javascript", true),
             ("application/javascript", true),
+            ("Application/JavaScript", true),
             ("application/json", true),
             ("application/json; charset=utf-8", true),
+            ("Application/JSON; Charset=UTF-8", true),
             ("image/jpeg", false),
             ("image/png", false),
             ("application/pdf", false),
@@ -2184,6 +2198,21 @@ mod tests {
                 false,
             ),
             ResponseRoute::Stream,
+        );
+    }
+
+    #[test]
+    fn route_streams_mixed_case_html_content_type() {
+        assert_eq!(
+            classify_response_route(
+                StatusCode::OK,
+                "Text/HTML; Charset=utf-8",
+                "gzip",
+                "example.com",
+                false,
+            ),
+            ResponseRoute::Stream,
+            "HTML MIME type matching must be case-insensitive",
         );
     }
 
@@ -2783,6 +2812,51 @@ mod tests {
         assert!(
             output.is_empty(),
             "empty origin body should produce empty streaming output. Got: {output:?}"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_treats_mixed_case_html_as_html() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let bids_script =
+            r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
+        let state = Arc::new(Mutex::new(Some(bids_script.to_string())));
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "Text/HTML; Charset=utf-8".to_string(),
+            ad_slots_script: Some(
+                r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                    .to_string(),
+            ),
+            ad_bids_state: state,
+            dispatched_auction: None,
+            price_granularity: crate::price_bucket::PriceGranularity::default(),
+        };
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            Body::from(b"<html><head></head><body>content</body></html>".to_vec()),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should process mixed-case HTML content type");
+
+        let html = String::from_utf8(output).expect("should be valid UTF-8");
+        assert!(
+            html.contains(".adSlots=JSON.parse"),
+            "mixed-case HTML must use the HTML processor and inject ad slots. Got: {html}"
+        );
+        assert!(
+            html.contains(".bids=JSON.parse"),
+            "mixed-case HTML must use the HTML processor and inject bids. Got: {html}"
         );
     }
 

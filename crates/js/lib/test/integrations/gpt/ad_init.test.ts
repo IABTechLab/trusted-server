@@ -285,7 +285,7 @@ describe('installTsAdInit', () => {
     expect(mockPubads.refresh).toHaveBeenCalledWith([mockSlot]);
   });
 
-  it('fires both nurl and burl via sendBeacon on slotRenderEnded when our bid won', async () => {
+  it('does not fire win/billing beacons from slotRenderEnded targeting alone', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     let capturedListener: ((e: SlotRenderEvent) => void) | undefined;
 
@@ -337,14 +337,12 @@ describe('installTsAdInit', () => {
     expect(capturedListener).toBeDefined();
     capturedListener!({ isEmpty: false, slot: mockSlot });
 
-    expect(beaconSpy).toHaveBeenCalledWith('https://ssp/win');
-    expect(beaconSpy).toHaveBeenCalledWith('https://ssp/bill');
-    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    expect(beaconSpy).not.toHaveBeenCalled();
 
-    // GAM re-rendering the same line item (same hb_adid) must not re-fire
-    // the same bid's win/billing beacons.
+    // GPT slot targeting is request state, not proof that the TS creative
+    // rendered. A repeated non-empty render must still not bill from this path.
     capturedListener!({ isEmpty: false, slot: mockSlot });
-    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    expect(beaconSpy).not.toHaveBeenCalled();
 
     beaconSpy.mockRestore();
   });
@@ -718,6 +716,8 @@ describe('installTsRenderBridge', () => {
           hb_pb: '1.50',
           hb_cache_host: 'openads.example.com',
           hb_cache_path: '/cache',
+          nurl: 'https://ssp.example/win',
+          burl: 'https://ssp.example/bill',
         },
       },
       adSlots: [
@@ -748,6 +748,7 @@ describe('installTsRenderBridge', () => {
   }
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const mockAd = '<div>Test Creative</div>';
     fetchStub.mockResolvedValue({
       ok: true,
@@ -801,9 +802,25 @@ describe('installTsRenderBridge', () => {
     expect(parsed.message).toBe('Prebid Response');
     expect(parsed.adId).toBe('test-cache-uuid');
     expect(parsed.ad).toBe(mockAd);
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+
+    bridgeListener!(
+      Object.assign(new Event('message'), {
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+        ports: [fakePort],
+        source,
+        stopImmediatePropagation: stopSpy,
+      }) as unknown as MessageEvent
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
   });
 
   it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const debugAdm = '<div>Debug Creative</div>';
     (window as TestWindow).tsjs = {
       bids: {
@@ -811,6 +828,8 @@ describe('installTsRenderBridge', () => {
           hb_adid: 'debug-adid',
           hb_bidder: 'mocktioneer',
           hb_pb: '0.20',
+          nurl: 'https://debug.example/win',
+          burl: 'https://debug.example/bill',
           adm: debugAdm,
         },
       },
@@ -867,6 +886,10 @@ describe('installTsRenderBridge', () => {
     expect(parsed.ad).toBe(debugAdm);
     expect(parsed.width).toBe(728);
     expect(parsed.height).toBe(90);
+    expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/bill');
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
   });
 
   it('ignores message when adId does not match any TS bid', async () => {

@@ -93,31 +93,6 @@
         googletag.pubads().enableSingleRequest();
         googletag.enableServices();
         ts.servicesEnabled = true;
-        googletag.pubads().addEventListener("slotRenderEnded", function (ev) {
-          var divId = ev.slot.getSlotElementId();
-          var slotId = (ts.divToSlotId || {})[divId];
-          if (!slotId) return;
-          var b = (ts.bids || {})[slotId] || {};
-          // Only fire when the rendered slot's hb_adid matches our bid's
-          // hb_adid. The prior `!!b.hb_bidder` fallback fired for ANY non-empty
-          // render when an (APS) bid existed, over-reporting wins/billing for
-          // other GAM demand. Kept in sync with the bundle listener in index.ts.
-          var ourBidWon =
-            !ev.isEmpty && !!b.hb_adid && ev.slot.getTargeting("hb_adid")[0] === b.hb_adid;
-          if (ourBidWon && (b.nurl || b.burl)) {
-            // Fire each bid's win/billing beacons at most once — GAM can
-            // re-render the same line item on publisher refreshes. Keep the
-            // key format in sync with the bundle listener in index.ts; the
-            // map lives on tsjs so both listeners share dedupe state.
-            var beaconKey = slotId + "|" + (b.hb_adid || b.nurl || b.burl || "");
-            var fired = (ts.firedBeacons = ts.firedBeacons || {});
-            if (!fired[beaconKey]) {
-              fired[beaconKey] = true;
-              if (b.nurl) navigator.sendBeacon(b.nurl);
-              if (b.burl) navigator.sendBeacon(b.burl);
-            }
-          }
-        });
       }
       if (slotsToRefresh.length > 0) {
         googletag.pubads().refresh(slotsToRefresh);

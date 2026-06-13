@@ -103,6 +103,49 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('waits for every configured route ad container before applying bids', async () => {
+    document.body.innerHTML = '<div id="div-first"></div>';
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        slots: [
+          { id: 'first', div_id: 'div-first' },
+          { id: 'second', div_id: 'div-second' },
+        ],
+        bids: {
+          first: { hb_pb: '1.00' },
+          second: { hb_pb: '2.00' },
+        },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/multi-slot-route');
+    await flushAsync();
+
+    expect(adInit).not.toHaveBeenCalled();
+    expect(ts.adSlots).toBeUndefined();
+
+    const second = document.createElement('div');
+    second.id = 'div-second';
+    document.body.appendChild(second);
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([
+      { id: 'first', div_id: 'div-first' },
+      { id: 'second', div_id: 'div-second' },
+    ]);
+    expect(ts.bids).toEqual({
+      first: { hb_pb: '1.00' },
+      second: { hb_pb: '2.00' },
+    });
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('does not fetch when pushState targets the current path', async () => {
     await importGptModule();
 
