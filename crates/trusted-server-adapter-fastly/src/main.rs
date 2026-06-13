@@ -179,10 +179,11 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
             }
         },
         Ok(None) => {
-            // Fires per-request when key is absent and edgezero_enabled=true.
-            // At production scale this creates one warn per request until the key is set.
-            // Resolution: set edgezero_rollout_pct = "0" before setting edgezero_enabled = "true".
-            log::warn!(
+            // Fires per-request when the key is absent and edgezero_enabled=true, so
+            // emit at debug to avoid a per-request warn flood at production QPS. The
+            // setup procedure (set edgezero_rollout_pct = "0" before edgezero_enabled
+            // = "true") and the migration runbook are the operational safety net here.
+            log::debug!(
                 "edgezero_rollout_pct key absent, defaulting to 100 (full rollout — backward compat)"
             );
             100
