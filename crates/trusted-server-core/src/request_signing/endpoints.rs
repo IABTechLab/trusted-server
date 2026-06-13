@@ -200,21 +200,13 @@ fn signing_store_ids(
         })
 }
 
-fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+/// Validates the structural constraints every kid must satisfy regardless of
+/// operation: non-empty, length-bounded, and limited to a safe charset so a kid
+/// cannot smuggle a CSV separator or other control characters into storage.
+fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
     if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: format!("kid must be 1..={MAX_KID_LENGTH} characters"),
-        }));
-    }
-
-    // Digit-leading KIDs alias in the Spin variable encoder ("1foo" and "n1foo" both map
-    // to "v_n1foo"). Blocking them here keeps all adapters consistent — this check applies
-    // to Fastly, Cloudflare, and Axum as well. System-generated KIDs (ts-YYYY-MM-DD) start
-    // with 't' and are unaffected.
-    if kid.starts_with(|c: char| c.is_ascii_digit()) {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
-                .into(),
         }));
     }
 
@@ -224,6 +216,30 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: "kid must contain only ASCII alphanumerics, '-', '_', '.', ':'".into(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// Validates a kid for creation/rotation.
+///
+/// In addition to the structural [`validate_kid_format`] checks, rejects
+/// digit-leading KIDs because the Spin variable encoder aliases them (`1foo` and
+/// `n1foo` both map to `v_n1foo`). Applying this on the create/rotate path keeps
+/// all adapters consistent. System-generated KIDs (`ts-YYYY-MM-DD`) start with
+/// `t` and are unaffected.
+///
+/// Deactivation/deletion deliberately uses the looser [`validate_kid_format`] so
+/// legacy digit-leading KIDs created under earlier validation rules remain
+/// removable.
+fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+    validate_kid_format(kid)?;
+
+    if kid.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
+                .into(),
         }));
     }
 
@@ -382,7 +398,10 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    let result = validate_kid(&deactivate_req.kid).and_then(|()| {
+    // Use the looser format validation here so legacy digit-leading KIDs created
+    // under earlier validation rules can still be deactivated or deleted. The
+    // stricter validate_kid only gates new key creation/rotation.
+    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
         if deactivate_req.delete {
             manager.delete_key(services, &deactivate_req.kid)
         } else {
@@ -998,6 +1017,49 @@ mod tests {
                 "should reject digit-leading kid value: {kid}"
             );
         }
+    }
+
+    #[test]
+    fn validate_kid_format_allows_digit_leading_for_legacy_removal() {
+        // Deactivation/deletion uses validate_kid_format so digit-leading KIDs
+        // created under earlier rules stay removable, while the stricter
+        // validate_kid still blocks them on the create/rotate path.
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should accept legacy kid {kid}: {e:?}"));
+            assert!(
+                validate_kid(kid).is_err(),
+                "create/rotate validation must still reject digit-leading kid: {kid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deactivate_allows_legacy_digit_leading_kid_past_validation() {
+        // A digit-leading legacy kid must pass validation and reach storage
+        // (which fails with the noop test stores -> 500) rather than being
+        // rejected up front as a 400 bad request.
+        let settings = crate::test_support::tests::create_test_settings();
+        let req_body = DeactivateKeyRequest {
+            kid: "1legacy-key".to_string(),
+            delete: true,
+        };
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
+
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response for a legacy digit-leading kid");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "legacy digit-leading kid must not be rejected as a bad request on deactivation"
+        );
     }
 
     #[test]
