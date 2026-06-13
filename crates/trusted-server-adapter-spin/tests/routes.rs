@@ -78,6 +78,30 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_route_returns_ok() {
+    // Parity with the Fastly/Axum adapters: GET /health is a cheap liveness probe
+    // answering 200 "ok", not routed through publisher handling.
+    let router = test_router();
+
+    let req = request_builder()
+        .method("GET")
+        .uri("/health")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+
+    let resp = router.oneshot(req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "health probe should return 200"
+    );
+
+    let body = resp.into_body().into_bytes();
+    assert_eq!(&body[..], b"ok", "health probe should return the body `ok`");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finalize_middleware_injects_geo_header() {
     // The X-Geo-Info-Available header is injected by FinalizeResponseMiddleware.
     // Its absence on any response means the middleware was not wired.

@@ -171,13 +171,16 @@ fn normalize_spin_request(req: &mut Request) {
         return;
     };
 
-    // Spin's WASI HTTP bridge does not surface the incoming Host header via
-    // IncomingRequest::headers(). Without it, extract_request_host() returns ""
-    // and classify_response_route falls back to BufferedUnmodified, skipping the
-    // HTML processor entirely (no URL rewriting, no TSJS injection).
-    if req.headers().get(header::HOST).is_none()
-        && let Ok(hval) = HeaderValue::from_str(&host)
-    {
+    // Always set Host from the trusted spin-full-url rather than preserving any
+    // incoming value. Spin's WASI HTTP bridge does not normally surface the
+    // incoming Host header (without it extract_request_host() returns "" and
+    // classify_response_route falls back to BufferedUnmodified, skipping the HTML
+    // processor), but when a Host *is* present it is client-controllable. Keeping
+    // it while rebuilding req.uri() from the spin-full-url host below would let the
+    // shared RequestInfo path (publisher HTML rewriting, integration URL rewriting,
+    // signing context) read one host while handlers parsing req.uri() see another.
+    // Overriding from the single trusted authority keeps both consistent.
+    if let Ok(hval) = HeaderValue::from_str(&host) {
         req.headers_mut().insert(header::HOST, hval);
     }
 
@@ -197,6 +200,25 @@ fn normalize_spin_request(req: &mut Request) {
     if let Ok(uri) = format!("{scheme}://{host}{path_and_query}").parse() {
         *req.uri_mut() = uri;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Health probe
+// ---------------------------------------------------------------------------
+
+/// Builds the `GET /health` liveness response (`200 ok`, `text/plain`).
+///
+/// Mirrors the Fastly entry point and Axum adapter so deployments reusing
+/// Trusted Server health probes see identical behaviour on Spin. Served from
+/// both the healthy router and the startup-error fallback so the probe answers
+/// even before (or when) application state is usable, leaving Spin's
+/// platform-provided `/.well-known/spin/health` untouched.
+fn health_response() -> Response {
+    let mut resp = Response::new(edgezero_core::body::Body::from("ok"));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +268,11 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
         Arc::new(Settings::default()),
     ));
+    // Keep the liveness probe answering 200 even while state construction is
+    // failing, matching the Fastly/Axum health behaviour.
+    builder = builder.get("/health", |_ctx: RequestContext| async {
+        Ok::<Response, EdgeError>(health_response())
+    });
     for method in publisher_fallback_methods() {
         builder = builder.route("/", method.clone(), handler);
         builder = builder.route("/{*rest}", method, handler);
@@ -487,6 +514,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let mut builder = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
+            // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
+            .get("/health", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(health_response())
+            })
             .get("/.well-known/trusted-server.json", discovery_handler)
             .post("/verify-signature", verify_handler)
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
@@ -624,9 +656,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_spin_request_preserves_existing_host() {
+    fn normalize_spin_request_overrides_existing_host_with_trusted_authority() {
+        // A client-supplied Host must not survive: it would diverge from the
+        // absolute req.uri() rebuilt from the trusted spin-full-url host, leaving
+        // RequestInfo and the first-party handlers reading different authorities.
         let mut req = request_with(&[
-            ("host", "real-host.example"),
+            ("host", "client-supplied.example"),
             ("spin-full-url", "https://www.publisher.example/cars/"),
         ]);
 
@@ -636,8 +671,13 @@ mod tests {
             req.headers()
                 .get(header::HOST)
                 .and_then(|v| v.to_str().ok()),
-            Some("real-host.example"),
-            "should not overwrite an already-present Host header"
+            Some("www.publisher.example"),
+            "should override an existing Host with the trusted spin-full-url host"
+        );
+        assert_eq!(
+            req.uri().host(),
+            Some("www.publisher.example"),
+            "should rebuild the absolute URI with the same trusted authority"
         );
         assert_eq!(
             req.headers()
@@ -673,5 +713,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_error_router_answers_health_with_200() {
+        // The liveness probe must keep returning 200 even while application state
+        // construction is failing, matching the Fastly/Axum health behaviour.
+        let report = Report::new(TrustedServerError::BadRequest {
+            message: "startup failure".to_string(),
+        });
+        let router = startup_error_router(&report);
+
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/health")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = router.oneshot(req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "GET /health must return 200 from the startup fallback"
+        );
+        let body = resp.into_body().into_bytes();
+        assert_eq!(
+            &body[..],
+            b"ok",
+            "startup-fallback health body should be `ok`"
+        );
     }
 }
