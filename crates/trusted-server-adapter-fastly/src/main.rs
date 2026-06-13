@@ -855,6 +855,87 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // read_rollout_pct — safety-critical config-store branches
+    // ---------------------------------------------------------------------------
+
+    // Canned config-store response so the safety-critical defaults can be pinned
+    // without a live Fastly Config Store. `ConfigStoreError` is not `Clone`, so the
+    // error case is built fresh inside `get` rather than stored.
+    enum StubResponse {
+        Value(String),
+        Absent,
+        Unavailable,
+    }
+
+    struct TestConfigStore {
+        response: StubResponse,
+    }
+
+    impl edgezero_core::config_store::ConfigStore for TestConfigStore {
+        fn get(
+            &self,
+            _key: &str,
+        ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
+            match &self.response {
+                StubResponse::Value(v) => Ok(Some(v.clone())),
+                StubResponse::Absent => Ok(None),
+                StubResponse::Unavailable => Err(
+                    edgezero_core::config_store::ConfigStoreError::unavailable("boom"),
+                ),
+            }
+        }
+    }
+
+    fn rollout_handle(response: StubResponse) -> ConfigStoreHandle {
+        ConfigStoreHandle::new(Arc::new(TestConfigStore { response }))
+    }
+
+    #[test]
+    fn read_rollout_pct_absent_defaults_to_full_rollout() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Absent)),
+            100,
+            "absent key should default to 100 (backward compat)"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_valid_value_is_parsed() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("42".into()))),
+            42,
+            "a valid in-range value should be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_invalid_value_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("abc".into()))),
+            0,
+            "an unparseable value should fail safe to 0 (legacy)"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_out_of_range_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("101".into()))),
+            0,
+            "an out-of-range value should fail safe to 0 (legacy)"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_read_error_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Unavailable)),
+            0,
+            "a config-store read error should fail safe to 0 (legacy)"
+        );
+    }
+
     #[test]
     fn health_response_short_circuits_get_health() {
         let req = FastlyRequest::get("https://example.com/health");
