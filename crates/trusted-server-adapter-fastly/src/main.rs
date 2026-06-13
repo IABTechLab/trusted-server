@@ -121,7 +121,7 @@ fn fnv1a_bucket(key: &str) -> u8 {
 /// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
 /// When `rollout_pct = 0` no bucket ever routes to `EdgeZero` (instant rollback).
 /// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
-fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
+fn routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
     debug_assert!(
         rollout_pct <= 100,
@@ -238,26 +238,42 @@ fn main() {
     }
 
     let rollout_pct = read_rollout_pct(&edgezero_config_store);
-    let routing_key = match req.get_client_ip_addr() {
-        Some(ip) => ip.to_string(),
-        None => {
+
+    // Skip the per-request routing-key allocation and FNV hash for the degenerate
+    // rollout values (0 = full rollback, 100 = full cutover), which together cover
+    // most of the canary's lifetime. Only the partial-rollout path needs a bucket.
+    let route_to_edgezero = match rollout_pct {
+        0 => {
+            log::debug!("routing request through legacy path (rollout_pct=0)");
+            false
+        }
+        100 => {
+            log::debug!("routing request through EdgeZero path (rollout_pct=100)");
+            true
+        }
+        pct => {
+            let routing_key = match req.get_client_ip_addr() {
+                Some(ip) => ip.to_string(),
+                None => {
+                    log::debug!(
+                        "no client IP available, using empty routing key (deterministic bucket 61)"
+                    );
+                    String::new()
+                }
+            };
+            let bucket = fnv1a_bucket(&routing_key);
+            let routed = routes_to_edgezero(bucket, pct);
             log::debug!(
-                "no client IP available, using empty routing key (deterministic bucket 61)"
+                "routing request through {} path (bucket={bucket}, rollout_pct={pct})",
+                if routed { "EdgeZero" } else { "legacy" }
             );
-            String::new()
+            routed
         }
     };
-    let bucket = fnv1a_bucket(&routing_key);
 
-    if canary_routes_to_edgezero(bucket, rollout_pct) {
-        log::debug!(
-            "routing request through EdgeZero path (bucket={bucket}, rollout_pct={rollout_pct})"
-        );
+    if route_to_edgezero {
         edgezero_main(req, edgezero_config_store);
     } else {
-        log::debug!(
-            "routing request through legacy path (bucket={bucket}, rollout_pct={rollout_pct})"
-        );
         legacy_main(req);
     }
 }
@@ -798,14 +814,14 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // canary_routes_to_edgezero
+    // routes_to_edgezero
     // ---------------------------------------------------------------------------
 
     #[test]
     fn rollout_zero_routes_all_to_legacy() {
         for bucket in 0u8..100 {
             assert!(
-                !canary_routes_to_edgezero(bucket, 0),
+                !routes_to_edgezero(bucket, 0),
                 "pct=0 should route all to legacy, bucket={bucket}"
             );
         }
@@ -815,7 +831,7 @@ mod tests {
     fn rollout_hundred_routes_all_to_edgezero() {
         for bucket in 0u8..100 {
             assert!(
-                canary_routes_to_edgezero(bucket, 100),
+                routes_to_edgezero(bucket, 100),
                 "pct=100 should route all to EdgeZero, bucket={bucket}"
             );
         }
@@ -823,9 +839,7 @@ mod tests {
 
     #[test]
     fn rollout_fifty_routes_exactly_half_of_bucket_space() {
-        let edgezero_count = (0u8..100)
-            .filter(|&b| canary_routes_to_edgezero(b, 50))
-            .count();
+        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 50)).count();
         assert_eq!(
             edgezero_count, 50,
             "pct=50 should route exactly 50 out of 100 buckets to EdgeZero"
@@ -834,9 +848,7 @@ mod tests {
 
     #[test]
     fn rollout_one_routes_exactly_one_bucket() {
-        let edgezero_count = (0u8..100)
-            .filter(|&b| canary_routes_to_edgezero(b, 1))
-            .count();
+        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 1)).count();
         assert_eq!(
             edgezero_count, 1,
             "pct=1 should route exactly 1 out of 100 buckets to EdgeZero"
