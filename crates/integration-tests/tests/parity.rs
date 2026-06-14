@@ -206,15 +206,40 @@ async fn discovery_route_body_is_json_parity() {
         (status, body)
     };
 
-    // This endpoint serves a static config document, so the parsed JSON bodies
-    // must be identical across adapters (not merely both parsable as JSON).
+    // This endpoint serves a static config document, so the bodies must be
+    // identical across adapters — not merely both parsable (or both unparsable)
+    // as JSON. Parse first so JSON key ordering / whitespace differences do not
+    // cause false failures, but never treat `None == None` as body parity.
     let axum_json: Option<Value> = serde_json::from_slice(&axum_body_bytes).ok();
     let cf_json: Option<Value> = serde_json::from_slice(&cf_body_bytes).ok();
+
+    // Both adapters must agree on whether the body is JSON. A regression where
+    // one returns the discovery JSON and the other returns a non-JSON error body
+    // is a definitive parity break.
     assert_eq!(
-        axum_json, cf_json,
-        "/.well-known/trusted-server.json body must match across adapters \
-         (axum_status={axum_status} cf_status={cf_status})"
+        axum_json.is_some(),
+        cf_json.is_some(),
+        "/.well-known/trusted-server.json body type (JSON vs non-JSON) must match \
+         across adapters (axum_status={axum_status} cf_status={cf_status})"
     );
+
+    match (axum_json, cf_json) {
+        // Both adapters serve JSON: compare parsed values so serialization
+        // differences (key ordering, whitespace) do not cause false failures.
+        (Some(axum_value), Some(cf_value)) => assert_eq!(
+            axum_value, cf_value,
+            "/.well-known/trusted-server.json JSON body must match across adapters \
+             (axum_status={axum_status} cf_status={cf_status})"
+        ),
+        // Without seeded signing/JWKS data both adapters take the same error path
+        // and return a non-JSON error body. Compare raw bytes so diverging error
+        // payloads are caught instead of both parsing to `None`.
+        _ => assert_eq!(
+            axum_body_bytes, cf_body_bytes,
+            "/.well-known/trusted-server.json non-JSON body must match across adapters \
+             (axum_status={axum_status} cf_status={cf_status})"
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
