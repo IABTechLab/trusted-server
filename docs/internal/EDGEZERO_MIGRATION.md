@@ -50,10 +50,15 @@ Before advancing any stage, activate the canary switch:
 1. Confirm `edgezero_rollout_pct = "0"` is already set in the production config store
    (set it now if not — the pre-condition above explains why this must come first).
 2. Set `edgezero_enabled = "true"` in the production config store.
-3. Confirm the flag is live and all traffic is still on the legacy path. With
-   debug-level logging enabled (see [Monitoring](#monitoring)) this appears as
-   `routing request through legacy path (rollout_pct=0)`; otherwise verify via the
-   Fastly real-time stats that no EdgeZero traffic is flowing.
+3. Confirm the flag is live and all traffic is still on the legacy path.
+   `rollout_pct = "0"` deterministically short-circuits every request to the
+   legacy path (`should_route_to_edgezero` in the Fastly entry point), so all-legacy
+   is guaranteed by the config value rather than observed per request: confirm the
+   config-store values are applied and that error rate, p95 latency, and timeout
+   rate hold at baseline. There is no production per-branch route signal to tail
+   (see [Monitoring](#monitoring)); the `routing request through legacy path
+(rollout_pct=0)` line is emitted at `debug!` and is visible only in local
+   Viceroy runs.
 
 ### Stage 1 — 1%
 
@@ -122,18 +127,28 @@ Rollback is **immediate, no deploy required**.
 
 ## Monitoring
 
-Fastly real-time stats dashboard. Key signals at each canary stage:
+> **There is no production signal that splits traffic by EdgeZero-vs-legacy
+> branch yet.** The per-request route decision is emitted only at `log::debug!`
+> (`should_route_to_edgezero` in the Fastly entry point), and the Fastly logger is
+> pinned to `Info` (`logging::init_logger`, no runtime override), so these lines
+> never reach the production log endpoint — they are observable only in local
+> Viceroy runs. No `x-edgezero-path` response-path marker exists (deferred
+> follow-up), and no Fastly real-time-stats traffic split is configured for this
+> decision. Until a production-safe per-branch signal is added, canary
+> verification relies on aggregate service metrics moving as expected when
+> `rollout_pct` is stepped — not on per-request branch attribution.
+
+Fastly real-time stats dashboard — aggregate service signals (not split by
+branch). Watch each as `rollout_pct` is increased stage by stage; a regression
+that appears and tracks the rollout steps implicates the EdgeZero branch:
 
 - **Error rate:** `5xx / total_requests` by edge PoP
-- **Latency p95:** use log search for `routing request through EdgeZero path` to identify EdgeZero traffic (`x-edgezero-path` instrumentation header does not exist yet — follow-up task)
+- **Latency p95:** service-wide
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> **The routing log lines are emitted at `log::debug!`, while the Fastly logger
-> is capped at `Info` in production.** Verifying the canary via log tailing
-> therefore requires a debug-level logging deployment (or another equivalent
-> observability signal, such as the Fastly real-time stats traffic split). With
-> debug logging enabled, the log lines in Viceroy / Fastly log tailing are:
+> For local pre-production validation under Viceroy (where `debug!` is visible),
+> the route-decision log lines are:
 >
 > - `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — partial-stage canary traffic.
 > - `routing request through legacy path (bucket=N, rollout_pct=M)` — partial-stage legacy traffic.
