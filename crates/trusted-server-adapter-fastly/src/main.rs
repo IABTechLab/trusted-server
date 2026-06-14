@@ -730,15 +730,19 @@ async fn route_request(
 
         // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") | (Method::POST, "/_ts/admin/keys/rotate") => {
+        //
+        // Only the canonical `/_ts/admin/keys/*` paths are routed. The production
+        // basic-auth handler regex `^/_ts/admin` does not match the legacy
+        // `/admin/keys/*` aliases, so routing them here would expose the key
+        // handlers to unauthenticated callers. Unmatched, they fall through to the
+        // organic/publisher path like any other unknown route.
+        (Method::POST, "/_ts/admin/keys/rotate") => {
             (handle_rotate_key(settings, runtime_services, req), false)
         }
-        (Method::POST, "/admin/keys/deactivate") | (Method::POST, "/_ts/admin/keys/deactivate") => {
-            (
-                handle_deactivate_key(settings, runtime_services, req),
-                false,
-            )
-        }
+        (Method::POST, "/_ts/admin/keys/deactivate") => (
+            handle_deactivate_key(settings, runtime_services, req),
+            false,
+        ),
         (Method::GET, "/_ts/api/v1/identify") => {
             let outcome = require_identity_graph(settings)
                 .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context));

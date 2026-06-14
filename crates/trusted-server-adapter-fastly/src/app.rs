@@ -22,8 +22,6 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
-//! | POST | `/admin/keys/rotate` (legacy alias) | [`handle_rotate_key`] |
-//! | POST | `/admin/keys/deactivate` (legacy alias) | [`handle_deactivate_key`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
@@ -696,19 +694,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
     },
-    // Legacy aliases without the `/_ts` prefix, kept for parity with
-    // route_request in main.rs. Auth coverage comes from settings.handlers
-    // (enforced by AuthMiddleware), same as on the legacy path.
-    NamedRoute {
-        path: "/admin/keys/rotate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::RotateKey,
-    },
-    NamedRoute {
-        path: "/admin/keys/deactivate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::DeactivateKey,
-    },
+    // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
+    // registered: the production basic-auth handler regex `^/_ts/admin` does not
+    // match them, so registering them as admin routes would expose the key
+    // handlers to unauthenticated callers. Unrouted, they fall through to the
+    // organic/publisher path like any other unknown route.
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
         primary_methods: &[Method::POST],
@@ -836,7 +826,7 @@ impl Hooks for TrustedServerApp {
 mod tests {
     use super::{
         build_per_request_services, build_state_from_settings, startup_error_router, AppState,
-        TrustedServerApp,
+        TrustedServerApp, NAMED_ROUTES,
     };
 
     use std::collections::HashMap;
@@ -1151,24 +1141,34 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_admin_alias_routes_are_registered_and_auth_gated() {
-        // Parity guard for the legacy non-`/_ts` admin aliases: both alias
-        // paths must be registered (no router-level 405) and protected by the
-        // `^/admin` handler in the test settings, mirroring how legacy
-        // route_request applies enforce_basic_auth before its route match.
-        let router = test_router();
+    fn legacy_admin_aliases_are_not_registered_admin_routes() {
+        // Security guard for the legacy non-`/_ts` admin aliases. AuthMiddleware
+        // authorizes by matching the configured handler regex against the request
+        // path, and the production regex `^/_ts/admin` does not match
+        // `/admin/keys/*`. So the legacy aliases must not appear in the named-route
+        // table — registering them would let unauthenticated callers reach the key
+        // rotate/deactivate handlers. Only the canonical `/_ts/admin/keys/*` paths
+        // are registered admin routes; the legacy aliases fall through to the
+        // publisher fallback like any other unrouted path. (Canonical auth-gating
+        // is covered by `dispatch_auth_rejected_401_carries_finalize_headers`.)
+        let registered: Vec<&str> = NAMED_ROUTES.iter().map(|route| route.path).collect();
 
-        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-            let req = empty_request(Method::POST, path);
-
-            let response = block_on(router.oneshot(req));
-
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "POST {path} without credentials should be rejected by AuthMiddleware"
-            );
-        }
+        assert!(
+            registered.contains(&"/_ts/admin/keys/rotate"),
+            "canonical /_ts/admin/keys/rotate must be a registered admin route"
+        );
+        assert!(
+            registered.contains(&"/_ts/admin/keys/deactivate"),
+            "canonical /_ts/admin/keys/deactivate must be a registered admin route"
+        );
+        assert!(
+            !registered.contains(&"/admin/keys/rotate"),
+            "legacy /admin/keys/rotate must not be registered (would bypass `^/_ts/admin` auth)"
+        );
+        assert!(
+            !registered.contains(&"/admin/keys/deactivate"),
+            "legacy /admin/keys/deactivate must not be registered (would bypass `^/_ts/admin` auth)"
+        );
     }
 
     #[test]
@@ -1334,7 +1334,7 @@ mod tests {
         let router = TrustedServerApp::routes_for_state(&state);
 
         let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/admin/keys/rotate")));
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/admin/keys/rotate")));
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
