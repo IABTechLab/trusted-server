@@ -210,10 +210,13 @@ struct StubPendingResponse {
 /// exercising the code under test, then inspect
 /// [`recorded_backend_names`](Self::recorded_backend_names) to assert call
 /// sites.
+/// A canned response: `(status_code, body_bytes, response_headers)`.
+/// Kept `Send` by avoiding `Body::Stream`.
+type StubResponse = (u16, Vec<u8>, Vec<(String, String)>);
+
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
-    // (status_code, body_bytes) — kept Send by avoiding Body::Stream
-    responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    responses: Mutex<VecDeque<StubResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
     // Queued select() errors — each pop makes the next select() return ready: Err.
@@ -235,7 +238,24 @@ impl StubHttpClient {
         self.responses
             .lock()
             .expect("should lock responses")
-            .push_back((status, body));
+            .push_back((status, body, Vec::new()));
+    }
+
+    /// Queue a canned response with response headers (e.g. `Content-Type`).
+    pub fn push_response_with_headers(
+        &self,
+        status: u16,
+        body: Vec<u8>,
+        headers: Vec<(&str, &str)>,
+    ) {
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        self.responses
+            .lock()
+            .expect("should lock responses")
+            .push_back((status, body, headers));
     }
 
     /// Inject a `select()` error: the next call to `select()` will return
@@ -290,15 +310,18 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock request_headers")
             .push(headers);
 
-        let (status, body_bytes) = self
+        let (status, body_bytes, response_headers) = self
             .responses
             .lock()
             .expect("should lock responses")
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
 
-        let edge_response = edgezero_core::http::response_builder()
-            .status(status)
+        let mut builder = edgezero_core::http::response_builder().status(status);
+        for (name, value) in &response_headers {
+            builder = builder.header(name, value);
+        }
+        let edge_response = builder
             .body(edgezero_core::body::Body::from(body_bytes))
             .change_context(PlatformError::HttpClient)?;
 
@@ -331,7 +354,7 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock request_headers")
             .push(headers);
 
-        let (status, body_bytes) = self
+        let (status, body_bytes, _response_headers) = self
             .responses
             .lock()
             .expect("should lock responses")

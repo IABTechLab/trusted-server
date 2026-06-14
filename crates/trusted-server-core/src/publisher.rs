@@ -435,6 +435,51 @@ pub fn stream_publisher_body<W: Write>(
     process_response_streaming(body, output, &borrowed)
 }
 
+/// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
+/// byte limit would be exceeded.
+///
+/// Used to bound in-WASM-heap buffering of decoded/re-written publisher bodies.
+/// A highly-compressible origin response can sit under the platform raw-body cap
+/// yet expand past a safe heap size after decode and post-processing; this writer
+/// turns that into a recoverable error instead of an out-of-memory abort.
+pub struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    /// Creates a writer that accepts at most `limit` bytes before erroring.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Consumes the writer and returns the buffered bytes.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Proxies requests to the publisher's origin server.
 ///
 /// Returns a [`PublisherResponse`] indicating how the response should be sent:
@@ -651,8 +696,9 @@ pub async fn handle_publisher_request(
                 content_type: &content_type,
                 integration_registry,
             };
-            let mut output = Vec::new();
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
             process_response_streaming(body, &mut output, &params)?;
+            let output = output.into_inner();
 
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
@@ -1590,6 +1636,61 @@ mod tests {
         assert!(
             !as_str.contains("origin.example.com"),
             "origin host must not leak. Got: {as_str}"
+        );
+    }
+
+    /// `BufferedProcessed` must enforce `publisher.max_buffered_body_bytes` so a
+    /// post-processed HTML body whose decoded output exceeds the cap fails instead
+    /// of allocating past the limit. Regression for the `EdgeZero` buffering gap
+    /// where only the streaming-conversion path applied the cap.
+    #[tokio::test]
+    async fn buffered_processed_enforces_max_buffered_body_bytes() {
+        let mut settings = create_test_settings();
+        // Register an HTML post-processor so the response routes to BufferedProcessed.
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &serde_json::json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        // Tiny cap so a modest HTML document exceeds it after processing.
+        settings.publisher.max_buffered_body_bytes = 64;
+
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        assert!(
+            registry.has_html_post_processors(),
+            "nextjs integration must register an HTML post-processor"
+        );
+
+        // Identity-encoded HTML well above the 64-byte cap once buffered.
+        let filler = "<p>padding</p>".repeat(64);
+        let html = format!("<html><body>{filler}</body></html>");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            html.into_bytes(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let result = handle_publisher_request(&settings, &registry, &services, req).await;
+
+        assert!(
+            result.is_err(),
+            "buffered-processed body exceeding max_buffered_body_bytes must error, not allocate past the cap"
         );
     }
 

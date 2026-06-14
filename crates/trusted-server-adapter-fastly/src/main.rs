@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
@@ -41,7 +39,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, BoundedWriter,
     OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
@@ -864,40 +862,6 @@ fn run_pull_sync_after_send(
 
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context);
-}
-
-struct BoundedWriter {
-    inner: Vec<u8>,
-    limit: usize,
-}
-
-impl BoundedWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            inner: Vec::new(),
-            limit,
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.inner
-    }
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.inner.len() + buf.len() > self.limit {
-            return Err(std::io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
-        }
-        self.inner.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 pub(crate) fn resolve_publisher_response_buffered(
