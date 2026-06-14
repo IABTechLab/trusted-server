@@ -264,21 +264,61 @@ async fn discovery_route_body_is_json_parity() {
     let (spin_status, _, spin_body_bytes) =
         spin_get_body("/.well-known/trusted-server.json").await;
 
-    // This endpoint serves a static config document, so the parsed JSON bodies
-    // must be identical across adapters (not merely both parsable as JSON).
+    // This endpoint serves a static config document, so the bodies must be
+    // identical across adapters — not merely both parsable (or both unparsable)
+    // as JSON. Parse first so JSON key ordering / whitespace differences do not
+    // cause false failures, but never treat `None == None` as body parity.
     let axum_json: Option<Value> = serde_json::from_slice(&axum_body_bytes).ok();
     let cf_json: Option<Value> = serde_json::from_slice(&cf_body_bytes).ok();
     let spin_json: Option<Value> = serde_json::from_slice(&spin_body_bytes).ok();
+
+    // All adapters must agree on whether the body is JSON. A regression where
+    // one returns the discovery JSON and another returns a non-JSON error body
+    // is a definitive parity break.
     assert_eq!(
-        axum_json, cf_json,
-        "/.well-known/trusted-server.json body must match across adapters \
-         (axum_status={axum_status} cf_status={cf_status})"
+        axum_json.is_some(),
+        cf_json.is_some(),
+        "/.well-known/trusted-server.json body type (JSON vs non-JSON) must match \
+         across adapters (axum_status={axum_status} cf_status={cf_status})"
     );
     assert_eq!(
-        cf_json, spin_json,
-        "/.well-known/trusted-server.json body must match across adapters \
-         (cf_status={cf_status} spin_status={spin_status})"
+        cf_json.is_some(),
+        spin_json.is_some(),
+        "/.well-known/trusted-server.json body type (JSON vs non-JSON) must match \
+         across adapters (cf_status={cf_status} spin_status={spin_status})"
     );
+
+    match (axum_json, cf_json, spin_json) {
+        // All adapters serve JSON: compare parsed values so serialization
+        // differences (key ordering, whitespace) do not cause false failures.
+        (Some(axum_value), Some(cf_value), Some(spin_value)) => {
+            assert_eq!(
+                axum_value, cf_value,
+                "/.well-known/trusted-server.json JSON body must match across adapters \
+                 (axum_status={axum_status} cf_status={cf_status})"
+            );
+            assert_eq!(
+                cf_value, spin_value,
+                "/.well-known/trusted-server.json JSON body must match across adapters \
+                 (cf_status={cf_status} spin_status={spin_status})"
+            );
+        }
+        // Without seeded signing/JWKS data the adapters take the same error path
+        // and return a non-JSON error body. Compare raw bytes so diverging error
+        // payloads are caught instead of all parsing to `None`.
+        _ => {
+            assert_eq!(
+                axum_body_bytes, cf_body_bytes,
+                "/.well-known/trusted-server.json non-JSON body must match across adapters \
+                 (axum_status={axum_status} cf_status={cf_status})"
+            );
+            assert_eq!(
+                cf_body_bytes, spin_body_bytes,
+                "/.well-known/trusted-server.json non-JSON body must match across adapters \
+                 (cf_status={cf_status} spin_status={spin_status})"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -598,4 +638,39 @@ async fn unknown_route_returns_same_status_parity() {
         cf_status, spin_status,
         "unknown routes must return same status: cf={cf_status} spin={spin_status}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
+    // The production handler regex `^/_ts/admin` only matches the canonical
+    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases must not be
+    // registered as admin routes on Cloudflare. If they were, AuthMiddleware would
+    // not match them and unauthenticated callers would reach the real key
+    // handlers. With the aliases removed, each behaves like any other unrouted
+    // path: it falls through to the publisher fallback rather than the auth-gated
+    // admin route.
+    for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
+        assert_eq!(
+            canonical_status, 401,
+            "canonical /_ts{alias} must challenge unauthenticated callers"
+        );
+
+        let (alias_status, alias_headers) = cf_post_headers(alias, "{}").await;
+        assert_ne!(
+            alias_status, 401,
+            "legacy {alias} must not be an auth-gated admin route"
+        );
+        assert!(
+            !alias_headers.contains_key("www-authenticate"),
+            "legacy {alias} must not issue an admin auth challenge"
+        );
+
+        let (unknown_status, _) = cf_post_headers("/this-route-does-not-exist-abc123", "{}").await;
+        assert_eq!(
+            alias_status, unknown_status,
+            "legacy {alias} must fall through to the publisher fallback like an unknown path: \
+             alias={alias_status} unknown={unknown_status}"
+        );
+    }
 }
