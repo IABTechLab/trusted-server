@@ -432,6 +432,42 @@ async fn admin_deactivate_unauthenticated_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spin_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
+    // The production handler regex `^/_ts/admin` only matches the canonical
+    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases must not be
+    // registered as admin routes on Spin. If they were, AuthMiddleware would not
+    // match them and unauthenticated callers would reach the key handlers. With
+    // the aliases removed, each behaves like any other unrouted path: it falls
+    // through to the publisher fallback rather than the auth-gated admin route.
+    for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        let (canonical_status, _) =
+            spin_post_headers(&format!("/_ts{alias}"), "{}").await;
+        assert_eq!(
+            canonical_status, 401,
+            "canonical /_ts{alias} must challenge unauthenticated callers"
+        );
+
+        let (alias_status, alias_headers) = spin_post_headers(alias, "{}").await;
+        assert_ne!(
+            alias_status, 401,
+            "legacy {alias} must not be an auth-gated admin route"
+        );
+        assert!(
+            !alias_headers.contains_key("www-authenticate"),
+            "legacy {alias} must not issue an admin auth challenge"
+        );
+
+        let (unknown_status, _) =
+            spin_post_headers("/this-route-does-not-exist-abc123", "{}").await;
+        assert_eq!(
+            alias_status, unknown_status,
+            "legacy {alias} must fall through to the publisher fallback like an unknown path: \
+             alias={alias_status} unknown={unknown_status}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn geo_header_parity_on_all_responses() {
     let routes_to_check: &[(&str, &str, &str)] = &[
         ("GET", "/.well-known/trusted-server.json", ""),

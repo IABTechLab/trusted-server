@@ -109,14 +109,12 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 9] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
-        ("/admin/keys/rotate", &[Method::POST]),
-        ("/admin/keys/deactivate", &[Method::POST]),
         ("/auction", &[Method::POST]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
@@ -162,9 +160,19 @@ fn scheme_host_from_spin_url(url: &str) -> Option<(String, String)> {
 fn normalize_spin_request(req: &mut Request) {
     sanitize_forwarded_headers(req);
 
-    let Some((scheme, host)) = req
-        .headers()
-        .get("spin-full-url")
+    // Spin's WASI HTTP bridge copies synthetic `spin-client-addr` and
+    // `spin-full-url` headers onto the core request. They are runtime metadata,
+    // not client- or application-supplied headers, and their parsed values are
+    // already available via `SpinRequestContext` (consumed in `build_runtime_services`
+    // before this runs). Remove them here so the shared publisher/integration
+    // handlers neither forward them to publisher origins nor mistake them for
+    // client-controlled input. `spin-full-url` is consumed below to derive the
+    // trusted scheme/host; `spin-client-addr` carries no further use on the request.
+    req.headers_mut().remove("spin-client-addr");
+
+    let full_url = req.headers_mut().remove("spin-full-url");
+    let Some((scheme, host)) = full_url
+        .as_ref()
         .and_then(|v| v.to_str().ok())
         .and_then(scheme_host_from_spin_url)
     else {
@@ -352,7 +360,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /admin/keys/rotate
+        // /_ts/admin/keys/rotate
         let s = Arc::clone(&state);
         let rotate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -364,7 +372,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /admin/keys/deactivate
+        // /_ts/admin/keys/deactivate
         let s = Arc::clone(&state);
         let deactivate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -524,11 +532,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
-            .post("/_ts/admin/keys/rotate", rotate_handler.clone())
-            .post("/_ts/admin/keys/deactivate", deactivate_handler.clone())
-            // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
-            .post("/admin/keys/rotate", rotate_handler)
-            .post("/admin/keys/deactivate", deactivate_handler)
+            //
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
+            // registered: the production handler regex `^/_ts/admin` does not match
+            // them, so registering them as admin routes would expose the key
+            // handlers to unauthenticated callers. Unrouted, they fall through to
+            // the publisher fallback like any other unknown path.
+            .post("/_ts/admin/keys/rotate", rotate_handler)
+            .post("/_ts/admin/keys/deactivate", deactivate_handler)
             .post("/auction", auction_handler)
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
@@ -614,6 +625,7 @@ mod tests {
         // http scheme and an attacker-controlled host via forwarded headers.
         let mut req = request_with(&[
             ("spin-full-url", "https://www.publisher.example/cars/"),
+            ("spin-client-addr", "203.0.113.7:5000"),
             ("x-forwarded-proto", "http"),
             ("x-forwarded-host", "evil.example"),
             ("forwarded", "host=evil.example;proto=http"),
@@ -629,6 +641,16 @@ mod tests {
         assert!(
             req.headers().get("forwarded").is_none(),
             "should strip spoofable forwarded header"
+        );
+        // Spin runtime synthetic headers must not survive onto the request that
+        // is forwarded to publisher origins or shared integration handlers.
+        assert!(
+            req.headers().get("spin-full-url").is_none(),
+            "should strip the consumed spin-full-url synthetic header"
+        );
+        assert!(
+            req.headers().get("spin-client-addr").is_none(),
+            "should strip the spin-client-addr synthetic header"
         );
         assert_eq!(
             req.headers()
