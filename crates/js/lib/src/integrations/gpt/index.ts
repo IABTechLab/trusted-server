@@ -80,15 +80,15 @@ function candidateSlotRoots(divId: string): HTMLElement[] {
   return roots;
 }
 
-function messageSourceBelongsToConfiguredSlot(source: MessageEventSource | null): boolean {
-  if (!source) return false;
+function slotIdForMessageSource(source: MessageEventSource | null): string | undefined {
+  if (!source) return undefined;
 
   const slots = window.tsjs?.adSlots ?? [];
-  return slots.some((slot) =>
+  return slots.find((slot) =>
     candidateSlotRoots(slot.div_id).some((root) =>
       Array.from(root.querySelectorAll('iframe')).some((iframe) => iframe.contentWindow === source)
     )
-  );
+  )?.id;
 }
 
 function clearTargetingKeys(slot: GoogleTagSlot, keys: Iterable<string>): void {
@@ -672,7 +672,8 @@ export function installTsRenderBridge(): void {
 
     const port = e.ports?.[0];
     if (!port) return;
-    if (!messageSourceBelongsToConfiguredSlot(e.source)) return;
+    const sourceSlotId = slotIdForMessageSource(e.source);
+    if (!sourceSlotId) return;
 
     // Build reverse map adId → slotId from live window.tsjs.bids.
     const bids = window.tsjs?.bids ?? {};
@@ -688,6 +689,11 @@ export function installTsRenderBridge(): void {
 
     // Not a TS bid — let Prebid.js handle it.
     if (!slotId || !matchedBid) return;
+
+    // The requesting iframe's slot must own the resolved adId. Without this an
+    // iframe under slot A could request slot B's hb_adid and receive slot B's
+    // creative/dimensions while firing slot B's win/billing beacons.
+    if (slotId !== sourceSlotId) return;
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
     const [width, height] = slot?.formats?.[0] ?? [728, 90];

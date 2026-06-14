@@ -342,6 +342,36 @@ function firstTargetingValue(values: string[] | undefined): string | undefined {
   return values?.find((value) => value.length > 0);
 }
 
+/**
+ * Collect the configured client-side bidder entries for a refreshing slot.
+ *
+ * Synthetic refresh ad units carry only the `trustedServer` bid. The
+ * `requestBids` shim preserves a client-side bidder only when its bid entry is
+ * already present on the ad unit, so without re-attaching them here publishers
+ * that split demand between server-side and native Prebid adapters would lose
+ * all client-side demand on refresh/scroll impressions. Bids are sourced from
+ * the matching `pbjs.adUnits` entry (by ad unit code) so the publisher's
+ * configured params are preserved.
+ */
+function clientSideBidsForRefresh(
+  code: string
+): Array<{ bidder: string; params: Record<string, unknown> }> {
+  const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
+  if (clientSideBidders.size === 0) return [];
+
+  const adUnits = (pbjs.adUnits ?? []) as TrustedServerAdUnit[];
+  const match = adUnits.find((unit) => unit.code === code);
+  if (!match?.bids) return [];
+
+  const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
+  for (const bid of match.bids) {
+    if (bid?.bidder && clientSideBidders.has(bid.bidder)) {
+      bids.push({ bidder: bid.bidder, params: bid.params ?? {} });
+    }
+  }
+  return bids;
+}
+
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
   if (typeof slot.clearTargeting !== 'function') return;
 
@@ -663,10 +693,14 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           ...(zone ? { name: zone } : {}),
         };
 
+        const code = refreshSlotElementId(slot) ?? 'refresh-slot';
         return {
-          code: refreshSlotElementId(slot) ?? 'refresh-slot',
+          code,
           mediaTypes: { banner },
-          bids: [{ bidder: ADAPTER_CODE, params: zone ? { [ZONE_KEY]: zone } : {} }],
+          bids: [
+            { bidder: ADAPTER_CODE, params: zone ? { [ZONE_KEY]: zone } : {} },
+            ...clientSideBidsForRefresh(code),
+          ],
         };
       });
 

@@ -95,7 +95,17 @@
         ts.servicesEnabled = true;
       }
       if (slotsToRefresh.length > 0) {
-        googletag.pubads().refresh(slotsToRefresh);
+        // One-shot bypass: this internal refresh delivers the just-applied
+        // server-side targeting to GAM. If slim-Prebid has already wrapped
+        // refresh(), it must pass this call straight through — not clear the
+        // targeting and run a duplicate client-side auction. Mirrors the
+        // bundle's adInit() in crates/js/lib/src/integrations/gpt/index.ts.
+        ts.adInitRefreshInProgress = true;
+        try {
+          googletag.pubads().refresh(slotsToRefresh);
+        } finally {
+          ts.adInitRefreshInProgress = false;
+        }
       }
     });
   };

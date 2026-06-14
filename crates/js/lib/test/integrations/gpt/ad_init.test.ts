@@ -932,6 +932,51 @@ describe('installTsRenderBridge', () => {
     foreignIframe.remove();
   });
 
+  it('ignores a request whose source slot does not own the resolved adId', async () => {
+    // Two configured slots; slot A's iframe requests slot B's hb_adid. The
+    // bridge must not return slot B's creative or fire slot B's beacons.
+    (window as TestWindow).tsjs.bids.homepage_footer = {
+      hb_adid: 'footer-uuid',
+      hb_bidder: 'kargo',
+      hb_pb: '2.00',
+      hb_cache_host: 'openads.example.com',
+      hb_cache_path: '/cache',
+      nurl: 'https://ssp.example/footer-win',
+      burl: 'https://ssp.example/footer-bill',
+    };
+    (window as TestWindow).tsjs.adSlots.push({
+      id: 'homepage_footer',
+      formats: [[300, 250]] as [number, number][],
+      gam_unit_path: '/a/b/footer',
+      div_id: 'div-footer',
+      targeting: {},
+    });
+
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    await import('../../../src/integrations/gpt/index');
+    fetchStub.mockResolvedValue({ ok: true, text: () => Promise.resolve('') } as Response);
+
+    // Source iframe lives under slot A (div-header).
+    const source = createTrustedSlotIframe();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        // adId belongs to slot B (homepage_footer), not slot A's iframe.
+        data: JSON.stringify({ message: 'Prebid Request', adId: 'footer-uuid' }),
+        ports: [fakePort as MessagePort],
+        source,
+      })
+    );
+
+    await new Promise<void>((r) => setTimeout(r, 50));
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(portMessages).toHaveLength(0);
+    expect(beaconSpy).not.toHaveBeenCalled();
+    document.getElementById('div-footer')?.remove();
+  });
+
   it('ignores non-Prebid messages', async () => {
     await import('../../../src/integrations/gpt/index');
     window.dispatchEvent(

@@ -864,6 +864,64 @@ describe('prebid/installRefreshHandler', () => {
     );
   });
 
+  it('includes configured client-side bidders in refresh ad units', () => {
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    // Original publisher ad unit carries a client-side rubicon bid.
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-homepage-header',
+        bids: [
+          { bidder: 'trustedServer', params: {} },
+          { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+        ],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-homepage-header',
+            bids: [
+              { bidder: 'trustedServer', params: { zone: 'homepage' } },
+              { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+            ],
+          }),
+        ],
+      })
+    );
+
+    delete (window as any).__tsjs_prebid;
+    mockPbjs.adUnits = [];
+  });
+
   it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
     const originalRefresh = vi.fn();
     const clearTargeting = vi.fn();
