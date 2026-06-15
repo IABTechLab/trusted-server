@@ -590,7 +590,6 @@ async fn route_request(
             false,
         ),
         (m, path) if integration_registry.has_route(&m, path) => {
-            let fastly_req = compat::to_fastly_request(req);
             let result = integration_registry
                 .handle_proxy(ProxyDispatchInput {
                     method: &m,
@@ -599,15 +598,14 @@ async fn route_request(
                     kv: kv_graph.as_ref(),
                     ec_context: &mut ec_context,
                     services: runtime_services,
-                    req: fastly_req,
+                    req,
                 })
                 .await
                 .unwrap_or_else(|| {
                     Err(Report::new(TrustedServerError::BadRequest {
                         message: format!("Unknown integration route: {path}"),
                     }))
-                })
-                .map(compat::from_fastly_response);
+                });
             (result, true)
         }
 

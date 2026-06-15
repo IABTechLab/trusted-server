@@ -5,8 +5,6 @@ use error_stack::{Report, ResultExt};
 use http::{header, Request, Response, StatusCode};
 use serde_json::Value as JsonValue;
 
-use crate::compat;
-
 use crate::auction::formats::AdRequest;
 use crate::consent::gate_eids_by_consent;
 use crate::constants::COOKIE_TS_EIDS;
@@ -157,13 +155,10 @@ pub async fn handle_auction(
         log::warn!("Auction EIDs stripped by TCF consent gating");
     }
 
-    // Provider context only needs request metadata.
-    let fastly_req = compat::to_fastly_request_ref(&http_req);
-
     // Create auction context
     let context = AuctionContext {
         settings,
-        request: &fastly_req,
+        request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,

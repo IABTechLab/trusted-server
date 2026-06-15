@@ -48,4 +48,8 @@ pub mod tests {
         let toml_str = crate_test_settings_str();
         Settings::from_toml(&toml_str).expect("Invalid config")
     }
+
+    /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.
+    pub const VALID_SYNTHETIC_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 }

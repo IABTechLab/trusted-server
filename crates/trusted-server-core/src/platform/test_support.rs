@@ -216,6 +216,8 @@ pub(crate) struct StubHttpClient {
     responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
+    // Queued select() errors — each pop makes the next select() return ready: Err.
+    select_errors: Mutex<VecDeque<()>>,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
@@ -234,6 +236,7 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            select_errors: Mutex::new(VecDeque::new()),
             image_optimizer_options: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
@@ -265,6 +268,16 @@ impl StubHttpClient {
                 body,
                 headers,
             });
+    }
+
+    /// Inject a `select()` error: the next call to `select()` will return
+    /// `ready: Err(...)` with the failed request's backend name in
+    /// `failed_backend_name`. The corresponding queued response is consumed.
+    pub fn push_select_error(&self) {
+        self.select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .push_back(());
     }
 
     /// Return backend names recorded across all `send` calls, in order.
@@ -451,16 +464,47 @@ impl PlatformHttpClient for StubHttpClient {
                     .attach("unexpected inner type in StubHttpClient::select")
             })?;
 
+        let ready_backend_name = stub.backend_name.clone();
+
+        // Strip backend names from remaining to match Fastly production behavior:
+        // Fastly's select() rebuilds remaining with PlatformPendingRequest::new()
+        // (no backend_name) — orchestrators must not rely on names being set.
+        let remaining: Vec<PlatformPendingRequest> = pending_requests
+            .into_iter()
+            .map(|r| match r.downcast::<StubPendingResponse>() {
+                Ok(inner) => PlatformPendingRequest::new(inner),
+                Err(r) => r,
+            })
+            .collect();
+
+        let should_error = self
+            .select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .pop_front()
+            .is_some();
+
+        if should_error {
+            return Ok(PlatformSelectResult {
+                ready: Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "injected select error for backend '{ready_backend_name}'"
+                ))),
+                remaining,
+                failed_backend_name: Some(ready_backend_name),
+            });
+        }
+
         let edge_response = edgezero_core::http::response_builder()
             .status(stub.status)
             .body(edgezero_core::body::Body::from(stub.body))
             .change_context(PlatformError::HttpClient)?;
 
-        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(stub.backend_name));
+        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
         Ok(PlatformSelectResult {
             ready,
-            remaining: pending_requests,
+            remaining,
+            failed_backend_name: None,
         })
     }
 }
@@ -694,8 +738,8 @@ mod tests {
         );
         assert_eq!(
             result.remaining[0].backend_name(),
-            Some("backend-b"),
-            "should preserve backend name on remaining request"
+            None,
+            "should strip backend name from remaining (matches Fastly production behavior)"
         );
 
         let names = stub.recorded_backend_names();

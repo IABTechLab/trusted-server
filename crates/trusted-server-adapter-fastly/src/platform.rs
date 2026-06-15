@@ -491,7 +491,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             .map(PlatformPendingRequest::new)
             .collect();
 
-        let ready = match result {
+        let (ready, failed_backend_name) = match result {
             Ok(fastly_resp) => {
                 let backend_name = fastly_resp
                     .get_backend_name()
@@ -500,15 +500,27 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                         ""
                     })
                     .to_string();
-                fastly_response_to_platform(fastly_resp, backend_name, false)
+                (
+                    fastly_response_to_platform(fastly_resp, backend_name, false),
+                    None,
+                )
             }
             Err(e) => {
-                Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("fastly select error: {e}")))
+                let failed_name = e.backend_name().to_string();
+                (
+                    Err(Report::new(PlatformError::HttpClient).attach(format!(
+                        "fastly select error for backend '{failed_name}': {e}"
+                    ))),
+                    Some(failed_name),
+                )
             }
         };
 
-        Ok(PlatformSelectResult { ready, remaining })
+        Ok(PlatformSelectResult {
+            ready,
+            remaining,
+            failed_backend_name,
+        })
     }
 }
 

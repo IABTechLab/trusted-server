@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method};
-use fastly::{Request, Response};
+use http::header::{self, HeaderMap, HeaderValue};
+use http::Method;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use validator::{Validate, ValidationError};
 
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    collect_body_bounded, ensure_integration_backend, IntegrationEndpoint, IntegrationHeadInjector,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
@@ -152,33 +152,42 @@ impl DidomiIntegration {
     fn copy_headers(
         &self,
         backend: &DidomiBackend,
-        original_req: &Request,
-        proxy_req: &mut Request,
+        client_ip: Option<std::net::IpAddr>,
+        original_headers: &HeaderMap<HeaderValue>,
+        proxy_headers: &mut HeaderMap<HeaderValue>,
     ) {
-        if let Some(client_ip) = original_req.get_client_ip_addr() {
-            proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
+        if let Some(ip) = client_ip {
+            proxy_headers.insert(
+                "X-Forwarded-For",
+                HeaderValue::from_str(&ip.to_string())
+                    .expect("should format X-Forwarded-For header"),
+            );
         }
 
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
+            header::CONTENT_TYPE,
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
             header::AUTHORIZATION,
         ] {
-            if let Some(value) = original_req.get_header(&header_name) {
-                proxy_req.set_header(&header_name, value);
+            if let Some(value) = original_headers.get(&header_name) {
+                proxy_headers.insert(header_name, value.clone());
             }
         }
 
         if matches!(backend, DidomiBackend::Sdk) {
-            Self::copy_geo_headers(original_req, proxy_req);
+            Self::copy_geo_headers(original_headers, proxy_headers);
         }
     }
 
-    fn copy_geo_headers(original_req: &Request, proxy_req: &mut Request) {
+    fn copy_geo_headers(
+        original_headers: &HeaderMap<HeaderValue>,
+        proxy_headers: &mut HeaderMap<HeaderValue>,
+    ) {
         let geo_headers = [
             ("X-Geo-Country", "FastlyGeo-CountryCode"),
             ("X-Geo-Region", "FastlyGeo-Region"),
@@ -186,22 +195,32 @@ impl DidomiIntegration {
         ];
 
         for (target, source) in geo_headers {
-            if let Some(value) = original_req.get_header(source) {
-                proxy_req.set_header(target, value);
+            if let Some(value) = original_headers.get(source) {
+                proxy_headers.insert(target, value.clone());
             }
         }
     }
 
-    fn add_cors_headers(response: &mut Response) {
-        response.set_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
-        response.set_header(
+    fn add_cors_headers(response: &mut http::Response<EdgeBody>) {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response.headers_mut().insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            "Content-Type, Authorization, X-Requested-With",
+            HeaderValue::from_static("Content-Type, Authorization, X-Requested-With"),
         );
-        response.set_header(
+        response.headers_mut().insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
-            "GET, POST, PUT, DELETE, OPTIONS",
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
         );
+    }
+
+    fn backend_name_for_origin(
+        services: &RuntimeServices,
+        origin: &str,
+    ) -> Result<String, Report<TrustedServerError>> {
+        ensure_integration_backend(services, origin, DIDOMI_INTEGRATION_ID, None)
     }
 }
 
@@ -255,12 +274,13 @@ impl IntegrationProxy for DidomiIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
-        _services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let (parts, body) = req.into_parts();
+        let path = parts.uri.path().to_string();
         let prefix = self.resolved_prefix();
-        let consent_path = path.strip_prefix(&prefix).unwrap_or(path);
+        let consent_path = path.strip_prefix(&prefix).unwrap_or(&path);
         let backend = self.backend_for_path(consent_path);
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
@@ -268,30 +288,43 @@ impl IntegrationProxy for DidomiIntegration {
         };
 
         let target_url = self
-            .build_target_url(base_origin, consent_path, req.get_query_str())
+            .build_target_url(base_origin, consent_path, parts.uri.query())
             .change_context(Self::error("Failed to build Didomi target URL"))?;
-        let backend_name = BackendConfig::from_url(base_origin, true)
+        let backend_name = Self::backend_name_for_origin(services, base_origin)
             .change_context(Self::error("Failed to configure Didomi backend"))?;
 
-        let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        self.copy_headers(&backend, &req, &mut proxy_req);
+        let request_body = if parts.method == Method::POST {
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, DIDOMI_INTEGRATION_ID)
+                    .await?;
+            EdgeBody::from(bytes)
+        } else {
+            EdgeBody::empty()
+        };
 
-        if matches!(req.get_method(), &Method::POST | &Method::PUT) {
-            if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
-                proxy_req.set_header(header::CONTENT_TYPE, content_type);
-            }
-            proxy_req.set_body(req.into_body());
-        }
+        let mut proxy_req = http::Request::builder()
+            .method(parts.method.clone())
+            .uri(&target_url)
+            .body(request_body)
+            .change_context(Self::error("Failed to build Didomi proxy request"))?;
+        self.copy_headers(
+            &backend,
+            services.client_info().client_ip,
+            &parts.headers,
+            proxy_req.headers_mut(),
+        );
 
-        let mut response = proxy_req
-            .send(&backend_name)
+        let mut response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(proxy_req, backend_name))
+            .await
             .change_context(Self::error("Didomi upstream request failed"))?;
 
         if matches!(backend, DidomiBackend::Sdk) {
-            Self::add_cors_headers(&mut response);
+            Self::add_cors_headers(&mut response.response);
         }
 
-        Ok(response)
+        Ok(response.response)
     }
 }
 
@@ -327,10 +360,14 @@ impl IntegrationHeadInjector for DidomiIntegration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::Method;
+    use http::Method;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
@@ -375,6 +412,39 @@ mod tests {
         assert!(registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
         assert!(registry.has_route(&Method::POST, "/integrations/didomi/consent/api/events"));
         assert!(!registry.has_route(&Method::GET, "/other"));
+    }
+
+    #[test]
+    fn copy_headers_sets_x_forwarded_for_from_client_ip() {
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Sdk;
+        let original_req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/test")
+            .body(EdgeBody::empty())
+            .expect("should build original request");
+        let mut proxy_req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://sdk.privacy-center.org/test")
+            .body(EdgeBody::empty())
+            .expect("should build proxy request");
+        let client_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+
+        integration.copy_headers(
+            &backend,
+            client_ip,
+            original_req.headers(),
+            proxy_req.headers_mut(),
+        );
+
+        assert_eq!(
+            proxy_req
+                .headers()
+                .get("X-Forwarded-For")
+                .and_then(|v| v.to_str().ok()),
+            Some("1.2.3.4"),
+            "should set X-Forwarded-For from client_ip"
+        );
     }
 
     #[test]
@@ -460,6 +530,64 @@ mod tests {
         assert_eq!(
             inserts[0],
             r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#
+        );
+    }
+
+    #[test]
+    fn copy_headers_omits_x_forwarded_for_when_no_client_ip() {
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Sdk;
+        let original_req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/test")
+            .body(EdgeBody::empty())
+            .expect("should build original request");
+        let mut proxy_req = http::Request::builder()
+            .method(Method::GET)
+            .uri("https://sdk.privacy-center.org/test")
+            .body(EdgeBody::empty())
+            .expect("should build proxy request");
+
+        integration.copy_headers(
+            &backend,
+            None,
+            original_req.headers(),
+            proxy_req.headers_mut(),
+        );
+
+        assert!(
+            proxy_req.headers().get("X-Forwarded-For").is_none(),
+            "should omit X-Forwarded-For when client_ip is None"
+        );
+    }
+
+    #[test]
+    fn didomi_proxy_uses_platform_http_client() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/integrations/didomi/consent/api/events")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed response"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should route outbound request through PlatformHttpClient"
         );
     }
 

@@ -7,7 +7,6 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::request::PendingRequest;
 use fastly::http::{header, Method, StatusCode};
 use fastly::Request;
 use serde_json::json;
@@ -313,24 +312,25 @@ impl PlatformGeo for NoopGeo {
 
 struct DisabledRouteProvider;
 
+#[async_trait::async_trait(?Send)]
 impl AuctionProvider for DisabledRouteProvider {
     fn provider_name(&self) -> &'static str {
         "disabled-route"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         _request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         Err(Report::new(TrustedServerError::Auction {
             message: "disabled route provider should not launch requests".to_string(),
         }))
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
-        _response: fastly::Response,
+        _response: PlatformResponse,
         _response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         Err(Report::new(TrustedServerError::Auction {
