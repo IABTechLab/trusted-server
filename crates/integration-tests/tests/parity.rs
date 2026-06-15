@@ -448,6 +448,37 @@ async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
     // handlers. With the aliases removed, each behaves like any other unrouted
     // path: it falls through to the publisher fallback rather than the auth-gated
     // admin route.
+    //
+    // Primary guard: assert the route table directly, analogous to the Fastly
+    // `NAMED_ROUTES` guard. A behavioral check alone can false-pass, because a
+    // reintroduced key handler could fail with the same fallback status and carry
+    // no `WWW-Authenticate` header in this no-store/no-origin environment.
+    let registered: Vec<(String, String)> = cf_router()
+        .routes()
+        .iter()
+        .map(|route| (route.method().to_string(), route.path().to_string()))
+        .collect();
+    let is_registered =
+        |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
+
+    assert!(
+        is_registered("POST", "/_ts/admin/keys/rotate"),
+        "canonical POST /_ts/admin/keys/rotate must be a registered admin route"
+    );
+    assert!(
+        is_registered("POST", "/_ts/admin/keys/deactivate"),
+        "canonical POST /_ts/admin/keys/deactivate must be a registered admin route"
+    );
+    assert!(
+        !is_registered("POST", "/admin/keys/rotate"),
+        "legacy POST /admin/keys/rotate must not be registered (would bypass `^/_ts/admin` auth)"
+    );
+    assert!(
+        !is_registered("POST", "/admin/keys/deactivate"),
+        "legacy POST /admin/keys/deactivate must not be registered (would bypass `^/_ts/admin` auth)"
+    );
+
+    // Secondary guard: confirm the runtime behavior matches an unrouted path.
     for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
         assert_eq!(
