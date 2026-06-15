@@ -33,6 +33,10 @@ struct HtmlWithPostProcessing {
     /// Buffer that accumulates all intermediate output when post-processors
     /// need the full document. Left empty on the streaming-only path.
     accumulated_output: Vec<u8>,
+    /// Upper bound on `accumulated_output` (and the post-processed result) to
+    /// prevent the buffered post-processing path from growing the Wasm heap
+    /// without limit on highly-compressible documents.
+    max_buffered_body_bytes: usize,
     origin_host: String,
     request_host: String,
     request_scheme: String,
@@ -48,7 +52,15 @@ impl StreamProcessor for HtmlWithPostProcessing {
             return Ok(output);
         }
 
-        // Post-processors need the full document. Accumulate until the last chunk.
+        // Post-processors need the full document. Accumulate until the last chunk,
+        // but enforce the buffering cap before growing the heap so a highly
+        // compressible document cannot OOM the accumulator. Matches the
+        // `BoundedWriter` error path (mapped to a 5xx proxy error downstream).
+        if self.accumulated_output.len() + output.len() > self.max_buffered_body_bytes {
+            return Err(io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
         self.accumulated_output.extend_from_slice(&output);
         if !is_last {
             return Ok(Vec::new());
@@ -97,6 +109,15 @@ impl StreamProcessor for HtmlWithPostProcessing {
             log::debug!("HTML post-processing complete: output_len={}", html.len());
         }
 
+        // Post-processors may append content (e.g. injected scripts); enforce the
+        // same cap on the final document so growth during post-processing cannot
+        // push the buffer past the limit either.
+        if html.len() > self.max_buffered_body_bytes {
+            return Err(io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+
         Ok(html.into_bytes())
     }
 
@@ -114,13 +135,18 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Maximum bytes the post-processing accumulator may buffer before the
+    /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
+    /// full-document buffering done for post-processors is bounded by the same
+    /// cap as the final [`crate::publisher::BoundedWriter`] sink.
+    pub max_buffered_body_bytes: usize,
 }
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
     #[must_use]
     pub fn from_settings(
-        _settings: &Settings,
+        settings: &Settings,
         integrations: &IntegrationRegistry,
         origin_host: &str,
         request_host: &str,
@@ -131,6 +157,7 @@ impl HtmlProcessorConfig {
             request_host: request_host.to_string(),
             request_scheme: request_scheme.to_string(),
             integrations: integrations.clone(),
+            max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
         }
     }
 }
@@ -494,6 +521,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         inner,
         post_processors,
         accumulated_output: Vec::new(),
+        max_buffered_body_bytes: config.max_buffered_body_bytes,
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
@@ -520,6 +548,7 @@ mod tests {
             request_host: "test.example.com".to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         }
     }
 
@@ -1041,6 +1070,7 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: Vec::new(),
             accumulated_output: Vec::new(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
@@ -1081,6 +1111,7 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: vec![Arc::new(NoopPostProcessor)],
             accumulated_output: Vec::new(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
@@ -1117,6 +1148,53 @@ mod tests {
     }
 
     #[test]
+    fn post_processing_accumulator_rejects_growth_past_cap() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        struct NoopPostProcessor;
+        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-noop"
+            }
+            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                false
+            }
+        }
+
+        // Tiny cap so a single non-final chunk overflows the accumulator.
+        let mut processor = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(NoopPostProcessor)],
+            accumulated_output: Vec::new(),
+            max_buffered_body_bytes: 16,
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        // A complete element well past the cap. The error must fire on this
+        // non-final chunk — proving the accumulator itself is bounded, not just
+        // the final write after the whole document was already buffered.
+        let oversized = format!("<p>{}</p>", "a".repeat(100));
+        let err = processor
+            .process_chunk(oversized.as_bytes(), false)
+            .expect_err("accumulator growth past the cap must error mid-stream");
+        assert!(
+            err.to_string().contains("exceeded maximum buffered size"),
+            "should report the buffering cap violation, got: {err}"
+        );
+
+        // The accumulator must never retain more than the configured cap.
+        assert!(
+            processor.accumulated_output.len() <= 16,
+            "accumulator must not grow past the cap, held {} bytes",
+            processor.accumulated_output.len()
+        );
+    }
+
+    #[test]
     fn active_post_processor_receives_full_document_and_mutates_output() {
         use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
         use lol_html::Settings;
@@ -1139,6 +1217,7 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: vec![Arc::new(AppendCommentProcessor)],
             accumulated_output: Vec::new(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
