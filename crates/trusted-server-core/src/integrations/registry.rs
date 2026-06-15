@@ -330,6 +330,8 @@ pub struct RequestFilterInput<'a> {
     pub services: &'a RuntimeServices,
     pub request: &'a Request<EdgeBody>,
     pub geo_info: Option<&'a GeoInfo>,
+    /// Whether the request matches a registered integration proxy route.
+    pub is_integration_route: bool,
 }
 
 /// How a header mutation should be applied.
@@ -389,6 +391,12 @@ impl RequestFilterEffects {
     pub fn apply_to_response(&self, response: &mut Response<EdgeBody>) {
         for mutation in &self.response_headers {
             apply_header_mutation_to_response(response, mutation);
+        }
+    }
+
+    pub fn apply_to_fastly_response(&self, response: &mut fastly::Response) {
+        for mutation in &self.response_headers {
+            apply_header_mutation_to_fastly_response(response, mutation);
         }
     }
 }
@@ -507,6 +515,40 @@ fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation
         }
         HeaderMutationMode::Append => {
             response.headers_mut().append(name, value);
+        }
+    }
+}
+
+fn apply_header_mutation_to_fastly_response(
+    response: &mut fastly::Response,
+    mutation: &HeaderMutation,
+) {
+    if is_forbidden_filter_header(&mutation.name) {
+        log::warn!(
+            "Skipping forbidden response-filter header: {}",
+            mutation.name
+        );
+        return;
+    }
+
+    let Ok(name) = fastly::http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
+        log::warn!("Skipping invalid response-filter header: {}", mutation.name);
+        return;
+    };
+    let Ok(value) = fastly::http::HeaderValue::from_str(&mutation.value) else {
+        log::warn!(
+            "Skipping invalid response-filter header value: {}",
+            mutation.name
+        );
+        return;
+    };
+
+    match mutation.mode {
+        HeaderMutationMode::Set => {
+            response.set_header(name, value);
+        }
+        HeaderMutationMode::Append => {
+            response.append_header(name, value);
         }
     }
 }
@@ -889,6 +931,7 @@ impl IntegrationRegistry {
             geo_info,
         } = input;
         let mut accumulated = RequestFilterEffects::default();
+        let is_integration_route = self.has_route(req.method(), req.uri().path());
 
         for filter in &self.inner.request_filters {
             let decision = filter
@@ -897,6 +940,7 @@ impl IntegrationRegistry {
                     services,
                     request: req,
                     geo_info,
+                    is_integration_route,
                 })
                 .await?;
 

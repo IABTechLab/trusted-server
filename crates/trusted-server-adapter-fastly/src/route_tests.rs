@@ -457,8 +457,8 @@ fn datadome_protection_toml() -> &'static str {
             [integrations.datadome]
             enabled = true
             enable_protection = true
-            server_side_key_secret_store = "datadome"
-            server_side_key_secret_name = "server_side_key"
+            server_side_key_secret_store = "ts_secrets"
+            server_side_key_secret_name = "datadome_server_side_key"
         "#
 }
 
@@ -482,7 +482,7 @@ fn create_datadome_auction_test_settings(providers: &str) -> Settings {
 
 fn datadome_secret_store() -> Arc<dyn PlatformSecretStore> {
     Arc::new(HashMapSecretStore::new(HashMap::from([(
-        "server_side_key".to_string(),
+        "datadome_server_side_key".to_string(),
         b"datadome-server-side-key".to_vec(),
     )])))
 }
@@ -597,7 +597,6 @@ fn route_result_to_fastly_response(
             .unwrap_or(None)
     };
     super::finalize_response(settings, geo_info.as_ref(), &mut response);
-    request_filter_effects.apply_to_response(&mut response);
     asset_cache_policy.apply_after_route_finalization(&mut response);
 
     let mut fastly_response = compat::to_fastly_response(response);
@@ -612,6 +611,7 @@ fn route_result_to_fastly_response(
             &mut fastly_response,
         );
     }
+    request_filter_effects.apply_to_fastly_response(&mut fastly_response);
     fastly_response
 }
 
@@ -905,6 +905,64 @@ fn datadome_skips_internal_and_static_asset_routes_by_default() {
     assert!(
         calls.is_empty(),
         "should not call DataDome for internal routes or default-excluded static assets"
+    );
+}
+
+#[test]
+fn datadome_skips_registered_integration_routes_with_custom_prefix() {
+    let base = base_route_settings_toml();
+    let datadome = datadome_protection_toml();
+    let config = format!(
+        r#"{base}
+
+{datadome}
+
+            [integrations.didomi]
+            enabled = true
+            proxy_path = "my-consent"
+            sdk_origin = "https://sdk.privacy-center.org"
+            api_origin = "https://api.privacy-center.org"
+
+            [auction]
+            enabled = true
+            providers = []
+            timeout_ms = 2000
+        "#,
+    );
+    let settings = Settings::from_toml(&config)
+        .expect("should parse DataDome and custom Didomi route test settings");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/my-consent/notice");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::OK));
+    let services = test_runtime_services_with_secret_and_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        datadome_secret_store(),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route custom Didomi proxy request without DataDome",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "custom integration proxy route should still be handled"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(calls.len(), 1, "should call only the Didomi upstream");
+    assert_eq!(
+        calls[0].uri, "https://sdk.privacy-center.org/notice",
+        "should not call the DataDome Protection API for registered integration routes"
     );
 }
 

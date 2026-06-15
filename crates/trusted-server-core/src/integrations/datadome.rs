@@ -240,11 +240,11 @@ fn default_protection_api_origin() -> String {
 }
 
 fn default_server_side_key_secret_store() -> String {
-    "datadome".to_string()
+    "ts_secrets".to_string()
 }
 
 fn default_server_side_key_secret_name() -> String {
-    "server_side_key".to_string()
+    "datadome_server_side_key".to_string()
 }
 
 fn default_timeout_ms() -> u32 {
@@ -1019,6 +1019,17 @@ mod tests {
             origin_host: "origin.example.com",
             document_state,
         }
+    }
+
+    #[test]
+    fn protection_secret_defaults_match_sample_config() {
+        let config = DataDomeConfig::default();
+
+        assert_eq!(config.server_side_key_secret_store, "ts_secrets");
+        assert_eq!(
+            config.server_side_key_secret_name,
+            "datadome_server_side_key"
+        );
     }
 
     #[test]

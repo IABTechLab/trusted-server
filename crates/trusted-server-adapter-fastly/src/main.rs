@@ -239,7 +239,6 @@ fn main() {
     match outcome {
         HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
-            request_filter_effects.apply_to_response(&mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
             let mut fastly_resp = compat::to_fastly_response(response);
             if should_finalize_ec {
@@ -253,6 +252,7 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
+            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
             fastly_resp.send_to_client();
 
             if is_real_browser {
@@ -267,7 +267,6 @@ fn main() {
             params,
         } => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
-            request_filter_effects.apply_to_response(&mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
             let mut fastly_resp = compat::to_fastly_response_skeleton(response);
             if should_finalize_ec {
@@ -281,6 +280,7 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
+            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
             match stream_publisher_body(
@@ -313,9 +313,9 @@ fn main() {
         }
         HandlerOutcome::AssetStreaming { mut response, body } => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
-            request_filter_effects.apply_to_response(&mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
-            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
+            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             if let Err(e) =
                 futures::executor::block_on(stream_asset_body(body, &mut streaming_body))

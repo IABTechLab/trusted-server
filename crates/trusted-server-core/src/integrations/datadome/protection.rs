@@ -95,12 +95,16 @@ impl DataDomeIntegration {
             .await
             .change_context(Self::error("Failed to call DataDome Protection API"))?;
 
-        Ok(self.classify_protection_response(platform_response.response))
+        Ok(self.classify_protection_response(platform_response.response, input.request.method()))
     }
 
     fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
         let req = input.request;
         if req.method() == Method::OPTIONS {
+            return false;
+        }
+
+        if input.is_integration_route {
             return false;
         }
 
@@ -356,6 +360,7 @@ impl DataDomeIntegration {
     fn classify_protection_response(
         &self,
         response: edgezero_core::http::Response,
+        request_method: &Method,
     ) -> RequestFilterDecision {
         let (parts, body) = response.into_parts();
         let status = parts.status;
@@ -386,14 +391,21 @@ impl DataDomeIntegration {
         }
 
         if matches!(status.as_u16(), 301 | 302 | 401 | 403 | 429) {
-            if body.is_stream() {
-                log::warn!("[datadome] Protection API challenge body was streaming; failing open");
-                return RequestFilterDecision::Continue(RequestFilterEffects::default());
-            }
-            let body_bytes = body.into_bytes();
+            let response_body = if request_method == Method::HEAD {
+                EdgeBody::empty()
+            } else {
+                if body.is_stream() {
+                    log::warn!(
+                        "[datadome] Protection API challenge body was streaming; failing open"
+                    );
+                    return RequestFilterDecision::Continue(RequestFilterEffects::default());
+                }
+                let body_bytes = body.into_bytes();
+                EdgeBody::from(body_bytes.as_ref().to_vec())
+            };
             let challenge = Response::builder()
                 .status(status)
-                .body(EdgeBody::from(body_bytes.as_ref().to_vec()))
+                .body(response_body)
                 .expect("should build DataDome challenge response");
             return RequestFilterDecision::Respond {
                 response: Box::new(challenge),
@@ -468,7 +480,7 @@ fn header_value(req: &Request<EdgeBody>, name: &str) -> String {
 fn headers_list(req: &Request<EdgeBody>) -> String {
     req.headers()
         .keys()
-        .map(|name| name.as_str())
+        .map(HeaderName::as_str)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -677,7 +689,10 @@ mod tests {
     fn load_server_side_key_reads_secret_store() {
         clear_datadome_server_side_key_cache_for_tests();
         let mut secrets = HashMap::new();
-        secrets.insert("server_side_key".to_string(), b"secret-from-store".to_vec());
+        secrets.insert(
+            "datadome_server_side_key".to_string(),
+            b"secret-from-store".to_vec(),
+        );
         let services = build_services_with_config_and_secret(
             NoopConfigStore,
             HashMapSecretStore::new(secrets),
@@ -744,6 +759,32 @@ mod tests {
     fn truncate_utf8_preserves_char_boundaries() {
         assert_eq!(truncate_utf8("ééé", 4), "éé");
         assert_eq!(truncate_utf8("ééé", -4), "éé");
+    }
+
+    #[test]
+    fn classify_head_challenge_omits_response_body() {
+        let integration = protection_integration();
+        let response = edgezero_core::http::response_builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(HEADER_DATADOME_RESPONSE, "403")
+            .body(EdgeBody::from("blocked"))
+            .expect("should build DataDome response");
+
+        let decision = integration.classify_protection_response(response, &Method::HEAD);
+
+        let RequestFilterDecision::Respond { response, .. } = decision else {
+            panic!("should return a challenge response for DataDome 403");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "should preserve challenge status"
+        );
+        assert_eq!(
+            response.into_body().into_bytes().as_ref(),
+            b"",
+            "HEAD challenges should not include a response body"
+        );
     }
 
     #[test]

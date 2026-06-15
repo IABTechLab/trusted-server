@@ -43,8 +43,8 @@ rewrite_sdk = true
 
 # Server-side Protection API layer
 enable_protection = false
-server_side_key_secret_store = "datadome"
-server_side_key_secret_name = "server_side_key"
+server_side_key_secret_store = "ts_secrets"
+server_side_key_secret_name = "datadome_server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
 protection_excluded_methods = ["OPTIONS"]
@@ -76,8 +76,8 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `cache_ttl_seconds`                    | integer | `3600`                           | Cache TTL for `tags.js`                                                 |
 | `rewrite_sdk`                          | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths               |
 | `enable_protection`                    | boolean | `false`                          | Call the Protection API before route matching                           |
-| `server_side_key_secret_store`         | string  | `datadome`                       | Runtime secret store containing the DataDome server-side key            |
-| `server_side_key_secret_name`          | string  | `server_side_key`                | Secret name containing the DataDome server-side key                     |
+| `server_side_key_secret_store`         | string  | `ts_secrets`                     | Runtime secret store containing the DataDome server-side key            |
+| `server_side_key_secret_name`          | string  | `datadome_server_side_key`       | Secret name containing the DataDome server-side key                     |
 | `protection_api_origin`                | string  | `https://api-fastly.datadome.co` | Protection API origin                                                   |
 | `timeout_ms`                           | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls             |
 | `protection_excluded_methods`          | array   | `["OPTIONS"]`                    | HTTP methods skipped before the Protection API call                     |
@@ -289,8 +289,8 @@ TRUSTED_SERVER__INTEGRATIONS__DATADOME__API_ORIGIN=https://api-js.datadome.co
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CACHE_TTL_SECONDS=3600
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__REWRITE_SDK=true
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__ENABLE_PROTECTION=true
-TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_STORE=datadome
-TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=server_side_key
+TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_STORE=ts_secrets
+TRUSTED_SERVER__INTEGRATIONS__DATADOME__SERVER_SIDE_KEY_SECRET_NAME=datadome_server_side_key
 TRUSTED_SERVER__INTEGRATIONS__DATADOME__CLIENT_SIDE_KEY=your-client-side-key
 ```
 
@@ -335,8 +335,8 @@ Check that both fields are configured:
 [integrations.datadome]
 enabled = true
 enable_protection = true
-server_side_key_secret_store = "datadome"
-server_side_key_secret_name = "server_side_key"
+server_side_key_secret_store = "ts_secrets"
+server_side_key_secret_name = "datadome_server_side_key"
 ```
 
 Also verify the request is not excluded by the default internal/static route exclusions or your custom inclusion/exclusion regexes.

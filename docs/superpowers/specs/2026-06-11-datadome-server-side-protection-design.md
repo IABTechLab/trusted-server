@@ -292,8 +292,8 @@ rewrite_sdk = true
 
 # New server-side protection layer
 enable_protection = false
-server_side_key_secret_store = "datadome"
-server_side_key_secret_name = "server_side_key"
+server_side_key_secret_store = "ts_secrets"
+server_side_key_secret_name = "datadome_server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
 protection_excluded_methods = ["OPTIONS"]
