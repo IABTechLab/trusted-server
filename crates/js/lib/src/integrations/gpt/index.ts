@@ -313,13 +313,46 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
 function fireWinBillingBeacons(slotId: string, bid: AuctionBidData): void {
   if (!slotId || (!bid.nurl && !bid.burl)) return;
 
-  const beaconKey = `${slotId}|${bid.hb_adid ?? bid.nurl ?? bid.burl ?? ''}`;
   const fired = (window.tsjs!.firedBeacons ??= {});
-  if (fired[beaconKey]) return;
+  const bidIdentity = bid.hb_adid ?? bid.nurl ?? bid.burl ?? '';
+  const urls = [
+    ['nurl', bid.nurl],
+    ['burl', bid.burl],
+  ] as const;
 
-  fired[beaconKey] = true;
-  if (bid.nurl) navigator.sendBeacon(bid.nurl);
-  if (bid.burl) navigator.sendBeacon(bid.burl);
+  for (const [kind, url] of urls) {
+    if (!url) continue;
+
+    const beaconKey = `${slotId}|${bidIdentity}|${kind}|${url}`;
+    if (fired[beaconKey]) continue;
+
+    if (queueWinBillingBeacon(url)) {
+      fired[beaconKey] = true;
+    }
+  }
+}
+
+function queueWinBillingBeacon(url: string): boolean {
+  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+    try {
+      if (navigator.sendBeacon(url)) {
+        return true;
+      }
+    } catch (err) {
+      log.warn('[tsjs-gpt] win/billing sendBeacon failed', err);
+    }
+  }
+
+  if (typeof fetch === 'function') {
+    try {
+      void fetch(url, { method: 'POST', keepalive: true, mode: 'no-cors' });
+      return true;
+    } catch (err) {
+      log.warn('[tsjs-gpt] win/billing fetch fallback failed', err);
+    }
+  }
+
+  return false;
 }
 
 // ------------------------------------------------------------------

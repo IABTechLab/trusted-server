@@ -707,6 +707,13 @@ describe('installTsRenderBridge', () => {
 
     fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
+    if (typeof navigator.sendBeacon !== 'function') {
+      Object.defineProperty(navigator, 'sendBeacon', {
+        value: vi.fn().mockReturnValue(true),
+        writable: true,
+        configurable: true,
+      });
+    }
 
     (window as TestWindow).tsjs = {
       bids: {
@@ -745,6 +752,25 @@ describe('installTsRenderBridge', () => {
     slot.appendChild(iframe);
     document.body.appendChild(slot);
     return iframe.contentWindow!;
+  }
+
+  async function captureBridgeListener(): Promise<(e: MessageEvent) => unknown> {
+    let bridgeListener: ((e: MessageEvent) => unknown) | undefined;
+    const origAdd = window.addEventListener.bind(window);
+    const addSpy = vi
+      .spyOn(window, 'addEventListener')
+      .mockImplementation(
+        (type: string, handler: EventListenerOrEventListenerObject, opts?: unknown) => {
+          if (type === 'message') bridgeListener = handler as (e: MessageEvent) => unknown;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          origAdd(type, handler as EventListener, opts as any);
+        }
+      );
+    await import('../../../src/integrations/gpt/index');
+    addSpy.mockRestore();
+
+    expect(bridgeListener, 'bridge listener should be registered').toBeDefined();
+    return bridgeListener!;
   }
 
   it('calls stopImmediatePropagation and fetches PBS Cache for a TS bid', async () => {
@@ -889,6 +915,101 @@ describe('installTsRenderBridge', () => {
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
     expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/bill');
     expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
+  it('falls back to keepalive fetch when sendBeacon is unavailable', async () => {
+    const originalSendBeacon = navigator.sendBeacon;
+    Object.defineProperty(navigator, 'sendBeacon', {
+      value: undefined,
+      writable: true,
+      configurable: true,
+    });
+
+    try {
+      (window as TestWindow).tsjs.bids.homepage_header = {
+        hb_adid: 'debug-no-beacon',
+        hb_bidder: 'mocktioneer',
+        hb_pb: '0.20',
+        nurl: 'https://debug.example/win',
+        burl: 'https://debug.example/bill',
+        adm: '<div>Debug Creative</div>',
+      };
+
+      const bridgeListener = await captureBridgeListener();
+      const portMessages: string[] = [];
+      const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+      const source = createTrustedSlotIframe();
+
+      expect(() =>
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: JSON.stringify({ message: 'Prebid Request', adId: 'debug-no-beacon' }),
+            ports: [fakePort],
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        )
+      ).not.toThrow();
+
+      expect(fetchStub).toHaveBeenCalledWith('https://debug.example/win', {
+        method: 'POST',
+        keepalive: true,
+        mode: 'no-cors',
+      });
+      expect(fetchStub).toHaveBeenCalledWith('https://debug.example/bill', {
+        method: 'POST',
+        keepalive: true,
+        mode: 'no-cors',
+      });
+    } finally {
+      Object.defineProperty(navigator, 'sendBeacon', {
+        value: originalSendBeacon,
+        writable: true,
+        configurable: true,
+      });
+    }
+  });
+
+  it('falls back to keepalive fetch when sendBeacon rejects the payload', async () => {
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(false);
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: 'debug-rejected-beacon',
+      hb_bidder: 'mocktioneer',
+      hb_pb: '0.20',
+      nurl: 'https://debug.example/win',
+      burl: 'https://debug.example/bill',
+      adm: '<div>Debug Creative</div>',
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+    const event = Object.assign(new Event('message'), {
+      data: JSON.stringify({ message: 'Prebid Request', adId: 'debug-rejected-beacon' }),
+      ports: [fakePort],
+      source,
+      stopImmediatePropagation: vi.fn(),
+    }) as unknown as MessageEvent;
+
+    bridgeListener(event);
+
+    expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://debug.example/bill');
+    expect(fetchStub).toHaveBeenCalledWith('https://debug.example/win', {
+      method: 'POST',
+      keepalive: true,
+      mode: 'no-cors',
+    });
+    expect(fetchStub).toHaveBeenCalledWith('https://debug.example/bill', {
+      method: 'POST',
+      keepalive: true,
+      mode: 'no-cors',
+    });
+
+    bridgeListener(event);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
     beaconSpy.mockRestore();
   });
 

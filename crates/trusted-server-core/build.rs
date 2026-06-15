@@ -76,6 +76,12 @@ mod creative_opportunities {
     impl CreativeOpportunitiesConfig {
         /// No-op stub — pattern compilation only runs at runtime.
         pub fn compile_slots(&mut self) {}
+
+        /// No-op stub — full slot-shape validation runs at runtime against
+        /// the real creative opportunity types.
+        pub fn validate_runtime(&self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// Stub — the typed `slot` vec is always empty in the build context (see

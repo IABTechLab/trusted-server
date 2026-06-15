@@ -1786,7 +1786,7 @@ impl Settings {
     ///
     /// Returns a configuration error if any cached runtime artifact cannot be
     /// prepared, if any handler path regex does not compile, or if a creative
-    /// opportunity slot has an invalid ID.
+    /// opportunity slot is invalid.
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
@@ -1798,16 +1798,14 @@ impl Settings {
 
         if let Some(co) = &mut self.creative_opportunities {
             co.compile_slots();
-            // Slot IDs flow into injected HTML/JS and provider payloads, and
-            // can arrive via TRUSTED_SERVER__ env overrides that bypass any
-            // static config review — validate them on every load path.
-            for slot in &co.slot {
-                crate::creative_opportunities::validate_slot_id(&slot.id).map_err(|err| {
-                    Report::new(TrustedServerError::Configuration {
-                        message: format!("Invalid creative opportunity slot id: {err}"),
-                    })
-                })?;
-            }
+            // Slots flow into injected HTML/JS, provider payloads, and GPT
+            // calls. Env/private config can bypass static review, so validate
+            // the full runtime shape on every load path.
+            co.validate_runtime().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity slot config: {err}"),
+                })
+            })?;
         }
 
         Ok(())
@@ -4681,8 +4679,105 @@ formats = [{ width = 300, height = 250 }]
 "#;
         let err = Settings::from_toml(toml).expect_err("should reject invalid slot id");
         assert!(
-            format!("{err:?}").contains("Invalid creative opportunity slot id"),
+            format!("{err:?}").contains("Invalid creative opportunity slot config"),
             "error should mention the invalid slot id, got: {err:?}"
+        );
+    }
+
+    fn creative_opportunity_settings_toml(slot_body: &str) -> String {
+        format!(
+            r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+{slot_body}
+"#
+        )
+    }
+
+    fn assert_creative_opportunity_slot_config_rejected(slot_body: &str, expected: &str) {
+        let toml = creative_opportunity_settings_toml(slot_body);
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject malformed creative opportunity slot");
+        assert!(
+            format!("{err:?}").contains(expected),
+            "error should contain {expected:?}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = []
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_valid_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["["]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one valid page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_formats() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = []
+"#,
+            "must include at least one format",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_zero_dimensions() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = [{ width = 0, height = 250 }]
+"#,
+            "must have positive width and height",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_empty_gam_unit_path() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+gam_unit_path = ""
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "resolved GAM unit path must not be empty",
         );
     }
 

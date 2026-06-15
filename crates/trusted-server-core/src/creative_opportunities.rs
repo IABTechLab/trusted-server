@@ -51,6 +51,20 @@ impl CreativeOpportunitiesConfig {
             slot.compile_patterns();
         }
     }
+
+    /// Validate all slot definitions after runtime preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when a slot has an invalid identifier, page
+    /// pattern set, format list, dimensions, or resolved GAM unit path.
+    pub fn validate_runtime(&self) -> Result<(), String> {
+        for slot in &self.slot {
+            slot.validate_runtime(&self.gam_network_id)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// A single ad placement opportunity on the publisher's site.
@@ -94,6 +108,54 @@ pub struct CreativeOpportunitySlot {
 }
 
 impl CreativeOpportunitySlot {
+    /// Validate the slot shape after [`compile_patterns`](Self::compile_patterns) has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when required slot fields are empty, invalid,
+    /// or semantically unusable at runtime.
+    pub fn validate_runtime(&self, gam_network_id: &str) -> Result<(), String> {
+        validate_slot_id(&self.id)?;
+
+        if self.page_patterns.is_empty() {
+            return Err(format!(
+                "slot `{}` must include at least one page pattern",
+                self.id
+            ));
+        }
+
+        if self.compiled_patterns.is_empty() {
+            return Err(format!(
+                "slot `{}` must include at least one valid page pattern",
+                self.id
+            ));
+        }
+
+        if self.formats.is_empty() {
+            return Err(format!(
+                "slot `{}` must include at least one format",
+                self.id
+            ));
+        }
+
+        for format in &self.formats {
+            format.validate_runtime(&self.id)?;
+        }
+
+        if self
+            .resolved_gam_unit_path(gam_network_id)
+            .trim()
+            .is_empty()
+        {
+            return Err(format!(
+                "slot `{}` resolved GAM unit path must not be empty",
+                self.id
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Returns `true` if `path` matches any of this slot's [`page_patterns`](Self::page_patterns).
     ///
     /// Patterns use glob syntax (e.g., `"/20**"` matches any path starting with `/20`,
@@ -236,6 +298,16 @@ pub struct CreativeOpportunityFormat {
 }
 
 impl CreativeOpportunityFormat {
+    fn validate_runtime(&self, slot_id: &str) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 {
+            return Err(format!(
+                "slot `{slot_id}` format must have positive width and height"
+            ));
+        }
+
+        Ok(())
+    }
+
     fn to_ad_format(&self) -> AdFormat {
         AdFormat {
             media_type: self.media_type.clone(),

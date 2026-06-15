@@ -1119,6 +1119,32 @@ mod tests {
     }
 
     #[test]
+    fn head_inserts_bootstrap_uses_css_safe_div_prefix_lookup() {
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("querySelectorAll(\"[id]\")"),
+            "bootstrap should scan ID-bearing elements instead of interpolating div_id into CSS"
+        );
+        assert!(
+            combined.contains(".startsWith(slot.div_id)"),
+            "bootstrap should match metacharacter-containing div_id prefixes with startsWith"
+        );
+        assert!(
+            !combined.contains("[id^='\" + slot.div_id"),
+            "bootstrap must not build a CSS attribute selector from raw div_id"
+        );
+    }
+
+    #[test]
     fn head_inserts_bootstrap_guards_enable_services_with_idempotency_flag() {
         let config = test_config();
         let integration = GptIntegration::new(config);
