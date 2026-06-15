@@ -1,14 +1,13 @@
 use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
-use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq};
+use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size};
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, HeaderValue, Method, StatusCode};
-use fastly::{Request, Response};
 use futures::StreamExt as _;
+use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +16,7 @@ use crate::constants::{
     HEADER_USER_AGENT, HEADER_X_FORWARDED_FOR,
 };
 use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
-use crate::ec::get_ec_id;
+use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices, StoreName,
@@ -31,6 +30,13 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 
 /// Chunk size used for streaming content through the rewrite pipeline.
 const STREAMING_CHUNK_SIZE: usize = 8192;
+
+const SIGN_MAX_BODY_BYTES: usize = 65536;
+const REBUILD_MAX_BODY_BYTES: usize = 65536;
+
+fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
+    Cursor::new(body.into_bytes())
+}
 
 /// Headers copied from the original client request to the upstream proxy request
 /// when `copy_request_headers` is enabled.
@@ -88,7 +94,7 @@ pub enum AssetProxyCachePolicy {
 
 impl AssetProxyCachePolicy {
     /// Apply protected cache headers after route-level response finalization.
-    pub fn apply_after_route_finalization(self, response: &mut Response) {
+    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
         if self == Self::NoStorePrivate {
             apply_no_store_cache_control(response);
         }
@@ -97,14 +103,14 @@ impl AssetProxyCachePolicy {
 
 /// Asset proxy response plus metadata needed by the outer router.
 pub struct AssetProxyResponse {
-    response: Response,
+    response: Response<EdgeBody>,
     stream_body: Option<EdgeBody>,
     cache_policy: AssetProxyCachePolicy,
 }
 
 impl AssetProxyResponse {
     fn new(
-        response: Response,
+        response: Response<EdgeBody>,
         stream_body: Option<EdgeBody>,
         cache_policy: AssetProxyCachePolicy,
     ) -> Self {
@@ -115,11 +121,11 @@ impl AssetProxyResponse {
         }
     }
 
-    fn origin_controlled(response: Response) -> Self {
+    fn origin_controlled(response: Response<EdgeBody>) -> Self {
         Self::new(response, None, AssetProxyCachePolicy::OriginControlled)
     }
 
-    fn origin_controlled_stream(response: Response, stream_body: EdgeBody) -> Self {
+    fn origin_controlled_stream(response: Response<EdgeBody>, stream_body: EdgeBody) -> Self {
         Self::new(
             response,
             Some(stream_body),
@@ -127,15 +133,15 @@ impl AssetProxyResponse {
         )
     }
 
-    fn no_store_private(response: Response) -> Self {
+    fn no_store_private(response: Response<EdgeBody>) -> Self {
         Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
     }
 
-    fn response(&self) -> &Response {
+    fn response(&self) -> &Response<EdgeBody> {
         &self.response
     }
 
-    fn response_mut(&mut self) -> &mut Response {
+    fn response_mut(&mut self) -> &mut Response<EdgeBody> {
         &mut self.response
     }
 
@@ -157,7 +163,7 @@ impl AssetProxyResponse {
     /// Returns [`TrustedServerError::Proxy`] when the response carries a
     /// streaming body. Use [`Self::into_response_and_body`] when the caller
     /// needs to handle both buffered and streaming asset responses.
-    pub fn into_response(self) -> Result<Response, Report<TrustedServerError>> {
+    pub fn into_response(self) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         if self.stream_body.is_some() {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "streaming asset response cannot be converted into a buffered response"
@@ -170,7 +176,7 @@ impl AssetProxyResponse {
 
     /// Consume this wrapper and return the response headers plus optional stream body.
     #[must_use]
-    pub fn into_response_and_body(self) -> (Response, Option<EdgeBody>) {
+    pub fn into_response_and_body(self) -> (Response<EdgeBody>, Option<EdgeBody>) {
         (self.response, self.stream_body)
     }
 }
@@ -186,18 +192,15 @@ struct S3CredentialsCacheKey {
 static S3_CREDENTIALS_CACHE: LazyLock<Mutex<HashMap<S3CredentialsCacheKey, Arc<S3Credentials>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Convert a platform-neutral response into a [`fastly::Response`] for downstream processing.
-///
-/// Shared with `auction/orchestrator.rs`. Both files will migrate off `fastly::Response`
-/// entirely in Phase 2, at which point this conversion helper will be removed.
+/// Convert a platform-neutral response into a buffered [`Response`] for downstream processing.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
-/// streaming body, which this Fastly-only conversion path cannot materialize.
+/// streaming body, which the buffered proxy path cannot materialize.
 pub(crate) fn platform_response_to_fastly(
     platform_resp: PlatformResponse,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = platform_resp.response.into_parts();
     let body_bytes = match body {
         EdgeBody::Once(bytes) => bytes.to_vec(),
@@ -208,27 +211,19 @@ pub(crate) fn platform_response_to_fastly(
             }));
         }
     };
-    let mut resp = Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.append_header(name.as_str(), value.as_bytes());
-    }
-    resp.set_body(body_bytes);
-    Ok(resp)
+    Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
 }
 
 fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
-    let mut resp = Response::from_status(parts.status.as_u16());
-    for (name, value) in parts.headers.iter() {
-        resp.append_header(name.as_str(), value.as_bytes());
-    }
 
     match body {
-        EdgeBody::Once(bytes) => {
-            resp.set_body(bytes.to_vec());
-            AssetProxyResponse::origin_controlled(resp)
-        }
+        EdgeBody::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
+            parts,
+            EdgeBody::from(bytes.to_vec()),
+        )),
         stream_body @ EdgeBody::Stream(_) => {
+            let resp = Response::from_parts(parts, EdgeBody::empty());
             AssetProxyResponse::origin_controlled_stream(resp, stream_body)
         }
     }
@@ -270,7 +265,6 @@ pub async fn stream_asset_body<W: Write>(
 
     Ok(())
 }
-
 #[derive(Deserialize)]
 struct ProxySignReq {
     url: String,
@@ -299,19 +293,16 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
-    /// Domain allowlist enforced on the initial target and every redirect hop.
+    /// Domains allowed for the initial request and any redirects.
     ///
-    /// An empty slice disables allowlist enforcement (open mode).
-    /// Integration proxies should pass `&[]`; first-party proxy passes
-    /// `&settings.proxy.allowed_domains`.
+    /// When empty every host is permitted (open mode). Integration proxies
+    /// should leave this empty; first-party handlers should pass
+    /// `&settings.proxy.allowed_domains` to enforce the publisher allowlist.
     pub allowed_domains: &'a [String],
 }
 
 impl<'a> ProxyRequestConfig<'a> {
     /// Build a proxy configuration that follows redirects and forwards the EC ID.
-    ///
-    /// `allowed_domains` defaults to `&[]` (open mode). Override it for the
-    /// first-party proxy by setting `allowed_domains` directly.
     #[must_use]
     pub fn new(target_url: &'a str) -> Self {
         Self {
@@ -363,31 +354,27 @@ const SUPPORTED_ENCODINGS: &str = "gzip, deflate, br";
 /// If `preserve_encoding` is true, the Content-Encoding header is kept (for compressed responses).
 /// If false, Content-Encoding is stripped (for decompressed responses).
 fn rebuild_response_with_body(
-    beresp: &Response,
+    beresp: Response<EdgeBody>,
     content_type: &'static str,
     body: Vec<u8>,
     preserve_encoding: bool,
-) -> Response {
-    let status = beresp.get_status();
-    let headers: Vec<(header::HeaderName, HeaderValue)> = beresp
-        .get_headers()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    let mut resp = Response::from_status(status);
-    for (name, value) in headers {
-        // Always skip Content-Length (size changed) and Content-Type (we set it)
-        if name == header::CONTENT_LENGTH || name == header::CONTENT_TYPE {
-            continue;
-        }
-        // Skip Content-Encoding only if we're not preserving it
-        if name == header::CONTENT_ENCODING && !preserve_encoding {
-            continue;
-        }
-        resp.append_header(name, value);
+) -> Response<EdgeBody> {
+    let (mut parts, _) = beresp.into_parts();
+
+    // Always skip Content-Length (size changed) and Content-Type (we set it)
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_TYPE);
+
+    // Skip Content-Encoding only if we're not preserving it
+    if !preserve_encoding {
+        parts.headers.remove(header::CONTENT_ENCODING);
     }
-    resp.set_header(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    resp.set_body(body);
-    resp
+
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    Response::from_parts(parts, EdgeBody::from(body))
 }
 
 /// Process a response body through a streaming pipeline with the given processor.
@@ -395,29 +382,29 @@ fn rebuild_response_with_body(
 /// Handles decompression, content processing, and re-compression while preserving
 /// the response status and headers.
 fn process_response_with_pipeline<P: StreamProcessor>(
-    mut beresp: Response,
+    mut beresp: Response<EdgeBody>,
     processor: P,
     compression: Compression,
     content_type: &'static str,
     error_context: &'static str,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let config = PipelineConfig {
         input_compression: compression,
         output_compression: compression,
         chunk_size: STREAMING_CHUNK_SIZE,
     };
 
-    let body = beresp.take_body();
+    let body = std::mem::replace(beresp.body_mut(), EdgeBody::empty());
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body, &mut output)
+        .process(body_as_reader(body), &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;
 
     Ok(rebuild_response_with_body(
-        &beresp,
+        beresp,
         content_type,
         output,
         compression != Compression::None,
@@ -426,28 +413,32 @@ fn process_response_with_pipeline<P: StreamProcessor>(
 
 fn finalize_proxied_response(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url: &str,
-    mut beresp: Response,
-) -> Result<Response, Report<TrustedServerError>> {
+    mut beresp: Response<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Determine content-type and content-encoding from response headers
-    let status_code = beresp.get_status().as_u16();
+    let status_code = beresp.status().as_u16();
     let ct_raw = beresp
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let content_encoding = beresp
-        .get_header(header::CONTENT_ENCODING)
+        .headers()
+        .get(header::CONTENT_ENCODING)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let cl_raw = beresp
-        .get_header(header::CONTENT_LENGTH)
+        .headers()
+        .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     let accept_raw = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
@@ -494,20 +485,24 @@ fn finalize_proxied_response(
 
     // Image handling: set generic content-type if missing and log pixel heuristics
     let req_accept_images = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_ascii_lowercase().contains("image/"))
         .unwrap_or(false);
 
     if ct.starts_with("image/") || req_accept_images {
-        if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+            beresp
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
         }
 
         // Heuristics to log likely tracking pixels without altering response
         let mut is_pixel = false;
         if let Some(cl) = beresp
-            .get_header(header::CONTENT_LENGTH)
+            .headers()
+            .get(header::CONTENT_LENGTH)
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -541,22 +536,25 @@ fn finalize_proxied_response(
 }
 
 fn finalize_proxied_response_streaming(
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url: &str,
-    mut beresp: Response,
-) -> Response {
-    let status_code = beresp.get_status().as_u16();
+    mut beresp: Response<EdgeBody>,
+) -> Response<EdgeBody> {
+    let status_code = beresp.status().as_u16();
     let ct_raw = beresp
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
     let cl_raw = beresp
-        .get_header(header::CONTENT_LENGTH)
+        .headers()
+        .get(header::CONTENT_LENGTH)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     let accept_raw = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
 
@@ -573,19 +571,23 @@ fn finalize_proxied_response_streaming(
     let ct = ct_raw.to_ascii_lowercase();
 
     let req_accept_images = req
-        .get_header(HEADER_ACCEPT)
+        .headers()
+        .get(HEADER_ACCEPT)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_ascii_lowercase().contains("image/"))
         .unwrap_or(false);
 
     if ct.starts_with("image/") || req_accept_images {
-        if beresp.get_header(header::CONTENT_TYPE).is_none() {
-            beresp.set_header(header::CONTENT_TYPE, "image/*");
+        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+            beresp
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/*"));
         }
 
         let mut is_pixel = false;
         if let Some(cl) = beresp
-            .get_header(header::CONTENT_LENGTH)
+            .headers()
+            .get(header::CONTENT_LENGTH)
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -621,11 +623,11 @@ fn finalize_proxied_response_streaming(
 /// content processing based on the `stream_passthrough` flag.
 fn finalize_response(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     url: &str,
-    beresp: Response,
+    beresp: Response<EdgeBody>,
     stream_passthrough: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     if stream_passthrough {
         Ok(finalize_proxied_response_streaming(req, url, beresp))
     } else {
@@ -657,10 +659,10 @@ struct ProxyRequestHeaders<'a> {
 ///   scheme, lacks a host, or the upstream fetch fails
 pub async fn proxy_request(
     settings: &Settings,
-    req: Request,
+    req: Request<EdgeBody>,
     config: ProxyRequestConfig<'_>,
     services: &RuntimeServices,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let ProxyRequestConfig {
         target_url,
         follow_redirects,
@@ -918,16 +920,16 @@ async fn send_asset_origin_request(
     }
 }
 
-fn strip_asset_proxy_response_headers(response: &mut Response) {
+fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
     // Asset origins must not be able to mutate publisher-domain browser state
     // or security policy through this proxy path.
     for header_name in ASSET_PROXY_STRIP_RESPONSE_HEADERS {
-        response.remove_header(header_name);
+        response.headers_mut().remove(header_name);
     }
 }
 
-fn apply_no_store_cache_control(response: &mut Response) {
-    response.set_header(
+fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
+    response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
     );
@@ -969,7 +971,7 @@ async fn preflight_s3_origin_for_image_optimizer(
         false,
     )
     .await?;
-    let head_status = head_response.response().get_status();
+    let head_status = head_response.response().status();
     if head_status.is_success() || head_status == StatusCode::NOT_MODIFIED {
         return Ok(None);
     }
@@ -1017,11 +1019,11 @@ async fn preflight_s3_origin_for_image_optimizer(
 pub async fn handle_asset_proxy_request(
     settings: &Settings,
     services: &RuntimeServices,
-    req: Request,
+    req: Request<EdgeBody>,
     route: &ProxyAssetRoute,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
-    let incoming_query = req.get_query_str().unwrap_or("");
-    let mut target_url = build_asset_proxy_target_url(route, req.get_path(), incoming_query)?;
+    let incoming_query = req.uri().query().unwrap_or("");
+    let mut target_url = build_asset_proxy_target_url(route, req.uri().path(), incoming_query)?;
     let skip_image_optimizer = asset_path_skips_image_optimizer(&target_url);
     let image_optimizer = if skip_image_optimizer {
         log::debug!(
@@ -1059,18 +1061,18 @@ pub async fn handle_asset_proxy_request(
 
     let mut outbound_headers = http::HeaderMap::new();
     for header_name in ASSET_PROXY_FORWARD_HEADERS {
-        if let Some(value) = req.get_header(&header_name) {
+        if let Some(value) = req.headers().get(&header_name) {
             outbound_headers.insert(header_name, value.clone());
         }
     }
     outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
 
-    if should_preflight_s3(route, image_optimizer.is_some(), req.get_method()) {
+    if should_preflight_s3(route, image_optimizer.is_some(), req.method()) {
         if let Some(response) = preflight_s3_origin_for_image_optimizer(
             services,
             route,
             &target_url,
-            req.get_method(),
+            req.method(),
             &outbound_headers,
             &backend_name,
         )
@@ -1083,19 +1085,15 @@ pub async fn handle_asset_proxy_request(
     if let Some(auth) = &route.auth {
         apply_asset_origin_auth(
             services,
-            req.get_method(),
+            req.method(),
             &target_url,
             &mut outbound_headers,
             auth,
         )?;
     }
 
-    let mut platform_req = build_asset_platform_request(
-        req.get_method(),
-        &target_url,
-        &outbound_headers,
-        &backend_name,
-    )?;
+    let mut platform_req =
+        build_asset_platform_request(req.method(), &target_url, &outbound_headers, &backend_name)?;
     if let Some(image_optimizer) = image_optimizer {
         platform_req = platform_req.with_image_optimizer(image_optimizer);
     }
@@ -1133,7 +1131,7 @@ fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
     url.set_query(Some(&serializer.finish()));
 }
 
-fn append_ec_id(req: &Request, target_url_parsed: &mut url::Url) {
+fn append_ec_id(req: &Request<EdgeBody>, target_url_parsed: &mut url::Url) {
     let ec_id_param = match get_ec_id(req) {
         Ok(id) => id,
         Err(e) => {
@@ -1187,17 +1185,17 @@ fn is_host_allowed(host: &str, pattern: &str) -> bool {
 
 async fn proxy_with_redirects(
     settings: &Settings,
-    req: &Request,
+    req: &Request<EdgeBody>,
     target_url_parsed: url::Url,
     follow_redirects: bool,
     body: Option<&[u8]>,
     request_headers: ProxyRequestHeaders<'_>,
     stream_passthrough: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const MAX_REDIRECTS: usize = 4;
 
     let mut current_url = target_url_parsed.to_string();
-    let mut current_method: Method = req.get_method().clone();
+    let mut current_method: Method = req.method().clone();
 
     for redirect_attempt in 0..=MAX_REDIRECTS {
         let parsed_url = url::Url::parse(&current_url).map_err(|_| {
@@ -1257,7 +1255,7 @@ async fn proxy_with_redirects(
         let mut outbound_headers = http::HeaderMap::new();
         if request_headers.copy_request_headers {
             for header_name in PROXY_FORWARD_HEADERS {
-                if let Some(v) = req.get_header(&header_name) {
+                if let Some(v) = req.headers().get(&header_name) {
                     outbound_headers.insert(header_name, v.clone());
                 }
             }
@@ -1290,13 +1288,13 @@ async fn proxy_with_redirects(
                 message: "Failed to proxy".to_string(),
             })?;
 
-        let beresp = platform_response_to_fastly(platform_resp)?;
+        let beresp = platform_resp.response;
 
         if !follow_redirects {
             return finalize_response(settings, req, &current_url, beresp, stream_passthrough);
         }
 
-        let status = beresp.get_status();
+        let status = beresp.status();
         let is_redirect = matches!(
             status,
             StatusCode::MOVED_PERMANENTLY
@@ -1311,7 +1309,8 @@ async fn proxy_with_redirects(
         }
 
         let Some(location) = beresp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .filter(|value| !value.is_empty())
         else {
@@ -1394,11 +1393,11 @@ async fn proxy_with_redirects(
 pub async fn handle_first_party_proxy(
     settings: &Settings,
     services: &RuntimeServices,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Parse, reconstruct, and validate the signed target URL
     let SignedTarget { target_url, .. } =
-        reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
+        reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
     proxy_request(
         settings,
@@ -1431,13 +1430,13 @@ pub async fn handle_first_party_proxy(
 pub async fn handle_first_party_click(
     settings: &Settings,
     _services: &RuntimeServices,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let SignedTarget {
         target_url: full_for_token,
         tsurl,
         had_params,
-    } = reconstruct_and_validate_signed_target(settings, req.get_url_str())?;
+    } = reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
 
     let ec_id = match get_ec_id(&req) {
         Ok(id) => id,
@@ -1463,11 +1462,13 @@ pub async fn handle_first_party_click(
 
     // Log click metadata for observability
     let ua = req
-        .get_header(HEADER_USER_AGENT)
+        .headers()
+        .get(HEADER_USER_AGENT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     let referer = req
-        .get_header(HEADER_REFERER)
+        .headers()
+        .get(HEADER_REFERER)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     log::info!(
@@ -1481,9 +1482,19 @@ pub async fn handle_first_party_click(
     );
 
     // 302 redirect to target URL
-    Ok(Response::from_status(fastly::http::StatusCode::FOUND)
-        .with_header(header::LOCATION, &redirect_target)
-        .with_header(header::CACHE_CONTROL, "no-store, private"))
+    let location = HeaderValue::from_str(&redirect_target).map_err(|_| {
+        Report::new(TrustedServerError::InvalidHeaderValue {
+            message: "invalid redirect target".to_string(),
+        })
+    })?;
+    let mut response = Response::new(EdgeBody::empty());
+    *response.status_mut() = StatusCode::FOUND;
+    response.headers_mut().insert(header::LOCATION, location);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    Ok(response)
 }
 
 /// Sign an arbitrary asset URL so creatives can request first-party proxying at runtime.
@@ -1498,20 +1509,25 @@ pub async fn handle_first_party_click(
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let method = req.get_method().clone();
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let method = req.method().clone();
+    let req_url = req.uri().to_string();
 
-    let payload = if method == fastly::http::Method::POST {
-        let body = req.take_body_str();
-        serde_json::from_str::<ProxySignReq>(&body).change_context(TrustedServerError::Proxy {
+    let payload = if method == Method::POST {
+        let body_bytes = req.into_body().into_bytes();
+        enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
+                message: "first-party sign request body should be valid UTF-8".to_string(),
+            })?;
+        serde_json::from_str::<ProxySignReq>(body).change_context(TrustedServerError::Proxy {
             message: "invalid JSON".to_string(),
         })?
     } else {
-        let parsed =
-            url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
-            })?;
+        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })?;
         let url = parsed
             .query_pairs()
             .find(|(k, _)| k == "url")
@@ -1526,7 +1542,7 @@ pub async fn handle_first_party_proxy_sign(
 
     let trimmed = payload.url.trim();
     let abs = if trimmed.starts_with("//") {
-        let default_scheme = url::Url::parse(req.get_url_str())
+        let default_scheme = url::Url::parse(&req_url)
             .ok()
             .map(|u| u.scheme().to_ascii_lowercase())
             .filter(|scheme| !scheme.is_empty())
@@ -1569,12 +1585,15 @@ pub async fn handle_first_party_proxy_sign(
         base: base.to_string(),
     };
 
-    let mut response = Response::from_status(fastly::http::StatusCode::OK);
-    response.set_header(header::CONTENT_TYPE, "application/json; charset=utf-8");
-    response.set_body(
+    let mut response = Response::new(EdgeBody::from(
         serde_json::to_string(&resp).change_context(TrustedServerError::Proxy {
             message: "failed to serialize".to_string(),
         })?,
+    ));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
     );
     Ok(response)
 }
@@ -1606,22 +1625,25 @@ struct ProxyRebuildResp {
 pub async fn handle_first_party_proxy_rebuild(
     settings: &Settings,
     _services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let method = req.get_method().clone();
-    let payload = if method == fastly::http::Method::POST {
-        let body = req.take_body_str();
-        serde_json::from_str::<ProxyRebuildReq>(&body).change_context(
-            TrustedServerError::Proxy {
-                message: "invalid JSON".to_string(),
-            },
-        )?
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let method = req.method().clone();
+    let req_url = req.uri().to_string();
+    let payload = if method == Method::POST {
+        let body_bytes = req.into_body().into_bytes();
+        enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
+        let body =
+            std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
+                message: "first-party rebuild request body should be valid UTF-8".to_string(),
+            })?;
+        serde_json::from_str::<ProxyRebuildReq>(body).change_context(TrustedServerError::Proxy {
+            message: "invalid JSON".to_string(),
+        })?
     } else {
         // Support GET: /first-party/proxy-rebuild?tsclick=...&add=...&del=...
-        let parsed =
-            url::Url::parse(req.get_url_str()).change_context(TrustedServerError::Proxy {
-                message: "Invalid URL".to_string(),
-            })?;
+        let parsed = url::Url::parse(&req_url).change_context(TrustedServerError::Proxy {
+            message: "Invalid URL".to_string(),
+        })?;
         let mut tsclick: Option<String> = None;
         let mut add: Option<std::collections::HashMap<String, String>> = None;
         let mut del: Option<Vec<String>> = None;
@@ -1738,11 +1760,21 @@ pub async fn handle_first_party_proxy_rebuild(
         }
     }
 
-    if method == fastly::http::Method::GET {
+    if method == Method::GET {
         // Redirect for GET usage to streamline navigation
-        Ok(Response::from_status(fastly::http::StatusCode::FOUND)
-            .with_header(header::LOCATION, href)
-            .with_header(header::CACHE_CONTROL, "no-store, private"))
+        let location = HeaderValue::from_str(&href).map_err(|_| {
+            Report::new(TrustedServerError::InvalidHeaderValue {
+                message: "invalid rebuild redirect target".to_string(),
+            })
+        })?;
+        let mut response = Response::new(EdgeBody::empty());
+        *response.status_mut() = StatusCode::FOUND;
+        response.headers_mut().insert(header::LOCATION, location);
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+        Ok(response)
     } else {
         let json = serde_json::to_string(&ProxyRebuildResp {
             href,
@@ -1750,11 +1782,20 @@ pub async fn handle_first_party_proxy_rebuild(
             added,
             removed,
         })
-        .unwrap_or_else(|_| "{}".to_string());
-        Ok(Response::from_status(fastly::http::StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-            .with_header(header::CACHE_CONTROL, "no-store, private")
-            .with_body(json))
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to serialize rebuild response".to_string(),
+        })?;
+        let mut response = Response::new(EdgeBody::from(json));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+        Ok(response)
     }
 }
 
@@ -1901,8 +1942,79 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
     use error_stack::Report;
-    use fastly::http::{header, HeaderValue, Method, StatusCode};
-    use fastly::{Request, Response};
+    use http::{header, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+
+    #[test]
+    fn test_rebuild_response_with_body_preserves_multiple_headers() {
+        let mut response = Response::new(EdgeBody::empty());
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("session=123"));
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, HeaderValue::from_static("tracker=456"));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+
+        let rebuilt =
+            rebuild_response_with_body(response, "application/json", b"{}".to_vec(), false);
+
+        let cookies: Vec<_> = rebuilt
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .collect();
+        assert_eq!(cookies, vec!["session=123", "tracker=456"]);
+        assert_eq!(
+            rebuilt
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/json"
+        );
+    }
+
+    fn build_http_request(method: Method, uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri.as_ref())
+            .body(EdgeBody::empty())
+            .expect("should build http request")
+    }
+
+    fn build_http_post_json_request(
+        uri: impl AsRef<str>,
+        body: &serde_json::Value,
+    ) -> HttpRequest<EdgeBody> {
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(uri.as_ref())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(body.to_string()))
+            .expect("should build http post request")
+    }
+
+    fn response_body_string(response: http::Response<EdgeBody>) -> String {
+        String::from_utf8(response.into_body().into_bytes().to_vec())
+            .expect("response body should be valid UTF-8")
+    }
+
+    fn build_http_response(status: StatusCode, body: EdgeBody) -> Response<EdgeBody> {
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        response
+    }
+
+    fn response_header(response: &Response<EdgeBody>, name: header::HeaderName) -> Option<&str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
 
     /// Test double that always returns a streaming (non-buffered) response body.
     ///
@@ -2008,7 +2120,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_missing_param_returns_400() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://example.com/first-party/proxy");
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
@@ -2020,7 +2132,7 @@ mod tests {
     async fn proxy_missing_or_invalid_token_returns_400() {
         let settings = create_test_settings();
         // missing tstoken should 400
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://example.com/first-party/proxy?tsurl=https%3A%2F%2Fcdn.example%2Fa.png",
         );
@@ -2037,13 +2149,12 @@ mod tests {
         let body = serde_json::json!({
             "url": "https://cdn.example/asset.js?c=3&b=2",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("sign ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_body_string(resp);
         assert!(json.contains("/first-party/proxy?tsurl="), "{}", json);
         assert!(json.contains("tsexp"), "{}", json);
         assert!(
@@ -2059,8 +2170,7 @@ mod tests {
         let body = serde_json::json!({
             "url": "data:image/png;base64,AAAA",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
         let err: Report<TrustedServerError> =
             handle_first_party_proxy_sign(&settings, &noop_services(), req)
                 .await
@@ -2074,17 +2184,12 @@ mod tests {
         let body = serde_json::json!({
             "url": "https://cdn.example.com:9443/img/300x250.svg",
         });
-        let mut req = Request::new(Method::POST, "https://edge.example/first-party/sign");
-        req.set_body(body.to_string());
-        let mut resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+        let req = build_http_post_json_request("https://edge.example/first-party/sign", &body);
+        let resp = handle_first_party_proxy_sign(&settings, &noop_services(), req)
             .await
             .expect("should sign URL with non-standard port");
-        assert_eq!(
-            resp.get_status(),
-            StatusCode::OK,
-            "should return 200 for valid sign request"
-        );
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_body_string(resp);
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
             json.contains("%3A9443"),
@@ -2182,7 +2287,7 @@ mod tests {
     #[tokio::test]
     async fn click_missing_params_returns_400() {
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://edge.example/first-party/click");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/click");
         let err: Report<TrustedServerError> =
             handle_first_party_click(&settings, &noop_services(), req)
                 .await
@@ -2197,7 +2302,7 @@ mod tests {
         let params = "foo=1&bar=2";
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
@@ -2209,9 +2314,10 @@ mod tests {
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.get_status(), StatusCode::FOUND);
+        assert_eq!(resp.status(), StatusCode::FOUND);
         let loc = resp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(http::header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         assert_eq!(loc, full);
@@ -2224,7 +2330,7 @@ mod tests {
         let params = "foo=1";
         let full = format!("{}?{}", tsurl, params);
         let sig = crate::http_util::compute_encrypted_sha256_token(&settings, &full);
-        let mut req = Request::new(
+        let mut req = build_http_request(
             Method::GET,
             format!(
                 "https://edge.example/first-party/click?tsurl={}&{}&tstoken={}",
@@ -2233,15 +2339,18 @@ mod tests {
                 sig
             ),
         );
-        let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
-        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC,
+            HeaderValue::from_static("ec-123"),
+        );
 
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
 
         let loc = resp
-            .get_header(header::LOCATION)
+            .headers()
+            .get(header::LOCATION)
             .and_then(|h| h.to_str().ok())
             .expect("Location header should be present and valid");
         let parsed = url::Url::parse(loc).expect("Location should be a valid URL");
@@ -2250,7 +2359,7 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs.remove("foo").as_deref(), Some("1"));
-        assert_eq!(pairs.remove("ts-ec").as_deref(), Some(valid_ec_id.as_str()));
+        assert_eq!(pairs.remove("ts-ec").as_deref(), Some("ec-123"));
         assert!(pairs.is_empty());
     }
 
@@ -2264,16 +2373,18 @@ mod tests {
             "add": {"y": "2"},
             "del": ["x"],
         });
-        let mut req = Request::new(
-            Method::POST,
-            "https://edge.example/first-party/proxy-rebuild",
-        );
-        req.set_body(serde_json::to_string(&body).expect("test JSON should serialize"));
-        let mut resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example/first-party/proxy-rebuild")
+            .body(EdgeBody::from(
+                serde_json::to_string(&body).expect("test JSON should serialize"),
+            ))
+            .expect("should build proxy rebuild request");
+        let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
             .await
             .expect("rebuild ok");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        let json = resp.take_body_str();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_body_string(resp);
         assert!(json.contains("/first-party/click?tsurl="));
         assert!(json.contains("tstoken"));
         // Diagnostics
@@ -2346,7 +2457,7 @@ mod tests {
         let clear = "ftp://cdn.example/file.gif";
         // Build a first-party proxy URL with a token for the unsupported scheme
         let first_party = creative::build_proxy_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
@@ -2367,7 +2478,7 @@ mod tests {
             url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
             sig
         );
-        let req = Request::new(Method::GET, &url);
+        let req = build_http_request(Method::GET, &url);
         let err: Report<TrustedServerError> =
             handle_first_party_proxy(&settings, &noop_services(), req)
                 .await
@@ -2380,15 +2491,12 @@ mod tests {
         let settings = create_test_settings();
         let clear = "https://cdn.example/landing.html?x=1";
         let first_party = creative::build_click_url(&settings, clear);
-        let req = Request::new(Method::GET, format!("https://edge.example{}", first_party));
+        let req = build_http_request(Method::GET, format!("https://edge.example{}", first_party));
         let resp = handle_first_party_click(&settings, &noop_services(), req)
             .await
             .expect("should redirect");
-        assert_eq!(resp.get_status(), StatusCode::FOUND);
-        let cc = resp
-            .get_header(header::CACHE_CONTROL)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let cc = response_header(&resp, header::CACHE_CONTROL).unwrap_or("");
         assert!(cc.contains("no-store"));
         assert!(cc.contains("private"));
     }
@@ -2403,38 +2511,40 @@ mod tests {
         let settings = create_test_settings();
         // HTML with an external image that should be proxied in rewrite
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_header(header::CACHE_CONTROL, "public, max-age=60")
-            .with_header(header::SET_COOKIE, "a=1; Path=/; Secure")
-            .with_body(html);
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        beresp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        beresp.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; Secure"),
+        );
         // Sanity: header present and creative rewrite works directly
-        let ct_pre = beresp
-            .get_header(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
+        let ct_pre = response_header(&beresp, header::CONTENT_TYPE)
             .unwrap_or("")
             .to_string();
         assert!(ct_pre.contains("text/html"), "ct_pre={}", ct_pre);
         let direct = creative::rewrite_creative_html(&settings, html);
         assert!(direct.contains("/first-party/proxy?tsurl="), "{}", direct);
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
-        let cc = out
-            .get_header(header::CACHE_CONTROL)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let cc = response_header(&out, header::CACHE_CONTROL)
+            .unwrap_or("")
+            .to_string();
         assert_eq!(cc, "public, max-age=60");
-        let cookie = out
-            .get_header(header::SET_COOKIE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let cookie = response_header(&out, header::SET_COOKIE)
+            .unwrap_or("")
+            .to_string();
         assert!(cookie.contains("a=1"));
     }
 
@@ -2442,19 +2552,18 @@ mod tests {
     fn css_response_is_rewritten_and_content_type_set() {
         let settings = create_test_settings();
         let css = "body{background:url(https://cdn.example/bg.png)}";
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/css")
-            .with_body(css);
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(css));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should succeed");
-        let body = out.take_body_str();
-        assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
+        let body = response_body_string(out);
+        assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
     }
 
@@ -2474,12 +2583,14 @@ mod tests {
   </body>
 </html>"#;
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(html);
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(
             &settings,
             &req,
             "https://cdn.example.com:9443/creatives/300x250.html",
@@ -2487,7 +2598,7 @@ mod tests {
         )
         .expect("should finalize HTML response with non-standard port URL");
 
-        let body = out.take_body_str();
+        let body = response_body_string(out);
 
         // Port 9443 should be preserved (URL-encoded as %3A9443)
         assert!(
@@ -2500,38 +2611,36 @@ mod tests {
     #[test]
     fn image_accept_sets_generic_content_type_when_missing() {
         let settings = create_test_settings();
-        let beresp = Response::from_status(StatusCode::OK).with_body("PNG");
-        let mut req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        req.set_header(HEADER_ACCEPT, "image/*");
+        let beresp = build_http_response(StatusCode::OK, EdgeBody::from("PNG"));
+        let mut req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        req.headers_mut()
+            .insert(HEADER_ACCEPT, HeaderValue::from_static("image/*"));
         let out = finalize(&settings, &req, "https://cdn.example/pixel.gif", beresp)
             .expect("finalize should succeed");
         // Since CT was missing and Accept indicates image, it should set generic image/*
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
-            .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+        let ct = response_header(&out, header::CONTENT_TYPE)
+            .expect("Content-Type header should be present");
         assert_eq!(ct, "image/*");
     }
 
     #[test]
     fn non_image_non_html_passthrough() {
         let settings = create_test_settings();
-        let beresp = Response::from_status(StatusCode::ACCEPTED)
-            .with_header(header::CONTENT_TYPE, "application/json")
-            .with_body("{\"ok\":true}");
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://api.example/ok", beresp)
+        let mut beresp = build_http_response(StatusCode::ACCEPTED, EdgeBody::from("{\"ok\":true}"));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://api.example/ok", beresp)
             .expect("finalize should succeed");
         // Should not rewrite, preserve status and content-type
-        assert_eq!(out.get_status(), StatusCode::ACCEPTED);
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        assert_eq!(out.status(), StatusCode::ACCEPTED);
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "application/json");
-        let body = out.take_body_str();
+        let body = response_body_string(out);
         assert_eq!(body, "{\"ok\":true}");
     }
 
@@ -2552,28 +2661,28 @@ mod tests {
             .expect("gzip write should succeed");
         let compressed = encoder.finish().expect("gzip finish should succeed");
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_header(header::CONTENT_ENCODING, "gzip")
-            .with_body(compressed);
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(compressed));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should process and succeed");
 
         // Content-Encoding should be preserved (gzip in -> gzip out)
-        let ce = out
-            .get_header(header::CONTENT_ENCODING)
+        let ce = response_header(&out, header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
-            .to_str()
-            .expect("Content-Encoding should be valid UTF-8");
+            .to_string();
         assert_eq!(ce, "gzip");
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -2609,28 +2718,27 @@ mod tests {
                 .expect("brotli write should succeed");
         }
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/css")
-            .with_header(header::CONTENT_ENCODING, "br")
-            .with_body(compressed);
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(compressed));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
+        beresp
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
         let out = finalize(&settings, &req, "https://cdn.example/bg.png", beresp)
             .expect("finalize should process brotli and succeed");
 
         // Content-Encoding should be preserved (br in -> br out)
-        let ce = out
-            .get_header(header::CONTENT_ENCODING)
+        let ce = response_header(&out, header::CONTENT_ENCODING)
             .expect("Content-Encoding should be preserved")
-            .to_str()
-            .expect("Content-Encoding should be valid UTF-8");
+            .to_string();
         assert_eq!(ce, "br");
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
@@ -2649,70 +2757,32 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
-        let mut beresp = Response::from_status(StatusCode::OK);
-        beresp.append_header(header::SET_COOKIE, "first=1; Path=/; HttpOnly");
-        beresp.append_header(header::SET_COOKIE, "second=2; Path=/; Secure");
-        beresp.set_header(header::CONTENT_TYPE, "text/plain");
-        beresp.set_header(header::CONTENT_LENGTH, "999");
-
-        let rebuilt = rebuild_response_with_body(
-            &beresp,
-            "text/html; charset=utf-8",
-            b"rewritten".to_vec(),
-            false,
-        );
-
-        let set_cookie_values: Vec<&str> = rebuilt
-            .get_headers()
-            .filter(|(name, _)| *name == header::SET_COOKIE)
-            .map(|(_, value)| value.to_str().expect("should be valid Set-Cookie"))
-            .collect();
-        assert_eq!(
-            set_cookie_values,
-            vec!["first=1; Path=/; HttpOnly", "second=2; Path=/; Secure"],
-            "should preserve multiple Set-Cookie headers"
-        );
-        assert_eq!(
-            rebuilt
-                .get_header(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/html; charset=utf-8"),
-            "should set rewritten Content-Type"
-        );
-        assert!(
-            rebuilt.get_header(header::CONTENT_LENGTH).is_none(),
-            "should not preserve stale Content-Length"
-        );
-    }
-
-    #[test]
     fn html_uncompressed_response_is_processed_without_encoding() {
         let settings = create_test_settings();
         let html = r#"<html><body><img src="https://cdn.example/a.png"></body></html>"#;
 
-        let beresp = Response::from_status(StatusCode::OK)
-            .with_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .with_body(html);
+        let mut beresp = build_http_response(StatusCode::OK, EdgeBody::from(html));
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
 
-        let req = Request::new(Method::GET, "https://edge.example/first-party/proxy");
-        let mut out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
+        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
+        let out = finalize(&settings, &req, "https://cdn.example/a.png", beresp)
             .expect("finalize should succeed");
 
         // No Content-Encoding since input was uncompressed
         assert!(
-            out.get_header(header::CONTENT_ENCODING).is_none(),
+            response_header(&out, header::CONTENT_ENCODING).is_none(),
             "Content-Encoding should not be set for uncompressed input"
         );
 
-        let ct = out
-            .get_header(header::CONTENT_TYPE)
+        let ct = response_header(&out, header::CONTENT_TYPE)
             .expect("Content-Type header should be present")
-            .to_str()
-            .expect("Content-Type should be valid UTF-8");
+            .to_string();
         assert_eq!(ct, "text/html; charset=utf-8");
 
-        let body = out.take_body_str();
+        let body = response_body_string(out);
         assert!(
             body.contains("/first-party/proxy?tsurl="),
             "HTML should be rewritten: {}",
@@ -2732,7 +2802,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/");
+        let req = build_http_request(Method::GET, "https://example.com/");
 
         let result = proxy_request(
             &settings,
@@ -2770,10 +2840,19 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let mut req = Request::new(Method::GET, "https://example.com/");
-        req.set_header(header::USER_AGENT, "test-agent/1.0");
-        req.set_header(header::ACCEPT, "text/html");
-        req.set_header(header::ACCEPT_LANGUAGE, "en-US");
+        let mut req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("test-agent/1.0"),
+        );
+        req.headers_mut()
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        req.headers_mut()
+            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
 
         let result = proxy_request(
             &settings,
@@ -2820,6 +2899,91 @@ mod tests {
             header_value("accept-encoding").as_deref(),
             Some(SUPPORTED_ENCODINGS),
             "should override Accept-Encoding with supported encodings"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_request_passes_through_streaming_platform_response_body() {
+        // HTTP types can carry streaming bodies; proxy_request returns Ok even when
+        // the origin sends a streaming body (unlike the old Fastly path which required
+        // materialising the body before wrapping it in fastly::Response).
+        let services = build_services_with_http_client(
+            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+
+        let result = proxy_request(
+            &settings,
+            req,
+            ProxyRequestConfig {
+                target_url: "https://example.com/resource",
+                follow_redirects: false,
+                forward_ec_id: false,
+                body: None,
+                headers: Vec::new(),
+                copy_request_headers: false,
+                stream_passthrough: false,
+                allowed_domains: &[],
+            },
+            &services,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "should pass streaming body through with HTTP types: {result:?}"
+        );
+        assert_eq!(
+            result.expect("should succeed").status(),
+            StatusCode::OK,
+            "should preserve the origin status code"
+        );
+    }
+
+    #[test]
+    fn rebuild_response_with_body_preserves_multiple_set_cookie_headers() {
+        let mut beresp = Response::new(EdgeBody::empty());
+        *beresp.status_mut() = StatusCode::OK;
+        beresp.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; Secure"),
+        );
+        beresp.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("b=2; Path=/; Secure"),
+        );
+
+        let rebuilt = rebuild_response_with_body(
+            beresp,
+            "text/html; charset=utf-8",
+            b"rewritten".to_vec(),
+            false,
+        );
+
+        let cookies: Vec<String> = rebuilt
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .into_iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("should preserve UTF-8 Set-Cookie header values")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            cookies,
+            vec![
+                "a=1; Path=/; Secure".to_string(),
+                "b=2; Path=/; Secure".to_string(),
+            ],
+            "should preserve every Set-Cookie value when rebuilding the response"
         );
     }
 
@@ -2963,23 +3127,58 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let mut req = Request::new(
+        let mut req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?auto=webp",
         );
-        req.set_header(header::USER_AGENT, "asset-agent/1.0");
-        req.set_header(header::ACCEPT, "image/avif,image/webp,image/*,*/*;q=0.8");
-        req.set_header(header::ACCEPT_ENCODING, "gzip, br");
-        req.set_header(header::ACCEPT_LANGUAGE, "en-US");
-        req.set_header(header::REFERER, "https://www.example.com/article");
-        req.set_header(header::IF_NONE_MATCH, "\"asset-etag\"");
-        req.set_header(header::IF_MODIFIED_SINCE, "Thu, 13 Mar 2025 08:00:00 GMT");
-        req.set_header(header::IF_MATCH, "\"asset-precondition\"");
-        req.set_header(header::IF_UNMODIFIED_SINCE, "Thu, 13 Mar 2025 09:00:00 GMT");
-        req.set_header(header::RANGE, "bytes=0-1023");
-        req.set_header(header::IF_RANGE, "\"asset-range\"");
-        req.set_header(HEADER_X_FORWARDED_FOR, "198.51.100.10");
-        req.set_header(header::HeaderName::from_static("x-custom-test"), "drop-me");
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("asset-agent/1.0"),
+        );
+        req.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("image/avif,image/webp,image/*,*/*;q=0.8"),
+        );
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        req.headers_mut()
+            .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+        req.headers_mut().insert(
+            header::REFERER,
+            HeaderValue::from_static("https://www.example.com/article"),
+        );
+        req.headers_mut().insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"asset-etag\""),
+        );
+        req.headers_mut().insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Thu, 13 Mar 2025 08:00:00 GMT"),
+        );
+        req.headers_mut().insert(
+            header::IF_MATCH,
+            HeaderValue::from_static("\"asset-precondition\""),
+        );
+        req.headers_mut().insert(
+            header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_static("Thu, 13 Mar 2025 09:00:00 GMT"),
+        );
+        req.headers_mut()
+            .insert(header::RANGE, HeaderValue::from_static("bytes=0-1023"));
+        req.headers_mut().insert(
+            header::IF_RANGE,
+            HeaderValue::from_static("\"asset-range\""),
+        );
+        req.headers_mut().insert(
+            HEADER_X_FORWARDED_FOR,
+            HeaderValue::from_static("198.51.100.10"),
+        );
+        req.headers_mut().insert(
+            header::HeaderName::from_static("x-custom-test"),
+            HeaderValue::from_static("drop-me"),
+        );
 
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
@@ -2987,7 +3186,7 @@ mod tests {
             .expect("should proxy asset request")
             .into_response()
             .expect("should return buffered asset response");
-        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
 
         let all_headers = stub.recorded_request_headers();
         assert_eq!(all_headers.len(), 1, "should have captured one request");
@@ -3072,7 +3271,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
 
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
         let response = handle_asset_proxy_request(&settings, &services, req, &route)
@@ -3082,21 +3281,22 @@ mod tests {
             .expect("should return buffered asset response");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "should strip upstream Set-Cookie headers from asset responses"
         );
         assert!(
             response
-                .get_header(header::STRICT_TRANSPORT_SECURITY)
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
                 .is_none(),
             "should strip upstream HSTS headers from asset responses"
         );
         assert!(
-            response.get_header("clear-site-data").is_none(),
+            response.headers().get("clear-site-data").is_none(),
             "should strip upstream Clear-Site-Data headers from asset responses"
         );
         assert_eq!(
-            response.get_header_str(header::ETAG),
+            response_header(&response, header::ETAG),
             Some("\"asset-etag\""),
             "should preserve safe cache validator headers on asset responses"
         );
@@ -3182,7 +3382,7 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
         );
         let settings = create_test_settings();
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1",
         );
@@ -3258,7 +3458,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium",
         );
@@ -3316,7 +3516,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1&x=71&y=bad",
         );
@@ -3371,7 +3571,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/logo.SVG?profile=unknown&ar=1-1",
         );
@@ -3410,7 +3610,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.image/options/id/logo.svg?profile=medium",
         );
@@ -3449,19 +3649,19 @@ mod tests {
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
         );
         let settings = create_test_settings();
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/logo.svg?profile=medium",
         );
         let route = test_s3_image_optimizer_route();
 
-        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+        let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy raw SVG asset through S3 route")
             .into_response()
             .expect("should return buffered asset response");
 
-        assert_eq!(response.take_body_str(), "raw-svg");
+        assert_eq!(response_body_string(response), "raw-svg");
         assert_eq!(
             stub.recorded_request_methods(),
             vec!["GET"],
@@ -3492,20 +3692,20 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium",
         );
         let route = test_s3_image_optimizer_route();
 
-        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+        let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy optimized S3 asset request")
             .into_response()
             .expect("should return buffered asset response");
 
-        assert_eq!(response.get_status(), StatusCode::OK);
-        assert_eq!(response.take_body_str(), "optimized");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body_string(response), "optimized");
         assert_eq!(
             stub.recorded_request_methods(),
             vec!["HEAD", "GET"],
@@ -3557,7 +3757,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/missing.jpg?profile=medium",
         );
@@ -3571,21 +3771,21 @@ mod tests {
             AssetProxyCachePolicy::NoStorePrivate,
             "should carry a typed no-store policy for router finalization"
         );
-        let mut response = asset_response
+        let response = asset_response
             .into_response()
             .expect("should return buffered asset response");
 
-        assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            response_header(&response, header::CACHE_CONTROL),
             Some("no-store, private"),
             "S3 origin errors should not be cached"
         );
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "raw S3 error should still strip unsafe response headers"
         );
-        let body = response.take_body_str();
+        let body = response_body_string(response);
         assert!(body.contains("NoSuchKey"), "should return S3 error body");
         assert!(
             body.contains("image/upload/missing.jpg"),
@@ -3621,19 +3821,19 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
         );
         let route = test_s3_image_optimizer_route();
 
-        let mut response = handle_asset_proxy_request(&settings, &services, req, &route)
+        let response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy debug S3 asset request")
             .into_response()
             .expect("should return buffered asset response");
 
-        assert_eq!(response.take_body_str(), "raw");
+        assert_eq!(response_body_string(response), "raw");
         assert_eq!(
             stub.recorded_request_methods(),
             vec!["GET"],
@@ -3662,7 +3862,7 @@ mod tests {
         settings.image_optimizer = ImageOptimizerSettings {
             profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
         };
-        let req = Request::new(
+        let req = build_http_request(
             Method::GET,
             "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
         );
@@ -3691,30 +3891,31 @@ mod tests {
             Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
         let (response, stream_body) = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
             .expect("should proxy a streaming asset response")
             .into_response_and_body();
-        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "should strip upstream Set-Cookie headers from streaming asset responses"
         );
         assert!(
             response
-                .get_header(header::STRICT_TRANSPORT_SECURITY)
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
                 .is_none(),
             "should strip upstream HSTS headers from streaming asset responses"
         );
         assert!(
-            response.get_header("clear-site-data").is_none(),
+            response.headers().get("clear-site-data").is_none(),
             "should strip upstream Clear-Site-Data headers from streaming asset responses"
         );
         assert_eq!(
-            response.get_header_str(header::ETAG),
+            response_header(&response, header::ETAG),
             Some("\"stream-etag\""),
             "should preserve safe cache validator headers on streaming asset responses"
         );
@@ -3758,7 +3959,7 @@ mod tests {
             Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
         );
         let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://www.example.com/.images/foo.jpg");
+        let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
         let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
             .await
@@ -3770,43 +3971,6 @@ mod tests {
         assert!(
             format!("{err:?}").contains("streaming asset response cannot be converted"),
             "should describe the buffered conversion failure: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn proxy_request_returns_error_for_streaming_platform_response_body() {
-        let services = build_services_with_http_client(
-            Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
-        );
-        let settings = create_test_settings();
-        let req = Request::new(Method::GET, "https://example.com/");
-
-        let err = proxy_request(
-            &settings,
-            req,
-            ProxyRequestConfig {
-                target_url: "https://example.com/resource",
-                follow_redirects: false,
-                forward_ec_id: false,
-                body: None,
-                headers: Vec::new(),
-                copy_request_headers: false,
-                stream_passthrough: false,
-                allowed_domains: &[],
-            },
-            &services,
-        )
-        .await
-        .expect_err("should reject streaming platform responses");
-
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::BAD_GATEWAY,
-            "should surface a proxy failure instead of truncating the body"
-        );
-        assert!(
-            format!("{err:?}").contains("streaming platform response body"),
-            "should describe the unsupported streaming body: {err:?}"
         );
     }
 
@@ -4046,8 +4210,9 @@ mod tests {
             urlencoding::encode(target),
             token,
         );
-        let req = Request::new(Method::GET, url);
-        let err = handle_first_party_proxy(&settings, &noop_services(), req)
+        let req = build_http_request(Method::GET, url);
+        let services = crate::platform::test_support::noop_services();
+        let err = handle_first_party_proxy(&settings, &services, req)
             .await
             .expect_err("should block initial target not in allowlist");
         assert_eq!(
@@ -4061,6 +4226,46 @@ mod tests {
                 TrustedServerError::AllowlistViolation { .. }
             ),
             "should be AllowlistViolation error"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let oversized = vec![b'x'; 65537];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example/first-party/sign")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for oversized sign body"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_rejects_oversized_body() {
+        let settings = create_test_settings();
+        let oversized = vec![b'x'; 65537];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://edge.example/first-party/proxy-rebuild")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+            .await
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for oversized rebuild body"
         );
     }
 }

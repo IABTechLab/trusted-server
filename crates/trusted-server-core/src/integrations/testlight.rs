@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, HeaderValue};
-use fastly::{Request, Response};
+use http::header::{self, HeaderValue};
+use http::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::ec::get_ec_id;
+use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 use crate::platform::RuntimeServices;
 use crate::proxy::{proxy_request, ProxyRequestConfig};
@@ -43,7 +46,7 @@ impl IntegrationConfig for TestlightConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 struct TestlightRequestBody {
     #[validate(nested)]
     #[serde(default)]
@@ -73,7 +76,7 @@ struct TestlightImp {
     extra: Map<String, Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct TestlightResponseBody {
     #[serde(flatten)]
     fields: Map<String, Value>,
@@ -93,6 +96,38 @@ impl TestlightIntegration {
             integration: TESTLIGHT_INTEGRATION_ID.to_string(),
             message: message.into(),
         }
+    }
+
+    fn rewrite_request_body(
+        payload_bytes: &[u8],
+        synthetic_id: &str,
+    ) -> Result<Vec<u8>, Report<TrustedServerError>> {
+        let mut payload = serde_json::from_slice::<TestlightRequestBody>(payload_bytes)
+            .change_context(Self::error("Failed to parse request body"))?;
+        payload
+            .validate()
+            .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
+
+        payload.user.id = Some(synthetic_id.to_string());
+
+        serde_json::to_vec(&payload).change_context(Self::error("Failed to serialize request body"))
+    }
+
+    fn rebuild_response(
+        mut parts: http::response::Parts,
+        body_bytes: Vec<u8>,
+        json_content_type: bool,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        parts.headers.remove(header::CONTENT_LENGTH);
+
+        if json_content_type {
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+
+        Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
     }
 }
 
@@ -142,28 +177,25 @@ impl IntegrationProxy for TestlightIntegration {
         &self,
         settings: &Settings,
         services: &RuntimeServices,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let mut payload = serde_json::from_slice::<TestlightRequestBody>(&req.take_body_bytes())
-            .change_context(Self::error("Failed to parse request body"))?;
-        payload
-            .validate()
-            .map_err(|err| Report::new(Self::error(format!("Invalid request payload: {err}"))))?;
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let (parts, body) = req.into_parts();
+        let payload_bytes =
+            collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, TESTLIGHT_INTEGRATION_ID)
+                .await?;
+        let req = http::Request::from_parts(parts, EdgeBody::empty());
 
-        // Read EC ID from header (set by registry) or cookie
+        // Read EC ID from the ts-ec cookie forwarded by the client.
+        // The registry strips x-ts-ec before dispatching, so only the cookie is available here.
         let ec_id = get_ec_id(&req)
             .change_context(Self::error("Failed to read EC ID"))?
             .ok_or_else(|| {
                 Report::new(Self::error(
-                    "EC ID not found in request header or cookie — \
-                     check that the integration registry propagated it",
+                    "EC ID not found in ts-ec cookie — the client must carry a valid EC cookie",
                 ))
             })?;
 
-        payload.user.id = Some(ec_id);
-
-        let payload_bytes = serde_json::to_vec(&payload)
-            .change_context(Self::error("Failed to serialize request body"))?;
+        let payload_bytes = Self::rewrite_request_body(&payload_bytes, &ec_id)?;
 
         let mut proxy_config = ProxyRequestConfig::new(&self.config.endpoint);
         proxy_config.forward_ec_id = false;
@@ -174,25 +206,29 @@ impl IntegrationProxy for TestlightIntegration {
             HeaderValue::from_static("application/json"),
         ));
 
-        let mut response = proxy_request(settings, req, proxy_config, services)
+        let response = proxy_request(settings, req, proxy_config, services)
             .await
             .change_context(Self::error("Failed to contact upstream integration"))?;
+        let (parts, body) = response.into_parts();
 
         // Attempt to parse response into structured form for logging/future transforms.
-        let response_body = response.take_body_bytes();
+        let response_body = collect_response_bounded(
+            body,
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            TESTLIGHT_INTEGRATION_ID,
+        )
+        .await?;
         match serde_json::from_slice::<TestlightResponseBody>(&response_body) {
             Ok(body) => {
-                response
-                    .set_body_json(&body)
+                let response_body = serde_json::to_vec(&body)
                     .change_context(Self::error("Failed to serialize integration response body"))?;
+                Self::rebuild_response(parts, response_body, true)
             }
             Err(_) => {
                 // Preserve original body if the integration responded with non-JSON content.
-                response.set_body(response_body);
+                Self::rebuild_response(parts, response_body, false)
             }
         }
-
-        Ok(response)
     }
 }
 
@@ -238,28 +274,15 @@ fn default_enabled() -> bool {
     false
 }
 
-impl Default for TestlightRequestBody {
-    fn default() -> Self {
-        Self {
-            user: TestlightUserSection::default(),
-            imp: Vec::new(),
-            extra: Map::new(),
-        }
-    }
-}
-
-impl Default for TestlightResponseBody {
-    fn default() -> Self {
-        Self { fields: Map::new() }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_support::tests::create_test_settings, tsjs};
-    use fastly::http::Method;
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::test_support::tests::{create_test_settings, VALID_SYNTHETIC_ID};
+    use crate::tsjs;
+    use http::Method;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn build_requires_config() {
@@ -349,6 +372,97 @@ mod tests {
             routes.iter().any(|route| route.method == Method::POST
                 && route.path == "/integrations/testlight/auction"),
             "Integration should register POST /integrations/testlight/auction"
+        );
+    }
+
+    #[test]
+    fn rewrite_request_body_injects_synthetic_id_without_fastly_types() {
+        let payload = br#"{"imp":[{"id":"slot-1"}]}"#;
+
+        let rewritten = TestlightIntegration::rewrite_request_body(payload, "abc123.XyZ789")
+            .expect("should rewrite Testlight payload");
+        let rewritten_json: serde_json::Value =
+            serde_json::from_slice(&rewritten).expect("should parse rewritten payload");
+
+        assert_eq!(
+            rewritten_json["user"]["id"], "abc123.XyZ789",
+            "should inject the synthetic ID into the Testlight user payload"
+        );
+    }
+
+    #[test]
+    fn rebuild_response_drops_stale_content_length_when_body_changes() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(header::CONTENT_LENGTH, "99")
+            .body(EdgeBody::from(br#"{ "ok" : true }"#.to_vec()))
+            .expect("should build Testlight response");
+        let (parts, _) = response.into_parts();
+
+        let rebuilt =
+            TestlightIntegration::rebuild_response(parts, br#"{"ok":true}"#.to_vec(), true)
+                .expect("should rebuild Testlight response");
+
+        assert!(
+            rebuilt.headers().get(header::CONTENT_LENGTH).is_none(),
+            "should drop stale Content-Length when rebuilding the response body"
+        );
+        assert_eq!(
+            rebuilt
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "should normalize JSON responses to application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_uses_platform_http_client_with_http_request() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"ok":true}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = TestlightIntegration::new(TestlightConfig {
+            enabled: true,
+            endpoint: "https://example.com/openrtb".to_string(),
+            timeout_ms: 1000,
+            shim_src: tsjs::tsjs_unified_script_src(),
+            rewrite_scripts: true,
+        });
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://edge.example.com/integrations/testlight/auction")
+            .body(EdgeBody::from(br#"{"imp":[{"id":"slot-1"}]}"#.to_vec()))
+            .expect("should build request");
+        req.headers_mut().insert(
+            crate::constants::HEADER_X_TS_EC.clone(),
+            http::HeaderValue::from_static(VALID_SYNTHETIC_ID),
+        );
+
+        let response = integration
+            .handle(&settings, &services, req)
+            .await
+            .expect("should proxy Testlight request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed upstream status"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should route outbound request through PlatformHttpClient"
+        );
+        let response_json: serde_json::Value =
+            serde_json::from_slice(&response.into_body().into_bytes())
+                .expect("should parse JSON response");
+        assert_eq!(
+            response_json["ok"], true,
+            "should preserve the upstream JSON response body"
         );
     }
 }

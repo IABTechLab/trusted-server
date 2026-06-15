@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_request_cookies_malformed_cookie_string() {
+    fn test_handle_request_cookies_invalid_cookie_header() {
         let req = build_request(Some("invalid"));
         let jar = handle_request_cookies(&req)
             .expect("should parse cookies")
