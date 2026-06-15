@@ -1931,7 +1931,9 @@ mod tests {
     use super::*;
     use crate::auction::types::{AdFormat, AdSlot, MediaType};
     use crate::integrations::IntegrationRegistry;
-    use crate::platform::test_support::noop_services;
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
     use http::{header, Method, Request as HttpRequest, StatusCode};
@@ -2159,6 +2161,75 @@ mod tests {
             ec_context.existing_cookie_ec_id(),
             Some(cookie_ec.as_str()),
             "should return cookie EC value for revocation"
+        );
+    }
+
+    /// Drive `handle_publisher_request` with no creative opportunities — a plain
+    /// proxy with no server-side auction. Hides the auction/EC wiring so callers
+    /// read like a simple `(settings, registry, services, req)` proxy.
+    async fn run_publisher_proxy(
+        settings: &Settings,
+        integration_registry: &IntegrationRegistry,
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> PublisherResponse {
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let fastly_req = crate::compat::to_fastly_request_ref(&req);
+        let mut ec_context =
+            EcContext::read_from_request(settings, &fastly_req).expect("should read EC context");
+        handle_publisher_request(
+            settings,
+            integration_registry,
+            services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            req,
+        )
+        .await
+        .expect("should proxy publisher request")
+    }
+
+    #[tokio::test]
+    async fn publisher_request_uses_platform_http_client_with_http_types() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"origin response".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = match run_publisher_proxy(&settings, &registry, &services, req).await {
+            PublisherResponse::Buffered(r) => r,
+            PublisherResponse::PassThrough { mut response, body } => {
+                *response.body_mut() = body;
+                response
+            }
+            PublisherResponse::Stream { response, .. } => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(response.into_body().into_bytes().to_vec())
+                .expect("response body should be valid UTF-8"),
+            "origin response"
+        );
+        assert_eq!(
+            stub.recorded_backend_names(),
+            vec!["stub-backend".to_string()],
+            "should proxy through the platform http client"
         );
     }
 
