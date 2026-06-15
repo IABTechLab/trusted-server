@@ -364,10 +364,15 @@ if [ -n "$NUMBER" ]; then
     # Use structured output. `gh pr checks` has non-zero exits for different
     # states. Classify from JSON whenever stdout exists; use the exit code only
     # to distinguish pending/no-output from command failures.
+    #
+    # Query the *full* check set — not `--required`. Branch protection's
+    # required list in this repo omits gates that CLAUDE.md still treats as PR
+    # gates (e.g. `Analyze (rust)`, `vitest`, CodeQL, browser/integration
+    # tests), so a `--required`-only query can report clean CI while one of
+    # those failed and hide a real regression.
     ci_error=$(mktemp)
     checks_json=$(gh pr checks "$NUMBER" \
         --repo IABTechLab/trusted-server \
-        --required \
         --json name,bucket,state,link 2>"$ci_error")
     checks_status=$?
 
@@ -376,13 +381,23 @@ if [ -n "$NUMBER" ]; then
     elif [ "$checks_status" = 8 ]; then
         # Exit 8 means checks are pending. With no JSON to classify, record
         # pending uncertainty rather than failed CI.
-        pr_checks_pending="required checks pending; gh returned no JSON"
+        pr_checks_pending="checks pending; gh returned no JSON"
     else
         # Network/auth/API failure. Treat this as diagnostic uncertainty,
-        # not as a failed required check.
+        # not as a failed check.
         pr_checks_error=$(cat "$ci_error")
     fi
     rm -f "$ci_error"
+
+    # Separately capture which checks branch protection marks as required, so a
+    # failed *required* check can be flagged as merge-blocking while failures in
+    # non-required gates are still surfaced. Best-effort: a nonzero exit here
+    # only costs the required/optional annotation, not the failure
+    # classification above, so the diagnostic is discarded.
+    required_names=$(gh pr checks "$NUMBER" \
+        --repo IABTechLab/trusted-server \
+        --required \
+        --json name --jq '.[].name' 2>/dev/null)
 fi
 ```
 
@@ -391,11 +406,17 @@ CI locally if checks haven't run yet or if you need to verify a specific
 failure. Note any CI failures in the review but continue with the code review
 regardless.
 
-Classify CI by `bucket`, not by the `gh pr checks` exit code:
+Classify CI by `bucket`, not by the `gh pr checks` exit code, over the
+**full** check set captured above:
 
 - `bucket == "fail"` or `bucket == "cancel"` → create a body-level 🔧 finding
-  in step 8a's "Cross-cutting / body-level findings" section. That finding
-  feeds the verdict rules below, so a PR with failed required CI cannot fall
+  in step 8a's "Cross-cutting / body-level findings" section. This applies to
+  **any** failed check, not just required ones — a failed non-required gate
+  (`vitest`, `Analyze (rust)`, integration tests, CodeQL) is still a real
+  regression CLAUDE.md treats as a PR gate. Note in the finding whether the
+  check name appears in `$required_names` (merge-blocking under branch
+  protection) or not (a failing gate branch protection doesn't enforce). That
+  finding feeds the verdict rules below, so a PR with any failed CI cannot fall
   through to `APPROVE`. Do not offer this finding as optional during triage
   unless the user shows the check is irrelevant, obsolete, or not required for
   the PR.
@@ -1031,17 +1052,19 @@ inline comment", not "this finding is out of scope".
 
 ## CI Status
 
-<!-- One bullet per required check actually reported by
-     `gh pr checks "$NUMBER" --required --json name,bucket,state,link` — use
-     the exact check names from that output, not a hardcoded list. Render the
-     bucket clearly as PASS / FAIL / CANCELLED / PENDING / SKIPPED. If a check
-     is missing from `gh pr checks` (workflow hasn't started, was skipped, or
-     is suppressed by branch protection), say "not run" rather than inventing a
-     bucket. If `gh pr checks` itself failed, include the diagnostic instead of
-     labelling CI as failed. If no GitHub CI ran and the agent only has local
-     results, label as "not run remotely; <local result> locally". -->
+<!-- One bullet per check actually reported by the full-set query
+     `gh pr checks "$NUMBER" --json name,bucket,state,link` (step 3) — use the
+     exact check names from that output, not a hardcoded list, and cover the
+     full set, not just required checks. Render the bucket clearly as PASS /
+     FAIL / CANCELLED / PENDING / SKIPPED, and append "(required)" when the
+     name is in `$required_names`. If a check is missing from `gh pr checks`
+     (workflow hasn't started or was skipped), say "not run" rather than
+     inventing a bucket. If `gh pr checks` itself failed, include the
+     diagnostic instead of labelling CI as failed. If no GitHub CI ran and the
+     agent only has local results, label as "not run remotely; <local result>
+     locally". -->
 
-- <check name from gh pr checks>: PASS / FAIL / CANCELLED / PENDING / SKIPPED / not run
+- <check name from gh pr checks>: PASS / FAIL / CANCELLED / PENDING / SKIPPED / not run <(required)>
 ```
 
 Omit any section that has no findings — don't include empty headings.
