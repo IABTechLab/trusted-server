@@ -67,7 +67,7 @@ pub trait AuctionProvider: Send + Sync {
     ///
     /// `timeout_ms` is the effective timeout that will be used when the backend
     /// is registered in [`request_bids`](Self::request_bids).  It must be
-    /// forwarded to [`crate::backend::BackendConfig::backend_name_for_url`] so the predicted
+    /// forwarded to [`crate::backend::BackendConfig::backend_name_for_url()`] so the predicted
     /// name matches the actual registration (the timeout is part of the name).
     fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
         None

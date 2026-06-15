@@ -15,6 +15,7 @@ const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
 const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
 const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
+const ERROR_TYPE_TRANSPORT: &str = "transport";
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
@@ -46,6 +47,18 @@ fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -
     AuctionResponse::error(provider_name, response_time_ms)
         .with_metadata("error_type", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
         .with_metadata("message", serde_json::json!("Provider launch failed"))
+}
+
+// Transport failures carry a static message: the underlying select() error is a
+// `Report<PlatformError>` that may reference upstream-controlled content, so it
+// is logged server-side rather than surfaced in the public /auction response.
+fn provider_transport_failed_response(
+    provider_name: &str,
+    response_time_ms: u64,
+) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
+        .with_metadata("message", serde_json::json!("Provider request failed"))
 }
 
 /// Compute the remaining time budget from a deadline.
@@ -85,6 +98,32 @@ impl AuctionOrchestrator {
     #[must_use]
     pub fn provider_count(&self) -> usize {
         self.providers.len()
+    }
+
+    /// Validate that every configured provider name has an enabled provider integration.
+    pub(crate) fn validate_configured_provider_names(
+        &self,
+    ) -> Result<(), Report<TrustedServerError>> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        for provider_name in self
+            .config
+            .providers
+            .iter()
+            .chain(self.config.mediator.iter())
+        {
+            if !self.providers.contains_key(provider_name) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!(
+                        "Auction provider `{provider_name}` is listed in [auction] but no enabled integration provides it"
+                    ),
+                }));
+            }
+        }
+
+        Ok(())
     }
 
     /// Execute an auction using the auto-detected strategy.
@@ -158,12 +197,7 @@ impl AuctionOrchestrator {
             let remaining_ms = remaining_budget_ms(mediation_start, context.timeout_ms);
 
             if remaining_ms == 0 {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
-                log::warn!(
-                    "Auction timeout ({}ms) exhausted during bidding phase — skipping mediator",
-                    context.timeout_ms
-                );
+                log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                 return Ok(OrchestrationResult {
                     provider_responses,
@@ -322,13 +356,7 @@ impl AuctionOrchestrator {
             let effective_timeout = remaining_ms.min(provider.timeout_ms());
 
             if effective_timeout == 0 {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
-                log::warn!(
-                    "Auction timeout ({}ms) exhausted before launching '{}' — skipping",
-                    context.timeout_ms,
-                    provider.provider_name()
-                );
+                log::warn!("Auction timeout exhausted before launching provider request; skipping");
                 continue;
             }
 
@@ -401,13 +429,19 @@ impl AuctionOrchestrator {
             }
         }
 
+        if pending_requests.is_empty() {
+            return Err(Report::new(TrustedServerError::Auction {
+                message: format!(
+                    "All {} configured provider(s) skipped or failed to launch",
+                    provider_names.len()
+                ),
+            }));
+        }
+
         let deadline = Duration::from_millis(u64::from(context.timeout_ms));
-        // lgtm[rust/cleartext-logging]
-        // This info log reports request counts and timeout budget only; no secret settings are logged.
         log::info!(
-            "Launched {} concurrent requests, waiting for responses (timeout: {}ms)...",
-            pending_requests.len(),
-            context.timeout_ms
+            "Launched {} concurrent provider request(s); waiting for responses",
+            pending_requests.len()
         );
 
         // Phase 2: Wait for responses using select() to process as they become ready.
@@ -490,7 +524,10 @@ impl AuctionOrchestrator {
                         {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
                             log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
-                            responses.push(AuctionResponse::error(provider_name, response_time_ms));
+                            responses.push(provider_transport_failed_response(
+                                provider_name,
+                                response_time_ms,
+                            ));
                         } else {
                             log::warn!(
                                 "A provider request failed (backend '{}' not tracked): {:?}",
@@ -511,11 +548,8 @@ impl AuctionOrchestrator {
             // Remaining PendingRequests are dropped, which abandons the
             // in-flight HTTP calls on the Fastly host.
             if auction_start.elapsed() >= deadline && !remaining.is_empty() {
-                // lgtm[rust/cleartext-logging]
-                // This warning reports timeout budget metadata only; no secret settings are logged.
                 log::warn!(
-                    "Auction timeout ({}ms) reached, dropping {} remaining request(s)",
-                    context.timeout_ms,
+                    "Auction timeout reached; dropping {} remaining request(s)",
                     remaining.len()
                 );
                 break;
@@ -816,6 +850,43 @@ mod tests {
         crate::settings::Settings::from_toml(&settings_str).expect("should parse test settings")
     }
 
+    struct LaunchFailingProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for LaunchFailingProvider {
+        fn provider_name(&self) -> &'static str {
+            "launch-failing"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "launch failed in test provider".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "launch-failing provider should not parse responses".to_string(),
+            }))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("launch-failing-backend".to_string())
+        }
+    }
+
     #[test]
     fn provider_error_response_includes_diagnostic_metadata() {
         let error = Report::new(TrustedServerError::Auction {
@@ -868,6 +939,27 @@ mod tests {
             response.metadata["message"],
             serde_json::json!("Provider launch failed"),
             "should use a safe, stable public launch failure message"
+        );
+    }
+
+    #[test]
+    fn transport_failed_response_has_safe_static_message() {
+        let response = super::provider_transport_failed_response("prebid", 64);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark transport failures as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("transport"),
+            "should classify transport failures consistently with other failure modes"
+        );
+        assert_eq!(
+            response.metadata["message"],
+            serde_json::json!("Provider request failed"),
+            "should use a safe, stable public transport failure message"
         );
     }
 
@@ -990,6 +1082,36 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(format!("{}", err).contains("No providers configured"));
+    }
+
+    #[tokio::test]
+    async fn provider_launch_failures_error_when_no_requests_launch() {
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["launch-failing".to_string()],
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(LaunchFailingProvider));
+
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://test.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = create_test_auction_context(&settings, &req, 2000);
+
+        let result = orchestrator.run_auction(&request, &context).await;
+
+        let err = result.expect_err("should fail when every provider launch fails");
+        assert!(
+            err.to_string()
+                .contains("All 1 configured provider(s) skipped or failed to launch"),
+            "should explain that no configured provider request launched"
+        );
     }
 
     #[test]

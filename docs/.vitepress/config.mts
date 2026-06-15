@@ -86,6 +86,7 @@ export default withMermaid(
               link: '/guide/auction-orchestration',
             },
             { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
+            { text: 'Asset Routes', link: '/guide/asset-routes' },
             { text: 'Creative Processing', link: '/guide/creative-processing' },
             {
               text: 'Integrations Overview',
