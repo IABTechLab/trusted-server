@@ -25,9 +25,11 @@ flowchart TD
 
 ## Core Endpoints
 
-### `/first-party/proxy` - Asset Proxy
+### `/first-party/proxy` - Signed Asset Proxy
 
 Proxies third-party assets with automatic HTML/CSS rewriting.
+
+For publisher-owned asset paths that should route directly to a configured origin without `tstoken`, use [Asset Routes](/guide/asset-routes). Asset routes support path-prefix matching, private S3 origins, and Fastly Image Optimizer profile tables.
 
 **Request**:
 
@@ -423,6 +425,18 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-random-secret"
 ```
+
+### Asset Routes
+
+Use `[[proxy.asset_routes]]` when a first-party path prefix should proxy directly to another asset origin.
+
+```toml
+[[proxy.asset_routes]]
+prefix = "/assets/"
+origin_url = "https://assets.example.com"
+```
+
+Asset routes are intended for publisher-owned paths, not third-party creative URLs. They support optional path rewrites, private S3 origin signing, and Fastly Image Optimizer metadata. See [Asset Routes](/guide/asset-routes) for full configuration and operational guidance.
 
 ### Proxy Allowlist
 

@@ -56,19 +56,50 @@ api_origin = "https://api.privacy-center.org"
 
 ### Configuration Options
 
-| Field        | Type    | Required | Default                          | Description                |
-| ------------ | ------- | -------- | -------------------------------- | -------------------------- |
-| `enabled`    | boolean | No       | `false`                          | Enable/disable integration |
-| `sdk_origin` | string  | Yes      | `https://sdk.privacy-center.org` | Didomi SDK backend URL     |
-| `api_origin` | string  | Yes      | `https://api.privacy-center.org` | Didomi API backend URL     |
+| Field        | Type    | Required | Default                          | Description                              |
+| ------------ | ------- | -------- | -------------------------------- | ---------------------------------------- |
+| `enabled`    | boolean | No       | `false`                          | Enable/disable integration               |
+| `proxy_path` | string  | No       | `integrations/didomi/consent`    | Custom proxy URL path prefix (see below) |
+| `sdk_origin` | string  | Yes      | `https://sdk.privacy-center.org` | Didomi SDK backend URL                   |
+| `api_origin` | string  | Yes      | `https://api.privacy-center.org` | Didomi API backend URL                   |
 
 ### Environment Variables
 
 ```bash
 TRUSTED_SERVER__INTEGRATIONS__DIDOMI__ENABLED=true
+TRUSTED_SERVER__INTEGRATIONS__DIDOMI__PROXY_PATH=my-custom-consent
 TRUSTED_SERVER__INTEGRATIONS__DIDOMI__SDK_ORIGIN=https://sdk.privacy-center.org
 TRUSTED_SERVER__INTEGRATIONS__DIDOMI__API_ORIGIN=https://api.privacy-center.org
 ```
+
+### Custom Proxy Path
+
+By default, Didomi requests are served at `/integrations/didomi/consent/*`. Since this path is predictable, ad blockers may add it to their block lists. Use `proxy_path` to set a customer-specific path that is harder to target:
+
+```toml
+[integrations.didomi]
+enabled = true
+proxy_path = "my-custom-consent"
+```
+
+With this configuration, requests are served at `/my-custom-consent/*` instead of the default.
+
+**Format rules:**
+
+- Must not be empty or just `/`
+- Must not end with a trailing slash
+- May contain only ASCII letters, numbers, `-`, `_`, `.`, `~`, and `/` path separators
+- Must not contain dot-only path segments (`.` or `..`)
+- Must not contain percent escapes or consecutive slashes (`//`)
+- Leading slash is optional (it is normalized internally)
+
+**Examples of valid values:**
+
+- `"consent-proxy"` → serves at `/consent-proxy/*`
+- `"privacy/manage"` → serves at `/privacy/manage/*`
+- `"/my-cmp-path"` → serves at `/my-cmp-path/*`
+
+The custom path is automatically passed to the client-side JavaScript bundle via `window.__tsjs_didomi.proxyPath`, so the Didomi SDK URL rewriting continues to work without additional frontend configuration.
 
 ## Endpoints
 

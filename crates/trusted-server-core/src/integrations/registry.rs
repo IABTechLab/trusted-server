@@ -3,17 +3,17 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use fastly::http::Method;
-use fastly::{Request, Response};
+use http::{Method, Request, Response};
 use matchit::Router;
 
-use crate::compat;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 /// Action returned by attribute rewriters to describe how the runtime should mutate the element.
@@ -245,14 +245,37 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
+/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
     /// Use this with the `namespaced_*` helper methods to automatically prefix routes.
     fn integration_name(&self) -> &'static str;
 
+    /// Returns the URL path prefix for this integration's proxy routes.
+    ///
+    /// Override this to provide a custom, customer-specific proxy path that is
+    /// harder for ad blockers to target. When not overridden, defaults to
+    /// `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn proxy_prefix(&self) -> String {
+    ///     "/my-custom-path".to_string()  // instead of /integrations/didomi
+    /// }
+    /// ```
+    fn proxy_prefix(&self) -> String {
+        format!("/integrations/{}", self.integration_name())
+    }
+
     /// Routes handled by this integration.
-    /// to automatically namespace routes under `/integrations/{integration_name()}/`,
+    /// to automatically namespace routes under the proxy prefix,
     /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
@@ -260,66 +283,42 @@ pub trait IntegrationProxy: Send + Sync {
     async fn handle(
         &self,
         settings: &Settings,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>>;
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>>;
 
     /// Helper to create a namespaced GET endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.namespaced_get("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn get(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.post("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn post(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.put("/users")  // becomes /integrations/my_integration/users
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn put(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn delete(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn patch(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::patch(full_path)
     }
 }
@@ -550,7 +549,8 @@ pub struct ProxyDispatchInput<'a> {
     pub settings: &'a Settings,
     pub kv: Option<&'a KvIdentityGraph>,
     pub ec_context: &'a mut EcContext,
-    pub req: Request,
+    pub services: &'a RuntimeServices,
+    pub req: Request<EdgeBody>,
 }
 
 /// In-memory registry of integrations discovered from settings.
@@ -674,21 +674,21 @@ impl IntegrationRegistry {
     pub async fn handle_proxy(
         &self,
         input: ProxyDispatchInput<'_>,
-    ) -> Option<Result<Response, Report<TrustedServerError>>> {
+    ) -> Option<Result<Response<EdgeBody>, Report<TrustedServerError>>> {
         let ProxyDispatchInput {
             method,
             path,
             settings,
             kv,
             ec_context,
+            services,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
-            let http_req = compat::from_fastly_headers_ref(&req);
-            if is_navigation_request(&http_req) {
+            if is_navigation_request(&req) {
                 if let Err(err) = ec_context.generate_if_needed(settings, kv) {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
@@ -700,9 +700,9 @@ impl IntegrationRegistry {
             }
 
             // Remove any caller-supplied EC header rather than forwarding it.
-            req.remove_header(HEADER_X_TS_EC);
+            req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            Some(proxy.handle(settings, req).await)
+            Some(proxy.handle(settings, services, req).await)
         } else {
             None
         }
@@ -978,6 +978,9 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::COOKIE_TS_EC;
+    use crate::platform::test_support::noop_services;
+    use http::{header, HeaderValue, StatusCode};
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -995,9 +998,10 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
-            _req: Request,
-        ) -> Result<Response, Report<TrustedServerError>> {
-            Ok(Response::new())
+            _services: &RuntimeServices,
+            _req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            Ok(Response::new(EdgeBody::empty()))
         }
     }
 
@@ -1010,6 +1014,33 @@ mod tests {
 
         fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
             false
+        }
+    }
+
+    struct EchoProxy;
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EchoProxy {
+        fn integration_name(&self) -> &'static str {
+            "echo"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![]
+        }
+
+        async fn handle(
+            &self,
+            _settings: &Settings,
+            _services: &RuntimeServices,
+            req: http::Request<EdgeBody>,
+        ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .header("x-echo-path", req.uri().path())
+                .body(EdgeBody::empty())
+                .expect("should build echo response");
+            Ok(response)
         }
     }
 
@@ -1027,6 +1058,46 @@ mod tests {
         assert!(
             !processor.should_process("<html></html>", &ctx),
             "Default `should_process` should be false to avoid running post-processing unexpectedly"
+        );
+    }
+
+    #[test]
+    fn handle_proxy_passes_http_request_without_fastly_round_trip() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            http::Method::GET,
+            "/integrations/test/echo",
+            (Arc::new(EchoProxy) as Arc<dyn IntegrationProxy>, "echo"),
+        )]);
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://test.example.com/integrations/test/echo?x=1")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &http::Method::GET,
+            path: "/integrations/test/echo",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &noop_services(),
+            req,
+        }))
+        .expect("should match route")
+        .expect("proxy should succeed");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should preserve HTTP status"
+        );
+        assert_eq!(
+            response.headers()["x-echo-path"],
+            "/integrations/test/echo",
+            "should expose the HTTP request path to the proxy"
         );
     }
 
@@ -1250,7 +1321,6 @@ mod tests {
 
     // Tests for EC ID header on proxy responses
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::header;
 
     /// Mock proxy that returns a simple 200 OK response
     struct EcTestProxy;
@@ -1277,15 +1347,18 @@ mod tests {
         async fn handle(
             &self,
             _settings: &Settings,
-            req: Request,
-        ) -> Result<Response, Report<TrustedServerError>> {
-            let mut response =
-                Response::from_status(fastly::http::StatusCode::OK).with_body("test response");
-
-            if let Some(ec) = req.get_header(HEADER_X_TS_EC) {
-                response.set_header("x-echo-ts-ec", ec);
+            _services: &RuntimeServices,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from("test response"))
+                .expect("should build test response");
+            if let Some(ec) = req.headers().get(HEADER_X_TS_EC.clone()) {
+                response
+                    .headers_mut()
+                    .insert(http::HeaderName::from_static("x-echo-ts-ec"), ec.clone());
             }
-
             Ok(response)
         }
     }
@@ -1303,12 +1376,18 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let valid_ec_id = format!("{}.CkEc1", "a".repeat(64));
-        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
-        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
-        req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
+            HEADER_X_TS_EC.clone(),
+            HeaderValue::from_static("some-ec-value"),
+        );
         let mut ec_context =
-            EcContext::read_from_request(&settings, &req).expect("should read EC context");
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services = noop_services();
 
         // Call handle_proxy (uses futures executor in test environment)
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
@@ -1317,6 +1396,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }));
 
@@ -1328,7 +1408,7 @@ mod tests {
         let response = response.unwrap();
 
         assert!(
-            response.get_header("x-echo-ts-ec").is_none(),
+            response.headers().get("x-echo-ts-ec").is_none(),
             "should not have x-ts-ec header on integration request"
         );
     }
@@ -1346,10 +1426,19 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test-publisher.com/integrations/test/ec");
-        req.set_header(HEADER_X_TS_EC, "evil;injected");
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
+            HEADER_X_TS_EC.clone(),
+            HeaderValue::from_static("evil;injected"),
+        );
         let mut ec_context =
-            EcContext::read_from_request(&settings, &req).expect("should read EC context");
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
@@ -1357,6 +1446,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }))
         .expect("should handle proxy request");
@@ -1364,7 +1454,7 @@ mod tests {
         let response = result.expect("handler should succeed");
 
         assert!(
-            response.get_header("x-echo-ts-ec").is_none(),
+            response.headers().get("x-echo-ts-ec").is_none(),
             "should not reflect the tampered request header to the integration"
         );
     }
@@ -1380,13 +1470,24 @@ mod tests {
 
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let mut req = Request::get("https://test.example.com/integrations/test/ec");
-        // Pre-existing cookie with valid EC ID format, but no geo data →
-        // Unknown jurisdiction → consent denied.
-        let valid_ec_id = format!("{}.AbCd12", "a".repeat(64));
-        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test.example.com/integrations/test/ec")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                COOKIE_TS_EC,
+                crate::test_support::tests::VALID_SYNTHETIC_ID
+            ))
+            .expect("should build Cookie header"),
+        );
         let mut ec_context =
-            EcContext::read_from_request(&settings, &req).expect("should read EC context");
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
@@ -1394,6 +1495,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }))
         .expect("should handle proxy request");
@@ -1401,7 +1503,7 @@ mod tests {
         let response = result.expect("proxy handle should succeed");
 
         assert!(
-            response.get_header("x-echo-ts-ec").is_none(),
+            response.headers().get("x-echo-ts-ec").is_none(),
             "should not set x-ts-ec on integration request"
         );
     }
@@ -1419,13 +1521,19 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let valid_ec_id = format!("{}.CkEc1", "a".repeat(64));
-        let mut req =
-            Request::post("https://test-publisher.com/integrations/test/ec").with_body("test body");
-        req.set_header(header::COOKIE, format!("ts-ec={valid_ec_id}"));
-        req.set_header("x-ts-ec", format!("{}.HdrEc1", "b".repeat(64)));
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .body(EdgeBody::from("test body"))
+            .expect("should build POST request");
+        req.headers_mut().insert(
+            HEADER_X_TS_EC.clone(),
+            HeaderValue::from_static("some-ec-value"),
+        );
         let mut ec_context =
-            EcContext::read_from_request(&settings, &req).expect("should read EC context");
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+        let services = crate::platform::test_support::noop_services();
 
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::POST,
@@ -1433,6 +1541,7 @@ mod tests {
             settings: &settings,
             kv: None,
             ec_context: &mut ec_context,
+            services: &services,
             req,
         }));
 
@@ -1442,7 +1551,7 @@ mod tests {
 
         let response = response.unwrap();
         assert!(
-            response.get_header("x-echo-ts-ec").is_none(),
+            response.headers().get("x-echo-ts-ec").is_none(),
             "POST integration request should not include x-ts-ec"
         );
     }
