@@ -196,6 +196,27 @@ async fn spin_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
     (s, h)
 }
 
+/// Send a POST request to the Spin adapter with additional request headers.
+async fn spin_post_with_headers(
+    uri: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, HeaderMap) {
+    let router = spin_router();
+    let mut builder = request_builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder
+        .body(edgezero_core::body::Body::from(body.to_owned()))
+        .expect("should build POST request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
 // ---------------------------------------------------------------------------
 // Route parity: same route → same status on all adapters
 // ---------------------------------------------------------------------------
@@ -586,6 +607,35 @@ async fn auction_not_challenged_by_auth_parity() {
         cf_status, spin_status,
         "/auction must return the same status across adapters: \
          cf={cf_status} spin={spin_status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spin_auction_ignores_spoofed_forwarded_headers() {
+    // POST /auction feeds prebid request signing via `RequestInfo::from_request`,
+    // which trusts `Forwarded` / `X-Forwarded-*` when the adapter has not stripped
+    // them. On Spin, normalization must strip those spoofable headers before the
+    // handler runs, so a spoofed request cannot influence routing or the trusted
+    // authority used in signed metadata: it must behave exactly like a clean one.
+    let body = r#"{"adUnits":[]}"#;
+    let (clean_status, _) = spin_post_headers("/auction", body).await;
+    let (spoofed_status, _) = spin_post_with_headers(
+        "/auction",
+        body,
+        &[
+            ("x-forwarded-host", "evil.example"),
+            ("x-forwarded-proto", "http"),
+            ("forwarded", "host=evil.example;proto=http"),
+        ],
+    )
+    .await;
+
+    assert_ne!(spoofed_status, 401, "Spin /auction must not 401");
+    assert_ne!(spoofed_status, 404, "Spin /auction must be routed (not 404)");
+    assert_eq!(
+        clean_status, spoofed_status,
+        "spoofed forwarded headers must not change Spin /auction behaviour: \
+         clean={clean_status} spoofed={spoofed_status}"
     );
 }
 

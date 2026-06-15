@@ -109,6 +109,14 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
+//
+// The EC API routes that the Fastly entry point registers — POST
+// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
+// intentionally absent here, matching the Axum and Cloudflare adapters: those
+// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
+// registry and rate limiter) that the portability adapters do not yet wire.
+// On Spin these paths fall through to the publisher/integration fallback,
+// identical to the other non-Fastly adapters.
 fn named_fallback_paths() -> [(&'static str, &'static [Method]); 9] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
@@ -170,10 +178,24 @@ fn normalize_spin_request(req: &mut Request) {
     // trusted scheme/host; `spin-client-addr` carries no further use on the request.
     req.headers_mut().remove("spin-client-addr");
 
-    let full_url = req.headers_mut().remove("spin-full-url");
-    let Some((scheme, host)) = full_url
-        .as_ref()
+    // Spin's WASI HTTP bridge appends its synthetic `spin-full-url` *after* the
+    // original client headers, so when duplicate names are present the trusted
+    // runtime value is the last one. `HeaderMap::remove` returns the *first*
+    // value, which a client could control by sending its own `spin-full-url`
+    // ahead of Spin's synthetic one — letting it choose the host/scheme consumed
+    // by publisher HTML rewriting, integration URL rewriting, and request
+    // signing. Select the last occurrence as the trusted authority, then strip
+    // every copy so none reach publisher origins or the shared handlers.
+    let trusted_full_url = req
+        .headers()
+        .get_all("spin-full-url")
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    req.headers_mut().remove("spin-full-url");
+    let Some((scheme, host)) = trusted_full_url
+        .as_deref()
         .and_then(scheme_host_from_spin_url)
     else {
         return;
@@ -390,7 +412,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
+                let mut req = ctx.into_request();
+                // Auction request signing builds `SigningParams` from
+                // `RequestInfo::from_request`, which trusts `Forwarded` /
+                // `X-Forwarded-*` when present. Normalize first so spoofed
+                // forwarded headers are stripped and the trusted runtime
+                // authority is used in the signed OpenRTB metadata.
+                normalize_spin_request(&mut req);
                 let ec_context = EcContext::default();
                 Ok(handle_auction(
                     &s.settings,
@@ -707,6 +735,49 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("https"),
             "should still inject the trusted scheme"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_uses_trusted_spin_full_url_over_client_duplicate() {
+        // Spin appends its synthetic `spin-full-url` after the client's headers,
+        // so a client that prepends its own `spin-full-url` would win a
+        // first-match lookup. The trusted authority must come from the last
+        // (Spin-supplied) value, never the attacker's prepended one.
+        let mut builder = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/first-party/proxy");
+        // Attacker-controlled value first, trusted Spin synthetic value last.
+        builder = builder.header("spin-full-url", "https://evil.example/attacker/path");
+        builder = builder.header("spin-full-url", "https://www.publisher.example/cars/");
+        let mut req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+
+        normalize_spin_request(&mut req);
+
+        // All `spin-full-url` copies are stripped after normalization.
+        assert!(
+            req.headers().get("spin-full-url").is_none(),
+            "should strip every spin-full-url copy"
+        );
+        // The trusted (last) authority wins — the attacker's host never appears.
+        assert_eq!(
+            req.headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("www.publisher.example"),
+            "should use the trusted last spin-full-url host, not the client duplicate"
+        );
+        assert_eq!(
+            req.uri().to_string(),
+            "https://www.publisher.example/first-party/proxy",
+            "should rebuild the absolute URI from the trusted authority, not evil.example"
+        );
+        assert_ne!(
+            req.uri().host(),
+            Some("evil.example"),
+            "the attacker-supplied spin-full-url must never become the runtime authority"
         );
     }
 
