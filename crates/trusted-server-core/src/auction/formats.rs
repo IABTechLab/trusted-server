@@ -350,14 +350,19 @@ mod tests {
     use super::*;
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::openrtb::{Eid, Uid};
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use http::Method;
     use serde_json::json;
     use std::collections::HashSet;
 
-    fn make_request() -> Request {
-        let mut req = Request::new("POST", "https://publisher.example.com/auction");
-        req.set_header(header::USER_AGENT, "Mozilla/5.0 test");
-        req
+    fn make_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/auction")
+            .header(header::USER_AGENT, "Mozilla/5.0 test")
+            .body(EdgeBody::empty())
+            .expect("should build request")
     }
 
     fn make_settings() -> Settings {
@@ -435,8 +440,9 @@ mod tests {
         }
     }
 
-    fn response_json(mut response: Response) -> JsonValue {
-        serde_json::from_slice(&response.take_body_bytes()).expect("should parse JSON response")
+    fn response_json(response: Response<EdgeBody>) -> JsonValue {
+        serde_json::from_slice(&response.into_body().into_bytes())
+            .expect("should parse JSON response")
     }
 
     fn make_banner_body(config: Option<JsonValue>) -> AdRequest {
@@ -466,13 +472,16 @@ mod tests {
 
     fn convert_body_to_auction_request(body: &AdRequest, settings: &Settings) -> AuctionRequest {
         let req = make_request();
+        let services = noop_services();
 
         convert_tsjs_to_auction_request(
             body,
             settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should convert banner request")
     }
@@ -666,11 +675,14 @@ mod tests {
     fn convert_tsjs_to_auction_request_propagates_missing_ec_id() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let auction_request = convert_tsjs_to_auction_request(
             &make_banner_body(None),
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
+            None,
             None,
         )
         .expect("should convert request without EC ID");
@@ -731,6 +743,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_allows_empty_banner_sizes() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
@@ -746,9 +759,11 @@ mod tests {
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should convert request with empty banner sizes");
 
@@ -763,6 +778,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_rejects_banner_sizes_that_are_not_width_height_pairs() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
@@ -780,9 +796,11 @@ mod tests {
         let err = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect_err("should reject malformed banner size");
 
@@ -796,6 +814,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_skips_units_without_banner_media() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![
                 AdUnit {
@@ -816,9 +835,11 @@ mod tests {
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should skip unsupported media units");
 
@@ -837,19 +858,25 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, true)
             .expect("should convert auction result to OpenRTB response");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         assert_eq!(
-            response.get_header_str(header::CONTENT_TYPE),
+            response
+                .headers()
+                .get(&header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "should set JSON content type"
         );
         assert_eq!(
-            response.get_header_str(HEADER_X_TS_EC_CONSENT),
+            response
+                .headers()
+                .get(&HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
             Some("ok"),
             "should set EC consent header when allowed"
         );
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            response.headers().get("x-ts-ec").is_none(),
             "should not emit removed EC ID header"
         );
 
@@ -895,7 +922,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert bid without creative HTML");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         assert_eq!(
             json["seatbid"][0]["bid"][0]["adm"],
@@ -915,7 +942,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert bid without advertiser domains");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         let bid = json["seatbid"][0]["bid"][0]
             .as_object()
@@ -941,7 +968,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert auction result without winning bids");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         assert!(
             json.get("seatbid").is_none(),

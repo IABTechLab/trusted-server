@@ -263,6 +263,7 @@ mod tests {
             | TrustedServerError::Settings { .. }
             | TrustedServerError::EdgeCookie { .. }
             | TrustedServerError::PartnerNotFound { .. }
+            | TrustedServerError::RequestTooLarge { .. }
             | TrustedServerError::InsecureDefault { .. } => (),
         };
 
@@ -370,6 +371,12 @@ mod tests {
                     message: "proxy failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::RequestTooLarge {
+                    message: "body too large".to_string(),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
             ),
         ];
 
