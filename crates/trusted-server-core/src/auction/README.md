@@ -24,7 +24,8 @@ The auction orchestration system allows you to:
                           ▼
 ┌─────────────────────────────────────────────────────────┐
 │              AuctionProvider Trait                       │
-│  - request_bids()                                        │
+│  - request_bids() async                                  │
+│  - parse_response()                                      │
 │  - provider_name()                                       │
 │  - timeout_ms()                                          │
 │  - is_enabled()                                          │
@@ -479,6 +480,7 @@ timeout_ms = 500
 use async_trait::async_trait;
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
+use crate::platform::{PlatformPendingRequest, PlatformResponse};
 
 pub struct YourAuctionProvider {
     config: YourConfig,
@@ -494,11 +496,19 @@ impl AuctionProvider for YourAuctionProvider {
         &self,
         request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         // 1. Transform AuctionRequest to your provider's format
-        // 2. Make HTTP request to your provider
-        // 3. Parse response
-        // 4. Return AuctionResponse with bids
+        // 2. Launch HTTP request through services.http_client().send_async(...)
+        // 3. Return PlatformPendingRequest for the orchestrator to await
+        todo!()
+    }
+
+    async fn parse_response(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // 4. Parse PlatformResponse into AuctionResponse
         todo!()
     }
 
@@ -534,7 +544,7 @@ let orchestrator = AuctionOrchestrator::new(config);
 orchestrator.register_provider(Arc::new(PrebidAuctionProvider::try_new(prebid_config)?));
 orchestrator.register_provider(Arc::new(ApsAuctionProvider::new(aps_config)));
 
-let result = orchestrator.run_auction(&request, &context).await?;
+let result = orchestrator.run_auction(&request, &context, &services).await?;
 
 // Check results
 assert_eq!(result.winning_bids.len(), 2);
@@ -543,7 +553,7 @@ assert!(result.total_time_ms < 2000);
 
 ## Performance Considerations
 
-- **Parallel Execution**: Currently runs sequentially in Fastly Compute (no tokio runtime), but structured for easy parallelization
+- **Parallel Execution**: Providers are launched concurrently via `select()` over `PendingRequest`s; responses are processed as they become ready within the auction deadline
 - **Timeouts**: Each provider has independent timeout; global timeout enforced at flow level
 - **Error Handling**: Provider failures don't fail entire auction; partial results returned
 

@@ -1,14 +1,15 @@
 //! Geographic location utilities for the trusted server.
 //!
-//! This module provides Fastly-specific helpers for extracting geographic
-//! information from incoming requests and writing geo headers to responses.
+//! This module provides a Fastly-to-core geo mapping helper and response-header
+//! injection for the platform-neutral [`GeoInfo`] type.
 //!
 //! The [`GeoInfo`] data type is defined in [`crate::platform`] as platform-
-//! neutral data; this module re-exports it and adds Fastly-coupled `impl`
-//! blocks for construction and response header injection.
+//! neutral data; this module re-exports it and adds helper methods for HTTP
+//! response header injection.
 
-use fastly::geo::{geo_lookup, Geo};
-use fastly::{Request, Response};
+use edgezero_core::body::Body as EdgeBody;
+use fastly::geo::Geo;
+use http::{HeaderValue, Response};
 
 pub use crate::platform::GeoInfo;
 
@@ -19,8 +20,8 @@ use crate::constants::{
 
 /// Convert a Fastly [`Geo`] value into a [`GeoInfo`].
 ///
-/// Shared by `GeoInfo::from_request` (legacy) and adapter geo lookups
-/// so that field mapping is never duplicated.
+/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
+/// that field mapping is never duplicated.
 pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
     let asn = match geo.as_number() {
         0 => None,
@@ -39,51 +40,44 @@ pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
 }
 
 impl GeoInfo {
-    /// Creates a new `GeoInfo` from a request by performing a geo lookup.
-    ///
-    /// # Legacy
-    ///
-    /// This is a Fastly-coupled convenience method that predates the
-    /// `platform` abstraction. New code should use
-    /// `RuntimeServices::geo.lookup(client_info.client_ip)` instead, which
-    /// goes through [`crate::platform::PlatformGeo`] and does not require
-    /// direct access to the Fastly request.
-    ///
-    /// # Returns
-    ///
-    /// `Some(GeoInfo)` if geo data is available, `None` otherwise
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// if let Some(geo_info) = GeoInfo::from_request(&req) {
-    ///     println!("User is in {} ({})", geo_info.city, geo_info.country);
-    /// }
-    /// ```
-    #[deprecated(note = "Use RuntimeServices::geo().lookup() instead")]
-    pub fn from_request(req: &Request) -> Option<Self> {
-        req.get_client_ip_addr()
-            .and_then(geo_lookup)
-            .map(|geo| geo_from_fastly(&geo))
-    }
-
     /// Sets geo information headers on the response.
     ///
     /// Adds `x-geo-city`, `x-geo-country`, `x-geo-continent`, `x-geo-coordinates`,
     /// `x-geo-metro-code`, `x-geo-region` (when available), and
     /// `x-geo-info-available: true` to the given response.
-    pub fn set_response_headers(&self, response: &mut Response) {
-        response.set_header(HEADER_X_GEO_CITY, &self.city);
-        response.set_header(HEADER_X_GEO_COUNTRY, &self.country);
-        response.set_header(HEADER_X_GEO_CONTINENT, &self.continent);
-        response.set_header(HEADER_X_GEO_COORDINATES, self.coordinates_string());
+    pub fn set_response_headers(&self, response: &mut Response<EdgeBody>) {
+        let headers = response.headers_mut();
+
+        insert_geo_header(headers, HEADER_X_GEO_CITY, &self.city);
+        insert_geo_header(headers, HEADER_X_GEO_COUNTRY, &self.country);
+        insert_geo_header(headers, HEADER_X_GEO_CONTINENT, &self.continent);
+        insert_geo_header(
+            headers,
+            HEADER_X_GEO_COORDINATES,
+            &self.coordinates_string(),
+        );
         if self.has_metro_code() {
-            response.set_header(HEADER_X_GEO_METRO_CODE, self.metro_code.to_string());
+            let metro_code = self.metro_code.to_string();
+            insert_geo_header(headers, HEADER_X_GEO_METRO_CODE, &metro_code);
         }
         if let Some(ref region) = self.region {
-            response.set_header(HEADER_X_GEO_REGION, region);
+            insert_geo_header(headers, HEADER_X_GEO_REGION, region);
         }
-        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "true");
+        headers.insert(
+            HEADER_X_GEO_INFO_AVAILABLE,
+            HeaderValue::from_static("true"),
+        );
+    }
+}
+
+fn insert_geo_header(headers: &mut http::HeaderMap, name: http::header::HeaderName, value: &str) {
+    match HeaderValue::from_str(value) {
+        Ok(header_value) => {
+            headers.insert(name, header_value);
+        }
+        Err(_) => {
+            log::warn!("Skipping invalid geo header value for {}", name.as_str());
+        }
     }
 }
 
@@ -123,7 +117,8 @@ pub fn is_gdpr_country(country_code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastly::Response;
+    use edgezero_core::body::Body as EdgeBody;
+    use http::Response as HttpResponse;
 
     fn sample_geo_info() -> GeoInfo {
         GeoInfo {
@@ -138,16 +133,24 @@ mod tests {
         }
     }
 
+    fn build_response() -> HttpResponse<EdgeBody> {
+        HttpResponse::builder()
+            .status(http::StatusCode::OK)
+            .body(EdgeBody::empty())
+            .expect("should build response")
+    }
+
     #[test]
     fn set_response_headers_sets_all_geo_headers() {
         let geo = sample_geo_info();
-        let mut response = Response::new();
+        let mut response = build_response();
 
         geo.set_response_headers(&mut response);
 
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_CITY)
+                .headers()
+                .get(HEADER_X_GEO_CITY)
                 .expect("should have city header")
                 .to_str()
                 .expect("should be valid str"),
@@ -156,7 +159,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_COUNTRY)
+                .headers()
+                .get(HEADER_X_GEO_COUNTRY)
                 .expect("should have country header")
                 .to_str()
                 .expect("should be valid str"),
@@ -165,7 +169,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_CONTINENT)
+                .headers()
+                .get(HEADER_X_GEO_CONTINENT)
                 .expect("should have continent header")
                 .to_str()
                 .expect("should be valid str"),
@@ -174,7 +179,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_COORDINATES)
+                .headers()
+                .get(HEADER_X_GEO_COORDINATES)
                 .expect("should have coordinates header")
                 .to_str()
                 .expect("should be valid str"),
@@ -183,7 +189,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_METRO_CODE)
+                .headers()
+                .get(HEADER_X_GEO_METRO_CODE)
                 .expect("should have metro code header")
                 .to_str()
                 .expect("should be valid str"),
@@ -192,7 +199,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_REGION)
+                .headers()
+                .get(HEADER_X_GEO_REGION)
                 .expect("should have region header")
                 .to_str()
                 .expect("should be valid str"),
@@ -201,7 +209,8 @@ mod tests {
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_INFO_AVAILABLE)
+                .headers()
+                .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .expect("should have info available header")
                 .to_str()
                 .expect("should be valid str"),
@@ -216,16 +225,16 @@ mod tests {
             metro_code: 0,
             ..sample_geo_info()
         };
-        let mut response = Response::new();
+        let mut response = build_response();
 
         geo.set_response_headers(&mut response);
 
         assert!(
-            response.get_header(HEADER_X_GEO_METRO_CODE).is_none(),
+            response.headers().get(HEADER_X_GEO_METRO_CODE).is_none(),
             "should not set metro code header when metro_code is 0"
         );
         assert!(
-            response.get_header(HEADER_X_GEO_CITY).is_some(),
+            response.headers().get(HEADER_X_GEO_CITY).is_some(),
             "should still set city header"
         );
     }
@@ -269,21 +278,22 @@ mod tests {
             region: None,
             ..sample_geo_info()
         };
-        let mut response = Response::new();
+        let mut response = build_response();
 
         geo.set_response_headers(&mut response);
 
         assert!(
-            response.get_header(HEADER_X_GEO_REGION).is_none(),
+            response.headers().get(HEADER_X_GEO_REGION).is_none(),
             "should not set region header when region is None"
         );
         assert!(
-            response.get_header(HEADER_X_GEO_CITY).is_some(),
+            response.headers().get(HEADER_X_GEO_CITY).is_some(),
             "should still set city header"
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_GEO_INFO_AVAILABLE)
+                .headers()
+                .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .expect("should have info available header")
                 .to_str()
                 .expect("should be valid str"),

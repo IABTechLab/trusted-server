@@ -23,10 +23,11 @@
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, StatusCode};
-use fastly::{Body, Request, Response};
+use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
@@ -35,8 +36,6 @@ use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
-use crate::backend::BackendConfig;
-use crate::compat;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
@@ -46,7 +45,7 @@ use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{price_bucket, PriceGranularity};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
@@ -54,26 +53,40 @@ use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, S
 use crate::streaming_replacer::create_url_replacer;
 
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
+const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Read buffer size for streaming body processing and brotli internal buffers.
 /// Both the `Decompressor` and `CompressorWriter` use this value so all
 /// brotli I/O layers operate on consistently-sized chunks.
 const STREAM_CHUNK_SIZE: usize = 8192;
 
-fn restrict_accept_encoding(req: &mut Request) {
+fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
+    std::io::Cursor::new(body.into_bytes())
+}
+
+fn not_found_response() -> Response<EdgeBody> {
+    let mut response = Response::new(EdgeBody::from("Not Found"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
+}
+
+fn restrict_accept_encoding(req: &mut Request<EdgeBody>) {
     // If the client sent no Accept-Encoding, leave the request unchanged so the
     // origin responds without compression. Adding encodings here would cause the
     // origin to compress its response even though the client never asked for it,
     // and the client would then receive content it cannot decode.
     let Some(current) = req
-        .get_header(header::ACCEPT_ENCODING)
+        .headers()
+        .get(header::ACCEPT_ENCODING)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
     else {
         return;
     };
-    req.set_header(
+    req.headers_mut().insert(
         header::ACCEPT_ENCODING,
-        select_supported_accept_encoding(current),
+        HeaderValue::from_str(&select_supported_accept_encoding(&current))
+            .expect("supported accept-encoding should be a valid header value"),
     );
 }
 
@@ -146,27 +159,25 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
 ///
 /// This function never returns an error; the Result type is for API consistency.
 pub fn handle_tsjs_dynamic(
-    req: &Request,
+    req: &Request<EdgeBody>,
     integration_registry: &IntegrationRegistry,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     const PREFIX: &str = "/static/tsjs=";
     const UNIFIED_FILENAMES: &[&str] = &["tsjs-unified.js", "tsjs-unified.min.js"];
 
-    let path = req.get_path();
+    let path = req.uri().path();
     if !path.starts_with(PREFIX) {
-        return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+        return Ok(not_found_response());
     }
     let filename = &path[PREFIX.len()..];
-    let http_req = compat::from_fastly_headers_ref(req);
 
     if UNIFIED_FILENAMES.contains(&filename) {
         // Serve core + immediate modules (excludes deferred like prebid)
         let module_ids = integration_registry.js_module_ids_immediate();
         let body = trusted_server_js::concatenate_modules(&module_ids);
-        let http_resp =
-            serve_static_with_etag(&body, &http_req, "application/javascript; charset=utf-8");
-        let mut resp = compat::to_fastly_response(http_resp);
-        resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+        let mut resp = serve_static_with_etag(&body, req, "application/javascript; charset=utf-8");
+        resp.headers_mut()
+            .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
         return Ok(resp);
     }
 
@@ -174,18 +185,18 @@ pub fn handle_tsjs_dynamic(
         // Only serve if the deferred module is actually enabled
         let deferred_ids = integration_registry.js_module_ids_deferred();
         if !deferred_ids.contains(&module_id) {
-            return Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"));
+            return Ok(not_found_response());
         }
         if let Some(content) = trusted_server_js::module_bundle(module_id) {
-            let http_resp =
-                serve_static_with_etag(content, &http_req, "application/javascript; charset=utf-8");
-            let mut resp = compat::to_fastly_response(http_resp);
-            resp.set_header(HEADER_X_COMPRESS_HINT, "on");
+            let mut resp =
+                serve_static_with_etag(content, req, "application/javascript; charset=utf-8");
+            resp.headers_mut()
+                .insert(HEADER_X_COMPRESS_HINT, HeaderValue::from_static("on"));
             return Ok(resp);
         }
     }
 
-    Ok(Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found"))
+    Ok(not_found_response())
 }
 
 /// Extract a module ID from a deferred-module filename like `tsjs-prebid.min.js`.
@@ -229,7 +240,7 @@ struct ProcessResponseParams<'a> {
 ///
 /// Returns an error if processor creation or chunk processing fails.
 fn process_response_streaming<W: Write>(
-    body: Body,
+    body: EdgeBody,
     output: &mut W,
     params: &ProcessResponseParams,
 ) -> Result<(), Report<TrustedServerError>> {
@@ -261,7 +272,7 @@ fn process_response_streaming<W: Write>(
             params.ad_slots_script.map(str::to_string),
             params.ad_bids_state.clone(),
         )?;
-        StreamingPipeline::new(config, processor).process(body, output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
     } else if is_rsc_flight {
         // RSC Flight responses are length-prefixed (T rows). A naive string replacement will
         // corrupt the stream by changing byte lengths without updating the prefixes.
@@ -271,7 +282,7 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, processor).process(body, output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
     } else {
         let replacer = create_url_replacer(
             params.origin_host,
@@ -279,7 +290,7 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, replacer).process(body, output)?;
+        StreamingPipeline::new(config, replacer).process(body_as_reader(body), output)?;
     }
 
     Ok(())
@@ -319,24 +330,46 @@ fn create_html_stream_processor(
 /// should be streamed or has already been buffered.
 pub enum PublisherResponse {
     /// Response is fully buffered and ready to send via `send_to_client()`.
-    Buffered(Response),
-    /// Response headers are ready for a streaming response. EC finalization is
-    /// header-only and must run before the adapter commits the headers.
+    Buffered(Response<EdgeBody>),
+    /// Response headers are ready for a streaming response. Covers processable
+    /// content on any status (2xx or non-2xx — e.g., branded 404/500 HTML and
+    /// error JSON still get URL rewriting) where the encoding is supported
+    /// and either the content is non-HTML or no HTML post-processors are
+    /// registered. The caller must:
+    /// 1. Call `finalize_response()` on the response
+    /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
+    /// 3. Call `stream_publisher_body()` with the body and streaming writer
+    /// 4. Call `StreamingBody::finish()`
+    ///
+    /// **Interim (PR 15):** `body` has already been fully materialised into
+    /// WASM heap by the platform HTTP client.  `stream_publisher_body` reads
+    /// from an in-memory buffer, not a live origin stream.  The origin-side
+    /// peak is bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`.
     Stream {
-        /// Response with all non-EC headers set but body not yet written.
-        response: Response,
+        /// Response with all headers set (EC ID, cookies, etc.)
+        /// but body not yet written. `Content-Length` already removed.
+        response: Response<EdgeBody>,
         /// Origin body to be piped through the streaming pipeline.
-        body: Body,
+        body: EdgeBody,
         /// Parameters for [`process_response_streaming`].
         params: Box<OwnedProcessResponseParams>,
     },
-    /// Non-processable `2xx` response (images, fonts, video). The adapter must
-    /// reattach the body before sending it to the client.
+    /// Non-processable 2xx response (images, fonts, video). The adapter must
+    /// reattach the body via setting the body before returning.
+    /// `finalize_response()` and `send_to_client()` are applied at the outer
+    /// response-dispatch level, not in this arm.
+    ///
+    /// `Content-Length` is preserved — the body is unmodified.
+    ///
+    /// **Interim (PR 15):** `body` has been fully materialised into WASM heap.
+    /// Previously, binary assets streamed lazily from origin with no WASM
+    /// buffering.  This path is now bounded by `MAX_PLATFORM_RESPONSE_BODY_BYTES`;
+    /// assets exceeding that limit return an error instead of exhausting heap.
     PassThrough {
-        /// Response with headers set but body not yet written.
-        response: Response,
+        /// Response with all headers set but body not yet written.
+        response: Response<EdgeBody>,
         /// Origin body to stream directly to the client.
-        body: Body,
+        body: EdgeBody,
     },
 }
 
@@ -413,7 +446,9 @@ pub struct OwnedProcessResponseParams {
 /// Stream the publisher response body through the processing pipeline.
 ///
 /// Called by the adapter after `stream_to_client()` has committed the response
-/// headers. Writes processed chunks directly to `output`.
+/// headers. Runs synchronously against an already-materialised body; the async
+/// I/O happened upstream in [`handle_publisher_request`]. Writes processed
+/// chunks directly to `output`.
 ///
 /// # Errors
 ///
@@ -421,7 +456,7 @@ pub struct OwnedProcessResponseParams {
 /// committed, the caller should log the error and drop the `StreamingBody`
 /// (client sees a truncated response).
 pub fn stream_publisher_body<W: Write>(
-    body: Body,
+    body: EdgeBody,
     output: &mut W,
     params: &OwnedProcessResponseParams,
     settings: &Settings,
@@ -464,7 +499,7 @@ pub fn stream_publisher_body<W: Write>(
 /// Returns an error if processing fails mid-stream. Headers are already
 /// committed at that point; the caller logs and drops the `StreamingBody`.
 pub async fn stream_publisher_body_async<W: Write>(
-    body: Body,
+    body: EdgeBody,
     output: &mut W,
     params: &mut OwnedProcessResponseParams,
     settings: &Settings,
@@ -482,7 +517,10 @@ pub async fn stream_publisher_body_async<W: Write>(
     if !is_html {
         // Non-HTML: collect auction first, then stream.  There is no </body>
         // to hold, so delaying the entire body until collection is acceptable.
-        let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
+        let placeholder = Request::builder()
+            .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
+            .body(EdgeBody::empty())
+            .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
         let result = orchestrator
             .collect_dispatched_auction(
                 dispatched,
@@ -541,10 +579,10 @@ pub async fn stream_publisher_body_async<W: Write>(
 fn make_collect_context<'a>(
     settings: &'a Settings,
     services: &'a RuntimeServices,
-    placeholder: &'a Request,
+    placeholder: &'a Request<EdgeBody>,
 ) -> AuctionContext<'a> {
     debug_assert_eq!(
-        placeholder.get_url_str(),
+        placeholder.uri().to_string(),
         crate::auction::types::MEDIATOR_PLACEHOLDER_URL,
         "make_collect_context must be given the canonical placeholder; \
          callers must not forward a real client request through the collect path"
@@ -567,8 +605,12 @@ pub(crate) const BOT_USER_AGENT_FRAGMENTS: &[&str] =
 
 /// Returns true when the request's User-Agent matches any well-known crawler
 /// fragment in [`BOT_USER_AGENT_FRAGMENTS`].
-pub(crate) fn is_bot_user_agent(req: &Request) -> bool {
-    let ua = req.get_header_str("user-agent").unwrap_or("");
+pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
+    let ua = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     BOT_USER_AGENT_FRAGMENTS
         .iter()
         .any(|frag| ua.contains(frag))
@@ -576,12 +618,14 @@ pub(crate) fn is_bot_user_agent(req: &Request) -> bool {
 
 /// Returns true when the request advertises itself as a prefetch via either
 /// the standard `Sec-Purpose` or the legacy `Purpose` header.
-pub(crate) fn is_prefetch_request(req: &Request) -> bool {
-    req.get_header_str("sec-purpose")
-        .is_some_and(|v| v.contains("prefetch"))
-        || req
-            .get_header_str("purpose")
+pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("prefetch"))
+    };
+    header("sec-purpose") || header("purpose")
 }
 
 /// Returns true only when the publisher request should run the full
@@ -673,7 +717,7 @@ struct AuctionCollectCtx<'a> {
 /// Run the close-body hold loop for HTML bodies, collecting the auction before
 /// the raw `</body` tail is processed so `lol_html` sees live bids.
 async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
-    body: Body,
+    body: EdgeBody,
     output: &mut W,
     processor: &mut P,
     compression: Compression,
@@ -685,6 +729,7 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
     use flate2::read::{GzDecoder, ZlibDecoder};
     use flate2::write::{GzEncoder, ZlibEncoder};
 
+    let body = body_as_reader(body);
     match compression {
         Compression::None => body_close_hold_loop(body, output, processor, ctx).await,
         Compression::Gzip => {
@@ -914,7 +959,10 @@ async fn collect_stream_auction(
     settings: &Settings,
 ) {
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
-    let placeholder = Request::get(crate::auction::types::MEDIATOR_PLACEHOLDER_URL);
+    let placeholder = Request::builder()
+        .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
+        .body(EdgeBody::empty())
+        .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
     let collect_ctx = make_collect_context(settings, services, &placeholder);
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
@@ -1001,27 +1049,28 @@ pub async fn handle_publisher_request(
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
     auction: AuctionDispatch<'_>,
-    mut req: Request,
+    mut req: Request<EdgeBody>,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    let http_req = compat::from_fastly_headers_ref(&req);
-
     // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
-    let request_info = RequestInfo::from_request(&http_req, &services.client_info);
+    let request_info = RequestInfo::from_request(&req, services.client_info());
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
     log::debug!(
-        "Request info extracted: has_host={}, scheme={}",
-        !request_host.is_empty(),
-        request_scheme
+        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
+        request_host,
+        request_scheme,
+        req.headers().get("x-forwarded-host"),
+        req.headers().get(header::HOST),
+        req.headers().get("x-forwarded-proto"),
     );
 
-    let is_navigation = is_navigation_request(&http_req);
+    let is_navigation = is_navigation_request(&req);
 
     // Generate a new EC ID only for document navigations. Subresource
     // requests (fonts, images, CSS) may lack consent signals such as the
@@ -1043,21 +1092,49 @@ pub async fn handle_publisher_request(
 
     let consent_context = ec_context.consent().clone();
     let ec_id = ec_context.ec_value().filter(|_| ec_allowed);
-    let cookie_jar = handle_request_cookies(&http_req)?;
+    let cookie_jar = handle_request_cookies(&req)?;
     let geo = ec_context.geo_info().cloned();
 
-    let backend_name = BackendConfig::from_url_with_host_header_override(
-        &settings.publisher.origin_url,
-        settings.proxy.certificate_check,
-        settings.publisher.origin_host_header_override.as_deref(),
+    let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
+        TrustedServerError::Proxy {
+            message: format!("Invalid origin_url: {}", settings.publisher.origin_url),
+        },
     )?;
+    let origin_scheme = parsed_origin.scheme().to_string();
+    let origin_host_without_port = parsed_origin.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in origin_url".to_string(),
+        })
+    })?;
+    let backend_name = services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: origin_scheme.clone(),
+            host: origin_host_without_port.to_string(),
+            port: parsed_origin.port(),
+            certificate_check: settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "backend registration failed".to_string(),
+        })?;
     let origin_host = settings.publisher.origin_host();
     let origin_host_header = settings.publisher.origin_host_header();
+    let origin_path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(http::uri::PathAndQuery::as_str)
+        .unwrap_or("/");
+    let target_uri = format!("{origin_scheme}://{origin_host}{origin_path_and_query}")
+        .parse::<Uri>()
+        .change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin uri".to_string(),
+        })?;
 
     log::debug!("Proxying request to configured publisher backend");
 
-    let request_path = req.get_path().to_string();
-    let is_get = req.get_method() == fastly::http::Method::GET;
+    let request_path = req.uri().path().to_string();
+    let is_get = req.method() == http::Method::GET;
 
     let is_prefetch = is_prefetch_request(&req);
     let is_bot = is_bot_user_agent(&req);
@@ -1122,7 +1199,9 @@ pub async fn handle_publisher_request(
             ec_id,
             &consent_context,
             &request_info,
-            req.get_header_str("user-agent"),
+            req.headers()
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
         );
         let ts_eids_value = cookie_jar
             .as_ref()
@@ -1141,7 +1220,7 @@ pub async fn handle_publisher_request(
         if had_eids && auction_request.user.eids.is_none() {
             log::warn!("Server-side auction EIDs stripped by TCF consent gating");
         }
-        let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
+        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
         if client_ip.is_some() || geo.is_some() {
             let device = auction_request.device.get_or_insert(DeviceInfo {
                 user_agent: None,
@@ -1161,6 +1240,7 @@ pub async fn handle_publisher_request(
         auction
             .orchestrator
             .dispatch_auction(&auction_request, &auction_context)
+            .await
     } else {
         None
     };
@@ -1175,27 +1255,29 @@ pub async fn handle_publisher_request(
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
-    req.set_header("host", &origin_host_header);
+    *req.uri_mut() = target_uri;
+    req.headers_mut().insert(
+        header::HOST,
+        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
+            message: "invalid publisher origin host header".to_string(),
+        })?,
+    );
 
-    // Dispatch origin — SSP requests are already racing in Fastly's native layer.
-    // TTFB ≈ origin latency instead of TTFB ≈ auction timeout.
-    let pending_origin =
-        req.send_async(&backend_name)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to dispatch async origin request".to_string(),
-            })?;
-
-    // Now yield for origin.
-    let mut response = pending_origin
-        .wait()
+    // SSP requests are already racing through the platform HTTP client, so
+    // origin TTFB tracks origin latency rather than the auction timeout.
+    let mut response = services
+        .http_client()
+        .send(PlatformHttpRequest::new(req, backend_name))
+        .await
         .change_context(TrustedServerError::Proxy {
-            message: "Failed to await origin response".to_string(),
-        })?;
+            message: "Failed to proxy request to origin".to_string(),
+        })?
+        .response;
 
     log::debug!(
         "Publisher origin response received: status={}, header_count={}",
-        response.get_status(),
-        response.get_headers().count()
+        response.status(),
+        response.headers().len()
     );
 
     let ad_slots_script = if should_run_ad_stack {
@@ -1220,24 +1302,30 @@ pub async fn handle_publisher_request(
     // per-user slot state). The separate EC-cookie cache net in the adapter's
     // `finalize_response` keeps first-visit identity responses private.
     let origin_content_type = response
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
     if should_run_ad_stack && is_html_content_type(origin_content_type) {
-        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
-        response.remove_header("surrogate-control");
-        response.remove_header("fastly-surrogate-control");
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
+        response.headers_mut().remove("surrogate-control");
+        response.headers_mut().remove("fastly-surrogate-control");
     }
 
     let content_type = response
-        .get_header(header::CONTENT_TYPE)
+        .headers()
+        .get(header::CONTENT_TYPE)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_string();
 
-    let status = response.get_status();
+    let status = response.status();
     let content_encoding = response
-        .get_header(header::CONTENT_ENCODING)
+        .headers()
+        .get(header::CONTENT_ENCODING)
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_lowercase();
@@ -1258,7 +1346,8 @@ pub async fn handle_publisher_request(
                 content_type,
                 status,
             );
-            let body = response.take_body();
+            let (parts, body) = response.into_parts();
+            let response = Response::from_parts(parts, EdgeBody::empty());
             Ok(PublisherResponse::PassThrough { response, body })
         }
         ResponseRoute::BufferedUnmodified => {
@@ -1288,8 +1377,8 @@ pub async fn handle_publisher_request(
                 content_encoding
             );
 
-            let body = response.take_body();
-            response.remove_header(header::CONTENT_LENGTH);
+            let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
+            response.headers_mut().remove(header::CONTENT_LENGTH);
 
             Ok(PublisherResponse::Stream {
                 response,
@@ -1595,10 +1684,14 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
 ///   the request carries the non-simple `X-TSJS-Page-Bids` header set by the
 ///   tsjs SPA hook — cross-origin callers cannot attach it without a CORS
 ///   preflight, which this endpoint never grants.
-fn page_bids_request_allowed(req: &Request) -> bool {
-    match req.get_header_str("sec-fetch-site") {
+fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
+    match req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(site) => site == "same-origin",
-        None => req.get_header("x-tsjs-page-bids").is_some(),
+        None => req.headers().contains_key("x-tsjs-page-bids"),
     }
 }
 
@@ -1626,30 +1719,40 @@ pub async fn handle_page_bids(
     kv: Option<&KvIdentityGraph>,
     auction: AuctionDispatch<'_>,
     ec_context: &EcContext,
-    req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(co_config) = &settings.creative_opportunities else {
-        return Ok(Response::from_status(StatusCode::NOT_FOUND)
-            .with_body_text_plain("Creative opportunities not configured"));
+        let mut response = Response::new(EdgeBody::from("Creative opportunities not configured"));
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        return Ok(response);
     };
 
     // CSRF-style gate: refuse cross-site invocations before any auction work.
     if !page_bids_request_allowed(&req) {
         log::debug!(
             "page-bids: rejecting request (sec-fetch-site={:?}, tsjs header present={})",
-            req.get_header_str("sec-fetch-site"),
-            req.get_header("x-tsjs-page-bids").is_some()
+            req.headers()
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok()),
+            req.headers().contains_key("x-tsjs-page-bids")
         );
-        return Ok(Response::from_status(StatusCode::FORBIDDEN)
-            .with_header(header::CACHE_CONTROL, "private, no-store")
-            .with_body_text_plain("Forbidden"));
+        let mut response = Response::new(EdgeBody::from("Forbidden"));
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return Ok(response);
     }
 
     let path_param = req
-        .get_url()
-        .query_pairs()
-        .find(|(k, _)| k == "path")
-        .map(|(_, v)| normalize_page_bids_path(&v))
+        .uri()
+        .query()
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(k, _)| k == "path")
+                .map(|(_, v)| normalize_page_bids_path(&v))
+        })
         .unwrap_or_else(|| "/".to_string());
 
     let matched_slots: Vec<_> =
@@ -1658,13 +1761,11 @@ pub async fn handle_page_bids(
             .cloned()
             .collect();
 
-    let http_req = compat::from_fastly_headers_ref(&req);
-    let request_info =
-        crate::http_util::RequestInfo::from_request(&http_req, &services.client_info);
+    let request_info = crate::http_util::RequestInfo::from_request(&req, services.client_info());
     let ec_id = ec_context.ec_value().filter(|_| ec_context.ec_allowed());
     let consent_context = ec_context.consent();
     let geo = ec_context.geo_info().cloned();
-    let cookie_jar = handle_request_cookies(&http_req)?;
+    let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
@@ -1708,7 +1809,9 @@ pub async fn handle_page_bids(
             ec_id,
             consent_context,
             &request_info,
-            req.get_header_str("user-agent"),
+            req.headers()
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
         );
         let ts_eids_value = cookie_jar
             .as_ref()
@@ -1727,7 +1830,7 @@ pub async fn handle_page_bids(
         if had_eids && auction_request.user.eids.is_none() {
             log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
         }
-        let client_ip = services.client_info.client_ip.map(|ip| ip.to_string());
+        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
         if client_ip.is_some() || geo.is_some() {
             let device = auction_request.device.get_or_insert(DeviceInfo {
                 user_agent: None,
@@ -1802,10 +1905,15 @@ pub async fn handle_page_bids(
         message: "Failed to serialize page-bids response".to_string(),
     })?;
 
-    let mut response = Response::from_status(StatusCode::OK);
-    response.set_header(header::CONTENT_TYPE, "application/json");
-    response.set_header(header::CACHE_CONTROL, "private, no-store");
-    response.set_body(json_str);
+    let mut response = Response::new(EdgeBody::from(json_str));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
 
     Ok(response)
 }
@@ -1814,7 +1922,6 @@ pub async fn handle_page_bids(
 mod tests {
     use std::io::{self, Read as _, Write as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     use brotli::enc::writer::CompressorWriter;
     use brotli::Decompressor;
@@ -1826,7 +1933,9 @@ mod tests {
     use crate::integrations::IntegrationRegistry;
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::{header, Method, StatusCode};
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{header, Method, Request as HttpRequest, StatusCode};
+    use std::sync::Arc;
 
     struct ChunkedReader {
         chunks: std::collections::VecDeque<Vec<u8>>,
@@ -1948,6 +2057,109 @@ mod tests {
             site: None,
             context: Default::default(),
         }
+    }
+
+    fn build_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::empty())
+            .expect("should build test request")
+    }
+
+    #[test]
+    fn stream_publisher_body_round_trips_gzip() {
+        let settings = create_test_settings();
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.js\"}";
+        let compressed = gzip_encode(input);
+        let params = make_stream_params(&settings, "gzip");
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            EdgeBody::from(compressed),
+            &mut output,
+            &params,
+            &settings,
+            &integration_registry,
+        )
+        .expect("should stream gzip response through rewrite pipeline");
+
+        let decoded = gzip_decode(&output);
+        let decoded = String::from_utf8(decoded).expect("should decode rewritten gzip payload");
+        assert!(
+            decoded.contains("https://test-publisher.com/path/file.js"),
+            "should rewrite origin URLs to the request host"
+        );
+        assert!(
+            !decoded.contains("origin.test-publisher.com"),
+            "should remove the origin hostname from the rewritten payload"
+        );
+    }
+
+    #[test]
+    fn stream_publisher_body_round_trips_brotli() {
+        let settings = create_test_settings();
+        let integration_registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.css\"}";
+        let compressed = brotli_encode(input);
+        let params = make_stream_params(&settings, "br");
+        let mut output = Vec::new();
+
+        stream_publisher_body(
+            EdgeBody::from(compressed),
+            &mut output,
+            &params,
+            &settings,
+            &integration_registry,
+        )
+        .expect("should stream brotli response through rewrite pipeline");
+
+        let decoded = brotli_decode(&output);
+        let decoded = String::from_utf8(decoded).expect("should decode rewritten brotli payload");
+        assert!(
+            decoded.contains("https://test-publisher.com/path/file.css"),
+            "should rewrite origin URLs to the request host"
+        );
+        assert!(
+            !decoded.contains("origin.test-publisher.com"),
+            "should remove the origin hostname from the rewritten payload"
+        );
+    }
+
+    #[test]
+    fn request_ec_uses_cookie_not_header() {
+        let settings = create_test_settings();
+        let header_ec = format!("{}.HdrId1", "a".repeat(64));
+        let cookie_ec = format!("{}.CkId01", "b".repeat(64));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test.example.com/page")
+            .header("x-ts-ec", &header_ec)
+            .header("cookie", format!("ts-ec={cookie_ec}; other=value"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let fastly_req = crate::compat::to_fastly_request_ref(&req);
+
+        let ec_context =
+            EcContext::read_from_request(&settings, &fastly_req).expect("should read EC context");
+
+        assert_eq!(
+            ec_context.ec_value(),
+            Some(cookie_ec.as_str()),
+            "should resolve request EC ID from cookie"
+        );
+        assert!(
+            ec_context.cookie_was_present(),
+            "should detect cookie was present"
+        );
+        assert_eq!(
+            ec_context.existing_cookie_ec_id(),
+            Some(cookie_ec.as_str()),
+            "should return cookie EC value for revocation"
+        );
     }
 
     #[test]
@@ -2395,22 +2607,30 @@ mod tests {
     fn pass_through_preserves_body_and_content_length() {
         let image_bytes: Vec<u8> = (0..=255).cycle().take(4096).collect();
 
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header("content-type", "image/png");
-        response.set_header("content-length", image_bytes.len().to_string());
-        response.set_body(Body::from(image_bytes.clone()));
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/png")
+            .header(header::CONTENT_LENGTH, image_bytes.len() as u64)
+            .body(EdgeBody::from(image_bytes.clone()))
+            .expect("should build test response");
 
-        let body = response.take_body();
+        // Simulate PassThrough: take body then reattach
+        let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
+        // Body is unmodified — Content-Length stays correct
         assert_eq!(
             response
-                .get_header_str("content-length")
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
                 .expect("should have content-length"),
             "4096",
             "Content-Length should be preserved for pass-through"
         );
 
-        response.set_body(body);
-        let output = response.into_body().into_bytes();
+        // Reattach and verify body content
+        *response.body_mut() = body;
+        let (_, final_body) = response.into_parts();
+        let output = final_body.into_bytes();
         assert_eq!(
             output, image_bytes,
             "pass-through should preserve body byte-for-byte"
@@ -2422,15 +2642,23 @@ mod tests {
         let test_encodings = vec!["gzip", "deflate", "br", "identity", ""];
 
         for encoding in test_encodings {
-            let mut req = Request::new(Method::GET, "https://test.example.com/page");
-            req.set_header("accept-encoding", "gzip, deflate, br");
+            let mut req = build_request(Method::GET, "https://test.example.com/page");
+            req.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                http::HeaderValue::from_static("gzip, deflate, br"),
+            );
 
             if !encoding.is_empty() {
-                req.set_header("content-encoding", encoding);
+                req.headers_mut().insert(
+                    header::CONTENT_ENCODING,
+                    http::HeaderValue::from_str(encoding)
+                        .expect("content encoding should be valid"),
+                );
             }
 
             let content_encoding = req
-                .get_header("content-encoding")
+                .headers()
+                .get(header::CONTENT_ENCODING)
                 .map(|h| h.to_str().unwrap_or_default())
                 .unwrap_or_default();
 
@@ -2440,12 +2668,13 @@ mod tests {
 
     #[test]
     fn publisher_proxy_does_not_add_accept_encoding_when_absent() {
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        // No Accept-Encoding header set by the client.
 
         restrict_accept_encoding(&mut req);
 
         assert_eq!(
-            req.get_header_str(header::ACCEPT_ENCODING),
+            req.headers().get(header::ACCEPT_ENCODING),
             None,
             "publisher proxy should not inject Accept-Encoding when the client sent none"
         );
@@ -2453,13 +2682,18 @@ mod tests {
 
     #[test]
     fn publisher_proxy_limits_accept_encoding_to_supported_values() {
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd");
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip, deflate, br, zstd"),
+        );
 
         restrict_accept_encoding(&mut req);
 
         assert_eq!(
-            req.get_header_str(header::ACCEPT_ENCODING),
+            req.headers()
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
             Some("gzip, deflate, br"),
             "publisher fallback should only advertise encodings the rewrite pipeline supports"
         );
@@ -2467,13 +2701,18 @@ mod tests {
 
     #[test]
     fn publisher_proxy_preserves_identity_only_accept_encoding() {
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header(header::ACCEPT_ENCODING, "identity");
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("identity"),
+        );
 
         restrict_accept_encoding(&mut req);
 
         assert_eq!(
-            req.get_header_str(header::ACCEPT_ENCODING),
+            req.headers()
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
             Some("identity"),
             "publisher fallback should preserve identity-only clients"
         );
@@ -2481,13 +2720,18 @@ mod tests {
 
     #[test]
     fn publisher_proxy_respects_supported_client_subset() {
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header(header::ACCEPT_ENCODING, "br, gzip;q=0, zstd");
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("br, gzip;q=0, zstd"),
+        );
 
         restrict_accept_encoding(&mut req);
 
         assert_eq!(
-            req.get_header_str(header::ACCEPT_ENCODING),
+            req.headers()
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
             Some("br"),
             "publisher fallback should only advertise the supported encodings the client accepts"
         );
@@ -2495,105 +2739,20 @@ mod tests {
 
     #[test]
     fn publisher_proxy_falls_back_to_identity_for_unsupported_client_encodings() {
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header(header::ACCEPT_ENCODING, "zstd");
+        let mut req = build_request(Method::GET, "https://test.example.com/page");
+        req.headers_mut().insert(
+            header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("zstd"),
+        );
 
         restrict_accept_encoding(&mut req);
 
         assert_eq!(
-            req.get_header_str(header::ACCEPT_ENCODING),
+            req.headers()
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
             Some("identity"),
             "publisher fallback should request identity when the client only accepts unsupported encodings"
-        );
-    }
-
-    #[test]
-    fn stream_publisher_body_round_trips_gzip() {
-        let settings = create_test_settings();
-        let integration_registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.js\"}";
-        let compressed = gzip_encode(input);
-        let params = make_stream_params(&settings, "gzip");
-        let mut output = Vec::new();
-
-        stream_publisher_body(
-            Body::from(compressed),
-            &mut output,
-            &params,
-            &settings,
-            &integration_registry,
-        )
-        .expect("should stream gzip response through rewrite pipeline");
-
-        let decoded = gzip_decode(&output);
-        let decoded = String::from_utf8(decoded).expect("should decode rewritten gzip payload");
-        assert!(
-            decoded.contains("https://test-publisher.com/path/file.js"),
-            "should rewrite origin URLs to the request host"
-        );
-        assert!(
-            !decoded.contains("origin.test-publisher.com"),
-            "should remove the origin hostname from the rewritten payload"
-        );
-    }
-
-    #[test]
-    fn stream_publisher_body_round_trips_brotli() {
-        let settings = create_test_settings();
-        let integration_registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let input = b"{\"asset\":\"https://origin.test-publisher.com/path/file.css\"}";
-        let compressed = brotli_encode(input);
-        let params = make_stream_params(&settings, "br");
-        let mut output = Vec::new();
-
-        stream_publisher_body(
-            Body::from(compressed),
-            &mut output,
-            &params,
-            &settings,
-            &integration_registry,
-        )
-        .expect("should stream brotli response through rewrite pipeline");
-
-        let decoded = brotli_decode(&output);
-        let decoded = String::from_utf8(decoded).expect("should decode rewritten brotli payload");
-        assert!(
-            decoded.contains("https://test-publisher.com/path/file.css"),
-            "should rewrite origin URLs to the request host"
-        );
-        assert!(
-            !decoded.contains("origin.test-publisher.com"),
-            "should remove the origin hostname from the rewritten payload"
-        );
-    }
-
-    #[test]
-    fn request_ec_uses_cookie_not_header() {
-        let settings = create_test_settings();
-        let header_ec = format!("{}.HdrId1", "a".repeat(64));
-        let cookie_ec = format!("{}.CkId01", "b".repeat(64));
-        let mut req = Request::new(Method::GET, "https://test.example.com/page");
-        req.set_header("x-ts-ec", &header_ec);
-        req.set_header("cookie", format!("ts-ec={cookie_ec}; other=value"));
-
-        let ec_context =
-            EcContext::read_from_request(&settings, &req).expect("should read EC context");
-
-        assert_eq!(
-            ec_context.ec_value(),
-            Some(cookie_ec.as_str()),
-            "should resolve request EC ID from cookie"
-        );
-        assert!(
-            ec_context.cookie_was_present(),
-            "should detect cookie was present"
-        );
-        assert_eq!(
-            ec_context.existing_cookie_ec_id(),
-            Some(cookie_ec.as_str()),
-            "should return cookie EC value for revocation"
         );
     }
 
@@ -2602,13 +2761,13 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=unknown.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
-        assert_eq!(response.get_status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -2616,13 +2775,13 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-unified.min.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
-        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -2668,14 +2827,14 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::OK,
             "should serve deferred prebid module when enabled"
         );
@@ -2696,14 +2855,14 @@ mod tests {
             .expect("should update prebid config");
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-prebid.min.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::NOT_FOUND,
             "should return 404 for disabled deferred module"
         );
@@ -2714,14 +2873,14 @@ mod tests {
         let settings = create_test_settings();
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://publisher.example/static/tsjs=tsjs-evil.min.js",
         );
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::NOT_FOUND,
             "should reject unknown module names"
         );
@@ -2746,7 +2905,7 @@ mod tests {
             encoder.finish().expect("should finish compression");
         }
 
-        let body = Body::from(compressed);
+        let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
             content_encoding: "gzip".to_string(),
             origin_host: "origin.example.com".to_string(),
@@ -2806,8 +2965,14 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        stream_publisher_body(Body::new(), &mut output, &params, &settings, &registry)
-            .expect("should succeed on empty body");
+        stream_publisher_body(
+            EdgeBody::empty(),
+            &mut output,
+            &params,
+            &settings,
+            &registry,
+        )
+        .expect("should succeed on empty body");
 
         assert!(
             output.is_empty(),
@@ -2841,7 +3006,7 @@ mod tests {
         let mut output = Vec::new();
 
         stream_publisher_body(
-            Body::from(b"<html><head></head><body>content</body></html>".to_vec()),
+            EdgeBody::from(b"<html><head></head><body>content</body></html>".to_vec()),
             &mut output,
             &params,
             &settings,
@@ -2886,7 +3051,7 @@ mod tests {
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
 
-        let bogus_body = Body::from(b"<html>not gzip</html>".to_vec());
+        let bogus_body = EdgeBody::from(b"<html>not gzip</html>".to_vec());
         let mut output = Vec::new();
         let result = stream_publisher_body(bogus_body, &mut output, &params, &settings, &registry);
 
@@ -2910,22 +3075,27 @@ mod tests {
         // reattachment half of the contract.
         let image_bytes: Vec<u8> = (0..=127).cycle().take(2048).collect();
 
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header(header::CONTENT_TYPE, "image/png");
-        response.set_header(header::CONTENT_LENGTH, image_bytes.len().to_string());
-        response.set_body(Body::from(image_bytes.clone()));
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/png")
+            .header(header::CONTENT_LENGTH, image_bytes.len() as u64)
+            .body(EdgeBody::from(image_bytes.clone()))
+            .expect("should build test response");
 
         // Mirror adapter: take body, then reattach.
-        let body = response.take_body();
-        response.set_body(body);
+        let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
+        *response.body_mut() = body;
 
         assert_eq!(
             response
-                .get_header_str(header::CONTENT_LENGTH)
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
                 .expect("content-length should survive"),
             "2048"
         );
-        let round_trip = response.into_body().into_bytes();
+        let (_, final_body) = response.into_parts();
+        let round_trip = final_body.into_bytes();
         assert_eq!(
             round_trip, image_bytes,
             "pass-through reattach must preserve bytes exactly"
@@ -2972,7 +3142,7 @@ mod tests {
         // Feed a small HTML body through the same pipeline the Stream arm uses.
         let html =
             b"<html><body><a href=\"https://origin.example.com/page\">link</a></body></html>";
-        let body = Body::from(html.to_vec());
+        let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
             content_encoding: String::new(),
@@ -3043,7 +3213,7 @@ mod tests {
 
         let mut output = Vec::new();
         stream_publisher_body(
-            Body::from(html.to_vec()),
+            EdgeBody::from(html.to_vec()),
             &mut output,
             &params,
             &settings,
@@ -3633,8 +3803,7 @@ mod tests {
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
         use crate::platform::test_support::noop_services;
         use crate::test_support::tests::crate_test_settings_str;
-        use fastly::http::Method;
-        use fastly::Request;
+        use http::Method;
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -3656,10 +3825,10 @@ mod tests {
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
             slots: &[CreativeOpportunitySlot],
-            req: Request,
+            req: Request<EdgeBody>,
         ) -> serde_json::Value {
             let response = run_page_bids_response(settings, orchestrator, slots, req).await;
-            serde_json::from_slice(&response.into_body_bytes()).expect("should be json")
+            serde_json::from_slice(&response.into_body().into_bytes()).expect("should be json")
         }
 
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
@@ -3680,26 +3849,37 @@ mod tests {
             }]
         }
 
-        fn make_page_bids_request(path: &str) -> Request {
-            let mut req = Request::new(
-                Method::GET,
-                format!("https://test-publisher.com/_ts/page-bids?path={path}"),
-            );
+        fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://test-publisher.com/_ts/page-bids?path={path}"
+                ))
+                .body(EdgeBody::empty())
+                .expect("should build test request");
             // Pass the same-origin gate the way a browser fetch from the
             // publisher page does.
-            req.set_header("sec-fetch-site", "same-origin");
+            set_test_header(&mut req, "sec-fetch-site", "same-origin");
             req
+        }
+
+        fn set_test_header(req: &mut Request<EdgeBody>, name: &'static str, value: &'static str) {
+            req.headers_mut().insert(
+                header::HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
         }
 
         async fn run_page_bids_response(
             settings: &Settings,
             orchestrator: &AuctionOrchestrator,
             slots: &[CreativeOpportunitySlot],
-            req: Request,
-        ) -> Response {
+            req: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
             let services = noop_services();
-            let ec_context =
-                EcContext::read_from_request(settings, &req).expect("should read EC context");
+            let fastly_req = crate::compat::to_fastly_request_ref(&req);
+            let ec_context = EcContext::read_from_request(settings, &fastly_req)
+                .expect("should read EC context");
             handle_page_bids(
                 settings,
                 &services,
@@ -3721,13 +3901,13 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.set_header("sec-fetch-site", "cross-site");
+            set_test_header(&mut req, "sec-fetch-site", "cross-site");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
 
             assert_eq!(
-                response.get_status(),
+                response.status(),
                 StatusCode::FORBIDDEN,
                 "cross-site request should be rejected before any auction work"
             );
@@ -3738,13 +3918,13 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.remove_header("sec-fetch-site");
+            req.headers_mut().remove("sec-fetch-site");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
 
             assert_eq!(
-                response.get_status(),
+                response.status(),
                 StatusCode::FORBIDDEN,
                 "request with neither fetch metadata nor tsjs header should be rejected"
             );
@@ -3755,14 +3935,14 @@ mod tests {
             let settings = settings_with_co();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.remove_header("sec-fetch-site");
-            req.set_header("x-tsjs-page-bids", "1");
+            req.headers_mut().remove("sec-fetch-site");
+            set_test_header(&mut req, "x-tsjs-page-bids", "1");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
 
             assert_eq!(
-                response.get_status(),
+                response.status(),
                 StatusCode::OK,
                 "legacy client carrying the tsjs header should pass the gate"
             );
@@ -3775,13 +3955,13 @@ mod tests {
             let mut req = make_page_bids_request("/2024/01/my-article/");
             // `same-site` admits sibling origins under the same registrable
             // domain — not trusted to spend SSP quota.
-            req.set_header("sec-fetch-site", "same-site");
+            set_test_header(&mut req, "sec-fetch-site", "same-site");
 
             let response =
                 run_page_bids_response(&settings, &orchestrator, &article_slot(), req).await;
 
             assert_eq!(
-                response.get_status(),
+                response.status(),
                 StatusCode::FORBIDDEN,
                 "same-site request should be rejected; only same-origin is trusted"
             );
@@ -3824,7 +4004,11 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.set_header("user-agent", "Mozilla/5.0 (compatible; Googlebot/2.1)");
+            set_test_header(
+                &mut req,
+                "user-agent",
+                "Mozilla/5.0 (compatible; Googlebot/2.1)",
+            );
 
             let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 
@@ -3854,7 +4038,7 @@ mod tests {
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
             let mut req = make_page_bids_request("/2024/01/my-article/");
-            req.set_header("sec-purpose", "prefetch");
+            set_test_header(&mut req, "sec-purpose", "prefetch");
 
             let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
 

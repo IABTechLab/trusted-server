@@ -43,6 +43,7 @@ pub mod cookies;
 pub mod creative;
 pub mod creative_opportunities;
 pub mod ec;
+pub(crate) mod edge_cookie;
 pub mod error;
 pub mod geo;
 pub(crate) mod host_header;

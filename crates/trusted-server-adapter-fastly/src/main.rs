@@ -1,6 +1,10 @@
+use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::http::{
+    header, HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
+};
 use error_stack::Report;
-use fastly::http::{header, Method};
-use fastly::{Error, Request, Response};
+use fastly::http::Method as FastlyMethod;
+use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
@@ -22,8 +26,9 @@ use trusted_server_core::ec::pull_sync::{
 use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
-use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::geo::GeoInfo;
+use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -33,7 +38,7 @@ use trusted_server_core::proxy::{
 };
 use trusted_server_core::publisher::{
     handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body_async,
-    PublisherResponse,
+    OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -53,18 +58,68 @@ use crate::error::to_error_response;
 use crate::logging::init_logger;
 use crate::platform::{build_runtime_services, UnavailableKvStore};
 
-fn main() -> Result<(), Error> {
+/// Result of routing a request, distinguishing buffered from streaming publisher responses.
+///
+/// The streaming arm keeps the publisher body out of WASM heap until it is written directly
+/// to the client via [`fastly::Response::stream_to_client`].  All other routes are buffered.
+///
+/// [`AuthChallenge`](HandlerOutcome::AuthChallenge) marks responses produced by this server's
+/// own `enforce_basic_auth` so the geo-lookup gate can distinguish them from origin-forwarded
+/// 401s, which should still carry geo headers.
+enum HandlerOutcome {
+    Buffered(HttpResponse),
+    AuthChallenge(HttpResponse),
+    Streaming {
+        response: HttpResponse,
+        body: EdgeBody,
+        params: Box<OwnedProcessResponseParams>,
+    },
+    AssetStreaming {
+        response: HttpResponse,
+        body: EdgeBody,
+    },
+}
+
+impl HandlerOutcome {
+    #[cfg(test)]
+    fn status(&self) -> edgezero_core::http::StatusCode {
+        match self {
+            HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
+            HandlerOutcome::Streaming { response, .. }
+            | HandlerOutcome::AssetStreaming { response, .. } => response.status(),
+        }
+    }
+}
+
+/// Combined result from `route_request`, bundling the handler outcome with the
+/// EC context and cookies needed for post-send finalization and pull sync.
+struct RouteResult {
+    outcome: HandlerOutcome,
+    ec_context: EcContext,
+    finalize_kv_graph: Option<KvIdentityGraph>,
+    eids_cookie: Option<String>,
+    sharedid_cookie: Option<String>,
+    is_real_browser: bool,
+    should_finalize_ec: bool,
+    asset_cache_policy: AssetProxyCachePolicy,
+}
+
+/// Entry point for the Fastly Compute program.
+///
+/// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
+/// `#[fastly::main]` so we can call `send_to_client()` explicitly when needed.
+fn main() {
     init_logger();
 
-    let req = Request::from_client();
+    let mut req = FastlyRequest::from_client();
 
     // Keep the health probe independent from settings loading and routing so
     // readiness checks still get a cheap liveness response during startup.
-    if req.get_method() == Method::GET && req.get_path() == "/health" {
-        Response::from_status(200)
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
+        FastlyResponse::from_status(200)
             .with_body_text_plain("ok")
             .send_to_client();
-        return Ok(());
+        return;
     }
 
     let settings = match get_settings() {
@@ -72,7 +127,7 @@ fn main() -> Result<(), Error> {
         Err(e) => {
             log::error!("Failed to load settings: {:?}", e);
             to_error_response(&e).send_to_client();
-            return Ok(());
+            return;
         }
     };
     // lgtm[rust/cleartext-logging]
@@ -81,13 +136,13 @@ fn main() -> Result<(), Error> {
 
     // Short-circuit the ja4 debug probe before finalize_response so that
     // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
-    if req.get_method() == Method::GET && req.get_path() == "/_ts/debug/ja4" {
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
         if settings.debug.ja4_endpoint_enabled {
             build_ja4_debug_response(&req).send_to_client();
         } else {
-            Response::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
         }
-        return Ok(());
+        return;
     }
 
     // Build the auction orchestrator once at startup
@@ -96,7 +151,7 @@ fn main() -> Result<(), Error> {
         Err(e) => {
             log::error!("Failed to build auction orchestrator: {:?}", e);
             to_error_response(&e).send_to_client();
-            return Ok(());
+            return;
         }
     };
 
@@ -105,7 +160,7 @@ fn main() -> Result<(), Error> {
         Err(e) => {
             log::error!("Failed to create integration registry: {:?}", e);
             to_error_response(&e).send_to_client();
-            return Ok(());
+            return;
         }
     };
 
@@ -114,7 +169,7 @@ fn main() -> Result<(), Error> {
         Err(e) => {
             log::error!("Failed to build partner registry: {:?}", e);
             to_error_response(&e).send_to_client();
-            return Ok(());
+            return;
         }
     };
 
@@ -123,38 +178,149 @@ fn main() -> Result<(), Error> {
     // unrelated routes stay available when EC KV is unavailable.
     let kv_store = std::sync::Arc::new(UnavailableKvStore)
         as std::sync::Arc<dyn trusted_server_core::platform::PlatformKvStore>;
-    let runtime_services = build_runtime_services(&req, kv_store);
+    // Strip client-spoofable forwarded headers at the edge before building
+    // any request-derived context or converting to the core HTTP types.
+    compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let outcome = futures::executor::block_on(route_request(
+    let runtime_services = build_runtime_services(&req, kv_store);
+    let http_req = compat::from_fastly_request(req);
+
+    let route_result = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &partner_registry,
         &runtime_services,
         settings.creative_opportunity_slots(),
-        req,
-    ))?;
+        http_req,
+    ))
+    .unwrap_or_else(|e| RouteResult {
+        outcome: HandlerOutcome::Buffered(http_error_response(&e)),
+        ec_context: EcContext::default(),
+        finalize_kv_graph: None,
+        eids_cookie: None,
+        sharedid_cookie: None,
+        is_real_browser: false,
+        should_finalize_ec: true,
+        asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+    });
 
-    let RouteOutcome {
-        response,
-        pull_sync_context,
-    } = outcome;
+    let RouteResult {
+        outcome,
+        ec_context,
+        finalize_kv_graph,
+        eids_cookie,
+        sharedid_cookie,
+        is_real_browser,
+        should_finalize_ec,
+        asset_cache_policy,
+    } = route_result;
 
-    if let Some(response) = response {
-        response.send_to_client();
+    // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
+    // unauthenticated callers.  Origin-forwarded 401s are not AuthChallenge and
+    // do receive geo headers — the client already reached the origin anyway.
+    let geo_info = if matches!(outcome, HandlerOutcome::AuthChallenge(_)) {
+        None
+    } else {
+        runtime_services
+            .geo()
+            .lookup(runtime_services.client_info().client_ip)
+            .unwrap_or_else(|e| {
+                log::warn!("geo lookup failed: {e}");
+                None
+            })
+    };
+
+    match outcome {
+        HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
+            let mut fastly_resp = compat::to_fastly_response(response);
+            if should_finalize_ec {
+                ec_finalize_response(
+                    &settings,
+                    &ec_context,
+                    finalize_kv_graph.as_ref(),
+                    &partner_registry,
+                    eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
+                    &mut fastly_resp,
+                );
+            }
+            fastly_resp.send_to_client();
+
+            if is_real_browser {
+                if let Some(context) = build_pull_sync_context(&ec_context) {
+                    run_pull_sync_after_send(&settings, &partner_registry, &context);
+                }
+            }
+        }
+        HandlerOutcome::Streaming {
+            mut response,
+            body,
+            mut params,
+        } => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
+            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
+            if should_finalize_ec {
+                ec_finalize_response(
+                    &settings,
+                    &ec_context,
+                    finalize_kv_graph.as_ref(),
+                    &partner_registry,
+                    eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
+                    &mut fastly_resp,
+                );
+            }
+            let mut streaming_body = fastly_resp.stream_to_client();
+            let mut stream_succeeded = false;
+            match futures::executor::block_on(stream_publisher_body_async(
+                body,
+                &mut streaming_body,
+                &mut params,
+                &settings,
+                &integration_registry,
+                &orchestrator,
+                &runtime_services,
+            )) {
+                Ok(()) => {
+                    if let Err(e) = streaming_body.finish() {
+                        log::error!("failed to finish streaming body: {e}");
+                    } else {
+                        stream_succeeded = true;
+                    }
+                }
+                Err(e) => {
+                    log::error!("streaming processing failed: {e:?}");
+                    // Headers already committed. Drop the body so the client sees a
+                    // truncated response (EOF mid-stream) — standard proxy behavior.
+                    drop(streaming_body);
+                }
+            }
+
+            if is_real_browser && stream_succeeded {
+                if let Some(context) = build_pull_sync_context(&ec_context) {
+                    run_pull_sync_after_send(&settings, &partner_registry, &context);
+                }
+            }
+        }
+        HandlerOutcome::AssetStreaming { mut response, body } => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut streaming_body = fastly_resp.stream_to_client();
+            if let Err(e) =
+                futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
+            {
+                log::error!("asset streaming failed: {e:?}");
+                drop(streaming_body);
+            } else if let Err(e) = streaming_body.finish() {
+                log::error!("failed to finish asset streaming body: {e}");
+            }
+        }
     }
-
-    if let Some(context) = pull_sync_context {
-        run_pull_sync_after_send(&settings, &partner_registry, &context);
-    }
-
-    Ok(())
-}
-
-#[must_use]
-struct RouteOutcome {
-    response: Option<Response>,
-    pull_sync_context: Option<PullSyncContext>,
 }
 
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
@@ -162,7 +328,7 @@ const FALLBACK_NOT_SENT: &str = "not sent";
 const FALLBACK_NONE: &str = "none";
 
 // TODO: remove after JA4 evaluation completes — see #645
-fn build_ja4_debug_response(req: &Request) -> Response {
+fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
     let ja4 = req.get_tls_ja4().unwrap_or(FALLBACK_UNAVAILABLE);
     let h2 = req
         .get_client_h2_fingerprint()
@@ -189,10 +355,10 @@ fn build_ja4_debug_response(req: &Request) -> Response {
          ch-platform: {ch_platform}\n"
     );
 
-    Response::from_status(fastly::http::StatusCode::OK)
-        .with_header(header::CACHE_CONTROL, "no-store, private")
+    FastlyResponse::from_status(fastly::http::StatusCode::OK)
+        .with_header(fastly::http::header::CACHE_CONTROL, "no-store, private")
         .with_header(
-            header::VARY,
+            fastly::http::header::VARY,
             "User-Agent, Sec-CH-UA-Mobile, Sec-CH-UA-Platform",
         )
         .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
@@ -206,24 +372,16 @@ async fn route_request(
     partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
     slots: &[trusted_server_core::creative_opportunities::CreativeOpportunitySlot],
-    mut req: Request,
-) -> Result<RouteOutcome, Error> {
-    // Strip client-spoofable forwarded headers at the edge.
-    // On Fastly this service IS the first proxy — these headers from
-    // clients are untrusted and can hijack URL rewriting (see #409).
-    compat::sanitize_fastly_forwarded_headers(&mut req);
+    req: HttpRequest,
+) -> Result<RouteResult, Report<TrustedServerError>> {
+    // Build a Fastly request reference for APIs that require fastly types
+    // (EcContext, device signals, cookie extraction).  This is headers/method/URI
+    // only — body has already been moved into `req`.
+    let fastly_req_ref = compat::to_fastly_request_ref(&req);
 
-    // Extract geo info before auth check or routing consumes the request.
-    #[allow(deprecated)]
-    let geo_info = GeoInfo::from_request(&req);
-
-    // Extract the Prebid EIDs cookie before routing consumes the request.
-    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
-
-    // Derive device signals from TLS/H2/UA for bot detection.
-    // This is pure in-memory computation — no KV I/O.
-    let device_signals = derive_device_signals(&req);
+    // Extract device signals from TLS/H2/UA.  TLS fingerprints are available
+    // on the fastly request reference even without the body.
+    let device_signals = derive_device_signals(&fastly_req_ref);
     let is_real_browser = device_signals.looks_like_browser();
 
     if !is_real_browser {
@@ -235,40 +393,73 @@ async fn route_request(
         );
     }
 
+    // Extract the Prebid EIDs and SharedID cookies before routing.
+    let eids_cookie = extract_cookie_value(&fastly_req_ref, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(&fastly_req_ref, COOKIE_SHAREDID);
+
+    // Extract geo info.
+    let geo_info = runtime_services
+        .geo()
+        .lookup(runtime_services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed during routing: {e}");
+            None
+        });
+
     // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
     // context creation and the EC finalize middleware entirely.
-    if req.get_method() == Method::POST && req.get_path() == "/_ts/api/v1/batch-sync" {
-        let auth_req = compat::from_fastly_headers_ref(&req);
-        let mut response = match enforce_basic_auth(settings, &auth_req) {
-            Ok(Some(response)) => compat::to_fastly_response(response),
-            Ok(None) => require_identity_graph(settings)
-                .map(|kv| {
-                    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-                    handle_batch_sync(&kv, partner_registry, &limiter, req)
-                })
-                .and_then(|r| r)
-                .unwrap_or_else(|e| to_error_response(&e)),
-            Err(e) => {
-                log::error!("Failed to evaluate basic auth: {:?}", e);
-                to_error_response(&e)
+    if req.method() == Method::POST && req.uri().path() == "/_ts/api/v1/batch-sync" {
+        match enforce_basic_auth(settings, &req) {
+            Ok(Some(response)) => {
+                return Ok(RouteResult {
+                    outcome: HandlerOutcome::AuthChallenge(response),
+                    ec_context: EcContext::default(),
+                    finalize_kv_graph: None,
+                    eids_cookie,
+                    sharedid_cookie,
+                    is_real_browser,
+                    should_finalize_ec: true,
+                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                });
             }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        let fastly_req = compat::to_fastly_request(req);
+        let result = require_identity_graph(settings).and_then(|kv| {
+            let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+            handle_batch_sync(&kv, partner_registry, &limiter, fastly_req)
+        });
+        let outcome = match result {
+            Ok(fastly_resp) => HandlerOutcome::Buffered(compat::from_fastly_response(fastly_resp)),
+            Err(e) => HandlerOutcome::Buffered(http_error_response(&e)),
         };
-        finalize_response(settings, geo_info.as_ref(), &mut response);
-        return Ok(RouteOutcome {
-            response: Some(response),
-            pull_sync_context: None,
+        return Ok(RouteResult {
+            outcome,
+            ec_context: EcContext::default(),
+            finalize_kv_graph: None,
+            eids_cookie,
+            sharedid_cookie,
+            is_real_browser,
+            should_finalize_ec: true,
+            asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
         });
     }
 
+    // Build EC context using the fastly request reference (headers/method/URI).
     let mut ec_context =
-        match EcContext::read_from_request_with_geo(settings, &req, geo_info.as_ref()) {
+        match EcContext::read_from_request_with_geo(settings, &fastly_req_ref, geo_info.as_ref()) {
             Ok(context) => context,
             Err(err) => {
-                let mut response = to_error_response(&err);
-                finalize_response(settings, geo_info.as_ref(), &mut response);
-                return Ok(RouteOutcome {
-                    response: Some(response),
-                    pull_sync_context: None,
+                return Ok(RouteResult {
+                    outcome: HandlerOutcome::Buffered(http_error_response(&err)),
+                    ec_context: EcContext::default(),
+                    finalize_kv_graph: None,
+                    eids_cookie,
+                    sharedid_cookie,
+                    is_real_browser,
+                    should_finalize_ec: true,
+                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
                 });
             }
         };
@@ -280,54 +471,40 @@ async fn route_request(
     // consent withdrawals. Revocations need the KV graph so tombstones remain
     // authoritative even for privacy-extension-heavy clients that do not look
     // like known browsers.
-    let kv_graph = if is_real_browser {
-        maybe_identity_graph(settings)
-    } else {
-        None
-    };
+    // Build the KV identity graph once. The write-path (finalize_kv_graph) is
+    // also given to bots when they signal consent withdrawal so tombstones are
+    // authoritative even for privacy-extension-heavy clients.
+    let kv_graph = maybe_identity_graph(settings);
     let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
-        maybe_identity_graph(settings)
+        kv_graph.clone()
     } else {
         None
     };
+    let kv_graph = if is_real_browser { kv_graph } else { None };
 
     // `get_settings()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
-    let auth_req = compat::from_fastly_headers_ref(&req);
-    match enforce_basic_auth(settings, &auth_req) {
+    match enforce_basic_auth(settings, &req) {
         Ok(Some(response)) => {
-            let mut response = compat::to_fastly_response(response);
-            ec_finalize_response(
-                settings,
-                &ec_context,
-                finalize_kv_graph.as_ref(),
-                partner_registry,
-                eids_cookie.as_deref(),
-                sharedid_cookie.as_deref(),
-                &mut response,
-            );
-            finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Ok(RouteOutcome {
-                response: Some(response),
-                pull_sync_context: None,
+            return Ok(RouteResult {
+                outcome: HandlerOutcome::AuthChallenge(response),
+                ec_context,
+                finalize_kv_graph,
+                eids_cookie,
+                sharedid_cookie,
+                is_real_browser,
+                should_finalize_ec: true,
+                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
             });
         }
         Ok(None) => {}
-        Err(e) => {
-            log::error!("Failed to evaluate basic auth: {:?}", e);
-            let mut response = to_error_response(&e);
-            finalize_response(settings, geo_info.as_ref(), &mut response);
-            return Ok(RouteOutcome {
-                response: Some(response),
-                pull_sync_context: None,
-            });
-        }
+        Err(e) => return Err(e),
     }
 
     // Get path and method for routing
-    let path = req.get_path().to_string();
-    let method = req.get_method().clone();
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
 
     let registry_ref = if partner_registry.is_empty() {
         None
@@ -368,13 +545,19 @@ async fn route_request(
                 false,
             )
         }
-        (Method::GET, "/_ts/api/v1/identify") => (
-            require_identity_graph(settings)
-                .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context)),
-            false,
-        ),
+        (Method::GET, "/_ts/api/v1/identify") => {
+            let fastly_ref = compat::to_fastly_request_ref(&req);
+            let outcome = require_identity_graph(settings).and_then(|kv| {
+                handle_identify(settings, &kv, partner_registry, &fastly_ref, &ec_context)
+                    .map(compat::from_fastly_response)
+            });
+            (outcome, false)
+        }
         (Method::OPTIONS, "/_ts/api/v1/identify") => {
-            (cors_preflight_identify(settings, &req), false)
+            let fastly_ref = compat::to_fastly_request_ref(&req);
+            let outcome =
+                cors_preflight_identify(settings, &fastly_ref).map(compat::from_fastly_response);
+            (outcome, false)
         }
 
         // Unified auction endpoint (returns creative HTML inline)
@@ -410,7 +593,7 @@ async fn route_request(
             false,
         ),
 
-        // tsjs endpoints
+        // First-party proxy/click/sign/rebuild endpoints
         (Method::GET, "/first-party/proxy") => (
             handle_first_party_proxy(settings, runtime_services, req).await,
             false,
@@ -462,24 +645,17 @@ async fn route_request(
                     {
                         Ok(asset_response) => {
                             asset_cache_policy = asset_response.cache_policy();
-                            let (mut response, stream_body) =
-                                asset_response.into_response_and_body();
+                            let (response, stream_body) = asset_response.into_response_and_body();
                             if let Some(body) = stream_body {
-                                finalize_response(settings, geo_info.as_ref(), &mut response);
-                                asset_cache_policy.apply_after_route_finalization(&mut response);
-
-                                let mut streaming_body = response.stream_to_client();
-                                if let Err(err) = stream_asset_body(body, &mut streaming_body).await
-                                {
-                                    log::error!("Asset streaming failed: {err:?}");
-                                    drop(streaming_body);
-                                } else if let Err(err) = streaming_body.finish() {
-                                    log::error!("Failed to finish asset streaming body: {err}");
-                                }
-
-                                return Ok(RouteOutcome {
-                                    response: None,
-                                    pull_sync_context: None,
+                                return Ok(RouteResult {
+                                    outcome: HandlerOutcome::AssetStreaming { response, body },
+                                    ec_context,
+                                    finalize_kv_graph,
+                                    eids_cookie,
+                                    sharedid_cookie,
+                                    is_real_browser,
+                                    should_finalize_ec,
+                                    asset_cache_policy,
                                 });
                             }
                             Ok(response)
@@ -495,6 +671,15 @@ async fn route_request(
                     "No known route matched for path: {}, proxying to publisher origin",
                     path
                 );
+
+                // Generate EC ID if needed — mirrors the integration proxy path in registry.rs.
+                // Only for document navigations by recognised browsers; subresource requests
+                // may lack consent signals such as Sec-GPC.
+                if is_real_browser && is_navigation_request(&req) {
+                    if let Err(err) = ec_context.generate_if_needed(settings, kv_graph.as_ref()) {
+                        log::warn!("EC generation failed for publisher proxy: {err:?}");
+                    }
+                }
 
                 match handle_publisher_request(
                     settings,
@@ -512,60 +697,27 @@ async fn route_request(
                 .await
                 {
                     Ok(PublisherResponse::Stream {
-                        mut response,
+                        response,
                         body,
-                        mut params,
+                        params,
                     }) => {
-                        // Publisher fallback has multiple delivery modes.
-                        // EC finalization is header-only, so it must happen before
-                        // headers are committed on the streaming path.
-                        ec_finalize_response(
-                            settings,
-                            &ec_context,
-                            finalize_kv_graph.as_ref(),
-                            partner_registry,
-                            eids_cookie.as_deref(),
-                            sharedid_cookie.as_deref(),
-                            &mut response,
-                        );
-                        finalize_response(settings, geo_info.as_ref(), &mut response);
-
-                        let mut streaming_body = response.stream_to_client();
-                        let mut stream_succeeded = false;
-                        if let Err(err) = stream_publisher_body_async(
-                            body,
-                            &mut streaming_body,
-                            &mut params,
-                            settings,
-                            integration_registry,
-                            orchestrator,
-                            runtime_services,
-                        )
-                        .await
-                        {
-                            // Headers are already committed. Log and abort rather
-                            // than trying to replace the response mid-stream.
-                            log::error!("Streaming processing failed: {err:?}");
-                            drop(streaming_body);
-                        } else if let Err(err) = streaming_body.finish() {
-                            log::error!("Failed to finish streaming body: {err}");
-                        } else {
-                            stream_succeeded = true;
-                        }
-
-                        let pull_sync_context = if is_real_browser && stream_succeeded {
-                            build_pull_sync_context(&ec_context)
-                        } else {
-                            None
-                        };
-
-                        return Ok(RouteOutcome {
-                            response: None,
-                            pull_sync_context,
+                        return Ok(RouteResult {
+                            outcome: HandlerOutcome::Streaming {
+                                response,
+                                body,
+                                params,
+                            },
+                            ec_context,
+                            finalize_kv_graph,
+                            eids_cookie,
+                            sharedid_cookie,
+                            is_real_browser,
+                            should_finalize_ec,
+                            asset_cache_policy,
                         });
                     }
                     Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                        response.set_body(body);
+                        *response.body_mut() = body;
                         (Ok(response), true)
                     }
                     Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
@@ -578,42 +730,21 @@ async fn route_request(
         }
     };
 
-    let route_succeeded = result.is_ok();
+    let _ = organic_route;
 
-    // Convert any errors to HTTP error responses
-    let mut response = result.unwrap_or_else(|e| to_error_response(&e));
+    let outcome = result
+        .map(HandlerOutcome::Buffered)
+        .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
-    // Bot gate still suppresses generated EC writes and pull sync via
-    // `kv_graph = None`, but withdrawal finalization uses `finalize_kv_graph`
-    // so revocation tombstones are not lost for bot-classified clients.
-    if should_finalize_ec {
-        ec_finalize_response(
-            settings,
-            &ec_context,
-            finalize_kv_graph.as_ref(),
-            partner_registry,
-            eids_cookie.as_deref(),
-            sharedid_cookie.as_deref(),
-            &mut response,
-        );
-    }
-
-    finalize_response(settings, geo_info.as_ref(), &mut response);
-    asset_cache_policy.apply_after_route_finalization(&mut response);
-
-    let pull_sync_context = if is_real_browser && organic_route && route_succeeded {
-        // Pull sync is intentionally refreshed only from successful organic
-        // browser traffic. This keeps the trigger narrow in the current PR;
-        // broadening it to auction-heavy or SPA-only flows is a follow-up
-        // product decision rather than an implicit behavior change here.
-        build_pull_sync_context(&ec_context)
-    } else {
-        None
-    };
-
-    Ok(RouteOutcome {
-        response: Some(response),
-        pull_sync_context,
+    Ok(RouteResult {
+        outcome,
+        ec_context,
+        finalize_kv_graph,
+        eids_cookie,
+        sharedid_cookie,
+        is_real_browser,
+        should_finalize_ec,
+        asset_cache_policy,
     })
 }
 
@@ -646,18 +777,27 @@ fn run_pull_sync_after_send(
 /// Header precedence (last write wins): geo headers are set first, then
 /// version/staging, then operator-configured `settings.response_headers`.
 /// This means operators can intentionally override any managed header.
-fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut Response) {
+fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
     if let Some(geo) = geo_info {
         geo.set_response_headers(response);
     } else {
-        response.set_header(HEADER_X_GEO_INFO_AVAILABLE, "false");
+        response.headers_mut().insert(
+            HEADER_X_GEO_INFO_AVAILABLE,
+            HeaderValue::from_static("false"),
+        );
     }
 
     if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        response.set_header(HEADER_X_TS_VERSION, v);
+        if let Ok(value) = HeaderValue::from_str(&v) {
+            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
+        } else {
+            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
+        }
     }
     if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response.set_header(HEADER_X_TS_ENV, "staging");
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
     }
 
     // Any response that sets a per-user cookie (notably the EC identity cookie
@@ -668,13 +808,17 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     // Skip when the response is already uncacheable so we don't clobber a
     // stricter directive (e.g. `no-store`).
     let already_uncacheable = response
-        .get_header(header::CACHE_CONTROL)
+        .headers()
+        .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-    if !already_uncacheable && response.get_header(header::SET_COOKIE).is_some() {
-        response.set_header(header::CACHE_CONTROL, "private, max-age=0");
-        response.remove_header("surrogate-control");
-        response.remove_header("fastly-surrogate-control");
+    if !already_uncacheable && response.headers().contains_key(header::SET_COOKIE) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
+        response.headers_mut().remove("surrogate-control");
+        response.headers_mut().remove("fastly-surrogate-control");
     }
 
     // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
@@ -682,23 +826,42 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     // re-enable shared caching for them — neither by replacing Cache-Control nor
     // by reintroducing the surrogate cache headers the privacy paths stripped.
     let response_is_private = response
-        .get_header(header::CACHE_CONTROL)
+        .headers()
+        .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("private"));
 
     for (key, value) in &settings.response_headers {
         if response_is_private
-            && (**key == header::CACHE_CONTROL
+            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
                 || key.eq_ignore_ascii_case("surrogate-control")
                 || key.eq_ignore_ascii_case("fastly-surrogate-control"))
         {
             continue;
         }
-        response.set_header(key, value);
+        let header_name = HeaderName::from_bytes(key.as_bytes())
+            .expect("settings.response_headers validated at load time");
+        let header_value =
+            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
+        response.headers_mut().insert(header_name, header_value);
     }
 }
 
-/// Constructs a `KvIdentityGraph` from settings, or returns 503 if the
+fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
+    let root_error = report.current_context();
+    log::error!("Error occurred: {:?}", report);
+
+    let mut response =
+        HttpResponse::new(EdgeBody::from(format!("{}\n", root_error.user_message())));
+    *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Constructs a `KvIdentityGraph` from settings, or returns an error if the
 /// `ec_store` config is not set.
 fn require_identity_graph(
     settings: &Settings,
@@ -713,7 +876,7 @@ fn require_identity_graph(
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
-fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
+fn extract_cookie_value(req: &FastlyRequest, name: &str) -> Option<String> {
     let cookie_header = req.get_header_str("cookie")?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
@@ -730,7 +893,7 @@ fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
 ///
 /// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
 /// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-fn derive_device_signals(req: &Request) -> DeviceSignals {
+fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
     let ua = req.get_header_str("user-agent").unwrap_or("");
     let ja4 = req.get_tls_ja4();
     let h2_fp = req.get_client_h2_fingerprint();
@@ -745,7 +908,7 @@ mod tests {
 
     #[test]
     fn ja4_debug_response_uses_plain_text_and_fallback_values() {
-        let req = Request::get("https://example.com/_ts/debug/ja4");
+        let req = FastlyRequest::get("https://example.com/_ts/debug/ja4");
 
         let mut response = build_ja4_debug_response(&req);
 
@@ -760,7 +923,7 @@ mod tests {
             "should return plain text content"
         );
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            response.get_header_str(fastly::http::header::CACHE_CONTROL),
             Some("no-store, private"),
             "should disable caching for the debug response"
         );

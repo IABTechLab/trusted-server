@@ -1,8 +1,8 @@
 //! HTTP endpoint handlers for auction requests.
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::StatusCode;
-use fastly::{Request, Response};
+use http::{header, Request, Response, StatusCode};
 use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
@@ -105,21 +105,41 @@ pub async fn handle_auction(
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
     services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    // Reject oversized bodies before any allocation. The `Content-Length`
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    // Reject oversized bodies before any allocation. The Content-Length
     // pre-check stops well-behaved clients early; the post-read check defends
     // against clients that lie about (or omit) the header.
     let content_length_exceeded = req
-        .get_header_str("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_AUCTION_BODY_SIZE);
     if content_length_exceeded {
-        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+        return Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(EdgeBody::from(format!(
+                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+            )))
+            .change_context(TrustedServerError::Auction {
+                message: "Auction request body exceeded maximum size".to_string(),
+            });
     }
-    let body_bytes = req.take_body_bytes();
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = body.into_bytes();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
-        return Ok(Response::from_status(StatusCode::PAYLOAD_TOO_LARGE));
+        return Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(EdgeBody::from(format!(
+                "Request body exceeds {MAX_AUCTION_BODY_SIZE} byte limit"
+            )))
+            .change_context(TrustedServerError::Auction {
+                message: "Auction request body exceeded maximum size".to_string(),
+            });
     }
     let body: AdRequest =
         serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
@@ -131,18 +151,14 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
+    let http_req = Request::from_parts(parts, EdgeBody::empty());
+
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
     // Only forward the EC ID to auction partners when consent allows it.
-    // A returning user may still have a ts-ec cookie but have since
-    // withdrawn consent — forwarding that revoked ID to bidders would
-    // defeat the consent gating.
     let ec_id = if ec_context.ec_allowed() {
         ec_context.ec_value()
     } else {
-        // Intentionally omit persistent identity when EC is disallowed.
-        // This keeps the no-consent / GPC path conservative rather than
-        // introducing a secondary session-scoped identifier surface here.
         None
     };
     let consent_context = ec_context.consent().clone();
@@ -153,20 +169,35 @@ pub async fn handle_auction(
     // full OpenRTB-style EID structure.
     let client_eids = resolve_client_auction_eids(
         body.eids.as_ref(),
-        extract_cookie_value(&req, COOKIE_TS_EIDS).as_deref(),
+        extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
     );
 
     // Resolve partner EIDs from the KV identity graph when the user has
     // a valid EC and both KV and partner stores are available.
     let eids = resolve_auction_eids(kv, registry, ec_context);
 
+    // Look up geo for device info.
+    let geo = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+
     // Convert tsjs request format to auction request
-    let mut auction_request =
-        convert_tsjs_to_auction_request(&body, settings, &req, consent_context, ec_id)?;
+    let mut auction_request = convert_tsjs_to_auction_request(
+        &body,
+        settings,
+        services,
+        &http_req,
+        consent_context,
+        ec_id,
+        geo,
+    )?;
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
-    // `gate_eids_by_consent` checks TCF Purpose 1 + 4.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -178,7 +209,7 @@ pub async fn handle_auction(
     // Create auction context
     let context = AuctionContext {
         settings,
-        request: &req,
+        request: &http_req,
         timeout_ms: settings.auction.timeout_ms,
         provider_responses: None,
         services,
@@ -238,8 +269,11 @@ pub(crate) fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
-fn extract_cookie_value(req: &Request, name: &str) -> Option<String> {
-    let cookie_header = req.get_header_str("cookie")?;
+fn extract_cookie_value(req: &Request<EdgeBody>, name: &str) -> Option<String> {
+    let cookie_header = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some((key, value)) = pair.split_once('=') {
@@ -777,6 +811,45 @@ mod tests {
             merged[0].uids[0].ext,
             Some(json!({ "provider": "server" })),
             "should prefer resolved ext"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_rejects_oversized_body() {
+        use edgezero_core::body::Body as EdgeBody;
+        use http::{Method, Request as HttpRequest, StatusCode};
+
+        use crate::auction::build_orchestrator;
+        use crate::consent::ConsentContext;
+        use crate::ec::EcContext;
+        use crate::platform::test_support::noop_services;
+        use crate::test_support::tests::create_test_settings;
+
+        let settings = create_test_settings();
+        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+        let services = noop_services();
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+        let oversized = vec![b'x'; MAX_AUCTION_BODY_SIZE + 1];
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("https://test.com/auction")
+            .body(EdgeBody::from(oversized))
+            .expect("should build request");
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("should return 413 response for oversized body");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for auction body over limit"
         );
     }
 }

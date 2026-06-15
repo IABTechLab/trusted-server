@@ -3,16 +3,26 @@
 //! This module provides endpoint handlers for JWKS retrieval, signature verification,
 //! key rotation, and key deactivation operations.
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::{Request, Response};
+use http::{header, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
+use crate::http_util::enforce_max_body_size;
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
 use crate::request_signing::signing;
 use crate::settings::Settings;
+
+fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+        .body(EdgeBody::from(body.into_bytes()))
+        .expect("should build json response")
+}
 
 /// Retrieves and returns the trusted-server discovery document.
 ///
@@ -26,8 +36,8 @@ use crate::settings::Settings;
 pub fn handle_trusted_server_discovery(
     _settings: &Settings,
     services: &RuntimeServices,
-    _req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    _req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let jwks_json = crate::request_signing::jwks::get_active_jwks(services).change_context(
         TrustedServerError::Configuration {
             message: "failed to retrieve JWKS".into(),
@@ -47,9 +57,7 @@ pub fn handle_trusted_server_discovery(
         },
     )?;
 
-    Ok(Response::from_status(200)
-        .with_content_type(mime::APPLICATION_JSON)
-        .with_body(json))
+    Ok(json_response(StatusCode::OK, json))
 }
 
 /// JSON request body for the signature verification endpoint.
@@ -77,6 +85,9 @@ pub struct VerifySignatureResponse {
     pub error: Option<String>,
 }
 
+const VERIFY_MAX_BODY_BYTES: usize = 4096;
+const ADMIN_MAX_BODY_BYTES: usize = 4096;
+
 /// Will verify a signature given a payload and kid
 /// Useful for testing integration with signatures
 ///
@@ -87,11 +98,12 @@ pub struct VerifySignatureResponse {
 pub fn handle_verify_signature(
     _settings: &Settings,
     services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    let body = req.take_body_str();
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let body = req.into_body().into_bytes();
+    enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
     let verify_req: VerifySignatureRequest =
-        serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
+        serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
         })?;
 
@@ -132,9 +144,7 @@ pub fn handle_verify_signature(
         })
     })?;
 
-    Ok(Response::from_status(200)
-        .with_content_type(mime::APPLICATION_JSON)
-        .with_body(response_json))
+    Ok(json_response(StatusCode::OK, response_json))
 }
 
 /// JSON request body for the key-rotation endpoint.
@@ -226,18 +236,19 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
 pub fn handle_rotate_key(
     settings: &Settings,
     services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let SigningStoreIds {
         config_store_id,
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.take_body_str();
+    let body = req.into_body().into_bytes();
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
     } else {
-        serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
+        serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
         })?
     };
@@ -274,9 +285,7 @@ pub fn handle_rotate_key(
                 })
             })?;
 
-            Ok(Response::from_status(200)
-                .with_content_type(mime::APPLICATION_JSON)
-                .with_body(response_json))
+            Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
             let status = e.current_context().status_code();
@@ -296,9 +305,7 @@ pub fn handle_rotate_key(
                 })
             })?;
 
-            Ok(Response::from_status(status)
-                .with_content_type(mime::APPLICATION_JSON)
-                .with_body(response_json))
+            Ok(json_response(status, response_json))
         }
     }
 }
@@ -348,16 +355,17 @@ pub struct DeactivateKeyResponse {
 pub fn handle_deactivate_key(
     settings: &Settings,
     services: &RuntimeServices,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let SigningStoreIds {
         config_store_id,
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.take_body_str();
+    let body = req.into_body().into_bytes();
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
     let deactivate_req: DeactivateKeyRequest =
-        serde_json::from_str(&body).change_context(TrustedServerError::Configuration {
+        serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
         })?;
 
@@ -397,9 +405,7 @@ pub fn handle_deactivate_key(
                 })
             })?;
 
-            Ok(Response::from_status(200)
-                .with_content_type(mime::APPLICATION_JSON)
-                .with_body(response_json))
+            Ok(json_response(StatusCode::OK, response_json))
         }
         Err(e) => {
             let status = e.current_context().status_code();
@@ -422,22 +428,53 @@ pub fn handle_deactivate_key(
                 })
             })?;
 
-            Ok(Response::from_status(status)
-                .with_content_type(mime::APPLICATION_JSON)
-                .with_body(response_json))
+            Ok(json_response(status, response_json))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use edgezero_core::body::Body as EdgeBody;
+    use error_stack::Report;
+    use http::{header, Method, Request as HttpRequest, StatusCode};
+
+    use crate::error::IntoHttpResponse;
     use crate::platform::{
         test_support::{build_request_signing_services, build_services_with_config, noop_services},
         PlatformConfigStore, PlatformError, StoreId, StoreName,
     };
 
     use super::*;
-    use fastly::http::{Method, StatusCode};
+
+    fn build_request(method: Method, uri: &str, body: Option<&str>) -> HttpRequest<EdgeBody> {
+        let body = match body {
+            Some(body) => EdgeBody::from(body.as_bytes().to_vec()),
+            None => EdgeBody::empty(),
+        };
+
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(body)
+            .expect("should build request")
+    }
+
+    fn response_body_string(response: http::Response<EdgeBody>) -> String {
+        String::from_utf8(response.into_body().into_bytes().to_vec())
+            .expect("should decode response body")
+    }
+
+    fn assert_json_content_type(response: &http::Response<EdgeBody>) {
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(mime::APPLICATION_JSON.as_ref()),
+            "should return application/json content type"
+        );
+    }
 
     /// Config store stub that returns a minimal JWKS with one Ed25519 key.
     struct StubJwksConfigStore;
@@ -482,19 +519,18 @@ mod tests {
         };
 
         let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
-        let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
-        req.set_body(body);
-
-        let mut resp = handle_verify_signature(&settings, &services, req)
-            .expect("should handle verification request");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        assert_eq!(
-            resp.get_content_type(),
-            Some(mime::APPLICATION_JSON),
-            "should return application/json content type"
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&body),
         );
 
-        let resp_body = resp.take_body_str();
+        let resp = handle_verify_signature(&settings, &services, req)
+            .expect("should handle verification request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_json_content_type(&resp);
+
+        let resp_body = response_body_string(resp);
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
@@ -522,19 +558,18 @@ mod tests {
         };
 
         let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
-        let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
-        req.set_body(body);
-
-        let mut resp = handle_verify_signature(&settings, &services, req)
-            .expect("should handle verification request");
-        assert_eq!(resp.get_status(), StatusCode::OK);
-        assert_eq!(
-            resp.get_content_type(),
-            Some(mime::APPLICATION_JSON),
-            "should return application/json content type"
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&body),
         );
 
-        let resp_body = resp.take_body_str();
+        let resp = handle_verify_signature(&settings, &services, req)
+            .expect("should handle verification request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_json_content_type(&resp);
+
+        let resp_body = response_body_string(resp);
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
@@ -557,16 +592,19 @@ mod tests {
         };
 
         let body = serde_json::to_string(&verify_req).expect("should serialize verify request");
-        let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
-        req.set_body(body);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&body),
+        );
 
         let services = noop_services();
-        let mut resp = handle_verify_signature(&settings, &services, req)
+        let resp = handle_verify_signature(&settings, &services, req)
             .expect("should return a verification response for internal errors");
 
-        assert_eq!(resp.get_status(), StatusCode::OK, "should return 200 OK");
+        assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
 
-        let resp_body = resp.take_body_str();
+        let resp_body = response_body_string(resp);
         let verify_resp: VerifySignatureResponse =
             serde_json::from_str(&resp_body).expect("should deserialize verify response");
 
@@ -591,8 +629,11 @@ mod tests {
     fn test_handle_verify_signature_malformed_request() {
         let settings = crate::test_support::tests::create_test_settings();
 
-        let mut req = Request::new(Method::POST, "https://test.com/verify-signature");
-        req.set_body("not valid json");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some("not valid json"),
+        );
 
         let result = handle_verify_signature(&settings, &noop_services(), req);
         assert!(result.is_err(), "Malformed JSON should error");
@@ -601,18 +642,18 @@ mod tests {
     #[test]
     fn test_handle_rotate_key_with_empty_body() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
+        let req = build_request(Method::POST, "https://test.com/admin/keys/rotate", None);
 
-        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when store writes fail"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: RotateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize rotate response");
 
@@ -635,19 +676,22 @@ mod tests {
         };
 
         let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
-        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
-        req.set_body(body_json);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some(&body_json),
+        );
 
-        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when store writes fail"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: RotateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize rotate response");
 
@@ -664,8 +708,11 @@ mod tests {
     #[test]
     fn test_handle_rotate_key_invalid_json() {
         let settings = crate::test_support::tests::create_test_settings();
-        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/rotate");
-        req.set_body("invalid json");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some("invalid json"),
+        );
 
         let result = handle_rotate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
@@ -680,19 +727,22 @@ mod tests {
         };
 
         let body_json = serde_json::to_string(&req_body).expect("should serialize rotate request");
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/rotate");
-        req.set_body(body_json);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some(&body_json),
+        );
 
-        let mut resp = handle_rotate_key(&settings, &noop_services(), req)
+        let resp = handle_rotate_key(&settings, &noop_services(), req)
             .expect("should return a response for invalid kid");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: RotateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize rotate response");
 
@@ -720,19 +770,22 @@ mod tests {
 
         let body_json =
             serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
-        req.set_body(body_json);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
 
-        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when active-kids cannot be read"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: DeactivateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize deactivate response");
 
@@ -757,19 +810,22 @@ mod tests {
 
         let body_json =
             serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
-        req.set_body(body_json);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
 
-        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
             .expect("should return a response even when stores are unavailable");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "should return 500 when active-kids cannot be read"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: DeactivateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize deactivate response");
 
@@ -790,8 +846,11 @@ mod tests {
     #[test]
     fn test_handle_deactivate_key_invalid_json() {
         let settings = crate::test_support::tests::create_test_settings();
-        let mut req = Request::new(Method::POST, "https://test.com/_ts/admin/keys/deactivate");
-        req.set_body("invalid json");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some("invalid json"),
+        );
 
         let result = handle_deactivate_key(&settings, &noop_services(), req);
         assert!(result.is_err(), "Invalid JSON should return error");
@@ -808,19 +867,22 @@ mod tests {
 
         let body_json =
             serde_json::to_string(&req_body).expect("should serialize deactivate request");
-        let mut req = Request::new(Method::POST, "https://test.com/admin/keys/deactivate");
-        req.set_body(body_json);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
 
-        let mut resp = handle_deactivate_key(&settings, &noop_services(), req)
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
             .expect("should return a response for invalid kid");
 
         assert_eq!(
-            resp.get_status(),
+            resp.status(),
             StatusCode::BAD_REQUEST,
             "should reject malformed kid as a bad request"
         );
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let response: DeactivateKeyResponse =
             serde_json::from_str(&body).expect("should deserialize deactivate response");
 
@@ -834,6 +896,60 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("kid must contain only")),
             "should explain the kid character restrictions"
+        );
+    }
+
+    #[test]
+    fn verify_signature_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(VERIFY_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/verify-signature",
+            Some(&oversized),
+        );
+        let err = handle_verify_signature(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for verify-signature body over limit"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/rotate",
+            Some(&oversized),
+        );
+        let err = handle_rotate_key(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for rotate-key body over limit"
+        );
+    }
+
+    #[test]
+    fn deactivate_key_rejects_oversized_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&oversized),
+        );
+        let err = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect_err("should reject oversized body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should return 413 for deactivate-key body over limit"
         );
     }
 
@@ -883,9 +999,10 @@ mod tests {
     #[test]
     fn test_handle_trusted_server_discovery() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://test.com/.well-known/trusted-server.json",
+            None,
         );
 
         // noop_services() config store always returns Err, so the discovery
@@ -901,18 +1018,19 @@ mod tests {
     #[test]
     fn test_handle_trusted_server_discovery_returns_jwks_document() {
         let settings = crate::test_support::tests::create_test_settings();
-        let req = Request::new(
+        let req = build_request(
             Method::GET,
             "https://test.com/.well-known/trusted-server.json",
+            None,
         );
 
         let services = build_services_with_config(StubJwksConfigStore);
-        let mut resp = handle_trusted_server_discovery(&settings, &services, req)
+        let resp = handle_trusted_server_discovery(&settings, &services, req)
             .expect("should return discovery document when config store is populated");
 
-        assert_eq!(resp.get_status(), StatusCode::OK, "should return 200 OK");
+        assert_eq!(resp.status(), StatusCode::OK, "should return 200 OK");
 
-        let body = resp.take_body_str();
+        let body = response_body_string(resp);
         let discovery: serde_json::Value =
             serde_json::from_str(&body).expect("should parse discovery document as JSON");
 

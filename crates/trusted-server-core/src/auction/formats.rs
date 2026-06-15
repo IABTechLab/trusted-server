@@ -4,9 +4,9 @@
 //! - Parsing incoming tsjs/Prebid.js format requests
 //! - Converting internal auction results to `OpenRTB` 2.x responses
 
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{ensure, Report, ResultExt};
-use fastly::http::{header, StatusCode};
-use fastly::{Request, Response};
+use http::{header, HeaderValue, Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -20,6 +20,7 @@ use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{to_openrtb_i32, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt};
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -100,9 +101,11 @@ pub struct BannerUnit {
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
-    req: &Request,
+    services: &RuntimeServices,
+    req: &Request<EdgeBody>,
     consent: ConsentContext,
     ec_id: Option<&str>,
+    geo: Option<GeoInfo>,
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.map(str::to_owned);
 
@@ -149,11 +152,12 @@ pub fn convert_tsjs_to_auction_request(
     // Build device info with user-agent (always) and geo (if available)
     let device = Some(DeviceInfo {
         user_agent: req
-            .get_header_str("user-agent")
-            .map(std::string::ToString::to_string),
-        ip: req.get_client_ip_addr().map(|ip| ip.to_string()),
-        #[allow(deprecated)]
-        geo: GeoInfo::from_request(req),
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        ip: services.client_info().client_ip.map(|ip| ip.to_string()),
+        geo,
     });
 
     // Forward allowed config entries from the JS request into the context map.
@@ -225,7 +229,7 @@ pub fn convert_to_openrtb_response(
     settings: &Settings,
     auction_request: &AuctionRequest,
     ec_allowed: bool,
-) -> Result<Response, Report<TrustedServerError>> {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // Build OpenRTB-style seatbid array
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
 
@@ -325,26 +329,33 @@ pub fn convert_to_openrtb_response(
             message: "Failed to serialize auction response".to_string(),
         })?;
 
-    let mut response = Response::from_status(StatusCode::OK)
-        .with_header(header::CONTENT_TYPE, "application/json")
-        .with_body(body_bytes);
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body_bytes))
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to build auction response".to_string(),
+        })?;
 
     // Signal consent status independently of whether EIDs were resolved.
-    // A user may have granted consent but have no partner syncs yet;
-    // downstream clients rely on this header to know consent was verified.
     if ec_allowed {
-        response.set_header(HEADER_X_TS_EC_CONSENT, "ok");
+        response
+            .headers_mut()
+            .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
     }
 
     // Attach EID response headers when consent-gated EIDs are available.
-    // `Some(empty)` means "we looked and found no synced partners" — the
-    // header is still set (with an encoded empty array) so clients can
-    // distinguish this from `None` (EIDs not checked / consent denied).
     if let Some(ref eids) = auction_request.user.eids {
         let (encoded, truncated) = encode_eids_header(eids)?;
-        response.set_header(HEADER_X_TS_EIDS, encoded);
+        let header_val =
+            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
+                message: "Failed to encode EIDs header value".to_string(),
+            })?;
+        response.headers_mut().insert(HEADER_X_TS_EIDS, header_val);
         if truncated {
-            response.set_header(HEADER_X_TS_EIDS_TRUNCATED, "true");
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
         }
     }
 
@@ -356,14 +367,19 @@ mod tests {
     use super::*;
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::openrtb::{Eid, Uid};
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use http::Method;
     use serde_json::json;
     use std::collections::HashSet;
 
-    fn make_request() -> Request {
-        let mut req = Request::new("POST", "https://publisher.example.com/auction");
-        req.set_header(header::USER_AGENT, "Mozilla/5.0 test");
-        req
+    fn make_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("https://publisher.example.com/auction")
+            .header(header::USER_AGENT, "Mozilla/5.0 test")
+            .body(EdgeBody::empty())
+            .expect("should build request")
     }
 
     fn make_settings() -> Settings {
@@ -445,8 +461,9 @@ mod tests {
         }
     }
 
-    fn response_json(mut response: Response) -> JsonValue {
-        serde_json::from_slice(&response.take_body_bytes()).expect("should parse JSON response")
+    fn response_json(response: Response<EdgeBody>) -> JsonValue {
+        serde_json::from_slice(&response.into_body().into_bytes())
+            .expect("should parse JSON response")
     }
 
     fn make_banner_body(config: Option<JsonValue>) -> AdRequest {
@@ -476,13 +493,16 @@ mod tests {
 
     fn convert_body_to_auction_request(body: &AdRequest, settings: &Settings) -> AuctionRequest {
         let req = make_request();
+        let services = noop_services();
 
         convert_tsjs_to_auction_request(
             body,
             settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should convert banner request")
     }
@@ -506,18 +526,22 @@ mod tests {
             .expect("should build response");
 
         assert!(
-            response.get_header(HEADER_X_TS_EIDS).is_some(),
+            response.headers().get(&HEADER_X_TS_EIDS).is_some(),
             "should include x-ts-eids header when EIDs are present"
         );
         assert_eq!(
             response
-                .get_header(HEADER_X_TS_EC_CONSENT)
+                .headers()
+                .get(&HEADER_X_TS_EC_CONSENT)
                 .and_then(|v| v.to_str().ok()),
             Some("ok"),
             "should include x-ts-ec-consent: ok when ec_allowed is true"
         );
         assert!(
-            response.get_header(HEADER_X_TS_EIDS_TRUNCATED).is_none(),
+            response
+                .headers()
+                .get(&HEADER_X_TS_EIDS_TRUNCATED)
+                .is_none(),
             "should not include truncated header for small payload"
         );
     }
@@ -533,13 +557,14 @@ mod tests {
 
         assert_eq!(
             response
-                .get_header(HEADER_X_TS_EC_CONSENT)
+                .headers()
+                .get(&HEADER_X_TS_EC_CONSENT)
                 .and_then(|v| v.to_str().ok()),
             Some("ok"),
             "should set x-ts-ec-consent: ok based on consent, not EID presence"
         );
         assert!(
-            response.get_header(HEADER_X_TS_EIDS).is_none(),
+            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
             "should omit x-ts-eids when no EIDs available"
         );
     }
@@ -554,16 +579,12 @@ mod tests {
             .expect("should build response");
 
         assert!(
-            response.get_header(HEADER_X_TS_EC_CONSENT).is_none(),
+            response.headers().get(&HEADER_X_TS_EC_CONSENT).is_none(),
             "should omit x-ts-ec-consent when ec_allowed is false"
         );
         assert!(
-            response.get_header(HEADER_X_TS_EIDS).is_none(),
+            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
             "should omit x-ts-eids when no EIDs available"
-        );
-        assert!(
-            response.get_header("x-ts-ec").is_none(),
-            "should not emit x-ts-ec when a valid EC is present"
         );
     }
 
@@ -579,7 +600,7 @@ mod tests {
             .expect("should build response");
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            response.headers().get("x-ts-ec").is_none(),
             "should omit x-ts-ec when no EC ID is available"
         );
     }
@@ -675,11 +696,14 @@ mod tests {
     fn convert_tsjs_to_auction_request_propagates_missing_ec_id() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let auction_request = convert_tsjs_to_auction_request(
             &make_banner_body(None),
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
+            None,
             None,
         )
         .expect("should convert request without EC ID");
@@ -740,6 +764,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_allows_empty_banner_sizes() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
@@ -755,9 +780,11 @@ mod tests {
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should convert request with empty banner sizes");
 
@@ -772,6 +799,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_rejects_banner_sizes_that_are_not_width_height_pairs() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
@@ -789,9 +817,11 @@ mod tests {
         let err = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect_err("should reject malformed banner size");
 
@@ -805,6 +835,7 @@ mod tests {
     fn convert_tsjs_to_auction_request_skips_units_without_banner_media() {
         let settings = make_settings();
         let req = make_request();
+        let services = noop_services();
         let body = AdRequest {
             ad_units: vec![
                 AdUnit {
@@ -825,9 +856,11 @@ mod tests {
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("existing-ec-id"),
+            None,
         )
         .expect("should skip unsupported media units");
 
@@ -846,19 +879,25 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, true)
             .expect("should convert auction result to OpenRTB response");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         assert_eq!(
-            response.get_header_str(header::CONTENT_TYPE),
+            response
+                .headers()
+                .get(&header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/json"),
             "should set JSON content type"
         );
         assert_eq!(
-            response.get_header_str(HEADER_X_TS_EC_CONSENT),
+            response
+                .headers()
+                .get(&HEADER_X_TS_EC_CONSENT)
+                .and_then(|v| v.to_str().ok()),
             Some("ok"),
             "should set EC consent header when allowed"
         );
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            response.headers().get("x-ts-ec").is_none(),
             "should not emit removed EC ID header"
         );
 
@@ -904,7 +943,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert bid without creative HTML");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         assert_eq!(
             json["seatbid"][0]["bid"][0]["adm"],
@@ -924,7 +963,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert bid without advertiser domains");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         let bid = json["seatbid"][0]["bid"][0]
             .as_object()
@@ -950,7 +989,7 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &auction_request, false)
             .expect("should convert auction result without winning bids");
 
-        assert_eq!(response.get_status(), StatusCode::OK, "should return OK");
+        assert_eq!(response.status(), StatusCode::OK, "should return OK");
         let json = response_json(response);
         assert!(
             json.get("seatbid").is_none(),
@@ -1116,27 +1155,34 @@ mod tests {
 mod convert_tests {
     use super::*;
     use crate::consent::ConsentContext;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::crate_test_settings_str;
-    use fastly::http::Method;
-    use fastly::Request;
+    use http::Method;
 
     fn make_settings() -> Settings {
         Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
     }
 
-    fn make_req() -> Request {
-        Request::new(Method::POST, "https://test-publisher.com/auction")
+    fn make_req() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::empty())
+            .expect("should build test request")
     }
 
     fn call_convert(body: &AdRequest) -> AuctionRequest {
         let settings = make_settings();
+        let services = noop_services();
         let req = make_req();
         convert_tsjs_to_auction_request(
             body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("test-ec-id"),
+            None,
         )
         .expect("should convert without error")
     }
@@ -1216,6 +1262,7 @@ mod convert_tests {
             crate_test_settings_str()
         );
         let settings = Settings::from_toml(&settings_str).expect("should parse");
+        let services = noop_services();
         let req = make_req();
 
         let body = AdRequest {
@@ -1230,9 +1277,11 @@ mod convert_tests {
         let auction_request = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("test-ec-id"),
+            None,
         )
         .expect("should convert");
 
@@ -1264,13 +1313,16 @@ mod convert_tests {
         };
 
         let settings = make_settings();
+        let services = noop_services();
         let req = make_req();
         let result = convert_tsjs_to_auction_request(
             &body,
             &settings,
+            &services,
             &req,
             ConsentContext::default(),
             Some("test-ec-id"),
+            None,
         );
 
         assert!(

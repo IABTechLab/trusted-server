@@ -45,6 +45,10 @@ pub enum TrustedServerError {
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
 
+    /// Request payload exceeded maximum allowed size.
+    #[display("Request payload too large: {message}")]
+    RequestTooLarge { message: String },
+
     /// HTTP header value creation failed.
     #[display("Invalid HTTP header value: {message}")]
     InvalidHeaderValue { message: String },
@@ -122,6 +126,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
+            Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
             Self::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -258,6 +263,7 @@ mod tests {
             | TrustedServerError::Settings { .. }
             | TrustedServerError::EdgeCookie { .. }
             | TrustedServerError::PartnerNotFound { .. }
+            | TrustedServerError::RequestTooLarge { .. }
             | TrustedServerError::InsecureDefault { .. } => (),
         };
 
@@ -365,6 +371,12 @@ mod tests {
                     message: "proxy failed".to_string(),
                 },
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::RequestTooLarge {
+                    message: "body too large".to_string(),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
             ),
         ];
 
