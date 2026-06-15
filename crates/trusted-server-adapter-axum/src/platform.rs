@@ -1,5 +1,8 @@
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -235,6 +238,35 @@ struct AxumPendingHandle {
     handle: tokio::task::JoinHandle<SpawnedRequestResult>,
 }
 
+impl Drop for AxumPendingHandle {
+    fn drop(&mut self) {
+        // Abort instead of detaching: when the orchestrator hits the auction
+        // deadline and drops the remaining pending requests, the abandoned
+        // bidder tasks would otherwise keep running for up to the 30s
+        // transport timeout.
+        self.handle.abort();
+    }
+}
+
+/// Resolves to the backend name together with the task result so that
+/// [`futures::future::select_all`] callers never have to reconstruct which
+/// backend a completion belongs to by position. `select_all` removes the
+/// ready future with `swap_remove` and makes no ordering guarantee for the
+/// remaining futures, so positional bookkeeping would mislabel them.
+impl Future for AxumPendingHandle {
+    type Output = (String, Result<SpawnedRequestResult, tokio::task::JoinError>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Ready(result) => {
+                let backend_name = std::mem::take(&mut self.backend_name);
+                Poll::Ready((backend_name, result))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// reqwest-backed HTTP client for the Axum dev server.
 ///
 /// `send_async` buffers any `Body::Stream` in the calling context, then spawns
@@ -258,6 +290,10 @@ impl AxumPlatformHttpClient {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(30))
+                // Disable automatic redirects: core proxy code enforces redirect
+                // limits and allowed_domains checks itself. Without this, reqwest
+                // would follow Location headers internally and bypass those checks.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("should build reqwest client"),
         }
@@ -323,6 +359,13 @@ impl AxumPlatformHttpClient {
             .bytes()
             .await
             .change_context(PlatformError::HttpClient)?;
+        // Upstream responses are buffered whole with no cap — acceptable for
+        // the dev server, but log the size so a large or hostile upstream is
+        // visible instead of silently growing the heap.
+        log::debug!(
+            "buffered {} upstream response bytes from {uri}",
+            resp_bytes.len()
+        );
         let edge_resp = edge_builder
             .body(edgezero_core::body::Body::from(resp_bytes.to_vec()))
             .change_context(PlatformError::HttpClient)?;
@@ -388,6 +431,9 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .await
                 .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
                 .to_vec();
+            // Same unbounded-buffering note as the synchronous path: log the
+            // size so large upstream responses are visible in dev.
+            log::debug!("buffered {} upstream response bytes from {uri}", body.len());
             Ok::<_, Report<PlatformError>>((status, resp_headers, body))
         });
 
@@ -407,7 +453,7 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        let mut handles: Vec<AxumPendingHandle> = pending_requests
+        let handles: Vec<AxumPendingHandle> = pending_requests
             .into_iter()
             .map(|pr| {
                 pr.downcast::<AxumPendingHandle>().map_err(|_| {
@@ -417,42 +463,54 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let backend_names: Vec<String> = handles.iter().map(|h| h.backend_name.clone()).collect();
-        let join_handles: Vec<_> = handles.drain(..).map(|h| h.handle).collect();
-
-        let (result, ready_idx, remaining_handles) =
-            futures::future::select_all(join_handles).await;
+        // Each AxumPendingHandle resolves to (backend_name, result), so the
+        // remaining handles keep their own backend names — no positional
+        // reconstruction (select_all does not preserve the order of the
+        // remaining futures).
+        let ((backend_name, result), _ready_idx, remaining_handles) =
+            futures::future::select_all(handles).await;
 
         let remaining: Vec<PlatformPendingRequest> = remaining_handles
             .into_iter()
-            .enumerate()
-            .map(|(i, handle)| {
-                let original_idx = if i < ready_idx { i } else { i + 1 };
-                let bn = backend_names[original_idx].clone();
-                PlatformPendingRequest::new(AxumPendingHandle {
-                    backend_name: bn.clone(),
-                    handle,
-                })
-                .with_backend_name(bn)
+            .map(|handle| {
+                let backend_name = handle.backend_name.clone();
+                PlatformPendingRequest::new(handle).with_backend_name(backend_name)
             })
             .collect();
 
-        let (status, headers, body) = result.map_err(|e| {
-            Report::new(PlatformError::HttpClient)
-                .attach(format!("auction request task failed: {e}"))
-        })??;
+        // Map join panics and per-request errors into ready: Err(...) so that the
+        // auction orchestrator can log the failure and continue with remaining providers
+        // rather than treating one bad provider as a fatal select() failure.
+        let ready = result
+            .map_err(|e| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("auction request task panicked: {e}"))
+            })
+            .and_then(|inner| inner)
+            .and_then(|(status, headers, body)| {
+                let mut builder = edgezero_core::http::response_builder().status(status);
+                for (name, value) in &headers {
+                    builder = builder.header(name.as_str(), value.as_slice());
+                }
+                builder
+                    .body(edgezero_core::body::Body::from(body))
+                    .change_context(PlatformError::HttpClient)
+            })
+            .map(|edge_resp| {
+                PlatformResponse::new(edge_resp).with_backend_name(backend_name.clone())
+            });
 
-        let backend_name = backend_names[ready_idx].clone();
-        let mut builder = edgezero_core::http::response_builder().status(status);
-        for (name, value) in &headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(body))
-            .change_context(PlatformError::HttpClient)?;
+        // Attribute the failure to its backend so the orchestrator can remove
+        // the provider and record a BidStatus::Error, matching the Fastly
+        // adapter. Without this, a failed provider silently vanishes through
+        // the orchestrator's "backend not identified" branch.
+        let failed_backend_name = ready.as_ref().err().map(|_| backend_name);
 
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(backend_name));
-        Ok(PlatformSelectResult { ready, remaining })
+        Ok(PlatformSelectResult {
+            ready,
+            remaining,
+            failed_backend_name,
+        })
     }
 }
 
@@ -480,17 +538,41 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
+    use trusted_server_core::platform::{
+        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+    };
+
+    // Stateless shims are promoted to process-wide statics so callers clone
+    // an existing Arc instead of allocating a new one per request.
+    static CONFIG_STORE: std::sync::OnceLock<Arc<dyn PlatformConfigStore>> =
+        std::sync::OnceLock::new();
+    static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
+        std::sync::OnceLock::new();
+    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
+    static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
+    static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+
     RuntimeServices::builder()
-        .config_store(Arc::new(AxumPlatformConfigStore))
-        .secret_store(Arc::new(AxumPlatformSecretStore))
-        .kv_store(Arc::new(trusted_server_core::platform::UnavailableKvStore))
-        .backend(Arc::new(AxumPlatformBackend))
+        .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
+            Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
+        })))
+        .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
+            Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
+        })))
+        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
+            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
+        })))
+        .backend(Arc::clone(BACKEND.get_or_init(|| {
+            Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
+        })))
         // Keep the HTTP client request-scoped in the dev adapter. Sharing a pooled
         // client across requests previously regressed the Next.js server-action →
         // API-route integration flow by reusing a poisoned connection after a
         // truncated POST. Revisit pooling if profiling shows allocation cost.
         .http_client(Arc::new(AxumPlatformHttpClient::new()))
-        .geo(Arc::new(AxumPlatformGeo))
+        .geo(Arc::clone(GEO.get_or_init(|| {
+            Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>
+        })))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -652,6 +734,47 @@ mod tests {
             response.into_body().into_bytes().as_ref(),
             b"ok",
             "should preserve decoded response body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn select_attributes_failed_backend_name() {
+        // Bind and immediately drop a listener so the port is closed — the
+        // request fails with connection refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind probe listener");
+        let addr = listener.local_addr().expect("should read local address");
+        drop(listener);
+
+        let request = edgezero_core::http::request_builder()
+            .uri(format!("http://{addr}/"))
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        let client = AxumPlatformHttpClient::new();
+        let pending = client
+            .send_async(PlatformHttpRequest::new(request, "failing_backend"))
+            .await
+            .expect("should spawn async request");
+
+        let result = client
+            .select(vec![pending])
+            .await
+            .expect("select should surface the failure via ready, not a fatal error");
+
+        assert!(
+            result.ready.is_err(),
+            "request to a closed port should fail"
+        );
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("failing_backend"),
+            "failed provider must be attributed to its backend so the orchestrator can record BidStatus::Error"
+        );
+        assert!(
+            result.remaining.is_empty(),
+            "no remaining requests expected"
         );
     }
 

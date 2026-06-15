@@ -51,6 +51,7 @@ debug = 1
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = "0.8"
 base64 = "0.22"
 brotli = "8.0"
 build-print = "1.0.1"
@@ -82,8 +83,8 @@ lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 regex = "1.12.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 simple_logger = "5"
 serde_json = "1.0.149"
@@ -92,6 +93,7 @@ subtle = "2.6"
 temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 toml = "1.1"
+tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"
 urlencoding = "2.1"

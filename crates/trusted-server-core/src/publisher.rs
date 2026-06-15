@@ -204,6 +204,8 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
+    // lgtm[rust/cleartext-logging]
+    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
         "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
         params.content_type,
@@ -394,21 +396,98 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
-/// Stream the publisher response body through the processing pipeline.
+/// Growable byte buffer that rejects writes past a configured limit.
 ///
-/// Called by the adapter after `stream_to_client()` has committed the
-/// response headers. Writes processed chunks directly to `output`.
+/// Used by [`buffer_publisher_response`] to enforce
+/// `settings.publisher.max_buffered_body_bytes` so a large processable
+/// origin response fails safely instead of exhausting the Wasm heap.
+struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Buffer a [`PublisherResponse`] into a single [`Response`].
 ///
-/// This is `async` because it uses `services.http_client().send(...).await` rather
-/// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
-/// route handler in `block_on`, so behavior is equivalent — the change reflects the
-/// migration to the platform-agnostic HTTP client.
+/// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
+/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
+/// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
+///
+/// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
+/// (16 MiB by default), so processable origin responses cannot grow the
+/// buffer without bound and exhaust the Wasm heap.
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Since headers are
-/// already committed, the caller should log the error and drop the
-/// `StreamingBody` (client sees a truncated response).
+/// Returns an error if the streaming pipeline fails to process the response
+/// body, or if the processed body exceeds the configured buffer cap.
+pub fn buffer_publisher_response(
+    publisher_response: PublisherResponse,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = output.into_inner();
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(bytes.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(bytes);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+/// Stream the publisher response body through the processing pipeline.
+///
+/// Called by the adapter after `stream_to_client()` has committed the response
+/// headers. Writes processed chunks directly to `output`.
+///
+/// # Errors
+///
+/// Returns an error if processing fails mid-stream. Since headers are already
+/// committed, the caller should log the error and drop the `StreamingBody`
+/// (client sees a truncated response).
 pub fn stream_publisher_body<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -549,6 +628,8 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
+    // lgtm[rust/cleartext-logging]
+    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
     log::debug!(
         "Proxying to dynamic backend: {} (from {})",
         backend_name,
@@ -753,14 +834,14 @@ fn apply_ec_headers(
         }
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        crate::cookies::set_ec_cookie(settings, response, ec_id);
+        crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        crate::cookies::expire_ec_cookie(settings, response);
+        crate::ec::cookies::expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -1512,42 +1593,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publisher_request_uses_platform_http_client_with_http_types() {
-        let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"origin response".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example/page")
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+    #[test]
+    fn publisher_request_uses_platform_http_client_with_http_types() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
 
-        let pub_response = handle_publisher_request(&settings, &registry, &services, req)
-            .await
-            .expect("should proxy publisher request");
-        let response = match pub_response {
-            PublisherResponse::Buffered(r) => r,
-            PublisherResponse::PassThrough { mut response, body } => {
-                *response.body_mut() = body;
-                response
-            }
-            PublisherResponse::Stream { response, .. } => response,
-        };
+            let pub_response = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+            let response = match pub_response {
+                PublisherResponse::Buffered(r) => r,
+                PublisherResponse::PassThrough { mut response, body } => {
+                    *response.body_mut() = body;
+                    response
+                }
+                PublisherResponse::Stream { response, .. } => response,
+            };
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "origin response");
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should proxy through the platform http client"
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "origin response");
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "should proxy through the platform http client"
+            );
+        });
     }
 
     #[test]
@@ -1834,6 +1917,41 @@ mod tests {
         assert!(
             !processed.contains("origin.example.com"),
             "origin host must not leak. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_accepts_writes_within_limit() {
+        let mut writer = BoundedWriter::new(10);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        writer
+            .write_all(b"67890")
+            .expect("should accept write up to exact limit");
+
+        assert_eq!(
+            writer.into_inner(),
+            b"1234567890",
+            "should preserve all written bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_writes_exceeding_limit() {
+        let mut writer = BoundedWriter::new(8);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        let err = writer
+            .write_all(b"6789")
+            .expect_err("should reject write that exceeds the limit");
+
+        assert!(
+            err.to_string().contains("maximum buffered size"),
+            "should report the buffer cap in the error message"
         );
     }
 }

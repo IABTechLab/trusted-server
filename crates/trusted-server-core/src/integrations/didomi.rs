@@ -172,7 +172,7 @@ impl DidomiIntegration {
         services: &RuntimeServices,
         origin: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, origin, DIDOMI_INTEGRATION_ID)
+        ensure_integration_backend(services, origin, DIDOMI_INTEGRATION_ID, None)
     }
 }
 

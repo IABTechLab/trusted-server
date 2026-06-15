@@ -324,7 +324,7 @@ impl LockrIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, target_url, LOCKR_INTEGRATION_ID)
+        ensure_integration_backend(services, target_url, LOCKR_INTEGRATION_ID, None)
     }
 }
 

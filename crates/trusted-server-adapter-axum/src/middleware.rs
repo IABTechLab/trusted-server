@@ -128,8 +128,24 @@ mod tests {
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        let mut s =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        let mut s = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-pass"
+
+                [publisher]
+                domain = "test-publisher.example.com"
+                cookie_domain = ".test-publisher.example.com"
+                origin_url = "https://origin.test-publisher.example.com"
+                proxy_secret = "unit-test-proxy-secret"
+
+                [ec]
+                passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should load test settings");
         s.response_headers = headers
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

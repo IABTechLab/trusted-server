@@ -377,14 +377,15 @@ impl DataDomeIntegration {
             .body(request_body)
             .change_context(Self::error("Failed to build DataDome API request"))?;
 
-        // Copy relevant headers
+        // Copy relevant headers from the original client request.
+        // CONTENT_LENGTH is intentionally omitted: the body is re-materialized
+        // via collect_body_bounded, so its length may differ from the original.
         let headers_to_copy = [
             header::USER_AGENT,
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
             header::CONTENT_TYPE,
-            header::CONTENT_LENGTH,
             header::ORIGIN,
             header::REFERER,
         ];
@@ -428,7 +429,7 @@ impl DataDomeIntegration {
         services: &RuntimeServices,
         target_url: &str,
     ) -> Result<String, Report<TrustedServerError>> {
-        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID)
+        ensure_integration_backend(services, target_url, DATADOME_INTEGRATION_ID, None)
     }
 }
 

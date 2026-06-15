@@ -11,16 +11,58 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
 use edgezero_adapter_axum::EdgeZeroAxumService;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::http::request_builder;
+use edgezero_core::router::RouterService;
 use http::HeaderMap;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
+use trusted_server_core::settings::Settings;
+
+/// Shared test settings for both adapters.
+///
+/// The settings baked into the binaries contain placeholder secrets that
+/// `get_settings()` rejects by design, so both routers are built through
+/// their `routes_with_settings` testing seams from this known-good config.
+/// The handler regex is the production-shaped `^/_ts/admin`, matching
+/// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
+/// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
+fn test_settings() -> Settings {
+    Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "parity-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+        "#,
+    )
+    .expect("should parse parity test settings")
+}
+
+/// Build the Axum adapter router from the shared test settings.
+fn axum_router() -> RouterService {
+    AxumApp::routes_with_settings(test_settings())
+        .expect("should build Axum router from parity test settings")
+}
+
+/// Build the Cloudflare adapter router from the shared test settings.
+fn cf_router() -> RouterService {
+    CloudflareApp::routes_with_settings(test_settings())
+        .expect("should build Cloudflare router from parity test settings")
+}
 
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("GET")
         .uri(uri)
@@ -39,7 +81,7 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+    let mut svc = EdgeZeroAxumService::new(axum_router());
     let req = AxumRequest::builder()
         .method("POST")
         .uri(uri)
@@ -72,7 +114,7 @@ async fn axum_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
 
 /// Send a GET request to the Cloudflare adapter and return (status, headers).
 async fn cf_get(uri: &str) -> (u16, HeaderMap) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("GET")
         .uri(uri)
@@ -84,7 +126,7 @@ async fn cf_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = CloudflareApp::routes();
+    let router = cf_router();
     let req = request_builder()
         .method("POST")
         .uri(uri)
@@ -136,7 +178,7 @@ async fn discovery_route_body_is_json_parity() {
     use serde_json::Value;
 
     let (axum_status, axum_body_bytes) = {
-        let mut svc = EdgeZeroAxumService::new(AxumApp::routes());
+        let mut svc = EdgeZeroAxumService::new(axum_router());
         let req = AxumRequest::builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
@@ -160,7 +202,7 @@ async fn discovery_route_body_is_json_parity() {
     };
 
     let (cf_status, cf_body_bytes) = {
-        let router = CloudflareApp::routes();
+        let router = cf_router();
         let req = request_builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")
@@ -172,15 +214,40 @@ async fn discovery_route_body_is_json_parity() {
         (status, body)
     };
 
-    // Both adapters must agree on whether the response is JSON.
+    // This endpoint serves a static config document, so the bodies must be
+    // identical across adapters — not merely both parsable (or both unparsable)
+    // as JSON. Parse first so JSON key ordering / whitespace differences do not
+    // cause false failures, but never treat `None == None` as body parity.
     let axum_json: Option<Value> = serde_json::from_slice(&axum_body_bytes).ok();
     let cf_json: Option<Value> = serde_json::from_slice(&cf_body_bytes).ok();
+
+    // Both adapters must agree on whether the body is JSON. A regression where
+    // one returns the discovery JSON and the other returns a non-JSON error body
+    // is a definitive parity break.
     assert_eq!(
         axum_json.is_some(),
         cf_json.is_some(),
-        "/.well-known/trusted-server.json body JSON-parsability must match across adapters \
-         (axum_status={axum_status} cf_status={cf_status})"
+        "/.well-known/trusted-server.json body type (JSON vs non-JSON) must match \
+         across adapters (axum_status={axum_status} cf_status={cf_status})"
     );
+
+    match (axum_json, cf_json) {
+        // Both adapters serve JSON: compare parsed values so serialization
+        // differences (key ordering, whitespace) do not cause false failures.
+        (Some(axum_value), Some(cf_value)) => assert_eq!(
+            axum_value, cf_value,
+            "/.well-known/trusted-server.json JSON body must match across adapters \
+             (axum_status={axum_status} cf_status={cf_status})"
+        ),
+        // Without seeded signing/JWKS data both adapters take the same error path
+        // and return a non-JSON error body. Compare raw bytes so diverging error
+        // payloads are caught instead of both parsing to `None`.
+        _ => assert_eq!(
+            axum_body_bytes, cf_body_bytes,
+            "/.well-known/trusted-server.json non-JSON body must match across adapters \
+             (axum_status={axum_status} cf_status={cf_status})"
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -204,11 +271,12 @@ async fn verify_signature_route_parity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_rotate_unauthenticated_parity() {
-    // Both adapters must return 401 for unauthenticated admin requests.
+    // Both adapters must return 401 for unauthenticated admin requests on the
+    // canonical `/_ts/admin/keys/*` path that production config auth-gates.
     // The authenticated-path divergence (Axum→501 no-KV, CF→4xx no-KV)
     // is separate and not covered here.
-    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/rotate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/admin/keys/rotate", "{}").await;
+    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/rotate", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/rotate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -227,7 +295,7 @@ async fn admin_rotate_unauthenticated_parity() {
     let cf_www_auth = header_value(&cf_headers, "www-authenticate", "Cloudflare");
     assert_eq!(
         axum_www_auth, cf_www_auth,
-        "WWW-Authenticate values must match across adapters"
+        "WWW-Authenticate values must match across adapters for /_ts/admin/keys/rotate"
     );
     assert!(
         axum_www_auth.starts_with("Basic realm="),
@@ -238,8 +306,8 @@ async fn admin_rotate_unauthenticated_parity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_deactivate_unauthenticated_parity() {
     // Mirror of admin_rotate_unauthenticated_parity for the deactivate endpoint.
-    let (axum_status, axum_headers) = axum_post_headers("/admin/keys/deactivate", "{}").await;
-    let (cf_status, cf_headers) = cf_post_headers("/admin/keys/deactivate", "{}").await;
+    let (axum_status, axum_headers) = axum_post_headers("/_ts/admin/keys/deactivate", "{}").await;
+    let (cf_status, cf_headers) = cf_post_headers("/_ts/admin/keys/deactivate", "{}").await;
 
     assert_eq!(
         axum_status, 401,
@@ -258,7 +326,7 @@ async fn admin_deactivate_unauthenticated_parity() {
     let cf_www_auth = header_value(&cf_headers, "www-authenticate", "Cloudflare");
     assert_eq!(
         axum_www_auth, cf_www_auth,
-        "WWW-Authenticate values must match across adapters"
+        "WWW-Authenticate values must match across adapters for /_ts/admin/keys/deactivate"
     );
     assert!(
         axum_www_auth.starts_with("Basic realm="),
@@ -303,6 +371,13 @@ async fn auction_not_challenged_by_auth_parity() {
 
     assert_ne!(axum_status, 401, "Axum /auction must not 401");
     assert_ne!(cf_status, 401, "Cloudflare /auction must not 401");
+    assert_ne!(axum_status, 404, "Axum /auction must be routed (not 404)");
+    assert_ne!(cf_status, 404, "Cloudflare /auction must be routed (not 404)");
+    assert_eq!(
+        axum_status, cf_status,
+        "/auction must return the same status across adapters: \
+         axum={axum_status} cf={cf_status}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -338,4 +413,70 @@ async fn unknown_route_returns_same_status_parity() {
         axum_status, cf_status,
         "unknown routes must return same status: axum={axum_status} cf={cf_status}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
+    // The production handler regex `^/_ts/admin` only matches the canonical
+    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases must not be
+    // registered as admin routes on Cloudflare. If they were, AuthMiddleware would
+    // not match them and unauthenticated callers would reach the real key
+    // handlers. With the aliases removed, each behaves like any other unrouted
+    // path: it falls through to the publisher fallback rather than the auth-gated
+    // admin route.
+    //
+    // Primary guard: assert the route table directly, analogous to the Fastly
+    // `NAMED_ROUTES` guard. A behavioral check alone can false-pass, because a
+    // reintroduced key handler could fail with the same fallback status and carry
+    // no `WWW-Authenticate` header in this no-store/no-origin environment.
+    let registered: Vec<(String, String)> = cf_router()
+        .routes()
+        .iter()
+        .map(|route| (route.method().to_string(), route.path().to_string()))
+        .collect();
+    let is_registered =
+        |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
+
+    assert!(
+        is_registered("POST", "/_ts/admin/keys/rotate"),
+        "canonical POST /_ts/admin/keys/rotate must be a registered admin route"
+    );
+    assert!(
+        is_registered("POST", "/_ts/admin/keys/deactivate"),
+        "canonical POST /_ts/admin/keys/deactivate must be a registered admin route"
+    );
+    assert!(
+        !is_registered("POST", "/admin/keys/rotate"),
+        "legacy POST /admin/keys/rotate must not be registered (would bypass `^/_ts/admin` auth)"
+    );
+    assert!(
+        !is_registered("POST", "/admin/keys/deactivate"),
+        "legacy POST /admin/keys/deactivate must not be registered (would bypass `^/_ts/admin` auth)"
+    );
+
+    // Secondary guard: confirm the runtime behavior matches an unrouted path.
+    for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
+        assert_eq!(
+            canonical_status, 401,
+            "canonical /_ts{alias} must challenge unauthenticated callers"
+        );
+
+        let (alias_status, alias_headers) = cf_post_headers(alias, "{}").await;
+        assert_ne!(
+            alias_status, 401,
+            "legacy {alias} must not be an auth-gated admin route"
+        );
+        assert!(
+            !alias_headers.contains_key("www-authenticate"),
+            "legacy {alias} must not issue an admin auth challenge"
+        );
+
+        let (unknown_status, _) = cf_post_headers("/this-route-does-not-exist-abc123", "{}").await;
+        assert_eq!(
+            alias_status, unknown_status,
+            "legacy {alias} must fall through to the publisher fallback like an unknown path: \
+             alias={alias_status} unknown={unknown_status}"
+        );
+    }
 }

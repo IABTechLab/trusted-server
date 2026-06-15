@@ -176,10 +176,7 @@ impl<'a> BackendConfig<'a> {
         if self.scheme.eq_ignore_ascii_case("https") {
             builder = builder.enable_ssl().sni_hostname(self.host);
             if self.certificate_check {
-                builder = builder
-                    .enable_ssl()
-                    .sni_hostname(self.host)
-                    .check_certificate(self.host);
+                builder = builder.check_certificate(self.host);
             } else {
                 log::warn!(
                     "INSECURE: certificate check disabled for backend: {}",

@@ -1,3 +1,13 @@
+// The `cloudflare` feature activates the `worker` crate which requires
+// wasm-bindgen and only compiles for `wasm32-unknown-unknown`. Enabling it on
+// a native target produces cryptic linker errors — catch it early instead.
+#[cfg(all(feature = "cloudflare", not(target_arch = "wasm32")))]
+compile_error!(
+    "The `cloudflare` feature requires `--target wasm32-unknown-unknown`. \
+     Run: cargo check -p trusted-server-adapter-cloudflare \
+     --features cloudflare --target wasm32-unknown-unknown"
+);
+
 pub mod app;
 pub mod middleware;
 pub mod platform;
