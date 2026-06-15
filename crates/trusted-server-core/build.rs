@@ -100,6 +100,10 @@ mod creative_opportunities {
 #[path = "src/settings.rs"]
 mod settings;
 
+#[path = "src/creative_slot_build_check.rs"]
+mod creative_slot_build_check;
+
+use creative_slot_build_check::validate_creative_slot;
 use std::fs;
 use std::path::Path;
 
@@ -118,10 +122,33 @@ fn main() {
     let toml_content = fs::read_to_string(init_config_path)
         .unwrap_or_else(|_| panic!("Failed to read {init_config_path:?}"));
 
-    // Merge base TOML with environment variable overrides and write output.
+    // Merge base TOML with environment variable overrides.
     // Panics if admin endpoints are not covered by a handler.
     let settings = settings::Settings::from_toml_and_env(&toml_content)
         .expect("Failed to parse settings at build time");
+
+    // Validate [creative_opportunities.slot] entries from the *merged* config
+    // (base trusted-server.toml plus any TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT
+    // env overrides) before it is serialized and embedded. This mirrors the
+    // runtime validator (CreativeOpportunitySlot::validate_runtime) — the build
+    // context uses a stub whose validate_runtime is a no-op, so without this an
+    // invalid slot would pass CI and surface as a request-time configuration
+    // error / service outage. The validator is shared with the crate (see
+    // `creative_slot_build_check`) so it stays under test. Running it before the
+    // write also means a rejected config is never persisted to the embedded file.
+    if let Some(co) = &settings.creative_opportunities {
+        for slot in &co.slot_raw {
+            if let Err(err) = validate_creative_slot(slot, &co.gam_network_id) {
+                panic!("trusted-server.toml [creative_opportunities.slot]: {err}");
+            }
+        }
+        if !co.slot_raw.is_empty() {
+            println!(
+                "cargo:warning=creative_opportunities: {} slot(s) validated",
+                co.slot_raw.len()
+            );
+        }
+    }
 
     let merged_toml =
         toml::to_string_pretty(&settings).expect("Failed to serialize settings to TOML");
@@ -132,31 +159,5 @@ fn main() {
     if current != merged_toml {
         fs::write(dest_path, merged_toml)
             .unwrap_or_else(|_| panic!("Failed to write {dest_path:?}"));
-    }
-
-    // Validate slot IDs from [creative_opportunities.slot] in trusted-server.toml
-    let slot_id_re = regex::Regex::new(r"^[A-Za-z0-9_\-]+$").expect("should compile regex");
-    if let Some(co) = &settings.creative_opportunities {
-        for slot in &co.slot_raw {
-            if let Some(id) = slot.get("id").and_then(|v| v.as_str()) {
-                if !slot_id_re.is_match(id) {
-                    panic!(
-                        "trusted-server.toml [creative_opportunities.slot]: slot id '{}' is invalid; \
-                         only [A-Za-z0-9_-] allowed",
-                        id
-                    );
-                }
-            } else {
-                panic!(
-                    "trusted-server.toml [creative_opportunities.slot]: a slot entry is missing the required 'id' field"
-                );
-            }
-        }
-        if !co.slot_raw.is_empty() {
-            println!(
-                "cargo:warning=creative_opportunities: {} slot(s) validated",
-                co.slot_raw.len()
-            );
-        }
     }
 }
