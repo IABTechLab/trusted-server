@@ -1,12 +1,15 @@
 //! HTTP endpoint handlers for auction requests.
 
+use std::collections::HashMap;
+
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, Request, Response, StatusCode};
 use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
-use crate::consent::gate_eids_by_consent;
+use crate::auction::orchestrator::OrchestrationResult;
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
@@ -162,6 +165,43 @@ pub async fn handle_auction(
         None
     };
     let consent_context = ec_context.consent().clone();
+
+    // Server-side auction consent gate. The publisher-navigation and
+    // `/__ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
+    // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
+    // for the same server-side auction, so it must gate identically: returning
+    // a no-bid response here prevents outbound PBS/APS calls and the forwarding
+    // of request-derived signals (UA/IP/geo, and cookies under some Prebid
+    // consent-forwarding modes) for traffic that must not run an auction.
+    if !consent_allows_server_side_auction(&consent_context) {
+        log::info!(
+            "/auction: server-side auction consent gate denied; returning no-bid response without contacting providers"
+        );
+        // Build the request shape locally (no outbound calls, no geo lookup, no
+        // EID resolution) so the no-bid OpenRTB response echoes the request id.
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            settings,
+            services,
+            &http_req,
+            consent_context,
+            ec_id,
+            None,
+        )?;
+        let empty_result = OrchestrationResult {
+            provider_responses: Vec::new(),
+            mediator_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 0,
+            metadata: HashMap::new(),
+        };
+        return convert_to_openrtb_response(
+            &empty_result,
+            settings,
+            &auction_request,
+            ec_context.ec_allowed(),
+        );
+    }
 
     // Parse client-provided EIDs from the current request body. When the
     // current request does not include them, fall back to the persisted
@@ -444,12 +484,19 @@ pub(crate) fn merge_auction_eids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auction::config::AuctionConfig;
+    use crate::auction::provider::AuctionProvider;
+    use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
+    use crate::platform::test_support::noop_services;
+    use crate::platform::{PlatformPendingRequest, PlatformResponse};
+    use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
         EcContext::new_for_test(
@@ -459,6 +506,107 @@ mod tests {
                 ..ConsentContext::default()
             },
         )
+    }
+
+    /// Provider that fails the test if it is ever contacted. Used to prove the
+    /// `/auction` consent gate short-circuits before any outbound bid request.
+    struct PanicOnBidProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for PanicOnBidProvider {
+        fn provider_name(&self) -> &'static str {
+            "panic_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            panic!("provider must not be contacted when the consent gate denies the auction");
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("provider must not parse a response when the auction is gated off");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("panic-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_endpoint_consent_gate_returns_no_bid_without_contacting_providers() {
+        // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run
+        // a server-side auction. The /auction endpoint must short-circuit to a
+        // no-bid response before dispatching to any provider — matching the
+        // publisher-navigation and /__ts/page-bids paths.
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["panic_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let services = noop_services();
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+
+        let body = json!({
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("gated auction should still return a valid response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "gated auction should return a 200 no-bid response"
+        );
+        let body_bytes = response.into_body().into_bytes();
+        let parsed: JsonValue =
+            serde_json::from_slice(&body_bytes).expect("response body should be valid JSON");
+        let seatbid_empty = match parsed.get("seatbid").and_then(JsonValue::as_array) {
+            Some(seatbid) => seatbid.is_empty(),
+            None => true,
+        };
+        assert!(
+            seatbid_empty,
+            "gated auction must return no bids, got: {parsed}"
+        );
     }
 
     #[test]

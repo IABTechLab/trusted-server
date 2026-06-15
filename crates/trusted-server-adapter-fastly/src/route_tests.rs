@@ -378,6 +378,23 @@ fn us_california_geo() -> GeoInfo {
     }
 }
 
+/// Geo resolving to a non-regulated jurisdiction, so the server-side auction
+/// consent gate (which fails closed for GDPR/unknown jurisdictions without TCF
+/// Purpose 1) allows the auction to proceed. Used by `/auction` route tests
+/// that exercise orchestration behavior rather than consent.
+fn non_regulated_geo() -> GeoInfo {
+    GeoInfo {
+        city: "Example City".to_string(),
+        country: "AU".to_string(),
+        continent: "OC".to_string(),
+        latitude: -33.8,
+        longitude: 151.2,
+        metro_code: 0,
+        region: Some("NSW".to_string()),
+        asn: None,
+    }
+}
+
 fn valid_ec_id() -> String {
     format!("{}.Abc123", "a".repeat(64))
 }
@@ -594,7 +611,16 @@ fn route_auction_with_stack(
     let req = Request::post("https://test.com/auction")
         .with_header(header::CONTENT_TYPE, "application/json")
         .with_body(body.into());
-    let services = test_runtime_services(&req);
+    // Resolve to a non-regulated jurisdiction so the server-side auction consent
+    // gate allows the auction; these tests assert orchestration behavior, not
+    // consent gating (covered separately in endpoints.rs).
+    let services = test_runtime_services_with_secret_http_client_and_geo(
+        &req,
+        Arc::new(NoopBackend),
+        Arc::new(NoopSecretStore),
+        Arc::new(NoopHttpClient) as Arc<dyn PlatformHttpClient>,
+        Arc::new(FixedGeo(non_regulated_geo())),
+    );
 
     let route_result = futures::executor::block_on(route_request(
         settings,
