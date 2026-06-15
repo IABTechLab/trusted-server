@@ -575,6 +575,7 @@ fn route_result_to_fastly_response(
         sharedid_cookie,
         should_finalize_ec,
         asset_cache_policy,
+        request_filter_effects,
         ..
     } = route_result;
 
@@ -596,6 +597,7 @@ fn route_result_to_fastly_response(
             .unwrap_or(None)
     };
     super::finalize_response(settings, geo_info.as_ref(), &mut response);
+    request_filter_effects.apply_to_response(&mut response);
     asset_cache_policy.apply_after_route_finalization(&mut response);
 
     let mut fastly_response = compat::to_fastly_response(response);

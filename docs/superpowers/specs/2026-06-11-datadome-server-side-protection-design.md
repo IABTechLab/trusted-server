@@ -70,7 +70,7 @@ JavaScript SDK.
 
 ## Current State
 
-Implementation branch status as of 2026-06-12:
+Implementation branch status as of 2026-06-15:
 
 - Added the generic integration request-filter model in
   `crates/trusted-server-core/src/integrations/registry.rs`.
@@ -83,28 +83,27 @@ Implementation branch status as of 2026-06-12:
 - Added client-side tag auto-injection through `IntegrationHeadInjector`.
 - Extended `ClientInfo` and Fastly runtime services with JA4, H2 fingerprint,
   edge hostname, and edge region fields.
+- Added configurable protection-scope exclusions for methods, ASNs, inline IP
+  CIDRs, Config Store-backed IP CIDR lists, and typed method-scoped rules for
+  path/query/IP/ASN matching.
 - Updated `trusted-server.toml` with the new DataDome configuration fields.
 - Updated `docs/guide/integrations/datadome.md` with the first-party,
-  server-side protection, fail-open, header-enrichment, auto-injection, and
-  GraphQL-v1 limitation behavior.
+  server-side protection, fail-open, header-enrichment, auto-injection,
+  configurable exclusion, Secret Store, and GraphQL-v1 limitation behavior.
 
 Known remaining work before the PR is ready:
 
-- Fix formatting and clippy blockers introduced by the implementation.
-- Add the spec-driven registry, DataDome config, protection matching, payload,
-  response classification, and route tests listed in this document.
-- Run the full CI gate after fixes:
-  - `cargo fmt --all -- --check`
-  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-  - `cargo test --workspace`
-  - JS/doc checks as applicable
+- Run JS checks if JS build output is touched.
+- Perform staging validation against a DataDome test policy/rule.
 
 Verification snapshot:
 
-- `cargo test --workspace` passed on 2026-06-12 for the current branch state.
-- `cargo fmt --all -- --check` failed due to formatting drift.
-- `cargo clippy --package trusted-server-core --all-targets --all-features -- -D warnings`
-  failed due to clippy issues in the new DataDome/request-filter code.
+- `cargo fmt --all -- --check` passed on 2026-06-15.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed
+  on 2026-06-15.
+- `cargo test --workspace -- --nocapture` passed on 2026-06-15.
+- `cd docs && npx prettier --check guide/integrations/datadome.md superpowers/specs/2026-06-11-datadome-server-side-protection-design.md`
+  passed on 2026-06-15.
 
 Baseline DataDome integration before this work:
 
@@ -297,8 +296,11 @@ server_side_key_secret_store = "datadome"
 server_side_key_secret_name = "server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
-url_pattern_exclusion = "\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"
-url_pattern_inclusion = ""
+protection_excluded_methods = ["OPTIONS"]
+protection_excluded_asns = []
+protection_excluded_ip_cidrs = []
+protection_excluded_ip_cidr_sources = []
+protection_ip_list_cache_ttl_seconds = 300
 enable_graphql_support = false
 
 # New client-side tag injection layer
@@ -306,6 +308,11 @@ client_side_key = ""
 inject_client_side_tag = true
 client_side_tag_url = "/integrations/datadome/tags.js"
 client_side_configuration = { ajaxListenerPath = true }
+
+[[integrations.datadome.protection_exclusion_rules]]
+id = "default-static-assets"
+type = "path_regex"
+patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"]
 ```
 
 Notes:
@@ -322,10 +329,14 @@ Notes:
   key is a valid no-op.
 - `protection_api_origin` remains configurable for regional/static endpoint
   selection.
-- `url_pattern_exclusion` and `url_pattern_inclusion` match `host + pathname`,
-  not query string, mirroring the official Fastly module behavior.
-- Static-asset exclusion should be case-insensitive so uppercase file
-  extensions such as `.PNG` are skipped.
+- Static-asset exclusion is represented as a default typed `path_regex` rule and
+  should remain case-insensitive so uppercase file extensions such as `.PNG` are
+  skipped.
+- `protection_excluded_methods`, `protection_excluded_asns`, inline
+  `protection_excluded_ip_cidrs`, Config Store-backed
+  `protection_excluded_ip_cidr_sources`, and typed
+  `protection_exclusion_rules` provide migration parity for legacy VCL bypass
+  policies without hardcoding publisher-specific rules in Rust.
 - `enable_graphql_support` is reserved but should remain unsupported or ignored
   with a warning until the deferred body-handling work is implemented.
 
@@ -335,11 +346,13 @@ A request is protected when:
 
 1. DataDome integration is enabled.
 2. `enable_protection = true`.
-3. The method is not `OPTIONS`; all other methods, including `HEAD`, are
-   eligible for protection.
-4. The URL does not match the default internal/static exclusions.
-5. If `url_pattern_inclusion` is configured, `host + pathname` matches it.
-6. If `url_pattern_exclusion` is configured, `host + pathname` does not match it.
+3. The method is not listed in `protection_excluded_methods`; by default this
+   skips `OPTIONS`.
+4. The URL does not match the default Trusted Server internal exclusions.
+5. The client IP does not match inline or Config Store-backed excluded CIDR
+   lists.
+6. The client ASN is not listed in `protection_excluded_asns`.
+7. No typed `protection_exclusion_rules` match.
 
 Default internal exclusions should include:
 
@@ -355,6 +368,40 @@ Default internal exclusions should include:
 - CORS preflight `OPTIONS` requests
 
 Auction traffic at `/auction` is intentionally protected by default.
+
+Typed exclusion rules use a small rule-engine pattern so new matcher types can
+be added without growing `is_request_protected()` into a large conditional. A
+rule has an operator-provided `id`, optional `methods`, and one matcher selected
+by `type`:
+
+```toml
+[[integrations.datadome.protection_exclusion_rules]]
+id = "legacy-static-get-head"
+methods = ["GET", "HEAD"]
+type = "path_regex"
+patterns = ["(?i)\\.(css|css\\.map|js|js\\.map|json|png|jpg|webp|woff2)$"]
+
+[[integrations.datadome.protection_exclusion_rules]]
+id = "next-rsc"
+methods = ["GET", "HEAD"]
+type = "query_param_non_empty"
+names = ["_rsc"]
+```
+
+Supported v1 rule types:
+
+- `path_exact`
+- `path_prefix`
+- `path_regex`
+- `query_param_non_empty`
+- `asn`
+- `ip_cidr`
+- `ip_cidr_source`
+
+Config Store-backed CIDR lists are non-secret operational data and may be
+encoded as JSON arrays, comma-separated strings, or newline/whitespace-separated
+strings. Load failures log a warning and do not match the bypass list, so a bad
+list does not accidentally disable DataDome for all traffic.
 
 ### Protection API Request
 
@@ -715,12 +762,13 @@ passes.
 - [x] GraphQL body parsing is not implemented in v1 and is clearly documented.
 - [x] Existing DataDome first-party proxy behavior remains unchanged. Existing
       DataDome proxy/rewrite tests pass as part of full workspace verification.
-- [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` pass after implementation. Verified on 2026-06-12.
+- [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` pass after implementation. Verified on 2026-06-15.
 
 ## Resolved Questions
 
-1. DataDome protection applies to all non-`OPTIONS` HTTP methods, including
-   `HEAD`, when the URL is otherwise in scope.
+1. DataDome protection excludes methods listed in
+   `protection_excluded_methods`, which defaults to `OPTIONS`. All other
+   methods, including `HEAD`, are eligible when the URL is otherwise in scope.
 2. The DataDome server-side key is loaded from runtime Secret Store in v1. The
    config contains only the secret store and secret name.
 3. The default Protection API timeout is `1500ms` for v1.

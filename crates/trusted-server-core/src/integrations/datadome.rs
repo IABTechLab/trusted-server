@@ -80,8 +80,15 @@ use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 mod protection;
+mod protection_scope;
 
-const DATADOME_INTEGRATION_ID: &str = "datadome";
+pub use protection_scope::{
+    ProtectionExclusionRuleConfig, ProtectionIpCidrSourceConfig, ProtectionMatcherConfig,
+};
+
+use protection_scope::ProtectionScope;
+
+pub(super) const DATADOME_INTEGRATION_ID: &str = "datadome";
 
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///
@@ -156,13 +163,36 @@ pub struct DataDomeConfig {
     #[validate(range(min = 1, max = 10000))]
     pub timeout_ms: u32,
 
-    /// Regex for URLs to exclude from Protection API validation.
-    #[serde(default = "default_url_pattern_exclusion")]
-    pub url_pattern_exclusion: String,
+    /// HTTP methods excluded from Protection API validation.
+    #[serde(
+        default = "default_protection_excluded_methods",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub protection_excluded_methods: Vec<String>,
 
-    /// Regex for URLs to include in Protection API validation.
-    #[serde(default)]
-    pub url_pattern_inclusion: String,
+    /// Client autonomous system numbers excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_asns: Vec<u32>,
+
+    /// Client IP CIDR ranges excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_ip_cidrs: Vec<String>,
+
+    /// Config Store-backed client IP CIDR ranges excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_ip_cidr_sources: Vec<ProtectionIpCidrSourceConfig>,
+
+    /// Cache TTL for Config Store-backed IP CIDR lists, in seconds.
+    #[serde(default = "default_protection_ip_list_cache_ttl_seconds")]
+    #[validate(range(min = 1, max = 86400))]
+    pub protection_ip_list_cache_ttl_seconds: u64,
+
+    /// Structured exclusion rules for Protection API validation.
+    #[serde(
+        default = "default_protection_exclusion_rules",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
 
     /// Reserved flag for future GraphQL payload extraction.
     #[serde(default)]
@@ -221,8 +251,27 @@ fn default_timeout_ms() -> u32 {
     1500
 }
 
-fn default_url_pattern_exclusion() -> String {
-    r"\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$".to_string()
+fn default_static_asset_exclusion_pattern() -> String {
+    r"(?i)\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$".to_string()
+}
+
+fn default_protection_excluded_methods() -> Vec<String> {
+    vec!["OPTIONS".to_string()]
+}
+
+fn default_protection_ip_list_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_protection_exclusion_rules() -> Vec<ProtectionExclusionRuleConfig> {
+    vec![ProtectionExclusionRuleConfig {
+        id: "default-static-assets".to_string(),
+        enabled: true,
+        methods: Vec::new(),
+        matcher: ProtectionMatcherConfig::PathRegex {
+            patterns: vec![default_static_asset_exclusion_pattern()],
+        },
+    }]
 }
 
 fn default_inject_client_side_tag() -> bool {
@@ -250,8 +299,12 @@ impl Default for DataDomeConfig {
             server_side_key_secret_name: default_server_side_key_secret_name(),
             protection_api_origin: default_protection_api_origin(),
             timeout_ms: default_timeout_ms(),
-            url_pattern_exclusion: default_url_pattern_exclusion(),
-            url_pattern_inclusion: String::new(),
+            protection_excluded_methods: default_protection_excluded_methods(),
+            protection_excluded_asns: Vec::new(),
+            protection_excluded_ip_cidrs: Vec::new(),
+            protection_excluded_ip_cidr_sources: Vec::new(),
+            protection_ip_list_cache_ttl_seconds: default_protection_ip_list_cache_ttl_seconds(),
+            protection_exclusion_rules: default_protection_exclusion_rules(),
             enable_graphql_support: false,
             client_side_key: String::new(),
             inject_client_side_tag: default_inject_client_side_tag(),
@@ -270,8 +323,7 @@ impl IntegrationConfig for DataDomeConfig {
 /// `DataDome` integration implementation.
 pub struct DataDomeIntegration {
     config: DataDomeConfig,
-    protection_exclusion: Option<Regex>,
-    protection_inclusion: Option<Regex>,
+    protection_scope: ProtectionScope,
 }
 
 impl DataDomeIntegration {
@@ -301,15 +353,11 @@ impl DataDomeIntegration {
             log::warn!("[datadome] enable_graphql_support is reserved and ignored in v1");
         }
 
-        let protection_exclusion =
-            Self::compile_optional_regex(&config.url_pattern_exclusion, "url_pattern_exclusion")?;
-        let protection_inclusion =
-            Self::compile_optional_regex(&config.url_pattern_inclusion, "url_pattern_inclusion")?;
+        let protection_scope = ProtectionScope::compile(&config)?;
 
         Ok(Arc::new(Self {
             config,
-            protection_exclusion,
-            protection_inclusion,
+            protection_scope,
         }))
     }
 
@@ -343,19 +391,6 @@ impl DataDomeIntegration {
         }
 
         Ok(())
-    }
-
-    fn compile_optional_regex(
-        pattern: &str,
-        name: &str,
-    ) -> Result<Option<Regex>, Report<TrustedServerError>> {
-        if pattern.trim().is_empty() {
-            return Ok(None);
-        }
-
-        Regex::new(&format!("(?i:{pattern})"))
-            .map(Some)
-            .map_err(|err| Report::new(Self::error(format!("Invalid {name}: {err}"))))
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {

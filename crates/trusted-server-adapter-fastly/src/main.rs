@@ -516,6 +516,7 @@ async fn route_request(
             settings,
             services: runtime_services,
             req: &mut req,
+            geo_info: geo_info.as_ref(),
         })
         .await
     {

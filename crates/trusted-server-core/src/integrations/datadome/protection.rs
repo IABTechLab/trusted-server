@@ -15,6 +15,7 @@ use crate::integrations::{
 use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, StoreName};
 use crate::redacted::Redacted;
 
+use super::protection_scope::{ProtectionRequestFacts, ProtectionScopeDecision};
 use super::DataDomeIntegration;
 
 const VALIDATE_REQUEST_PATH: &str = "/validate-request";
@@ -42,7 +43,7 @@ impl DataDomeIntegration {
         &self,
         input: RequestFilterInput<'_>,
     ) -> RequestFilterDecision {
-        if !self.config.enable_protection || !self.is_request_protected(input.request) {
+        if !self.config.enable_protection || !self.is_request_protected(&input) {
             return RequestFilterDecision::Continue(RequestFilterEffects::default());
         }
 
@@ -97,7 +98,8 @@ impl DataDomeIntegration {
         Ok(self.classify_protection_response(platform_response.response))
     }
 
-    fn is_request_protected(&self, req: &Request<EdgeBody>) -> bool {
+    fn is_request_protected(&self, input: &RequestFilterInput<'_>) -> bool {
+        let req = input.request;
         if req.method() == Method::OPTIONS {
             return false;
         }
@@ -107,16 +109,17 @@ impl DataDomeIntegration {
             return false;
         }
 
-        let target = format!("{}{}", request_host(req), path);
-
-        if let Some(inclusion) = &self.protection_inclusion {
-            if !inclusion.is_match(&target) {
-                return false;
-            }
-        }
-
-        if let Some(exclusion) = &self.protection_exclusion {
-            if exclusion.is_match(&target) {
+        let facts = ProtectionRequestFacts {
+            method: req.method().as_str(),
+            path,
+            query: req.uri().query(),
+            client_ip: input.services.client_info().client_ip,
+            asn: input.geo_info.and_then(|geo| geo.asn),
+        };
+        match self.protection_scope.evaluate(&facts, input.services) {
+            ProtectionScopeDecision::Protect => {}
+            ProtectionScopeDecision::Skip { rule_id, reason } => {
+                log::debug!("[datadome] Skipping Protection API for rule {rule_id} ({reason})");
                 return false;
             }
         }

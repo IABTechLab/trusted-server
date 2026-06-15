@@ -12,6 +12,7 @@ use crate::constants::HEADER_X_TS_EC;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -328,6 +329,7 @@ pub struct RequestFilterInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
     pub request: &'a Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
 }
 
 /// How a header mutation should be applied.
@@ -405,6 +407,7 @@ pub struct RequestFilterRegistryInput<'a> {
     pub settings: &'a Settings,
     pub services: &'a RuntimeServices,
     pub req: &'a mut Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
 }
 
 /// Outcome returned by [`IntegrationRegistry::filter_request`].
@@ -460,7 +463,10 @@ fn apply_header_mutation_to_request(req: &mut Request<EdgeBody>, mutation: &Head
         return;
     };
     let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
-        log::warn!("Skipping invalid request-filter header value: {}", mutation.name);
+        log::warn!(
+            "Skipping invalid request-filter header value: {}",
+            mutation.name
+        );
         return;
     };
 
@@ -488,7 +494,10 @@ fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation
         return;
     };
     let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
-        log::warn!("Skipping invalid response-filter header value: {}", mutation.name);
+        log::warn!(
+            "Skipping invalid response-filter header value: {}",
+            mutation.name
+        );
         return;
     };
 
@@ -877,6 +886,7 @@ impl IntegrationRegistry {
             settings,
             services,
             req,
+            geo_info,
         } = input;
         let mut accumulated = RequestFilterEffects::default();
 
@@ -886,6 +896,7 @@ impl IntegrationRegistry {
                     settings,
                     services,
                     request: req,
+                    geo_info,
                 })
                 .await?;
 
@@ -1417,6 +1428,7 @@ mod tests {
                 settings: &settings,
                 services: &services,
                 req: &mut req,
+                geo_info: None,
             }))
             .expect("should run request filter");
 

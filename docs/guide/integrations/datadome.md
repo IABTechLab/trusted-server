@@ -47,8 +47,11 @@ server_side_key_secret_store = "datadome"
 server_side_key_secret_name = "server_side_key"
 protection_api_origin = "https://api-fastly.datadome.co"
 timeout_ms = 1500
-url_pattern_exclusion = "\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"
-url_pattern_inclusion = ""
+protection_excluded_methods = ["OPTIONS"]
+protection_excluded_asns = []
+protection_excluded_ip_cidrs = []
+protection_excluded_ip_cidr_sources = []
+protection_ip_list_cache_ttl_seconds = 300
 enable_graphql_support = false
 
 # Client-side tag auto-injection
@@ -56,29 +59,38 @@ client_side_key = ""
 inject_client_side_tag = true
 client_side_tag_url = "/integrations/datadome/tags.js"
 client_side_configuration = { ajaxListenerPath = true }
+
+[[integrations.datadome.protection_exclusion_rules]]
+id = "default-static-assets"
+type = "path_regex"
+patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"]
 ```
 
 ### Configuration options
 
-| Option                         | Type    | Default                          | Description                                                                             |
-| ------------------------------ | ------- | -------------------------------- | --------------------------------------------------------------------------------------- |
-| `enabled`                      | boolean | `false`                          | Enable the DataDome integration                                                         |
-| `sdk_origin`                   | string  | `https://js.datadome.co`         | DataDome SDK origin URL for `tags.js`                                                   |
-| `api_origin`                   | string  | `https://api-js.datadome.co`     | DataDome signal collection API origin URL for `/js/*`                                   |
-| `cache_ttl_seconds`            | integer | `3600`                           | Cache TTL for `tags.js`                                                                 |
-| `rewrite_sdk`                  | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths                               |
-| `enable_protection`            | boolean | `false`                          | Call the Protection API before route matching                                           |
-| `server_side_key_secret_store` | string  | `datadome`                       | Runtime secret store containing the DataDome server-side key                            |
-| `server_side_key_secret_name`  | string  | `server_side_key`                | Secret name containing the DataDome server-side key                                     |
-| `protection_api_origin`        | string  | `https://api-fastly.datadome.co` | Protection API origin                                                                   |
-| `timeout_ms`                   | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls                             |
-| `url_pattern_exclusion`        | string  | Static asset extension regex     | Case-insensitive regex matched against `host + pathname` to skip protection             |
-| `url_pattern_inclusion`        | string  | `""`                             | Optional case-insensitive regex matched against `host + pathname` to include protection |
-| `enable_graphql_support`       | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1                              |
-| `client_side_key`              | string  | `""`                             | DataDome client-side JavaScript key used for tag injection                              |
-| `inject_client_side_tag`       | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty                         |
-| `client_side_tag_url`          | string  | `/integrations/datadome/tags.js` | Script URL used by auto-injection                                                       |
-| `client_side_configuration`    | object  | `{ ajaxListenerPath = true }`    | Options assigned to `window.ddoptions`                                                  |
+| Option                                 | Type    | Default                          | Description                                                             |
+| -------------------------------------- | ------- | -------------------------------- | ----------------------------------------------------------------------- |
+| `enabled`                              | boolean | `false`                          | Enable the DataDome integration                                         |
+| `sdk_origin`                           | string  | `https://js.datadome.co`         | DataDome SDK origin URL for `tags.js`                                   |
+| `api_origin`                           | string  | `https://api-js.datadome.co`     | DataDome signal collection API origin URL for `/js/*`                   |
+| `cache_ttl_seconds`                    | integer | `3600`                           | Cache TTL for `tags.js`                                                 |
+| `rewrite_sdk`                          | boolean | `true`                           | Rewrite DataDome script URLs in HTML to first-party paths               |
+| `enable_protection`                    | boolean | `false`                          | Call the Protection API before route matching                           |
+| `server_side_key_secret_store`         | string  | `datadome`                       | Runtime secret store containing the DataDome server-side key            |
+| `server_side_key_secret_name`          | string  | `server_side_key`                | Secret name containing the DataDome server-side key                     |
+| `protection_api_origin`                | string  | `https://api-fastly.datadome.co` | Protection API origin                                                   |
+| `timeout_ms`                           | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls             |
+| `protection_excluded_methods`          | array   | `["OPTIONS"]`                    | HTTP methods skipped before the Protection API call                     |
+| `protection_excluded_asns`             | array   | `[]`                             | Client autonomous system numbers skipped before the Protection API call |
+| `protection_excluded_ip_cidrs`         | array   | `[]`                             | Inline client IP CIDR ranges skipped before the Protection API call     |
+| `protection_excluded_ip_cidr_sources`  | array   | `[]`                             | Config Store sources containing dynamic client IP CIDR bypass lists     |
+| `protection_ip_list_cache_ttl_seconds` | integer | `300`                            | Process-local cache TTL for Config Store-backed IP CIDR bypass lists    |
+| `protection_exclusion_rules`           | array   | Static asset path regex          | Structured method/path/query/IP/ASN exclusion rules                     |
+| `enable_graphql_support`               | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1              |
+| `client_side_key`                      | string  | `""`                             | DataDome client-side JavaScript key used for tag injection              |
+| `inject_client_side_tag`               | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty         |
+| `client_side_tag_url`                  | string  | `/integrations/datadome/tags.js` | Script URL used by auto-injection                                       |
+| `client_side_configuration`            | object  | `{ ajaxListenerPath = true }`    | Options assigned to `window.ddoptions`                                  |
 
 ## Client-side setup
 
@@ -151,14 +163,55 @@ A request is protected when all of the following are true:
 
 1. The DataDome integration is enabled.
 2. `enable_protection = true`.
-3. The method is not `OPTIONS`.
+3. The method is not listed in `protection_excluded_methods`.
 4. The path is not one of Trusted Server's internal routes.
-5. The `host + pathname` matches `url_pattern_inclusion`, when configured.
-6. The `host + pathname` does not match `url_pattern_exclusion`, when configured.
+5. The client IP does not match `protection_excluded_ip_cidrs` or any Config Store-backed CIDR source.
+6. The client ASN is not listed in `protection_excluded_asns`.
+7. No `protection_exclusion_rules` match.
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, admin routes, discovery routes, and signature-verification routes are also excluded by default.
 
 Auction traffic at `/auction` is protected by default.
+
+### Structured exclusion rules
+
+Use structured rules for all DataDome protection exclusions. Each rule has an `id`, optional `methods`, and a typed matcher. The default configuration includes a `path_regex` rule for common static assets.
+
+```toml
+[[integrations.datadome.protection_exclusion_rules]]
+id = "legacy-static-get-head"
+methods = ["GET", "HEAD"]
+type = "path_regex"
+patterns = [
+  "(?i)\\.(css|css\\.map|js|js\\.map|json|png|jpg|webp|woff2)$",
+  "^/\\.image/",
+  "^/robots\\.txt$",
+]
+
+[[integrations.datadome.protection_exclusion_rules]]
+id = "next-rsc"
+methods = ["GET", "HEAD"]
+type = "query_param_non_empty"
+names = ["_rsc"]
+```
+
+Supported rule types are:
+
+- `path_exact`
+- `path_prefix`
+- `path_regex`
+- `query_param_non_empty`
+- `asn`
+- `ip_cidr`
+- `ip_cidr_source`
+
+Config Store-backed CIDR sources accept newline-, comma-, whitespace-, or JSON-array encoded CIDR lists. They are useful for large or frequently updated vendor crawler lists.
+
+```toml
+[[integrations.datadome.protection_excluded_ip_cidr_sources]]
+config_store = "datadome-ip-bypass"
+key = "googlebot_ips"
+```
 
 ### Header handling
 
