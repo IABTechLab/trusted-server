@@ -15,6 +15,7 @@ const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
 const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
 const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
+const ERROR_TYPE_TRANSPORT: &str = "transport";
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
@@ -46,6 +47,18 @@ fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -
     AuctionResponse::error(provider_name, response_time_ms)
         .with_metadata("error_type", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
         .with_metadata("message", serde_json::json!("Provider launch failed"))
+}
+
+// Transport failures carry a static message: the underlying select() error is a
+// `Report<PlatformError>` that may reference upstream-controlled content, so it
+// is logged server-side rather than surfaced in the public /auction response.
+fn provider_transport_failed_response(
+    provider_name: &str,
+    response_time_ms: u64,
+) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
+        .with_metadata("message", serde_json::json!("Provider request failed"))
 }
 
 /// Compute the remaining time budget from a deadline.
@@ -511,7 +524,10 @@ impl AuctionOrchestrator {
                         {
                             let response_time_ms = start_time.elapsed().as_millis() as u64;
                             log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
-                            responses.push(AuctionResponse::error(provider_name, response_time_ms));
+                            responses.push(provider_transport_failed_response(
+                                provider_name,
+                                response_time_ms,
+                            ));
                         } else {
                             log::warn!(
                                 "A provider request failed (backend '{}' not tracked): {:?}",
@@ -923,6 +939,27 @@ mod tests {
             response.metadata["message"],
             serde_json::json!("Provider launch failed"),
             "should use a safe, stable public launch failure message"
+        );
+    }
+
+    #[test]
+    fn transport_failed_response_has_safe_static_message() {
+        let response = super::provider_transport_failed_response("prebid", 64);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Error,
+            "should mark transport failures as errors"
+        );
+        assert_eq!(
+            response.metadata["error_type"],
+            serde_json::json!("transport"),
+            "should classify transport failures consistently with other failure modes"
+        );
+        assert_eq!(
+            response.metadata["message"],
+            serde_json::json!("Provider request failed"),
+            "should use a safe, stable public transport failure message"
         );
     }
 
