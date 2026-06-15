@@ -32,8 +32,9 @@ use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
+    AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
@@ -73,6 +74,10 @@ enum HandlerOutcome {
         body: EdgeBody,
         params: OwnedProcessResponseParams,
     },
+    AssetStreaming {
+        response: HttpResponse,
+        body: EdgeBody,
+    },
 }
 
 impl HandlerOutcome {
@@ -80,7 +85,8 @@ impl HandlerOutcome {
     fn status(&self) -> edgezero_core::http::StatusCode {
         match self {
             HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
-            HandlerOutcome::Streaming { response, .. } => response.status(),
+            HandlerOutcome::Streaming { response, .. }
+            | HandlerOutcome::AssetStreaming { response, .. } => response.status(),
         }
     }
 }
@@ -94,6 +100,8 @@ struct RouteResult {
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
+    should_finalize_ec: bool,
+    asset_cache_policy: AssetProxyCachePolicy,
 }
 
 /// Entry point for the Fastly Compute program.
@@ -192,6 +200,8 @@ fn main() {
         eids_cookie: None,
         sharedid_cookie: None,
         is_real_browser: false,
+        should_finalize_ec: true,
+        asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
     });
 
     let RouteResult {
@@ -201,6 +211,8 @@ fn main() {
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        should_finalize_ec,
+        asset_cache_policy,
     } = route_result;
 
     // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
@@ -221,16 +233,19 @@ fn main() {
     match outcome {
         HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
             let mut fastly_resp = compat::to_fastly_response(response);
-            ec_finalize_response(
-                &settings,
-                &ec_context,
-                finalize_kv_graph.as_ref(),
-                &partner_registry,
-                eids_cookie.as_deref(),
-                sharedid_cookie.as_deref(),
-                &mut fastly_resp,
-            );
+            if should_finalize_ec {
+                ec_finalize_response(
+                    &settings,
+                    &ec_context,
+                    finalize_kv_graph.as_ref(),
+                    &partner_registry,
+                    eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
+                    &mut fastly_resp,
+                );
+            }
             fastly_resp.send_to_client();
 
             if is_real_browser {
@@ -245,16 +260,19 @@ fn main() {
             params,
         } => {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
             let mut fastly_resp = compat::to_fastly_response_skeleton(response);
-            ec_finalize_response(
-                &settings,
-                &ec_context,
-                finalize_kv_graph.as_ref(),
-                &partner_registry,
-                eids_cookie.as_deref(),
-                sharedid_cookie.as_deref(),
-                &mut fastly_resp,
-            );
+            if should_finalize_ec {
+                ec_finalize_response(
+                    &settings,
+                    &ec_context,
+                    finalize_kv_graph.as_ref(),
+                    &partner_registry,
+                    eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
+                    &mut fastly_resp,
+                );
+            }
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
             match stream_publisher_body(
@@ -283,6 +301,20 @@ fn main() {
                 if let Some(context) = build_pull_sync_context(&ec_context) {
                     run_pull_sync_after_send(&settings, &partner_registry, &context);
                 }
+            }
+        }
+        HandlerOutcome::AssetStreaming { mut response, body } => {
+            finalize_response(&settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut streaming_body = fastly_resp.stream_to_client();
+            if let Err(e) =
+                futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
+            {
+                log::error!("asset streaming failed: {e:?}");
+                drop(streaming_body);
+            } else if let Err(e) = streaming_body.finish() {
+                log::error!("failed to finish asset streaming body: {e}");
             }
         }
     }
@@ -382,6 +414,8 @@ async fn route_request(
                     eids_cookie,
                     sharedid_cookie,
                     is_real_browser,
+                    should_finalize_ec: true,
+                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
                 });
             }
             Ok(None) => {}
@@ -403,6 +437,8 @@ async fn route_request(
             eids_cookie,
             sharedid_cookie,
             is_real_browser,
+            should_finalize_ec: true,
+            asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
         });
     }
 
@@ -418,6 +454,8 @@ async fn route_request(
                     eids_cookie,
                     sharedid_cookie,
                     is_real_browser,
+                    should_finalize_ec: true,
+                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
                 });
             }
         };
@@ -452,6 +490,8 @@ async fn route_request(
                 eids_cookie,
                 sharedid_cookie,
                 is_real_browser,
+                should_finalize_ec: true,
+                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
             });
         }
         Ok(None) => {}
@@ -461,6 +501,9 @@ async fn route_request(
     // Get path and method for routing
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+
+    let mut asset_cache_policy = AssetProxyCachePolicy::OriginControlled;
+    let mut should_finalize_ec = true;
 
     // Match known routes and handle them
     let (result, organic_route) = match (method, path.as_str()) {
@@ -566,51 +609,94 @@ async fn route_request(
             (result, true)
         }
 
-        // No known route matched, proxy to publisher origin as fallback
-        _ => {
-            log::info!(
-                "No known route matched for path: {}, proxying to publisher origin",
-                path
-            );
+        // No known route matched, proxy to an asset origin or publisher origin as fallback
+        (method, _) => {
+            let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+                .then(|| settings.asset_route_for_path(&path))
+                .flatten();
 
-            // Generate EC ID if needed — mirrors the integration proxy path in registry.rs.
-            // Only for document navigations by recognised browsers; subresource requests
-            // may lack consent signals such as Sec-GPC.
-            if is_real_browser && is_navigation_request(&req) {
-                if let Err(err) = ec_context.generate_if_needed(settings, kv_graph.as_ref()) {
-                    log::warn!("EC generation failed for publisher proxy: {err:?}");
+            if let Some(asset_route) = matched_asset_route {
+                should_finalize_ec = false;
+                log::info!("No explicit route matched; proxying via configured asset route");
+                let result =
+                    match handle_asset_proxy_request(settings, runtime_services, req, asset_route)
+                        .await
+                    {
+                        Ok(asset_response) => {
+                            asset_cache_policy = asset_response.cache_policy();
+                            let (response, stream_body) = asset_response.into_response_and_body();
+                            if let Some(body) = stream_body {
+                                return Ok(RouteResult {
+                                    outcome: HandlerOutcome::AssetStreaming { response, body },
+                                    ec_context,
+                                    finalize_kv_graph,
+                                    eids_cookie,
+                                    sharedid_cookie,
+                                    is_real_browser,
+                                    should_finalize_ec,
+                                    asset_cache_policy,
+                                });
+                            }
+                            Ok(response)
+                        }
+                        Err(e) => {
+                            asset_cache_policy = AssetProxyCachePolicy::NoStorePrivate;
+                            Err(e)
+                        }
+                    };
+                (result, false)
+            } else {
+                log::info!(
+                    "No known route matched for path: {}, proxying to publisher origin",
+                    path
+                );
+
+                // Generate EC ID if needed — mirrors the integration proxy path in registry.rs.
+                // Only for document navigations by recognised browsers; subresource requests
+                // may lack consent signals such as Sec-GPC.
+                if is_real_browser && is_navigation_request(&req) {
+                    if let Err(err) = ec_context.generate_if_needed(settings, kv_graph.as_ref()) {
+                        log::warn!("EC generation failed for publisher proxy: {err:?}");
+                    }
                 }
-            }
 
-            match handle_publisher_request(settings, integration_registry, runtime_services, req)
+                match handle_publisher_request(
+                    settings,
+                    integration_registry,
+                    runtime_services,
+                    req,
+                )
                 .await
-            {
-                Ok(PublisherResponse::Stream {
-                    response,
-                    body,
-                    params,
-                }) => {
-                    return Ok(RouteResult {
-                        outcome: HandlerOutcome::Streaming {
-                            response,
-                            body,
-                            params,
-                        },
-                        ec_context,
-                        finalize_kv_graph,
-                        eids_cookie,
-                        sharedid_cookie,
-                        is_real_browser,
-                    });
-                }
-                Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                    *response.body_mut() = body;
-                    (Ok(response), true)
-                }
-                Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
-                Err(e) => {
-                    log::error!("Failed to proxy to publisher origin: {:?}", e);
-                    (Err(e), true)
+                {
+                    Ok(PublisherResponse::Stream {
+                        response,
+                        body,
+                        params,
+                    }) => {
+                        return Ok(RouteResult {
+                            outcome: HandlerOutcome::Streaming {
+                                response,
+                                body,
+                                params,
+                            },
+                            ec_context,
+                            finalize_kv_graph,
+                            eids_cookie,
+                            sharedid_cookie,
+                            is_real_browser,
+                            should_finalize_ec,
+                            asset_cache_policy,
+                        });
+                    }
+                    Ok(PublisherResponse::PassThrough { mut response, body }) => {
+                        *response.body_mut() = body;
+                        (Ok(response), true)
+                    }
+                    Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
+                    Err(e) => {
+                        log::error!("Failed to proxy to publisher origin: {:?}", e);
+                        (Err(e), true)
+                    }
                 }
             }
         }
@@ -629,6 +715,8 @@ async fn route_request(
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        should_finalize_ec,
+        asset_cache_policy,
     })
 }
 

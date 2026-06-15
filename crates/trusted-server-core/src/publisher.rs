@@ -10,6 +10,17 @@
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
+//!
+//! **Note on platform coupling:** This module is currently coupled to
+//! `fastly::Body`/`Request`/`Response` at its handler boundaries — the entry
+//! points ([`handle_publisher_request`], [`stream_publisher_body`]) still
+//! accept and return `fastly::Body` and `fastly::Response`. The streaming
+//! processor itself is generic: `process_response_streaming` writes into
+//! any [`Write`] (a `Vec<u8>` for buffered routes, a `StreamingBody` for the
+//! streaming route). The HTTP-type coupling will be addressed in the
+//! platform HTTP-type migration alongside all other
+//! `fastly::Request`/`Response`/`Body` migrations. It is not a
+//! content-rewriting concern.
 
 use std::io::Write;
 use std::time::Duration;
@@ -215,15 +226,12 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
-    // lgtm[rust/cleartext-logging]
-    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
         params.content_encoding,
         is_html,
-        is_rsc_flight,
-        params.origin_host
+        is_rsc_flight
     );
 
     let compression = Compression::from_content_encoding(params.content_encoding);
@@ -498,6 +506,7 @@ pub async fn handle_publisher_request(
             message: "backend registration failed".to_string(),
         })?;
     let origin_host = settings.publisher.origin_host();
+    let origin_host_header = settings.publisher.origin_host_header();
     let origin_path_and_query = req
         .uri()
         .path_and_query()
@@ -509,19 +518,13 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
-    // lgtm[rust/cleartext-logging]
-    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
-    log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
-        backend_name,
-        settings.publisher.origin_url
-    );
+    log::debug!("Proxying request to configured publisher backend");
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
-        HeaderValue::from_str(&origin_host).change_context(TrustedServerError::Proxy {
+        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
             message: "invalid publisher origin host header".to_string(),
         })?,
     );
@@ -535,10 +538,11 @@ pub async fn handle_publisher_request(
         })?
         .response;
 
-    log::debug!("Response headers:");
-    for (name, value) in response.headers() {
-        log::debug!("  {}: {:?}", name, value);
-    }
+    log::debug!(
+        "Publisher origin response received: status={}, header_count={}",
+        response.status(),
+        response.headers().len()
+    );
 
     let content_type = response
         .headers()
@@ -585,15 +589,11 @@ pub async fn handle_publisher_request(
                     status,
                 );
             } else if !is_supported_content_encoding(&content_encoding) {
-                log::warn!(
-                    "Unsupported Content-Encoding '{}' - returning response unmodified",
-                    content_encoding,
-                );
+                log::warn!("Unsupported Content-Encoding; returning response unmodified");
             } else {
                 log::debug!(
-                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
+                    "Skipping response processing - Content-Type: '{}', status: {}",
                     content_type,
-                    request_host,
                     status,
                 );
             }
@@ -601,11 +601,9 @@ pub async fn handle_publisher_request(
         }
         ResponseRoute::Stream => {
             log::debug!(
-                "Streaming response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                "Streaming response - Content-Type: {}, Content-Encoding: {}",
                 content_type,
-                content_encoding,
-                request_host,
-                origin_host,
+                content_encoding
             );
 
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
@@ -626,11 +624,9 @@ pub async fn handle_publisher_request(
         }
         ResponseRoute::BufferedProcessed => {
             log::debug!(
-                "Buffered response - Content-Type: {}, Content-Encoding: {}, Request Host: {}, Origin Host: {}",
+                "Buffered response - Content-Type: {}, Content-Encoding: {}",
                 content_type,
-                content_encoding,
-                request_host,
-                origin_host,
+                content_encoding
             );
 
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());

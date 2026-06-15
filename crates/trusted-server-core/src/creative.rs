@@ -342,7 +342,7 @@ fn is_safe_data_uri(lower: &str) -> bool {
 /// This runs as the first pass in the creative pipeline, before URL rewriting, so the
 /// rewriter only ever sees clean markup.
 ///
-/// Inputs larger than [`MAX_CREATIVE_SIZE`] are rejected (empty string returned) with a warning.
+/// Inputs larger than `MAX_CREATIVE_SIZE` are rejected (empty string returned) with a warning.
 /// On parse errors the markup is also rejected (empty string returned) with a warning.
 #[must_use]
 pub fn sanitize_creative_html(markup: &str) -> String {

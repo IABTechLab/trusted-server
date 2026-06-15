@@ -44,7 +44,7 @@ const MAX_GPP_STRING_LEN: usize = 8192;
 /// # Errors
 ///
 /// - [`ConsentDecodeError::InvalidGppString`] if the string exceeds
-///   [`MAX_GPP_STRING_LEN`] or the `iab_gpp` parser fails.
+///   `MAX_GPP_STRING_LEN` or the `iab_gpp` parser fails.
 pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentDecodeError>> {
     if gpp_string.len() > MAX_GPP_STRING_LEN {
         return Err(Report::new(ConsentDecodeError::InvalidGppString {
