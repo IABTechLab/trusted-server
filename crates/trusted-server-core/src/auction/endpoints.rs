@@ -91,7 +91,7 @@ pub async fn handle_auction(
             });
     }
     let body: AdRequest =
-        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
+        serde_json::from_slice(&body_bytes).change_context(TrustedServerError::BadRequest {
             message: "Failed to parse auction request body".to_string(),
         })?;
 

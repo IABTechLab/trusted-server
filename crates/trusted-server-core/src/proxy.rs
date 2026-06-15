@@ -2,9 +2,12 @@ use crate::http_util::{compute_encrypted_sha256_token, ct_str_eq, enforce_max_bo
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{request_builder as edge_request_builder, Uri as EdgeUri};
 use error_stack::{Report, ResultExt};
+use futures::StreamExt as _;
 use http::{header, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
+use std::collections::HashMap;
+use std::io::{Cursor, Write};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
@@ -15,9 +18,14 @@ use crate::creative::{CreativeCssProcessor, CreativeHtmlProcessor};
 use crate::edge_cookie::get_ec_id;
 use crate::error::TrustedServerError;
 use crate::platform::{
-    PlatformBackendSpec, PlatformHttpRequest, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT,
+    PlatformBackendSpec, PlatformHttpRequest, PlatformResponse, RuntimeServices, StoreName,
+    DEFAULT_FIRST_BYTE_TIMEOUT,
 };
-use crate::settings::Settings;
+use crate::redacted::Redacted;
+use crate::s3_sigv4::{self, S3Credentials};
+use crate::settings::{
+    AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings,
+};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
@@ -45,6 +53,218 @@ const PROXY_FORWARD_HEADERS: [header::HeaderName; 5] = [
     HEADER_X_FORWARDED_FOR,
 ];
 
+/// Curated request headers preserved for asset proxying.
+///
+/// Unlike the HTML publisher fallback, asset requests need cache validation and
+/// byte-range semantics to keep 304/206 responses working for browsers.
+/// Client-supplied forwarding headers are stripped at the edge and are not
+/// reconstructed here, so asset origins see Trusted Server as the client.
+const ASSET_PROXY_FORWARD_HEADERS: [header::HeaderName; 11] = [
+    HEADER_USER_AGENT,
+    HEADER_ACCEPT,
+    HEADER_ACCEPT_ENCODING,
+    HEADER_ACCEPT_LANGUAGE,
+    HEADER_REFERER,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_MATCH,
+    header::IF_UNMODIFIED_SINCE,
+    header::RANGE,
+    header::IF_RANGE,
+];
+
+const ASSET_PROXY_STRIP_RESPONSE_HEADERS: [&str; 3] =
+    ["set-cookie", "strict-transport-security", "clear-site-data"];
+
+/// Cache-control value used when asset proxy responses must not be stored.
+pub const ASSET_NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
+
+/// Cache policy metadata emitted by the asset proxy handler.
+///
+/// The Fastly router finalizes standard response headers after the asset handler
+/// returns. This typed policy lets the router reapply protected cache directives
+/// without depending on an exact header string set by the handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetProxyCachePolicy {
+    /// Leave origin/cache-control headers under normal response finalization.
+    OriginControlled,
+    /// Reapply `Cache-Control: no-store, private` after standard finalization.
+    NoStorePrivate,
+}
+
+impl AssetProxyCachePolicy {
+    /// Apply protected cache headers after route-level response finalization.
+    pub fn apply_after_route_finalization(self, response: &mut Response<EdgeBody>) {
+        if self == Self::NoStorePrivate {
+            apply_no_store_cache_control(response);
+        }
+    }
+}
+
+/// Asset proxy response plus metadata needed by the outer router.
+pub struct AssetProxyResponse {
+    response: Response<EdgeBody>,
+    stream_body: Option<EdgeBody>,
+    cache_policy: AssetProxyCachePolicy,
+}
+
+impl AssetProxyResponse {
+    fn new(
+        response: Response<EdgeBody>,
+        stream_body: Option<EdgeBody>,
+        cache_policy: AssetProxyCachePolicy,
+    ) -> Self {
+        Self {
+            response,
+            stream_body,
+            cache_policy,
+        }
+    }
+
+    fn origin_controlled(response: Response<EdgeBody>) -> Self {
+        Self::new(response, None, AssetProxyCachePolicy::OriginControlled)
+    }
+
+    fn origin_controlled_stream(response: Response<EdgeBody>, stream_body: EdgeBody) -> Self {
+        Self::new(
+            response,
+            Some(stream_body),
+            AssetProxyCachePolicy::OriginControlled,
+        )
+    }
+
+    fn no_store_private(response: Response<EdgeBody>) -> Self {
+        Self::new(response, None, AssetProxyCachePolicy::NoStorePrivate)
+    }
+
+    fn response(&self) -> &Response<EdgeBody> {
+        &self.response
+    }
+
+    fn response_mut(&mut self) -> &mut Response<EdgeBody> {
+        &mut self.response
+    }
+
+    fn apply_no_store_private_policy(&mut self) {
+        self.cache_policy = AssetProxyCachePolicy::NoStorePrivate;
+        apply_no_store_cache_control(&mut self.response);
+    }
+
+    /// Return cache policy metadata for router finalization.
+    #[must_use]
+    pub fn cache_policy(&self) -> AssetProxyCachePolicy {
+        self.cache_policy
+    }
+
+    /// Consume this wrapper and return a buffered Fastly response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::Proxy`] when the response carries a
+    /// streaming body. Use [`Self::into_response_and_body`] when the caller
+    /// needs to handle both buffered and streaming asset responses.
+    pub fn into_response(self) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        if self.stream_body.is_some() {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "streaming asset response cannot be converted into a buffered response"
+                    .to_string(),
+            }));
+        }
+
+        Ok(self.response)
+    }
+
+    /// Consume this wrapper and return the response headers plus optional stream body.
+    #[must_use]
+    pub fn into_response_and_body(self) -> (Response<EdgeBody>, Option<EdgeBody>) {
+        (self.response, self.stream_body)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct S3CredentialsCacheKey {
+    secret_store: String,
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+static S3_CREDENTIALS_CACHE: LazyLock<Mutex<HashMap<S3CredentialsCacheKey, Arc<S3Credentials>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Convert a platform-neutral response into a buffered [`Response`] for downstream processing.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
+/// streaming body, which the buffered proxy path cannot materialize.
+pub(crate) fn platform_response_to_fastly(
+    platform_resp: PlatformResponse,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let (parts, body) = platform_resp.response.into_parts();
+    let body_bytes = match body {
+        EdgeBody::Once(bytes) => bytes.to_vec(),
+        EdgeBody::Stream(_) => {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "streaming platform response body is not supported by Fastly response conversion"
+                    .to_string(),
+            }));
+        }
+    };
+    Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
+}
+
+fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
+    let (parts, body) = platform_resp.response.into_parts();
+
+    match body {
+        EdgeBody::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
+            parts,
+            EdgeBody::from(bytes.to_vec()),
+        )),
+        stream_body @ EdgeBody::Stream(_) => {
+            let resp = Response::from_parts(parts, EdgeBody::empty());
+            AssetProxyResponse::origin_controlled_stream(resp, stream_body)
+        }
+    }
+}
+
+/// Stream an asset response body directly to a writable client stream.
+///
+/// # Errors
+///
+/// Returns an error if the platform stream yields an error or if writing a
+/// chunk to the client stream fails.
+pub async fn stream_asset_body<W: Write>(
+    body: EdgeBody,
+    output: &mut W,
+) -> Result<(), Report<TrustedServerError>> {
+    match body {
+        EdgeBody::Once(bytes) => {
+            output
+                .write_all(bytes.as_ref())
+                .change_context(TrustedServerError::Proxy {
+                    message: "failed to write buffered asset response body".to_string(),
+                })?;
+        }
+        EdgeBody::Stream(mut stream) => {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    Report::new(TrustedServerError::Proxy {
+                        message: format!("streaming platform response body failed: {err}"),
+                    })
+                })?;
+                output
+                    .write_all(chunk.as_ref())
+                    .change_context(TrustedServerError::Proxy {
+                        message: "failed to write streaming asset response body".to_string(),
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
 #[derive(Deserialize)]
 struct ProxySignReq {
     url: String,
@@ -490,6 +710,419 @@ pub async fn proxy_request(
     .await
 }
 
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn build_asset_proxy_target_url(
+    route: &ProxyAssetRoute,
+    path: &str,
+    query: &str,
+) -> Result<url::Url, Report<TrustedServerError>> {
+    let mut target_url =
+        url::Url::parse(&route.origin_url).change_context(TrustedServerError::Proxy {
+            message: format!("Invalid asset origin_url: {}", route.origin_url),
+        })?;
+
+    let scheme = target_url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: format!("Unsupported asset origin_url scheme: {scheme}"),
+        }));
+    }
+
+    if target_url.host_str().is_none() {
+        return Err(Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset origin_url".to_string(),
+        }));
+    }
+
+    let target_path = route.target_path_for(path)?;
+    target_url.set_path(&target_path);
+    if query.is_empty() {
+        target_url.set_query(None);
+    } else {
+        target_url.set_query(Some(query));
+    }
+
+    Ok(target_url)
+}
+
+fn asset_path_skips_image_optimizer(target_url: &url::Url) -> bool {
+    let lower_path = target_url.path().to_ascii_lowercase();
+    lower_path.ends_with(".svg") || lower_path.ends_with(".svgz")
+}
+
+fn asset_origin_host_header(
+    target_url: &url::Url,
+) -> Result<HeaderValue, Report<TrustedServerError>> {
+    let scheme = target_url.scheme();
+    let host = target_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset target URL".to_string(),
+        })
+    })?;
+    let resolved_port = target_url.port_or_known_default().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: format!("Unsupported asset target URL scheme: {scheme}"),
+        })
+    })?;
+    let host_header = if Some(resolved_port) == default_port_for_scheme(scheme) {
+        host.to_string()
+    } else {
+        format!("{host}:{resolved_port}")
+    };
+
+    HeaderValue::from_str(&host_header).change_context(TrustedServerError::InvalidHeaderValue {
+        message: format!("invalid asset Host header value: {host_header}"),
+    })
+}
+
+fn s3_credentials_cache_key(config: &S3SigV4AuthConfig) -> S3CredentialsCacheKey {
+    S3CredentialsCacheKey {
+        secret_store: config.secret_store.clone(),
+        access_key_id: config.access_key_id.clone(),
+        secret_access_key: config.secret_access_key.clone(),
+        session_token: config.session_token.clone(),
+    }
+}
+
+fn load_s3_credentials(
+    services: &RuntimeServices,
+    config: &S3SigV4AuthConfig,
+) -> Result<Arc<S3Credentials>, Report<TrustedServerError>> {
+    let cache_key = s3_credentials_cache_key(config);
+    if let Some(credentials) = S3_CREDENTIALS_CACHE
+        .lock()
+        .expect("should lock S3 credentials cache")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(credentials);
+    }
+
+    let store_name = StoreName::from(config.secret_store.as_str());
+    let access_key_id = services
+        .secret_store()
+        .get_string(&store_name, &config.access_key_id)
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to read S3 access key ID from secret store".to_string(),
+        })?;
+    let secret_access_key = services
+        .secret_store()
+        .get_string(&store_name, &config.secret_access_key)
+        .change_context(TrustedServerError::Proxy {
+            message: "failed to read S3 secret access key from secret store".to_string(),
+        })?;
+    let session_token = config
+        .session_token
+        .as_deref()
+        .map(|key| {
+            services
+                .secret_store()
+                .get_string(&store_name, key)
+                .change_context(TrustedServerError::Proxy {
+                    message: "failed to read S3 session token from secret store".to_string(),
+                })
+        })
+        .transpose()?;
+    let credentials = Arc::new(S3Credentials {
+        access_key_id,
+        secret_access_key: Redacted::new(secret_access_key),
+        session_token: session_token.map(Redacted::new),
+    });
+
+    let mut cache = S3_CREDENTIALS_CACHE
+        .lock()
+        .expect("should lock S3 credentials cache");
+    Ok(Arc::clone(cache.entry(cache_key).or_insert(credentials)))
+}
+
+#[cfg(test)]
+fn clear_s3_credentials_cache_for_tests() {
+    S3_CREDENTIALS_CACHE
+        .lock()
+        .expect("should lock S3 credentials cache")
+        .clear();
+}
+
+fn apply_asset_origin_auth(
+    services: &RuntimeServices,
+    method: &Method,
+    target_url: &url::Url,
+    headers: &mut http::HeaderMap,
+    auth: &AssetOriginAuth,
+) -> Result<(), Report<TrustedServerError>> {
+    match auth {
+        AssetOriginAuth::S3SigV4(config) => {
+            let credentials = load_s3_credentials(services, config)?;
+            s3_sigv4::sign_headers(
+                method,
+                target_url,
+                headers,
+                &config.region,
+                credentials.as_ref(),
+                SystemTime::now(),
+            )
+        }
+    }
+}
+
+fn build_asset_platform_request(
+    method: &Method,
+    target_url: &url::Url,
+    outbound_headers: &http::HeaderMap,
+    backend_name: &str,
+) -> Result<PlatformHttpRequest, Report<TrustedServerError>> {
+    let mut builder = edge_request_builder().method(method.clone()).uri(
+        target_url
+            .as_str()
+            .parse::<EdgeUri>()
+            .change_context(TrustedServerError::Proxy {
+                message: "invalid asset target URL".to_string(),
+            })?,
+    );
+
+    for (name, value) in outbound_headers {
+        builder = builder.header(name, value);
+    }
+
+    let edge_req =
+        builder
+            .body(EdgeBody::from(Vec::new()))
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to build asset proxy request".to_string(),
+            })?;
+
+    Ok(PlatformHttpRequest::new(edge_req, backend_name))
+}
+
+async fn send_asset_origin_request(
+    services: &RuntimeServices,
+    backend_name: &str,
+    method: &Method,
+    target_url: &url::Url,
+    outbound_headers: &http::HeaderMap,
+    stream_response: bool,
+) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let mut platform_req =
+        build_asset_platform_request(method, target_url, outbound_headers, backend_name)?;
+    if stream_response {
+        platform_req = platform_req.with_stream_response();
+    }
+    let platform_resp = services
+        .http_client()
+        .send(platform_req)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to proxy asset request".to_string(),
+        })?;
+
+    if stream_response {
+        Ok(platform_response_to_fastly_asset(platform_resp))
+    } else {
+        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)
+    }
+}
+
+fn strip_asset_proxy_response_headers(response: &mut Response<EdgeBody>) {
+    // Asset origins must not be able to mutate publisher-domain browser state
+    // or security policy through this proxy path.
+    for header_name in ASSET_PROXY_STRIP_RESPONSE_HEADERS {
+        response.headers_mut().remove(header_name);
+    }
+}
+
+fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(ASSET_NO_STORE_PRIVATE_CACHE_CONTROL),
+    );
+}
+
+fn should_preflight_s3(
+    route: &ProxyAssetRoute,
+    image_optimizer_enabled: bool,
+    request_method: &Method,
+) -> bool {
+    image_optimizer_enabled
+        && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
+        && (request_method == Method::GET || request_method == Method::HEAD)
+}
+
+async fn preflight_s3_origin_for_image_optimizer(
+    services: &RuntimeServices,
+    route: &ProxyAssetRoute,
+    target_url: &url::Url,
+    request_method: &Method,
+    unsigned_headers: &http::HeaderMap,
+    backend_name: &str,
+) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
+    let Some(auth @ AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
+        return Ok(None);
+    };
+
+    // Fastly Image Optimizer can mask or transform S3 origin errors. A signed
+    // HEAD preflight lets missing or unauthorized objects return raw S3 errors
+    // without invoking IO on the failure path.
+    let mut head_headers = unsigned_headers.clone();
+    apply_asset_origin_auth(services, &Method::HEAD, target_url, &mut head_headers, auth)?;
+    let head_response = send_asset_origin_request(
+        services,
+        backend_name,
+        &Method::HEAD,
+        target_url,
+        &head_headers,
+        false,
+    )
+    .await?;
+    let head_status = head_response.response().status();
+    if head_status.is_success() || head_status == StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+
+    if request_method == Method::HEAD {
+        let mut response = head_response.into_response()?;
+        strip_asset_proxy_response_headers(&mut response);
+        apply_no_store_cache_control(&mut response);
+        return Ok(Some(AssetProxyResponse::no_store_private(response)));
+    }
+
+    let mut get_headers = unsigned_headers.clone();
+    apply_asset_origin_auth(services, &Method::GET, target_url, &mut get_headers, auth)?;
+    let mut response = send_asset_origin_request(
+        services,
+        backend_name,
+        &Method::GET,
+        target_url,
+        &get_headers,
+        true,
+    )
+    .await?;
+    strip_asset_proxy_response_headers(response.response_mut());
+    response.apply_no_store_private_policy();
+
+    Ok(Some(response))
+}
+
+/// Proxy a configured first-party asset path to its matched asset origin.
+///
+/// This is a lean raw pass-through path: it preserves status/body/headers,
+/// does not follow redirects, and bypasses publisher-page processing. The flow
+/// is path rewrite, profile-table Image Optimizer metadata extraction, optional
+/// origin query stripping, optional origin authentication, then platform send.
+///
+/// The origin query policy is applied before S3 signing so the signature covers
+/// the exact URL sent to the asset origin. Image Optimizer metadata remains
+/// separate from the origin URL and is translated by the platform adapter.
+///
+/// # Errors
+///
+/// Returns an error if the configured origin URL is invalid, backend
+/// registration fails, S3 credentials cannot be read, signing fails, image
+/// optimizer metadata cannot be built, or the upstream request cannot be sent.
+pub async fn handle_asset_proxy_request(
+    settings: &Settings,
+    services: &RuntimeServices,
+    req: Request<EdgeBody>,
+    route: &ProxyAssetRoute,
+) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let incoming_query = req.uri().query().unwrap_or("");
+    let mut target_url = build_asset_proxy_target_url(route, req.uri().path(), incoming_query)?;
+    let skip_image_optimizer = asset_path_skips_image_optimizer(&target_url);
+    let image_optimizer = if skip_image_optimizer {
+        log::debug!(
+            "Skipping Image Optimizer for unsupported SVG asset path: {}",
+            target_url.path()
+        );
+        None
+    } else {
+        crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?
+    };
+
+    if route.origin_query_policy() == OriginQueryPolicy::Strip {
+        target_url.set_query(None);
+    }
+
+    let scheme = target_url.scheme();
+    let host = target_url.host_str().ok_or_else(|| {
+        Report::new(TrustedServerError::Proxy {
+            message: "Missing host in asset target URL".to_string(),
+        })
+    })?;
+
+    let backend_name = services
+        .backend()
+        .ensure(&PlatformBackendSpec {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port: target_url.port(),
+            host_header_override: None,
+            certificate_check: settings.proxy.certificate_check,
+            first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+        })
+        .change_context(TrustedServerError::Proxy {
+            message: "asset backend registration failed".to_string(),
+        })?;
+
+    let mut outbound_headers = http::HeaderMap::new();
+    for header_name in ASSET_PROXY_FORWARD_HEADERS {
+        if let Some(value) = req.headers().get(&header_name) {
+            outbound_headers.insert(header_name, value.clone());
+        }
+    }
+    outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
+
+    if should_preflight_s3(route, image_optimizer.is_some(), req.method()) {
+        if let Some(response) = preflight_s3_origin_for_image_optimizer(
+            services,
+            route,
+            &target_url,
+            req.method(),
+            &outbound_headers,
+            &backend_name,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+    }
+
+    if let Some(auth) = &route.auth {
+        apply_asset_origin_auth(
+            services,
+            req.method(),
+            &target_url,
+            &mut outbound_headers,
+            auth,
+        )?;
+    }
+
+    let mut platform_req =
+        build_asset_platform_request(req.method(), &target_url, &outbound_headers, &backend_name)?;
+    if let Some(image_optimizer) = image_optimizer {
+        platform_req = platform_req.with_image_optimizer(image_optimizer);
+    }
+    platform_req = platform_req.with_stream_response();
+
+    let platform_resp = services
+        .http_client()
+        .send(platform_req)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to proxy asset request".to_string(),
+        })?;
+
+    let mut response = platform_response_to_fastly_asset(platform_resp);
+    strip_asset_proxy_response_headers(response.response_mut());
+
+    Ok(response)
+}
+
 /// Upserts the `ts-ec` query parameter on a URL, replacing any existing value.
 fn upsert_ec_query_param(url: &mut url::Url, ec_id: &str) {
     let mut pairs: Vec<(String, String)> = url
@@ -611,6 +1244,7 @@ async fn proxy_with_redirects(
                 scheme: scheme.clone(),
                 host: host.to_string(),
                 port: parsed_url.port(),
+                host_header_override: None,
                 certificate_check: settings.proxy.certificate_check,
                 first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             })
@@ -1309,22 +1943,33 @@ fn reconstruct_and_validate_signed_target(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     use super::{
-        handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-        handle_first_party_proxy_sign, is_host_allowed, proxy_request, rebuild_response_with_body,
-        reconstruct_and_validate_signed_target, redirect_is_permitted, ProxyRequestConfig,
-        SUPPORTED_ENCODINGS,
+        asset_origin_host_header, asset_path_skips_image_optimizer, build_asset_proxy_target_url,
+        clear_s3_credentials_cache_for_tests, handle_asset_proxy_request, handle_first_party_click,
+        handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
+        is_host_allowed, proxy_request, rebuild_response_with_body,
+        reconstruct_and_validate_signed_target, redirect_is_permitted, stream_asset_body,
+        AssetProxyCachePolicy, ProxyRequestConfig, SUPPORTED_ENCODINGS,
     };
-    use crate::constants::HEADER_ACCEPT;
+    use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
     use crate::creative;
     use crate::error::{IntoHttpResponse, TrustedServerError};
-    use crate::platform::test_support::{build_services_with_http_client, noop_services};
+    use crate::platform::test_support::{
+        build_services_with_http_client, build_services_with_secret_and_http_client, noop_services,
+        HashMapSecretStore, StubHttpClient,
+    };
     use crate::platform::{
         PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse, PlatformSelectResult,
+        PlatformResponse, PlatformSecretStore, PlatformSelectResult, StoreId, StoreName,
+    };
+    use crate::settings::{
+        AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerAspectRatioConfig,
+        ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
+        OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, UnknownProfilePolicy,
     };
     use crate::test_support::tests::create_test_settings;
     use bytes::Bytes;
@@ -1494,6 +2139,14 @@ mod tests {
         ) -> Result<PlatformResponse, Report<PlatformError>> {
             let edge_response = edge_response_builder()
                 .status(StatusCode::OK)
+                .header(header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure")
+                .header(header::SET_COOKIE.as_str(), "other=2; Path=/; Secure")
+                .header(
+                    header::STRICT_TRANSPORT_SECURITY.as_str(),
+                    "max-age=31536000; includeSubDomains; preload",
+                )
+                .header("clear-site-data", "\"*\"")
+                .header(header::ETAG.as_str(), "\"stream-etag\"")
                 .body(EdgeBody::stream(futures::stream::iter(vec![
                     Bytes::from_static(b"chunk"),
                 ])))
@@ -1513,6 +2166,60 @@ mod tests {
             &self,
             _pending_requests: Vec<PlatformPendingRequest>,
         ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingSecretStore {
+        data: Arc<HashMap<String, Vec<u8>>>,
+        reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CountingSecretStore {
+        fn new(data: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                data: Arc::new(data),
+                reads: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn read_count(&self, key: &str) -> usize {
+            self.reads
+                .lock()
+                .expect("should lock counting secret-store reads")
+                .iter()
+                .filter(|read_key| read_key.as_str() == key)
+                .count()
+        }
+    }
+
+    impl PlatformSecretStore for CountingSecretStore {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            self.reads
+                .lock()
+                .expect("should lock counting secret-store reads")
+                .push(key.to_string());
+            self.data
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::SecretStore))
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
             Err(Report::new(PlatformError::Unsupported))
         }
     }
@@ -2497,6 +3204,1028 @@ mod tests {
             ],
             "should preserve every Set-Cookie value when rebuilding the response"
         );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_preserves_path_and_query() {
+        let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+        let target_url =
+            build_asset_proxy_target_url(&route, "/.images/foo.jpg", "auto=webp&width=800")
+                .expect("should build asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://assets.example.com/.images/foo.jpg?auto=webp&width=800",
+            "should preserve the incoming path and query exactly"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_applies_cdn_style_rewrite() {
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets-cdn.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
+        route.target_path = Some("/image/upload/$1.$2".to_string());
+        let target_url = build_asset_proxy_target_url(
+            &route,
+            "/.image/c_fit,w_1440/MjA/example.jpg",
+            "auto=webp",
+        )
+        .expect("should build rewritten asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://assets-cdn.example.com/image/upload/c_fit,w_1440/MjA.jpg?auto=webp",
+            "should rewrite the path generically while preserving query parameters"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_applies_static_prefix_rewrite() {
+        let mut route = ProxyAssetRoute::new("/_next/static/", "https://static-assets.example.com");
+        route.path_pattern = Some(r"^(.*)$".to_string());
+        route.target_path = Some("/_network$1".to_string());
+        let target_url = build_asset_proxy_target_url(&route, "/_next/static/chunks/app.js", "")
+            .expect("should build rewritten static asset target URL");
+
+        assert_eq!(
+            target_url.as_str(),
+            "https://static-assets.example.com/_network/_next/static/chunks/app.js",
+            "should prepend the configured upstream path prefix"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_errors_when_rewrite_pattern_misses() {
+        let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/\.image/(.*)\.jpg$".to_string());
+        route.target_path = Some("/image/upload/$1.jpg".to_string());
+        let err = build_asset_proxy_target_url(&route, "/.image/foo.png", "")
+            .expect_err("should reject paths that do not match the configured rewrite");
+
+        assert!(
+            format!("{err:?}").contains("did not match path_pattern"),
+            "should explain the rewrite miss: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_errors_when_rewrite_omits_leading_slash() {
+        let mut route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        route.path_pattern = Some(r"^/assets/(.*)$".to_string());
+        route.target_path = Some("$1".to_string());
+        let err = build_asset_proxy_target_url(&route, "/assets/app.js", "")
+            .expect_err("should reject rewritten paths without a leading slash");
+
+        assert!(
+            format!("{err:?}").contains("must start with '/'"),
+            "should explain the invalid rewritten path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn asset_path_skips_image_optimizer_for_svg_extensions() {
+        for url in [
+            "https://assets.example.com/.images/logo.svg",
+            "https://assets.example.com/.images/LOGO.SVG",
+            "https://assets.example.com/.images/icon.svgz",
+        ] {
+            let target_url = url::Url::parse(url).expect("should parse target URL");
+            assert!(
+                asset_path_skips_image_optimizer(&target_url),
+                "should skip Image Optimizer for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_path_uses_image_optimizer_for_raster_extensions() {
+        for url in [
+            "https://assets.example.com/.images/photo.jpg",
+            "https://assets.example.com/.images/photo.png",
+            "https://assets.example.com/.images/photo.webp",
+        ] {
+            let target_url = url::Url::parse(url).expect("should parse target URL");
+            assert!(
+                !asset_path_skips_image_optimizer(&target_url),
+                "should allow Image Optimizer for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_origin_host_header_omits_standard_port() {
+        let target_url = url::Url::parse("https://assets.example.com/.images/foo.jpg")
+            .expect("should parse URL");
+        let host = asset_origin_host_header(&target_url).expect("should compute Host header");
+        assert_eq!(
+            host.to_str().expect("should serialize Host header"),
+            "assets.example.com",
+            "should omit standard HTTPS port from Host header"
+        );
+    }
+
+    #[test]
+    fn asset_origin_host_header_includes_non_standard_port() {
+        let target_url = url::Url::parse("https://assets.example.com:8443/.images/foo.jpg")
+            .expect("should parse URL");
+        let host = asset_origin_host_header(&target_url).expect("should compute Host header");
+        assert_eq!(
+            host.to_str().expect("should serialize Host header"),
+            "assets.example.com:8443",
+            "should include non-standard port in Host header"
+        );
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_forwards_asset_headers_and_host() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let mut req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?auto=webp",
+            );
+            req.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static("asset-agent/1.0"),
+            );
+            req.headers_mut().insert(
+                header::ACCEPT,
+                HeaderValue::from_static("image/avif,image/webp,image/*,*/*;q=0.8"),
+            );
+            req.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip, br"),
+            );
+            req.headers_mut()
+                .insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+            req.headers_mut().insert(
+                header::REFERER,
+                HeaderValue::from_static("https://www.example.com/article"),
+            );
+            req.headers_mut().insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("\"asset-etag\""),
+            );
+            req.headers_mut().insert(
+                header::IF_MODIFIED_SINCE,
+                HeaderValue::from_static("Thu, 13 Mar 2025 08:00:00 GMT"),
+            );
+            req.headers_mut().insert(
+                header::IF_MATCH,
+                HeaderValue::from_static("\"asset-precondition\""),
+            );
+            req.headers_mut().insert(
+                header::IF_UNMODIFIED_SINCE,
+                HeaderValue::from_static("Thu, 13 Mar 2025 09:00:00 GMT"),
+            );
+            req.headers_mut()
+                .insert(header::RANGE, HeaderValue::from_static("bytes=0-1023"));
+            req.headers_mut().insert(
+                header::IF_RANGE,
+                HeaderValue::from_static("\"asset-range\""),
+            );
+            req.headers_mut().insert(
+                HEADER_X_FORWARDED_FOR,
+                HeaderValue::from_static("198.51.100.10"),
+            );
+            req.headers_mut().insert(
+                header::HeaderName::from_static("x-custom-test"),
+                HeaderValue::from_static("drop-me"),
+            );
+
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
+            let response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request")
+                .into_response()
+                .expect("should return buffered asset response");
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let all_headers = stub.recorded_request_headers();
+            assert_eq!(all_headers.len(), 1, "should have captured one request");
+            let sent = &all_headers[0];
+            let header_value = |name: &str| -> Option<String> {
+                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+            };
+
+            assert_eq!(
+                header_value("user-agent").as_deref(),
+                Some("asset-agent/1.0"),
+                "should forward User-Agent"
+            );
+            assert_eq!(
+                header_value("accept-encoding").as_deref(),
+                Some("gzip, br"),
+                "should preserve the incoming Accept-Encoding"
+            );
+            assert_eq!(
+                header_value("if-none-match").as_deref(),
+                Some("\"asset-etag\""),
+                "should forward conditional ETag validation headers"
+            );
+            assert_eq!(
+                header_value("if-modified-since").as_deref(),
+                Some("Thu, 13 Mar 2025 08:00:00 GMT"),
+                "should forward conditional date validation headers"
+            );
+            assert_eq!(
+                header_value("if-match").as_deref(),
+                Some("\"asset-precondition\""),
+                "should forward precondition headers"
+            );
+            assert_eq!(
+                header_value("if-unmodified-since").as_deref(),
+                Some("Thu, 13 Mar 2025 09:00:00 GMT"),
+                "should forward date precondition headers"
+            );
+            assert_eq!(
+                header_value("range").as_deref(),
+                Some("bytes=0-1023"),
+                "should forward byte-range requests"
+            );
+            assert_eq!(
+                header_value("if-range").as_deref(),
+                Some("\"asset-range\""),
+                "should forward range validators"
+            );
+            assert_eq!(
+                header_value("host").as_deref(),
+                Some("assets.example.com:8443"),
+                "should override Host to the asset origin host"
+            );
+            assert!(
+                header_value("x-forwarded-for").is_none(),
+                "should not forward client-supplied X-Forwarded-For"
+            );
+            assert!(
+                header_value("x-custom-test").is_none(),
+                "should not forward unrelated custom headers"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_strips_unsafe_response_headers() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                Vec::new(),
+                vec![
+                    (header::SET_COOKIE.as_str(), "asset=1; Path=/; Secure"),
+                    (header::SET_COOKIE.as_str(), "other=2; Path=/; Secure"),
+                    (
+                        header::STRICT_TRANSPORT_SECURITY.as_str(),
+                        "max-age=31536000; includeSubDomains; preload",
+                    ),
+                    ("clear-site-data", "\"*\""),
+                    (header::ETAG.as_str(), "\"asset-etag\""),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            let response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy asset request")
+                .into_response()
+                .expect("should return buffered asset response");
+
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "should strip upstream Set-Cookie headers from asset responses"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::STRICT_TRANSPORT_SECURITY)
+                    .is_none(),
+                "should strip upstream HSTS headers from asset responses"
+            );
+            assert!(
+                response.headers().get("clear-site-data").is_none(),
+                "should strip upstream Clear-Site-Data headers from asset responses"
+            );
+            assert_eq!(
+                response_header(&response, header::ETAG),
+                Some("\"asset-etag\""),
+                "should preserve safe cache validator headers on asset responses"
+            );
+        });
+    }
+
+    fn test_profile_set() -> ImageOptimizerProfileSet {
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), "width=1920".to_string());
+        profiles.insert("medium".to_string(), "format=auto&width=828".to_string());
+        ImageOptimizerProfileSet {
+            base_params: "quality=70&resize-filter=bicubic".to_string(),
+            default_profile: "default".to_string(),
+            unknown_profile: Default::default(),
+            profile_param: "profile".to_string(),
+            aspect_ratio_param: "ar".to_string(),
+            debug_param: "_io_debug".to_string(),
+            profiles,
+            aspect_ratios: Some(ImageOptimizerAspectRatioConfig {
+                allowed: vec!["1-1".to_string()],
+                profiles: vec!["medium".to_string()],
+            }),
+            crop_offsets: Some(ImageOptimizerCropOffsetsConfig {
+                enabled: true,
+                x_param: "x".to_string(),
+                y_param: "y".to_string(),
+                buckets: vec![10, 30, 50, 70, 90],
+                default: 50,
+                when_missing: Default::default(),
+            }),
+        }
+    }
+
+    fn test_s3_secrets() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            (
+                "access_key_id".to_string(),
+                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
+            ),
+            (
+                "secret_access_key".to_string(),
+                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+            ),
+        ])
+    }
+
+    fn test_s3_image_optimizer_route() -> ProxyAssetRoute {
+        let mut route = ProxyAssetRoute::new(
+            "/.images/",
+            "https://examplebucket.s3.us-east-1.amazonaws.com",
+        );
+        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+            region: "us-east-1".to_string(),
+            secret_store: "s3-auth".to_string(),
+            access_key_id: "access_key_id".to_string(),
+            secret_access_key: "secret_access_key".to_string(),
+            session_token: None,
+            origin_query: None,
+        }));
+        route.image_optimizer = Some(AssetImageOptimizerConfig {
+            enabled: true,
+            region: "us_east".to_string(),
+            profile_set: "default_images".to_string(),
+            origin_query: None,
+        });
+        route
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_signs_s3_and_strips_transform_query() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let mut secrets = HashMap::new();
+            secrets.insert(
+                "access_key_id".to_string(),
+                b"AKIAIOSFODNN7EXAMPLE".to_vec(),
+            );
+            secrets.insert(
+                "secret_access_key".to_string(),
+                b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+            );
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(secrets),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1",
+            );
+            let mut route = ProxyAssetRoute::new(
+                "/.images/",
+                "https://examplebucket.s3.us-east-1.amazonaws.com",
+            );
+            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: "s3-auth".to_string(),
+                access_key_id: "access_key_id".to_string(),
+                secret_access_key: "secret_access_key".to_string(),
+                session_token: None,
+                origin_query: Some(OriginQueryPolicy::Strip),
+            }));
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy signed S3 asset request");
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris,
+                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg"],
+                "should strip transform query before signing and sending to S3"
+            );
+            let headers = stub.recorded_request_headers();
+            let sent = &headers[0];
+            let header_value = |name: &str| -> Option<String> {
+                sent.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+            };
+            assert_eq!(
+                header_value("host").as_deref(),
+                Some("examplebucket.s3.us-east-1.amazonaws.com"),
+                "should sign for the S3 origin host"
+            );
+            assert!(
+                header_value("authorization")
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 Credential=")),
+                "should add a SigV4 Authorization header"
+            );
+            assert_eq!(
+                header_value("x-amz-content-sha256").as_deref(),
+                Some("UNSIGNED-PAYLOAD"),
+                "should use unsigned payload for read-only asset requests"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_caches_s3_credentials_for_repeated_signing() {
+        futures::executor::block_on(async {
+            clear_s3_credentials_cache_for_tests();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            stub.push_response(200, b"optimized".to_vec());
+            let secret_store = CountingSecretStore::new(HashMap::from([
+                (
+                    "cache_access_key_id".to_string(),
+                    b"AKIAIOSFODNN7EXAMPLE".to_vec(),
+                ),
+                (
+                    "cache_secret_access_key".to_string(),
+                    b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+                ),
+                ("cache_session_token".to_string(), b"session-token".to_vec()),
+            ]));
+            let observed_secret_store = secret_store.clone();
+            let services = build_services_with_secret_and_http_client(
+                secret_store,
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+            );
+            let mut route = test_s3_image_optimizer_route();
+            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: "s3-auth-cache".to_string(),
+                access_key_id: "cache_access_key_id".to_string(),
+                secret_access_key: "cache_secret_access_key".to_string(),
+                session_token: Some("cache_session_token".to_string()),
+                origin_query: None,
+            }));
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy optimized S3 asset request");
+
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD", "GET"],
+                "should sign both the S3 preflight and final request"
+            );
+            assert_eq!(
+                observed_secret_store.read_count("cache_access_key_id"),
+                1,
+                "should read S3 access key ID once despite repeated signing"
+            );
+            assert_eq!(
+                observed_secret_store.read_count("cache_secret_access_key"),
+                1,
+                "should read S3 secret access key once despite repeated signing"
+            );
+            assert_eq!(
+                observed_secret_store.read_count("cache_session_token"),
+                1,
+                "should read S3 session token once despite repeated signing"
+            );
+            let headers = stub.recorded_request_headers();
+            assert!(
+                headers
+                    .iter()
+                    .all(|sent| sent
+                        .iter()
+                        .any(|(name, value)| name == "x-amz-security-token"
+                            && value == "session-token")),
+                "should sign both requests with the cached session token"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_attaches_image_optimizer_metadata() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium&ar=1-1&x=71&y=bad",
+            );
+            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy optimized asset request");
+
+            let uris = stub.recorded_request_uris();
+            assert_eq!(
+                uris,
+                vec!["https://assets.example.com/.images/foo.jpg"],
+                "should strip profile-table query from the origin request by default"
+            );
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "final asset responses should stay streaming"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            let options = options[0]
+                .as_ref()
+                .expect("should attach image optimizer metadata");
+            assert_eq!(options.region, "us_east");
+            assert!(!options.preserve_query_string_on_origin_request);
+            assert_eq!(options.params.quality, Some(70));
+            assert_eq!(options.params.resize_filter.as_deref(), Some("bicubic"));
+            assert_eq!(options.params.format.as_deref(), Some("auto"));
+            assert_eq!(options.params.width, Some(828));
+            let crop = options.params.crop.as_ref().expect("should set crop");
+            assert_eq!((crop.width, crop.height), (1, 1));
+            assert_eq!((crop.offset_x, crop.offset_y), (Some(70), Some(50)));
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_svg_assets() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut settings = create_test_settings();
+            let mut profile_set = test_profile_set();
+            profile_set.unknown_profile = UnknownProfilePolicy::Reject;
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/logo.SVG?profile=unknown&ar=1-1",
+            );
+            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy SVG asset without Image Optimizer profile parsing");
+
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://assets.example.com/.images/logo.SVG"],
+                "should still strip profile-table query from SVG origin requests"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options(),
+                vec![None],
+                "SVG assets should bypass Image Optimizer metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_rewritten_svg_assets() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.image/options/id/logo.svg?profile=medium",
+            );
+            let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+            route.path_pattern = Some(r"^/\.image/(.*)/[^/]+\.([^/.]+)$".to_string());
+            route.target_path = Some("/image/upload/$1.$2".to_string());
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy rewritten SVG asset without Image Optimizer metadata");
+
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://assets.example.com/image/upload/options/id.svg"],
+                "should detect SVG after route path rewriting"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options(),
+                vec![None],
+                "rewritten SVG assets should bypass Image Optimizer metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_s3_preflight_for_svg_image_optimizer_routes() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"raw-svg".to_vec());
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/logo.svg?profile=medium",
+            );
+            let route = test_s3_image_optimizer_route();
+
+            let response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy raw SVG asset through S3 route")
+                .into_response()
+                .expect("should return buffered asset response");
+
+            assert_eq!(response_body_string(response), "raw-svg");
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["GET"],
+                "SVG IO bypass should not add an S3 preflight"
+            );
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://examplebucket.s3.us-east-1.amazonaws.com/.images/logo.svg"],
+                "SVG IO bypass should still strip the transform query"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options(),
+                vec![None],
+                "SVG IO bypass should not attach Image Optimizer metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_preflights_s3_before_image_optimizer() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, Vec::new());
+            stub.push_response(200, b"optimized".to_vec());
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium",
+            );
+            let route = test_s3_image_optimizer_route();
+
+            let response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy optimized S3 asset request")
+                .into_response()
+                .expect("should return buffered asset response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "optimized");
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD", "GET"],
+                "should preflight S3 with HEAD before the optimized GET"
+            );
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec![
+                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
+                    "https://examplebucket.s3.us-east-1.amazonaws.com/.images/foo.jpg",
+                ],
+                "should strip transform query from both S3 requests"
+            );
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![false, true],
+                "S3 HEAD preflight stays non-streaming, final asset GET stays streaming"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            assert_eq!(options.len(), 2, "should send two origin requests");
+            assert!(
+                options[0].is_none(),
+                "preflight should not attach IO metadata"
+            );
+            assert!(
+                options[1].is_some(),
+                "final asset request should attach IO metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_returns_raw_s3_error_before_image_optimizer() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(404, Vec::new());
+            stub.push_response_with_headers(
+                404,
+                br#"<Error><Code>NoSuchKey</Code><Key>image/upload/missing.jpg</Key></Error>"#
+                    .to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "application/xml"),
+                    (header::CACHE_CONTROL.as_str(), "public, max-age=3600"),
+                    (header::SET_COOKIE.as_str(), "asset=1; Path=/"),
+                ],
+            );
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/missing.jpg?profile=medium",
+            );
+            let route = test_s3_image_optimizer_route();
+
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should return raw S3 error response");
+            assert_eq!(
+                asset_response.cache_policy(),
+                AssetProxyCachePolicy::NoStorePrivate,
+                "should carry a typed no-store policy for router finalization"
+            );
+            let response = asset_response
+                .into_response()
+                .expect("should return buffered asset response");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                response_header(&response, header::CACHE_CONTROL),
+                Some("no-store, private"),
+                "S3 origin errors should not be cached"
+            );
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "raw S3 error should still strip unsafe response headers"
+            );
+            let body = response_body_string(response);
+            assert!(body.contains("NoSuchKey"), "should return S3 error body");
+            assert!(
+                body.contains("image/upload/missing.jpg"),
+                "should expose the missing S3 key"
+            );
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["HEAD", "GET"],
+                "should fetch S3 error body after failed HEAD preflight"
+            );
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![false, true],
+                "S3 HEAD preflight stays non-streaming, error-body GET stays streaming"
+            );
+            let options = stub.recorded_image_optimizer_options();
+            assert_eq!(
+                options,
+                vec![None, None],
+                "should not invoke IO for S3 errors"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_does_not_preflight_when_io_disabled() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"raw".to_vec());
+            let services = build_services_with_secret_and_http_client(
+                HashMapSecretStore::new(test_s3_secrets()),
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+            );
+            let route = test_s3_image_optimizer_route();
+
+            let response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy debug S3 asset request")
+                .into_response()
+                .expect("should return buffered asset response");
+
+            assert_eq!(response_body_string(response), "raw");
+            assert_eq!(
+                stub.recorded_request_methods(),
+                vec!["GET"],
+                "disabled IO should not add S3 preflight"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options(),
+                vec![None],
+                "debug query param should disable image optimizer metadata"
+            );
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "debug asset responses should still stay streaming"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_debug_param_disables_image_optimizer() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut settings = create_test_settings();
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), test_profile_set())]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.images/foo.jpg?profile=medium&_io_debug=1",
+            );
+            let mut route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy debug asset request");
+
+            let options = stub.recorded_image_optimizer_options();
+            assert!(
+                options[0].is_none(),
+                "debug query param should disable image optimizer metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_accepts_streaming_platform_response_body() {
+        futures::executor::block_on(async {
+            let services = build_services_with_http_client(
+                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+
+            let (response, stream_body) =
+                handle_asset_proxy_request(&settings, &services, req, &route)
+                    .await
+                    .expect("should proxy a streaming asset response")
+                    .into_response_and_body();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "should strip upstream Set-Cookie headers from streaming asset responses"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::STRICT_TRANSPORT_SECURITY)
+                    .is_none(),
+                "should strip upstream HSTS headers from streaming asset responses"
+            );
+            assert!(
+                response.headers().get("clear-site-data").is_none(),
+                "should strip upstream Clear-Site-Data headers from streaming asset responses"
+            );
+            assert_eq!(
+                response_header(&response, header::ETAG),
+                Some("\"stream-etag\""),
+                "should preserve safe cache validator headers on streaming asset responses"
+            );
+
+            let mut output = Vec::new();
+            stream_asset_body(
+                stream_body.expect("should preserve asset body as a stream"),
+                &mut output,
+            )
+            .await
+            .expect("should stream asset body");
+
+            assert_eq!(output, b"chunk");
+        });
+    }
+
+    #[test]
+    fn stream_asset_body_reports_mid_stream_origin_errors() {
+        futures::executor::block_on(async {
+            let body = EdgeBody::from_stream(futures::stream::iter(vec![
+                Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
+                Err(io::Error::other("origin stream failed")),
+            ]));
+            let mut output = Vec::new();
+
+            let err = stream_asset_body(body, &mut output)
+                .await
+                .expect_err("should report mid-stream origin errors");
+
+            assert_eq!(
+                output, b"partial",
+                "should only write chunks received before the stream error"
+            );
+            assert!(
+                format!("{err:?}").contains("streaming platform response body failed"),
+                "should describe the streaming failure: {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn asset_proxy_response_into_response_rejects_stream_body() {
+        futures::executor::block_on(async {
+            let services = build_services_with_http_client(
+                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy a streaming asset response");
+
+            let err = asset_response
+                .into_response()
+                .expect_err("streaming asset responses should require explicit stream handling");
+            assert!(
+                format!("{err:?}").contains("streaming asset response cannot be converted"),
+                "should describe the buffered conversion failure: {err:?}"
+            );
+        });
     }
 
     // --- is_host_allowed ---

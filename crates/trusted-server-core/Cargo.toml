@@ -48,18 +48,10 @@ toml = { workspace = true }
 trusted-server-js = { path = "../js" }
 trusted-server-openrtb = { path = "../openrtb" }
 url = { workspace = true }
-urlencoding = { workspace = true }
 uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 edgezero-core = { workspace = true }
-
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-# Enable JS-backed RNG for `wasm32-unknown-unknown` targets (e.g. Cloudflare Workers).
-# The Fastly adapter uses `wasm32-wasip1`, which has native POSIX RNG and does not
-# need these — this block is intentionally scoped to `target_os = "unknown"` only.
-getrandom = { version = "0.2", features = ["js"] }
-uuid = { workspace = true, features = ["js"] }
 
 [build-dependencies]
 config = { workspace = true }
@@ -81,6 +73,7 @@ default = []
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }
+urlencoding = { workspace = true }
 
 [[bench]]
 name = "consent_decode"

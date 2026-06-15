@@ -125,6 +125,8 @@ pub struct PlatformBackendSpec {
     pub host: String,
     /// Explicit port, or `None` to use the scheme default.
     pub port: Option<u16>,
+    /// Optional outbound `Host` header override for backend registration.
+    pub host_header_override: Option<String>,
     /// Whether to verify the TLS certificate.
     pub certificate_check: bool,
     /// Maximum time to wait for the first response byte.
