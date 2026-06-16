@@ -22,6 +22,17 @@ fn is_valid_slot_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Returns `true` when `pattern` compiles as a glob, mirroring the runtime
+/// `CreativeOpportunitySlot::compile_patterns` contract: try `glob::Pattern::new`
+/// directly, then fall back to the `**` -> `*` normalization. A pattern that
+/// fails both is dropped at runtime, leaving the slot unmatchable, so the build
+/// must reject it too.
+fn pattern_compiles(pattern: &str) -> bool {
+    glob::Pattern::new(pattern)
+        .or_else(|_| glob::Pattern::new(&pattern.replace("**", "*")))
+        .is_ok()
+}
+
 /// Validate a single raw creative-opportunity slot.
 ///
 /// Mirrors the runtime checks in `CreativeOpportunitySlot::validate_runtime`:
@@ -51,18 +62,22 @@ pub(crate) fn validate_creative_slot(
         ));
     }
 
-    // At least one non-empty page pattern.
+    // At least one page pattern that is non-empty and compiles as a glob.
+    // Runtime preparation drops uncompilable patterns and rejects the slot when
+    // none remain, so a private/env config like `page_patterns = ["["]` would
+    // otherwise pass the build and fail settings load on the deployed service.
     let has_valid_pattern = slot
         .get("page_patterns")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|patterns| {
             patterns
                 .iter()
-                .any(|p| p.as_str().is_some_and(|s| !s.trim().is_empty()))
+                .filter_map(serde_json::Value::as_str)
+                .any(|s| !s.trim().is_empty() && pattern_compiles(s))
         });
     if !has_valid_pattern {
         return Err(format!(
-            "slot `{id}` must include at least one non-empty page pattern"
+            "slot `{id}` must include at least one valid page pattern"
         ));
     }
 
@@ -172,6 +187,33 @@ mod tests {
             "formats": [{ "width": 300, "height": 250 }]
         });
         assert!(validate_creative_slot(&slot, "123456789").is_err());
+    }
+
+    #[test]
+    fn rejects_uncompilable_glob_pattern() {
+        // `[` is an unterminated character class; it fails to compile both
+        // directly and after the ** -> * normalization, so the slot would be
+        // unmatchable at runtime.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["["],
+            "formats": [{ "width": 300, "height": 250 }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("uncompilable glob pattern must fail at build time");
+        assert!(err.contains("valid page pattern"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_recursive_glob_pattern() {
+        // `/20**` fails direct glob compilation but compiles after the
+        // ** -> * normalization, matching runtime behavior.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }]
+        });
+        assert!(validate_creative_slot(&slot, "123456789").is_ok());
     }
 
     #[test]
