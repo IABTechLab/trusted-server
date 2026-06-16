@@ -158,11 +158,12 @@ impl CreativeOpportunitySlot {
 
     /// Returns `true` if `path` matches any of this slot's [`page_patterns`](Self::page_patterns).
     ///
-    /// Patterns use glob syntax (e.g., `"/20**"` matches any path starting with `/20`,
-    /// `"/"` matches only the root). When a pattern contains `**` in a position that the
-    /// glob crate considers invalid (e.g., `b**`), the `**` is normalised to `*` before
-    /// matching. A single `*` matches any sequence of characters including path separators
-    /// because `require_literal_separator` is `false`.
+    /// Patterns use glob syntax (e.g., `"/2024/*"` matches any path under `/2024/`,
+    /// `"/"` matches only the root). A single `*` matches any sequence of characters
+    /// including path separators because `require_literal_separator` is `false`.
+    /// When a pattern contains `**` in a position the glob crate considers invalid
+    /// (e.g., `"/20**"` or `"b**"`), the `**` is normalised to `*` before matching —
+    /// prefer a valid single-`*` pattern over relying on this fallback.
     ///
     /// Patterns that cannot be compiled even after normalisation are silently skipped.
     #[must_use]
