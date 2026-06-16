@@ -39,10 +39,12 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
-    /// Maximum number of bytes buffered when the `EdgeZero` publisher fallback
-    /// processes an origin response. This caps the *decoded, post-rewrite*
-    /// output buffer. Defaults to 16 MiB — a conservative cap that prevents
-    /// Wasm-heap OOM at flag-flip.
+    /// Maximum number of bytes buffered when a publisher origin response is
+    /// post-processed in full (HTML rewriting/injection) instead of streamed.
+    /// This caps the *decoded, post-rewrite* output buffer and applies to any
+    /// such buffered response on **both** the legacy and `EdgeZero` paths;
+    /// exceeding it fails the response rather than allocating past the cap.
+    /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
     /// On Fastly the *effective* ceiling for a publisher page is lower: the
     /// platform HTTP client rejects any origin response whose raw (still

@@ -101,15 +101,18 @@ use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
+    AssetProxyCachePolicy,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::Settings;
+use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -130,6 +133,7 @@ pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
+    pub(crate) partner_registry: Arc<PartnerRegistry>,
     pub(crate) kv_store: Arc<dyn PlatformKvStore>,
 }
 
@@ -148,11 +152,18 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
+    // Build the partner registry up front so invalid `ec.partners` config fails
+    // closed at startup — `routes()` falls back to `startup_error_router`, which
+    // serves the structured error for every route. This mirrors legacy_main,
+    // which builds the registry before routing and aborts on failure, and
+    // prevents fallback responses from being served with a bad EC config.
+    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
     let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        partner_registry: Arc::new(partner_registry),
         kv_store,
     }))
 }
@@ -372,11 +383,10 @@ async fn run_named_route(
                     .map(compat::from_fastly_response)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
-                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
                     &kv,
-                    &partner_registry,
+                    &state.partner_registry,
                     &fastly_ref,
                     &ec.ec_context,
                 )
@@ -384,11 +394,10 @@ async fn run_named_route(
             }
         }
         NamedRouteHandler::Auction => {
-            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
-            let registry_ref = if partner_registry.is_empty() {
+            let registry_ref = if state.partner_registry.is_empty() {
                 None
             } else {
-                Some(&partner_registry)
+                Some(state.partner_registry.as_ref())
             };
             handle_auction(
                 &state.settings,
@@ -429,10 +438,9 @@ fn run_batch_sync(state: &AppState, req: Request) -> Response {
     let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
-        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
         let fastly_req = compat::to_fastly_request(req);
-        handle_batch_sync(&kv, &partner_registry, &limiter, fastly_req)
+        handle_batch_sync(&kv, &state.partner_registry, &limiter, fastly_req)
             .map(compat::from_fastly_response)
     });
 
@@ -494,6 +502,18 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
                 }))
             })
     } else {
+        // Asset-route fallback (GET/HEAD), mirroring the legacy catch-all arm:
+        // matched asset paths proxy to the configured asset origin instead of the
+        // publisher origin. Must be checked after tsjs/integration routes and
+        // before the publisher fallback. Asset responses skip EC finalization
+        // (no EcFinalizeState attached), matching legacy's `should_finalize_ec = false`.
+        let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+            .then(|| state.settings.asset_route_for_path(&path))
+            .flatten();
+        if let Some(asset_route) = matched_asset_route {
+            return dispatch_asset_fallback(state, services, req, asset_route).await;
+        }
+
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
@@ -520,6 +540,78 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     response.extensions_mut().insert(ec.into_finalize_state());
     response
+}
+
+/// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
+/// `route_request` asset branch.
+///
+/// Proxies the request to the configured asset origin, buffers the body (the
+/// `EdgeZero` path buffers rather than streams), and threads the
+/// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
+/// can reapply protected cache directives after finalization. EC finalization
+/// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
+/// legacy `should_finalize_ec = false` behavior for asset responses.
+async fn dispatch_asset_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    asset_route: &ProxyAssetRoute,
+) -> Response {
+    log::info!("No explicit route matched; proxying via configured asset route");
+
+    match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
+        Ok(asset_response) => {
+            let cache_policy = asset_response.cache_policy();
+            let (mut response, stream_body) = asset_response.into_response_and_body();
+
+            if let Some(body) = stream_body {
+                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
+                    .await
+                {
+                    Ok(bytes) => {
+                        response.headers_mut().insert(
+                            header::CONTENT_LENGTH,
+                            HeaderValue::from(bytes.len() as u64),
+                        );
+                        *response.body_mut() = edgezero_core::body::Body::from(bytes);
+                    }
+                    Err(report) => {
+                        let mut response = http_error(&report);
+                        response
+                            .extensions_mut()
+                            .insert(AssetProxyCachePolicy::NoStorePrivate);
+                        return response;
+                    }
+                }
+            }
+
+            response.extensions_mut().insert(cache_policy);
+            response
+        }
+        Err(report) => {
+            let mut response = http_error(&report);
+            response
+                .extensions_mut()
+                .insert(AssetProxyCachePolicy::NoStorePrivate);
+            response
+        }
+    }
+}
+
+/// Buffers a streaming asset body into memory, bounded by
+/// `publisher.max_buffered_body_bytes`.
+///
+/// # Errors
+///
+/// Returns an error if the body exceeds the configured cap or the underlying
+/// stream yields an error.
+async fn buffer_asset_body(
+    body: edgezero_core::body::Body,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut output = BoundedWriter::new(max_bytes);
+    stream_asset_body(body, &mut output).await?;
+    Ok(output.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1165,110 @@ mod tests {
                 .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_asset_route_skips_ec_finalization() {
+        // Parity guard for the configured asset-route fallback: a GET matching a
+        // proxy.asset_routes prefix must dispatch through the asset proxy (not the
+        // publisher fallback) and skip EC finalization. Without a live asset
+        // backend the proxy errors, but the response must carry the asset cache
+        // policy and must NOT carry an EcFinalizeState — proving the asset branch
+        // ran instead of the publisher fallback (which always attaches one).
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+
+        assert!(
+            response
+                .extensions()
+                .get::<trusted_server_core::proxy::AssetProxyCachePolicy>()
+                .is_some(),
+            "asset-route responses should carry the asset cache policy"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
+    #[test]
+    fn build_state_rejects_invalid_partner_config() {
+        // Fail-closed parity: invalid ec.partners config must fail at state
+        // construction so routes() degrades to startup_error_router instead of
+        // serving fallback responses with a bad EC config (the legacy path
+        // aborts before routing on the same condition).
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [[ec.partners]]
+            name = "Partner One"
+            source_domain = "partner.example.com"
+            api_token = "0123456789012345678901234567890001"
+
+            [[ec.partners]]
+            name = "Partner Two"
+            source_domain = "partner.example.com"
+            api_token = "0123456789012345678901234567890002"
+            "#,
+        )
+        .expect("should parse settings with duplicate partner domains");
+
+        assert!(
+            build_state_from_settings(settings).is_err(),
+            "duplicate partner source_domain must fail state construction (fail closed)"
         );
     }
 }

@@ -267,6 +267,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         .extensions_mut()
         .remove::<crate::app::EcFinalizeState>();
 
+    // Pop the asset cache policy threaded out by the asset-route fallback. Must
+    // happen before the fastly conversion, which drops extensions. Reapplied
+    // after finalization below so protected directives (e.g. no-store on asset
+    // errors) survive operator `response_headers`, mirroring legacy_main's
+    // asset_cache_policy.apply_after_route_finalization.
+    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
+
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
@@ -287,6 +294,12 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                 log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
             }
         }
+    }
+
+    // Reapply protected asset cache directives after finalization, mirroring
+    // legacy_main. A no-op for OriginControlled responses.
+    if let Some(policy) = asset_cache_policy {
+        policy.apply_after_route_finalization(&mut response);
     }
 
     let mut fastly_resp = compat::to_fastly_response(response);
