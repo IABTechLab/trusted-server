@@ -243,7 +243,9 @@ impl AuctionOrchestrator {
             let mediator_context = AuctionContext {
                 settings: context.settings,
                 request: context.request,
-                timeout_ms: remaining_ms,
+                // Bound by both the remaining auction budget and the mediator's
+                // own configured timeout, matching the dispatched collect path.
+                timeout_ms: remaining_ms.min(mediator.timeout_ms()),
                 provider_responses: Some(&provider_responses),
                 services: context.services,
             };
