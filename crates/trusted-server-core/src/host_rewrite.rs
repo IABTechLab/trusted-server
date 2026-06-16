@@ -128,19 +128,37 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_larger_hostname_tokens() {
-        let input = "cdn.origin.example.com notorigin.example.com origin.example.com.evil origin.example.com-extra origin.example.comextra";
-
         assert_eq!(
-            rewrite(input),
+            rewrite("cdn.origin.example.com"),
             None,
-            "should not rewrite subdomains, embedded words, or larger hostname tokens"
+            "should not rewrite a subdomain prefix"
+        );
+        assert_eq!(
+            rewrite("notorigin.example.com"),
+            None,
+            "should not rewrite an embedded-word prefix"
+        );
+        assert_eq!(
+            rewrite("origin.example.com.evil"),
+            None,
+            "should not rewrite a trailing-dot label"
+        );
+        assert_eq!(
+            rewrite("origin.example.com-extra"),
+            None,
+            "should not rewrite a trailing-hyphen token"
+        );
+        assert_eq!(
+            rewrite("origin.example.comextra"),
+            None,
+            "should not rewrite a trailing-word token"
         );
     }
 
     #[test]
     fn rewrites_host_with_valid_numeric_port() {
-        let input = "origin.example.com:8443/path origin.example.com:9443?x=1 origin.example.com:443#frag origin.example.com:8080";
-        let expected = "proxy.example.com:8443/path proxy.example.com:9443?x=1 proxy.example.com:443#frag proxy.example.com:8080";
+        let input = "origin.example.com:8443/path origin.example.com:9443?x=1 origin.example.com:443#frag origin.example.com:8080 (origin.example.com:5000)";
+        let expected = "proxy.example.com:8443/path proxy.example.com:9443?x=1 proxy.example.com:443#frag proxy.example.com:8080 (proxy.example.com:5000)";
 
         assert_eq!(
             rewrite(input),
@@ -151,12 +169,25 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_invalid_port_like_suffixes() {
-        let input = "origin.example.com:not-a-port origin.example.com:8443evil origin.example.com:8443.evil origin.example.com:";
-
         assert_eq!(
-            rewrite(input),
+            rewrite("origin.example.com:not-a-port"),
             None,
-            "should not treat arbitrary colon suffixes as host boundaries"
+            "should not treat a non-numeric suffix as a port"
+        );
+        assert_eq!(
+            rewrite("origin.example.com:8443evil"),
+            None,
+            "should not treat a port with a trailing word as a boundary"
+        );
+        assert_eq!(
+            rewrite("origin.example.com:8443.evil"),
+            None,
+            "should not treat a port with a trailing dot as a boundary"
+        );
+        assert_eq!(
+            rewrite("origin.example.com:"),
+            None,
+            "should not treat an empty port as a boundary"
         );
     }
 }
