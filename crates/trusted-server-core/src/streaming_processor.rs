@@ -52,14 +52,11 @@ impl Compression {
     /// Detect compression from content-encoding header
     #[must_use]
     pub fn from_content_encoding(encoding: &str) -> Self {
-        if encoding.eq_ignore_ascii_case("gzip") {
-            Self::Gzip
-        } else if encoding.eq_ignore_ascii_case("deflate") {
-            Self::Deflate
-        } else if encoding.eq_ignore_ascii_case("br") {
-            Self::Brotli
-        } else {
-            Self::None
+        match encoding {
+            s if s.eq_ignore_ascii_case("gzip") => Self::Gzip,
+            s if s.eq_ignore_ascii_case("deflate") => Self::Deflate,
+            s if s.eq_ignore_ascii_case("br") => Self::Brotli,
+            _ => Self::None,
         }
     }
 }
