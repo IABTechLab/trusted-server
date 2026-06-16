@@ -807,10 +807,13 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     // net covers ordinary navigations whose sole per-user payload is the cookie.
     // Skip when the response is already uncacheable so we don't clobber a
     // stricter directive (e.g. `no-store`).
+    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
+    // against a lowercased copy — `No-Store` / `Private` must count.
     let already_uncacheable = response
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
         .is_some_and(|v| v.contains("private") || v.contains("no-store"));
     if !already_uncacheable && response.headers().contains_key(header::SET_COOKIE) {
         response.headers_mut().insert(
@@ -829,6 +832,7 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
         .is_some_and(|v| v.contains("private"));
 
     for (key, value) in &settings.response_headers {

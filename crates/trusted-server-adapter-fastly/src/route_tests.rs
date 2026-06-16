@@ -1153,6 +1153,58 @@ fn finalize_response_leaves_stricter_no_store_untouched() {
 }
 
 #[test]
+fn finalize_response_treats_mixed_case_no_store_as_uncacheable() {
+    // Cache-Control directives are case-insensitive: `No-Store` on a Set-Cookie
+    // response must be recognized as already-uncacheable and left untouched, not
+    // downgraded to the weaker `private, max-age=0`.
+    let settings = create_test_settings();
+    let mut response = edge_response_builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "No-Store")
+        .header(header::SET_COOKIE, "ec=abc; Path=/")
+        .body(EdgeBody::empty())
+        .expect("should build test response");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("No-Store"),
+        "mixed-case No-Store must be treated as uncacheable and preserved"
+    );
+}
+
+#[test]
+fn finalize_response_mixed_case_private_blocks_operator_surrogate_reenable() {
+    // A mixed-case `Private` directive must still mark the response private so
+    // operator response_headers cannot re-enable shared caching.
+    let mut settings = create_test_settings();
+    settings
+        .response_headers
+        .insert("Surrogate-Control".to_string(), "max-age=86400".to_string());
+    let mut response = edge_response_builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "Private, max-age=0")
+        .body(EdgeBody::empty())
+        .expect("should build test response");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response
+            .headers()
+            .get("surrogate-control")
+            .and_then(|v| v.to_str().ok()),
+        None,
+        "operator Surrogate-Control must not re-enable caching for a mixed-case Private response"
+    );
+}
+
+#[test]
 fn finalize_response_cookie_net_blocks_operator_surrogate_reenable() {
     // Operator response_headers must not re-add surrogate caching once the
     // cookie net has marked the response private.
