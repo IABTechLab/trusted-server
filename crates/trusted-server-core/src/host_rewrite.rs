@@ -72,20 +72,20 @@ mod tests {
     const ORIGIN_HOST: &str = "origin.example.com";
     const REQUEST_HOST: &str = "proxy.example.com";
 
+    fn rewrite(input: &str) -> Option<String> {
+        rewrite_bare_host_at_boundaries(input, ORIGIN_HOST, REQUEST_HOST)
+    }
+
     fn assert_rewrite(input: &str, expected: &str) {
         assert_eq!(
-            rewrite_bare_host_at_boundaries(input, ORIGIN_HOST, REQUEST_HOST),
+            rewrite(input),
             Some(expected.to_string()),
             "should rewrite bare host at valid boundaries"
         );
     }
 
     fn assert_no_rewrite(input: &str, message: &str) {
-        assert_eq!(
-            rewrite_bare_host_at_boundaries(input, ORIGIN_HOST, REQUEST_HOST),
-            None,
-            "{message}"
-        );
+        assert_eq!(rewrite(input), None, "{message}");
     }
 
     #[test]
@@ -93,12 +93,12 @@ mod tests {
         assert_eq!(
             rewrite_bare_host_at_boundaries("origin.example.com", "", REQUEST_HOST),
             None,
-            "should ignore empty origin host"
+            "should ignore an empty origin host"
         );
         assert_eq!(
             rewrite_bare_host_at_boundaries("origin.example.com", ORIGIN_HOST, ""),
             None,
-            "should ignore empty request host"
+            "should ignore an empty request host"
         );
     }
 
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn rewrites_exact_bare_host() {
-        assert_rewrite("origin.example.com", "proxy.example.com");
+        assert_rewrite(ORIGIN_HOST, REQUEST_HOST);
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn does_not_rewrite_suffix_domains_or_host_char_continuations() {
         assert_no_rewrite(
-            "origin.example.com.uk",
+            "origin.example.com.evil",
             "should not rewrite host followed by a domain suffix",
         );
         assert_no_rewrite(
