@@ -193,6 +193,12 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
+                TrustedServerError::RequestTooLarge {
+                    message: String::from("body too large"),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
                 TrustedServerError::InvalidHeaderValue {
                     message: String::from("non-ascii header"),
                 },
@@ -277,6 +283,7 @@ mod tests {
                 TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
                 TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
