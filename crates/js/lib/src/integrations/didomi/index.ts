@@ -1,19 +1,27 @@
 import { log } from '../../core/log';
 
-const DEFAULT_SDK_PATH = 'https://sdk.privacy-center.org/';
-const CONSENT_PROXY_PATH = '/integrations/didomi/consent/';
+const DEFAULT_CONSENT_PROXY_PATH = '/integrations/didomi/consent/';
 
 type DidomiConfig = {
   sdkPath?: string;
   [key: string]: unknown;
 };
 
-type DidomiWindow = Window & { didomiConfig?: DidomiConfig };
+type DidomiWindow = Window & {
+  didomiConfig?: DidomiConfig;
+  __tsjs_didomi?: { proxyPath?: string };
+};
+
+/** Read the server-injected proxy path, falling back to the default. */
+function getConsentProxyPath(win: DidomiWindow): string {
+  return win.__tsjs_didomi?.proxyPath ?? DEFAULT_CONSENT_PROXY_PATH;
+}
 
 function buildProxySdkPath(win: DidomiWindow): string {
+  const proxyPath = getConsentProxyPath(win);
   const base = win.location?.origin ?? win.location?.href;
-  if (!base) return CONSENT_PROXY_PATH;
-  const url = new URL(CONSENT_PROXY_PATH, base);
+  if (!base) return proxyPath;
+  const url = new URL(proxyPath, base);
   return `${url.origin}${url.pathname}`;
 }
 
@@ -25,7 +33,7 @@ export function installDidomiSdkProxy(): boolean {
   const previousSdkPath =
     typeof config.sdkPath === 'string' && config.sdkPath.length > 0
       ? config.sdkPath
-      : DEFAULT_SDK_PATH;
+      : 'https://sdk.privacy-center.org/';
 
   const proxiedSdkPath = buildProxySdkPath(win);
   config.sdkPath = proxiedSdkPath;
