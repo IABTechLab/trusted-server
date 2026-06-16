@@ -1346,6 +1346,17 @@ pub async fn handle_publisher_request(
                 content_type,
                 status,
             );
+            if dispatched_auction.is_some() {
+                // should_run_auction is decided from request signals before the
+                // origin content-type is known. A pass-through (2xx non-HTML)
+                // response has no `</body>` to inject bids into, so the dispatched
+                // SSP requests are wasted — surface it for quota observability.
+                log::warn!(
+                    "Server-side auction dispatched but response routed to pass-through (Content-Type: '{}', status: {}); in-flight SSP bid requests will not be collected",
+                    content_type,
+                    status,
+                );
+            }
             let (parts, body) = response.into_parts();
             let response = Response::from_parts(parts, EdgeBody::empty());
             Ok(PublisherResponse::PassThrough { response, body })
@@ -1364,6 +1375,16 @@ pub async fn handle_publisher_request(
             } else {
                 log::debug!(
                     "Skipping response processing - Content-Type: '{}', status: {}",
+                    content_type,
+                    status,
+                );
+            }
+            if dispatched_auction.is_some() {
+                // Same wasted-dispatch case as the pass-through arm: an
+                // unprocessable/non-2xx response can't carry injected bids, so
+                // the in-flight SSP requests are left uncollected.
+                log::warn!(
+                    "Server-side auction dispatched but response routed to buffered-unmodified (Content-Type: '{}', status: {}); in-flight SSP bid requests will not be collected",
                     content_type,
                     status,
                 );
