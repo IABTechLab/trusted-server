@@ -117,7 +117,7 @@ jobs:
         run: cargo test-cloudflare
 
   test-spin:
-    name: cargo check/build (spin native + wasm32-wasip1)
+    name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -32,6 +32,11 @@ component = "trusted-server"
 
 [component.trusted-server]
 source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
+# Wildcard outbound is required because the first-party proxy and ad-serving
+# paths reach arbitrary, operator-configured publisher and ad origins that are
+# not known at build time. Both https and http are allowed because some upstream
+# origins are still served over plaintext http. Follow-up: scope this to the
+# configured origins once they can be enumerated from settings.
 allowed_outbound_hosts = ["https://*:*", "http://*:*"]
 key_value_stores = ["default"]
 

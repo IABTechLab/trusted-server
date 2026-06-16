@@ -82,6 +82,41 @@ impl Middleware for AuthMiddleware {
 }
 
 // ---------------------------------------------------------------------------
+// NormalizeMiddleware
+// ---------------------------------------------------------------------------
+
+/// Request-normalization chokepoint.
+///
+/// Runs [`crate::app::normalize_spin_request`] on every routed request before
+/// the handler executes, so the de-spoofing invariant — strip client-spoofable
+/// `Forwarded` / `X-Forwarded-*` headers, derive the trusted Host, scheme, and
+/// client IP from Spin's synthetic runtime headers — holds for *every* route
+/// structurally rather than by per-handler convention. A future route, or a
+/// signing handler that begins deriving an issuer/audience from `RequestInfo`,
+/// cannot silently trust spoofable input by forgetting to opt in.
+///
+/// Registered after [`AuthMiddleware`] (innermost) so the basic-auth gate still
+/// evaluates the original request, preserving prior behaviour.
+#[derive(Default)]
+pub struct NormalizeMiddleware;
+
+impl NormalizeMiddleware {
+    /// Creates a new [`NormalizeMiddleware`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for NormalizeMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        crate::app::normalize_spin_request(ctx.request_mut());
+        next.run(ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // apply_finalize_headers — extracted for unit testing
 // ---------------------------------------------------------------------------
 
