@@ -28,8 +28,13 @@
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
       var newSlots = [];
-      // All slots to refresh (TS-defined + publisher-owned reused).
+      // Publisher-owned slots TS reused — refreshed to pick up server-side
+      // targeting. The publisher already display()ed these.
       var slotsToRefresh = [];
+      // Element IDs of slots TS defined itself. GPT requires display() to
+      // register/render a freshly-defined slot; refresh() alone no-ops for a
+      // slot that was never displayed, so these are display()ed instead.
+      var slotsToDisplay = [];
       slots.forEach(function (slot) {
         // Resolve actual div ID: exact match first, then safe prefix scan.
         // div_id in config may be a stable prefix (e.g. "ad-header-0-") when
@@ -93,8 +98,13 @@
         if (slotElementId && slotElementId !== actualDivId) {
           divToSlotId[slotElementId] = slot.id;
         }
-        if (tsOwned) newSlots.push(s);
-        slotsToRefresh.push(s);
+        if (tsOwned) {
+          newSlots.push(s);
+          var displayId = s.getSlotElementId() || actualDivId;
+          slotsToDisplay.push(displayId);
+        } else {
+          slotsToRefresh.push(s);
+        }
       });
       ts.prevGptSlots = newSlots;
       ts.divToSlotId = divToSlotId;
@@ -103,6 +113,13 @@
         googletag.enableServices();
         ts.servicesEnabled = true;
       }
+      // Register and render TS-defined slots. GPT requires display() for a
+      // freshly-defined slot; without it the slot no-ops and misses its
+      // impression. Runs after enableServices(); on SPA navigation services are
+      // already enabled, so this runs unconditionally for new slots.
+      slotsToDisplay.forEach(function (divId) {
+        googletag.display(divId);
+      });
       if (slotsToRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has already wrapped

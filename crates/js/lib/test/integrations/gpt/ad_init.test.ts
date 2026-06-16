@@ -138,6 +138,55 @@ describe('installTsAdInit', () => {
     fetchSpy.mockRestore();
   });
 
+  it('displays TS-defined slots and does not include them in refresh', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      // Publisher has not defined this slot, so TS defines (owns) it.
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const defineSlotMock = vi.fn().mockReturnValue(mockSlot);
+    const displayMock = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: defineSlotMock,
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [[300, 250]],
+          targeting: {},
+        },
+      ],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(defineSlotMock).toHaveBeenCalled();
+    // GPT requires display() to register/render a freshly-defined slot.
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    // TS-owned slots are displayed, not refreshed (refresh() no-ops for a slot
+    // that was never displayed).
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
   it('sets adInitRefreshInProgress only for the duration of the internal refresh', async () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),
@@ -148,7 +197,9 @@ describe('installTsAdInit', () => {
     let flagDuringRefresh: boolean | undefined;
     const mockPubads = {
       enableSingleRequest: vi.fn(),
-      getSlots: vi.fn().mockReturnValue([]),
+      // Publisher-owned slot reused by TS, so it goes through refresh() (which
+      // carries the bypass flag) rather than display().
+      getSlots: vi.fn().mockReturnValue([mockSlot]),
       addEventListener: vi.fn(),
       refresh: vi.fn(() => {
         flagDuringRefresh = (window as TestWindow).tsjs!.adInitRefreshInProgress;

@@ -392,8 +392,14 @@ export function installTsAdInit(): void {
       // Slots TS defined itself — tracked for SPA destroy. Publisher-owned
       // slots are reused but never destroyed by TS on navigation.
       const newSlots: GoogleTagSlot[] = [];
-      // All slots to refresh (TS-defined + publisher-owned reused).
+      // Publisher-owned slots TS reused — refreshed to pick up server-side
+      // targeting. The publisher already display()ed these.
       const slotsToRefresh: GoogleTagSlot[] = [];
+      // Element IDs of slots TS defined itself this call. GPT requires a
+      // display() call to register/render a freshly-defined slot; refresh()
+      // alone no-ops for a slot that was never displayed, so these are
+      // display()ed instead of refreshed.
+      const slotsToDisplay: string[] = [];
       const divToSlotId: Record<string, string> = {};
       const prevSlotTargetingKeys = ts.prevSlotTargetingKeys ?? {};
       const nextSlotTargetingKeys: Record<string, string[]> = {};
@@ -468,8 +474,12 @@ export function installTsAdInit(): void {
         const slotTargetingKeys = Object.keys(slot.targeting ?? {});
         nextSlotTargetingKeys[actualDivId] = slotTargetingKeys;
         if (slotDivId2 !== actualDivId) nextSlotTargetingKeys[slotDivId2] = slotTargetingKeys;
-        if (tsOwned) newSlots.push(gptSlot);
-        slotsToRefresh.push(gptSlot);
+        if (tsOwned) {
+          newSlots.push(gptSlot);
+          slotsToDisplay.push(slotDivId2);
+        } else {
+          slotsToRefresh.push(gptSlot);
+        }
 
         // APS: signal to apstag that bids are ready so Amazon's GAM creative
         // can render.  apstag must already be initialised on the page (which it
@@ -507,12 +517,20 @@ export function installTsAdInit(): void {
         });
       }
 
+      // Register and render TS-defined slots. GPT requires display() for a
+      // freshly-defined slot — without it the slot no-ops ("defineSlot was
+      // called without a matching display call") and misses its impression.
+      // Must run after enableServices(); on SPA navigation services are already
+      // enabled, so this runs unconditionally for any newly-defined slots.
+      slotsToDisplay.forEach((divId) => g.display?.(divId));
+
       if (slotsToRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
-        // server-side targeting to GAM. If slim-Prebid has wrapped refresh(),
-        // it must pass this call straight through — not clear the targeting
-        // and run a duplicate client-side auction. Later publisher-initiated
-        // refreshes of the same slots still go through the wrapper normally.
+        // server-side targeting to GAM for reused publisher-owned slots. If
+        // slim-Prebid has wrapped refresh(), it must pass this call straight
+        // through — not clear the targeting and run a duplicate client-side
+        // auction. Later publisher-initiated refreshes of the same slots still
+        // go through the wrapper normally.
         ts.adInitRefreshInProgress = true;
         try {
           g.pubads!().refresh(slotsToRefresh);
