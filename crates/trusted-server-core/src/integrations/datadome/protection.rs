@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
@@ -28,15 +26,10 @@ const HEADER_DATADOME_CLIENT_ID: &str = "x-datadome-clientid";
 const HEADER_DATADOME_X_SET_COOKIE: &str = "x-datadome-x-set-cookie";
 const DATADOME_COOKIE_NAME: &str = "datadome";
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-struct DataDomeServerSideKeyCacheKey {
-    secret_store: String,
-    secret_name: String,
+enum ProtectionRequestError {
+    Setup(Report<TrustedServerError>),
+    Runtime(Report<TrustedServerError>),
 }
-
-static DATADOME_SERVER_SIDE_KEY_CACHE: LazyLock<
-    Mutex<HashMap<DataDomeServerSideKeyCacheKey, Arc<Redacted<String>>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl DataDomeIntegration {
     pub(super) async fn filter_protection_request(
@@ -49,7 +42,11 @@ impl DataDomeIntegration {
 
         match self.filter_protection_request_inner(input).await {
             Ok(decision) => decision,
-            Err(err) => {
+            Err(ProtectionRequestError::Setup(err)) => {
+                log::error!("[datadome] Protection setup failed open: {err:?}");
+                RequestFilterDecision::Continue(RequestFilterEffects::default())
+            }
+            Err(ProtectionRequestError::Runtime(err)) => {
                 log::warn!("[datadome] Protection API failed open: {err:?}");
                 RequestFilterDecision::Continue(RequestFilterEffects::default())
             }
@@ -59,11 +56,15 @@ impl DataDomeIntegration {
     async fn filter_protection_request_inner(
         &self,
         input: RequestFilterInput<'_>,
-    ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+    ) -> Result<RequestFilterDecision, ProtectionRequestError> {
         let api_url = self.protection_validate_url();
-        let backend_name = self.ensure_protection_backend(input.services, &api_url)?;
-        let server_side_key = self.load_server_side_key(input.services)?;
-        let payload = self.build_protection_payload(&input, server_side_key.as_ref());
+        let backend_name = self
+            .ensure_protection_backend(input.services, &api_url)
+            .map_err(ProtectionRequestError::Setup)?;
+        let server_side_key = self
+            .load_server_side_key(input.services)
+            .map_err(ProtectionRequestError::Setup)?;
+        let payload = self.build_protection_payload(&input, &server_side_key);
         let encoded_body = form_encode(&payload.fields);
 
         let mut builder = request_builder()
@@ -86,14 +87,16 @@ impl DataDomeIntegration {
             .body(EdgeBody::from(encoded_body))
             .change_context(Self::error(
                 "Failed to build DataDome Protection API request",
-            ))?;
+            ))
+            .map_err(ProtectionRequestError::Runtime)?;
 
         let platform_response = input
             .services
             .http_client()
             .send(PlatformHttpRequest::new(request, backend_name))
             .await
-            .change_context(Self::error("Failed to call DataDome Protection API"))?;
+            .change_context(Self::error("Failed to call DataDome Protection API"))
+            .map_err(ProtectionRequestError::Runtime)?;
 
         Ok(self.classify_protection_response(platform_response.response, input.request.method()))
     }
@@ -165,17 +168,7 @@ impl DataDomeIntegration {
     fn load_server_side_key(
         &self,
         services: &RuntimeServices,
-    ) -> Result<Arc<Redacted<String>>, Report<TrustedServerError>> {
-        let cache_key = server_side_key_cache_key(self);
-        if let Some(key) = DATADOME_SERVER_SIDE_KEY_CACHE
-            .lock()
-            .expect("should lock DataDome server-side key cache")
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(key);
-        }
-
+    ) -> Result<Redacted<String>, Report<TrustedServerError>> {
         let store_name = StoreName::from(self.config.server_side_key_secret_store.as_str());
         let key = services
             .secret_store()
@@ -190,11 +183,7 @@ impl DataDomeIntegration {
             )));
         }
 
-        let key = Arc::new(Redacted::new(key));
-        let mut cache = DATADOME_SERVER_SIDE_KEY_CACHE
-            .lock()
-            .expect("should lock DataDome server-side key cache");
-        Ok(Arc::clone(cache.entry(cache_key).or_insert(key)))
+        Ok(Redacted::new(key))
     }
 
     fn build_protection_payload(
@@ -426,21 +415,6 @@ struct ProtectionPayload {
     uses_header_client_id: bool,
 }
 
-fn server_side_key_cache_key(integration: &DataDomeIntegration) -> DataDomeServerSideKeyCacheKey {
-    DataDomeServerSideKeyCacheKey {
-        secret_store: integration.config.server_side_key_secret_store.clone(),
-        secret_name: integration.config.server_side_key_secret_name.clone(),
-    }
-}
-
-#[cfg(test)]
-fn clear_datadome_server_side_key_cache_for_tests() {
-    DATADOME_SERVER_SIDE_KEY_CACHE
-        .lock()
-        .expect("should lock DataDome server-side key cache")
-        .clear();
-}
-
 fn is_internal_path(path: &str) -> bool {
     path.starts_with("/static/tsjs=")
         || path.starts_with("/integrations/")
@@ -668,6 +642,7 @@ fn truncate_utf8(value: &str, limit: i32) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use crate::integrations::datadome::DataDomeConfig;
     use crate::platform::test_support::{
@@ -687,7 +662,6 @@ mod tests {
 
     #[test]
     fn load_server_side_key_reads_secret_store() {
-        clear_datadome_server_side_key_cache_for_tests();
         let mut secrets = HashMap::new();
         secrets.insert(
             "datadome_server_side_key".to_string(),
@@ -708,7 +682,6 @@ mod tests {
 
     #[test]
     fn load_server_side_key_errors_when_secret_missing() {
-        clear_datadome_server_side_key_cache_for_tests();
         let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
         let config = DataDomeConfig {
             enabled: true,
@@ -784,6 +757,57 @@ mod tests {
             response.into_body().into_bytes().as_ref(),
             b"",
             "HEAD challenges should not include a response body"
+        );
+    }
+
+    #[test]
+    fn classify_redirect_challenge_preserves_location_as_response_effect() {
+        let integration = protection_integration();
+        let response = edgezero_core::http::response_builder()
+            .status(StatusCode::FOUND)
+            .header(HEADER_DATADOME_RESPONSE, "302")
+            .header(HEADER_DATADOME_HEADERS, "Location")
+            .header(header::LOCATION, "/challenge")
+            .body(EdgeBody::empty())
+            .expect("should build DataDome redirect response");
+
+        let decision = integration.classify_protection_response(response, &Method::GET);
+
+        let RequestFilterDecision::Respond { response, effects } = decision else {
+            panic!("should return a redirect challenge response");
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "should preserve redirect status"
+        );
+        assert_eq!(
+            effects.response_headers,
+            vec![HeaderMutation::set("location", "/challenge")],
+            "should carry Location through response effects"
+        );
+    }
+
+    #[test]
+    fn classify_ok_response_preserves_request_header_effects() {
+        let integration = protection_integration();
+        let response = edgezero_core::http::response_builder()
+            .status(StatusCode::OK)
+            .header(HEADER_DATADOME_RESPONSE, "200")
+            .header(HEADER_DATADOME_REQUEST_HEADERS, "X-DataDome-ClientID")
+            .header(HEADER_DATADOME_CLIENT_ID, "client-123")
+            .body(EdgeBody::empty())
+            .expect("should build DataDome allow response");
+
+        let decision = integration.classify_protection_response(response, &Method::GET);
+
+        let RequestFilterDecision::Continue(effects) = decision else {
+            panic!("should continue with request header effects");
+        };
+        assert_eq!(
+            effects.request_headers,
+            vec![HeaderMutation::set(HEADER_DATADOME_CLIENT_ID, "client-123")],
+            "should carry requested upstream headers through effects"
         );
     }
 

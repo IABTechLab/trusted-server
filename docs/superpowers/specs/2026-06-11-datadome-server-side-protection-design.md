@@ -574,9 +574,11 @@ client-side tag:
 
 Rust implementation requirements:
 
-- Serialize `client_side_key`, `client_side_configuration`, and
-  `client_side_tag_url` with `serde_json`.
-- Escape `</` as `<\/` before inserting into a script tag.
+- Serialize `client_side_key` and `client_side_configuration` with
+  `serde_json`.
+- Escape `</` as `<\/` before inserting values into a script tag.
+- Validate `client_side_tag_url` as root-relative or HTTPS, then HTML-escape it
+  before inserting it into the script `src` attribute.
 - Use the first-party DataDome tag URL by default.
 - Provide `inject_client_side_tag = false` for publishers that already manage
   the tag themselves.

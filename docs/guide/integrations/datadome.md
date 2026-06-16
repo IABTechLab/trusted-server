@@ -89,7 +89,7 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `enable_graphql_support`               | boolean | `false`                          | Reserved for future GraphQL body inspection; ignored in v1              |
 | `client_side_key`                      | string  | `""`                             | DataDome client-side JavaScript key used for tag injection              |
 | `inject_client_side_tag`               | boolean | `true`                           | Auto-inject the browser tag when `client_side_key` is non-empty         |
-| `client_side_tag_url`                  | string  | `/integrations/datadome/tags.js` | Script URL used by auto-injection                                       |
+| `client_side_tag_url`                  | string  | `/integrations/datadome/tags.js` | Root-relative or HTTPS script URL used by auto-injection                |
 | `client_side_configuration`            | object  | `{ ajaxListenerPath = true }`    | Options assigned to `window.ddoptions`                                  |
 
 ## Client-side setup

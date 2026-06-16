@@ -286,6 +286,25 @@ fn default_client_side_configuration() -> JsonValue {
     serde_json::json!({ "ajaxListenerPath": true })
 }
 
+fn is_unsafe_client_side_tag_path_char(ch: char) -> bool {
+    ch.is_ascii_control() || ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`')
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
@@ -337,6 +356,7 @@ impl DataDomeIntegration {
             config.server_side_key_secret_store.trim().to_string();
         config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
         config.protection_api_origin = config.protection_api_origin.trim().to_string();
+        config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
 
         if config.enable_protection {
             if config.server_side_key_secret_store.is_empty()
@@ -347,6 +367,10 @@ impl DataDomeIntegration {
                 )));
             }
             Self::validate_protection_api_origin(&config.protection_api_origin)?;
+        }
+
+        if config.inject_client_side_tag {
+            Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
         }
 
         if config.enable_graphql_support {
@@ -387,6 +411,39 @@ impl DataDomeIntegration {
         {
             return Err(Report::new(Self::error(
                 "protection_api_origin must be an origin URL without path, query, or fragment",
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_client_side_tag_url(tag_url: &str) -> Result<(), Report<TrustedServerError>> {
+        if tag_url.starts_with('/') && !tag_url.starts_with("//") {
+            if tag_url.chars().any(is_unsafe_client_side_tag_path_char) {
+                return Err(Report::new(Self::error(
+                    "client_side_tag_url root-relative paths must not include unsafe characters",
+                )));
+            }
+            return Ok(());
+        }
+
+        let parsed = Url::parse(tag_url).map_err(|err| {
+            Report::new(Self::error(format!("Invalid client_side_tag_url: {err}")))
+        })?;
+
+        if !parsed.scheme().eq_ignore_ascii_case("https") {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must be root-relative or use https",
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must include a host when absolute",
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must not include credentials",
             )));
         }
 
@@ -719,12 +776,7 @@ impl IntegrationHeadInjector for DataDomeIntegration {
                 "\"\"".to_string()
             })
             .replace("</", "<\\/");
-        let tag_url = serde_json::to_string(&self.config.client_side_tag_url)
-            .unwrap_or_else(|err| {
-                log::warn!("[datadome] Failed to serialize client-side tag URL: {err}");
-                "\"/integrations/datadome/tags.js\"".to_string()
-            })
-            .replace("</", "<\\/");
+        let tag_url = escape_html_attribute(&self.config.client_side_tag_url);
         let options = serde_json::to_string(&self.config.client_side_configuration)
             .unwrap_or_else(|err| {
                 log::warn!("[datadome] Failed to serialize client-side configuration: {err}");
@@ -733,7 +785,7 @@ impl IntegrationHeadInjector for DataDomeIntegration {
             .replace("</", "<\\/");
 
         vec![format!(
-            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src={tag_url} async></script>"
+            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src=\"{tag_url}\" async></script>"
         )]
     }
 }
@@ -1113,6 +1165,57 @@ mod tests {
 
         DataDomeIntegration::try_new(config)
             .expect("should accept HTTPS origin URL with optional trailing slash");
+    }
+
+    #[test]
+    fn client_side_tag_url_requires_root_relative_or_https() {
+        for tag_url in [
+            "",
+            "tags.js",
+            "//example.com/tags.js",
+            "http://example.com/tags.js",
+            "/tags.js\" data-bad=\"1",
+        ] {
+            let mut config = test_config();
+            config.client_side_tag_url = tag_url.to_string();
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject unsafe client-side tag URL: {tag_url}"),
+                Err(err) => err,
+            };
+
+            assert!(
+                format!("{err:?}").contains("client_side_tag_url"),
+                "should explain rejected client-side tag URL {tag_url}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_side_tag_url_accepts_https_absolute_url() {
+        let mut config = test_config();
+        config.client_side_tag_url = "https://example.com/tags.js?version=1".to_string();
+
+        DataDomeIntegration::try_new(config).expect("should accept HTTPS client-side tag URL");
+    }
+
+    #[test]
+    fn head_injector_escapes_client_side_tag_url_attribute() {
+        let mut config = test_config();
+        config.client_side_key = "test-client-key".to_string();
+        config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
+        let integration = DataDomeIntegration::new(config);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert!(
+            inserts[0].contains(
+                "<script src=\"/integrations/datadome/tags.js?one=1&amp;two=2\" async></script>"
+            ),
+            "should HTML-escape the DataDome tag URL attribute"
+        );
     }
 
     #[test]
