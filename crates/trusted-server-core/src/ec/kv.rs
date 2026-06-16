@@ -105,7 +105,7 @@ fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) ->
 ///
 /// Methods use optimistic concurrency (generation markers) for safe
 /// read-modify-write operations on concurrent requests.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KvIdentityGraph {
     store_name: String,
 }

@@ -1787,6 +1787,19 @@ impl Settings {
             handler.prepare_runtime()?;
         }
 
+        for (name, value) in &self.response_headers {
+            http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid response header name: {name}"),
+                })
+            })?;
+            http::header::HeaderValue::from_str(value).map_err(|_| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid response header value for {name}"),
+                })
+            })?;
+        }
+
         Ok(())
     }
 

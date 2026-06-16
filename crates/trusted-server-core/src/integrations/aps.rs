@@ -2,9 +2,10 @@
 //!
 //! This module provides the APS auction provider for server-side bidding.
 
-use error_stack::{Report, ResultExt as _};
-use fastly::http::Method;
-use fastly::Request;
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::{header, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -15,6 +16,10 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::{
+    collect_response_bounded, ensure_integration_backend, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+};
+use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::IntegrationConfig;
 
 // ============================================================================
@@ -215,7 +220,7 @@ where
 
     struct PubIdVisitor;
 
-    impl Visitor<'_> for PubIdVisitor {
+    impl<'de> Visitor<'de> for PubIdVisitor {
         type Value = String;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -226,7 +231,7 @@ where
         where
             E: de::Error,
         {
-            Ok(value.to_owned())
+            Ok(value.to_string())
         }
 
         fn visit_string<E>(self, value: String) -> Result<String, E>
@@ -259,7 +264,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_endpoint() -> String {
-    "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned()
+    "https://aax.amazon-adsystem.com/e/dtb/bid".to_string()
 }
 
 fn default_timeout_ms() -> u32 {
@@ -388,19 +393,19 @@ impl ApsAuctionProvider {
         // Build metadata from targeting keys - includes encoded price for mediation
         let mut metadata = HashMap::new();
         if let Some(ref amzniid) = slot.amzniid {
-            metadata.insert("amzniid".to_owned(), json!(amzniid));
+            metadata.insert("amzniid".to_string(), json!(amzniid));
         }
         if let Some(ref amznbid) = slot.amznbid {
-            metadata.insert("amznbid".to_owned(), json!(amznbid));
+            metadata.insert("amznbid".to_string(), json!(amznbid));
         }
         if let Some(ref amznp) = slot.amznp {
-            metadata.insert("amznp".to_owned(), json!(amznp));
+            metadata.insert("amznp".to_string(), json!(amznp));
         }
         if let Some(ref amznsz) = slot.amznsz {
-            metadata.insert("amznsz".to_owned(), json!(amznsz));
+            metadata.insert("amznsz".to_string(), json!(amznsz));
         }
         if let Some(ref amznactt) = slot.amznactt {
-            metadata.insert("amznactt".to_owned(), json!(amznactt));
+            metadata.insert("amznactt".to_string(), json!(amznactt));
         }
 
         // APS doesn't return creative HTML - only targeting keys
@@ -409,10 +414,10 @@ impl ApsAuctionProvider {
         Ok(Bid {
             slot_id: slot.slot_id.clone(),
             price: None, // Encoded price in metadata, decoded by mediation
-            currency: "USD".to_owned(),
+            currency: "USD".to_string(),
             creative: None,
             adomain: None, // APS doesn't provide adomain in response
-            bidder: "amazon-aps".to_owned(),
+            bidder: "amazon-aps".to_string(),
             width,
             height,
             nurl: None, // Real APS uses client-side event tracking
@@ -451,7 +456,7 @@ impl ApsAuctionProvider {
                         );
                         bids.push(bid);
                     }
-                    Err(()) => {
+                    Err(_) => {
                         log::debug!("APS: skipped slot (no fill or invalid)");
                     }
                 }
@@ -468,16 +473,17 @@ impl ApsAuctionProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl AuctionProvider for ApsAuctionProvider {
     fn provider_name(&self) -> &'static str {
         "aps"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         log::info!(
             "APS: requesting bids for {} slots (pub_id: {})",
             request.slots.len(),
@@ -490,62 +496,70 @@ impl AuctionProvider for ApsAuctionProvider {
         // Serialize to JSON
         let aps_json =
             serde_json::to_value(&aps_request).change_context(TrustedServerError::Auction {
-                message: "Failed to serialize APS bid request".to_owned(),
+                message: "Failed to serialize APS bid request".to_string(),
             })?;
 
-        log::trace!("APS: sending bid request: {aps_json:?}");
+        log::trace!("APS: sending bid request: {:?}", aps_json);
 
         // Create HTTP POST request
-        let mut aps_req = Request::new(Method::POST, &self.config.endpoint);
-
-        aps_req
-            .set_body_json(&aps_json)
+        let aps_body =
+            serde_json::to_vec(&aps_json).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize APS request body".to_string(),
+            })?;
+        let aps_req = http::Request::builder()
+            .method(Method::POST)
+            .uri(&self.config.endpoint)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(aps_body))
             .change_context(TrustedServerError::Auction {
-                message: "Failed to set APS request body".to_owned(),
+                message: "Failed to build APS request".to_string(),
             })?;
 
-        // Send request asynchronously with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend(
+            context.services,
             &self.config.endpoint,
-            true,
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for APS endpoint: {}",
-                self.config.endpoint
-            ),
-        })?;
+            "aps",
+            Some(Duration::from_millis(u64::from(context.timeout_ms))),
+        )?;
 
-        let pending =
-            aps_req
-                .send_async(backend_name)
-                .change_context(TrustedServerError::Auction {
-                    message: "Failed to send async request to APS".to_owned(),
-                })?;
+        let pending = context
+            .services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(aps_req, backend_name))
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to send async request to APS".to_string(),
+            })?;
 
         Ok(pending)
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let response = response.response;
+
         // Check status code
-        if !response.get_status().is_success() {
-            log::warn!("APS returned non-success status: {}", response.get_status());
+        if !response.status().is_success() {
+            log::warn!("APS returned non-success status: {}", response.status());
             return Ok(AuctionResponse::error("aps", response_time_ms));
         }
 
-        // Parse response body
-        let body_bytes = response.take_body_bytes();
+        // Parse response body — collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes =
+            collect_response_bounded(response.into_body(), UPSTREAM_RTB_MAX_RESPONSE_BYTES, "aps")
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Failed to read APS response body".to_string(),
+                })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse APS response JSON".to_owned(),
+                message: "Failed to parse APS response JSON".to_string(),
             })?;
 
-        log::trace!("APS: received response: {response_json:?}");
+        log::trace!("APS: received response: {:?}", response_json);
 
         // Transform to unified format
         let auction_response = self.parse_aps_response(&response_json, response_time_ms);
@@ -640,10 +654,10 @@ mod tests {
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
-            id: "test-auction-123".to_owned(),
+            id: "test-auction-123".to_string(),
             slots: vec![
                 AdSlot {
-                    id: "header-banner".to_owned(),
+                    id: "header-banner".to_string(),
                     formats: vec![
                         AdFormat {
                             media_type: MediaType::Banner,
@@ -661,7 +675,7 @@ mod tests {
                     bidders: HashMap::new(),
                 },
                 AdSlot {
-                    id: "sidebar".to_owned(),
+                    id: "sidebar".to_string(),
                     formats: vec![AdFormat {
                         media_type: MediaType::Banner,
                         width: 300,
@@ -673,17 +687,17 @@ mod tests {
                 },
             ],
             publisher: PublisherInfo {
-                domain: "test.com".to_owned(),
-                page_url: Some("https://test.com/article".to_owned()),
+                domain: "test.com".to_string(),
+                page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: Some("user-123".to_owned()),
+                id: Some("user-123".to_string()),
                 consent: None,
                 eids: None,
             },
             device: Some(DeviceInfo {
-                user_agent: Some("Mozilla/5.0".to_owned()),
-                ip: Some("192.168.1.1".to_owned()),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                ip: Some("192.168.1.1".to_string()),
                 geo: None,
             }),
             site: None,
@@ -695,8 +709,8 @@ mod tests {
     fn test_aps_request_transformation() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
@@ -709,9 +723,9 @@ mod tests {
         assert_eq!(aps_request.slots.len(), 2);
         assert_eq!(
             aps_request.page_url,
-            Some("https://test.com/article".to_owned())
+            Some("https://test.com/article".to_string())
         );
-        assert_eq!(aps_request.user_agent, Some("Mozilla/5.0".to_owned()));
+        assert_eq!(aps_request.user_agent, Some("Mozilla/5.0".to_string()));
         assert_eq!(aps_request.timeout, Some(800));
 
         // Verify first slot
@@ -732,8 +746,8 @@ mod tests {
     fn test_aps_response_parsing_success() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
@@ -813,8 +827,8 @@ mod tests {
     fn test_aps_response_parsing_no_bid() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
@@ -839,8 +853,8 @@ mod tests {
     fn test_aps_response_parsing_invalid_bids() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
@@ -881,26 +895,26 @@ mod tests {
     fn test_aps_slot_parsing() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
         let provider = ApsAuctionProvider::new(config);
 
         let aps_slot = ApsSlotResponse {
-            slot_id: "test-slot".to_owned(),
-            size: "728x90".to_owned(),
-            crid: Some("crid-123".to_owned()),
-            media_type: Some("d".to_owned()),
-            fif: Some("1".to_owned()),
-            targeting: vec!["amzniid".to_owned(), "amznbid".to_owned()],
-            meta: vec!["slotID".to_owned()],
-            amzniid: Some("impression-id-123".to_owned()),
-            amznbid: Some("1c7d4ow".to_owned()), // Encoded price (to be decoded by mediation)
-            amznp: Some("1c7d4ow".to_owned()),
-            amznsz: Some("728x90".to_owned()),
-            amznactt: Some("OPEN".to_owned()),
+            slot_id: "test-slot".to_string(),
+            size: "728x90".to_string(),
+            crid: Some("crid-123".to_string()),
+            media_type: Some("d".to_string()),
+            fif: Some("1".to_string()),
+            targeting: vec!["amzniid".to_string(), "amznbid".to_string()],
+            meta: vec!["slotID".to_string()],
+            amzniid: Some("impression-id-123".to_string()),
+            amznbid: Some("1c7d4ow".to_string()), // Encoded price (to be decoded by mediation)
+            amznp: Some("1c7d4ow".to_string()),
+            amznsz: Some("728x90".to_string()),
+            amznactt: Some("OPEN".to_string()),
         };
 
         let bid = provider
@@ -940,7 +954,7 @@ mod tests {
 
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
+            pub_id: "5128".to_string(),
             endpoint: default_endpoint(),
             timeout_ms: 800,
         };
@@ -948,10 +962,10 @@ mod tests {
 
         let mut request = create_test_auction_request();
         request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA".to_owned()),
+            raw_tc_string: Some("BOEFEAyOEFEAyAHABDENAI4AAAB9vABAASA".to_string()),
             gdpr_applies: true,
-            raw_us_privacy: Some("1YNN".to_owned()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_owned()),
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
             gpp_section_ids: Some(vec![2, 6]),
             ..Default::default()
         });
@@ -978,7 +992,7 @@ mod tests {
     fn test_aps_request_no_consent() {
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
+            pub_id: "5128".to_string(),
             endpoint: default_endpoint(),
             timeout_ms: 800,
         };
@@ -999,7 +1013,7 @@ mod tests {
 
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
+            pub_id: "5128".to_string(),
             endpoint: default_endpoint(),
             timeout_ms: 800,
         };
@@ -1007,7 +1021,7 @@ mod tests {
 
         let mut request = create_test_auction_request();
         request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOE".to_owned()),
+            raw_tc_string: Some("BOE".to_string()),
             gdpr_applies: true,
             ..Default::default()
         });
@@ -1032,26 +1046,26 @@ mod tests {
         // The creative will be generated by the mediation layer (e.g., GAM or ad server)
         let config = ApsConfig {
             enabled: true,
-            pub_id: "5128".to_owned(),
-            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_owned(),
+            pub_id: "5128".to_string(),
+            endpoint: "https://aax.amazon-adsystem.com/e/dtb/bid".to_string(),
             timeout_ms: 800,
         };
 
         let provider = ApsAuctionProvider::new(config);
 
         let aps_slot = ApsSlotResponse {
-            slot_id: "test-slot".to_owned(),
-            size: "300x250".to_owned(),
-            crid: Some("test-creative".to_owned()),
-            media_type: Some("d".to_owned()),
-            fif: Some("1".to_owned()),
-            targeting: vec!["amzniid".to_owned(), "amznbid".to_owned()],
-            meta: vec!["slotID".to_owned()],
-            amzniid: Some("imp-123".to_owned()),
-            amznbid: Some("encoded-price".to_owned()),
-            amznp: Some("encoded-price-alt".to_owned()),
-            amznsz: Some("300x250".to_owned()),
-            amznactt: Some("OPEN".to_owned()),
+            slot_id: "test-slot".to_string(),
+            size: "300x250".to_string(),
+            crid: Some("test-creative".to_string()),
+            media_type: Some("d".to_string()),
+            fif: Some("1".to_string()),
+            targeting: vec!["amzniid".to_string(), "amznbid".to_string()],
+            meta: vec!["slotID".to_string()],
+            amzniid: Some("imp-123".to_string()),
+            amznbid: Some("encoded-price".to_string()),
+            amznp: Some("encoded-price-alt".to_string()),
+            amznsz: Some("300x250".to_string()),
+            amznactt: Some("OPEN".to_string()),
         };
 
         let bid = provider.parse_aps_slot(&aps_slot).expect("should parse");

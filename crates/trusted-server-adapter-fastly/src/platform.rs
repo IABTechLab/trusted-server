@@ -12,7 +12,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
-use error_stack::{Report, ResultExt as _};
+use error_stack::{Report, ResultExt};
 use fastly::geo::geo_lookup;
 use fastly::{ConfigStore, Request, SecretStore};
 
@@ -307,7 +307,7 @@ fn edge_request_to_fastly(
 ) -> Result<fastly::Request, Report<PlatformError>> {
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
-    for (name, value) in &parts.headers {
+    for (name, value) in parts.headers.iter() {
         fastly_req.append_header(name.as_str(), value.as_bytes());
     }
     match body {
@@ -323,6 +323,15 @@ fn edge_request_to_fastly(
     }
     Ok(fastly_req)
 }
+
+/// Maximum origin response body size copied into WASM heap.
+///
+/// `take_body_bytes()` copies the full origin response into a single
+/// allocation.  This cap prevents oversized origin responses from exhausting
+/// the WASM address space.  The Content-Length pre-check avoids the copy
+/// entirely for responses that declare their size.  Streaming response support
+/// will remove this limit in PR 15.
+const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
     let stream = futures::stream::unfold(Some(body), |state| async move {
@@ -347,6 +356,24 @@ fn fastly_response_to_platform(
     backend_name: impl Into<String>,
     stream_response: bool,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
+    // Pre-flight: reject oversized responses before copying bytes into WASM heap.
+    // Content-Length is advisory but covers most origin responses; chunked
+    // responses without it fall through to the post-materialization check below.
+    if !stream_response {
+        if let Some(claimed_len) = resp
+            .get_header("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+                return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "origin Content-Length {claimed_len} exceeds \
+                     {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+                )));
+            }
+        }
+    }
+
     let status = resp.get_status();
     let mut builder = edgezero_core::http::response_builder().status(status);
     for (name, value) in resp.get_headers() {
@@ -355,7 +382,18 @@ fn fastly_response_to_platform(
     let body = if stream_response {
         fastly_body_to_edge_stream(resp.take_body())
     } else {
-        edgezero_core::body::Body::from(resp.take_body_bytes())
+        let body_bytes = resp.take_body_bytes();
+
+        // Belt-and-suspenders: catches chunked responses without Content-Length.
+        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin response body {} bytes exceeds \
+                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
+                body_bytes.len()
+            )));
+        }
+
+        edgezero_core::body::Body::from(body_bytes)
     };
     let edge_response = builder
         .body(body)
@@ -453,7 +491,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             .map(PlatformPendingRequest::new)
             .collect();
 
-        let ready = match result {
+        let (ready, failed_backend_name) = match result {
             Ok(fastly_resp) => {
                 let backend_name = fastly_resp
                     .get_backend_name()
@@ -462,15 +500,27 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                         ""
                     })
                     .to_string();
-                fastly_response_to_platform(fastly_resp, backend_name, false)
+                (
+                    fastly_response_to_platform(fastly_resp, backend_name, false),
+                    None,
+                )
             }
             Err(e) => {
-                Err(Report::new(PlatformError::HttpClient)
-                    .attach(format!("fastly select error: {e}")))
+                let failed_name = e.backend_name().to_string();
+                (
+                    Err(Report::new(PlatformError::HttpClient).attach(format!(
+                        "fastly select error for backend '{failed_name}': {e}"
+                    ))),
+                    Some(failed_name),
+                )
             }
         };
 
-        Ok(PlatformSelectResult { ready, remaining })
+        Ok(PlatformSelectResult {
+            ready,
+            remaining,
+            failed_backend_name,
+        })
     }
 }
 
@@ -519,12 +569,8 @@ pub fn build_runtime_services(
         .geo(Arc::new(FastlyPlatformGeo))
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_owned),
-            tls_cipher: req
-                .get_tls_cipher_openssl_name()
-                .ok()
-                .flatten()
-                .map(str::to_owned),
+            tls_protocol: req.get_tls_protocol().map(str::to_string),
+            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
         })
         .build()
 }
@@ -535,10 +581,7 @@ pub fn build_runtime_services(
 ///
 /// Returns [`KvError::Unavailable`] when the store does not exist, or
 /// [`KvError::Internal`] when the Fastly SDK fails to open it.
-#[allow(
-    dead_code,
-    reason = "helper is retained for direct KV-store construction in adapter tests"
-)]
+#[allow(dead_code)]
 pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
     FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
@@ -569,8 +612,8 @@ mod tests {
     fn predict_name_produces_same_name_as_backend_config() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_owned(),
-            host: "origin.example.com".to_owned(),
+            scheme: "https".to_string(),
+            host: "origin.example.com".to_string(),
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
@@ -590,8 +633,8 @@ mod tests {
     fn predict_name_includes_nocert_suffix_when_cert_check_disabled() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_owned(),
-            host: "origin.example.com".to_owned(),
+            scheme: "https".to_string(),
+            host: "origin.example.com".to_string(),
             port: None,
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
@@ -611,7 +654,7 @@ mod tests {
     fn predict_name_returns_error_for_empty_host() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_owned(),
+            scheme: "https".to_string(),
             host: String::new(),
             port: None,
             certificate_check: true,
@@ -627,11 +670,11 @@ mod tests {
     fn predict_name_encodes_custom_timeout() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
-            scheme: "https".to_owned(),
-            host: "origin.example.com".to_owned(),
+            scheme: "https".to_string(),
+            host: "origin.example.com".to_string(),
             port: None,
             certificate_check: true,
-            first_byte_timeout: Duration::from_secs(2),
+            first_byte_timeout: Duration::from_millis(2000),
         };
 
         let name = backend
@@ -733,7 +776,7 @@ mod tests {
     fn fastly_platform_http_client_select_returns_error_for_wrong_inner_type() {
         let client = FastlyPlatformHttpClient;
         // Wrap a non-PendingRequest type to trigger the downcast failure.
-        let wrong = PlatformPendingRequest::new(42_u32).with_backend_name("origin-a");
+        let wrong = PlatformPendingRequest::new(42u32).with_backend_name("origin-a");
         let err = futures::executor::block_on(client.select(vec![wrong]))
             .expect_err("should return error for wrong inner type");
 

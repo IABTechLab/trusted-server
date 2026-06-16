@@ -34,12 +34,12 @@ config = "0.15.19"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "e78871407057c392d78fa4a0bcec5e4ca8ba80b5", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "e78871407057c392d78fa4a0bcec5e4ca8ba80b5", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "e78871407057c392d78fa4a0bcec5e4ca8ba80b5", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "e78871407057c392d78fa4a0bcec5e4ca8ba80b5", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
 error-stack = "0.6"
-fastly = "0.12"
+fastly = "0.11.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
@@ -49,7 +49,7 @@ http = "1.4.0"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
 log = "0.4.29"
-log-fastly = "0.12"
+log-fastly = "0.11.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
@@ -71,127 +71,23 @@ which = "8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.clippy]
-# Match EdgeZero's strict lint posture from stackpop/edgezero#257: keep
-# pedantic visible, deny restriction by default, and require every broad allow
-# to carry a workspace-level rationale.
-pedantic = { level = "warn", priority = -1 }
-restriction = { level = "deny", priority = -1 }
+# Correctness - Force explicit error handling in production code
+unwrap_used = "deny"
+expect_used = "allow"  # Allow expect with context message
+panic = "deny"
 
-# Meta - required when enabling `restriction` as a group.
-blanket_clippy_restriction_lints = "allow"
-# Local allows are permitted when they carry a reason; reasonless allows remain
-# denied by `allow_attributes_without_reason`.
-allow_attributes = "allow"
-
-# Documentation - private items don't need full docs.
-missing_docs_in_private_items = "allow"
-# Rust 1.95's restriction group requires every doc paragraph to end with
-# punctuation. Existing field docs often use concise noun phrases; changing all
-# of them is broad documentation churn unrelated to the EdgeZero tool sync.
-doc_paragraphs_missing_punctuation = "allow"
-
-# Style / formatting - match idiomatic Rust conventions.
-implicit_return = "allow"
-question_mark_used = "allow"
-single_call_fn = "allow"
-separated_literal_suffix = "allow"
-# `pub_with_shorthand` flags `pub(crate)` and suggests `pub(in crate)`, but
-# rustfmt rewrites `pub(in crate)` back to `pub(crate)`.
-pub_with_shorthand = "allow"
-# Existing tests and small parsing helpers use short local names per Rust
-# convention; renaming all of them creates churn without improving behavior.
-min_ident_chars = "allow"
-single_char_lifetime_names = "allow"
-str_to_string = "allow"
-
-# Existing module/test organization is intentionally conventional for this
-# codebase. Moving every `mod.rs`, alphabetizing every item, and renaming every
-# `test_*` function would be broad churn unrelated to the EdgeZero sync.
-arbitrary_source_item_ordering = "allow"
-mod_module_files = "allow"
-redundant_test_prefix = "allow"
-
-# Imports / paths - this workspace targets std-enabled Fastly Compute code.
-std_instead_of_alloc = "allow"
-std_instead_of_core = "allow"
-absolute_paths = "allow"
-
-# API design - broad generated/public names are intentional in this workspace;
-# reduce this by localizing allows where practical during cleanup.
-exhaustive_enums = "allow"
-exhaustive_structs = "allow"
-field_scoped_visibility_modifiers = "allow"
-impl_trait_in_params = "allow"
-missing_inline_in_public_items = "allow"
-missing_trait_methods = "allow"
+# Style
 module_name_repetitions = "allow"
-multiple_inherent_impl = "allow"
-partial_pub_fields = "allow"
-pub_use = "allow"
-return_self_not_must_use = "allow"
-same_name_method = "allow"
-struct_excessive_bools = "allow"
-trivially_copy_pass_by_ref = "allow"
-unused_self = "allow"
+must_use_candidate = "warn"
 
-# Pattern style - mutually exclusive with `ref_patterns`; use match ergonomics.
-pattern_type_mismatch = "allow"
-ref_patterns = "allow"
+# Pedantic (selective)
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+needless_pass_by_value = "warn"  # Encourage borrowing over ownership
+redundant_closure_for_method_calls = "warn"
 
-# Defensive-coding restriction lints that are noisy in parsing, streaming, test,
-# and benchmark code. Keep them visible as local cleanup candidates rather than
-# blocking the EdgeZero dependency sync on whole-workspace rewrites.
-arithmetic_side_effects = "allow"
-as_conversions = "allow"
-case_sensitive_file_extension_comparisons = "allow"
-clone_on_ref_ptr = "allow"
-default_numeric_fallback = "allow"
-decimal_literal_representation = "allow"
-else_if_without_else = "allow"
-expect_used = "allow"
-format_push_string = "allow"
-implicit_hasher = "allow"
-indexing_slicing = "allow"
-integer_division = "allow"
-integer_division_remainder_used = "allow"
-iter_over_hash_type = "allow"
-items_after_statements = "allow"
-let_underscore_must_use = "allow"
-let_underscore_untyped = "allow"
-map_err_ignore = "allow"
-map_with_unused_argument_over_ranges = "allow"
-missing_assert_message = "allow"
-missing_fields_in_debug = "allow"
-semicolon_outside_block = "allow"
-string_add = "allow"
-string_slice = "allow"
-too_many_lines = "allow"
-unnecessary_safety_comment = "allow"
-unnecessary_wraps = "allow"
-unwrap_in_result = "allow"
-use_debug = "allow"
-wildcard_enum_match_arm = "allow"
-
-# Naming and literal style that is frequently intentional in tests and protocol
-# fixtures.
-non_ascii_literal = "allow"
-shadow_reuse = "allow"
-shadow_same = "allow"
-shadow_unrelated = "allow"
-similar_names = "allow"
-used_underscore_binding = "allow"
-
-# Async function shapes are dictated by handler traits and future extension
-# points even when some implementations do not currently await.
-unused_async = "allow"
-
-# Some docs intentionally show JSON/string examples rather than intra-doc links.
-doc_link_with_quotes = "allow"
-
-# Trait implementations sometimes use domain-specific parameter names that are
-# clearer than the trait's placeholder names.
-renamed_function_params = "allow"
-
-# Narrow casts remain at audited call sites where values are bounded by protocol,
-# platform, or current-time invariants.
-cast_possible_truncation = "allow"
+# Restriction (selective)
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"

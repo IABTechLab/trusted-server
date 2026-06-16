@@ -1,11 +1,13 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead as _, aead::KeyInit as _, XChaCha20Poly1305, XNonce};
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::{header, Request, Response, StatusCode};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
+use crate::error::TrustedServerError;
 use crate::platform::ClientInfo;
 use crate::settings::Settings;
 
@@ -436,6 +438,27 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
         .expect("decode must succeed for just-encoded data");
     let digest = Sha256::digest(&raw);
     URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Return an error if `bytes` exceeds `limit`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::RequestTooLarge`] when `bytes.len() > limit`.
+pub fn enforce_max_body_size(
+    bytes: &[u8],
+    limit: usize,
+    what: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if bytes.len() > limit {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "{what} payload {} exceeds limit of {limit} bytes",
+                bytes.len()
+            ),
+        }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

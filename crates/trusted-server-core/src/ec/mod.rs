@@ -135,7 +135,7 @@ pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<Trusted
 /// Created via [`read_from_request`](Self::read_from_request) during
 /// pre-routing, then optionally mutated by
 /// [`generate_if_needed`](Self::generate_if_needed) in organic handlers.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct EcContext {
     /// The EC ID value, if one exists (from request) or was generated.
     ec_value: Option<String>,
@@ -295,6 +295,9 @@ impl EcContext {
                 );
                 self.ec_value = None;
                 self.ec_generated = false;
+                return Err(err.change_context(TrustedServerError::EdgeCookie {
+                    message: "Failed to persist generated EC ID to KV identity graph".to_string(),
+                }));
             }
         }
 

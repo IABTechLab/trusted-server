@@ -35,6 +35,20 @@ fn build_http_request(req: &fastly::Request, body: EdgeBody) -> http::Request<Ed
         .expect("should build http request from fastly request")
 }
 
+/// Convert an owned `fastly::Request` into an `http::Request<EdgeBody>`.
+///
+/// # PR 15 removal target
+///
+/// # Panics
+///
+/// Does not panic in practice — URL parse failure falls back to `"/"` (logged
+/// as a warning), and the subsequent `builder.body()` cannot fail given a valid
+/// method and URI. Listed here only because clippy cannot prove it statically.
+pub fn from_fastly_request(mut req: fastly::Request) -> http::Request<EdgeBody> {
+    let body = EdgeBody::from(req.take_body_bytes());
+    build_http_request(&req, body)
+}
+
 /// Convert a borrowed `fastly::Request` into an `http::Request<EdgeBody>` for reading.
 ///
 /// Headers are copied; the body is empty.
@@ -50,6 +64,70 @@ pub fn from_fastly_headers_ref(req: &fastly::Request) -> http::Request<EdgeBody>
     build_http_request(req, EdgeBody::empty())
 }
 
+/// Convert an `http::Request<EdgeBody>` into a `fastly::Request`.
+///
+/// # PR 15 removal target
+pub fn to_fastly_request(req: http::Request<EdgeBody>) -> fastly::Request {
+    let (parts, body) = req.into_parts();
+    let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
+    for (name, value) in &parts.headers {
+        fastly_req.append_header(name.as_str(), value.as_bytes());
+    }
+
+    match body {
+        EdgeBody::Once(bytes) => {
+            if !bytes.is_empty() {
+                // bytes.to_vec() is an O(N) copy at the compat boundary; goes away in PR 15.
+                fastly_req.set_body(bytes.to_vec());
+            }
+        }
+        EdgeBody::Stream(_) => {
+            // Audited call sites: only integration proxy routes, which always carry buffered
+            // Once bodies from from_fastly_request.  No streaming body reaches this path today.
+            log::warn!("streaming body in compat::to_fastly_request; body will be empty");
+        }
+    }
+
+    fastly_req
+}
+
+/// Convert a borrowed `http::Request<EdgeBody>` into a `fastly::Request`.
+///
+/// Headers, method, and URI are copied; the body is always empty. This function
+/// requires that the caller has already consumed or discarded the body — passing
+/// a request with a non-empty body is a caller error: the body bytes will be
+/// silently lost with no warning or panic.
+///
+/// # PR 15 removal target
+pub fn to_fastly_request_ref(req: &http::Request<EdgeBody>) -> fastly::Request {
+    let mut fastly_req = fastly::Request::new(req.method().clone(), req.uri().to_string());
+    for (name, value) in req.headers() {
+        fastly_req.append_header(name.as_str(), value.as_bytes());
+    }
+
+    fastly_req
+}
+
+/// Convert a `fastly::Response` into an `http::Response<EdgeBody>`.
+///
+/// # PR 15 removal target
+///
+/// # Panics
+///
+/// Panics if the copied Fastly response parts cannot form a valid
+/// `http::Response`.
+pub fn from_fastly_response(mut resp: fastly::Response) -> http::Response<EdgeBody> {
+    let status = resp.get_status();
+    let mut builder = http::Response::builder().status(status);
+    for (name, value) in resp.get_headers() {
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    builder
+        .body(EdgeBody::from(resp.take_body_bytes()))
+        .expect("should build http response from fastly response")
+}
+
 /// Convert an `http::Response<EdgeBody>` into a `fastly::Response`.
 ///
 /// # PR 15 removal target
@@ -60,17 +138,17 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
         fastly_resp.append_header(name.as_str(), value.as_bytes());
     }
 
-    debug_assert!(
-        matches!(&body, EdgeBody::Once(_)),
-        "streaming body passed to compat::to_fastly_response will be silently truncated"
-    );
     match body {
         EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
-                fastly_resp.set_body(bytes.as_ref());
+                // bytes.to_vec() is an O(N) copy at the compat boundary; goes away in PR 15.
+                fastly_resp.set_body(bytes.to_vec());
             }
         }
         EdgeBody::Stream(_) => {
+            // Audited call sites: streaming publisher bodies are dispatched via
+            // to_fastly_response_skeleton + stream_to_client before reaching here.
+            // No streaming body reaches to_fastly_response in the current adapter.
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }
@@ -78,13 +156,41 @@ pub fn to_fastly_response(resp: http::Response<EdgeBody>) -> fastly::Response {
     fastly_resp
 }
 
-/// Sanitize forwarded headers on a `fastly::Request`.
+/// Convert an `http::Response<EdgeBody>` into a `fastly::Response` with headers only.
+///
+/// Body is discarded — use when the caller will stream the body separately via
+/// [`fastly::Response::stream_to_client`]. Audited call sites: only the streaming
+/// publisher dispatch path in the adapter, which streams the body directly to the
+/// client via [`crate::publisher::stream_publisher_body`]. (Removal target: PR 15.)
+///
+/// # PR 15 removal target
+pub fn to_fastly_response_skeleton(resp: http::Response<EdgeBody>) -> fastly::Response {
+    let (parts, _body) = resp.into_parts();
+    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
+    for (name, value) in &parts.headers {
+        fastly_resp.append_header(name.as_str(), value.as_bytes());
+    }
+    fastly_resp
+}
+
+/// Sanitize forwarded and internal headers on a `fastly::Request`.
+///
+/// Strips spoofable forwarded headers (X-Forwarded-Host etc.) and TS-internal
+/// identity headers (x-ts-ec, x-ts-eids, …) that clients must not be able to
+/// inject.  Both sets are stripped at the edge entry point, before any
+/// request-derived context is built or the request is converted to http types.
 ///
 /// # PR 15 removal target
 pub fn sanitize_fastly_forwarded_headers(req: &mut fastly::Request) {
     for &name in SPOOFABLE_FORWARDED_HEADERS {
         if req.get_header(name).is_some() {
             log::debug!("Stripped spoofable header: {name}");
+            req.remove_header(name);
+        }
+    }
+    for &name in crate::constants::INTERNAL_HEADERS {
+        if req.get_header(name).is_some() {
+            log::debug!("Stripped inbound internal header: {name}");
             req.remove_header(name);
         }
     }
@@ -218,6 +324,104 @@ mod tests {
     }
 
     #[test]
+    fn from_fastly_request_copies_body() {
+        let mut fastly_req =
+            fastly::Request::new(fastly::http::Method::POST, "https://example.com/path");
+        fastly_req.set_header("content-type", "application/json");
+        fastly_req.set_body(r#"{"ok":true}"#);
+
+        let http_req = from_fastly_request(fastly_req);
+        let (parts, body) = http_req.into_parts();
+
+        assert_eq!(parts.method, http::Method::POST, "should copy method");
+        assert_eq!(parts.uri.path(), "/path", "should copy uri path");
+        assert_eq!(
+            parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "should copy headers"
+        );
+        assert_once_body_eq(body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn to_fastly_request_copies_headers_and_body() {
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/submit")
+            .header("x-custom", "value")
+            .body(EdgeBody::from(b"payload".as_ref()))
+            .expect("should build request");
+
+        let mut fastly_req = to_fastly_request(http_req);
+
+        assert_eq!(
+            fastly_req.get_method(),
+            &fastly::http::Method::POST,
+            "should copy method"
+        );
+        assert_eq!(
+            fastly_req
+                .get_header("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("value"),
+            "should copy headers"
+        );
+        assert_eq!(
+            fastly_req.take_body_bytes().as_slice(),
+            b"payload",
+            "should copy body bytes"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_preserves_duplicate_headers() {
+        let http_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .header("x-custom", "first")
+            .header("x-custom", "second")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let fastly_req = to_fastly_request(http_req);
+
+        let values: Vec<_> = fastly_req
+            .get_headers()
+            .filter(|(name, _)| name.as_str() == "x-custom")
+            .map(|(_, value)| value.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate headers"
+        );
+    }
+
+    #[test]
+    fn from_fastly_response_copies_status_headers_and_body() {
+        let mut fastly_resp = fastly::Response::from_status(202);
+        fastly_resp.set_header("content-type", "application/json");
+        fastly_resp.set_body(r#"{"ok":true}"#);
+
+        let http_resp = from_fastly_response(fastly_resp);
+        let (parts, body) = http_resp.into_parts();
+
+        assert_eq!(parts.status.as_u16(), 202, "should copy status");
+        assert_eq!(
+            parts
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "should copy headers"
+        );
+        assert_once_body_eq(body, br#"{"ok":true}"#);
+    }
+
+    #[test]
     fn to_fastly_response_copies_status_and_headers() {
         let http_resp = http::Response::builder()
             .status(201)
@@ -231,6 +435,64 @@ mod tests {
         assert!(
             fastly_resp.get_header("content-type").is_some(),
             "should copy content-type header"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_ref_copies_method_uri_and_headers_without_body() {
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/path?q=1")
+            .header("x-custom", "value")
+            .body(EdgeBody::from(b"payload".as_ref()))
+            .expect("should build request");
+
+        let mut fastly_req = to_fastly_request_ref(&http_req);
+
+        assert_eq!(
+            fastly_req.get_method(),
+            &fastly::http::Method::POST,
+            "should copy method"
+        );
+        assert_eq!(
+            fastly_req.get_url_str(),
+            "https://example.com/path?q=1",
+            "should copy URI"
+        );
+        assert_eq!(
+            fastly_req
+                .get_header("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("value"),
+            "should copy headers"
+        );
+        assert!(
+            fastly_req.take_body_bytes().is_empty(),
+            "borrowed conversion should not copy body bytes"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_ref_preserves_duplicate_headers() {
+        let http_req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/")
+            .header("x-custom", "first")
+            .header("x-custom", "second")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let fastly_req = to_fastly_request_ref(&http_req);
+
+        let values: Vec<_> = fastly_req
+            .get_headers()
+            .filter(|(name, _)| name.as_str() == "x-custom")
+            .map(|(_, value)| value.to_str().expect("should be valid utf8"))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["first", "second"],
+            "should preserve duplicate headers"
         );
     }
 
@@ -373,6 +635,86 @@ mod tests {
                 settings.publisher.domain
             )),
             "should set expected expiry cookie"
+        );
+    }
+
+    #[test]
+    fn to_fastly_response_skeleton_copies_status_and_headers_discards_body() {
+        let http_resp = http::Response::builder()
+            .status(206)
+            .header("content-type", "text/html; charset=utf-8")
+            .header("x-custom", "value")
+            .body(EdgeBody::from(b"some body bytes".as_ref()))
+            .expect("should build response");
+
+        let fastly_resp = to_fastly_response_skeleton(http_resp);
+
+        assert_eq!(
+            fastly_resp.get_status().as_u16(),
+            206,
+            "should copy status code"
+        );
+        assert_eq!(
+            fastly_resp
+                .get_header("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "should copy content-type header"
+        );
+        assert_eq!(
+            fastly_resp
+                .get_header("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("value"),
+            "should copy custom header"
+        );
+    }
+
+    #[test]
+    fn to_fastly_request_with_streaming_body_produces_empty_body() {
+        // Stream bodies cannot cross the compat boundary: the Fastly SDK has no
+        // streaming body API, so the shim drops the stream and logs a warning.
+        // This test pins that silent-drop behaviour so it cannot become
+        // accidentally load-bearing.  (Removal target: PR 15.)
+        let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+            b"data",
+        )]));
+        let http_req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://example.com/")
+            .body(body)
+            .expect("should build request");
+
+        let mut fastly_req = to_fastly_request(http_req);
+
+        assert!(
+            fastly_req.take_body_bytes().is_empty(),
+            "streaming body should be silently dropped; compat shim produces empty body"
+        );
+    }
+
+    #[test]
+    fn to_fastly_response_with_streaming_body_produces_empty_body() {
+        // Same constraint as to_fastly_request: streaming bodies are dropped at
+        // the compat boundary.  (Removal target: PR 15.)
+        let body = EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from_static(
+            b"data",
+        )]));
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(body)
+            .expect("should build response");
+
+        let mut fastly_resp = to_fastly_response(http_resp);
+
+        assert_eq!(
+            fastly_resp.get_status().as_u16(),
+            200,
+            "should copy status code"
+        );
+        assert!(
+            fastly_resp.take_body_bytes().is_empty(),
+            "streaming body should be silently dropped; compat shim produces empty body"
         );
     }
 }

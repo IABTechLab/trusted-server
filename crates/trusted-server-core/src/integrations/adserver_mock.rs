@@ -4,9 +4,10 @@
 //! This integration acts as a mediator in the auction flow, selecting winning bids
 //! based on price (highest price wins).
 
-use error_stack::{Report, ResultExt as _};
-use fastly::http::Method;
-use fastly::Request;
+use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::{header, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::{BTreeMap, HashMap};
@@ -21,6 +22,10 @@ use crate::auction::types::{
 };
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
+use crate::integrations::{
+    collect_response_bounded, ensure_integration_backend, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+};
+use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
 use crate::settings::{IntegrationConfig, Settings};
 
 // ============================================================================
@@ -70,7 +75,7 @@ impl Default for AdServerMockConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
-            endpoint: "http://localhost:6767/adserver/mediate".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: default_timeout_ms(),
             price_floor: None,
             context_query_params: BTreeMap::new(),
@@ -205,7 +210,7 @@ impl AdServerMockProvider {
         // Build consent summary from ConsentContext
         let consent_json = request.user.consent.as_ref().map(|ctx| {
             json!({
-                "gdpr": i32::from(ctx.gdpr_applies),
+                "gdpr": if ctx.gdpr_applies { 1 } else { 0 },
                 "consent": ctx.raw_tc_string,
                 "us_privacy": ctx.raw_us_privacy,
                 "gpp": ctx.raw_gpp_string,
@@ -242,13 +247,13 @@ impl AdServerMockProvider {
             for bid in bids {
                 // Mediation layer returns decoded prices for all bids
                 all_bids.push(Bid {
-                    slot_id: bid["impid"].as_str().unwrap_or("").to_owned(),
+                    slot_id: bid["impid"].as_str().unwrap_or("").to_string(),
                     price: bid["price"].as_f64(), // Now properly decoded by mediation
-                    currency: "USD".to_owned(),
+                    currency: "USD".to_string(),
                     creative: bid["adm"].as_str().map(String::from),
                     width: bid["w"].as_u64().unwrap_or(0) as u32,
                     height: bid["h"].as_u64().unwrap_or(0) as u32,
-                    bidder: seat_name.to_owned(),
+                    bidder: seat_name.to_string(),
                     adomain: bid["adomain"].as_array().map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(String::from))
@@ -269,16 +274,17 @@ impl AdServerMockProvider {
     }
 }
 
+#[async_trait(?Send)]
 impl AuctionProvider for AdServerMockProvider {
     fn provider_name(&self) -> &'static str {
         "adserver_mock"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Result<fastly::http::request::PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         // Get bidder responses from context (passed by orchestrator for mediation)
         let bidder_responses = context.provider_responses.unwrap_or(&[]);
 
@@ -292,76 +298,98 @@ impl AuctionProvider for AdServerMockProvider {
         let mediation_req = self
             .build_mediation_request(request, bidder_responses)
             .change_context(TrustedServerError::Auction {
-                message: "Failed to build mediation request".to_owned(),
+                message: "Failed to build mediation request".to_string(),
             })?;
 
-        log::trace!("AdServer Mock: mediation request: {mediation_req:?}");
+        log::trace!("AdServer Mock: mediation request: {:?}", mediation_req);
 
         // Build endpoint URL with context-driven query parameters
         let endpoint_url = self.build_endpoint_url(request);
 
         // Create HTTP POST request
-        let mut req = Request::new(Method::POST, &endpoint_url);
+        let mediation_body =
+            serde_json::to_vec(&mediation_req).change_context(TrustedServerError::Auction {
+                message: "Failed to serialize mediation request".to_string(),
+            })?;
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(&endpoint_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::from(mediation_body))
+            .change_context(TrustedServerError::Auction {
+                message: "Failed to build mediation request".to_string(),
+            })?;
 
         // Set Host header with port to ensure mocktioneer generates correct iframe URLs
         if let Ok(url) = url::Url::parse(&self.config.endpoint) {
             if let Some(host) = url.host_str() {
                 let host_with_port = if let Some(port) = url.port() {
-                    format!("{host}:{port}")
+                    format!("{}:{}", host, port)
                 } else {
-                    host.to_owned()
+                    host.to_string()
                 };
-                req.set_header("Host", &host_with_port);
+                match header::HeaderValue::from_str(&host_with_port) {
+                    Ok(value) => {
+                        req.headers_mut().insert(header::HOST, value);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to build Host header for '{}': {}",
+                            host_with_port,
+                            e
+                        );
+                    }
+                }
             }
         }
 
-        req.set_body_json(&mediation_req)
-            .change_context(TrustedServerError::Auction {
-                message: "Failed to set mediation request body".to_owned(),
-            })?;
-
-        // Send async with auction-scoped timeout
-        let backend_name = BackendConfig::from_url_with_first_byte_timeout(
+        let backend_name = ensure_integration_backend(
+            context.services,
             &self.config.endpoint,
-            true,
-            Duration::from_millis(u64::from(context.timeout_ms)),
-        )
-        .change_context(TrustedServerError::Auction {
-            message: format!(
-                "Failed to resolve backend for mediation endpoint: {}",
-                self.config.endpoint
-            ),
-        })?;
+            "adserver_mock",
+            Some(Duration::from_millis(u64::from(context.timeout_ms))),
+        )?;
 
-        let pending = req
-            .send_async(backend_name)
+        let pending = context
+            .services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(req, backend_name))
+            .await
             .change_context(TrustedServerError::Auction {
-                message: "Failed to send mediation request".to_owned(),
+                message: "Failed to send mediation request".to_string(),
             })?;
 
         Ok(pending)
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
-        mut response: fastly::Response,
+        response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        if !response.get_status().is_success() {
-            log::warn!(
-                "AdServer Mock returned non-success: {}",
-                response.get_status()
-            );
+        let response = response.response;
+
+        if !response.status().is_success() {
+            log::warn!("AdServer Mock returned non-success: {}", response.status());
             return Ok(AuctionResponse::error("adserver_mock", response_time_ms));
         }
 
-        let body_bytes = response.take_body_bytes();
+        // collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes = collect_response_bounded(
+            response.into_body(),
+            UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+            "adserver_mock",
+        )
+        .await
+        .change_context(TrustedServerError::Auction {
+            message: "Failed to read AdServer Mock response body".to_string(),
+        })?;
         let response_json: Json =
             serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse mediation response".to_owned(),
+                message: "Failed to parse mediation response".to_string(),
             })?;
 
-        log::trace!("AdServer Mock response: {response_json:?}");
+        log::trace!("AdServer Mock response: {:?}", response_json);
 
         let auction_response = self.parse_mediation_response(&response_json, response_time_ms);
 
@@ -448,9 +476,9 @@ mod tests {
 
     fn create_test_auction_request() -> AuctionRequest {
         AuctionRequest {
-            id: "test-auction-123".to_owned(),
+            id: "test-auction-123".to_string(),
             slots: vec![AdSlot {
-                id: "header-banner".to_owned(),
+                id: "header-banner".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
                     width: 728,
@@ -461,17 +489,17 @@ mod tests {
                 bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
-                domain: "test.com".to_owned(),
-                page_url: Some("https://test.com/article".to_owned()),
+                domain: "test.com".to_string(),
+                page_url: Some("https://test.com/article".to_string()),
             },
             user: UserInfo {
-                id: Some("user-123".to_owned()),
+                id: Some("user-123".to_string()),
                 consent: None,
                 eids: None,
             },
             device: Some(DeviceInfo {
-                user_agent: Some("Mozilla/5.0".to_owned()),
-                ip: Some("192.168.1.1".to_owned()),
+                user_agent: Some("Mozilla/5.0".to_string()),
+                ip: Some("192.168.1.1".to_string()),
                 geo: None,
             }),
             site: None,
@@ -483,7 +511,7 @@ mod tests {
     fn test_build_mediation_request() {
         let config = AdServerMockConfig {
             enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: Some(1.00),
             context_query_params: BTreeMap::new(),
@@ -494,17 +522,17 @@ mod tests {
 
         let bidder_responses = vec![
             AuctionResponse {
-                provider: "amazon-aps".to_owned(),
+                provider: "amazon-aps".to_string(),
                 status: BidStatus::Success,
                 bids: vec![Bid {
-                    slot_id: "header-banner".to_owned(),
+                    slot_id: "header-banner".to_string(),
                     price: Some(3.00),
-                    currency: "USD".to_owned(),
-                    creative: Some("<div>APS Ad</div>".to_owned()),
+                    currency: "USD".to_string(),
+                    creative: Some("<div>APS Ad</div>".to_string()),
                     width: 728,
                     height: 90,
-                    bidder: "amazon-aps".to_owned(),
-                    adomain: Some(vec!["amazon.com".to_owned()]),
+                    bidder: "amazon-aps".to_string(),
+                    adomain: Some(vec!["amazon.com".to_string()]),
                     nurl: None,
                     burl: None,
                     metadata: HashMap::new(),
@@ -513,16 +541,16 @@ mod tests {
                 metadata: HashMap::new(),
             },
             AuctionResponse {
-                provider: "test-bidder".to_owned(),
+                provider: "test-bidder".to_string(),
                 status: BidStatus::Success,
                 bids: vec![Bid {
-                    slot_id: "header-banner".to_owned(),
+                    slot_id: "header-banner".to_string(),
                     price: Some(3.50),
-                    currency: "USD".to_owned(),
-                    creative: Some("<div>Test Ad</div>".to_owned()),
+                    currency: "USD".to_string(),
+                    creative: Some("<div>Test Ad</div>".to_string()),
                     width: 728,
                     height: 90,
-                    bidder: "test-bidder".to_owned(),
+                    bidder: "test-bidder".to_string(),
                     adomain: None,
                     nurl: None,
                     burl: None,
@@ -622,9 +650,9 @@ mod tests {
         let provider = AdServerMockProvider::new(config);
 
         let auction_request = AuctionRequest {
-            id: "test-auction".to_owned(),
+            id: "test-auction".to_string(),
             slots: vec![AdSlot {
-                id: "slot-1".to_owned(),
+                id: "slot-1".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
                     width: 300,
@@ -635,11 +663,11 @@ mod tests {
                 bidders: HashMap::new(),
             }],
             publisher: PublisherInfo {
-                domain: "test.com".to_owned(),
+                domain: "test.com".to_string(),
                 page_url: None,
             },
             user: UserInfo {
-                id: Some("user-1".to_owned()),
+                id: Some("user-1".to_string()),
                 consent: None,
                 eids: None,
             },
@@ -650,20 +678,20 @@ mod tests {
 
         // APS bid with encoded price (price=None, amznbid in metadata)
         let mut aps_metadata = HashMap::new();
-        aps_metadata.insert("amznbid".to_owned(), json!("encoded-price-value"));
+        aps_metadata.insert("amznbid".to_string(), json!("encoded-price-value"));
 
         let bidder_responses = vec![AuctionResponse {
-            provider: "aps".to_owned(),
+            provider: "aps".to_string(),
             status: BidStatus::Success,
             bids: vec![Bid {
-                slot_id: "slot-1".to_owned(),
+                slot_id: "slot-1".to_string(),
                 price: None, // APS bids have no decoded price
-                currency: "USD".to_owned(),
+                currency: "USD".to_string(),
                 creative: None, // APS doesn't provide creative
                 width: 300,
                 height: 250,
-                bidder: "amazon-aps".to_owned(),
-                adomain: Some(vec!["amazon.com".to_owned()]),
+                bidder: "amazon-aps".to_string(),
+                adomain: Some(vec!["amazon.com".to_string()]),
                 nurl: None,
                 burl: None,
                 metadata: aps_metadata,
@@ -726,7 +754,7 @@ mod tests {
 
         let config = AdServerMockConfig {
             enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::new(),
@@ -736,10 +764,10 @@ mod tests {
 
         let mut request = create_test_auction_request();
         request.user.consent = Some(ConsentContext {
-            raw_tc_string: Some("BOEFEAyO".to_owned()),
+            raw_tc_string: Some("BOEFEAyO".to_string()),
             gdpr_applies: true,
-            raw_us_privacy: Some("1YNN".to_owned()),
-            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_owned()),
+            raw_us_privacy: Some("1YNN".to_string()),
+            raw_gpp_string: Some("DBACNYA~CPXxRfAPXxRfA".to_string()),
             gpp_section_ids: Some(vec![2, 6]),
             ..Default::default()
         });
@@ -830,19 +858,19 @@ mod tests {
     fn test_build_endpoint_url_with_context_query_params() {
         let config = AdServerMockConfig {
             enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::from([(
-                "permutive_segments".to_owned(),
-                "permutive".to_owned(),
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
             )]),
         };
         let provider = AdServerMockProvider::new(config);
 
         let mut request = create_test_auction_request();
         request.context.insert(
-            "permutive_segments".to_owned(),
+            "permutive_segments".to_string(),
             ContextValue::StringList(vec![
                 "10000001".into(),
                 "10000003".into(),
@@ -864,7 +892,7 @@ mod tests {
         // even if context contains data.
         let config = AdServerMockConfig {
             enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::new(),
@@ -873,7 +901,7 @@ mod tests {
 
         let mut request = create_test_auction_request();
         request.context.insert(
-            "permutive_segments".to_owned(),
+            "permutive_segments".to_string(),
             ContextValue::StringList(vec!["10000001".into()]),
         );
 
@@ -885,8 +913,8 @@ mod tests {
     fn test_build_endpoint_url_empty_array_skipped() {
         let config = AdServerMockConfig {
             context_query_params: BTreeMap::from([(
-                "permutive_segments".to_owned(),
-                "permutive".to_owned(),
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
             )]),
             ..Default::default()
         };
@@ -894,7 +922,7 @@ mod tests {
 
         let mut request = create_test_auction_request();
         request.context.insert(
-            "permutive_segments".to_owned(),
+            "permutive_segments".to_string(),
             ContextValue::StringList(vec![]),
         );
 
@@ -909,19 +937,19 @@ mod tests {
     fn test_build_endpoint_url_preserves_existing_query_params() {
         let config = AdServerMockConfig {
             enabled: true,
-            endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_owned(),
+            endpoint: "http://localhost:6767/adserver/mediate?debug=true".to_string(),
             timeout_ms: 500,
             price_floor: None,
             context_query_params: BTreeMap::from([(
-                "permutive_segments".to_owned(),
-                "permutive".to_owned(),
+                "permutive_segments".to_string(),
+                "permutive".to_string(),
             )]),
         };
         let provider = AdServerMockProvider::new(config);
 
         let mut request = create_test_auction_request();
         request.context.insert(
-            "permutive_segments".to_owned(),
+            "permutive_segments".to_string(),
             ContextValue::StringList(vec!["123".into(), "adv".into()]),
         );
 

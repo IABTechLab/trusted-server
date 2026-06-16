@@ -7,7 +7,6 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
 use edgezero_core::key_value_store::NoopKvStore;
 use error_stack::Report;
-use fastly::http::request::PendingRequest;
 use fastly::http::{header, Method, StatusCode};
 use fastly::Request;
 use serde_json::json;
@@ -15,6 +14,8 @@ use trusted_server_core::auction::{
     build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
     AuctionResponse,
 };
+use trusted_server_core::compat;
+use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::IntegrationRegistry;
@@ -24,22 +25,24 @@ use trusted_server_core::platform::{
     PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
     StoreName,
 };
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::request_signing::JWKS_CONFIG_STORE_NAME;
 use trusted_server_core::settings::{
     AssetImageOptimizerConfig, AssetOriginAuth, ImageOptimizerProfileSet, ImageOptimizerSettings,
-    ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
+    ProxyAssetRoute, S3SigV4AuthConfig, Settings,
 };
 
-use super::route_request;
+use super::{route_request, HandlerOutcome};
 
 struct StubJwksConfigStore;
 
 impl PlatformConfigStore for StubJwksConfigStore {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         match key {
-            "active-kids" => Ok("test-kid-1".to_owned()),
+            "active-kids" => Ok("test-kid-1".to_string()),
             "test-kid-1" => Ok(
-                r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#.to_owned(),
+                r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","kid":"test-kid-1","alg":"EdDSA"}"#
+                    .to_string(),
             ),
             _ => Err(Report::new(PlatformError::ConfigStore)),
         }
@@ -309,24 +312,25 @@ impl PlatformGeo for NoopGeo {
 
 struct DisabledRouteProvider;
 
+#[async_trait::async_trait(?Send)]
 impl AuctionProvider for DisabledRouteProvider {
     fn provider_name(&self) -> &'static str {
         "disabled-route"
     }
 
-    fn request_bids(
+    async fn request_bids(
         &self,
         _request: &AuctionRequest,
         _context: &AuctionContext<'_>,
-    ) -> Result<PendingRequest, Report<TrustedServerError>> {
+    ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
         Err(Report::new(TrustedServerError::Auction {
             message: "disabled route provider should not launch requests".to_string(),
         }))
     }
 
-    fn parse_response(
+    async fn parse_response(
         &self,
-        _response: fastly::Response,
+        _response: PlatformResponse,
         _response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         Err(Report::new(TrustedServerError::Auction {
@@ -427,7 +431,7 @@ fn create_auction_test_settings(providers: &str) -> Settings {
     let base = base_route_settings_toml();
     let prebid = prebid_integration_toml();
     let config = format!(
-        "{base}
+        r#"{base}
 
 {prebid}
 
@@ -435,7 +439,7 @@ fn create_auction_test_settings(providers: &str) -> Settings {
             enabled = true
             providers = {providers}
             timeout_ms = 2000
-        ",
+        "#,
     );
 
     Settings::from_toml(&config).expect("should parse adapter auction route test settings")
@@ -501,18 +505,66 @@ fn test_runtime_services_with_secret_http_client_and_geo(
         .geo(geo)
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_owned),
-            tls_cipher: req
-                .get_tls_cipher_openssl_name()
-                .ok()
-                .flatten()
-                .map(str::to_owned),
+            tls_protocol: req.get_tls_protocol().map(str::to_string),
+            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
         })
         .build()
 }
 
 fn test_partner_registry(settings: &Settings) -> PartnerRegistry {
     PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry")
+}
+
+fn route_result_to_fastly_response(
+    settings: &Settings,
+    services: &RuntimeServices,
+    partner_registry: &PartnerRegistry,
+    route_result: super::RouteResult,
+) -> fastly::Response {
+    let super::RouteResult {
+        outcome,
+        ec_context,
+        finalize_kv_graph,
+        eids_cookie,
+        sharedid_cookie,
+        should_finalize_ec,
+        asset_cache_policy,
+        ..
+    } = route_result;
+
+    let is_auth_challenge = matches!(&outcome, HandlerOutcome::AuthChallenge(_));
+    let mut response = match outcome {
+        HandlerOutcome::Buffered(response) | HandlerOutcome::AuthChallenge(response) => {
+            Some(response)
+        }
+        _ => None,
+    }
+    .expect("should have a buffered route response");
+
+    let geo_info = if is_auth_challenge {
+        None
+    } else {
+        services
+            .geo()
+            .lookup(services.client_info().client_ip)
+            .unwrap_or(None)
+    };
+    super::finalize_response(settings, geo_info.as_ref(), &mut response);
+    asset_cache_policy.apply_after_route_finalization(&mut response);
+
+    let mut fastly_response = compat::to_fastly_response(response);
+    if should_finalize_ec {
+        ec_finalize_response(
+            settings,
+            &ec_context,
+            finalize_kv_graph.as_ref(),
+            partner_registry,
+            eids_cookie.as_deref(),
+            sharedid_cookie.as_deref(),
+            &mut fastly_response,
+        );
+    }
+    fastly_response
 }
 
 fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
@@ -534,17 +586,16 @@ fn route_auction_with_stack(
         .with_body(body.into());
     let services = test_runtime_services(&req);
 
-    futures::executor::block_on(route_request(
+    let route_result = futures::executor::block_on(route_request(
         settings,
         orchestrator,
         integration_registry,
         &partner_registry,
         &services,
-        req,
+        compat::from_fastly_request(req),
     ))
-    .expect("should route auction request")
-    .response
-    .expect("should buffer auction response in tests")
+    .expect("should route auction request");
+    route_result_to_fastly_response(settings, &services, &partner_registry, route_result)
 }
 
 fn route_buffered_response(
@@ -558,17 +609,16 @@ fn route_buffered_response(
     let partner_registry =
         PartnerRegistry::from_config(&settings.ec.partners).expect("should build partner registry");
 
-    futures::executor::block_on(route_request(
+    let route_result = futures::executor::block_on(route_request(
         settings,
         orchestrator,
         integration_registry,
         &partner_registry,
         services,
-        req,
+        compat::from_fastly_request(req),
     ))
-    .expect(expect_message)
-    .response
-    .expect("should buffer route response in tests")
+    .expect(expect_message);
+    route_result_to_fastly_response(settings, services, &partner_registry, route_result)
 }
 
 fn valid_banner_ad_unit_body() -> Vec<u8> {
@@ -595,42 +645,36 @@ fn routes_use_request_local_consent() {
         IntegrationRegistry::new(&settings).expect("should create integration registry");
     let partner_registry = test_partner_registry(&settings);
 
-    let discovery_req = Request::get("https://test.com/.well-known/trusted-server.json");
-    let discovery_services = test_runtime_services(&discovery_req);
+    let discovery_fastly_req = Request::get("https://test.com/.well-known/trusted-server.json");
+    let discovery_services = test_runtime_services(&discovery_fastly_req);
     let discovery_resp = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &partner_registry,
         &discovery_services,
-        discovery_req,
+        compat::from_fastly_request(discovery_fastly_req),
     ))
     .expect("should route discovery request");
-    let discovery_response = discovery_resp
-        .response
-        .expect("should buffer discovery response in tests");
     assert_eq!(
-        discovery_response.get_status(),
+        discovery_resp.outcome.status(),
         StatusCode::OK,
         "should keep discovery available with request-local consent"
     );
 
-    let admin_req = Request::post("https://test.com/_ts/admin/keys/rotate");
-    let admin_services = test_runtime_services(&admin_req);
+    let admin_fastly_req = Request::post("https://test.com/_ts/admin/keys/rotate");
+    let admin_services = test_runtime_services(&admin_fastly_req);
     let admin_resp = futures::executor::block_on(route_request(
         &settings,
         &orchestrator,
         &integration_registry,
         &partner_registry,
         &admin_services,
-        admin_req,
+        compat::from_fastly_request(admin_fastly_req),
     ))
     .expect("should route admin request");
-    let admin_response = admin_resp
-        .response
-        .expect("should buffer admin response in tests");
     assert_eq!(
-        admin_response.get_status(),
+        admin_resp.outcome.status(),
         StatusCode::UNAUTHORIZED,
         "should keep admin auth behavior unchanged with request-local consent"
     );
@@ -825,17 +869,18 @@ fn asset_routes_stream_asset_responses_directly() {
         IntegrationRegistry::new(&settings).expect("should create integration registry");
     let partner_registry = test_partner_registry(&settings);
 
-    let mut req = Request::get("https://test.com/.images/logo.png");
-    req.set_header(header::COOKIE, format!("ts-ec={}", valid_ec_id()));
-    req.set_header("sec-gpc", "1");
+    let mut fastly_req = Request::get("https://test.com/.images/logo.png");
+    fastly_req.set_header(header::COOKIE, format!("ts-ec={}", valid_ec_id()));
+    fastly_req.set_header("sec-gpc", "1");
     let http_client = Arc::new(StreamingRecordingHttpClient::new());
     let services = test_runtime_services_with_secret_http_client_and_geo(
-        &req,
+        &fastly_req,
         Arc::new(FixedBackend),
         Arc::new(NoopSecretStore),
         Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
         Arc::new(FixedGeo(us_california_geo())),
     );
+    let req = compat::from_fastly_request(fastly_req);
 
     let outcome = futures::executor::block_on(route_request(
         &settings,
@@ -848,12 +893,27 @@ fn asset_routes_stream_asset_responses_directly() {
     .expect("should route streaming asset request");
 
     assert!(
-        outcome.response.is_none(),
-        "streaming asset route should send directly instead of returning a buffered response"
+        !outcome.should_finalize_ec,
+        "asset routes should not emit EC identity headers"
+    );
+    assert_eq!(
+        outcome.asset_cache_policy,
+        AssetProxyCachePolicy::OriginControlled,
+        "successful asset routes should preserve origin cache policy"
+    );
+    let (response, body) = match outcome.outcome {
+        HandlerOutcome::AssetStreaming { response, body } => Some((response, body)),
+        _ => None,
+    }
+    .expect("should return streaming asset outcome");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "should preserve streaming asset response status"
     );
     assert!(
-        outcome.pull_sync_context.is_none(),
-        "asset routes should not schedule publisher pull-sync work"
+        matches!(body, EdgeBody::Stream(_)),
+        "should preserve streaming asset response body"
     );
     let calls = http_client
         .calls
@@ -974,7 +1034,7 @@ fn s3_asset_origin_error_stays_uncacheable_after_global_headers() {
             ImageOptimizerProfileSet {
                 base_params: String::new(),
                 default_profile: "default".to_string(),
-                unknown_profile: UnknownProfilePolicy::default(),
+                unknown_profile: Default::default(),
                 profile_param: "profile".to_string(),
                 aspect_ratio_param: "ar".to_string(),
                 debug_param: "_io_debug".to_string(),

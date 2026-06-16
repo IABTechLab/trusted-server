@@ -22,9 +22,10 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use error_stack::{Report, ResultExt as _};
-use fastly::http::{header, Method, StatusCode};
-use fastly::{Request, Response};
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::header::{self, HeaderValue};
+use http::{Method, Request, Response, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
 use url::Url;
@@ -33,11 +34,12 @@ use validator::{Validate, ValidationError};
 use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
-    IntegrationRegistration,
+    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
+    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
+    INTEGRATION_MAX_BODY_BYTES,
 };
-use crate::platform::RuntimeServices;
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const SOURCEPOINT_INTEGRATION_ID: &str = "sourcepoint";
@@ -256,7 +258,7 @@ impl SourcepointIntegration {
 
     fn error(message: impl Into<String>) -> TrustedServerError {
         TrustedServerError::Integration {
-            integration: SOURCEPOINT_INTEGRATION_ID.to_owned(),
+            integration: SOURCEPOINT_INTEGRATION_ID.to_string(),
             message: message.into(),
         }
     }
@@ -309,11 +311,13 @@ impl SourcepointIntegration {
     fn copy_headers(
         &self,
         client_ip: Option<IpAddr>,
-        original_req: &Request,
-        proxy_req: &mut Request,
+        original_req: &Request<EdgeBody>,
+        proxy_req: &mut Request<EdgeBody>,
     ) -> bool {
         if let Some(client_ip) = client_ip {
-            proxy_req.set_header("X-Forwarded-For", client_ip.to_string());
+            if let Ok(val) = HeaderValue::from_str(&client_ip.to_string()) {
+                proxy_req.headers_mut().insert("x-forwarded-for", val);
+            }
         }
 
         // Accept-Encoding is deliberately omitted here and handled in the
@@ -332,27 +336,35 @@ impl SourcepointIntegration {
             header::HeaderName::from_static("access-control-request-method"),
             header::HeaderName::from_static("access-control-request-headers"),
         ] {
-            if let Some(value) = original_req.get_header(&header_name) {
-                proxy_req.set_header(&header_name, value);
+            if let Some(value) = original_req.headers().get(&header_name) {
+                proxy_req.headers_mut().insert(header_name, value.clone());
             }
         }
 
         if let Some(filtered_cookie_header) = self.filtered_sourcepoint_cookie_header(original_req)
         {
-            proxy_req.set_header(header::COOKIE, &filtered_cookie_header);
+            if let Ok(val) = HeaderValue::from_str(&filtered_cookie_header) {
+                proxy_req.headers_mut().insert(header::COOKIE, val);
+            }
             return true;
         }
 
         false
     }
 
-    fn filtered_sourcepoint_cookie_header(&self, original_req: &Request) -> Option<String> {
-        let cookie_header = original_req.get_header(header::COOKIE)?;
-        let Ok(cookie_header) = cookie_header.to_str() else {
-            log::warn!(
-                "Sourcepoint: request Cookie header is not valid UTF-8, skipping upstream cookie forwarding"
-            );
-            return None;
+    fn filtered_sourcepoint_cookie_header(
+        &self,
+        original_req: &Request<EdgeBody>,
+    ) -> Option<String> {
+        let cookie_header = original_req.headers().get(header::COOKIE)?;
+        let cookie_header = match cookie_header.to_str() {
+            Ok(value) => value,
+            Err(_) => {
+                log::warn!(
+                    "Sourcepoint: request Cookie header is not valid UTF-8, skipping upstream cookie forwarding"
+                );
+                return None;
+            }
         };
 
         let filtered = cookie_header
@@ -378,35 +390,39 @@ impl SourcepointIntegration {
             || self.config.auth_cookie_name.as_deref() == Some(cookie_name)
     }
 
-    fn response_sets_cookie(response: &Response) -> bool {
-        response.get_header(header::SET_COOKIE).is_some()
+    fn response_sets_cookie(response: &Response<EdgeBody>) -> bool {
+        response.headers().contains_key(header::SET_COOKIE)
     }
 
-    fn apply_cookie_safety(response: &mut Response) -> bool {
+    fn apply_cookie_safety(response: &mut Response<EdgeBody>) -> bool {
         if Self::response_sets_cookie(response) {
-            response.set_header(header::CACHE_CONTROL, "private, no-store");
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
             return true;
         }
 
         false
     }
 
-    fn apply_cache_headers(&self, response: &mut Response, forwarded_cookies: bool) {
+    fn apply_cache_headers(&self, response: &mut Response<EdgeBody>, forwarded_cookies: bool) {
         if Self::apply_cookie_safety(response) {
             return;
         }
 
-        if response.get_header(header::CACHE_CONTROL).is_none()
-            && response.get_status().is_success()
+        if response.headers().get(header::CACHE_CONTROL).is_none() && response.status().is_success()
         {
-            if forwarded_cookies {
-                response.set_header(header::CACHE_CONTROL, "private, max-age=0");
+            let val = if forwarded_cookies {
+                HeaderValue::from_static("private, max-age=0")
             } else {
-                response.set_header(
-                    header::CACHE_CONTROL,
-                    format!("public, max-age={}", self.config.cache_ttl_seconds),
-                );
-            }
+                HeaderValue::from_str(&format!(
+                    "public, max-age={}",
+                    self.config.cache_ttl_seconds
+                ))
+                .unwrap_or(HeaderValue::from_static("public"))
+            };
+            response.headers_mut().insert(header::CACHE_CONTROL, val);
         }
     }
 
@@ -464,7 +480,10 @@ impl SourcepointIntegration {
                 let open_quote = &caps[1];
                 let path = caps.get(4).map_or("", |m| m.as_str());
                 let close_quote = &caps[5];
-                format!("{open_quote}{SOURCEPOINT_CDN_PREFIX}{path}{close_quote}")
+                format!(
+                    "{}{}{}{close_quote}",
+                    open_quote, SOURCEPOINT_CDN_PREFIX, path
+                )
             })
             .into_owned();
 
@@ -489,22 +508,29 @@ impl SourcepointIntegration {
     }
 
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
-    fn is_javascript_response(response: &Response) -> bool {
+    fn is_javascript_response(response: &Response<EdgeBody>) -> bool {
         response
-            .get_header_str(header::CONTENT_TYPE)
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("javascript") || ct.contains("ecmascript"))
     }
 
-    fn remove_vary_accept_encoding(response: &mut Response) {
-        let Some(vary) = response.get_header_str(header::VARY) else {
-            return;
+    fn remove_vary_accept_encoding(response: &mut Response<EdgeBody>) {
+        let vary_owned = match response
+            .headers()
+            .get(header::VARY)
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(v) => v.to_string(),
+            None => return,
         };
 
-        if vary.trim() == "*" {
+        if vary_owned.trim() == "*" {
             return;
         }
 
-        let kept = vary
+        let kept = vary_owned
             .split(',')
             .map(str::trim)
             .filter(|value| !value.eq_ignore_ascii_case("accept-encoding"))
@@ -513,15 +539,15 @@ impl SourcepointIntegration {
             .collect::<Vec<_>>();
 
         if kept.is_empty() {
-            response.remove_header(header::VARY);
-        } else {
-            response.set_header(header::VARY, kept.join(", "));
+            response.headers_mut().remove(header::VARY);
+        } else if let Ok(val) = HeaderValue::from_str(&kept.join(", ")) {
+            response.headers_mut().insert(header::VARY, val);
         }
     }
 
-    fn rewrite_javascript_response(&self, response: &mut Response, rewritten: String) {
-        response.remove_header(header::CONTENT_ENCODING);
-        response.remove_header(header::CONTENT_LENGTH);
+    fn rewrite_javascript_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
+        response.headers_mut().remove(header::CONTENT_ENCODING);
+        response.headers_mut().remove(header::CONTENT_LENGTH);
         Self::remove_vary_accept_encoding(response);
 
         if !Self::apply_cookie_safety(response) {
@@ -530,17 +556,19 @@ impl SourcepointIntegration {
             // regardless of what upstream sent. This intentionally diverges from the
             // passthrough path's `apply_cache_headers` (which only sets a default
             // when upstream omitted Cache-Control).
-            response.set_header(
-                header::CACHE_CONTROL,
-                format!("public, max-age={}", self.config.cache_ttl_seconds),
-            );
+            if let Ok(val) = HeaderValue::from_str(&format!(
+                "public, max-age={}",
+                self.config.cache_ttl_seconds
+            )) {
+                response.headers_mut().insert(header::CACHE_CONTROL, val);
+            }
         }
-        response.set_header(
+        response.headers_mut().insert(
             header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
+            HeaderValue::from_static("application/javascript; charset=utf-8"),
         );
 
-        response.set_body(rewritten);
+        *response.body_mut() = EdgeBody::from(rewritten.into_bytes());
     }
 }
 
@@ -551,12 +579,12 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
     }
 
     // Keep in sync with JS normalization in:
-    // crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts
+    // crates/js/lib/src/integrations/sourcepoint/script_guard.ts
     // (protocol-relative + bare-domain handling + host-validation behavior).
     let normalized = if trimmed.starts_with("//") {
         format!("https:{trimmed}")
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_owned()
+        trimmed.to_string()
     } else if is_sourcepoint_bare_host_reference(trimmed) {
         format!("https://{trimmed}")
     } else {
@@ -636,64 +664,97 @@ impl IntegrationProxy for SourcepointIntegration {
     async fn handle(
         &self,
         _settings: &Settings,
-        _services: &RuntimeServices,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path().to_owned();
-        let method = req.get_method().clone();
+        services: &RuntimeServices,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
         let target_path = Self::strip_cdn_prefix(&path).ok_or_else(|| {
             Report::new(Self::error(format!("Unknown Sourcepoint route: {path}")))
         })?;
 
         let target_url = self
-            .build_target_url(target_path, req.get_query_str())
+            .build_target_url(target_path, req.uri().query())
             .change_context(Self::error("Failed to build Sourcepoint target URL"))?;
 
-        log::info!("Sourcepoint: proxying {method} {path} \u{2192} {target_url}");
+        log::info!("Sourcepoint: proxying {method} {path} → {target_url}");
 
-        let mut proxy_req = Request::new(req.get_method().clone(), &target_url);
-        let forwarded_cookies = self.copy_headers(req.get_client_ip_addr(), &req, &mut proxy_req);
+        let (req_parts, req_body) = req.into_parts();
+
+        let request_body = if method == Method::POST {
+            let bytes = collect_body_bounded(
+                req_body,
+                INTEGRATION_MAX_BODY_BYTES,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
+            EdgeBody::from(bytes)
+        } else {
+            EdgeBody::empty()
+        };
+
+        let mut proxy_req = http::Request::builder()
+            .method(method.clone())
+            .uri(&target_url)
+            .body(request_body)
+            .change_context(Self::error("Failed to build Sourcepoint proxy request"))?;
+
+        let source_req = http::Request::from_parts(req_parts, EdgeBody::empty());
+        let forwarded_cookies =
+            self.copy_headers(services.client_info.client_ip, &source_req, &mut proxy_req);
 
         // Request uncompressed content only for paths that are likely
         // JavaScript (the files we need to regex-rewrite).  All other CDN
         // responses (images, JSON API responses, CSS) keep the client's
         // original Accept-Encoding for efficiency.
         if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
-            proxy_req.set_header(header::ACCEPT_ENCODING, "identity");
-        } else if let Some(ae) = req.get_header(header::ACCEPT_ENCODING) {
-            proxy_req.set_header(header::ACCEPT_ENCODING, ae);
+            proxy_req.headers_mut().insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        } else if let Some(ae) = source_req.headers().get(header::ACCEPT_ENCODING) {
+            proxy_req
+                .headers_mut()
+                .insert(header::ACCEPT_ENCODING, ae.clone());
         }
 
-        if matches!(method, Method::POST) {
-            if let Some(content_type) = req.get_header(header::CONTENT_TYPE) {
-                proxy_req.set_header(header::CONTENT_TYPE, content_type);
+        if method == Method::POST {
+            if let Some(content_type) = source_req.headers().get(header::CONTENT_TYPE) {
+                proxy_req
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, content_type.clone());
             }
-            proxy_req.set_body(req.into_body());
         }
 
         let backend_name = BackendConfig::from_url(&self.config.cdn_origin, true)
             .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
 
-        let mut response = proxy_req
-            .send(&backend_name)
-            .change_context(Self::error("Sourcepoint upstream request failed"))?;
+        let mut response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(proxy_req, backend_name))
+            .await
+            .change_context(Self::error("Sourcepoint upstream request failed"))?
+            .response;
 
         log::info!(
             "Sourcepoint: upstream responded with status {}",
-            response.get_status()
+            response.status()
         );
 
         // Rewrite Location headers on redirect responses so the browser
         // follows the redirect through the first-party proxy instead of
         // leaking the CDN origin to the client.
-        if response.get_status().is_redirection() {
+        if response.status().is_redirection() {
             if let Some(location) = response
-                .get_header(header::LOCATION)
+                .headers()
+                .get(header::LOCATION)
                 .and_then(|h| h.to_str().ok())
             {
                 if let Some(rewritten) = Self::rewrite_redirect_location(location, &target_url) {
                     log::info!("Sourcepoint: rewrote redirect Location to {rewritten}");
-                    response.set_header(header::LOCATION, &rewritten);
+                    if let Ok(val) = HeaderValue::from_str(&rewritten) {
+                        response.headers_mut().insert(header::LOCATION, val);
+                    }
                 }
             }
             // Redirects without Set-Cookie intentionally keep upstream cache
@@ -705,8 +766,8 @@ impl IntegrationProxy for SourcepointIntegration {
 
         // Rewrite CDN URLs inside JavaScript responses so that dynamically
         // loaded chunks and API calls route through the first-party proxy.
-        if matches!(method, Method::GET)
-            && response.get_status() == StatusCode::OK
+        if method == Method::GET
+            && response.status() == StatusCode::OK
             && self.config.rewrite_sdk
             && Self::is_javascript_response(&response)
         {
@@ -715,15 +776,17 @@ impl IntegrationProxy for SourcepointIntegration {
             // Guard against unexpectedly large responses to avoid unbounded
             // memory consumption during rewriting.
             let content_length = response
-                .get_header(header::CONTENT_LENGTH)
+                .headers()
+                .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
 
             match content_length {
                 Some(len) if len > MAX_REWRITE_BODY_SIZE => {
                     log::warn!(
-                        "Sourcepoint: response body for {path} exceeds {MAX_REWRITE_BODY_SIZE} bytes \
-                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)"
+                        "Sourcepoint: response body for {path} exceeds {} bytes \
+                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
+                        MAX_REWRITE_BODY_SIZE
                     );
                     self.apply_cache_headers(&mut response, forwarded_cookies);
                     return Ok(response);
@@ -739,7 +802,15 @@ impl IntegrationProxy for SourcepointIntegration {
                 Some(_) => {}
             }
 
-            let body_bytes = response.take_body_bytes();
+            let (resp_parts, resp_body) = response.into_parts();
+            let body_bytes = collect_response_bounded(
+                resp_body,
+                MAX_REWRITE_BODY_SIZE as usize,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
+            let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
+
             let body = match String::from_utf8(body_bytes) {
                 Ok(text) => text,
                 Err(err) => {
@@ -748,7 +819,7 @@ impl IntegrationProxy for SourcepointIntegration {
                          at byte offset {}, passing through unmodified",
                         err.utf8_error().valid_up_to()
                     );
-                    response.set_body(err.into_bytes());
+                    *response.body_mut() = EdgeBody::from(err.into_bytes());
                     self.apply_cache_headers(&mut response, forwarded_cookies);
                     return Ok(response);
                 }
@@ -863,7 +934,6 @@ mod tests {
     use super::*;
     use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::Method;
     use serde_json::json;
 
     fn config(enabled: bool) -> SourcepointConfig {
@@ -1155,7 +1225,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "http://169.254.169.254".to_owned(),
+            cdn_origin: "http://169.254.169.254".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1170,7 +1240,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "ftp://cdn.privacy-mgmt.com".to_owned(),
+            cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1182,7 +1252,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_owned(),
+            cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1197,7 +1267,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_owned(),
+            cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1212,7 +1282,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_owned(),
+            cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1227,7 +1297,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_owned(),
+            cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1242,7 +1312,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "https://cdn.privacy-mgmt.com".to_owned(),
+            cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1257,7 +1327,7 @@ mod tests {
         let cfg = SourcepointConfig {
             enabled: true,
             rewrite_sdk: true,
-            cdn_origin: "http://cdn.privacy-mgmt.com".to_owned(),
+            cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
         };
@@ -1274,7 +1344,7 @@ mod tests {
                 enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
-                auth_cookie_name: Some(auth_cookie_name.to_owned()),
+                auth_cookie_name: Some(auth_cookie_name.to_string()),
                 cache_ttl_seconds: default_cache_ttl(),
             };
 
@@ -1305,7 +1375,7 @@ mod tests {
                 enabled: true,
                 rewrite_sdk: true,
                 cdn_origin: default_cdn_origin(),
-                auth_cookie_name: Some(auth_cookie_name.to_owned()),
+                auth_cookie_name: Some(auth_cookie_name.to_string()),
                 cache_ttl_seconds: default_cache_ttl(),
             };
 
@@ -1334,11 +1404,69 @@ mod tests {
         );
     }
 
+    fn make_req(method: Method, url: &str) -> Request<EdgeBody> {
+        http::Request::builder()
+            .method(method)
+            .uri(url)
+            .body(EdgeBody::empty())
+            .expect("should build test request")
+    }
+
+    fn make_resp_with_status(status: StatusCode) -> Response<EdgeBody> {
+        http::Response::builder()
+            .status(status)
+            .body(EdgeBody::empty())
+            .expect("should build test response")
+    }
+
+    fn get_header_str(
+        resp: &Response<EdgeBody>,
+        name: impl http::header::AsHeaderName,
+    ) -> Option<&str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn get_req_header_str(
+        req: &Request<EdgeBody>,
+        name: impl http::header::AsHeaderName,
+    ) -> Option<&str> {
+        req.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn set_header(
+        resp: &mut Response<EdgeBody>,
+        name: impl http::header::IntoHeaderName,
+        value: &str,
+    ) {
+        resp.headers_mut().insert(
+            name,
+            HeaderValue::from_str(value).expect("should build header value"),
+        );
+    }
+
+    fn set_req_header(
+        req: &mut Request<EdgeBody>,
+        name: impl http::header::IntoHeaderName,
+        value: &str,
+    ) {
+        req.headers_mut().insert(
+            name,
+            HeaderValue::from_str(value).expect("should build header value"),
+        );
+    }
+
+    fn take_body_bytes(resp: Response<EdgeBody>) -> Vec<u8> {
+        match resp.into_body() {
+            EdgeBody::Once(b) => b.to_vec(),
+            EdgeBody::Stream(_) => vec![],
+        }
+    }
+
     #[test]
     fn copy_headers_sets_x_forwarded_for_from_runtime_client_ip() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let original_req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
-        let mut proxy_req = Request::new(Method::GET, "https://cdn.privacy-mgmt.com/wrapper.js");
+        let original_req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
+        let mut proxy_req = make_req(Method::GET, "https://cdn.privacy-mgmt.com/wrapper.js");
         let client_ip = "203.0.113.10".parse().expect("should parse test IP");
 
         let forwarded_cookies =
@@ -1349,7 +1477,7 @@ mod tests {
             "should report no forwarded cookies when request has none"
         );
         assert_eq!(
-            proxy_req.get_header_str("X-Forwarded-For"),
+            get_req_header_str(&proxy_req, "x-forwarded-for"),
             Some("203.0.113.10"),
             "should forward platform-provided client IP"
         );
@@ -1359,21 +1487,24 @@ mod tests {
     fn copy_headers_forwards_preflight_headers() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let mut original_req =
-            Request::new(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
-        original_req.set_header("Access-Control-Request-Method", "POST");
-        original_req.set_header("Access-Control-Request-Headers", "Content-Type, X-Test");
-        let mut proxy_req =
-            Request::new(Method::OPTIONS, "https://cdn.privacy-mgmt.com/wrapper.js");
+            make_req(Method::OPTIONS, "https://publisher.example.com/sourcepoint");
+        set_req_header(&mut original_req, "access-control-request-method", "POST");
+        set_req_header(
+            &mut original_req,
+            "access-control-request-headers",
+            "Content-Type, X-Test",
+        );
+        let mut proxy_req = make_req(Method::OPTIONS, "https://cdn.privacy-mgmt.com/wrapper.js");
 
         integration.copy_headers(None, &original_req, &mut proxy_req);
 
         assert_eq!(
-            proxy_req.get_header_str("Access-Control-Request-Method"),
+            get_req_header_str(&proxy_req, "access-control-request-method"),
             Some("POST"),
             "should forward requested preflight method"
         );
         assert_eq!(
-            proxy_req.get_header_str("Access-Control-Request-Headers"),
+            get_req_header_str(&proxy_req, "access-control-request-headers"),
             Some("Content-Type, X-Test"),
             "should forward requested preflight headers"
         );
@@ -1382,8 +1513,9 @@ mod tests {
     #[test]
     fn forwards_only_allowlisted_sourcepoint_cookies() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
-        req.set_header(
+        let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
+        set_req_header(
+            &mut req,
             header::COOKIE,
             "consentUUID=uuid123; session_id=secret; euconsent-v2=tcf; _sp_su=1; theme=dark",
         );
@@ -1400,10 +1532,11 @@ mod tests {
     #[test]
     fn forwards_configured_auth_cookie_name() {
         let mut cfg = config(true);
-        cfg.auth_cookie_name = Some("sp_auth".to_owned());
+        cfg.auth_cookie_name = Some("sp_auth".to_string());
         let integration = SourcepointIntegration::new(Arc::new(cfg));
-        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
-        req.set_header(
+        let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
+        set_req_header(
+            &mut req,
             header::COOKIE,
             "sp_auth=token123; session_id=secret; consentUUID=uuid123",
         );
@@ -1420,8 +1553,8 @@ mod tests {
     #[test]
     fn drops_unrelated_publisher_cookies_from_upstream_request() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut req = Request::new(Method::GET, "https://publisher.example.com/sourcepoint");
-        req.set_header(header::COOKIE, "session_id=secret; theme=dark");
+        let mut req = make_req(Method::GET, "https://publisher.example.com/sourcepoint");
+        set_req_header(&mut req, header::COOKIE, "session_id=secret; theme=dark");
 
         assert_eq!(
             integration.filtered_sourcepoint_cookie_header(&req),
@@ -1433,14 +1566,18 @@ mod tests {
     #[test]
     fn apply_cache_headers_uses_private_no_store_for_cookie_setting_responses() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header(header::SET_COOKIE, "consentUUID=uuid123; Path=/");
-        response.set_header(header::CACHE_CONTROL, "public, max-age=3600");
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(
+            &mut response,
+            header::SET_COOKIE,
+            "consentUUID=uuid123; Path=/",
+        );
+        set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
 
         integration.apply_cache_headers(&mut response, false);
 
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            get_header_str(&response, header::CACHE_CONTROL),
             Some("private, no-store"),
             "should prevent public caching for cookie-setting responses"
         );
@@ -1449,12 +1586,12 @@ mod tests {
     #[test]
     fn apply_cache_headers_uses_private_policy_when_cookies_were_forwarded() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
+        let mut response = make_resp_with_status(StatusCode::OK);
 
         integration.apply_cache_headers(&mut response, true);
 
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            get_header_str(&response, header::CACHE_CONTROL),
             Some("private, max-age=0"),
             "should not publicly cache responses that may vary by forwarded Cookie"
         );
@@ -1463,13 +1600,13 @@ mod tests {
     #[test]
     fn apply_cache_headers_uses_public_default_without_forwarded_cookies() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
+        let mut response = make_resp_with_status(StatusCode::OK);
 
         integration.apply_cache_headers(&mut response, false);
 
         let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            get_header_str(&response, header::CACHE_CONTROL),
             Some(expected_cache_control.as_str()),
             "should keep public default caching for non-personalized responses"
         );
@@ -1478,36 +1615,40 @@ mod tests {
     #[test]
     fn rewrite_javascript_response_preserves_headers() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
+        let mut response = make_resp_with_status(StatusCode::OK);
 
-        response.set_header(header::VARY, "Accept-Encoding, Origin");
-        response.set_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "https://example.com");
-        response.set_header(header::CONTENT_ENCODING, "gzip");
-        response.set_header(header::CONTENT_LENGTH, "4");
-        response.set_header(header::CACHE_CONTROL, "no-store");
+        set_header(&mut response, header::VARY, "Accept-Encoding, Origin");
+        set_header(
+            &mut response,
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            "https://example.com",
+        );
+        set_header(&mut response, header::CONTENT_ENCODING, "gzip");
+        set_header(&mut response, header::CONTENT_LENGTH, "4");
+        set_header(&mut response, header::CACHE_CONTROL, "no-store");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        response.set_body("payload");
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
 
-        assert_eq!(response.get_status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.get_header_str(header::CONTENT_TYPE),
+            get_header_str(&response, header::CONTENT_TYPE),
             Some("application/javascript; charset=utf-8")
         );
         let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            get_header_str(&response, header::CACHE_CONTROL),
             Some(expected_cache_control.as_str())
         );
-        assert_eq!(response.get_header_str(header::VARY), Some("Origin"));
+        assert_eq!(get_header_str(&response, header::VARY), Some("Origin"));
         assert_eq!(
-            response.get_header_str(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            get_header_str(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some("https://example.com")
         );
-        assert!(response.get_header(header::CONTENT_ENCODING).is_none());
-        assert!(response.get_header(header::CONTENT_LENGTH).is_none());
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
 
-        let body = response.take_body_bytes();
+        let body = take_body_bytes(response);
         assert_eq!(
             String::from_utf8(body).expect("should decode rewritten JavaScript response"),
             "rewritten"
@@ -1517,20 +1658,24 @@ mod tests {
     #[test]
     fn rewrite_javascript_response_uses_private_no_store_for_cookie_setting_responses() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header(header::SET_COOKIE, "consentUUID=uuid123; Path=/");
-        response.set_header(header::CACHE_CONTROL, "public, max-age=3600");
-        response.set_body("payload");
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(
+            &mut response,
+            header::SET_COOKIE,
+            "consentUUID=uuid123; Path=/",
+        );
+        set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
 
         assert_eq!(
-            response.get_header_str(header::CACHE_CONTROL),
+            get_header_str(&response, header::CACHE_CONTROL),
             Some("private, no-store"),
             "should avoid public caching when rewritten response still sets cookies"
         );
         assert_eq!(
-            response.get_header_str(header::CONTENT_TYPE),
+            get_header_str(&response, header::CONTENT_TYPE),
             Some("application/javascript; charset=utf-8")
         );
     }
@@ -1538,25 +1683,25 @@ mod tests {
     #[test]
     fn rewrite_javascript_response_removes_exact_accept_encoding_vary() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
-        let mut response = Response::from_status(StatusCode::OK);
-        response.set_header(header::VARY, "Accept-Encoding");
-        response.set_body("payload");
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(&mut response, header::VARY, "Accept-Encoding");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
 
-        integration.rewrite_javascript_response(&mut response, "rewritten".to_owned());
+        integration.rewrite_javascript_response(&mut response, "rewritten".to_string());
 
         assert!(
-            response.get_header(header::VARY).is_none(),
+            response.headers().get(header::VARY).is_none(),
             "should remove stale Vary: Accept-Encoding after stripping content encoding"
         );
     }
 
     #[test]
     fn rewrites_single_quoted_origin_plus_unified_pattern() {
-        let input = "return t.origin+'/unified/4.40.1/'}";
+        let input = r#"return t.origin+'/unified/4.40.1/'}"#;
         let output = SourcepointIntegration::rewrite_script_content(input);
 
         assert_eq!(
-            output, "return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}",
+            output, r#"return t.origin+'/integrations/sourcepoint/cdn/unified/4.40.1/'}"#,
             "should rewrite single-quoted unified path"
         );
     }
