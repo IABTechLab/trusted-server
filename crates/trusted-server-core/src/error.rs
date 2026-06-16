@@ -257,11 +257,44 @@ mod tests {
             ),
         ];
 
+        // `mapped_status` is an exhaustive match with no `_` arm, so adding a
+        // new `TrustedServerError` variant fails to compile here until its
+        // status is declared — the per-variant coverage can't silently go
+        // stale. Cross-checking it against the independent `cases` literals
+        // above guards both encodings against drift.
+        fn mapped_status(error: &TrustedServerError) -> StatusCode {
+            match error {
+                TrustedServerError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::Configuration { .. } | TrustedServerError::Settings { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
+                TrustedServerError::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+
         for (error, expected_status) in cases {
             assert_eq!(
                 error.status_code(),
                 expected_status,
                 "should map {error:?} to {expected_status}",
+            );
+            assert_eq!(
+                mapped_status(&error),
+                expected_status,
+                "exhaustive mapping should agree with the table for {error:?}",
             );
         }
     }
