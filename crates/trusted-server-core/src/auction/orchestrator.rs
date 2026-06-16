@@ -266,8 +266,14 @@ impl AuctionOrchestrator {
                 })?;
 
             let response_time_ms = start_time.elapsed().as_millis() as u64;
+            // Use the context-aware parse so mediators (e.g. adserver_mock) can
+            // restore nurl/burl/ad_id and PBS cache fields from the collected SSP
+            // responses. The dispatched collect path already does this; the
+            // synchronous mediation path used by POST /auction and
+            // /__ts/page-bids must match or mediated cache bids lose the metadata
+            // needed for creative rendering and win/billing beacons.
             let mediator_resp = mediator
-                .parse_response(platform_resp, response_time_ms)
+                .parse_response_with_context(platform_resp, response_time_ms, &mediator_context)
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} parse failed", mediator.provider_name()),
@@ -1209,6 +1215,159 @@ mod tests {
         fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
             Some(self.backend.to_string())
         }
+    }
+
+    /// Mediator whose context-aware parse restores `nurl`/`ad_id` (mirroring
+    /// `adserver_mock`), while its context-free parse does not. Lets a test prove
+    /// the synchronous mediation path calls `parse_response_with_context`.
+    struct CacheRestoringMediator;
+
+    fn mediated_bid(nurl: Option<String>) -> Bid {
+        Bid {
+            slot_id: "header-banner".to_string(),
+            price: Some(2.5),
+            currency: "USD".to_string(),
+            creative: Some("<div>ad</div>".to_string()),
+            adomain: None,
+            bidder: "mediator".to_string(),
+            width: 728,
+            height: 90,
+            nurl: nurl.clone(),
+            burl: nurl,
+            ad_id: Some("creative-123".to_string()),
+            cache_id: Some("cache-abc".to_string()),
+            cache_host: None,
+            cache_path: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for CacheRestoringMediator {
+        fn provider_name(&self) -> &'static str {
+            "mediator"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            let req = PlatformHttpRequest::new(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/mediate")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build mediator request"),
+                "mediator-backend",
+            );
+            context
+                .services
+                .http_client()
+                .send_async(req)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "mediator launch failed".to_string(),
+                })
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            // Context-free path: cannot restore SSP-only render/accounting fields.
+            Ok(AuctionResponse::success(
+                "mediator",
+                vec![mediated_bid(None)],
+                response_time_ms,
+            ))
+        }
+
+        async fn parse_response_with_context(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+            _context: &AuctionContext<'_>,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            // Context-aware path: restores nurl/ad_id from the collected SSP bids.
+            Ok(AuctionResponse::success(
+                "mediator",
+                vec![mediated_bid(Some("https://nurl.example/win".to_string()))],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("mediator-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn mediated_bid_preserves_restored_fields_through_run_auction() {
+        // run_parallel_mediation must parse the mediator response via
+        // parse_response_with_context so cache/nurl fields restored from SSP
+        // responses survive the synchronous mediation path (POST /auction,
+        // /__ts/page-bids), matching the dispatched collect path.
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec()); // bidder send_async
+        stub.push_response(200, b"{}".to_vec()); // mediator send_async
+        let services = build_services_with_http_client(stub);
+        // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["bidder".to_string()],
+            mediator: Some("mediator".to_string()),
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "bidder",
+            backend: "bidder-backend",
+        }));
+        orchestrator.register_provider(Arc::new(CacheRestoringMediator));
+
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &req,
+            timeout_ms: 2000,
+            provider_responses: None,
+            services,
+        };
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("mediated auction should complete");
+
+        let bid = result
+            .winning_bids
+            .get("header-banner")
+            .expect("mediator should produce a winning bid for the slot");
+        assert_eq!(
+            bid.nurl.as_deref(),
+            Some("https://nurl.example/win"),
+            "synchronous mediation must restore nurl via parse_response_with_context"
+        );
+        assert_eq!(
+            bid.ad_id.as_deref(),
+            Some("creative-123"),
+            "mediated bid must keep its restored ad_id"
+        );
     }
 
     fn create_test_auction_request() -> AuctionRequest {
