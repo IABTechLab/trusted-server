@@ -161,7 +161,7 @@ sequenceDiagram
   rect rgb(239,246,255)
     Note over Client,Mock: Creative Rendering
     Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative through proxy
-    Note right of Client: iframe src="/first-party/proxy?tsurl=...&tstoken=sig"<br/>Ensures first-party serving<br/>Maintains privacy & security
+    Note right of Client: iframe src="/first-party/proxy?tsurl=...&tstoken=sig"<br/>Ensures first-party serving<br/>Applies signed URL validation
     deactivate Client
   end
 ```
@@ -553,7 +553,7 @@ EC identity is maintained with the `ts-ec` cookie; auction responses do not emit
 
 ## Creative Processing
 
-Winning creatives are processed through a streaming HTML rewriter (`lol_html`) before being returned. This rewrites external resource URLs to first-party proxy paths, maintaining privacy and enabling security controls.
+Winning creatives are processed through a streaming HTML rewriter (`lol_html`) before being returned. This rewrites external resource URLs to first-party proxy paths, applying signed URL validation and enabling security controls.
 
 **Elements rewritten:**
 

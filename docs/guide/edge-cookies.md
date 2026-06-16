@@ -1,24 +1,44 @@
 # Edge Cookies (EC)
 
-Trusted Server's EC module maintains user recognition across all browsers through first-party identifiers.
+Trusted Server persists a stable per-device identifier in a first-party
+cookie on the publisher's domain. The cookie name is `ts-ec`. Trusted
+Server also surfaces the current EC ID on the `x-ts-ec` response
+header, and strips that header when the consent evaluation does not
+permit EC use.
 
-## What are Edge Cookies?
+## Policy Posture
 
-Edge Cookies (EC) are privacy-safe identifiers generated on a first site visit using HMAC-based hashing that allow tracking with user consent while protecting user privacy. Trusted Server derives a deterministic HMAC base from the client IP address and appends a short random suffix to reduce collision risk. They are passed in requests on subsequent visits and activity.
-
-Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
+Trusted Server is technology. It is neutral on policy. The Edge Cookie
+gives the deployer a cookie slot and configuration over the surrounding
+attributes. The deployer determines the policy posture based on the
+laws and contractual arrangements that apply to their deployment.
+Privacy outcomes follow from that configuration, not from the cookie
+mechanism itself.
 
 For full operational onboarding (partner configuration, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
 
 ## How They Work
 
-### HMAC-Based Generation
+EC IDs are generated on first request using HMAC-SHA256 over the
+normalized client IP and a configured secret, with a short random
+suffix appended. On subsequent requests the value is read from the
+`ts-ec` cookie and reused.
 
-EC IDs use HMAC (Hash-based Message Authentication Code) to generate a deterministic base from the client IP address, then append a short random suffix.
+**Format:** `64-hex-hmac`.`6-alphanumeric-suffix`
 
-**Format**: `64-hex-hmac`.`6-alphanumeric-suffix`
+**IP normalization:** IPv4 addresses pass through unchanged. IPv6
+addresses are masked to the /64 prefix before hashing, so a device
+that rotates its interface identifier under Privacy Extensions still
+maps to a stable base.
 
-**IP normalization**: IPv6 addresses are normalized to a /64 prefix before hashing.
+### Determinism and Stability
+
+| Scenario                                                    | Result                                               |
+| ----------------------------------------------------------- | ---------------------------------------------------- |
+| Same client IP, same secret, no cookie                      | Same 64-hex base; fresh suffix each mint.            |
+| Same client IP, same secret, existing cookie                | Existing cookie value reused; no fresh mint.         |
+| Same client IP, different secret                            | Different 64-hex base. Useful for rotating identity. |
+| Multiple clients behind shared NAT, same secret, no cookies | Same 64-hex base; the suffix distinguishes them.     |
 
 ### Request Lifecycle
 
@@ -71,7 +91,7 @@ When consent cannot be verified for the current request — for example, unknown
 
 ## Consent Model
 
-EC creation is gated by jurisdiction. The server detects jurisdiction from geolocation data attached to the request and applies the appropriate consent framework. Live consent comes from request-local signals (`euconsent-v2`, `__gpp`, `__gpp_sid`, `us_privacy`, `Sec-GPC`) plus geolocation and policy defaults; there is no separate consent KV fallback.
+EC creation is gated by jurisdiction. The server detects jurisdiction from geolocation data attached to the request and applies the corresponding consent rules. Live consent comes from request-local signals (`euconsent-v2`, `__gpp`, `__gpp_sid`, `us_privacy`, `Sec-GPC`) plus geolocation and policy defaults; there is no separate consent KV fallback.
 
 ```mermaid
 flowchart TD
@@ -232,20 +252,34 @@ Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source
 
 ## Configuration
 
-Configure EC settings in `trusted-server.toml`. See the full [Configuration Reference](/guide/configuration) for the `[ec]` section and environment variable overrides.
+Configure EC settings in the `[ec]` section of `trusted-server.toml`. See the [Configuration Reference](/guide/configuration) for the full surface and environment variable overrides.
 
-## Privacy Considerations
+The shipped configuration carries a local-development passphrase, and
+known placeholder values are rejected at startup with a settings load
+error, because an HMAC computed with a known secret can be forged by
+anyone who knows it. Replace the development passphrase before
+running outside local development.
 
-- EC IDs combine a deterministic HMAC base derived from the client IP with a random suffix for uniqueness. The cookie is only set when storage consent is present
-- No personally identifiable information (PII) is stored in the ID
-- The hash input is the client IP address only
-- IDs can be rotated by changing the secret key
+## What Goes in the Cookie
 
-## Best Practices
+The EC value is the deterministic HMAC base plus a random suffix. It
+contains no name, email, account identifier, or other field supplied
+by the user. The value is written back as `Set-Cookie` only when the
+consent evaluation permits EC creation for the detected jurisdiction.
+See [GDPR Compliance](/guide/gdpr-compliance) for how signals are
+interpreted.
 
-1. Always verify GDPR consent before generating IDs
-2. Rotate secret keys periodically
-3. Monitor ID collision rates
+The value passes a base64url-compatible allowlist. The cookie envelope
+sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
+`Domain` is computed as `.{publisher.domain}`. The separate
+`cookie_domain` setting applies only to non-EC cookies.
+
+## Operational Notes
+
+- Rotate the secret periodically. Rotation produces a new 64-hex base
+  for subsequent mints.
+- Watch the logs for cookie value rejections, which happen when a
+  `ts-ec` cookie value carries characters outside the allowlist.
 
 ## Runtime Behavior Notes
 
@@ -259,6 +293,7 @@ Configure EC settings in `trusted-server.toml`. See the full [Configuration Refe
 ## Next Steps
 
 - Follow the [EC Setup Guide](/guide/ec-setup-guide)
-- Learn about [GDPR Compliance](/guide/gdpr-compliance)
+- [Configuration Reference](/guide/configuration)
+- [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
 - Configure [Ad Serving](/guide/ad-serving)
-- Learn about [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams
+- [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams

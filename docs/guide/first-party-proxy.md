@@ -1,12 +1,12 @@
 # First-Party Proxy
 
-Learn how Trusted Server proxies third-party assets through first-party domains to improve privacy, security, and ad performance.
+Learn how Trusted Server proxies third-party assets through first-party domains to give the deployer control over routing, security, and ad performance.
 
 ## Overview
 
 The First-Party Proxy system rewrites third-party URLs in ad creatives to route through your domain, providing:
 
-- **Privacy Protection** - No direct third-party cookies or tracking
+- **First-Party Routing** - Rewritten asset requests route through your domain
 - **EC ID Forwarding** - Controlled identity propagation
 - **Creative Rewrites** - Automatic HTML/CSS URL transformation
 - **Click Tracking** - First-party click redirects
@@ -387,7 +387,7 @@ EC IDs are re-applied on **every redirect hop**:
   → 200 response
 ```
 
-This ensures downstream trackers receive consistent IDs even through redirect chains.
+This ensures downstream endpoints receive consistent IDs even through redirect chains.
 
 ### Click ID Forwarding
 
@@ -404,10 +404,10 @@ User clicks → redirect includes ID:
 Location: https://advertiser.com?ts-ec=user123
 ```
 
-::: tip Privacy Control
+::: tip Forwarding Conditions
 EC IDs are only forwarded when:
 
-1. User has given GDPR consent (if required)
+1. Consent rules permitted the EC ID to be issued (issuance is gated per jurisdiction)
 2. ID exists in request (header/cookie)
 3. Integration hasn't disabled forwarding (`forward_ec_id: false`)
    :::
@@ -665,7 +665,7 @@ Trusted Server:
 
 **Automatic Protection**:
 
-- HTML/CSS rewriting removes malicious URLs
+- HTML/CSS rewriting routes URLs through signed first-party endpoints
 - Data URIs are skipped (`data:`, `javascript:`, `blob:`)
 - Protocol validation (only `http://` and `https://`)
 

@@ -60,7 +60,7 @@ Edit `trusted-server.toml` to configure:
 - Ad server integrations
 - KV store mappings
 - EC configuration
-- GDPR settings
+- Consent settings (`[gdpr]`)
 
 See [Configuration](/guide/configuration) for details.
 

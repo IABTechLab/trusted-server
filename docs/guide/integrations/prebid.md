@@ -6,7 +6,7 @@
 
 ## Overview
 
-The Prebid integration enables server-side header bidding through Prebid Server while maintaining first-party context and privacy compliance.
+The Prebid integration enables server-side header bidding through Prebid Server while maintaining first-party context and applying publisher-configured consent enforcement.
 
 ## What is Prebid?
 
@@ -124,12 +124,12 @@ Full OpenRTB protocol conversion:
 
 - Converts ad units to OpenRTB `imp` objects
 - Injects publisher domain and page URL
-- Adds EC ID for privacy-safe tracking
+- Injects EC ID into bid requests for user recognition
 - Supports banner formats (video and native are currently not emitted by the Prebid provider)
 
 ### EC ID Injection
 
-Automatically injects privacy-preserving EC ID into bid requests for user recognition without cookies.
+Automatically injects EC ID into bid requests for user recognition via first-party context.
 
 ### Request Signing
 
@@ -221,7 +221,7 @@ the outgoing bidder params become:
 { "kargo": { "placementId": "_s2sHeaderPlacement" } }
 ```
 
-For an unrecognised zone (e.g., `sidebar`), the incoming params are left unchanged.
+For an unrecognized zone (e.g., `sidebar`), the incoming params are left unchanged.
 
 **Environment variable**:
 
@@ -494,4 +494,4 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Review [Ad Serving Guide](/guide/ad-serving) for general concepts
 - Check [OpenRTB Support](/roadmap) on the roadmap for enhancements
 - Explore [Request Signing](/guide/request-signing) for authentication
-- Learn about [Edge Cookies](/guide/edge-cookies) for privacy-safe tracking
+- Learn about [Edge Cookies](/guide/edge-cookies) for state management

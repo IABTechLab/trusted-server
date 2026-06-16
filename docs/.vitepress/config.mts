@@ -36,7 +36,7 @@ export default withMermaid(
   defineConfig({
     title: 'Trusted Server',
     description:
-      'Privacy-preserving edge computing for ad serving and edge cookie (EC) generation',
+      'Edge computing for ad serving, consent signal handling, and edge cookie (EC) generation',
     base: '/trusted-server',
 
     // Replace version placeholders like {{NODEJS_VERSION}} with values from .tool-versions

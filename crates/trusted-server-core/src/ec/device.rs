@@ -33,7 +33,7 @@ pub struct DeviceSignals {
     /// Coarse OS family: `"mac"`, `"windows"`, `"ios"`, `"android"`,
     /// `"linux"`.
     pub platform_class: Option<String>,
-    /// SHA256 prefix (12 hex chars) of raw H2 SETTINGS fingerprint.
+    /// SHA256 prefix (12 hex chars) of the raw H2 SETTINGS string.
     pub h2_fp_hash: Option<String>,
     /// `true` = known browser, `false` = known bot, `None` = unknown.
     pub known_browser: Option<bool>,
@@ -65,8 +65,8 @@ impl DeviceSignals {
     /// Returns `true` when the request looks like a real browser.
     ///
     /// Checks for the presence of recognizable signals rather than matching
-    /// against a hardcoded fingerprint allowlist. Real browsers always
-    /// produce a valid TLS fingerprint (`ja4_class`) and a recognizable UA
+    /// against a hardcoded signal allowlist. Real browsers always
+    /// produce a valid TLS probabilistic identifier (`ja4_class`) and a recognizable UA
     /// platform string (`platform_class`). Raw HTTP clients (curl, Python
     /// requests, Go net/http, headless scrapers) typically lack one or both.
     ///
@@ -146,11 +146,11 @@ fn parse_platform_class(ua: &str) -> Option<String> {
     None
 }
 
-/// Extracts Section 1 from a full JA4 fingerprint.
+/// Extracts Section 1 from a full JA4 string.
 ///
 /// JA4 format: `section1_section2_section3` separated by underscores.
 /// Section 1 identifies browser family (cipher count, extension count,
-/// ALPN) without uniquely fingerprinting a device.
+/// ALPN) without uniquely identifying a device.
 ///
 /// Returns `None` if the input is empty or has no underscore-delimited
 /// section.
@@ -164,7 +164,7 @@ fn extract_ja4_section1(full_ja4: &str) -> Option<String> {
 }
 
 /// Computes a 12-hex-char prefix of the SHA256 hash of the raw H2
-/// SETTINGS fingerprint string.
+/// SETTINGS string.
 ///
 /// The raw string looks like `"1:65536;2:0;4:6291456;6:262144"`.
 #[must_use]
@@ -175,7 +175,7 @@ fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
     hex::encode(&digest[..6])
 }
 
-/// Known browser fingerprint allowlist.
+/// Known browser signal allowlist.
 ///
 /// Each entry is `(ja4_class, h2_fp_prefix, known_browser)`.
 /// `h2_fp_prefix` is the raw H2 SETTINGS string (not the hash) — we
@@ -191,7 +191,7 @@ const KNOWN_BROWSERS: &[(&str, &str, bool)] = &[
     ("t13d1717h2", "1:65536;2:0;4:131072;5:16384", true),
 ];
 
-/// Returns H2 fingerprint hashes for the known browser allowlist.
+/// Returns H2 SETTINGS hashes for the known browser allowlist.
 ///
 /// Computed once on first call and cached via `OnceLock`.
 fn known_browser_h2_hashes() -> &'static Vec<(&'static str, String, bool)> {
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Chrome fingerprint should be recognized"
+            "Chrome signals should be recognized"
         );
     }
 
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Safari fingerprint should be recognized"
+            "Safari signals should be recognized"
         );
     }
 
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(
             evaluate_known_browser(Some(ja4), Some(&h2_hash)),
             Some(true),
-            "Firefox fingerprint should be recognized"
+            "Firefox signals should be recognized"
         );
     }
 
@@ -538,7 +538,7 @@ mod tests {
         );
         assert!(
             signals.looks_like_browser(),
-            "unknown fingerprint with valid JA4 + platform should pass"
+            "unknown signal combination with valid JA4 + platform should pass"
         );
         assert_eq!(signals.known_browser, None, "should not match allowlist");
     }
@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn looks_like_browser_rejects_missing_ja4() {
-        // Real UA but no TLS fingerprint (e.g. HTTP/1.1 or missing SDK support)
+        // Real UA but no JA4 value (e.g. HTTP/1.1 or missing SDK support)
         let signals = DeviceSignals::derive(CHROME_MAC_UA, None, Some("1:65536"));
         assert!(
             !signals.looks_like_browser(),

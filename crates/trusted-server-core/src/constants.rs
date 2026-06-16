@@ -43,7 +43,7 @@ pub const HEADER_REFERER: HeaderName = HeaderName::from_static("referer");
 ///
 /// These headers are used internally by Trusted Server for identity, geo-enrichment,
 /// debugging, and compression hints. Leaking them to external origins could expose
-/// user tracking data and internal implementation details.
+/// user identity, geo data, and internal implementation details.
 ///
 /// Uses `&str` slices because `HeaderName` has interior mutability and cannot appear
 /// in `const` context.

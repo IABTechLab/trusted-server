@@ -870,7 +870,7 @@ mod tests {
         );
         assert!(
             body.contains("h2_fp:       unavailable"),
-            "should include H2 fingerprint fallback"
+            "should include H2 probabilistic identifier fallback"
         );
         assert!(
             body.contains("cipher:      unavailable"),
