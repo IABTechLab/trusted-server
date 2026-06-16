@@ -10,45 +10,42 @@ epic [#480](https://github.com/IABTechLab/trusted-server/issues/480)).
 
 Config store name: **`trusted_server_config`** (Fastly service config store)
 
-| Key                    | Type                 | Effect                                                                                                                            |
-| ---------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                      |
-| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"100"`. |
+| Key                    | Type                 | Effect                                                                                                                                                |
+| ---------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                                          |
+| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"0"` (fail safe to legacy). |
 
 **Routing logic:** `fnv1a_bucket(client_ip) < edgezero_rollout_pct` → EdgeZero, else legacy.
-Same client IP always gets the same bucket — routing is sticky per user.
+Same client IP always gets the same bucket — routing is sticky per client IP (not per
+user; a user whose IP changes, e.g. mobile roaming or ISP reassignment, may re-bucket and
+switch paths, and could observe inconsistent identity if the two paths differ in EC handling).
 
 ### Safe defaults / failure modes
 
-| Condition                                           | Effective behaviour   |
-| --------------------------------------------------- | --------------------- |
-| Config store unreachable                            | All legacy            |
-| `edgezero_enabled` unreadable                       | All legacy            |
-| `edgezero_rollout_pct` absent (but enabled=true)    | All EdgeZero (100%)   |
-| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy            |
-| `edgezero_rollout_pct = "0"`                        | All legacy (rollback) |
+| Condition                                           | Effective behaviour    |
+| --------------------------------------------------- | ---------------------- |
+| Config store unreachable                            | All legacy             |
+| `edgezero_enabled` unreadable                       | All legacy             |
+| `edgezero_rollout_pct` absent (but enabled=true)    | All legacy (fail safe) |
+| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy             |
+| `edgezero_rollout_pct = "0"`                        | All legacy (rollback)  |
 
-> ⚠️ **Do NOT delete `edgezero_rollout_pct` while `edgezero_enabled = "true"`.** An absent key
-> is treated as 100 (full rollout) for backward compatibility. If you want to pause or roll back,
-> **set the value to `"0"`** — do not delete it.
+> **Note:** Every non-explicit state fails safe to legacy — an absent, invalid, or unreadable
+> `edgezero_rollout_pct` all route 100% to the legacy path, so deleting the key can never trigger
+> a cutover. To roll out, set an explicit percentage; to pause or roll back, set `"0"`.
 
 ---
 
 ## Canary progression
 
 > **Pre-condition:** All Phase 5 verification gates (PR18) passed.
->
-> **Production key setup order (important):** Set `edgezero_rollout_pct = "0"` in the
-> production config store **before** setting `edgezero_enabled = "true"`. If you set
-> `edgezero_enabled` first and `edgezero_rollout_pct` is absent, the absent-key default
-> (100) kicks in immediately, routing all traffic to EdgeZero without a staged canary.
 
 ### Pre-flight activation
 
 Before advancing any stage, activate the canary switch:
 
-1. Confirm `edgezero_rollout_pct = "0"` is already set in the production config store
-   (set it now if not — the pre-condition above explains why this must come first).
+1. Confirm `edgezero_rollout_pct = "0"` (or absent — both fail safe to legacy) in the
+   production config store. Setting it explicitly to `"0"` documents intent.
 2. Set `edgezero_enabled = "true"` in the production config store.
 3. Confirm the flag is live and all traffic is still on the legacy path.
    `rollout_pct = "0"` deterministically short-circuits every request to the

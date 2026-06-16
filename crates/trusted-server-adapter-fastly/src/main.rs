@@ -185,7 +185,7 @@ fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly:
 ///
 /// | Config store state              | Return value | Effect                     |
 /// |---------------------------------|--------------|----------------------------|
-/// | Key absent                      | `100`        | Full rollout (backward compat) |
+/// | Key absent                      | `0`          | All legacy (safe default)  |
 /// | Key present, valid 0–100        | parsed value | Partial or full rollout    |
 /// | Key present, invalid            | `0`          | All legacy (safe default)  |
 /// | Key read error                  | `0`          | All legacy (safe default)  |
@@ -202,14 +202,15 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
             }
         },
         Ok(None) => {
-            // Fires per-request when the key is absent and edgezero_enabled=true, so
-            // emit at debug to avoid a per-request warn flood at production QPS. The
-            // setup procedure (set edgezero_rollout_pct = "0" before edgezero_enabled
-            // = "true") and the migration runbook are the operational safety net here.
+            // Absent key fails safe to legacy, matching every other failure branch
+            // (unreadable flag, invalid value, read error all resolve to legacy).
+            // Deleting the key can never trigger a full cutover. Fires per-request
+            // when the key is absent and edgezero_enabled=true, so emit at debug to
+            // avoid a per-request log flood at production QPS.
             log::debug!(
-                "edgezero_rollout_pct key absent, defaulting to 100 (full rollout — backward compat)"
+                "edgezero_rollout_pct key absent, defaulting to 0 (legacy path — fail safe)"
             );
-            100
+            0
         }
         Err(e) => {
             log::warn!("failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)");
@@ -1403,11 +1404,11 @@ mod tests {
     }
 
     #[test]
-    fn read_rollout_pct_absent_defaults_to_full_rollout() {
+    fn read_rollout_pct_absent_defaults_to_legacy() {
         assert_eq!(
             read_rollout_pct(&rollout_handle(StubResponse::Absent)),
-            100,
-            "absent key should default to 100 (backward compat)"
+            0,
+            "absent key should fail safe to 0 (legacy), like every other failure branch"
         );
     }
 

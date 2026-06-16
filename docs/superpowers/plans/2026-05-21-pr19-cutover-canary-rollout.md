@@ -607,14 +607,22 @@ Rollback is **immediate, no deploy required**.
 
 ## Monitoring
 
-Fastly real-time stats dashboard. Key signals at each canary stage:
+Fastly real-time stats dashboard, **aggregate service metrics only**. There is no
+production per-branch (EdgeZero vs legacy) route attribution: route-decision logs are
+emitted at `debug!` and Fastly Compute does not surface `EDGEZERO_LOG_LEVEL`, so they
+appear only in local Viceroy runs. No `x-edgezero-path` / real-time-stats branch split
+exists yet (tracked as a follow-up). Verify each stage by watching aggregate metrics move
+as `rollout_pct` is stepped, not by per-request branch tagging.
+
+Key signals at each canary stage:
 
 - **Error rate:** `5xx / total_requests` by edge PoP
-- **Latency p95:** use log search for `routing request through EdgeZero path` to identify EdgeZero traffic (`x-edgezero-path` instrumentation header does not exist yet — follow-up task)
+- **Latency p95:** aggregate service latency; correlate shifts with the active `rollout_pct` stage
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> Log lines in Viceroy / Fastly log tailing:
+> Route-decision log lines are **local Viceroy only** (run with `EDGEZERO_LOG_LEVEL=debug`;
+> the logger defaults to `Info` and suppresses them in production):
 > `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
 > `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
 

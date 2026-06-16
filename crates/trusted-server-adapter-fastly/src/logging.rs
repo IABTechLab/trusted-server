@@ -24,6 +24,11 @@ fn target_label(target: &str) -> &str {
 /// Compute does not surface arbitrary process environment variables, so the
 /// override is effectively local-only and the level stays at the safe default
 /// when the variable is unset or unparseable.
+///
+/// Fastly-only by design: this knob is safe here *because* Compute hides runtime
+/// env vars. It must not be copied verbatim into the axum/spin/cloudflare
+/// adapters, which run where env vars are readable — there it would reintroduce
+/// the per-request production debug flood this path deliberately avoids.
 const LOG_LEVEL_ENV: &str = "EDGEZERO_LOG_LEVEL";
 
 /// Resolves the logger's maximum level from an optional configured value,
@@ -41,8 +46,9 @@ fn resolve_max_level(configured: Option<&str>) -> log::LevelFilter {
 /// of the record's target module path.
 ///
 /// The maximum level defaults to `Info`. Setting the [`LOG_LEVEL_ENV`]
-/// environment variable (e.g. `EDGEZERO_LOG_LEVEL=debug`) raises it for local
-/// Viceroy validation; see [`resolve_max_level`].
+/// environment variable (e.g. `EDGEZERO_LOG_LEVEL=debug`) overrides it for local
+/// Viceroy validation — the value is used as-is, so `error`/`off` lowers it just
+/// as `debug` raises it; see [`resolve_max_level`].
 ///
 /// # Panics
 ///
