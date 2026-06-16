@@ -11,30 +11,40 @@ pub enum PriceGranularity {
     Auto,
 }
 
+/// Convert a CPM in dollars to whole cents, flooring to the cent.
+///
+/// Multiplying by 100 and flooring directly under-buckets common CPMs because
+/// many two-decimal values are not exactly representable in binary floating
+/// point: `0.29 * 100.0` is `28.999…`, which would truncate to `28` ("0.28").
+/// A tiny epsilon corrects values sitting an ULP below a cent boundary without
+/// promoting genuinely sub-cent values — `0.015` (`1.4999…`) still floors to
+/// `1` ("0.01"), while `0.29` correctly yields `29`.
+fn cpm_to_cents(cpm: f64) -> u64 {
+    const CENT_EPSILON: f64 = 1e-6;
+    (cpm * 100.0 + CENT_EPSILON).floor() as u64
+}
+
 #[must_use]
 pub fn price_bucket(cpm: f64, granularity: PriceGranularity) -> String {
-    // Reject NaN / Inf early so the `(x * 100.0).floor() as u64` cast below
-    // can never see a non-finite value (the cast's behaviour for NaN/Inf is
-    // implementation-defined in Rust and "saturate to 0" only by convention).
+    // Reject NaN / Inf early so the cast in `cpm_to_cents` can never see a
+    // non-finite value (the cast's behaviour for NaN/Inf is implementation-
+    // defined in Rust and "saturate to 0" only by convention).
     if !cpm.is_finite() || cpm <= 0.0 {
         return "0.00".to_string();
     }
     match granularity {
         PriceGranularity::Low => {
-            let capped = cpm.min(5.0);
-            let cents = (capped * 100.0).floor() as u64;
+            let cents = cpm_to_cents(cpm.min(5.0));
             let bucketed_cents = (cents / 50) * 50;
             format!("{:.2}", bucketed_cents as f64 / 100.0)
         }
         PriceGranularity::Medium => {
-            let capped = cpm.min(20.0);
-            let cents = (capped * 100.0).floor() as u64;
+            let cents = cpm_to_cents(cpm.min(20.0));
             let bucketed_cents = (cents / 10) * 10;
             format!("{:.2}", bucketed_cents as f64 / 100.0)
         }
         PriceGranularity::High => {
-            let capped = cpm.min(20.0);
-            let cents = (capped * 100.0).floor() as u64;
+            let cents = cpm_to_cents(cpm.min(20.0));
             format!("{:.2}", cents as f64 / 100.0)
         }
         PriceGranularity::Dense | PriceGranularity::Auto => dense_bucket(cpm),
@@ -46,17 +56,14 @@ fn dense_bucket(cpm: f64) -> String {
         return "20.00".to_string();
     }
     if cpm >= 8.0 {
-        let cents = (cpm * 100.0).floor() as u64;
-        let bucketed_cents = (cents / 50) * 50;
+        let bucketed_cents = (cpm_to_cents(cpm) / 50) * 50;
         return format!("{:.2}", bucketed_cents as f64 / 100.0);
     }
     if cpm >= 3.0 {
-        let cents = (cpm * 100.0).floor() as u64;
-        let bucketed_cents = (cents / 5) * 5;
+        let bucketed_cents = (cpm_to_cents(cpm) / 5) * 5;
         return format!("{:.2}", bucketed_cents as f64 / 100.0);
     }
-    let cents = (cpm * 100.0).floor() as u64;
-    format!("{:.2}", cents as f64 / 100.0)
+    format!("{:.2}", cpm_to_cents(cpm) as f64 / 100.0)
 }
 
 #[cfg(test)]
@@ -120,6 +127,19 @@ mod tests {
             price_bucket(2.53, PriceGranularity::Auto),
             price_bucket(2.53, PriceGranularity::Dense)
         );
+    }
+
+    #[test]
+    fn float_boundary_cpms_are_not_under_bucketed() {
+        // These two-decimal CPMs are not exactly representable in binary float
+        // (`0.29 * 100.0 == 28.999…`); a naive floor truncates them a cent low.
+        assert_eq!(price_bucket(0.29, PriceGranularity::Dense), "0.29");
+        assert_eq!(price_bucket(1.15, PriceGranularity::Dense), "1.15");
+        assert_eq!(price_bucket(0.29, PriceGranularity::High), "0.29");
+        assert_eq!(price_bucket(1.15, PriceGranularity::High), "1.15");
+        // Genuinely sub-cent values must still floor, not round up.
+        assert_eq!(price_bucket(0.289, PriceGranularity::High), "0.28");
+        assert_eq!(price_bucket(0.015, PriceGranularity::Dense), "0.01");
     }
 
     #[test]
