@@ -4697,6 +4697,52 @@ formats = [{ width = 300, height = 250 }]
         );
     }
 
+    #[test]
+    fn settings_rejects_env_injected_invalid_creative_opportunity_slot_id() {
+        // A TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT override must go through
+        // the same runtime slot validation as a TOML-defined slot, so an invalid
+        // id injected via env is rejected by from_toml_and_env (the build-time
+        // path uses the same validation against the merged config).
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+"#;
+        let slot_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}SLOT",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            slot_key,
+            Some(
+                r#"[{"id":"bad id","page_patterns":["/"],"formats":[{"width":300,"height":250}]}]"#,
+            ),
+            || {
+                let err = Settings::from_toml_and_env(toml)
+                    .expect_err("should reject env-injected invalid slot id");
+                assert!(
+                    format!("{err:?}").contains("Invalid creative opportunity slot config"),
+                    "error should mention the invalid slot id, got: {err:?}"
+                );
+            },
+        );
+    }
+
     fn creative_opportunity_settings_toml(slot_body: &str) -> String {
         format!(
             r#"
