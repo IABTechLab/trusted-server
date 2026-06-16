@@ -10,19 +10,23 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use fastly::http::{header, Method, StatusCode};
-use fastly::{Request, Response};
+use http::header::{self, HeaderMap, HeaderValue};
+use http::{Method, StatusCode};
 use serde::Deserialize;
 use validator::Validate;
 
-use crate::backend::BackendConfig;
-use crate::compat;
+use crate::constants::INTERNAL_HEADERS;
+use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::integrations::{
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
+    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
+use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const LOCKR_INTEGRATION_ID: &str = "lockr";
@@ -105,67 +109,83 @@ impl LockrIntegration {
     async fn handle_sdk_serving(
         &self,
         _settings: &Settings,
-        _req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
+        services: &RuntimeServices,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let sdk_url = &self.config.sdk_url;
         log::info!("Fetching Lockr SDK from {}", sdk_url);
 
         // TODO: Check KV store cache first (future enhancement)
 
-        let mut lockr_req = Request::new(Method::GET, sdk_url);
-        lockr_req.set_header(header::USER_AGENT, "TrustedServer/1.0");
-        lockr_req.set_header(header::ACCEPT, "application/javascript, */*");
+        let lockr_req = http::Request::builder()
+            .method(Method::GET)
+            .uri(sdk_url)
+            .header(header::USER_AGENT, "TrustedServer/1.0")
+            .header(header::ACCEPT, "application/javascript, */*")
+            .body(EdgeBody::empty())
+            .change_context(Self::error("Failed to build Lockr SDK request"))?;
 
-        let backend_name = BackendConfig::from_url(sdk_url, true)
+        let backend_name = Self::backend_name_for_url(services, sdk_url)
             .change_context(Self::error("Failed to determine backend for SDK fetch"))?;
 
-        let mut lockr_response =
-            lockr_req
-                .send(backend_name)
-                .change_context(Self::error(format!(
-                    "Failed to fetch Lockr SDK from {}",
-                    sdk_url
-                )))?;
+        let lockr_response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(lockr_req, backend_name))
+            .await
+            .change_context(Self::error(format!(
+                "Failed to fetch Lockr SDK from {}",
+                sdk_url
+            )))?
+            .response;
 
-        if !lockr_response.get_status().is_success() {
+        if !lockr_response.status().is_success() {
             log::error!(
                 "Lockr SDK fetch failed with status {}",
-                lockr_response.get_status()
+                lockr_response.status()
             );
             return Err(Report::new(Self::error(format!(
                 "Lockr SDK returned error status: {}",
-                lockr_response.get_status()
+                lockr_response.status()
             ))));
         }
 
-        let sdk_body = lockr_response.take_body_bytes();
+        let sdk_body = collect_response_bounded(
+            lockr_response.into_body(),
+            UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+            LOCKR_INTEGRATION_ID,
+        )
+        .await
+        .change_context(Self::error("Failed to read Lockr SDK response body"))?;
         log::info!("Fetched Lockr SDK ({} bytes)", sdk_body.len());
 
         // TODO: Cache in KV store (future enhancement)
 
-        Ok(Response::from_status(StatusCode::OK)
-            .with_header(
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header(
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             )
-            .with_header(
+            .header(
                 header::CACHE_CONTROL,
                 format!("public, max-age={}", self.config.cache_ttl_seconds),
             )
-            .with_header("X-Lockr-SDK-Proxy", "true")
-            .with_header("X-Lockr-SDK-Mode", "trust-server")
-            .with_header("X-SDK-Source", sdk_url)
-            .with_body(sdk_body))
+            .header("X-Lockr-SDK-Proxy", "true")
+            .header("X-Lockr-SDK-Mode", "trust-server")
+            .header("X-SDK-Source", sdk_url)
+            .body(EdgeBody::from(sdk_body))
+            .change_context(Self::error("Failed to build Lockr SDK response"))
     }
 
     /// Handle API proxy — forward requests to the configured Lockr API endpoint.
     async fn handle_api_proxy(
         &self,
         _settings: &Settings,
-        mut req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let original_path = req.get_path();
-        let method = req.get_method();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let (parts, body) = req.into_parts();
+        let original_path = parts.uri.path().to_string();
+        let method = parts.method.clone();
 
         log::info!("Proxying Lockr API request: {} {}", method, original_path);
 
@@ -175,8 +195,8 @@ impl LockrIntegration {
             .strip_prefix("/integrations/lockr/api")
             .ok_or_else(|| Self::error(format!("Invalid Lockr API path: {}", original_path)))?;
 
-        let query = req
-            .get_url()
+        let query = parts
+            .uri
             .query()
             .map(|q| format!("?{}", q))
             .unwrap_or_default();
@@ -184,30 +204,36 @@ impl LockrIntegration {
 
         log::info!("Forwarding to Lockr API: {}", target_url);
 
-        let mut target_req = Request::new(method.clone(), &target_url);
-        self.copy_request_headers(&req, &mut target_req);
-
-        if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-            let body = req.take_body();
-            target_req.set_body(body);
-        }
-
-        let backend_name = BackendConfig::from_url(&self.config.api_endpoint, true)
-            .change_context(Self::error("Failed to determine backend for API proxy"))?;
-
-        let response = match target_req.send(backend_name) {
-            Ok(res) => res,
-            Err(e) => {
-                return Err(Self::error(format!(
-                    "failed to forward request to {}, {}",
-                    target_url,
-                    e.root_cause()
-                ))
-                .into());
-            }
+        let request_body = if method == Method::POST {
+            let bytes =
+                collect_body_bounded(body, INTEGRATION_MAX_BODY_BYTES, LOCKR_INTEGRATION_ID)
+                    .await?;
+            EdgeBody::from(bytes)
+        } else {
+            EdgeBody::empty()
         };
 
-        log::info!("Lockr API responded with status {}", response.get_status());
+        let mut target_req = http::Request::builder()
+            .method(method.clone())
+            .uri(&target_url)
+            .body(request_body)
+            .change_context(Self::error("Failed to build Lockr API proxy request"))?;
+        self.copy_request_headers(&parts.headers, target_req.headers_mut())?;
+
+        let backend_name = Self::backend_name_for_url(services, &self.config.api_endpoint)
+            .change_context(Self::error("Failed to determine backend for API proxy"))?;
+
+        let response = services
+            .http_client()
+            .send(PlatformHttpRequest::new(target_req, backend_name))
+            .await
+            .change_context(Self::error(format!(
+                "Failed to forward request to {}",
+                target_url
+            )))?
+            .response;
+
+        log::info!("Lockr API responded with status {}", response.status());
 
         Ok(response)
     }
@@ -217,7 +243,11 @@ impl LockrIntegration {
     /// Consent cookies are always stripped — consent signals are forwarded
     /// through the `OpenRTB` body by the Prebid integration, not through
     /// Lockr's cookie-based API calls.
-    fn copy_request_headers(&self, from: &Request, to: &mut Request) {
+    fn copy_request_headers(
+        &self,
+        from: &HeaderMap<HeaderValue>,
+        to: &mut HeaderMap<HeaderValue>,
+    ) -> Result<(), Report<TrustedServerError>> {
         let headers_to_copy = [
             header::CONTENT_TYPE,
             header::ACCEPT,
@@ -228,25 +258,73 @@ impl LockrIntegration {
         ];
 
         for header_name in &headers_to_copy {
-            if let Some(value) = from.get_header(header_name) {
-                to.set_header(header_name, value);
+            if let Some(value) = from.get(header_name) {
+                to.insert(header_name, value.clone());
             }
         }
 
         // Always strip consent cookies — consent travels through the OpenRTB body
-        compat::forward_fastly_cookie_header(from, to, true);
+        self.copy_cookie_header(from, to)?;
 
         // Use origin override if configured, otherwise forward original
-        let origin = self
-            .config
-            .origin_override
-            .as_deref()
-            .or_else(|| from.get_header_str(header::ORIGIN));
+        let origin = self.config.origin_override.as_deref().or_else(|| {
+            from.get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok())
+        });
         if let Some(origin) = origin {
-            to.set_header(header::ORIGIN, origin);
+            match HeaderValue::from_str(origin) {
+                Ok(value) => {
+                    to.insert(header::ORIGIN, value);
+                }
+                Err(error) => {
+                    log::warn!("Skipping invalid Lockr origin header value '{origin}': {error}");
+                }
+            }
         }
 
-        compat::copy_fastly_custom_headers(from, to);
+        for (name, value) in from {
+            let name_str = name.as_str();
+            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
+                to.append(name.clone(), value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_cookie_header(
+        &self,
+        from: &HeaderMap<HeaderValue>,
+        to: &mut HeaderMap<HeaderValue>,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let Some(cookie_value) = from.get(header::COOKIE) else {
+            return Ok(());
+        };
+
+        match cookie_value.to_str() {
+            Ok(value) => {
+                let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
+                if stripped.is_empty() {
+                    return Ok(());
+                }
+
+                let cookie_header = HeaderValue::from_str(&stripped)
+                    .change_context(Self::error("Failed to rebuild stripped cookie header"))?;
+                to.insert(header::COOKIE, cookie_header);
+            }
+            Err(_) => {
+                to.insert(header::COOKIE, cookie_value.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backend_name_for_url(
+        services: &RuntimeServices,
+        target_url: &str,
+    ) -> Result<String, Report<TrustedServerError>> {
+        ensure_integration_backend(services, target_url, LOCKR_INTEGRATION_ID, None)
     }
 }
 
@@ -303,14 +381,15 @@ impl IntegrationProxy for LockrIntegration {
     async fn handle(
         &self,
         settings: &Settings,
-        req: Request,
-    ) -> Result<Response, Report<TrustedServerError>> {
-        let path = req.get_path();
+        services: &RuntimeServices,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        let path = req.uri().path().to_string();
 
         if path == "/integrations/lockr/sdk" {
-            self.handle_sdk_serving(settings, req).await
+            self.handle_sdk_serving(settings, services).await
         } else if path.starts_with("/integrations/lockr/api/") {
-            self.handle_api_proxy(settings, req).await
+            self.handle_api_proxy(settings, services, req).await
         } else {
             Err(Report::new(Self::error(format!(
                 "Unknown Lockr route: {}",
@@ -374,9 +453,13 @@ fn default_rewrite_sdk() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
     use crate::test_support::tests::create_test_settings;
 
     fn test_config() -> LockrConfig {
@@ -485,6 +568,36 @@ mod tests {
             result,
             AttributeRewriteAction::Keep,
             "should keep all URLs when rewrite_sdk is disabled"
+        );
+    }
+
+    #[test]
+    fn lockr_proxy_uses_platform_http_client() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = LockrIntegration::new(test_config());
+        let req = http::Request::builder()
+            .method(HttpMethod::GET)
+            .uri("https://publisher.example/integrations/lockr/api/publisher/app/v1/identityLockr/settings")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed response"
+        );
+        assert_eq!(
+            stub.recorded_backend_names().len(),
+            1,
+            "should route one outbound request through PlatformHttpClient"
         );
     }
 

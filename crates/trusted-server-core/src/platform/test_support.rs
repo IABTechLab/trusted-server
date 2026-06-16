@@ -9,8 +9,9 @@ use rand::rngs::OsRng;
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
-    PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
 use crate::request_signing::{JWKS_STORE_NAME, SIGNING_STORE_NAME};
 
@@ -201,7 +202,7 @@ struct StubPendingResponse {
 /// Test stub for [`PlatformHttpClient`] that records call backend names and
 /// returns pre-queued canned responses for `send`, `send_async`, and `select`.
 ///
-/// Responses are stored as `(status_code, body_bytes)` to remain [`Send`].
+/// Responses are stored as status/body/header parts to remain [`Send`].
 /// [`PlatformResponse`] contains [`edgezero_core::body::Body`] which wraps a
 /// `LocalBoxStream` that is `!Send`, so it cannot be stored directly in a
 /// `Mutex` field.
@@ -212,10 +213,21 @@ struct StubPendingResponse {
 /// sites.
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
-    // (status_code, body_bytes) — kept Send by avoiding Body::Stream
-    responses: Mutex<VecDeque<(u16, Vec<u8>)>>,
+    responses: Mutex<VecDeque<StubHttpResponse>>,
     // Headers captured per send call, stored as (name, value) string pairs.
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
+    // Queued select() errors — each pop makes the next select() return ready: Err.
+    select_errors: Mutex<VecDeque<()>>,
+    image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
+    stream_response_flags: Mutex<Vec<bool>>,
+    request_methods: Mutex<Vec<String>>,
+    request_uris: Mutex<Vec<String>>,
+}
+
+struct StubHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
 }
 
 impl StubHttpClient {
@@ -224,20 +236,95 @@ impl StubHttpClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
+            select_errors: Mutex::new(VecDeque::new()),
+            image_optimizer_options: Mutex::new(Vec::new()),
+            stream_response_flags: Mutex::new(Vec::new()),
+            request_methods: Mutex::new(Vec::new()),
+            request_uris: Mutex::new(Vec::new()),
         }
     }
 
     /// Queue a canned response by status code and body bytes.
     pub fn push_response(&self, status: u16, body: Vec<u8>) {
+        self.push_response_with_headers(status, body, Vec::<(String, String)>::new());
+    }
+
+    /// Queue a canned response with headers.
+    pub fn push_response_with_headers(
+        &self,
+        status: u16,
+        body: Vec<u8>,
+        headers: Vec<(impl Into<String>, impl Into<String>)>,
+    ) {
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
         self.responses
             .lock()
             .expect("should lock responses")
-            .push_back((status, body));
+            .push_back(StubHttpResponse {
+                status,
+                body,
+                headers,
+            });
+    }
+
+    /// Inject a `select()` error: the next call to `select()` will return
+    /// `ready: Err(...)` with the failed request's backend name in
+    /// `failed_backend_name`. The corresponding queued response is consumed.
+    pub fn push_select_error(&self) {
+        self.select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .push_back(());
     }
 
     /// Return backend names recorded across all `send` calls, in order.
     pub fn recorded_backend_names(&self) -> Vec<String> {
         self.calls.lock().expect("should lock calls").clone()
+    }
+
+    /// Return the request headers captured per `send` call, in order.
+    ///
+    /// Each entry is the set of `(name, value)` pairs from one call.
+    pub fn recorded_request_headers(&self) -> Vec<Vec<(String, String)>> {
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .clone()
+    }
+
+    /// Return Image Optimizer metadata captured per `send` call, in order.
+    pub fn recorded_image_optimizer_options(&self) -> Vec<Option<PlatformImageOptimizerOptions>> {
+        self.image_optimizer_options
+            .lock()
+            .expect("should lock image optimizer options")
+            .clone()
+    }
+
+    /// Return streaming-response flags captured per `send` call, in order.
+    pub fn recorded_stream_response_flags(&self) -> Vec<bool> {
+        self.stream_response_flags
+            .lock()
+            .expect("should lock stream response flags")
+            .clone()
+    }
+
+    /// Return request methods captured per `send` call, in order.
+    pub fn recorded_request_methods(&self) -> Vec<String> {
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .clone()
+    }
+
+    /// Return request URIs captured per `send` call, in order.
+    pub fn recorded_request_uris(&self) -> Vec<String> {
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .clone()
     }
 }
 
@@ -252,6 +339,23 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock calls")
             .push(request.backend_name.clone());
+
+        self.image_optimizer_options
+            .lock()
+            .expect("should lock image optimizer options")
+            .push(request.image_optimizer.clone());
+        self.stream_response_flags
+            .lock()
+            .expect("should lock stream response flags")
+            .push(request.stream_response);
+        self.request_methods
+            .lock()
+            .expect("should lock request methods")
+            .push(request.request.method().to_string());
+        self.request_uris
+            .lock()
+            .expect("should lock request URIs")
+            .push(request.request.uri().to_string());
 
         let headers: Vec<(String, String)> = request
             .request
@@ -269,16 +373,19 @@ impl PlatformHttpClient for StubHttpClient {
             .expect("should lock request_headers")
             .push(headers);
 
-        let (status, body_bytes) = self
+        let response = self
             .responses
             .lock()
             .expect("should lock responses")
             .pop_front()
             .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
 
-        let edge_response = edgezero_core::http::response_builder()
-            .status(status)
-            .body(edgezero_core::body::Body::from(body_bytes))
+        let mut builder = edgezero_core::http::response_builder().status(response.status);
+        for (name, value) in response.headers {
+            builder = builder.header(name, value);
+        }
+        let edge_response = builder
+            .body(edgezero_core::body::Body::from(response.body))
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_response))
@@ -288,13 +395,38 @@ impl PlatformHttpClient for StubHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("Image Optimizer is not supported with StubHttpClient send_async"));
+        }
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("streaming responses are not supported with StubHttpClient send_async"));
+        }
+
         let backend_name = request.backend_name.clone();
         self.calls
             .lock()
             .expect("should lock calls")
             .push(backend_name.clone());
 
-        let (status, body_bytes) = self
+        let headers: Vec<(String, String)> = request
+            .request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        self.request_headers
+            .lock()
+            .expect("should lock request_headers")
+            .push(headers);
+
+        let response = self
             .responses
             .lock()
             .expect("should lock responses")
@@ -303,8 +435,8 @@ impl PlatformHttpClient for StubHttpClient {
 
         let pending = StubPendingResponse {
             backend_name: backend_name.clone(),
-            status,
-            body: body_bytes,
+            status: response.status,
+            body: response.body,
         };
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
@@ -332,16 +464,47 @@ impl PlatformHttpClient for StubHttpClient {
                     .attach("unexpected inner type in StubHttpClient::select")
             })?;
 
+        let ready_backend_name = stub.backend_name.clone();
+
+        // Strip backend names from remaining to match Fastly production behavior:
+        // Fastly's select() rebuilds remaining with PlatformPendingRequest::new()
+        // (no backend_name) — orchestrators must not rely on names being set.
+        let remaining: Vec<PlatformPendingRequest> = pending_requests
+            .into_iter()
+            .map(|r| match r.downcast::<StubPendingResponse>() {
+                Ok(inner) => PlatformPendingRequest::new(inner),
+                Err(r) => r,
+            })
+            .collect();
+
+        let should_error = self
+            .select_errors
+            .lock()
+            .expect("should lock select_errors")
+            .pop_front()
+            .is_some();
+
+        if should_error {
+            return Ok(PlatformSelectResult {
+                ready: Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "injected select error for backend '{ready_backend_name}'"
+                ))),
+                remaining,
+                failed_backend_name: Some(ready_backend_name),
+            });
+        }
+
         let edge_response = edgezero_core::http::response_builder()
             .status(stub.status)
             .body(edgezero_core::body::Body::from(stub.body))
             .change_context(PlatformError::HttpClient)?;
 
-        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(stub.backend_name));
+        let ready = Ok(PlatformResponse::new(edge_response).with_backend_name(ready_backend_name));
 
         Ok(PlatformSelectResult {
             ready,
-            remaining: pending_requests,
+            remaining,
+            failed_backend_name: None,
         })
     }
 }
@@ -369,11 +532,7 @@ pub(crate) fn build_services_with_config_and_secret(
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        })
+        .client_info(ClientInfo::default())
         .build()
 }
 
@@ -409,16 +568,25 @@ pub(crate) fn build_services_with_config(
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        })
+        .client_info(ClientInfo::default())
         .build()
 }
 
 pub(crate) fn noop_services() -> RuntimeServices {
     build_services_with_config(NoopConfigStore)
+}
+
+/// Build a [`RuntimeServices`] with a caller-supplied HTTP client and a [`StubBackend`].
+///
+/// Uses [`StubBackend`] (always returns `Ok("stub-backend")`) rather than
+/// [`NoopBackend`] (always returns `Err(Unsupported)`) so that handlers which
+/// both make HTTP calls and resolve backends don't need two separate service
+/// setups.  If your test must verify that a missing backend returns an error,
+/// use [`noop_services`] directly.
+pub(crate) fn build_services_with_http_client(
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    build_services_with_secret_and_http_client(NoopSecretStore, http_client)
 }
 
 pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
@@ -431,8 +599,28 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
+            ..ClientInfo::default()
+        })
+        .build()
+}
+
+/// Build a [`RuntimeServices`] with a custom secret store, [`StubBackend`], and HTTP client.
+pub(crate) fn build_services_with_secret_and_http_client(
+    secret_store: impl PlatformSecretStore + 'static,
+    http_client: Arc<dyn PlatformHttpClient>,
+) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(secret_store))
+        .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+        .backend(Arc::new(StubBackend))
+        .http_client(http_client)
+        .geo(Arc::new(NoopGeo))
+        .client_info(ClientInfo {
+            client_ip: None,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -542,8 +730,8 @@ mod tests {
         );
         assert_eq!(
             result.remaining[0].backend_name(),
-            Some("backend-b"),
-            "should preserve backend name on remaining request"
+            None,
+            "should strip backend name from remaining (matches Fastly production behavior)"
         );
 
         let names = stub.recorded_backend_names();
@@ -551,6 +739,53 @@ mod tests {
             names,
             vec!["backend-a", "backend-b"],
             "should record both send_async calls in order"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_send_async_rejects_image_optimizer_metadata() {
+        let stub = StubHttpClient::new();
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/image.jpg")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_image_optimizer(PlatformImageOptimizerOptions::new(
+            "us_east",
+            PlatformImageOptimizerParams::default(),
+        ));
+
+        let err = futures::executor::block_on(stub.send_async(req))
+            .expect_err("should reject async Image Optimizer metadata");
+
+        assert!(
+            format!("{err:?}").contains("Image Optimizer"),
+            "should explain unsupported async IO path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stub_http_client_send_async_rejects_stream_response() {
+        let stub = StubHttpClient::new();
+        let req = PlatformHttpRequest::new(
+            request_builder()
+                .method("GET")
+                .uri("https://example.com/image.jpg")
+                .body(Body::empty())
+                .expect("should build request"),
+            "stub-backend",
+        )
+        .with_stream_response();
+
+        let err = futures::executor::block_on(stub.send_async(req))
+            .expect_err("should reject async streaming-response requests");
+
+        assert!(
+            format!("{err:?}").contains("streaming responses"),
+            "should explain unsupported async streaming-response path: {err:?}"
         );
     }
 

@@ -5,6 +5,7 @@ use fastly::backend::Backend;
 use url::Url;
 
 use crate::error::TrustedServerError;
+use crate::host_header::validate_host_header_override_value;
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]
@@ -33,6 +34,19 @@ fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
     }
 }
 
+fn sanitize_backend_name_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Default first-byte timeout for backends (15 seconds).
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -46,6 +60,7 @@ pub struct BackendConfig<'a> {
     port: Option<u16>,
     certificate_check: bool,
     first_byte_timeout: Duration,
+    host_header_override: Option<&'a str>,
 }
 
 impl<'a> BackendConfig<'a> {
@@ -61,6 +76,7 @@ impl<'a> BackendConfig<'a> {
             port: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            host_header_override: None,
         }
     }
 
@@ -90,6 +106,13 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set the outbound Host header sent to the backend origin.
+    #[must_use]
+    pub fn host_header_override(mut self, host: Option<&'a str>) -> Self {
+        self.host_header_override = host;
+        self
+    }
+
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
     ///
@@ -114,12 +137,23 @@ impl<'a> BackendConfig<'a> {
                 message: "scheme contains control characters".to_string(),
             }));
         }
+        if let Some(host_header_override) = self.host_header_override {
+            validate_host_header_override_value(host_header_override).map_err(|reason| {
+                Report::new(TrustedServerError::Proxy {
+                    message: format!("host header override {reason}"),
+                })
+            })?;
+        }
 
         let target_port = self
             .port
             .unwrap_or_else(|| default_port_for_scheme(self.scheme));
 
         let name_base = format!("{}_{}_{}", self.scheme, self.host, target_port);
+        let host_override_suffix = self
+            .host_header_override
+            .map(|host| format!("_oh_{}", sanitize_backend_name_component(host)))
+            .unwrap_or_default();
         let cert_suffix = if self.certificate_check {
             ""
         } else {
@@ -127,8 +161,9 @@ impl<'a> BackendConfig<'a> {
         };
         let timeout_ms = self.first_byte_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}_t{}",
-            name_base.replace(['.', ':'], "_"),
+            "backend_{}{}{}_t{}",
+            sanitize_backend_name_component(&name_base),
+            host_override_suffix,
             cert_suffix,
             timeout_ms
         );
@@ -138,7 +173,7 @@ impl<'a> BackendConfig<'a> {
 
     /// Return the deterministic backend name without registering anything.
     ///
-    /// Convenience wrapper over [`Self::compute_name`] that discards the
+    /// Convenience wrapper over `Self::compute_name` that discards the
     /// resolved port, used by [`crate::platform::PlatformBackend`]
     /// implementations that only need the name for correlation.
     ///
@@ -165,7 +200,10 @@ impl<'a> BackendConfig<'a> {
 
         let host_with_port = format!("{}:{}", self.host, target_port);
 
-        let host_header = compute_host_header(self.scheme, self.host, target_port);
+        let host_header = self
+            .host_header_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| compute_host_header(self.scheme, self.host, target_port));
 
         // Target base is host[:port]; SSL is enabled only for https scheme
         let mut builder = Backend::builder(&backend_name, &host_with_port)
@@ -219,6 +257,7 @@ impl<'a> BackendConfig<'a> {
     ///
     /// Centralises URL parsing so that [`from_url`](Self::from_url),
     /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout),
+    /// [`from_url_with_host_header_override`](Self::from_url_with_host_header_override),
     /// and [`backend_name_for_url`](Self::backend_name_for_url) share one
     /// code-path.
     fn parse_origin(
@@ -279,12 +318,46 @@ impl<'a> BackendConfig<'a> {
         certificate_check: bool,
         first_byte_timeout: Duration,
     ) -> Result<String, Report<TrustedServerError>> {
+        Self::from_url_with_first_byte_timeout_and_host_header_override(
+            origin_url,
+            certificate_check,
+            first_byte_timeout,
+            None,
+        )
+    }
+
+    /// Parse an origin URL and ensure a dynamic backend with a custom Host header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL cannot be parsed or lacks a host, or if
+    /// backend creation fails.
+    pub fn from_url_with_host_header_override(
+        origin_url: &str,
+        certificate_check: bool,
+        host_header_override: Option<&str>,
+    ) -> Result<String, Report<TrustedServerError>> {
+        Self::from_url_with_first_byte_timeout_and_host_header_override(
+            origin_url,
+            certificate_check,
+            DEFAULT_FIRST_BYTE_TIMEOUT,
+            host_header_override,
+        )
+    }
+
+    fn from_url_with_first_byte_timeout_and_host_header_override(
+        origin_url: &str,
+        certificate_check: bool,
+        first_byte_timeout: Duration,
+        host_header_override: Option<&str>,
+    ) -> Result<String, Report<TrustedServerError>> {
         let (scheme, host, port) = Self::parse_origin(origin_url)?;
 
         BackendConfig::new(&scheme, &host)
             .port(port)
             .certificate_check(certificate_check)
             .first_byte_timeout(first_byte_timeout)
+            .host_header_override(host_header_override)
             .ensure()
     }
 
@@ -435,6 +508,65 @@ mod tests {
             first, second,
             "should return same backend name on repeat call"
         );
+    }
+
+    #[test]
+    fn host_header_overrides_produce_different_names() {
+        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("www.example.com"))
+            .compute_name()
+            .expect("should compute name with host header override");
+        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("m.example.com"))
+            .compute_name()
+            .expect("should compute name with different host header override");
+
+        assert_ne!(
+            name_a, name_b,
+            "backends with different host header overrides should have different names"
+        );
+        assert_eq!(
+            name_a,
+            "backend_https_origin_example_com_443_oh_www_example_com_t15000"
+        );
+        assert_eq!(
+            name_b,
+            "backend_https_origin_example_com_443_oh_m_example_com_t15000"
+        );
+    }
+
+    #[test]
+    fn host_header_override_rejects_control_characters() {
+        let err = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("www\n.example.com"))
+            .predict_name()
+            .expect_err("should reject host header override containing newline");
+
+        assert!(
+            err.to_string().contains("control characters"),
+            "should report control characters in error message"
+        );
+    }
+
+    #[test]
+    fn host_header_override_rejects_invalid_values() {
+        for host_header_override in [
+            "https://www.example.com",
+            "www.example.com/path",
+            "www.example.com:",
+            "example..com",
+            "-",
+        ] {
+            let err = BackendConfig::new("https", "origin.example.com")
+                .host_header_override(Some(host_header_override))
+                .predict_name()
+                .expect_err("should reject invalid host header override");
+
+            assert!(
+                err.to_string().contains("host header override"),
+                "should report host header override error for {host_header_override:?}"
+            );
+        }
     }
 
     #[test]

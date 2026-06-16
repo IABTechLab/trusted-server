@@ -18,7 +18,6 @@ pub mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_backend = "publisher_origin"
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
@@ -49,4 +48,8 @@ pub mod tests {
         let toml_str = crate_test_settings_str();
         Settings::from_toml(&toml_str).expect("Invalid config")
     }
+
+    /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.
+    pub const VALID_SYNTHETIC_ID: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 }

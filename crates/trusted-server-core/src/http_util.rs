@@ -1,11 +1,13 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{aead::Aead, aead::KeyInit, XChaCha20Poly1305, XNonce};
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::{header, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 
 use crate::constants::INTERNAL_HEADERS;
+use crate::error::TrustedServerError;
 use crate::platform::ClientInfo;
 use crate::settings::Settings;
 
@@ -444,6 +446,27 @@ pub fn compute_encrypted_sha256_token(settings: &Settings, full_url: &str) -> St
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Return an error if `bytes` exceeds `limit`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::RequestTooLarge`] when `bytes.len() > limit`.
+pub fn enforce_max_body_size(
+    bytes: &[u8],
+    limit: usize,
+    what: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    if bytes.len() > limit {
+        return Err(Report::new(TrustedServerError::RequestTooLarge {
+            message: format!(
+                "{what} payload {} exceeds limit of {limit} bytes",
+                bytes.len()
+            ),
+        }));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,11 +489,7 @@ mod tests {
     }
 
     fn default_client_info() -> ClientInfo {
-        ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        }
+        ClientInfo::default()
     }
 
     #[test]
@@ -819,9 +838,8 @@ mod tests {
     fn request_info_https_from_client_info_tls_protocol() {
         let req = build_request(Method::GET, "https://test.example.com/page");
         let client_info = ClientInfo {
-            client_ip: None,
             tls_protocol: Some("TLSv1.3".to_string()),
-            tls_cipher: None,
+            ..ClientInfo::default()
         };
 
         let info = RequestInfo::from_request(&req, &client_info);
@@ -836,9 +854,8 @@ mod tests {
     fn request_info_https_from_client_info_tls_cipher() {
         let req = build_request(Method::GET, "https://test.example.com/page");
         let client_info = ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
             tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_string()),
+            ..ClientInfo::default()
         };
 
         let info = RequestInfo::from_request(&req, &client_info);
