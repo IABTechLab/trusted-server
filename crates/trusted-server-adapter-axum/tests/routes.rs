@@ -71,8 +71,6 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
-        ("POST", "/admin/keys/rotate"),
-        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
@@ -83,6 +81,25 @@ fn all_explicit_routes_are_registered() {
 
     for (method, path) in expected {
         assert_route_registered(method, path);
+    }
+}
+
+/// Verify the legacy non-`/_ts` admin aliases are NOT registered as explicit
+/// routes, matching the Fastly and Cloudflare adapters.
+///
+/// The production basic-auth handler regex (`^/_ts/admin`) does not match
+/// `/admin/keys/*`, so registering those aliases as admin routes would expose
+/// key operations to unauthenticated callers. Unrouted, they fall through to the
+/// publisher fallback like any unknown path. This guard pins the cross-adapter
+/// agreement so the divergence cannot silently reappear.
+#[test]
+fn legacy_admin_aliases_are_not_registered() {
+    let routes = registered_routes();
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        assert!(
+            !routes.iter().any(|(_, p)| p == path),
+            "legacy {path} must not be a registered route (would bypass `^/_ts/admin` auth); registered routes: {routes:?}"
+        );
     }
 }
 
@@ -140,91 +157,6 @@ async fn verify_signature_endpoint_is_routed() {
         resp.status().as_u16(),
         404,
         "verify-signature must be routed"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_key_is_routed() {
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    // The admin handler is a fixed 501 responder with no I/O. The production-shaped
-    // test settings protect only `^/_ts/admin`, so the legacy `/admin/keys/rotate`
-    // alias is not auth-gated and reaches the handler directly.
-    assert_eq!(
-        resp.status().as_u16(),
-        501,
-        "legacy admin/keys/rotate alias must reach the not-supported handler"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_deactivate_key_is_routed() {
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/deactivate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from("{}"))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-
-    // Same fixed 501 contract as admin/keys/rotate.
-    assert_eq!(
-        resp.status().as_u16(),
-        501,
-        "admin/keys/deactivate must reach the not-supported handler"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_rotate_key_returns_non_5xx() {
-    // Admin routes return 501 Not Implemented on the Axum dev server (store
-    // writes are unsupported). Auth middleware may short-circuit with 4xx
-    // before reaching the handler. Either way, no panic or unhandled 500.
-    let mut svc = make_service();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/keys/rotate")
-        .header("content-type", "application/json")
-        .body(AxumBody::from(r#"{"keyId":"test-key"}"#))
-        .expect("should build request");
-
-    let resp = svc
-        .ready()
-        .await
-        .expect("should be ready")
-        .call(req)
-        .await
-        .expect("should respond");
-    let status = resp.status().as_u16();
-
-    assert_eq!(
-        status, 501,
-        "admin/keys/rotate must return the fixed not-supported status"
     );
 }
 
@@ -429,7 +361,7 @@ async fn admin_route_returns_non_404_non_5xx() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/admin/keys/rotate")
+        .uri("/_ts/admin/keys/rotate")
         .header("content-type", "application/json")
         .body(AxumBody::from("{}"))
         .expect("should build request");
@@ -444,8 +376,8 @@ async fn admin_route_returns_non_404_non_5xx() {
     let status = resp.status().as_u16();
 
     assert_ne!(status, 404, "admin route must be routed");
-    // 501 Not Implemented is the designed dev-server response for admin key
-    // routes; only an unhandled 500 indicates a panic or missing handler.
+    // The auth gate short-circuits with 401 before the handler; only an
+    // unhandled 500 indicates a panic or missing handler.
     assert_ne!(status, 500, "admin route must not panic: got {status}");
 }
 

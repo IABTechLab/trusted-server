@@ -189,7 +189,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 11] {
+fn named_routes() -> [NamedRoute; 9] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -214,17 +214,11 @@ fn named_routes() -> [NamedRoute; 11] {
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
         },
-        // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
-        NamedRoute {
-            path: "/admin/keys/rotate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::AdminNotSupported,
-        },
-        NamedRoute {
-            path: "/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
-            handler: NamedRouteHandler::AdminNotSupported,
-        },
+        // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
+        // registered, matching the Fastly and Cloudflare adapters: the production
+        // basic-auth handler regex `^/_ts/admin` does not match them, so registering
+        // them as admin routes would expose key operations to unauthenticated callers.
+        // Unrouted, they fall through to the publisher fallback like any unknown path.
         NamedRoute {
             path: "/auction",
             primary_methods: &[Method::POST],
