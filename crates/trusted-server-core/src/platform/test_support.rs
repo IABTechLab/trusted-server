@@ -596,11 +596,7 @@ pub(crate) fn build_services_with_config_and_secret(
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        })
+        .client_info(ClientInfo::default())
         .build()
 }
 
@@ -636,11 +632,7 @@ pub(crate) fn build_services_with_config(
         .backend(Arc::new(NoopBackend))
         .http_client(Arc::new(NoopHttpClient))
         .geo(Arc::new(NoopGeo))
-        .client_info(ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        })
+        .client_info(ClientInfo::default())
         .build()
 }
 
@@ -671,8 +663,7 @@ pub(crate) fn noop_services_with_client_ip(ip: IpAddr) -> RuntimeServices {
         .geo(Arc::new(NoopGeo))
         .client_info(ClientInfo {
             client_ip: Some(ip),
-            tls_protocol: None,
-            tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -693,6 +684,7 @@ pub(crate) fn build_services_with_secret_and_http_client(
             client_ip: None,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }

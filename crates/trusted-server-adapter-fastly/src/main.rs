@@ -30,7 +30,10 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::is_navigation_request;
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::integrations::{
+    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome,
+};
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -157,6 +160,7 @@ struct RouteResult {
     is_real_browser: bool,
     should_finalize_ec: bool,
     asset_cache_policy: AssetProxyCachePolicy,
+    request_filter_effects: RequestFilterEffects,
 }
 
 /// Entry point for the Fastly Compute program.
@@ -237,6 +241,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
+    // Derive device signals from the original FastlyRequest before conversion.
+    // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
+    // return real values on the client request; a synthetic request rebuilt from
+    // EdgeZero HTTP types cannot expose them, which would strip the JA4/H2 class
+    // the EC bot gate needs and misclassify real browsers as bots. Stored in the
+    // request extensions so `build_ec_request_state` reads the authoritative
+    // signals instead of re-deriving from the reconstructed request.
+    let device_signals = derive_device_signals(&req);
+
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. The standard dispatch helpers
     // (dispatch_with_config_handle, etc.) convert through fastly::Response using
@@ -249,6 +262,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         match into_core_request(req) {
             Ok(mut core_req) => {
                 core_req.extensions_mut().insert(config_store);
+                core_req.extensions_mut().insert(device_signals);
                 futures::executor::block_on(app.router().oneshot(core_req))
             }
             Err(e) => {
@@ -267,6 +281,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     let ec_state = response
         .extensions_mut()
         .remove::<crate::app::EcFinalizeState>();
+
+    // Pop the asset cache policy threaded out by the asset-route fallback. Must
+    // happen before the fastly conversion, which drops extensions. Reapplied
+    // after finalization below so protected directives (e.g. no-store on asset
+    // errors) survive operator `response_headers`, mirroring legacy_main's
+    // asset_cache_policy.apply_after_route_finalization.
+    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
 
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
@@ -288,6 +309,12 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                 log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
             }
         }
+    }
+
+    // Reapply protected asset cache directives after finalization, mirroring
+    // legacy_main. A no-op for OriginControlled responses.
+    if let Some(policy) = asset_cache_policy {
+        policy.apply_after_route_finalization(&mut response);
     }
 
     // EC response lifecycle, mirroring legacy_main: finalize EC cookies and
@@ -419,6 +446,7 @@ fn legacy_main(mut req: FastlyRequest) {
         is_real_browser: false,
         should_finalize_ec: true,
         asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+        request_filter_effects: RequestFilterEffects::default(),
     });
 
     let RouteResult {
@@ -430,6 +458,7 @@ fn legacy_main(mut req: FastlyRequest) {
         is_real_browser,
         should_finalize_ec,
         asset_cache_policy,
+        request_filter_effects,
     } = route_result;
 
     // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
@@ -462,6 +491,7 @@ fn legacy_main(mut req: FastlyRequest) {
                     &mut response,
                 );
             }
+            request_filter_effects.apply_to_response(&mut response);
             compat::to_fastly_response(response).send_to_client();
 
             if is_real_browser {
@@ -493,6 +523,7 @@ fn legacy_main(mut req: FastlyRequest) {
                     &mut response,
                 );
             }
+            request_filter_effects.apply_to_response(&mut response);
             let fastly_resp = compat::to_fastly_response_skeleton(response);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
@@ -532,6 +563,7 @@ fn legacy_main(mut req: FastlyRequest) {
         HandlerOutcome::AssetStreaming { mut response, body } => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
+            request_filter_effects.apply_to_response(&mut response);
             let fastly_resp = compat::to_fastly_response_skeleton(response);
             let mut streaming_body = fastly_resp.stream_to_client();
             if let Err(e) =
@@ -594,7 +626,7 @@ async fn route_request(
     integration_registry: &IntegrationRegistry,
     partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
-    req: HttpRequest,
+    mut req: HttpRequest,
     device_signals: DeviceSignals,
 ) -> Result<RouteResult, Report<TrustedServerError>> {
     let is_real_browser = device_signals.looks_like_browser();
@@ -635,6 +667,7 @@ async fn route_request(
                     is_real_browser,
                     should_finalize_ec: true,
                     asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                    request_filter_effects: RequestFilterEffects::default(),
                 });
             }
             Ok(None) => {}
@@ -657,6 +690,7 @@ async fn route_request(
             is_real_browser,
             should_finalize_ec: true,
             asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+            request_filter_effects: RequestFilterEffects::default(),
         });
     }
 
@@ -678,6 +712,7 @@ async fn route_request(
                 is_real_browser,
                 should_finalize_ec: true,
                 asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                request_filter_effects: RequestFilterEffects::default(),
             });
         }
     };
@@ -714,13 +749,53 @@ async fn route_request(
                 is_real_browser,
                 should_finalize_ec: true,
                 asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                request_filter_effects: RequestFilterEffects::default(),
             });
         }
         Ok(None) => {}
         Err(e) => return Err(e),
     }
 
-    // Get path and method for routing.
+    let request_filter_effects = match integration_registry
+        .filter_request(RequestFilterRegistryInput {
+            settings,
+            services: runtime_services,
+            req: &mut req,
+            geo_info: geo_info.as_ref(),
+        })
+        .await
+    {
+        Ok(RequestFilterRegistryOutcome::Continue(effects)) => effects,
+        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => {
+            return Ok(RouteResult {
+                outcome: HandlerOutcome::Buffered(*response),
+                ec_context,
+                finalize_kv_graph,
+                eids_cookie,
+                sharedid_cookie,
+                is_real_browser,
+                should_finalize_ec: true,
+                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                request_filter_effects: effects,
+            });
+        }
+        Err(e) => {
+            log::error!("Failed to run integration request filters: {:?}", e);
+            return Ok(RouteResult {
+                outcome: HandlerOutcome::Buffered(http_error_response(&e)),
+                ec_context,
+                finalize_kv_graph,
+                eids_cookie,
+                sharedid_cookie,
+                is_real_browser,
+                should_finalize_ec: true,
+                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                request_filter_effects: RequestFilterEffects::default(),
+            });
+        }
+    };
+
+    // Get path and method for routing
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -852,6 +927,7 @@ async fn route_request(
                                     is_real_browser,
                                     should_finalize_ec,
                                     asset_cache_policy,
+                                    request_filter_effects,
                                 });
                             }
                             Ok(response)
@@ -903,6 +979,7 @@ async fn route_request(
                             is_real_browser,
                             should_finalize_ec,
                             asset_cache_policy,
+                            request_filter_effects,
                         });
                     }
                     Ok(PublisherResponse::PassThrough { mut response, body }) => {
@@ -934,6 +1011,7 @@ async fn route_request(
         is_real_browser,
         should_finalize_ec,
         asset_cache_policy,
+        request_filter_effects,
     })
 }
 

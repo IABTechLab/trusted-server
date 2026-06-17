@@ -4150,6 +4150,7 @@ dependencies = [
  "trusted-server-js",
  "trusted-server-openrtb",
  "url",
+ "urlencoding",
  "uuid",
  "validator",
 ]

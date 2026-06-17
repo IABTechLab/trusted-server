@@ -82,7 +82,9 @@ use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HandlerFuture, HeaderValue, Method, Request, Response};
+use edgezero_core::http::{
+    header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
+};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -101,15 +103,18 @@ use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
 use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
+    AssetProxyCachePolicy,
 };
-use trusted_server_core::publisher::{handle_publisher_request, handle_tsjs_dynamic};
+use trusted_server_core::publisher::{
+    handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+};
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::Settings;
+use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -211,6 +216,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -288,9 +294,11 @@ impl EcRequestState {
 
 /// Derives device signals from the request's `User-Agent` header.
 ///
-/// TLS and H2 fingerprints are unavailable in the `EdgeZero` request context
-/// (see module docs), so classification is UA-only on this path — matching
-/// the signals the legacy path effectively had after request conversion.
+/// Used as the fallback when no entry-point-captured [`DeviceSignals`] are
+/// present in the request extensions (see [`device_signals_for`]). TLS and H2
+/// fingerprints cannot be reconstructed from the `EdgeZero` request, so this
+/// fallback is UA-only — matching the signals the legacy path effectively had
+/// after request conversion.
 fn derive_request_device_signals(req: &Request) -> DeviceSignals {
     let user_agent = req
         .headers()
@@ -300,6 +308,22 @@ fn derive_request_device_signals(req: &Request) -> DeviceSignals {
     DeviceSignals::derive(user_agent, None, None)
 }
 
+/// Returns the device signals for an `EdgeZero` request.
+///
+/// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
+/// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
+/// real values — and stores them in the request extensions. Reading them back
+/// here preserves the bot gate's browser classification, which the `EdgeZero`
+/// request cannot expose on its own. Falls back to UA-only
+/// [`derive_request_device_signals`] when the extension is absent (e.g. in
+/// tests that dispatch without the entry point).
+fn device_signals_for(req: &Request) -> DeviceSignals {
+    req.extensions()
+        .get::<DeviceSignals>()
+        .cloned()
+        .unwrap_or_else(|| derive_request_device_signals(req))
+}
+
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
@@ -307,7 +331,7 @@ fn build_ec_request_state(
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
-    let device_signals = derive_request_device_signals(req);
+    let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
         log::info!(
@@ -469,7 +493,7 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = derive_request_device_signals(&req);
+    let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
@@ -539,6 +563,18 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
                 }))
             })
     } else {
+        // Asset-route fallback (GET/HEAD), mirroring the legacy catch-all arm:
+        // matched asset paths proxy to the configured asset origin instead of the
+        // publisher origin. Must be checked after tsjs/integration routes and
+        // before the publisher fallback. Asset responses skip EC finalization
+        // (no EcFinalizeState attached), matching legacy's `should_finalize_ec = false`.
+        let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+            .then(|| state.settings.asset_route_for_path(&path))
+            .flatten();
+        if let Some(asset_route) = matched_asset_route {
+            return dispatch_asset_fallback(state, services, req, asset_route).await;
+        }
+
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
@@ -573,6 +609,106 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
     let mut response = result.unwrap_or_else(|e| http_error(&e));
     response.extensions_mut().insert(ec.into_finalize_state());
     response
+}
+
+/// Returns `true` when an asset response should carry a buffered body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
+/// representation length in their `Content-Length` header while carrying no
+/// body. Rewriting that header to the buffered byte count (0) would corrupt the
+/// metadata, so those responses keep the origin's `Content-Length` untouched.
+fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
+/// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
+/// `route_request` asset branch.
+///
+/// Proxies the request to the configured asset origin and threads the
+/// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
+/// can reapply protected cache directives after finalization. EC finalization
+/// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
+/// legacy `should_finalize_ec = false` behavior for asset responses.
+///
+/// Unlike legacy `route_request`, which streams asset bodies straight to the
+/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
+/// converts the whole response before sending, so there is no streaming seam
+/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
+/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
+/// uncapped streaming are both resolved by the streaming cutover (issue #495);
+/// whether assets get a dedicated cap is deferred to that work.
+async fn dispatch_asset_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    asset_route: &ProxyAssetRoute,
+) -> Response {
+    log::info!("No explicit route matched; proxying via configured asset route");
+
+    let method = req.method().clone();
+
+    match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
+        Ok(asset_response) => {
+            let cache_policy = asset_response.cache_policy();
+            let (mut response, stream_body) = asset_response.into_response_and_body();
+
+            if let Some(body) = stream_body {
+                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
+                    .await
+                {
+                    Ok(bytes) => {
+                        // Preserve the origin's Content-Length for HEAD and
+                        // bodiless statuses; only body-bearing responses get a
+                        // recomputed length and the buffered body attached.
+                        if asset_response_carries_body(&method, response.status()) {
+                            response.headers_mut().insert(
+                                header::CONTENT_LENGTH,
+                                HeaderValue::from(bytes.len() as u64),
+                            );
+                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
+                        }
+                    }
+                    Err(report) => {
+                        let mut response = http_error(&report);
+                        response
+                            .extensions_mut()
+                            .insert(AssetProxyCachePolicy::NoStorePrivate);
+                        return response;
+                    }
+                }
+            }
+
+            response.extensions_mut().insert(cache_policy);
+            response
+        }
+        Err(report) => {
+            let mut response = http_error(&report);
+            response
+                .extensions_mut()
+                .insert(AssetProxyCachePolicy::NoStorePrivate);
+            response
+        }
+    }
+}
+
+/// Buffers a streaming asset body into memory, bounded by `max_bytes`
+/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
+/// [`dispatch_asset_fallback`]).
+///
+/// # Errors
+///
+/// Returns an error if the body exceeds the configured cap or the underlying
+/// stream yields an error.
+async fn buffer_asset_body(
+    body: edgezero_core::body::Body,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut output = BoundedWriter::new(max_bytes);
+    stream_asset_body(body, &mut output).await?;
+    Ok(output.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +962,7 @@ mod tests {
     use futures::executor::block_on;
     use serde_json::json;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::settings::Settings;
 
@@ -981,6 +1118,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn asset_response_carries_body_preserves_bodiless_content_length() {
+        // GET/200 buffers a body and recomputes Content-Length.
+        assert!(
+            super::asset_response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 asset response should carry a buffered body"
+        );
+        // HEAD advertises the origin representation length with no body — the
+        // recomputed (zero) length must not overwrite it.
+        assert!(
+            !super::asset_response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD asset responses must preserve the origin Content-Length"
+        );
+        // Bodiless statuses keep their origin metadata regardless of method.
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must preserve the origin Content-Length"
+        );
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must preserve the origin Content-Length"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Full EdgeZero dispatch-path tests
     // ---------------------------------------------------------------------------
@@ -1101,6 +1262,54 @@ mod tests {
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn browser_device_signals_from_extension_reach_ec_finalize_state() {
+        // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
+        // derives DeviceSignals from the original FastlyRequest (the only place
+        // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
+        // them in the request extensions. A browser-shaped signal must survive
+        // dispatch so the EC bot gate classifies the request as a real browser
+        // and keeps the KV-backed generation/finalize path active.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/some-page");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = block_on(router.oneshot(req));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            finalize.is_real_browser,
+            "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn missing_device_signals_extension_classifies_as_non_browser() {
+        // Without the entry-point-captured signals, the reconstructed request
+        // cannot expose JA4/H2, so the bot gate falls back to non-browser. This
+        // documents the regression the extension threading fixes: the same
+        // request that looks like a browser above is treated as a bot here.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            !finalize.is_real_browser,
+            "a request without captured device signals should not be classified as a real browser"
         );
     }
 
@@ -1238,6 +1447,64 @@ mod tests {
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "integration routes should be unaffected by a missing consent KV store"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_asset_route_skips_ec_finalization() {
+        // Parity guard for the configured asset-route fallback: a GET matching a
+        // proxy.asset_routes prefix must dispatch through the asset proxy (not the
+        // publisher fallback) and skip EC finalization. Without a live asset
+        // backend the proxy errors, but the response must carry the asset cache
+        // policy and must NOT carry an EcFinalizeState — proving the asset branch
+        // ran instead of the publisher fallback (which always attaches one).
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+
+        assert!(
+            response
+                .extensions()
+                .get::<trusted_server_core::proxy::AssetProxyCachePolicy>()
+                .is_some(),
+            "asset-route responses should carry the asset cache policy"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "asset-route responses must skip EC finalization (no EcFinalizeState)"
         );
     }
 }

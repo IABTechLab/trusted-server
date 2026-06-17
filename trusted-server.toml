@@ -15,7 +15,8 @@ origin_url = "https://origin.test-publisher.com"
 # Optional: override outbound Host header while connecting to origin_url.
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
-# Maximum bytes buffered when processing a streaming publisher response on the EdgeZero path.
+# Maximum bytes buffered when a publisher response is post-processed in full (HTML
+# rewriting/injection) instead of streamed. Applies on both the legacy and EdgeZero paths.
 # Defaults to 16 MiB when omitted; responses exceeding the cap return 502 (proxy error).
 # Raise it for deployments serving larger publisher pages:
 # max_buffered_body_bytes = 16777216  # 16 MiB
@@ -149,6 +150,30 @@ sdk_origin = "https://js.datadome.co"
 api_origin = "https://api-js.datadome.co"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
+
+# Server-side Protection API validation (fails open on timeout/error)
+enable_protection = false
+server_side_key_secret_store = "ts_secrets"
+server_side_key_secret_name = "datadome_server_side_key"
+protection_api_origin = "https://api-fastly.datadome.co"
+timeout_ms = 1500
+protection_excluded_methods = ["OPTIONS"]
+protection_excluded_asns = []
+protection_excluded_ip_cidrs = []
+protection_excluded_ip_cidr_sources = []
+protection_ip_list_cache_ttl_seconds = 300
+enable_graphql_support = false
+
+# Client-side tag auto-injection (emits only when client_side_key is non-empty)
+client_side_key = ""
+inject_client_side_tag = true
+client_side_tag_url = "/integrations/datadome/tags.js"
+client_side_configuration = { ajaxListenerPath = true }
+
+[[integrations.datadome.protection_exclusion_rules]]
+id = "default-static-assets"
+type = "path_regex"
+patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$"]
 
 [integrations.gpt]
 enabled = false
