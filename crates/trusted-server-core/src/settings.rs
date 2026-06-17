@@ -20,7 +20,7 @@ use crate::redacted::Redacted;
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Publisher {
     #[validate(custom(function = validate_publisher_domain))]
@@ -61,6 +61,24 @@ pub struct Publisher {
 
 fn default_max_buffered_body_bytes() -> usize {
     16 * 1024 * 1024
+}
+
+impl Default for Publisher {
+    /// Hand-written so `max_buffered_body_bytes` matches the serde default
+    /// ([`default_max_buffered_body_bytes`]) instead of `usize`'s `0`. A derived
+    /// `Default` would set a zero-byte cap, which fails buffered post-processing
+    /// immediately when `Publisher::default()` / `Settings::default()` are used
+    /// programmatically (tests, helpers) rather than deserialized from TOML.
+    fn default() -> Self {
+        Self {
+            domain: String::default(),
+            cookie_domain: String::default(),
+            origin_url: String::default(),
+            origin_host_header_override: None,
+            proxy_secret: Redacted::default(),
+            max_buffered_body_bytes: default_max_buffered_body_bytes(),
+        }
+    }
 }
 
 impl Publisher {
@@ -3522,6 +3540,42 @@ origin_host_header_overide = "www.example.com""#,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
+    }
+
+    #[test]
+    fn publisher_default_max_buffered_body_bytes_matches_config_default() {
+        // The manual `Default` impl must agree with the serde default applied
+        // when the key is omitted from TOML, so programmatic `Publisher::default()`
+        // does not silently produce a zero-byte buffer cap.
+        assert_eq!(
+            Publisher::default().max_buffered_body_bytes,
+            super::default_max_buffered_body_bytes(),
+            "Publisher::default() must use the same buffer cap as the TOML default"
+        );
+
+        let from_toml = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse settings without max_buffered_body_bytes");
+        assert_eq!(
+            from_toml.publisher.max_buffered_body_bytes,
+            Publisher::default().max_buffered_body_bytes,
+            "TOML default and Publisher::default() must stay aligned"
+        );
     }
 
     #[test]
