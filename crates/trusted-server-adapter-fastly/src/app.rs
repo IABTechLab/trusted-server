@@ -192,6 +192,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }

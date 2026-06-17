@@ -491,11 +491,7 @@ mod tests {
     }
 
     fn default_client_info() -> ClientInfo {
-        ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
-            tls_cipher: None,
-        }
+        ClientInfo::default()
     }
 
     #[test]
@@ -844,9 +840,8 @@ mod tests {
     fn request_info_https_from_client_info_tls_protocol() {
         let req = build_request(Method::GET, "https://test.example.com/page");
         let client_info = ClientInfo {
-            client_ip: None,
             tls_protocol: Some("TLSv1.3".to_string()),
-            tls_cipher: None,
+            ..ClientInfo::default()
         };
 
         let info = RequestInfo::from_request(&req, &client_info);
@@ -861,9 +856,8 @@ mod tests {
     fn request_info_https_from_client_info_tls_cipher() {
         let req = build_request(Method::GET, "https://test.example.com/page");
         let client_info = ClientInfo {
-            client_ip: None,
-            tls_protocol: None,
             tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_string()),
+            ..ClientInfo::default()
         };
 
         let info = RequestInfo::from_request(&req, &client_info);
