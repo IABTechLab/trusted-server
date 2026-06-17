@@ -3,12 +3,18 @@
 #   trusted-server-adapter-axum      → native                (dev server)
 #   trusted-server-adapter-cloudflare → wasm32-unknown-unknown (Cloudflare Workers)
 #   trusted-server-adapter-spin      → wasm32-wasip1         (Fermyon Spin)
+#   trusted-server-cli               → native                (operator CLI)
 #
 # All adapters are workspace members so `-p` resolves each.
 # default-members = [fastly] — required so Viceroy can locate the binary via `cargo run --bin`.
 # Use the aliases below to target each adapter with the correct toolchain.
 
 [alias]
+test_details = ["test", "--target", "aarch64-apple-darwin"]
+test_cli_macos = ["test", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+build_cli_macos = ["build", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+test_cli_linux = ["test", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
+build_cli_linux = ["build", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
 # Fastly adapter + shared crates (wasm32-wasip1 via Viceroy)
 # Excludes Axum (native-only), Cloudflare (wasm32-unknown-unknown), and Spin (separate wasm32-wasip1 job)
 test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]

@@ -78,8 +78,8 @@
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
 //! finalization (geo and TS headers) when settings can be reloaded via
-//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
-//! fails, they are returned without geo or TS headers.
+//! [`load_settings_from_config_store`]; if settings loading itself fails, they
+//! are returned without geo or TS headers.
 
 use std::sync::Arc;
 
@@ -122,7 +122,9 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_store_name, get_settings_from_config_store,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -153,7 +155,12 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(get_settings()?)
+    build_state_from_settings(load_settings_from_config_store()?)
+}
+
+pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name)
 }
 
 pub(crate) fn build_state_from_settings(

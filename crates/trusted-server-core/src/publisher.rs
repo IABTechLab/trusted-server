@@ -32,8 +32,10 @@ use crate::streaming_replacer::create_url_replacer;
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
-    std::io::Cursor::new(body.into_bytes())
+fn body_as_reader(
+    body: EdgeBody,
+) -> Result<std::io::Cursor<bytes::Bytes>, Report<TrustedServerError>> {
+    Ok(std::io::Cursor::new(body.into_bytes().unwrap_or_default()))
 }
 
 fn not_found_response() -> Response<EdgeBody> {
@@ -239,7 +241,7 @@ fn process_response_streaming<W: Write>(
             params.settings,
             params.integration_registry,
         )?;
-        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
     } else if is_rsc_flight {
         let processor = RscFlightUrlRewriter::new(
             params.origin_host,
@@ -247,7 +249,7 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, processor).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, processor).process(body_as_reader(body)?, output)?;
     } else {
         let replacer = create_url_replacer(
             params.origin_host,
@@ -255,7 +257,7 @@ fn process_response_streaming<W: Write>(
             params.request_host,
             params.request_scheme,
         );
-        StreamingPipeline::new(config, replacer).process(body_as_reader(body), output)?;
+        StreamingPipeline::new(config, replacer).process(body_as_reader(body)?, output)?;
     }
 
     Ok(())

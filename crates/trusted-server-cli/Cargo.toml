@@ -1,0 +1,31 @@
+[package]
+name = "trusted-server-cli"
+version = "0.1.0"
+authors = []
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "ts"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { workspace = true }
+derive_more = { workspace = true }
+edgezero-adapter = { workspace = true, features = ["cli"] }
+edgezero-cli = { workspace = true }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "89f592665a8b386111995da5cbf3fcc068113dfc" }
+error-stack = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+trusted-server-core = { workspace = true }
+validator = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }

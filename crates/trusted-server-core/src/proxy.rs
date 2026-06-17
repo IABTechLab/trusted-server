@@ -38,8 +38,15 @@ const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
-fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes())
+fn body_as_reader(body: EdgeBody) -> Result<Cursor<bytes::Bytes>, Report<TrustedServerError>> {
+    Ok(Cursor::new(body.into_bytes().unwrap_or_default()))
+}
+
+fn request_body_bytes(
+    body: EdgeBody,
+    _endpoint: &str,
+) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    Ok(body.into_bytes().unwrap_or_default())
 }
 
 /// Headers copied from the original client request to the upstream proxy request
@@ -409,7 +416,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body_as_reader(body), &mut output)
+        .process(body_as_reader(body)?, &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;
@@ -1543,7 +1550,7 @@ pub async fn handle_first_party_proxy_sign(
     let req_url = req.uri().to_string();
 
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes();
+        let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
         enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
@@ -1658,7 +1665,7 @@ pub async fn handle_first_party_proxy_rebuild(
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes();
+        let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {

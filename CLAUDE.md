@@ -18,12 +18,14 @@ crates/
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
+  trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
 
-Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
-`rust-toolchain.toml`, `CONTRIBUTING.md`.
+Supporting files: `edgezero.toml`, `fastly.toml`,
+`trusted-server.example.toml`, `.env.dev`, `rust-toolchain.toml`,
+`CONTRIBUTING.md`. Operator-owned `trusted-server.toml` files are gitignored.
 
 ## Toolchain
 
@@ -95,6 +97,11 @@ cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
 cargo test-axum        # Axum dev server adapter (native)
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 cargo test-spin        # Spin adapter route tests (native host)
+
+# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
+# or aarch64-apple-darwin on Apple Silicon macOS.
+cargo test --package trusted-server-cli --target <host-triple>
 
 # Format
 cargo fmt --all -- --check
@@ -311,10 +318,12 @@ IntegrationRegistration::builder(ID)
 
 | File                  | Purpose                                                    |
 | --------------------- | ---------------------------------------------------------- |
-| `fastly.toml`         | Fastly service configuration and build settings            |
-| `trusted-server.toml` | Application settings (ad servers, KV stores, ID templates) |
-| `rust-toolchain.toml` | Pins Rust version to 1.95.0                                |
-| `.env.dev`            | Local development environment variables                    |
+| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
+| `fastly.toml`                   | Fastly service configuration and build settings                 |
+| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
+| `trusted-server.toml`           | Operator-owned app config; gitignored and pushed with `ts` CLI  |
+| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
+| `.env.dev`                      | Local development environment variables                         |
 
 ---
 
