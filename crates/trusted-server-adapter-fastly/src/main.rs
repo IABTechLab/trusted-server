@@ -51,7 +51,6 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
@@ -65,7 +64,7 @@ mod platform;
 #[cfg(test)]
 mod route_tests;
 
-use crate::app::{build_state, TrustedServerApp};
+use crate::app::{build_state, load_settings_from_config_store, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
@@ -208,7 +207,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // legacy_main. Must run here because TLS/JA4 accessors are only available
     // on FastlyRequest before conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        match get_settings() {
+        match load_settings_from_config_store() {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
                 build_ja4_debug_response(&req).send_to_client();
             }
@@ -327,7 +326,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         // verbs) carry TS/geo headers. Middleware-finalized responses are
         // skipped here to avoid a second settings read and geo lookup on the
         // normal registered-route path.
-        match get_settings() {
+        match load_settings_from_config_store() {
             Ok(settings) => {
                 let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
                     FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
@@ -355,7 +354,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // loaded the response is sent without EC finalization rather than
     // dropped.
     if let Some(ec_state) = ec_state {
-        match get_settings() {
+        match load_settings_from_config_store() {
             Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
                 Ok(partner_registry) => {
                     ec_finalize_response(
@@ -779,7 +778,7 @@ async fn route_request(
     };
     let kv_graph = if is_real_browser { kv_graph } else { None };
 
-    // `get_settings()` should already have rejected invalid handler regexes.
+    // `load_settings_from_config_store()` should already have rejected invalid handler regexes.
     // Keep this fallback so manually-constructed or otherwise unprepared
     // settings still become an error response instead of panicking.
     match enforce_basic_auth(settings, &req) {

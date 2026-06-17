@@ -18,7 +18,6 @@ bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-config = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
@@ -54,19 +53,6 @@ validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 edgezero-core = { workspace = true }
 
-[build-dependencies]
-config = { workspace = true }
-derive_more = { workspace = true }
-error-stack = { workspace = true }
-http = { workspace = true }
-log = { workspace = true }
-regex = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
-url = { workspace = true }
-validator = { workspace = true }
-
 [features]
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
@@ -74,6 +60,7 @@ default = []
 test-utils = []
 
 [dev-dependencies]
+config = { workspace = true }
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
 temp-env = { workspace = true }

@@ -192,6 +192,24 @@ impl IntegrationConfig for PrebidIntegrationConfig {
     }
 }
 
+/// Validate enabled Prebid config using the same startup-only checks as runtime registration.
+///
+/// # Errors
+///
+/// Returns a configuration error if enabled Prebid settings fail typed parsing,
+/// schema validation, or bidder-param override compilation.
+pub fn validate_config_for_startup(
+    settings: &Settings,
+) -> Result<Option<PrebidIntegrationConfig>, Report<TrustedServerError>> {
+    let Some(config) =
+        settings.integration_config::<PrebidIntegrationConfig>(PREBID_INTEGRATION_ID)?
+    else {
+        return Ok(None);
+    };
+    BidParamOverrideEngine::try_from_config(&config)?;
+    Ok(Some(config))
+}
+
 /// Canonical bidder-param override rule.
 ///
 /// A rule matches against the request-time facts in [`BidParamOverrideWhen`]

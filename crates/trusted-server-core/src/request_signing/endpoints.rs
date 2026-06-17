@@ -24,6 +24,13 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
         .expect("should build json response")
 }
 
+fn request_body_bytes(
+    body: EdgeBody,
+    _endpoint: &str,
+) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    Ok(body.into_bytes().unwrap_or_default())
+}
+
 /// Retrieves and returns the trusted-server discovery document.
 ///
 /// This endpoint provides a standardized discovery mechanism following the IAB
@@ -100,7 +107,7 @@ pub fn handle_verify_signature(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    let body = req.into_body().into_bytes().unwrap_or_default();
+    let body = request_body_bytes(req.into_body(), "verify-signature")?;
     enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
@@ -243,7 +250,7 @@ pub fn handle_rotate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.into_body().into_bytes().unwrap_or_default();
+    let body = request_body_bytes(req.into_body(), "rotate-key")?;
     enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
@@ -362,7 +369,7 @@ pub fn handle_deactivate_key(
         secret_store_id,
     } = signing_store_ids(settings)?;
 
-    let body = req.into_body().into_bytes().unwrap_or_default();
+    let body = request_body_bytes(req.into_body(), "deactivate-key")?;
     enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {

@@ -15,12 +15,14 @@ real-time bidding integration, and publisher-side JavaScript injection.
 crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
+  trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
 
-Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
-`rust-toolchain.toml`, `CONTRIBUTING.md`.
+Supporting files: `edgezero.toml`, `fastly.toml`,
+`trusted-server.example.toml`, `.env.dev`, `rust-toolchain.toml`,
+`CONTRIBUTING.md`. Operator-owned `trusted-server.toml` files are gitignored.
 
 ## Toolchain
 
@@ -58,6 +60,11 @@ fastly compute publish
 ```bash
 # Run all Rust tests (uses viceroy)
 cargo test --workspace
+
+# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
+# or aarch64-apple-darwin on Apple Silicon macOS.
+cargo test --package trusted-server-cli --target <host-triple>
 
 # Format
 cargo fmt --all -- --check
@@ -266,10 +273,12 @@ IntegrationRegistration::builder(ID)
 
 | File                  | Purpose                                                    |
 | --------------------- | ---------------------------------------------------------- |
-| `fastly.toml`         | Fastly service configuration and build settings            |
-| `trusted-server.toml` | Application settings (ad servers, KV stores, ID templates) |
-| `rust-toolchain.toml` | Pins Rust version to 1.95.0                                |
-| `.env.dev`            | Local development environment variables                    |
+| `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
+| `fastly.toml`                   | Fastly service configuration and build settings                 |
+| `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
+| `trusted-server.toml`           | Operator-owned app config; gitignored and pushed with `ts` CLI  |
+| `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
+| `.env.dev`                      | Local development environment variables                         |
 
 ---
 

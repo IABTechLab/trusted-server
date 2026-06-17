@@ -22,14 +22,17 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
-# Build
+# Build the runtime
 cargo build
 
-# Run tests
-cargo test
+# Build the host-target CLI
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --package trusted-server-cli --target "$HOST_TARGET"
 
-# Start local server
-fastly compute serve
+# Create local config, then edit placeholders before validation
+ts config init
+# Edit trusted-server.toml
+ts config validate
 ```
 
 ## Development
