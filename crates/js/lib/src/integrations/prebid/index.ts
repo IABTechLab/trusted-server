@@ -372,6 +372,49 @@ function clientSideBidsForRefresh(
   return bids;
 }
 
+/**
+ * Recover the publisher's inline server-side (PBS) bidder params for a slot.
+ *
+ * The synthetic refresh ad unit carries only the `trustedServer` bid, so the
+ * `requestBids` shim has no original server-side bidder entries to collect into
+ * `bidderParams` — without this, refresh/scroll `/auction` requests send `{}`
+ * and lose demand the publisher configured only on the initial ad unit. Source
+ * the params from the matching `pbjs.adUnits` entry by code, covering both
+ * states the initial auction can leave that entry in:
+ *   - raw server-side bidder entries (`{ bidder, params }`) not yet folded, and
+ *   - params already folded into that unit's `trustedServer` bid `bidderParams`
+ *     by a prior `requestBids` call.
+ */
+function serverSideBidderParamsForRefresh(code: string): Record<string, Record<string, unknown>> {
+  const adUnits = (pbjs.adUnits ?? []) as TrustedServerAdUnit[];
+  const match = adUnits.find((unit) => unit.code === code);
+  if (!match?.bids) return {};
+
+  const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
+  const params: Record<string, Record<string, unknown>> = {};
+
+  for (const bid of match.bids) {
+    if (!bid?.bidder) continue;
+    if (bid.bidder === ADAPTER_CODE) {
+      // Params captured and folded onto the trustedServer bid by an earlier
+      // requestBids call.
+      const folded = (bid.params?.[BIDDER_PARAMS_KEY] ?? {}) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      for (const [bidder, bidderParams] of Object.entries(folded)) {
+        params[bidder] = bidderParams;
+      }
+      continue;
+    }
+    if (clientSideBidders.has(bid.bidder)) continue;
+    // Raw server-side bidder entry not yet folded by the shim.
+    params[bid.bidder] = bid.params ?? {};
+  }
+
+  return params;
+}
+
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
   if (typeof slot.clearTargeting !== 'function') return;
 
@@ -694,13 +737,17 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         };
 
         const code = refreshSlotElementId(slot) ?? 'refresh-slot';
+        const tsParams: Record<string, unknown> = zone ? { [ZONE_KEY]: zone } : {};
+        // Carry the publisher's inline server-side (PBS) bidder params captured
+        // on the initial ad unit so refresh/scroll auctions don't drop them.
+        const serverSideParams = serverSideBidderParamsForRefresh(code);
+        if (Object.keys(serverSideParams).length > 0) {
+          tsParams[BIDDER_PARAMS_KEY] = serverSideParams;
+        }
         return {
           code,
           mediaTypes: { banner },
-          bids: [
-            { bidder: ADAPTER_CODE, params: zone ? { [ZONE_KEY]: zone } : {} },
-            ...clientSideBidsForRefresh(code),
-          ],
+          bids: [{ bidder: ADAPTER_CODE, params: tsParams }, ...clientSideBidsForRefresh(code)],
         };
       });
 
