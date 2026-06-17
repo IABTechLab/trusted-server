@@ -1072,18 +1072,14 @@ pub async fn handle_publisher_request(
 
     let is_navigation = is_navigation_request(&req);
 
-    // Generate a new EC ID only for document navigations. Subresource
-    // requests (fonts, images, CSS) may lack consent signals such as the
-    // Sec-GPC header, so we skip generation to avoid setting identity
-    // cookies when the user's consent preference is unknown.
-    if is_navigation {
-        if let Err(err) = ec_context.generate_if_needed(settings, kv) {
-            log::warn!("EC generation failed: {err:?}");
-        }
-    } else {
-        log::debug!("EC generation skipped: non-document request");
-    }
-
+    // EC generation is the caller's responsibility — it must run only for real
+    // browsers on document navigations, and that real-browser decision lives in
+    // the adapter (TLS/JA4/device gate). Generating here, with only the
+    // navigation signal, would mint an IP-derived EC for clients the adapter
+    // classified as non-real browsers and forward it to SSPs/APS even though EC
+    // operations were blocked for them. The adapter calls
+    // `EcContext::generate_if_needed` (real-browser-gated) before dispatching to
+    // this handler; subresource requests are likewise filtered there.
     let ec_allowed = ec_context.ec_allowed();
     log::debug!(
         "Proxy EC state: has_ec_id={}, ec_allowed={ec_allowed}",
@@ -1815,12 +1811,16 @@ pub async fn handle_page_bids(
         );
     }
 
-    let winning_bids = if auction_enabled
-        && !matched_slots.is_empty()
-        && consent_allows_auction
-        && !is_bot
-        && !is_prefetch
-    {
+    // The [auction].enabled kill switch and a consent denial disable the entire
+    // server-side ad stack. In those states the endpoint must return no slots,
+    // so the SPA hook does not assign `ts.adSlots` and call `adInit()` —
+    // otherwise the kill switch/consent gate would stop SSP calls but still let
+    // the client create/refresh GPT slots. Bot/prefetch requests, by contrast,
+    // keep their slot definitions (the placement structure is unchanged) but
+    // skip the live auction, matching the existing bot/prefetch behaviour.
+    let ad_stack_enabled = auction_enabled && consent_allows_auction;
+
+    let winning_bids = if ad_stack_enabled && !matched_slots.is_empty() && !is_bot && !is_prefetch {
         let slots_ctx = MatchedSlotsContext {
             matched_slots: &matched_slots,
             request_path: &path_param,
@@ -1892,30 +1892,36 @@ pub async fn handle_page_bids(
         settings.debug.inject_adm_for_testing,
     );
 
-    let slots_json: Vec<serde_json::Value> = matched_slots
-        .iter()
-        .map(|slot| {
-            let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
-            let div_id = slot.resolved_div_id();
-            let formats: Vec<serde_json::Value> = slot
-                .formats
-                .iter()
-                .map(|f| serde_json::json!([f.width, f.height]))
-                .collect();
-            let targeting: serde_json::Map<String, serde_json::Value> = slot
-                .targeting
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            serde_json::json!({
-                "id": slot.id,
-                "gam_unit_path": gam_path,
-                "div_id": div_id,
-                "formats": formats,
-                "targeting": targeting,
+    // Gate slots on the ad-stack kill switch / consent: when disabled, return no
+    // slots so the SPA hook does not call `adInit()` / create GPT slots.
+    let slots_json: Vec<serde_json::Value> = if ad_stack_enabled {
+        matched_slots
+            .iter()
+            .map(|slot| {
+                let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
+                let div_id = slot.resolved_div_id();
+                let formats: Vec<serde_json::Value> = slot
+                    .formats
+                    .iter()
+                    .map(|f| serde_json::json!([f.width, f.height]))
+                    .collect();
+                let targeting: serde_json::Map<String, serde_json::Value> = slot
+                    .targeting
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                serde_json::json!({
+                    "id": slot.id,
+                    "gam_unit_path": gam_path,
+                    "div_id": div_id,
+                    "formats": formats,
+                    "targeting": targeting,
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let body = serde_json::json!({
         "slots": slots_json,
@@ -2251,6 +2257,67 @@ mod tests {
             stub.recorded_backend_names(),
             vec!["stub-backend".to_string()],
             "should proxy through the platform http client"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_publisher_request_does_not_self_generate_ec() {
+        // EC generation is the adapter's real-browser-gated responsibility. This
+        // handler must never mint an EC ID on its own: for a navigation from a
+        // client the adapter did not pre-generate for (e.g. a non-real browser),
+        // `ec_value` must stay `None` so no IP-derived identifier reaches the
+        // auction. Consent allows EC creation and a client IP is present here —
+        // exactly the conditions under which the old inline call would have
+        // generated one.
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"<html><body>ok</body></html>".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..Default::default()
+        };
+        let mut ec_context =
+            EcContext::new_for_test_with_ip(None, consent, Some("203.0.113.7".to_string()));
+        assert!(
+            ec_context.ec_allowed(),
+            "test precondition: consent must allow EC creation"
+        );
+
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/article")
+            .header(header::HOST, "publisher.example")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let _ = handle_publisher_request(
+            &settings,
+            &registry,
+            &services,
+            None,
+            &mut ec_context,
+            AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            req,
+        )
+        .await
+        .expect("should proxy publisher request");
+
+        assert_eq!(
+            ec_context.ec_value(),
+            None,
+            "handler must not self-generate an EC ID; generation is the adapter's real-browser-gated responsibility",
         );
     }
 
@@ -3923,6 +3990,34 @@ mod tests {
             serde_json::from_slice(&response.into_body().into_bytes()).expect("should be json")
         }
 
+        /// `run_page_bids` with an EC context whose jurisdiction allows the
+        /// server-side auction, so slot-counting tests isolate the variable
+        /// under test (bot/prefetch) from the consent gate. The default
+        /// request resolves to `Jurisdiction::Unknown`, which fails the
+        /// consent gate and now suppresses slots.
+        async fn run_page_bids_consent_allowed(
+            settings: &Settings,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            req: Request<EdgeBody>,
+        ) -> serde_json::Value {
+            let ec_context = consent_allowing_ec_context();
+            let response =
+                run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req)
+                    .await;
+            serde_json::from_slice(&response.into_body().into_bytes()).expect("should be json")
+        }
+
+        /// Builds an [`EcContext`] whose consent context permits the server-side
+        /// auction (known non-GDPR jurisdiction, no EU TCF signal).
+        fn consent_allowing_ec_context() -> EcContext {
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            EcContext::new_for_test(None, consent)
+        }
+
         fn article_slot() -> Vec<CreativeOpportunitySlot> {
             vec![CreativeOpportunitySlot {
                 id: "atf".to_string(),
@@ -3968,10 +4063,20 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            let services = noop_services();
             let fastly_req = crate::compat::to_fastly_request_ref(&req);
             let ec_context = EcContext::read_from_request(settings, &fastly_req)
                 .expect("should read EC context");
+            run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req).await
+        }
+
+        async fn run_page_bids_response_with_ec(
+            settings: &Settings,
+            orchestrator: &AuctionOrchestrator,
+            slots: &[CreativeOpportunitySlot],
+            ec_context: &EcContext,
+            req: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
+            let services = noop_services();
             handle_page_bids(
                 settings,
                 &services,
@@ -3981,7 +4086,7 @@ mod tests {
                     slots,
                     registry: None,
                 },
-                &ec_context,
+                ec_context,
                 req,
             )
             .await
@@ -4102,7 +4207,7 @@ mod tests {
                 "Mozilla/5.0 (compatible; Googlebot/2.1)",
             );
 
-            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
@@ -4132,7 +4237,7 @@ mod tests {
             let mut req = make_page_bids_request("/2024/01/my-article/");
             set_test_header(&mut req, "sec-purpose", "prefetch");
 
-            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
@@ -4210,24 +4315,27 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn disabled_auction_returns_slots_but_no_bids() {
-            // [auction].enabled = false is a global kill switch: slot definitions
-            // are still returned (HTML structure unchanged) but no server-side
-            // auction may be dispatched.
+        async fn disabled_auction_returns_no_slots_or_bids() {
+            // [auction].enabled = false is a global kill switch: it must disable
+            // the entire server-side ad stack, not just SSP calls. Returning slot
+            // definitions would let the SPA hook assign `ts.adSlots` and call
+            // `adInit()`, creating/refreshing GPT slots client-side even though
+            // the auction is off. Consent is allowed here so the test isolates
+            // the kill switch.
             let settings = settings_with_co_auction_disabled();
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let slots = article_slot();
             let req = make_page_bids_request("/2024/01/my-article/");
 
-            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
+            let body = run_page_bids_consent_allowed(&settings, &orchestrator, &slots, req).await;
 
             assert_eq!(
                 body["slots"]
                     .as_array()
                     .expect("slots should be array")
                     .len(),
-                1,
-                "disabled auction should still return slot definitions"
+                0,
+                "disabled auction must not return slot definitions (kill switch stops the ad stack)"
             );
             assert_eq!(
                 body["bids"]
@@ -4236,6 +4344,39 @@ mod tests {
                     .len(),
                 0,
                 "disabled auction must not produce bids"
+            );
+        }
+
+        #[tokio::test]
+        async fn consent_denied_returns_no_slots_or_bids() {
+            // When consent denies the server-side auction (here: Jurisdiction
+            // Unknown fails closed), the endpoint must return no slots so the SPA
+            // hook does not create GPT slots client-side — matching the publisher
+            // navigation path's `should_run_server_side_ad_stack` gate.
+            let settings = settings_with_co();
+            let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+            let slots = article_slot();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            // run_page_bids uses the default EC context, which resolves to
+            // Jurisdiction::Unknown (consent denied).
+            let body = run_page_bids(&settings, &orchestrator, &slots, req).await;
+
+            assert_eq!(
+                body["slots"]
+                    .as_array()
+                    .expect("slots should be array")
+                    .len(),
+                0,
+                "consent denial must suppress slot definitions"
+            );
+            assert_eq!(
+                body["bids"]
+                    .as_object()
+                    .expect("bids should be object")
+                    .len(),
+                0,
+                "consent denial must produce no bids"
             );
         }
     }

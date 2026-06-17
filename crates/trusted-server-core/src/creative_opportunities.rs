@@ -16,6 +16,7 @@ use crate::settings::vec_from_seq_or_map;
 
 /// Top-level configuration for the creative opportunities system.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreativeOpportunitiesConfig {
     /// GAM network ID used to build default unit paths.
     pub gam_network_id: String,
@@ -288,6 +289,7 @@ impl CreativeOpportunitySlot {
 
 /// An ad format combining a media type with pixel dimensions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreativeOpportunityFormat {
     /// Creative width in pixels.
     pub width: u32,
@@ -320,6 +322,7 @@ impl CreativeOpportunityFormat {
 
 /// Provider-specific slot identifiers for a [`CreativeOpportunitySlot`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlotProviders {
     /// Amazon Publisher Services (APS/TAM) slot parameters.
     pub aps: Option<ApsSlotParams>,
@@ -333,6 +336,7 @@ pub struct SlotProviders {
 
 /// APS-specific parameters for a slot.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApsSlotParams {
     /// The APS slot ID string used when making TAM bid requests.
     pub slot_id: String,
@@ -345,6 +349,7 @@ pub struct ApsSlotParams {
 /// When `bidders` is non-empty the map is forwarded verbatim, bypassing
 /// automatic expansion (useful for slots that need explicit per-bidder params).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrebidSlotParams {
     /// Per-bidder inline params map. Bidder name → params object.
     ///
@@ -592,6 +597,47 @@ mod tests {
         assert_eq!(
             params.get("custom").and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_top_level_key() {
+        // A typo such as `slots` instead of `slot` must surface as a config
+        // error rather than silently deserializing to an empty (disabled) stack.
+        let typo = serde_json::json!({ "gam_network_id": "12345", "slots": [] });
+        assert!(
+            serde_json::from_value::<CreativeOpportunitiesConfig>(typo).is_err(),
+            "unknown top-level key should be rejected by deny_unknown_fields"
+        );
+
+        let correct = serde_json::json!({ "gam_network_id": "12345", "slot": [] });
+        assert!(
+            serde_json::from_value::<CreativeOpportunitiesConfig>(correct).is_ok(),
+            "the correct `slot` key should still deserialize"
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_nested_keys() {
+        // Format typo: `med.a_type` instead of `media_type`.
+        let format_typo = serde_json::json!({ "width": 300, "height": 250, "meda_type": "banner" });
+        assert!(
+            serde_json::from_value::<CreativeOpportunityFormat>(format_typo).is_err(),
+            "unknown format key should be rejected"
+        );
+
+        // Provider typo: `prebd` instead of `prebid`.
+        let providers_typo = serde_json::json!({ "prebd": {} });
+        assert!(
+            serde_json::from_value::<SlotProviders>(providers_typo).is_err(),
+            "unknown provider key should be rejected"
+        );
+
+        // APS typo: `slotId` instead of `slot_id`.
+        let aps_typo = serde_json::json!({ "slotId": "x" });
+        assert!(
+            serde_json::from_value::<ApsSlotParams>(aps_typo).is_err(),
+            "unknown APS key should be rejected"
         );
     }
 
