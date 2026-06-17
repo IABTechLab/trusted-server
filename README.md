@@ -22,17 +22,19 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
-# Build Axum dev server (native)
-cargo build -p trusted-server-adapter-axum
-
-# Build Fastly adapter (WASM)
-cargo build -p trusted-server-adapter-fastly --target wasm32-wasip1
+# Build per adapter (target-matched aliases from .cargo/config.toml)
+cargo build-fastly       # Fastly adapter + core (wasm32-wasip1)
+cargo build-axum         # Axum dev server (native)
+cargo build-cloudflare   # Cloudflare Workers (wasm32-unknown-unknown)
 
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly
 
 # Run tests (Axum native adapter)
 cargo test-axum
+
+# Run tests (Cloudflare Workers adapter — native host)
+cargo test-cloudflare
 
 # Start local server — Axum (no Fastly CLI or Viceroy required)
 cargo run -p trusted-server-adapter-axum
@@ -48,11 +50,12 @@ fastly compute serve
 cargo fmt
 
 # Lint
-cargo clippy-fastly && cargo clippy-axum
+cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
 
 # Run all tests
-cargo test-fastly   # Fastly/WASM (requires Viceroy)
-cargo test-axum     # Axum native adapter
+cargo test-fastly      # Fastly/WASM (requires Viceroy)
+cargo test-axum        # Axum native adapter
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

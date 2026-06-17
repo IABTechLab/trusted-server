@@ -903,6 +903,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgezero-adapter-cloudflare"
+version = "0.1.0"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "brotli",
+ "bytes",
+ "edgezero-core",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "serde_json",
+ "worker",
+]
+
+[[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
 source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
@@ -1960,6 +1978,12 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "matchit"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -2938,6 +2962,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3537,6 +3572,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-adapter-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-adapter-cloudflare",
+ "edgezero-core",
+ "error-stack",
+ "js-sys",
+ "log",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-js",
+ "worker",
+]
+
+[[package]]
 name = "trusted-server-adapter-fastly"
 version = "0.1.0"
 dependencies = [
@@ -3602,6 +3654,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "validator",
+ "web-time",
 ]
 
 [[package]]
@@ -3870,6 +3923,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -4268,6 +4334,64 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "worker"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7267f3baa986254a8dace6f6a7c6ab88aef59f00c03aaad6749e048b5faaf6f6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-channel",
+ "futures-util",
+ "http",
+ "http-body",
+ "js-sys",
+ "matchit 0.7.3",
+ "pin-project",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_urlencoded",
+ "tokio",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
+ "worker-macros",
+ "worker-sys",
+]
+
+[[package]]
+name = "worker-macros"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7410081121531ec2fa111ab17b911efc601d7b6d590c0a92b847874ebeff0030"
+dependencies = [
+ "async-trait",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-macro-support",
+ "worker-sys",
+]
+
+[[package]]
+name = "worker-sys"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4777582bf8a04174a034cb336f3702eb0e5cb444a67fdaa4fd44454ff7e2dd95"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
+  trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   js/            # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -40,7 +41,7 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 
 ```bash
 # Build (per-target aliases — bare `cargo build` fails at the workspace root)
-cargo build-fastly && cargo build-axum
+cargo build-fastly && cargo build-axum && cargo build-cloudflare
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -56,6 +57,15 @@ cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
 cargo test-axum
+
+# Check Cloudflare adapter (native)
+cargo check -p trusted-server-adapter-cloudflare
+
+# Check Cloudflare adapter (WASM target — alias for the full command)
+cargo check-cloudflare
+
+# Test Cloudflare adapter (native host)
+cargo test-cloudflare
 ```
 
 ### Testing & Quality
@@ -63,17 +73,18 @@ cargo test-axum
 ```bash
 # Run all Rust tests — use workspace aliases (see .cargo/config.toml)
 # default-members = [fastly] so Viceroy can locate the binary via `cargo run --bin`.
-cargo test-fastly  # Fastly adapter + core (wasm32-wasip1 via Viceroy)
-cargo test-axum    # Axum dev server adapter (native)
+cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-axum        # Axum dev server adapter (native)
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 
 # Format
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy-fastly && cargo clippy-axum
+cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
 
 # Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
-cargo check-fastly && cargo check-axum
+cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
 cd crates/js/lib && npx vitest run

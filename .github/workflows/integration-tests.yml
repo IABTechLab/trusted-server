@@ -16,6 +16,7 @@ env:
   WASM_ARTIFACT_PATH: /tmp/integration-test-artifacts/wasm/trusted-server-adapter-fastly.wasm
   AXUM_ARTIFACT_PATH: /tmp/integration-test-artifacts/axum/trusted-server-axum
   DOCKER_ARTIFACT_PATH: /tmp/integration-test-artifacts/docker/test-images.tar
+  CF_BUILD_ARTIFACT_PATH: /tmp/integration-test-artifacts/cloudflare/build
 
 jobs:
   prepare-artifacts:
@@ -30,12 +31,14 @@ jobs:
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
           install-viceroy: "false"
+          build-cloudflare: "true"
 
       - name: Package integration test artifacts
         run: |
-          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")"
+          mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")" "$CF_BUILD_ARTIFACT_PATH"
           cp target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm "$WASM_ARTIFACT_PATH"
           cp target/debug/trusted-server-axum "$AXUM_ARTIFACT_PATH"
+          cp -r crates/trusted-server-adapter-cloudflare/build/. "$CF_BUILD_ARTIFACT_PATH/"
           docker save \
             --output "$DOCKER_ARTIFACT_PATH" \
             test-wordpress:latest test-nextjs:latest
@@ -51,7 +54,7 @@ jobs:
     name: integration tests
     needs: prepare-artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -63,6 +66,7 @@ jobs:
           check-dependency-versions: "false"
           install-viceroy: "true"
           build-wasm: "false"
+          build-axum: "false"
           build-test-images: "false"
 
       - name: Download integration test artifacts
@@ -74,18 +78,34 @@ jobs:
       - name: Make binaries executable
         run: chmod +x "$AXUM_ARTIFACT_PATH"
 
+      - name: Restore Cloudflare Workers bundle
+        run: |
+          mkdir -p crates/trusted-server-adapter-cloudflare/build
+          cp -r "$CF_BUILD_ARTIFACT_PATH/." crates/trusted-server-adapter-cloudflare/build/
+
       - name: Load integration test Docker images
         run: docker load --input "$DOCKER_ARTIFACT_PATH"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.shared-setup.outputs.node-version }}
+
+      - name: Install wrangler
+        run: npm install -g wrangler
 
       - name: Run integration tests
         run: >-
           cargo test
           --manifest-path crates/integration-tests/Cargo.toml
           --target x86_64-unknown-linux-gnu
-          -- --include-ignored --skip test_wordpress_fastly --skip test_nextjs_fastly --test-threads=1
+          -- --include-ignored
+          --skip test_wordpress_fastly --skip test_nextjs_fastly
+          --test-threads=1
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
+          CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           RUST_LOG: info
 

@@ -4,6 +4,7 @@ members = [
     "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
     "crates/trusted-server-adapter-axum",
+    "crates/trusted-server-adapter-cloudflare",
     "crates/js",
     "crates/openrtb",
 ]
@@ -75,6 +76,7 @@ hmac = "0.12.1"
 http = "1.4.0"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
+js-sys = "0.3"
 log = "0.4.29"
 log-fastly = "0.11.12"
 lol_html = "2.7.2"
@@ -97,5 +99,6 @@ url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
+web-time = "1"
 which = "8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

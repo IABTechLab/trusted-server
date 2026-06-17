@@ -8,10 +8,11 @@ Validate that the project builds correctly across all targets.
 
 ## Steps
 
-1. **Per-target builds** (no global target — fastly is wasm-only, axum is native)
+1. **Per-target builds** (no global target — fastly is wasm32-wasip1, axum is
+   native, cloudflare is wasm32-unknown-unknown)
 
    ```bash
-   cargo build-fastly && cargo build-axum
+   cargo build-fastly && cargo build-axum && cargo build-cloudflare
    ```
 
 2. **WASM build** (production target)
@@ -23,7 +24,7 @@ Validate that the project builds correctly across all targets.
 3. **Clippy**
 
    ```bash
-   cargo clippy-fastly && cargo clippy-axum
+   cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
    ```
 
 4. **Format check**

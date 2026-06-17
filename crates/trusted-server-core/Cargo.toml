@@ -48,6 +48,7 @@ uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 edgezero-core = { workspace = true }
+web-time = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # Enable JS-backed RNG for `wasm32-unknown-unknown` targets (e.g. Cloudflare Workers).

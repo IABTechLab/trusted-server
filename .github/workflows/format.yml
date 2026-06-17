@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**"]
 
 permissions:
   contents: read
@@ -37,6 +37,9 @@ jobs:
 
       - name: Run cargo clippy (Axum — native)
         run: cargo clippy-axum
+
+      - name: Run cargo clippy (Cloudflare — native)
+        run: cargo clippy-cloudflare
 
   format-typescript:
     runs-on: ubuntu-latest
