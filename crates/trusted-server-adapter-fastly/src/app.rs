@@ -82,7 +82,9 @@ use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HandlerFuture, HeaderValue, Method, Request, Response};
+use edgezero_core::http::{
+    header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
+};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -560,15 +562,35 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
     response
 }
 
+/// Returns `true` when an asset response should carry a buffered body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
+/// representation length in their `Content-Length` header while carrying no
+/// body. Rewriting that header to the buffered byte count (0) would corrupt the
+/// metadata, so those responses keep the origin's `Content-Length` untouched.
+fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
 /// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
 /// `route_request` asset branch.
 ///
-/// Proxies the request to the configured asset origin, buffers the body (the
-/// `EdgeZero` path buffers rather than streams), and threads the
+/// Proxies the request to the configured asset origin and threads the
 /// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
 /// can reapply protected cache directives after finalization. EC finalization
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
 /// legacy `should_finalize_ec = false` behavior for asset responses.
+///
+/// Unlike legacy `route_request`, which streams asset bodies straight to the
+/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
+/// converts the whole response before sending, so there is no streaming seam
+/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
+/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
+/// uncapped streaming are both resolved by the streaming cutover (issue #495);
+/// whether assets get a dedicated cap is deferred to that work.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -576,6 +598,8 @@ async fn dispatch_asset_fallback(
     asset_route: &ProxyAssetRoute,
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
+
+    let method = req.method().clone();
 
     match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
         Ok(asset_response) => {
@@ -587,11 +611,16 @@ async fn dispatch_asset_fallback(
                     .await
                 {
                     Ok(bytes) => {
-                        response.headers_mut().insert(
-                            header::CONTENT_LENGTH,
-                            HeaderValue::from(bytes.len() as u64),
-                        );
-                        *response.body_mut() = edgezero_core::body::Body::from(bytes);
+                        // Preserve the origin's Content-Length for HEAD and
+                        // bodiless statuses; only body-bearing responses get a
+                        // recomputed length and the buffered body attached.
+                        if asset_response_carries_body(&method, response.status()) {
+                            response.headers_mut().insert(
+                                header::CONTENT_LENGTH,
+                                HeaderValue::from(bytes.len() as u64),
+                            );
+                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
+                        }
                     }
                     Err(report) => {
                         let mut response = http_error(&report);
@@ -616,8 +645,9 @@ async fn dispatch_asset_fallback(
     }
 }
 
-/// Buffers a streaming asset body into memory, bounded by
-/// `publisher.max_buffered_body_bytes`.
+/// Buffers a streaming asset body into memory, bounded by `max_bytes`
+/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
+/// [`dispatch_asset_fallback`]).
 ///
 /// # Errors
 ///
@@ -990,6 +1020,30 @@ mod tests {
         assert!(
             !super::uses_dynamic_tsjs_fallback(&Method::OPTIONS, "/static/tsjs=tsjs-unified.js"),
             "OPTIONS should fall through to the publisher/integration fallback"
+        );
+    }
+
+    #[test]
+    fn asset_response_carries_body_preserves_bodiless_content_length() {
+        // GET/200 buffers a body and recomputes Content-Length.
+        assert!(
+            super::asset_response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 asset response should carry a buffered body"
+        );
+        // HEAD advertises the origin representation length with no body — the
+        // recomputed (zero) length must not overwrite it.
+        assert!(
+            !super::asset_response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD asset responses must preserve the origin Content-Length"
+        );
+        // Bodiless statuses keep their origin metadata regardless of method.
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must preserve the origin Content-Length"
+        );
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must preserve the origin Content-Length"
         );
     }
 
