@@ -1,3 +1,15 @@
+//! Publisher response handler.
+//!
+//! Publisher fallback has three delivery modes that must remain explicit at
+//! the API boundary:
+//! - pass-through for non-processable `2xx` content
+//! - streamed processing for stream-safe processable responses
+//! - buffered responses for unsupported encodings, `204/205`, or HTML routes
+//!   that require full-document post-processing
+//!
+//! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
+//! streaming processor treats unknown encodings as identity, so publisher code
+//! must gate them out before the body enters the rewrite pipeline.
 use std::io::Write;
 use std::time::Duration;
 
@@ -204,15 +216,12 @@ fn process_response_streaming<W: Write>(
 ) -> Result<(), Report<TrustedServerError>> {
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
-    // lgtm[rust/cleartext-logging]
-    // This debug log records content-shape metadata and hostnames only; no secrets are logged.
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
         params.content_encoding,
         is_html,
-        is_rsc_flight,
-        params.origin_host
+        is_rsc_flight
     );
 
     let compression = Compression::from_content_encoding(params.content_encoding);
@@ -396,45 +405,6 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
-/// Growable byte buffer that rejects writes past a configured limit.
-///
-/// Used by [`buffer_publisher_response`] to enforce
-/// `settings.publisher.max_buffered_body_bytes` so a large processable
-/// origin response fails safely instead of exhausting the Wasm heap.
-struct BoundedWriter {
-    inner: Vec<u8>,
-    limit: usize,
-}
-
-impl BoundedWriter {
-    fn new(limit: usize) -> Self {
-        Self {
-            inner: Vec::new(),
-            limit,
-        }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.inner
-    }
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.inner.len() + buf.len() > self.limit {
-            return Err(std::io::Error::other(
-                "publisher body exceeded maximum buffered size",
-            ));
-        }
-        self.inner.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Buffer a [`PublisherResponse`] into a single [`Response`].
 ///
 /// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
@@ -506,6 +476,51 @@ pub fn stream_publisher_body<W: Write>(
         integration_registry,
     };
     process_response_streaming(body, output, &borrowed)
+}
+
+/// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
+/// byte limit would be exceeded.
+///
+/// Used to bound in-WASM-heap buffering of decoded/re-written publisher bodies.
+/// A highly-compressible origin response can sit under the platform raw-body cap
+/// yet expand past a safe heap size after decode and post-processing; this writer
+/// turns that into a recoverable error instead of an out-of-memory abort.
+pub struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    /// Creates a writer that accepts at most `limit` bytes before erroring.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Consumes the writer and returns the buffered bytes.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -610,6 +625,7 @@ pub async fn handle_publisher_request(
             scheme: origin_scheme.clone(),
             host: origin_host_without_port.to_string(),
             port: parsed_origin.port(),
+            host_header_override: settings.publisher.origin_host_header_override.clone(),
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
         })
@@ -617,6 +633,7 @@ pub async fn handle_publisher_request(
             message: "backend registration failed".to_string(),
         })?;
     let origin_host = settings.publisher.origin_host();
+    let origin_host_header = settings.publisher.origin_host_header();
     let origin_path_and_query = req
         .uri()
         .path_and_query()
@@ -628,19 +645,20 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
-    // lgtm[rust/cleartext-logging]
-    // This debug log records backend routing metadata only; `Settings` secrets remain redacted.
-    log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
-        backend_name,
-        settings.publisher.origin_url
-    );
+    log::debug!("Proxying request to configured publisher backend");
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
+    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
+    // origin. On the EdgeZero path the entry point re-injects this header from
+    // trusted Fastly TLS metadata so in-process scheme detection
+    // (`RequestInfo::from_request`, computed above) works; the legacy path never
+    // sets it. Either way it is an internal edge signal that must not leak to
+    // publisher backends, matching legacy outbound-header behavior.
+    req.headers_mut().remove("fastly-ssl");
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
-        HeaderValue::from_str(&origin_host).change_context(TrustedServerError::Proxy {
+        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
             message: "invalid publisher origin host header".to_string(),
         })?,
     );
@@ -654,10 +672,11 @@ pub async fn handle_publisher_request(
         })?
         .response;
 
-    log::debug!("Response headers:");
-    for (name, value) in response.headers() {
-        log::debug!("  {}: {:?}", name, value);
-    }
+    log::debug!(
+        "Publisher origin response received: status={}, header_count={}",
+        response.status(),
+        response.headers().len()
+    );
 
     // Set EC ID / cookie headers BEFORE body processing.
     // These are body-independent (computed from request cookies + consent).
@@ -717,15 +736,11 @@ pub async fn handle_publisher_request(
                     status,
                 );
             } else if !is_supported_content_encoding(&content_encoding) {
-                log::warn!(
-                    "Unsupported Content-Encoding '{}' - returning response unmodified",
-                    content_encoding,
-                );
+                log::warn!("Unsupported Content-Encoding; returning response unmodified");
             } else {
                 log::debug!(
-                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
+                    "Skipping response processing - Content-Type: '{}', status: {}",
                     content_type,
-                    request_host,
                     status,
                 );
             }
@@ -770,8 +785,9 @@ pub async fn handle_publisher_request(
                 content_type: &content_type,
                 integration_registry,
             };
-            let mut output = Vec::new();
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
             process_response_streaming(body, &mut output, &params)?;
+            let output = output.into_inner();
 
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
@@ -1634,6 +1650,45 @@ mod tests {
     }
 
     #[test]
+    fn publisher_request_strips_fastly_ssl_before_forwarding() {
+        futures::executor::block_on(async {
+            // The EdgeZero entry point re-injects `fastly-ssl` from trusted TLS
+            // metadata so in-process scheme detection works. It must not leak to the
+            // origin: the legacy path never forwarded it.
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .header("fastly-ssl", "1")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+
+            let recorded = stub.recorded_request_headers();
+            let outbound = recorded
+                .first()
+                .expect("should record one outbound request");
+            assert!(
+                !outbound
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("fastly-ssl")),
+                "internal fastly-ssl signal must not be forwarded to the origin, got: {outbound:?}"
+            );
+        });
+    }
+
+    #[test]
     fn stream_publisher_body_preserves_gzip_round_trip() {
         use flate2::write::GzEncoder;
         use std::io::Write;
@@ -1861,6 +1916,63 @@ mod tests {
             !as_str.contains("origin.example.com"),
             "origin host must not leak. Got: {as_str}"
         );
+    }
+
+    /// `BufferedProcessed` must enforce `publisher.max_buffered_body_bytes` so a
+    /// post-processed HTML body whose decoded output exceeds the cap fails instead
+    /// of allocating past the limit. Regression for the `EdgeZero` buffering gap
+    /// where only the streaming-conversion path applied the cap.
+    #[test]
+    fn buffered_processed_enforces_max_buffered_body_bytes() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            // Register an HTML post-processor so the response routes to BufferedProcessed.
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should update nextjs config");
+            // Tiny cap so a modest HTML document exceeds it after processing.
+            settings.publisher.max_buffered_body_bytes = 64;
+
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            assert!(
+                registry.has_html_post_processors(),
+                "nextjs integration must register an HTML post-processor"
+            );
+
+            // Identity-encoded HTML well above the 64-byte cap once buffered.
+            let filler = "<p>padding</p>".repeat(64);
+            let html = format!("<html><body>{filler}</body></html>");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                html.into_bytes(),
+                vec![("content-type", "text/html; charset=utf-8")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let result = handle_publisher_request(&settings, &registry, &services, req).await;
+
+            assert!(
+            result.is_err(),
+            "buffered-processed body exceeding max_buffered_body_bytes must error, not allocate past the cap"
+        );
+        });
     }
 
     /// Document-state survives from the streaming pass into the post-processor.

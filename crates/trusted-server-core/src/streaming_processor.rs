@@ -65,10 +65,10 @@ impl Compression {
     /// Detect compression from content-encoding header
     #[must_use]
     pub fn from_content_encoding(encoding: &str) -> Self {
-        match encoding.to_lowercase().as_str() {
-            "gzip" => Self::Gzip,
-            "deflate" => Self::Deflate,
-            "br" => Self::Brotli,
+        match encoding {
+            s if s.eq_ignore_ascii_case("gzip") => Self::Gzip,
+            s if s.eq_ignore_ascii_case("deflate") => Self::Deflate,
+            s if s.eq_ignore_ascii_case("br") => Self::Brotli,
             _ => Self::None,
         }
     }
@@ -128,7 +128,7 @@ impl<P: StreamProcessor> StreamingPipeline<P> {
     ///
     /// Handles all supported compression transformations by wrapping the raw
     /// reader/writer in the appropriate decoder/encoder, then delegating to
-    /// [`Self::process_chunks`].
+    /// `Self::process_chunks`.
     ///
     /// # Errors
     ///
