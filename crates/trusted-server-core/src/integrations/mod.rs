@@ -19,6 +19,7 @@ pub mod google_tag_manager;
 pub mod gpt;
 pub mod lockr;
 pub mod nextjs;
+pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
@@ -210,6 +211,7 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         lockr::register,
         didomi::register,
         sourcepoint::register,
+        osano::register,
         google_tag_manager::register,
         datadome::register,
         gpt::register,

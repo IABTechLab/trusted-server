@@ -727,6 +727,7 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
@@ -746,6 +747,7 @@ impl Default for IntegrationRegistryInner {
             head_router: Router::new(),
             options_router: Router::new(),
             routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
@@ -816,6 +818,10 @@ impl IntegrationRegistry {
 
         for builder in crate::integrations::builders() {
             if let Some(registration) = builder(settings)? {
+                inner
+                    .enabled_integration_ids
+                    .push(registration.integration_id);
+
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
                         let value = (proxy.clone(), registration.integration_id);
@@ -1082,6 +1088,11 @@ impl IntegrationRegistry {
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
+        for integration_id in &self.inner.enabled_integration_ids {
+            map.entry(*integration_id)
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
+        }
+
         for (route, integration_id) in &self.inner.routes {
             let entry = map
                 .entry(*integration_id)
@@ -1131,15 +1142,14 @@ impl IntegrationRegistry {
     pub fn js_module_ids(&self) -> Vec<&'static str> {
         // Rust-only integrations with no corresponding JS module
         const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
-        // JS-only modules always included (no Rust-side registration).
-        // Sourcepoint's JS guards cookie clearing with a Sourcepoint-owned marker.
-        const JS_ALWAYS: &[&str] = &["creative", "sourcepoint"];
+        // Core JS-only modules that do not have a Rust-side registration.
+        const JS_ALWAYS: &[&str] = &["creative"];
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
-        for meta in self.registered_integrations() {
-            if !JS_EXCLUDED.contains(&meta.id) && !ids.contains(&meta.id) {
-                ids.push(meta.id);
+        for id in &self.inner.enabled_integration_ids {
+            if !JS_EXCLUDED.contains(id) && !ids.contains(id) {
+                ids.push(*id);
             }
         }
 
@@ -1186,6 +1196,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
@@ -1213,6 +1224,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
@@ -1299,6 +1311,7 @@ impl IntegrationRegistry {
                 head_router,
                 options_router,
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
@@ -1951,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn js_module_ids_immediate_excludes_prebid_and_includes_js_only_modules() {
+    fn js_module_ids_immediate_excludes_prebid_and_includes_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1984,8 +1997,8 @@ mod tests {
             "should include creative in immediate IDs"
         );
         assert!(
-            immediate.contains(&"sourcepoint"),
-            "should include sourcepoint in immediate IDs"
+            !immediate.contains(&"sourcepoint"),
+            "should not include Sourcepoint unless explicitly enabled"
         );
         assert!(
             !immediate.contains(&"prebid"),
@@ -1994,6 +2007,37 @@ mod tests {
         assert!(
             deferred.contains(&"prebid"),
             "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("sourcepoint", &serde_json::json!({ "enabled": true }))
+            .expect("should insert sourcepoint config");
+        settings
+            .integrations
+            .insert_config("osano", &serde_json::json!({ "enabled": true }))
+            .expect("should insert osano config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let immediate = registry.js_module_ids_immediate();
+
+        assert!(
+            immediate.contains(&"sourcepoint"),
+            "should include Sourcepoint when explicitly enabled"
+        );
+        assert!(
+            immediate.contains(&"osano"),
+            "should include Osano when explicitly enabled"
+        );
+
+        let metadata = registry.registered_integrations();
+        assert!(
+            metadata.iter().any(|integration| integration.id == "osano"),
+            "should include JS-only Osano registration in metadata"
         );
     }
 
