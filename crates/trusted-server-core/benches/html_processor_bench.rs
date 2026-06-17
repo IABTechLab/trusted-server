@@ -9,6 +9,7 @@ fn make_config() -> HtmlProcessorConfig {
         request_host: "proxy.bench.com".to_string(),
         request_scheme: "https".to_string(),
         integrations: IntegrationRegistry::default(),
+        max_buffered_body_bytes: 16 * 1024 * 1024,
     }
 }
 

@@ -7,18 +7,18 @@ use http::header::{self, HeaderMap, HeaderValue};
 use http::Method;
 use serde::{Deserialize, Serialize};
 use url::Url;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, ensure_integration_backend, IntegrationEndpoint, IntegrationProxy,
-    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, ensure_integration_backend, IntegrationEndpoint, IntegrationHeadInjector,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
 const DIDOMI_INTEGRATION_ID: &str = "didomi";
-const DIDOMI_PREFIX: &str = "/integrations/didomi/consent";
+const DIDOMI_DEFAULT_PREFIX: &str = "/integrations/didomi/consent";
 
 /// Configuration for the Didomi consent notice reverse proxy.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -26,6 +26,11 @@ pub struct DidomiIntegrationConfig {
     /// Whether the integration is enabled.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Custom proxy path prefix to avoid ad-blocker detection.
+    /// Defaults to "integrations/didomi/consent" if not set.
+    #[serde(default)]
+    #[validate(custom(function = "validate_proxy_path"))]
+    pub proxy_path: Option<String>,
     /// Base URL for the Didomi SDK origin.
     #[serde(default = "default_sdk_origin")]
     #[validate(url)]
@@ -34,6 +39,41 @@ pub struct DidomiIntegrationConfig {
     #[serde(default = "default_api_origin")]
     #[validate(url)]
     pub api_origin: String,
+}
+
+/// Validates the optional `proxy_path` value.
+/// Rejects empty, root-only, trailing-slash, dot-segment, and values
+/// containing characters that are unsafe for URL path routing.
+fn validate_proxy_path(value: &str) -> Result<(), ValidationError> {
+    let trimmed = value.trim_start_matches('/');
+
+    if trimmed.is_empty() {
+        return Err(ValidationError::new("proxy_path_empty"));
+    }
+
+    if trimmed.ends_with('/') {
+        return Err(ValidationError::new("proxy_path_trailing_slash"));
+    }
+
+    if trimmed.contains("//") {
+        return Err(ValidationError::new("proxy_path_double_slash"));
+    }
+
+    if trimmed
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(ValidationError::new("proxy_path_dot_segment"));
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~' | '/'))
+    {
+        return Err(ValidationError::new("proxy_path_forbidden_chars"));
+    }
+
+    Ok(())
 }
 
 impl IntegrationConfig for DidomiIntegrationConfig {
@@ -72,6 +112,14 @@ impl DidomiIntegration {
         TrustedServerError::Integration {
             integration: DIDOMI_INTEGRATION_ID.to_string(),
             message: message.into(),
+        }
+    }
+
+    /// Returns the canonicalized proxy prefix: always starts with `/`, no trailing slash.
+    fn resolved_prefix(&self) -> String {
+        match &self.config.proxy_path {
+            Some(custom) => format!("/{}", custom.trim_start_matches('/')),
+            None => DIDOMI_DEFAULT_PREFIX.to_string(),
         }
     }
 
@@ -203,7 +251,8 @@ pub fn register(
 
     Ok(Some(
         IntegrationRegistration::builder(DIDOMI_INTEGRATION_ID)
-            .with_proxy(integration)
+            .with_proxy(integration.clone())
+            .with_head_injector(integration)
             .build(),
     ))
 }
@@ -214,8 +263,12 @@ impl IntegrationProxy for DidomiIntegration {
         DIDOMI_INTEGRATION_ID
     }
 
+    fn proxy_prefix(&self) -> String {
+        self.resolved_prefix()
+    }
+
     fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get("/consent/*"), self.post("/consent/*")]
+        vec![self.get("/*"), self.post("/*")]
     }
 
     async fn handle(
@@ -226,7 +279,8 @@ impl IntegrationProxy for DidomiIntegration {
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
-        let consent_path = path.strip_prefix(DIDOMI_PREFIX).unwrap_or(&path);
+        let prefix = self.resolved_prefix();
+        let consent_path = path.strip_prefix(&prefix).unwrap_or(&path);
         let backend = self.backend_for_path(consent_path);
         let base_origin = match backend {
             DidomiBackend::Sdk => self.config.sdk_origin.as_str(),
@@ -274,12 +328,42 @@ impl IntegrationProxy for DidomiIntegration {
     }
 }
 
+impl IntegrationHeadInjector for DidomiIntegration {
+    fn integration_id(&self) -> &'static str {
+        DIDOMI_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InjectedDidomiClientConfig {
+            proxy_path: String,
+        }
+
+        let payload = InjectedDidomiClientConfig {
+            proxy_path: format!("{}/", self.resolved_prefix()),
+        };
+
+        // Escape `</` to prevent breaking out of the script tag.
+        let config_json = serde_json::to_string(&payload)
+            .unwrap_or_else(|e| {
+                log::warn!("Didomi: failed to serialize client config: {e}");
+                "{}".to_string()
+            })
+            .replace("</", "<\\/");
+
+        vec![format!(
+            r#"<script>window.__tsjs_didomi={config_json};</script>"#
+        )]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::integrations::IntegrationRegistry;
+    use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
@@ -288,6 +372,7 @@ mod tests {
     fn config(enabled: bool) -> DidomiIntegrationConfig {
         DidomiIntegrationConfig {
             enabled,
+            proxy_path: None,
             sdk_origin: default_sdk_origin(),
             api_origin: default_api_origin(),
         }
@@ -363,6 +448,92 @@ mod tests {
     }
 
     #[test]
+    fn registers_custom_proxy_path() {
+        let mut settings = create_test_settings();
+        let custom_config = DidomiIntegrationConfig {
+            enabled: true,
+            proxy_path: Some("my-custom-consent".to_string()),
+            sdk_origin: default_sdk_origin(),
+            api_origin: default_api_origin(),
+        };
+        settings
+            .integrations
+            .insert_config(DIDOMI_INTEGRATION_ID, &custom_config)
+            .expect("should insert config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        assert!(registry.has_route(&Method::GET, "/my-custom-consent/loader.js"));
+        assert!(registry.has_route(&Method::POST, "/my-custom-consent/api/events"));
+        assert!(!registry.has_route(&Method::GET, "/integrations/didomi/consent/loader.js"));
+    }
+
+    #[test]
+    fn validates_proxy_path_rejects_empty() {
+        assert!(validate_proxy_path("").is_err());
+        assert!(validate_proxy_path("/").is_err());
+    }
+
+    #[test]
+    fn validates_proxy_path_rejects_trailing_slash() {
+        assert!(validate_proxy_path("my-path/").is_err());
+    }
+
+    #[test]
+    fn validates_proxy_path_rejects_forbidden_chars() {
+        assert!(validate_proxy_path("path?query").is_err());
+        assert!(validate_proxy_path("path#frag").is_err());
+        assert!(validate_proxy_path("{param}").is_err());
+        assert!(validate_proxy_path("wild*card").is_err());
+        assert!(validate_proxy_path("has space").is_err());
+        assert!(validate_proxy_path("has\"quote").is_err());
+        assert!(validate_proxy_path("has\\backslash").is_err());
+        assert!(validate_proxy_path("has\nnewline").is_err());
+        assert!(validate_proxy_path("encoded%2e%2e/path").is_err());
+    }
+
+    #[test]
+    fn validates_proxy_path_rejects_double_slash() {
+        assert!(validate_proxy_path("my//path").is_err());
+    }
+
+    #[test]
+    fn validates_proxy_path_rejects_dot_segments() {
+        assert!(validate_proxy_path("my/./path").is_err());
+        assert!(validate_proxy_path("my/../path").is_err());
+    }
+
+    #[test]
+    fn validates_proxy_path_accepts_valid() {
+        assert!(validate_proxy_path("my-custom-path").is_ok());
+        assert!(validate_proxy_path("nested/path/here").is_ok());
+        assert!(validate_proxy_path("/leading-slash-ok").is_ok());
+    }
+
+    #[test]
+    fn head_injector_emits_proxy_path() {
+        let custom_config = DidomiIntegrationConfig {
+            enabled: true,
+            proxy_path: Some("my-consent".to_string()),
+            sdk_origin: default_sdk_origin(),
+            api_origin: default_api_origin(),
+        };
+        let integration = DidomiIntegration::new(Arc::new(custom_config));
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(
+            inserts[0],
+            r#"<script>window.__tsjs_didomi={"proxyPath":"/my-consent/"};</script>"#
+        );
+    }
+
+    #[test]
     fn copy_headers_omits_x_forwarded_for_when_no_client_ip() {
         let integration = DidomiIntegration::new(Arc::new(config(true)));
         let backend = DidomiBackend::Sdk;
@@ -417,6 +588,23 @@ mod tests {
             stub.recorded_backend_names(),
             vec!["stub-backend".to_string()],
             "should route outbound request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn head_injector_default_path() {
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts[0],
+            r#"<script>window.__tsjs_didomi={"proxyPath":"/integrations/didomi/consent/"};</script>"#
         );
     }
 }

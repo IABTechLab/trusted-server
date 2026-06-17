@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Request, Response, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -153,6 +153,21 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
+/// HTTP methods the publisher fallback proxies, mirroring the Axum/Fastly
+/// adapters so a transparent edge proxy handles HEAD, CORS preflights, and
+/// non-GET/POST API calls rather than rejecting them.
+fn publisher_fallback_methods() -> [Method; 7] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ]
+}
+
 /// Returns a [`RouterService`] that responds to every route with the startup error.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
     let message = Arc::new(format!("{}\n", e.current_context().user_message()));
@@ -171,15 +186,14 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         }
     };
 
-    RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::new(
-            Settings::default(),
-        )))
-        .get("/", make(Arc::clone(&message)))
-        .post("/", make(Arc::clone(&message)))
-        .get("/{*rest}", make(Arc::clone(&message)))
-        .post("/{*rest}", make(Arc::clone(&message)))
-        .build()
+    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+        Arc::new(Settings::default()),
+    ));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), make(Arc::clone(&message)));
+        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
+    }
+    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -234,12 +248,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         async fn dispatch(
             state: Arc<AppState>,
             ctx: RequestContext,
-            allow_tsjs: bool,
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
             let req = ctx.into_request();
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
+            // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
+            let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
@@ -271,22 +286,15 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok(result.unwrap_or_else(|e| http_error(&e)))
         }
 
-        let get_fallback = {
+        let fallback = {
             let s = Arc::clone(&state);
             move |ctx: RequestContext| {
                 let s = Arc::clone(&s);
-                dispatch(s, ctx, true)
-            }
-        };
-        let post_fallback = {
-            let s = Arc::clone(&state);
-            move |ctx: RequestContext| {
-                let s = Arc::clone(&s);
-                dispatch(s, ctx, false)
+                dispatch(s, ctx)
             }
         };
 
-        RouterService::builder()
+        let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
@@ -367,11 +375,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
-            )
-            .get("/", get_fallback.clone())
-            .post("/", post_fallback.clone())
-            .get("/{*rest}", get_fallback)
-            .post("/{*rest}", post_fallback)
-            .build()
+            );
+
+        for method in publisher_fallback_methods() {
+            router = router.route("/", method.clone(), fallback.clone());
+            router = router.route("/{*rest}", method, fallback.clone());
+        }
+
+        router.build()
     }
 }

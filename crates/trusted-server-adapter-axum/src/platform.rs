@@ -577,6 +577,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -641,6 +642,7 @@ mod tests {
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            host_header_override: None,
         };
         let name1 = backend.predict_name(&spec).expect("should return a name");
         let name2 = backend
@@ -659,6 +661,7 @@ mod tests {
             port: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            host_header_override: None,
         };
         assert_eq!(
             backend.predict_name(&spec).expect("should return name"),

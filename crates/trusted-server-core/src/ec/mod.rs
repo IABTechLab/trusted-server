@@ -476,10 +476,13 @@ impl EcContext {
 
 /// Returns the current Unix timestamp in seconds.
 ///
-/// Uses `std::time::SystemTime` which is supported on `wasm32-wasip1`.
+/// Uses [`web_time::SystemTime`], which maps to `std::time::SystemTime` on
+/// native and `wasm32-wasip1` targets and to a JS-backed clock on
+/// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
+/// available.
 pub(crate) fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_else(|err| {
             log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");

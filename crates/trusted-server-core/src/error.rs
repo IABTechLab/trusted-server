@@ -107,7 +107,7 @@ pub trait IntoHttpResponse {
 
     /// Get a safe, user-facing error message.
     ///
-    /// Client errors (4xx) return a brief description; server/integration errors
+    /// Selected client errors return a brief description; all other errors
     /// return a generic message. Full error details are preserved in server logs.
     fn user_message(&self) -> String;
 }
@@ -137,7 +137,7 @@ impl IntoHttpResponse for TrustedServerError {
 
     fn user_message(&self) -> String {
         match self {
-            // Client errors (4xx) — safe to surface a brief description
+            // Selected client errors with safe details to surface.
             Self::BadRequest { message } => format!("Bad request: {message}"),
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
@@ -152,6 +152,164 @@ impl IntoHttpResponse for TrustedServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_code_returns_expected_http_status_for_each_variant() {
+        let cases = [
+            (
+                TrustedServerError::BadRequest {
+                    message: String::from("missing field"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::Configuration {
+                    message: String::from("missing setting"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Auction {
+                    message: String::from("bid timeout"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Gam {
+                    message: String::from("request failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::GdprConsent {
+                    message: String::from("missing consent string"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::InvalidUtf8 {
+                    message: String::from("invalid byte sequence"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::RequestTooLarge {
+                    message: String::from("body too large"),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                TrustedServerError::InvalidHeaderValue {
+                    message: String::from("non-ascii header"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::KvStore {
+                    store_name: String::from("sessions"),
+                    message: String::from("timeout"),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::Prebid {
+                    message: String::from("adapter error"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Integration {
+                    integration: String::from("example-integration"),
+                    message: String::from("request failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Proxy {
+                    message: String::from("upstream failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Forbidden {
+                    message: String::from("missing permission"),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::AllowlistViolation {
+                    host: String::from("example.com"),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::Settings {
+                    message: String::from("parse failed"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::EdgeCookie {
+                    message: String::from("generation failed"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::PartnerNotFound {
+                    partner_id: String::from("example-partner"),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                TrustedServerError::InsecureDefault {
+                    field: String::from("example.secret"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        // `mapped_status` is an exhaustive match with no `_` arm, so adding a
+        // new `TrustedServerError` variant fails to compile here until its
+        // status is declared — the per-variant coverage can't silently go
+        // stale. Cross-checking it against the independent `cases` literals
+        // above guards both encodings against drift.
+        fn mapped_status(error: &TrustedServerError) -> StatusCode {
+            match error {
+                TrustedServerError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::Configuration { .. } | TrustedServerError::Settings { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
+                TrustedServerError::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+
+        for (error, expected_status) in cases {
+            assert_eq!(
+                error.status_code(),
+                expected_status,
+                "should map {error:?} to {expected_status}",
+            );
+            assert_eq!(
+                mapped_status(&error),
+                expected_status,
+                "exhaustive mapping should agree with the table for {error:?}",
+            );
+        }
+    }
 
     #[test]
     fn server_errors_return_generic_message() {
@@ -188,12 +346,38 @@ mod tests {
             TrustedServerError::InvalidUtf8 {
                 message: "byte 0xff".into(),
             },
+            TrustedServerError::InsecureDefault {
+                field: "ec.passphrase".into(),
+            },
         ];
         for error in &cases {
             assert_eq!(
                 error.user_message(),
                 "An internal error occurred",
                 "should not leak details for {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn other_client_errors_return_generic_user_message() {
+        let cases = [
+            TrustedServerError::Forbidden {
+                message: "policy detail".into(),
+            },
+            TrustedServerError::AllowlistViolation {
+                host: "blocked.example.com".into(),
+            },
+            TrustedServerError::PartnerNotFound {
+                partner_id: "partner-1".into(),
+            },
+        ];
+
+        for error in &cases {
+            assert_eq!(
+                error.user_message(),
+                "An internal error occurred",
+                "should not leak client-error details for {error:?}",
             );
         }
     }
@@ -214,5 +398,152 @@ mod tests {
             message: "non-ascii".into(),
         };
         assert_eq!(error.user_message(), "Invalid header value");
+    }
+
+    #[test]
+    fn status_code_maps_each_error_variant_to_expected_http_response() {
+        // Compile-time guard: adding a TrustedServerError variant without
+        // updating this test will fail to compile.
+        let _guard: fn(&TrustedServerError) = |error| match error {
+            TrustedServerError::BadRequest { .. }
+            | TrustedServerError::Configuration { .. }
+            | TrustedServerError::Auction { .. }
+            | TrustedServerError::Gam { .. }
+            | TrustedServerError::GdprConsent { .. }
+            | TrustedServerError::InvalidUtf8 { .. }
+            | TrustedServerError::InvalidHeaderValue { .. }
+            | TrustedServerError::KvStore { .. }
+            | TrustedServerError::Prebid { .. }
+            | TrustedServerError::Integration { .. }
+            | TrustedServerError::Proxy { .. }
+            | TrustedServerError::Forbidden { .. }
+            | TrustedServerError::AllowlistViolation { .. }
+            | TrustedServerError::Settings { .. }
+            | TrustedServerError::EdgeCookie { .. }
+            | TrustedServerError::PartnerNotFound { .. }
+            | TrustedServerError::RequestTooLarge { .. }
+            | TrustedServerError::InsecureDefault { .. } => (),
+        };
+
+        let cases = [
+            (
+                TrustedServerError::BadRequest {
+                    message: "bad input".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::GdprConsent {
+                    message: "missing consent".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::InvalidHeaderValue {
+                    message: "invalid header".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::Forbidden {
+                    message: "not allowed".to_string(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::AllowlistViolation {
+                    host: "evil.example.com".to_string(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::Configuration {
+                    message: "config failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Settings {
+                    message: "settings failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::InvalidUtf8 {
+                    message: "invalid utf-8".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::EdgeCookie {
+                    message: "ec failed".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::PartnerNotFound {
+                    partner_id: "partner-1".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                TrustedServerError::InsecureDefault {
+                    field: "ec.passphrase".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::KvStore {
+                    store_name: "store".to_string(),
+                    message: "kv failed".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::Auction {
+                    message: "auction failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Gam {
+                    message: "gam failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Prebid {
+                    message: "prebid failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Integration {
+                    integration: "test".to_string(),
+                    message: "integration failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Proxy {
+                    message: "proxy failed".to_string(),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::RequestTooLarge {
+                    message: "body too large".to_string(),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                error.status_code(),
+                expected,
+                "should map {error:?} to expected HTTP status"
+            );
+        }
     }
 }

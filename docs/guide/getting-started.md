@@ -4,14 +4,15 @@ Get up and running with Trusted Server quickly.
 
 ## Prerequisites
 
-Before you begin, ensure you have:
+Before you begin, ensure you have the following installed (versions are pinned in `.tool-versions`):
 
-- Rust 1.91.1 (see `.tool-versions`)
+- Rust {{RUST_VERSION}} (see `.tool-versions`)
+- NodeJS {{NODEJS_VERSION}}
 - Basic familiarity with Rust and WebAssembly
 
 **For Fastly deployment** (optional for local dev):
 
-- Fastly CLI installed
+- Fastly {{FASTLY_VERSION}} CLI installed
 - A Fastly account and API key
 
 ## Installation
