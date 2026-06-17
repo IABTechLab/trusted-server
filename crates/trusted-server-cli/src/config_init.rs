@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-const EXAMPLE_CONFIG: &str = include_str!(concat!(
+pub(crate) const EXAMPLE_CONFIG: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../trusted-server.example.toml"
 ));
