@@ -1610,7 +1610,7 @@ mod tests {
 
         let response = handle_tsjs_dynamic(&req, &registry).expect("should handle tsjs request");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::NOT_FOUND,
             "should not serve embedded prebid module"
         );

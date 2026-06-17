@@ -424,7 +424,7 @@ fn create_test_settings() -> Settings {
             enabled = true
             providers = ["prebid"]
             timeout_ms = 2000
-        "#,        
+        "#,
     );
     let settings = Settings::from_toml(&config).expect("should parse adapter route test settings");
 

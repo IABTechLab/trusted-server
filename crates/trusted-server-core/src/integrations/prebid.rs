@@ -570,6 +570,10 @@ impl PrebidIntegration {
         format!("<script src=\"{src}\"{integrity} defer></script>")
     }
 
+    fn is_managed_external(&self) -> bool {
+        self.config.external_bundle_url.is_some()
+    }
+
     fn external_bundle_request_cache_mode(
         &self,
         req: &http::Request<EdgeBody>,
