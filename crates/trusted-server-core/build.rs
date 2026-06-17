@@ -103,7 +103,7 @@ mod settings;
 #[path = "src/creative_slot_build_check.rs"]
 mod creative_slot_build_check;
 
-use creative_slot_build_check::validate_creative_slot;
+use creative_slot_build_check::{validate_creative_slot, validate_price_granularity};
 use std::fs;
 use std::path::Path;
 
@@ -137,6 +137,12 @@ fn main() {
     // `creative_slot_build_check`) so it stays under test. Running it before the
     // write also means a rejected config is never persisted to the embedded file.
     if let Some(co) = &settings.creative_opportunities {
+        // price_granularity is a String stub in the build context, so validate it
+        // against the real PriceGranularity enum before embedding — an invalid
+        // value would otherwise fail runtime settings load on every request.
+        if let Err(err) = validate_price_granularity(&co.price_granularity) {
+            panic!("trusted-server.toml [creative_opportunities]: {err}");
+        }
         for slot in &co.slot_raw {
             if let Err(err) = validate_creative_slot(slot, &co.gam_network_id) {
                 panic!("trusted-server.toml [creative_opportunities.slot]: {err}");

@@ -14,6 +14,54 @@
 //! intentionally empty in the build context, keeping `build.rs` free of the
 //! full runtime dependency graph.
 
+/// Top-level slot fields the runtime [`CreativeOpportunitySlot`] accepts.
+///
+/// The runtime struct is `#[serde(deny_unknown_fields)]`, but the build context
+/// deserializes slots as raw `serde_json::Value`, which silently keeps unknown
+/// keys. Mirror the runtime field set here so an env-injected typo or stray key
+/// fails the build instead of failing settings load on every request.
+///
+/// `compiled_patterns` is intentionally excluded: it is `#[serde(skip)]` on the
+/// runtime struct and is never a valid input field.
+///
+/// [`CreativeOpportunitySlot`]: crate::creative_opportunities::CreativeOpportunitySlot
+const ALLOWED_SLOT_FIELDS: &[&str] = &[
+    "id",
+    "gam_unit_path",
+    "div_id",
+    "page_patterns",
+    "formats",
+    "floor_price",
+    "targeting",
+    "providers",
+];
+
+/// Validate that `value` is a `price_granularity` the runtime can deserialize.
+///
+/// The build context types `price_granularity` as a `String`, so an invalid
+/// value such as `custom` would embed cleanly and then fail runtime settings
+/// load — the real [`PriceGranularity`] enum cannot deserialize it — on every
+/// non-health request. Delegating to that enum's `Deserialize` impl keeps the
+/// accepted set in lockstep with the runtime, avoiding drift.
+///
+/// # Errors
+///
+/// Returns an error string when `value` is not one of the runtime
+/// [`PriceGranularity`] variants.
+///
+/// [`PriceGranularity`]: crate::price_bucket::PriceGranularity
+pub(crate) fn validate_price_granularity(value: &str) -> Result<(), String> {
+    serde_json::from_value::<crate::price_bucket::PriceGranularity>(serde_json::Value::String(
+        value.to_string(),
+    ))
+    .map(|_| ())
+    .map_err(|_| {
+        format!(
+            "price_granularity '{value}' is invalid; expected one of: low, medium, dense, high, auto"
+        )
+    })
+}
+
 /// Returns `true` when `id` is non-empty and only `[A-Za-z0-9_-]`.
 fn is_valid_slot_id(id: &str) -> bool {
     !id.is_empty()
@@ -60,6 +108,17 @@ pub(crate) fn validate_creative_slot(
         return Err(format!(
             "slot id '{id}' is invalid; only [A-Za-z0-9_-] allowed"
         ));
+    }
+
+    // Reject unknown top-level keys, mirroring the runtime slot's
+    // `#[serde(deny_unknown_fields)]`. The raw-JSON build path would otherwise
+    // accept env-injected typos that the runtime rejects at settings load.
+    if let Some(object) = slot.as_object() {
+        for key in object.keys() {
+            if !ALLOWED_SLOT_FIELDS.contains(&key.as_str()) {
+                return Err(format!("slot `{id}` has unknown field '{key}'"));
+            }
+        }
     }
 
     // At least one page pattern that is non-empty and compiles as a glob.
@@ -119,8 +178,63 @@ pub(crate) fn validate_creative_slot(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_creative_slot;
+    use super::{validate_creative_slot, validate_price_granularity};
     use serde_json::json;
+
+    #[test]
+    fn rejects_unknown_slot_field() {
+        // The runtime slot is deny_unknown_fields, so an env-injected typo like
+        // `floorprice` must fail the build, not pass it and break settings load.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "floorprice": 1.5
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("unknown slot field must fail at build time");
+        assert!(err.contains("unknown field 'floorprice'"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_all_known_slot_fields() {
+        let slot = json!({
+            "id": "atf",
+            "gam_unit_path": "/123456789/publisher/atf",
+            "div_id": "atf-div",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "floor_price": 1.5,
+            "targeting": { "pos": "atf" },
+            "providers": {}
+        });
+        assert!(
+            validate_creative_slot(&slot, "123456789").is_ok(),
+            "all documented slot fields must be accepted"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_price_granularities() {
+        for value in ["low", "medium", "dense", "high", "auto"] {
+            assert!(
+                validate_price_granularity(value).is_ok(),
+                "'{value}' should be a valid price_granularity"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_price_granularity() {
+        // The runtime PriceGranularity enum has no `custom` variant, so a build
+        // that embeds it would fail settings load on every request.
+        let err = validate_price_granularity("custom")
+            .expect_err("invalid price_granularity must fail at build time");
+        assert!(
+            err.contains("price_granularity 'custom' is invalid"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn accepts_a_well_formed_slot() {
