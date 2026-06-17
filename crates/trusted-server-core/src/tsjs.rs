@@ -140,6 +140,19 @@ mod tests {
     }
 
     #[test]
+    fn tsjs_script_src_is_stable_for_identical_module_ids() {
+        let module_ids = ["core", "lockr", "permutive"];
+        let src = tsjs_script_src(&module_ids);
+
+        assert_sha256_hex_hash(hash_query_value(&src));
+        assert_eq!(
+            src,
+            tsjs_script_src(&module_ids),
+            "should produce a stable URL for identical module IDs"
+        );
+    }
+
+    #[test]
     fn tsjs_script_tag_wraps_source_in_single_trustedserver_tag() {
         let module_ids = ["creative"];
         let src = tsjs_script_src(&module_ids);
@@ -217,6 +230,40 @@ mod tests {
                 tsjs_deferred_script_tag("creative")
             ),
             "should preserve caller-provided deferred module order"
+        );
+    }
+
+    #[test]
+    fn tsjs_unified_script_src_and_tag_include_cache_busting_hash() {
+        let src = tsjs_unified_script_src();
+
+        assert!(
+            src.starts_with("/static/tsjs=tsjs-unified.min.js?v="),
+            "should include unified script URL prefix"
+        );
+        assert_sha256_hex_hash(hash_query_value(&src));
+        assert_eq!(
+            tsjs_unified_script_tag(),
+            format!(r#"<script src="{src}" id="trustedserver-js"></script>"#),
+            "should wrap the unified source in a trusted server script tag"
+        );
+    }
+
+    #[test]
+    fn tsjs_script_src_differs_for_different_module_sets() {
+        assert_ne!(
+            tsjs_script_src(&["lockr"]),
+            tsjs_script_src(&["lockr", "permutive"]),
+            "should bust the cache when the module set content changes"
+        );
+    }
+
+    #[test]
+    fn tsjs_deferred_script_src_has_empty_hash_for_unknown_module() {
+        assert_eq!(
+            tsjs_deferred_script_src("does-not-exist"),
+            "/static/tsjs=tsjs-does-not-exist.min.js?v=",
+            "should fall back to an empty cache-busting hash for an unknown module"
         );
     }
 }
