@@ -1248,6 +1248,7 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
