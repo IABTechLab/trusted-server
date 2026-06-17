@@ -167,9 +167,11 @@ pub(crate) fn build_state_from_settings(
 /// Resolves per-request consent KV store services for routes that read consent data.
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// matches the legacy `route_request` behavior where a misconfigured consent store
-/// makes consent-dependent routes unavailable rather than proceeding without consent.
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
+/// intentional hardening over the legacy `route_request` path, which builds
+/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
+/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
+/// routes unavailable rather than proceeding without consent.
 ///
 /// # Errors
 ///
