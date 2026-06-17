@@ -49,9 +49,9 @@ function setGppApi(
   });
 }
 
-function setTcfApi(tcString: string | undefined, success = true): void {
+function setTcfApi(tcString: string | undefined, success = true, eventStatus = 'tcloaded'): void {
   (window as TestWindow).__tcfapi = vi.fn((_command, _version, callback) => {
-    callback(tcString === undefined ? {} : { tcString }, success);
+    callback(tcString === undefined ? { eventStatus } : { tcString, eventStatus }, success);
   });
 }
 
@@ -195,19 +195,7 @@ describe('integrations/osano consent mirror', () => {
     expect(getCookie(MARKER_COOKIE)).toBe('osano');
   });
 
-  it('preserves stale Osano-owned cookies until Osano listeners are ready', async () => {
-    document.cookie = 'us_privacy=stale; path=/';
-    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
-    setUspApi(undefined);
-
-    const result = await mirrorOsanoConsent();
-
-    expect(result).toBe(false);
-    expect(getCookie('us_privacy')).toBe('stale');
-    expect(getCookie(MARKER_COOKIE)).toBe('osano');
-  });
-
-  it('clears stale Osano-owned cookies when a ready API definitively has no value', async () => {
+  it('preserves stale Osano-owned cookies until Osano is ready for clearing', async () => {
     vi.useFakeTimers();
     document.cookie = 'us_privacy=stale; path=/';
     document.cookie = `${MARKER_COOKIE}=osano; path=/`;
@@ -217,8 +205,53 @@ describe('integrations/osano consent mirror', () => {
     initializeOsanoConsentMirror();
     await vi.runOnlyPendingTimersAsync();
 
+    expect(getCookie('us_privacy')).toBe('stale');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+  });
+
+  it('clears stale Osano-owned cookies when a ready API definitively has no value', async () => {
+    vi.useFakeTimers();
+    document.cookie = 'us_privacy=stale; path=/';
+    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
+    const listeners = setOsanoStub();
+    setUspApi(undefined);
+
+    initializeOsanoConsentMirror();
+    await vi.runOnlyPendingTimersAsync();
+    listeners['osano-cm-initialized']?.();
+    await vi.runOnlyPendingTimersAsync();
+
     expect(getCookie('us_privacy')).toBeUndefined();
     expect(getCookie(MARKER_COOKIE)).toBeUndefined();
+  });
+
+  it('does not clear cookies when an API callback returns malformed data', async () => {
+    vi.useFakeTimers();
+    document.cookie = 'us_privacy=stale; path=/';
+    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
+    const listeners = setOsanoStub();
+    (window as TestWindow).__uspapi = vi.fn((_command, _version, callback) => {
+      callback({ uspString: 123 }, true);
+    });
+
+    initializeOsanoConsentMirror();
+    listeners['osano-cm-initialized']?.();
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(getCookie('us_privacy')).toBe('stale');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+  });
+
+  it('does not mirror or clear TCF cookies before TCF is ready', async () => {
+    document.cookie = 'euconsent-v2=stale-tcf; path=/';
+    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
+    setTcfApi('CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA', true, 'cmpuishown');
+
+    const result = await mirrorOsanoConsent();
+
+    expect(result).toBe(false);
+    expect(getCookie('euconsent-v2')).toBe('stale-tcf');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
   });
 
   it('does not clear cookies when an API callback reports failure', async () => {

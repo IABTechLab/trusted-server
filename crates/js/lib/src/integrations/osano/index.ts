@@ -25,6 +25,13 @@ const OSANO_EVENTS = [
   'osano-cm-opt-out',
   'osano-cm-storage',
 ] as const;
+const OSANO_CLEAR_READY_EVENTS = new Set<string>([
+  'osano-cm-initialized',
+  'osano-cm-consent-saved',
+  'osano-cm-consent-new',
+  'osano-cm-consent-changed',
+  'osano-cm-opt-out',
+]);
 
 interface UspData {
   uspString?: string;
@@ -38,6 +45,7 @@ interface GppPingData {
 
 interface TcfData {
   tcString?: string;
+  eventStatus?: string;
 }
 
 interface OsanoCm {
@@ -88,9 +96,10 @@ interface MirrorPlan {
 let initialized = false;
 let osanoListenersInstalled = false;
 let osanoRetryCount = 0;
+let osanoReadyForClears = false;
 let osanoRetryTimer: number | undefined;
 let mirrorTimer: number | undefined;
-let osanoEventHandler: ((payload?: unknown) => void) | undefined;
+let osanoEventHandlers: Map<string, (payload?: unknown) => void> | undefined;
 let focusHandler: (() => void) | undefined;
 let visibilityHandler: (() => void) | undefined;
 
@@ -140,6 +149,14 @@ function canWriteConsentCookies(): boolean {
   return true;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isNumberArray(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'number');
+}
+
 function shouldWriteGppSid(
   applicableSections: number[] | undefined
 ): applicableSections is number[] {
@@ -148,6 +165,10 @@ function shouldWriteGppSid(
     applicableSections.length > 0 &&
     !applicableSections.includes(-1)
   );
+}
+
+function isTcfReady(eventStatus: unknown): boolean {
+  return eventStatus === 'tcloaded' || eventStatus === 'useractioncomplete';
 }
 
 function signalResult(writes: CookieWrite[] = [], clears: string[] = []): SignalResult {
@@ -163,7 +184,7 @@ function unavailableResult(): SignalResult {
 }
 
 function emptyAfterOsanoReadyResult(cookieName: string): SignalResult {
-  if (!osanoListenersInstalled) {
+  if (!osanoReadyForClears) {
     return pendingResult();
   }
 
@@ -191,12 +212,17 @@ function readUspSignal(win: OsanoWindow): Promise<SignalResult> {
 
     try {
       win.__uspapi?.('getUSPData', 1, (data, success) => {
-        if (success === false) {
+        if (success === false || !isRecord(data)) {
           done(pendingResult());
           return;
         }
 
-        if (typeof data?.uspString === 'string' && data.uspString.length > 0) {
+        if ('uspString' in data && typeof data.uspString !== 'string') {
+          done(pendingResult());
+          return;
+        }
+
+        if (typeof data.uspString === 'string' && data.uspString.length > 0) {
           done(signalResult([{ name: US_PRIVACY_COOKIE_NAME, value: data.uspString }]));
           return;
         }
@@ -222,22 +248,37 @@ function readGppSignal(win: OsanoWindow): Promise<SignalResult> {
 
     try {
       win.__gpp?.('ping', (data, success) => {
-        if (success === false) {
+        if (success === false || !isRecord(data)) {
           done(pendingResult());
           return;
         }
 
-        if (data?.signalStatus !== 'ready') {
+        if (data.signalStatus !== 'ready') {
           done(pendingResult());
           return;
         }
 
+        if ('gppString' in data && typeof data.gppString !== 'string') {
+          done(pendingResult());
+          return;
+        }
+
+        if (
+          'applicableSections' in data &&
+          data.applicableSections !== undefined &&
+          !isNumberArray(data.applicableSections)
+        ) {
+          done(pendingResult());
+          return;
+        }
+
+        const applicableSections = data.applicableSections;
         if (typeof data.gppString === 'string' && data.gppString.length > 0) {
           const writes = [{ name: GPP_COOKIE_NAME, value: data.gppString }];
           const clears: string[] = [];
 
-          if (shouldWriteGppSid(data.applicableSections)) {
-            writes.push({ name: GPP_SID_COOKIE_NAME, value: data.applicableSections.join(',') });
+          if (shouldWriteGppSid(applicableSections)) {
+            writes.push({ name: GPP_SID_COOKIE_NAME, value: applicableSections.join(',') });
           } else {
             clears.push(GPP_SID_COOKIE_NAME);
           }
@@ -267,12 +308,22 @@ function readTcfSignal(win: OsanoWindow): Promise<SignalResult> {
 
     try {
       win.__tcfapi?.('getTCData', 2, (data, success) => {
-        if (success === false) {
+        if (success === false || !isRecord(data)) {
           done(pendingResult());
           return;
         }
 
-        if (typeof data?.tcString === 'string' && data.tcString.length > 0) {
+        if (!isTcfReady(data.eventStatus)) {
+          done(pendingResult());
+          return;
+        }
+
+        if ('tcString' in data && typeof data.tcString !== 'string') {
+          done(pendingResult());
+          return;
+        }
+
+        if (typeof data.tcString === 'string' && data.tcString.length > 0) {
           done(signalResult([{ name: TCF_COOKIE_NAME, value: data.tcString }]));
           return;
         }
@@ -366,9 +417,16 @@ function installOsanoListeners(): boolean {
     return false;
   }
 
-  osanoEventHandler = () => scheduleMirror();
+  osanoEventHandlers = new Map();
   for (const eventName of OSANO_EVENTS) {
-    cm.addEventListener(eventName, osanoEventHandler);
+    const handler = (): void => {
+      if (OSANO_CLEAR_READY_EVENTS.has(eventName)) {
+        osanoReadyForClears = true;
+      }
+      scheduleMirror();
+    };
+    osanoEventHandlers.set(eventName, handler);
+    cm.addEventListener(eventName, handler);
   }
   osanoListenersInstalled = true;
 
@@ -420,12 +478,12 @@ export function resetOsanoConsentMirrorForTest(): void {
   const cm = getWindow()?.Osano?.cm;
   if (
     osanoListenersInstalled &&
-    osanoEventHandler &&
+    osanoEventHandlers &&
     cm &&
     typeof cm.removeEventListener === 'function'
   ) {
-    for (const eventName of OSANO_EVENTS) {
-      cm.removeEventListener(eventName, osanoEventHandler);
+    for (const [eventName, handler] of osanoEventHandlers) {
+      cm.removeEventListener(eventName, handler);
     }
   }
 
@@ -437,9 +495,10 @@ export function resetOsanoConsentMirrorForTest(): void {
   initialized = false;
   osanoListenersInstalled = false;
   osanoRetryCount = 0;
+  osanoReadyForClears = false;
   osanoRetryTimer = undefined;
   mirrorTimer = undefined;
-  osanoEventHandler = undefined;
+  osanoEventHandlers = undefined;
   focusHandler = undefined;
   visibilityHandler = undefined;
 }
