@@ -91,6 +91,7 @@ use trusted_server_core::compat;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
@@ -263,6 +264,22 @@ impl EcRequestState {
     }
 }
 
+/// Returns the device signals for an `EdgeZero` request.
+///
+/// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
+/// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
+/// real values — and stores them in the request extensions. Reading them back
+/// here preserves the bot gate's browser classification, which a synthetic
+/// request reconstructed from `EdgeZero` HTTP types cannot expose. Falls back
+/// to deriving from the reconstructed request when the extension is absent
+/// (e.g. in tests that dispatch without the entry point).
+fn device_signals_for(req: &Request) -> DeviceSignals {
+    req.extensions()
+        .get::<DeviceSignals>()
+        .cloned()
+        .unwrap_or_else(|| crate::derive_device_signals(&compat::to_fastly_request_ref(req)))
+}
+
 /// Builds the per-request EC state from a headers-only fastly request copy,
 /// mirroring the legacy `route_request` prelude step by step.
 fn build_ec_request_state(
@@ -272,7 +289,7 @@ fn build_ec_request_state(
 ) -> EcRequestState {
     let fastly_ref = compat::to_fastly_request_ref(req);
 
-    let device_signals = crate::derive_device_signals(&fastly_ref);
+    let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
         log::info!(
@@ -433,7 +450,7 @@ fn run_batch_sync(state: &AppState, req: Request) -> Response {
     // Device signals and cookies come from a headers-only fastly copy taken
     // before the conversion below consumes the request body.
     let fastly_ref = compat::to_fastly_request_ref(&req);
-    let device_signals = crate::derive_device_signals(&fastly_ref);
+    let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
@@ -864,6 +881,7 @@ mod tests {
     use error_stack::Report;
     use futures::executor::block_on;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::settings::Settings;
 
@@ -1095,6 +1113,54 @@ mod tests {
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn browser_device_signals_from_extension_reach_ec_finalize_state() {
+        // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
+        // derives DeviceSignals from the original FastlyRequest (the only place
+        // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
+        // them in the request extensions. A browser-shaped signal must survive
+        // dispatch so the EC bot gate classifies the request as a real browser
+        // and keeps the KV-backed generation/finalize path active.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/some-page");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = block_on(router.oneshot(req));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            finalize.is_real_browser,
+            "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn missing_device_signals_extension_classifies_as_non_browser() {
+        // Without the entry-point-captured signals, the reconstructed request
+        // cannot expose JA4/H2, so the bot gate falls back to non-browser. This
+        // documents the regression the extension threading fixes: the same
+        // request that looks like a browser above is treated as a bot here.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            !finalize.is_real_browser,
+            "a request without captured device signals should not be classified as a real browser"
         );
     }
 

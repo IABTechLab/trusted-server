@@ -240,6 +240,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
+    // Derive device signals from the original FastlyRequest before conversion.
+    // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
+    // return real values on the client request; a synthetic request rebuilt from
+    // EdgeZero HTTP types cannot expose them, which would strip the JA4/H2 class
+    // the EC bot gate needs and misclassify real browsers as bots. Stored in the
+    // request extensions so `build_ec_request_state` reads the authoritative
+    // signals instead of re-deriving from the reconstructed request.
+    let device_signals = derive_device_signals(&req);
+
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. The standard dispatch helpers
     // (dispatch_with_config_handle, etc.) convert through fastly::Response using
@@ -252,6 +261,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         match into_core_request(req) {
             Ok(mut core_req) => {
                 core_req.extensions_mut().insert(config_store);
+                core_req.extensions_mut().insert(device_signals);
                 futures::executor::block_on(app.router().oneshot(core_req))
             }
             Err(e) => {
