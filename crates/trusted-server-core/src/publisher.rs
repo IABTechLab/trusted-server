@@ -43,7 +43,7 @@ const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
-    std::io::Cursor::new(body.into_bytes())
+    std::io::Cursor::new(body.into_bytes().unwrap_or_default())
 }
 
 fn not_found_response() -> Response<EdgeBody> {
@@ -692,8 +692,14 @@ mod tests {
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("response body should be valid UTF-8")
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("response body should be valid UTF-8")
     }
 
     #[test]
@@ -1021,7 +1027,7 @@ mod tests {
         // Reattach and verify body content
         *response.body_mut() = body;
         let (_, final_body) = response.into_parts();
-        let output = final_body.into_bytes();
+        let output = final_body.into_bytes().unwrap_or_default();
         assert_eq!(
             output, image_bytes,
             "pass-through should preserve body byte-for-byte"
@@ -1467,7 +1473,7 @@ mod tests {
             "2048"
         );
         let (_, final_body) = response.into_parts();
-        let round_trip = final_body.into_bytes();
+        let round_trip = final_body.into_bytes().unwrap_or_default();
         assert_eq!(
             round_trip, image_bytes,
             "pass-through reattach must preserve bytes exactly"

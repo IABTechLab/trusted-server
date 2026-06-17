@@ -34,12 +34,12 @@ config = "0.15.19"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "170b74b", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
 error-stack = "0.6"
-fastly = "0.11.12"
+fastly = "0.12"
 fern = "0.7.1"
 flate2 = "1.1"
 futures = "0.3"
@@ -49,7 +49,7 @@ http = "1.4.0"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
 log = "0.4.29"
-log-fastly = "0.11.12"
+log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"

@@ -341,8 +341,14 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .unwrap_or(FALLBACK_UNAVAILABLE);
     let cipher = req
         .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
         .unwrap_or(FALLBACK_UNAVAILABLE);
-    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req
+        .get_tls_protocol()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
     let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
     let ch_mobile = req
         .get_header_str("sec-ch-ua-mobile")

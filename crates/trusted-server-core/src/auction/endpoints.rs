@@ -78,7 +78,7 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes();
+    let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
