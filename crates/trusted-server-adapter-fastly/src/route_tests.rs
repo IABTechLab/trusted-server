@@ -638,6 +638,7 @@ fn route_result_to_fastly_response(
             &mut fastly_response,
         );
     }
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
     request_filter_effects.apply_to_fastly_response(&mut fastly_response);
     fastly_response
 }
@@ -1460,6 +1461,76 @@ fn finalize_response_makes_cookie_bearing_responses_private() {
             .and_then(|v| v.to_str().ok()),
         None,
         "a Set-Cookie response must not retain surrogate cacheability"
+    );
+}
+
+#[test]
+fn ec_set_cookie_added_after_finalize_downgrades_origin_public_cache() {
+    // First-visit navigation: the origin response is shared-cacheable and carries
+    // no cookie, so the HttpResponse-stage finalizer keeps its cache headers. EC
+    // finalization then mints the identity Set-Cookie on the converted Fastly
+    // response, after that guard has already run. The post-EC privacy guard must
+    // downgrade caching so a shared cache cannot replay one visitor's EC cookie.
+    let settings = create_test_settings();
+    let mut response = edge_response_builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header("surrogate-control", "max-age=86400")
+        .body(EdgeBody::empty())
+        .expect("should build test response");
+
+    // No cookie at this stage, so the cookie net does not fire and the origin
+    // cache directive survives finalize_response — reproducing the gap.
+    super::finalize_response(&settings, None, &mut response);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=3600"),
+        "a cookieless response should keep its origin cache directive"
+    );
+
+    let mut fastly_response = compat::to_fastly_response(response);
+    // Stand in for ec_finalize_response minting the first-visit identity cookie:
+    // its EcContext constructors are #[cfg(test)] in trusted-server-core and are
+    // not reachable from this crate, but the only behavior under test here is the
+    // post-EC ordering — a Set-Cookie appearing after finalize_response ran.
+    fastly_response.set_header(header::SET_COOKIE, "ec=abc; Path=/; HttpOnly");
+
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
+
+    assert_eq!(
+        fastly_response.get_header_str("cache-control"),
+        Some("private, max-age=0"),
+        "an EC Set-Cookie added after finalize_response must downgrade caching"
+    );
+    assert!(
+        fastly_response.get_header("surrogate-control").is_none(),
+        "EC Set-Cookie responses must not retain surrogate cacheability"
+    );
+}
+
+#[test]
+fn enforce_set_cookie_cache_privacy_keeps_stricter_no_store() {
+    // A stricter directive minted alongside the cookie must not be weakened to
+    // the `private, max-age=0` downgrade.
+    let mut fastly_response = compat::to_fastly_response(
+        edge_response_builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::SET_COOKIE, "ec=abc; Path=/")
+            .body(EdgeBody::empty())
+            .expect("should build test response"),
+    );
+
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
+
+    assert_eq!(
+        fastly_response.get_header_str("cache-control"),
+        Some("no-store"),
+        "an already-uncacheable response should keep its stricter directive"
     );
 }
 

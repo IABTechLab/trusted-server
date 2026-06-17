@@ -253,6 +253,9 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
+            // EC finalization may have just added the identity Set-Cookie, which
+            // the HttpResponse-stage cache guard could not see.
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
             fastly_resp.send_to_client();
 
@@ -281,6 +284,9 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
+            // EC finalization may have just added the identity Set-Cookie, which
+            // the HttpResponse-stage cache guard could not see.
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
@@ -904,6 +910,31 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
             HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
         response.headers_mut().insert(header_name, header_value);
     }
+}
+
+/// Forces cookie-bearing Fastly responses to stay private to shared caches.
+///
+/// [`finalize_response`] applies this same downgrade on the [`HttpResponse`],
+/// but the EC identity cookie is written later by [`ec_finalize_response`] onto
+/// the converted [`FastlyResponse`], so the earlier guard never sees it.
+/// Re-apply it here so a first-visit navigation whose only per-user payload is
+/// the EC `Set-Cookie` can never be served with `public`/surrogate cache headers
+/// inherited from the origin or operator response headers — a shared cache must
+/// not be able to store and replay one visitor's EC cookie to others.
+///
+/// Idempotent: a response already marked `private`/`no-store` is left untouched
+/// so a stricter directive is never weakened.
+fn enforce_set_cookie_cache_privacy(response: &mut FastlyResponse) {
+    let already_uncacheable = response
+        .get_header_str("cache-control")
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    if already_uncacheable || response.get_header("set-cookie").is_none() {
+        return;
+    }
+    response.set_header("cache-control", "private, max-age=0");
+    response.remove_header("surrogate-control");
+    response.remove_header("fastly-surrogate-control");
 }
 
 fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
