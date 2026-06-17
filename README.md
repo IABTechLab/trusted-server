@@ -33,6 +33,9 @@ cargo build --package trusted-server-cli --target "$HOST_TARGET"
 ts config init
 # Edit trusted-server.toml
 ts config validate
+
+# Audit a public page with Chrome/Chromium to bootstrap a draft config
+ts audit https://publisher.example
 ```
 
 ## Development
