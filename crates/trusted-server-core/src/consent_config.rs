@@ -35,6 +35,7 @@ fn str_vec(codes: &[&str]) -> Vec<String> {
 
 /// Top-level consent configuration (`[consent]` in TOML).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsentConfig {
     /// Operating mode for consent handling.
     ///
@@ -175,6 +176,7 @@ impl ConsentForwardingMode {
 /// this list, the system logs that GDPR applies, enabling publishers to
 /// monitor compliance coverage.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GdprConfig {
     /// ISO 3166-1 alpha-2 country codes where GDPR applies.
     #[serde(default = "default_gdpr_countries")]
@@ -197,6 +199,7 @@ impl Default for GdprConfig {
 ///
 /// Config-driven to avoid recompilation when new state laws take effect.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsStatesConfig {
     /// US state codes with active comprehensive privacy laws.
     #[serde(default = "default_us_privacy_states")]
@@ -221,6 +224,7 @@ impl Default for UsStatesConfig {
 /// These reflect the publisher's actual compliance posture — they are
 /// **publisher policy**, not protocol requirements.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UsPrivacyDefaultsConfig {
     /// Whether the publisher has actually shown a CCPA notice to the user.
     #[serde(default = "default_true")]
@@ -254,6 +258,7 @@ impl Default for UsPrivacyDefaultsConfig {
 /// How to resolve disagreements between GPP and TC String when both are
 /// present (`[consent.conflict_resolution]`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictResolutionConfig {
     /// Resolution strategy.
     #[serde(default = "default_conflict_mode")]

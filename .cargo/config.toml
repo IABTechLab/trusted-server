@@ -1,5 +1,9 @@
 [alias]
 test_details = ["test", "--target", "aarch64-apple-darwin"]
+test_cli_macos = ["test", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+build_cli_macos = ["build", "--package", "trusted-server-cli", "--target", "aarch64-apple-darwin"]
+test_cli_linux = ["test", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
+build_cli_linux = ["build", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
 
 [build]
 target = "wasm32-wasip1"

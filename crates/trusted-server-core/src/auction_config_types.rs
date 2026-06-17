@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuctionConfig {
     /// Enable the auction orchestrator
     #[serde(default)]
