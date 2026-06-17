@@ -1301,7 +1301,7 @@ mod tests {
     #[test]
     fn golden_url_rewriting_replaces_origin_in_href() {
         // href attributes pointing at origin domain must be rewritten to proxy host.
-        let origin = "https://origin.test-publisher.com";
+        let origin = "https://origin.test-publisher.example.com";
         let html = format!(
             r#"<!DOCTYPE html><html><head></head><body>
         <a href="{origin}/page">Link</a>
@@ -1309,9 +1309,9 @@ mod tests {
         </body></html>"#
         );
 
-        let request_host = "proxy.test-publisher.com";
+        let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
-            origin_host: "origin.test-publisher.com".to_string(),
+            origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
@@ -1324,7 +1324,7 @@ mod tests {
         let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
 
         assert!(
-            !output_str.contains("origin.test-publisher.com"),
+            !output_str.contains("origin.test-publisher.example.com"),
             "origin host must not appear in rewritten HTML"
         );
         assert!(
