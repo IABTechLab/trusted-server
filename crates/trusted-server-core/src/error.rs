@@ -154,6 +154,164 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_code_returns_expected_http_status_for_each_variant() {
+        let cases = [
+            (
+                TrustedServerError::BadRequest {
+                    message: String::from("missing field"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::Configuration {
+                    message: String::from("missing setting"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::Auction {
+                    message: String::from("bid timeout"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Gam {
+                    message: String::from("request failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::GdprConsent {
+                    message: String::from("missing consent string"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::InvalidUtf8 {
+                    message: String::from("invalid byte sequence"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::RequestTooLarge {
+                    message: String::from("body too large"),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                TrustedServerError::InvalidHeaderValue {
+                    message: String::from("non-ascii header"),
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                TrustedServerError::KvStore {
+                    store_name: String::from("sessions"),
+                    message: String::from("timeout"),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::Prebid {
+                    message: String::from("adapter error"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Integration {
+                    integration: String::from("example-integration"),
+                    message: String::from("request failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Proxy {
+                    message: String::from("upstream failed"),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                TrustedServerError::Forbidden {
+                    message: String::from("missing permission"),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::AllowlistViolation {
+                    host: String::from("example.com"),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                TrustedServerError::Settings {
+                    message: String::from("parse failed"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::EdgeCookie {
+                    message: String::from("generation failed"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                TrustedServerError::PartnerNotFound {
+                    partner_id: String::from("example-partner"),
+                },
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                TrustedServerError::InsecureDefault {
+                    field: String::from("example.secret"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        // `mapped_status` is an exhaustive match with no `_` arm, so adding a
+        // new `TrustedServerError` variant fails to compile here until its
+        // status is declared — the per-variant coverage can't silently go
+        // stale. Cross-checking it against the independent `cases` literals
+        // above guards both encodings against drift.
+        fn mapped_status(error: &TrustedServerError) -> StatusCode {
+            match error {
+                TrustedServerError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::Configuration { .. } | TrustedServerError::Settings { .. } => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Gam { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
+                TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
+                TrustedServerError::Forbidden { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::AllowlistViolation { .. } => StatusCode::FORBIDDEN,
+                TrustedServerError::EdgeCookie { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                TrustedServerError::PartnerNotFound { .. } => StatusCode::NOT_FOUND,
+                TrustedServerError::InsecureDefault { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }
+
+        for (error, expected_status) in cases {
+            assert_eq!(
+                error.status_code(),
+                expected_status,
+                "should map {error:?} to {expected_status}",
+            );
+            assert_eq!(
+                mapped_status(&error),
+                expected_status,
+                "exhaustive mapping should agree with the table for {error:?}",
+            );
+        }
+    }
+
+    #[test]
     fn server_errors_return_generic_message() {
         let cases = [
             TrustedServerError::Configuration {

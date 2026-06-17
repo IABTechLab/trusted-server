@@ -2270,8 +2270,12 @@ mod tests {
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
-        gpt::GptConfig, nextjs::NextJsIntegrationConfig, prebid::PrebidIntegrationConfig,
-        testlight::TestlightConfig, IntegrationRegistry,
+        datadome::{DataDomeConfig, ProtectionMatcherConfig},
+        gpt::GptConfig,
+        nextjs::NextJsIntegrationConfig,
+        prebid::PrebidIntegrationConfig,
+        testlight::TestlightConfig,
+        IntegrationRegistry,
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
@@ -2823,6 +2827,221 @@ origin_host_header_overide = "www.example.com""#,
                         );
                     },
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn test_datadome_protection_scope_overrides_with_json_env() {
+        let toml_str = crate_test_settings_str();
+        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
+        );
+        let enabled_key = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+        let enable_protection_key = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}ENABLE_PROTECTION",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+        let excluded_methods_key = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_METHODS",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+        let cidr_sources_key = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUDED_IP_CIDR_SOURCES",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+        let rules_key = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}PROTECTION_EXCLUSION_RULES",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+
+        temp_env::with_vars(
+            [
+                (origin_key, Some("https://origin.test-publisher.com")),
+                (enabled_key, Some("true")),
+                (enable_protection_key, Some("true")),
+                (excluded_methods_key, Some(r#"["OPTIONS","TRACE"]"#)),
+                (
+                    cidr_sources_key,
+                    Some(r#"[{"config_store":"datadome-ip-bypass","key":"googlebot_ips"}]"#),
+                ),
+                (
+                    rules_key,
+                    Some(
+                        r#"[{"id":"legacy-static-get-head","methods":["GET","HEAD"],"type":"path_regex","patterns":["(?i)\\.(css|js)$"]},{"id":"next-rsc","type":"query_param_non_empty","names":["_rsc"]}]"#,
+                    ),
+                ),
+            ],
+            || {
+                let settings = Settings::from_toml_and_env(&toml_str)
+                    .expect("Settings should parse DataDome JSON env overrides");
+                let cfg = settings
+                    .integration_config::<DataDomeConfig>("datadome")
+                    .expect("DataDome config query should succeed")
+                    .expect("DataDome config should exist with env override");
+
+                assert!(cfg.enabled, "should parse enabled override as bool");
+                assert!(
+                    cfg.enable_protection,
+                    "should parse enable_protection override as bool"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_methods,
+                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
+                    "should parse method list from JSON env override"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_ip_cidr_sources[0].config_store, "datadome-ip-bypass",
+                    "should parse CIDR source config_store from JSON env override"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_ip_cidr_sources[0].key, "googlebot_ips",
+                    "should parse CIDR source key from JSON env override"
+                );
+                assert_eq!(
+                    cfg.protection_exclusion_rules.len(),
+                    2,
+                    "should parse all structured rules from JSON env override"
+                );
+                assert!(matches!(
+                    &cfg.protection_exclusion_rules[0].matcher,
+                    ProtectionMatcherConfig::PathRegex { patterns }
+                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
+                ));
+                assert!(matches!(
+                    &cfg.protection_exclusion_rules[1].matcher,
+                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
+                        if names == &vec!["_rsc".to_string()]
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn test_datadome_protection_scope_overrides_with_indexed_env() {
+        let toml_str = crate_test_settings_str();
+        let separator = ENVIRONMENT_VARIABLE_SEPARATOR;
+        let datadome_prefix = format!(
+            "{}{}INTEGRATIONS{}DATADOME{}",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator, separator
+        );
+        let origin_key = format!(
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX, separator, separator
+        );
+
+        temp_env::with_vars(
+            [
+                (origin_key, Some("https://origin.test-publisher.com")),
+                (format!("{datadome_prefix}ENABLED"), Some("true")),
+                (
+                    format!("{datadome_prefix}ENABLE_PROTECTION"),
+                    Some("true"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}0"),
+                    Some("OPTIONS"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUDED_METHODS{separator}1"),
+                    Some("TRACE"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUDED_ASNS{separator}0"),
+                    Some("19750"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDRS{separator}0"),
+                    Some("198.51.100.0/24"),
+                ),
+                (
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}CONFIG_STORE"
+                    ),
+                    Some("datadome-ip-bypass"),
+                ),
+                (
+                    format!(
+                        "{datadome_prefix}PROTECTION_EXCLUDED_IP_CIDR_SOURCES{separator}0{separator}KEY"
+                    ),
+                    Some("googlebot_ips"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}ID"),
+                    Some("legacy-static-get-head"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}0"),
+                    Some("GET"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}METHODS{separator}1"),
+                    Some("HEAD"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}TYPE"),
+                    Some("path_regex"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}0{separator}PATTERNS{separator}0"),
+                    Some(r"(?i)\.(css|js)$"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}ID"),
+                    Some("next-rsc"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}TYPE"),
+                    Some("query_param_non_empty"),
+                ),
+                (
+                    format!("{datadome_prefix}PROTECTION_EXCLUSION_RULES{separator}1{separator}NAMES{separator}0"),
+                    Some("_rsc"),
+                ),
+            ],
+            || {
+                let settings = Settings::from_toml_and_env(&toml_str)
+                    .expect("Settings should parse DataDome indexed env overrides");
+                let cfg = settings
+                    .integration_config::<DataDomeConfig>("datadome")
+                    .expect("DataDome config query should succeed")
+                    .expect("DataDome config should exist with indexed env override");
+
+                assert_eq!(
+                    cfg.protection_excluded_methods,
+                    vec!["OPTIONS".to_string(), "TRACE".to_string()],
+                    "should parse indexed method list"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_asns,
+                    vec![19750],
+                    "should parse indexed ASN list"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_ip_cidrs,
+                    vec!["198.51.100.0/24".to_string()],
+                    "should parse indexed IP CIDR list"
+                );
+                assert_eq!(
+                    cfg.protection_excluded_ip_cidr_sources[0].key,
+                    "googlebot_ips",
+                    "should parse indexed CIDR source list"
+                );
+                assert!(matches!(
+                    &cfg.protection_exclusion_rules[0].matcher,
+                    ProtectionMatcherConfig::PathRegex { patterns }
+                        if patterns == &vec!["(?i)\\.(css|js)$".to_string()]
+                ));
+                assert!(matches!(
+                    &cfg.protection_exclusion_rules[1].matcher,
+                    ProtectionMatcherConfig::QueryParamNonEmpty { names }
+                        if names == &vec!["_rsc".to_string()]
+                ));
             },
         );
     }
