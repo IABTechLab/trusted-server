@@ -75,8 +75,8 @@ fn read_config_entry(
         .get(store_name, key)
         .change_context(TrustedServerError::Configuration {
             message: format!(
-                "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
-            ),
+            "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
+        ),
         })
 }
 

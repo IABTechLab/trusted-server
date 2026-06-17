@@ -164,11 +164,11 @@ what `ts config push` publishes.
 `ts config push` writes EdgeZero-style flattened config entries by default. It
 does **not** store the whole Trusted Server config as one large JSON blob.
 
-| Key pattern                     | Value                                                                                         |
-| ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `<escaped-dotted-settings-key>` | Canonical JSON text for one flattened Trusted Server setting leaf                             |
-| `ts-config-hash`                | `sha256:<hex>` over the canonical flattened settings entry map, excluding metadata entries    |
-| `ts-config-keys`                | Minified JSON array of flattened settings keys in sorted order, excluding metadata entries    |
+| Key pattern                     | Value                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------ |
+| `<escaped-dotted-settings-key>` | Canonical JSON text for one flattened Trusted Server setting leaf                          |
+| `ts-config-hash`                | `sha256:<hex>` over the canonical flattened settings entry map, excluding metadata entries |
+| `ts-config-keys`                | Minified JSON array of flattened settings keys in sorted order, excluding metadata entries |
 
 Flattening follows EdgeZero's config push model with Trusted Server key
 escaping:

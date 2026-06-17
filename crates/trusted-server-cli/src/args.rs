@@ -11,6 +11,8 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Audit a public page and write draft Trusted Server artifacts.
+    Audit(AuditArgs),
     /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
     /// Build the project for a target adapter.
@@ -24,6 +26,27 @@ pub enum Command {
     Provision(DelegateArgs),
     /// Serve the project locally through a target adapter.
     Serve(DelegateArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AuditArgs {
+    /// Public HTTP(S) URL to audit.
+    pub url: String,
+    /// JavaScript asset audit output path.
+    #[arg(long)]
+    pub js_assets: Option<PathBuf>,
+    /// Draft Trusted Server config output path.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    /// Do not write the JavaScript asset audit file.
+    #[arg(long)]
+    pub no_js_assets: bool,
+    /// Do not write the draft Trusted Server config file.
+    #[arg(long)]
+    pub no_config: bool,
+    /// Overwrite existing output files.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -120,6 +143,66 @@ pub struct ConfigPushArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_audit_with_default_outputs() {
+        let args = Args::try_parse_from(["ts", "audit", "https://publisher.example"])
+            .expect("should parse audit command");
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        assert_eq!(audit.url, "https://publisher.example");
+        assert_eq!(audit.js_assets, None);
+        assert_eq!(audit.config, None);
+        assert!(!audit.no_js_assets);
+        assert!(!audit.no_config);
+        assert!(!audit.force);
+    }
+
+    #[test]
+    fn parses_audit_with_custom_outputs() {
+        let args = Args::try_parse_from([
+            "ts",
+            "audit",
+            "https://publisher.example",
+            "--js-assets",
+            "audit/js-assets.toml",
+            "--config",
+            "audit/trusted-server.toml",
+            "--no-js-assets",
+            "--no-config",
+            "--force",
+        ])
+        .expect("should parse audit command");
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        assert_eq!(audit.js_assets, Some(PathBuf::from("audit/js-assets.toml")));
+        assert_eq!(
+            audit.config,
+            Some(PathBuf::from("audit/trusted-server.toml"))
+        );
+        assert!(audit.no_js_assets);
+        assert!(audit.no_config);
+        assert!(audit.force);
+    }
+
+    #[test]
+    fn audit_does_not_accept_adapter_option() {
+        let error = Args::try_parse_from([
+            "ts",
+            "audit",
+            "https://publisher.example",
+            "--adapter",
+            "fastly",
+        ])
+        .expect_err("should reject audit adapter option");
+        assert!(
+            error.to_string().contains("unexpected argument")
+                || error.to_string().contains("Found argument"),
+            "error should explain unsupported option"
+        );
+    }
 
     #[test]
     fn parses_build_with_passthrough_args() {

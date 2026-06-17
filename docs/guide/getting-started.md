@@ -9,6 +9,7 @@ Before you begin, ensure you have the following installed (versions are pinned i
 - Rust {{RUST_VERSION}}
 - NodeJS {{NODEJS_VERSION}}
 - Fastly {{FASTLY_VERSION}} CLI installed
+- Chrome or Chromium, required for `ts audit`
 - A Fastly account and API key
 - Basic familiarity with WebAssembly
 
@@ -55,6 +56,25 @@ The server will be available at `http://localhost:7676`.
 
 ## Configuration
 
+Create a starter Trusted Server config with the `ts` CLI:
+
+```bash
+ts config init
+```
+
+To bootstrap from a public publisher page, run an audit first:
+
+```bash
+ts audit https://publisher.example
+```
+
+The audit command writes `js-assets.toml` plus a draft `trusted-server.toml`.
+Review the draft, replace placeholders/secrets, then validate it:
+
+```bash
+ts config validate
+```
+
 Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
@@ -62,7 +82,7 @@ Edit `trusted-server.toml` to configure:
 - EC configuration
 - GDPR settings
 
-See [Configuration](/guide/configuration) for details.
+See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly
 

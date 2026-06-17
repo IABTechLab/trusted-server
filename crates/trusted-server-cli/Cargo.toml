@@ -14,18 +14,26 @@ path = "src/main.rs"
 workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chromiumoxide = { workspace = true }
 clap = { workspace = true }
 derive_more = { workspace = true }
 edgezero-adapter = { workspace = true, features = ["cli"] }
 edgezero-cli = { workspace = true }
 edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "2eeccc9748daba92b9adf6afe4df105e79269ae9" }
 error-stack = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
+regex = { workspace = true }
+scraper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 trusted-server-core = { workspace = true }
+url = { workspace = true }
 validator = { workspace = true }
+which = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = { workspace = true }

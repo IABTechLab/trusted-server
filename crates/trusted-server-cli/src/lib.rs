@@ -12,6 +12,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod args;
 #[cfg(not(target_arch = "wasm32"))]
+mod audit;
+#[cfg(not(target_arch = "wasm32"))]
 mod config_command;
 #[cfg(not(target_arch = "wasm32"))]
 mod edgezero_delegate;
