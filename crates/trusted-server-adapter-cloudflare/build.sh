@@ -17,5 +17,15 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # worker-build must run from the crate root (where Cargo.toml lives) regardless
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
-command -v worker-build >/dev/null 2>&1 || cargo install -q --version '^0.7' worker-build
-worker-build --release
+
+# worker-build 0.8+ requires worker >= 0.8.4, but this crate and the pinned
+# edgezero adapter use worker 0.7. Install a matching 0.7-series worker-build
+# into a crate-local root so a newer globally-installed worker-build (used by
+# other projects) is neither required nor disturbed. The version guard also
+# re-pins if the local copy is somehow on a non-0.7 series.
+WORKER_BUILD_ROOT="$SCRIPT_DIR/.worker-build"
+WORKER_BUILD_BIN="$WORKER_BUILD_ROOT/bin/worker-build"
+if ! "$WORKER_BUILD_BIN" --version 2>/dev/null | grep -qE '0\.7\.'; then
+    cargo install -q --version '^0.7' --root "$WORKER_BUILD_ROOT" worker-build
+fi
+"$WORKER_BUILD_BIN" --release
