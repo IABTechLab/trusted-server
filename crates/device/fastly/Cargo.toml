@@ -1,0 +1,17 @@
+[package]
+name = "trusted-server-device-fastly"
+version = "0.1.0"
+authors = []
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+fastly = { workspace = true }

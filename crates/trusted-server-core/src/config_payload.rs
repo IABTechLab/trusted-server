@@ -82,7 +82,9 @@ mod tests {
     fn strings_that_look_like_json_scalars_round_trip_as_strings() {
         let mut original = test_settings();
         original.publisher.proxy_secret = Redacted::new("1234567890".to_string());
-        original.ec.passphrase = Redacted::new("12345678901234567890123456789012".to_string());
+        original.ec.providers.hmac = Some(crate::settings::HmacProviderConfig {
+            passphrase: Redacted::new("12345678901234567890123456789012".to_string()),
+        });
         original.handlers[0].password = Redacted::new("true".to_string());
 
         let reconstructed = settings_from_config_blob(&envelope_json(&original))
@@ -94,8 +96,22 @@ mod tests {
             "numeric-looking proxy secret should remain a string"
         );
         assert_eq!(
-            reconstructed.ec.passphrase.expose(),
-            original.ec.passphrase.expose(),
+            reconstructed
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should reconstruct the hmac provider")
+                .passphrase
+                .expose(),
+            original
+                .ec
+                .providers
+                .hmac
+                .as_ref()
+                .expect("should keep the hmac provider")
+                .passphrase
+                .expose(),
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(

@@ -16,6 +16,9 @@
 /spin
 /spin.sig
 
+# logs
+*.log
+
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
 
