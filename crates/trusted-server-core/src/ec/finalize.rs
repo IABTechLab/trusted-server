@@ -8,10 +8,10 @@ use std::collections::HashSet;
 use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
-use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::settings::Settings;
 
 use super::EcContext;
+use super::consent::ec_storage_withdrawn;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::is_valid_ec_id;
 use super::kv::KvIdentityGraph;
@@ -29,12 +29,16 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies withdrawal handling, last-seen updates, cookie reconciliation,
-/// Prebid EID ingestion, and cookie writes for new EC generation.
+/// Applies the resolved permission state, last-seen updates, cookie
+/// reconciliation, Prebid EID ingestion, and cookie writes for new EC generation.
 ///
-/// On consent withdrawal, the browser response clears the EC cookie
-/// immediately and the EC identity-graph KV tombstone is the authoritative
-/// revocation marker. There is no separate consent KV store to clean up.
+/// When the request carries an explicit withdrawal signal (a storage opt-out or
+/// a TCF record refusing storage) and the client presented a cookie, the browser
+/// response clears the EC cookie immediately and the EC identity-graph KV
+/// tombstone is the authoritative revocation marker. A request that is merely
+/// not permitted (pre-consent or fail-closed) strips EC response headers but
+/// leaves an already-issued cookie intact. There is no separate consent KV
+/// store to clean up.
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
 /// from the request *before* routing consumes it.
@@ -47,19 +51,27 @@ pub fn ec_finalize_response(
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
-    let consent_allows_ec = ec_consent_granted(ec_context.consent());
-    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
+    // Apply any response headers the active provider asked for during
+    // generation (for example to request more client evidence). This is empty
+    // unless a provider produced headers, so it is safe on every path.
+    for (name, value) in ec_context.response_headers() {
+        response.headers_mut().insert(name, value.clone());
+    }
 
-    if !consent_allows_ec {
-        // Always strip EC-specific response headers when consent is not
-        // currently usable for this request. This covers both explicit
-        // revocation and fail-closed cases such as missing geo or undecodable
-        // consent input.
+    let ec_permitted = ec_context.ec_allowed();
+
+    if !ec_permitted {
+        // Always strip EC-specific response headers when EC is not permitted for
+        // this request, covering both an explicit withdrawal and fail-closed
+        // cases such as missing geo or undecodable consent input.
         clear_ec_headers_on_response(response, Some(registry));
 
         // Only expire the browser cookie and tombstone the identity-graph row
-        // when the request carries an explicit withdrawal signal.
-        if consent_withdrawn && ec_context.cookie_was_present() {
+        // when the request carries an explicit withdrawal signal. A pre-consent
+        // or fail-closed state (the permission is simply not set) strips headers
+        // but must not destroy an already-issued identifier, or a returning user
+        // would be permanently withdrawn before they ever get to consent.
+        if ec_storage_withdrawn(ec_context.consent()) && ec_context.cookie_was_present() {
             expire_ec_cookie(settings, response);
 
             // Compute once for the authoritative identity-graph tombstones.
@@ -82,8 +94,8 @@ pub fn ec_finalize_response(
         return;
     }
 
-    // Returning user: consent is granted and EC came from request.
-    if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
+    // Returning user: EC is permitted and came from the request.
+    if ec_context.ec_was_present() && !ec_context.ec_generated() && ec_permitted {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value()) {
             ingest_eid_cookies(eids_cookie, sharedid_cookie, ec_id, graph, registry);
         }
@@ -219,6 +231,7 @@ mod tests {
         ec_was_present: bool,
         ec_generated: bool,
         jurisdiction: Jurisdiction,
+        ec_allowed: bool,
     ) -> EcContext {
         let consent = ConsentContext {
             jurisdiction,
@@ -232,6 +245,7 @@ mod tests {
             ec_was_present,
             ec_generated,
             consent,
+            ec_allowed,
         )
     }
 
@@ -241,6 +255,7 @@ mod tests {
         ec_was_present: bool,
         ec_generated: bool,
         consent: ConsentContext,
+        ec_allowed: bool,
     ) -> EcContext {
         EcContext::new_for_test_with_cookie(
             ec_value.map(str::to_owned),
@@ -248,6 +263,7 @@ mod tests {
             ec_was_present,
             ec_generated,
             consent,
+            ec_allowed,
         )
     }
 
@@ -275,7 +291,14 @@ mod tests {
     #[test]
     fn withdrawal_ec_ids_returns_cookie_ec_only_when_active_missing() {
         let cookie_ec = sample_ec_id("cook1e");
-        let ec_context = make_context(None, Some(&cookie_ec), true, false, Jurisdiction::Unknown);
+        let ec_context = make_context(
+            None,
+            Some(&cookie_ec),
+            true,
+            false,
+            Jurisdiction::Unknown,
+            false,
+        );
 
         let ids = withdrawal_ec_ids(&ec_context);
 
@@ -295,6 +318,7 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
         let ids = withdrawal_ec_ids(&ec_context);
@@ -313,6 +337,7 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
         let ids = withdrawal_ec_ids(&ec_context);
@@ -331,6 +356,7 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
 
         let ids = withdrawal_ec_ids(&ec_context);
@@ -402,7 +428,7 @@ mod tests {
             ..Default::default()
         };
         let ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", "stale");
         set_header(&mut response, "x-ts-eids", "[]");
@@ -459,6 +485,7 @@ mod tests {
             true,
             false,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -493,6 +520,7 @@ mod tests {
             true,
             false,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -527,6 +555,7 @@ mod tests {
             false,
             true,
             Jurisdiction::NonRegulated,
+            true,
         );
         let mut response = empty_response();
 
@@ -554,7 +583,7 @@ mod tests {
     #[test]
     fn finalize_denied_without_cookie_is_noop() {
         let settings = create_test_settings();
-        let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
+        let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown, false);
         let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
@@ -579,7 +608,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_unknown_jurisdiction_strips_headers_without_expiring_cookie() {
+    fn finalize_not_permitted_without_withdrawal_keeps_cookie() {
+        // When EC is not permitted (here a fail-closed unknown jurisdiction with
+        // no geo) but the request carries no explicit withdrawal signal, the
+        // response strips EC headers yet must leave an already-issued cookie
+        // intact. A pre-consent or transient fail-closed request must not
+        // permanently withdraw a returning user before they get to consent.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("unk001");
         let ec_context = make_context(
@@ -588,6 +622,7 @@ mod tests {
             true,
             false,
             Jurisdiction::Unknown,
+            false,
         );
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", &ec_id);
@@ -606,15 +641,78 @@ mod tests {
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),
-            "should strip EC header when consent cannot be verified"
+            "should strip EC header when EC is not permitted"
         );
         assert!(
             get_header(&response, "x-ts-eids").is_none(),
-            "should strip EID header when consent cannot be verified"
+            "should strip EID header when EC is not permitted"
         );
         assert!(
             get_header(&response, "set-cookie").is_none(),
-            "should not expire the cookie without an explicit withdrawal signal"
+            "a not-permitted request without a withdrawal signal should keep the cookie"
+        );
+    }
+
+    #[test]
+    fn set_ec_cookie_on_response_writes_the_ts_ec_cookie() {
+        // The positive case: when an EC value is present, the finalize path
+        // writes the ts-ec cookie to the browser, carrying the EC id.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("setck1");
+        let ec_context = make_context(
+            Some(&ec_id),
+            None,
+            false,
+            true,
+            Jurisdiction::NonRegulated,
+            true,
+        );
+        let mut response = empty_response();
+
+        set_ec_cookie_on_response(&settings, &ec_context, &mut response);
+
+        let set_cookie =
+            get_header_str(&response, "set-cookie").expect("an EC value should write a Set-Cookie");
+        assert!(
+            set_cookie.contains("ts-ec=") && set_cookie.contains(&ec_id),
+            "should write the ts-ec cookie carrying the EC id, got: {set_cookie}"
+        );
+    }
+
+    #[test]
+    fn closed_permission_gate_writes_no_ec_cookie() {
+        // The gate: with the permission gate closed (ec_allowed = false), no
+        // ts-ec cookie is written, even when an EC value and a generated flag are
+        // present. The permission model is what suppresses the cookie.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("gated1");
+        let ec_context = make_context(
+            Some(&ec_id),
+            None,
+            false,
+            true,
+            Jurisdiction::NonRegulated,
+            false,
+        );
+        let mut response = empty_response();
+
+        // Pass a KV graph so the missing-graph guard cannot be the reason the
+        // cookie is suppressed; the closed gate must be doing the work.
+        let kv = KvIdentityGraph::failing("test_store");
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &ec_context,
+            Some(&kv),
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "a closed permission gate must not write a ts-ec cookie"
         );
     }
 }

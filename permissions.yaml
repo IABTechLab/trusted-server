@@ -1,0 +1,129 @@
+# Country and region permission rules for Trusted Server's permission model.
+#
+# This file is compiled into the build, not loaded at runtime. Editing it and
+# rebuilding is how a deployer changes the default policy, so the rules stay
+# visible and reviewable in version control.
+#
+# There are two parts:
+#   groups  named permission baselines, defined once and referenced by rules
+#   rules   map a country (FR) or country/state (US/CA) to a group, with optional
+#           explicit per-permission overrides
+#
+# Rule keys use the codes a geo provider returns, matched case-insensitively:
+#   country        ISO 3166-1 alpha-2 (for example FR, US, GB)
+#   country/state  adds the ISO 3166-2 subdivision code, with no country prefix
+#                  (for example US/CA for California)
+# The Fastly and other geo providers both emit these codes directly.
+#
+# A request whose country/region matches no rule, or whose country the geo
+# provider cannot resolve, uses the deployer's default set in trusted-server.toml
+# as [geo] default_country. A default is required, so there is always a default
+# permission set; startup fails when none is configured.
+#
+# A permission flag is one of:
+#   granted          set without any signal (for example strictly necessary)
+#   requires_signal  set only when a signal grants it (opt-in)
+#   denied           never set, even when a signal grants it
+#
+# Permission names are the IAB TCF Europe purposes:
+#   store-on-device, select-basic-ads, create-ads-profile,
+#   select-personalised-ads, create-content-profile, select-personalised-content,
+#   measure-ad-performance, measure-content-performance, market-research,
+#   develop-services, select-basic-content
+#
+# Named baselines. Each group lists every permission and its flag, so a group's
+# meaning is explicit. (A `default: <flag>` shorthand is also accepted for any
+# permission a group omits, but the shipped groups spell every one out.)
+groups:
+  # European Union: opt-in, every purpose requires a signal.
+  gdpr-eu:
+    store-on-device: requires_signal
+    select-basic-ads: requires_signal
+    create-ads-profile: requires_signal
+    select-personalised-ads: requires_signal
+    create-content-profile: requires_signal
+    select-personalised-content: requires_signal
+    measure-ad-performance: requires_signal
+    measure-content-performance: requires_signal
+    market-research: requires_signal
+    develop-services: requires_signal
+    select-basic-content: requires_signal
+
+  # United Kingdom: opt-in, but device storage proceeds without a signal under
+  # the reformed ePrivacy regime.
+  gdpr-uk:
+    store-on-device: granted
+    select-basic-ads: requires_signal
+    create-ads-profile: requires_signal
+    select-personalised-ads: requires_signal
+    create-content-profile: requires_signal
+    select-personalised-content: requires_signal
+    measure-ad-performance: requires_signal
+    measure-content-performance: requires_signal
+    market-research: requires_signal
+    develop-services: requires_signal
+    select-basic-content: requires_signal
+
+  # United States: opt-out, every purpose granted by default.
+  us-opt-out:
+    store-on-device: granted
+    select-basic-ads: granted
+    create-ads-profile: granted
+    select-personalised-ads: granted
+    create-content-profile: granted
+    select-personalised-content: granted
+    measure-ad-performance: granted
+    measure-content-performance: granted
+    market-research: granted
+    develop-services: granted
+    select-basic-content: granted
+
+# Map a country, or a country and state (country/state), to a group. Add explicit
+# per-permission overrides with +permission (granted) or -permission (denied).
+# These win over the group baseline.
+rules:
+  # European Union (27).
+  AT: gdpr-eu
+  BE: gdpr-eu
+  BG: gdpr-eu
+  HR: gdpr-eu
+  CY: gdpr-eu
+  CZ: gdpr-eu
+  DK: gdpr-eu
+  EE: gdpr-eu
+  FI: gdpr-eu
+  FR: gdpr-eu
+  DE: gdpr-eu
+  GR: gdpr-eu
+  HU: gdpr-eu
+  IE: gdpr-eu
+  IT: gdpr-eu
+  LV: gdpr-eu
+  LT: gdpr-eu
+  LU: gdpr-eu
+  MT: gdpr-eu
+  NL: gdpr-eu
+  PL: gdpr-eu
+  PT: gdpr-eu
+  RO: gdpr-eu
+  SK: gdpr-eu
+  SI: gdpr-eu
+  ES: gdpr-eu
+  SE: gdpr-eu
+
+  # European Economic Area (non-EU): GDPR applies through the EEA agreement.
+  IS: gdpr-eu
+  LI: gdpr-eu
+  NO: gdpr-eu
+
+  GB: gdpr-uk
+  AU: us-opt-out
+
+  # United States. Every state follows the country rule until a state entry
+  # overrides it: a country/state key takes precedence over the country, so add
+  # a row only where a state's law differs from the baseline, for example:
+  #   US/CA:
+  #     group: us-opt-out
+  #     permissions: [-select-personalised-ads]
+  # or reference a stricter group.
+  US: us-opt-out

@@ -112,8 +112,11 @@ Configure in `trusted-server.toml`:
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+provider = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.providers.hmac]
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 Verify stores exist:

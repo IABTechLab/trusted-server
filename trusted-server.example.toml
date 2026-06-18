@@ -12,11 +12,27 @@ origin_url = "https://origin.example.com"
 proxy_secret = "change-me-proxy-secret"
 
 [ec]
-passphrase = "trusted-server-placeholder-secret"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
 # cluster_trust_threshold = 10
 # cluster_recheck_secs = 3600
+
+# Edge Cookie identity is OFF by default: with no provider selected, Trusted
+# Server runs statelessly and generates no Edge Cookie. Activate one by
+# uncommenting the selector below (its [ec.providers.<key>] block must exist) or
+# via the TRUSTED_SERVER__ec__provider environment variable. The built-in hmac
+# provider is host-neutral; a vendor provider needs its own cargo feature.
+# provider = "hmac"
+
+[ec.providers.hmac]
+passphrase = "trusted-server-placeholder-secret"
+
+# Built-in host-signal provider: mints the identifier from the host's TLS JA4
+# and HTTP/2 fingerprints instead of the client IP. Requires a host that
+# supplies those signals (for example Fastly). Select with provider =
+# "host-signals" and configure its own passphrase:
+# [ec.providers.host-signals]
+# passphrase = "replace-with-32-plus-byte-random-secret"
 
 # Example partner configuration. Replace the token before validating/pushing.
 # [[ec.partners]]
@@ -28,6 +44,29 @@ pull_sync_concurrency = 3
 # api_token = "replace-with-partner-api-token-32-bytes-minimum"
 # batch_rate_limit = 60
 # pull_sync_enabled = false
+
+# Device-detection provider. Selects how a request is classified into device
+# signals (browser/bot gating). Default "builtin" classifies from the User-Agent
+# alone and makes no host call, so a default deployment stays host-neutral. The
+# opt-in "fastly" provider adds the host's TLS/H2 fingerprints to the gate.
+# Override at deployment with TRUSTED_SERVER__device__provider.
+# [device]
+# provider = "builtin"   # or "fastly" to add TLS/H2 fingerprint evidence
+
+# Geo / IP intelligence provider. No provider is the default: Trusted Server
+# resolves no geolocation and makes no host geo call, so a default deployment is
+# not tied to any host geo service. Opt into the host lookup with
+# provider = "platform". Override with TRUSTED_SERVER__geo__provider.
+#
+# default_country is required. Trusted Server does not assume a jurisdiction for
+# you, so the operator declares the baseline: the country (US) or country/region
+# (US/CA) whose permissions.yaml rule is the default permission set for a request
+# the geo provider leaves unmatched. The example uses FR (GDPR-EU), the most
+# protective baseline where every permission requires a signal. Validated at
+# startup.
+[geo]
+# provider = "platform"
+default_country = "FR"
 
 # Custom headers to include in every response.
 # [response_headers]

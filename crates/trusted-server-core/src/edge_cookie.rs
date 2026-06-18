@@ -11,24 +11,29 @@ use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 #[cfg(test)]
-use crate::ec::generation::{generate_ec_id as generate_canonical_ec_id, normalize_ip};
+use crate::ec::generation::normalize_ip;
+#[cfg(test)]
+use crate::ec::provider::{IdentityInput, build_provider};
 use crate::error::TrustedServerError;
+#[cfg(test)]
+use crate::evidence::BorrowedRequestInfo;
 #[cfg(test)]
 use crate::platform::RuntimeServices;
 #[cfg(test)]
 use crate::settings::Settings;
 
-/// Generates a fresh EC ID based on client IP address.
+/// Generates a fresh EC ID using the configured Edge Cookie provider.
 ///
-/// Delegates to the canonical generator in [`crate::ec::generation`] so a
-/// single normalization + HMAC path produces EC IDs. The canonical
-/// `normalize_ip` format is a stable contract — EC hashes stored in KV
-/// depend on it, and a divergent normalization would mint non-correlating
-/// identities for the same client.
+/// Routes through the pluggable provider model: the active `[ec] provider`
+/// selection decides the outcome. Returns `Ok(None)` when no provider is
+/// configured, so Trusted Server runs statelessly and mints no Edge Cookie.
+/// `request_headers` lets a provider that derives identity from request
+/// evidence read it; the built-in HMAC provider ignores it and uses only the
+/// normalized client IP.
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
+/// - [`TrustedServerError::EdgeCookie`] if provider generation fails
 ///
 /// Currently exercised only by tests: the production EC lifecycle generates IDs
 /// through [`crate::ec`]/`EcContext` rather than this edge-cookie helper.
@@ -36,18 +41,32 @@ use crate::settings::Settings;
 pub fn generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
-) -> Result<String, Report<TrustedServerError>> {
-    // Fallback to "unknown" when client IP is unavailable (e.g., local testing).
-    // All such requests share the same HMAC base; the random suffix provides uniqueness.
+    request_headers: Option<&http::HeaderMap>,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    // Fall back to "unknown" when the client IP is unavailable (for example in
+    // local testing). All such requests share the same HMAC base; the random
+    // suffix provides uniqueness.
     let client_ip = services
-        .client_info
+        .client_info()
         .client_ip
         .map(normalize_ip)
         .unwrap_or_else(|| "unknown".to_string());
 
     log::trace!("Generating fresh EC ID from normalized client context");
 
-    generate_canonical_ec_id(settings, &client_ip)
+    let Some(provider) = build_provider(&settings.ec, services.host_signals())? else {
+        log::info!("No Edge Cookie provider configured; running statelessly");
+        return Ok(None);
+    };
+
+    // The provider reads request data (the client IP, and on a fingerprinting
+    // host the TLS/HTTP-2 signals) borrowed at call time, so nothing is cloned.
+    let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
+    // The publisher path applies the permission gate at the call site, and the
+    // built-in provider reads neither the resolved permissions nor consent, so
+    // they are not threaded here.
+    let generated = provider.generate(&request_info, &IdentityInput::default())?;
+    Ok(generated.id)
 }
 
 /// Gets an existing EC ID from the request.
@@ -99,7 +118,10 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
 /// 1. The `x-ts-ec` header
 /// 2. The `ts-ec` cookie
 ///
-/// If neither exists, generates a new EC ID.
+/// If neither exists, generates a new EC ID via the configured provider.
+///
+/// Returns `Ok(None)` when no existing EC ID is present and no Edge Cookie
+/// provider is configured, so the caller proceeds statelessly.
 ///
 /// # Errors
 ///
@@ -109,14 +131,16 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
-) -> Result<String, Report<TrustedServerError>> {
+) -> Result<Option<String>, Report<TrustedServerError>> {
     if let Some(id) = get_ec_id(req)? {
-        return Ok(id);
+        return Ok(Some(id));
     }
 
-    // If no existing EC ID found, generate a fresh one
-    let ec_id = generate_ec_id(settings, services)?;
-    log::trace!("No existing EC ID found; generated a fresh EC ID");
+    // If no existing EC ID found, generate a fresh one through the provider.
+    let ec_id = generate_ec_id(settings, services, Some(req.headers()))?;
+    if ec_id.is_some() {
+        log::trace!("No existing EC ID found; generated a fresh EC ID");
+    }
     Ok(ec_id)
 }
 
@@ -130,7 +154,7 @@ pub fn get_or_generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
-) -> Result<String, Report<TrustedServerError>> {
+) -> Result<Option<String>, Report<TrustedServerError>> {
     get_or_generate_ec_id_from_http_request(settings, services, req)
 }
 
@@ -141,6 +165,7 @@ mod tests {
     use http::{HeaderName, header};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    use crate::ec::generation::generate_ec_id as generate_canonical_ec_id;
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
     use crate::test_support::tests::create_test_settings;
 
@@ -155,9 +180,17 @@ mod tests {
             0x2001, 0x0db8, 0x85a3, 0x0000, 0x8a2e, 0x0370, 0x7334, 0x1234,
         ));
 
-        let id_here = generate_ec_id(&settings, &noop_services_with_client_ip(ip))
-            .expect("should generate EC ID via edge_cookie");
-        let id_canonical = generate_canonical_ec_id(&settings, &normalize_ip(ip))
+        let id_here = generate_ec_id(&settings, &noop_services_with_client_ip(ip), None)
+            .expect("should generate EC ID via edge_cookie")
+            .expect("should configure the hmac provider in test settings");
+        let passphrase = settings
+            .ec
+            .providers
+            .hmac
+            .as_ref()
+            .map(|hmac| hmac.passphrase.expose().as_str())
+            .unwrap_or("");
+        let id_canonical = generate_canonical_ec_id(passphrase, &normalize_ip(ip))
             .expect("should generate EC ID via canonical generator");
 
         assert_eq!(
@@ -206,7 +239,9 @@ mod tests {
     fn test_generate_ec_id() {
         let settings: Settings = create_test_settings();
 
-        let ec_id = generate_ec_id(&settings, &noop_services()).expect("should generate EC ID");
+        let ec_id = generate_ec_id(&settings, &noop_services(), None)
+            .expect("should generate EC ID")
+            .expect("should configure the hmac provider in test settings");
         log::debug!("Generated EC ID: {}", ec_id);
         assert!(
             is_ec_id_format(&ec_id),
@@ -215,14 +250,30 @@ mod tests {
     }
 
     #[test]
+    fn generate_ec_id_returns_none_when_no_provider_is_configured() {
+        let mut settings = create_test_settings();
+        // No provider selected: Trusted Server runs statelessly.
+        settings.ec.provider = None;
+
+        let id = generate_ec_id(&settings, &noop_services(), None)
+            .expect("generation should not error when no provider is configured");
+        assert!(
+            id.is_none(),
+            "no Edge Cookie provider should mean no Edge Cookie is minted"
+        );
+    }
+
+    #[test]
     fn test_generate_ec_id_uses_client_ip() {
         let settings = create_test_settings();
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
 
-        let id_with_ip = generate_ec_id(&settings, &noop_services_with_client_ip(ip))
-            .expect("should generate EC ID with client IP");
-        let id_without_ip = generate_ec_id(&settings, &noop_services())
-            .expect("should generate EC ID without client IP");
+        let id_with_ip = generate_ec_id(&settings, &noop_services_with_client_ip(ip), None)
+            .expect("should generate EC ID with client IP")
+            .expect("should configure the hmac provider in test settings");
+        let id_without_ip = generate_ec_id(&settings, &noop_services(), None)
+            .expect("should generate EC ID without client IP")
+            .expect("should configure the hmac provider in test settings");
 
         let hmac_with_ip = id_with_ip.split_once('.').expect("should contain dot").0;
         let hmac_without_ip = id_without_ip.split_once('.').expect("should contain dot").0;
@@ -278,7 +329,8 @@ mod tests {
         assert_eq!(ec_id, Some("existing_ec_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
-            .expect("should reuse header EC ID");
+            .expect("should reuse header EC ID")
+            .expect("an existing EC should be present");
         assert_eq!(ec_id, "existing_ec_id");
     }
 
@@ -294,7 +346,8 @@ mod tests {
         assert_eq!(ec_id, Some("existing_cookie_id".to_string()));
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
-            .expect("should reuse cookie EC ID");
+            .expect("should reuse cookie EC ID")
+            .expect("an existing EC should be present");
         assert_eq!(ec_id, "existing_cookie_id");
     }
 
@@ -326,7 +379,8 @@ mod tests {
             .expect("should build test request");
 
         let ec_id = get_or_generate_ec_id_from_http_request(&settings, &noop_services(), &req)
-            .expect("should reuse cookie EC ID from http request");
+            .expect("should reuse cookie EC ID from http request")
+            .expect("an existing EC should be present");
 
         assert_eq!(ec_id, "existing_http_cookie_id");
     }
@@ -344,7 +398,8 @@ mod tests {
         let req = create_test_request(&[]);
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
-            .expect("should get or generate EC ID");
+            .expect("should get or generate EC ID")
+            .expect("should configure the hmac provider in test settings");
         assert!(!ec_id.is_empty());
     }
 
@@ -369,7 +424,8 @@ mod tests {
         let req = create_test_request(&[(HEADER_X_TS_EC, "evil;injected")]);
 
         let ec_id = get_or_generate_ec_id(&settings, &noop_services(), &req)
-            .expect("should generate fresh ID on invalid header");
+            .expect("should generate fresh ID on invalid header")
+            .expect("should configure the hmac provider in test settings");
         assert_ne!(
             ec_id, "evil;injected",
             "should not use tampered header value"

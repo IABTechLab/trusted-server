@@ -11,8 +11,12 @@ on:
 
 jobs:
   test-rust:
-    name: cargo test
-    runs-on: ubuntu-latest
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,8 +54,12 @@ jobs:
         run: cargo test-fastly
 
   test-axum:
-    name: cargo test (axum native)
-    runs-on: ubuntu-latest
+    name: cargo test (axum native, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -92,8 +100,12 @@ jobs:
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
   test-cloudflare:
-    name: cargo check (cloudflare native + wasm32-unknown-unknown)
-    runs-on: ubuntu-latest
+    name: cargo check (cloudflare native + wasm32-unknown-unknown, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
