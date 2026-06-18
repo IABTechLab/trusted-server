@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::EcContext;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
@@ -273,10 +273,9 @@ pub async fn handle_auction(
     // consent gating before attaching them to the auction request.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-    auction_request.user.eids =
-        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+    auction_request.user.eids = gate_eids_by_permissions(merged_eids, ec_context.permissions());
     if had_eids && auction_request.user.eids.is_none() {
-        log::warn!("Auction EIDs stripped by TCF consent gating");
+        log::warn!("Auction EIDs stripped: bidstream permissions not set");
     }
 
     // Create auction context
@@ -596,13 +595,11 @@ mod tests {
             .build()
     }
 
-    fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
-        EcContext::new_for_test(
+    fn make_ec_context(ec_allowed: bool, ec_value: Option<&str>) -> EcContext {
+        EcContext::new_for_test_gated(
             ec_value.map(str::to_owned),
-            ConsentContext {
-                jurisdiction,
-                ..ConsentContext::default()
-            },
+            ConsentContext::default(),
+            ec_allowed,
         )
     }
 
@@ -660,7 +657,9 @@ mod tests {
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        // The default consent context keeps the jurisdiction unknown, so the
+        // server-side auction gate fails closed; the EC gate is off to match.
+        let ec_context = make_ec_context(false, Some(&ec_id));
 
         let body = json!({
             "adUnits": [
@@ -857,7 +856,7 @@ mod tests {
     fn resolve_auction_eids_returns_none_without_kv() {
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(None, Some(&registry), &ec_context);
         assert!(result.is_none(), "should return None when KV is missing");
@@ -867,7 +866,7 @@ mod tests {
     fn resolve_auction_eids_returns_none_without_registry() {
         let kv = KvIdentityGraph::failing("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         let result = resolve_auction_eids(Some(&kv), None, &ec_context);
         assert!(
@@ -881,7 +880,7 @@ mod tests {
         let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
+        let ec_context = make_ec_context(false, Some(&ec_id));
 
         let result = resolve_auction_eids(Some(&kv), Some(&registry), &ec_context);
         assert!(
@@ -894,7 +893,7 @@ mod tests {
     fn resolve_auction_eids_returns_none_when_no_ec() {
         let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let ec_context = make_ec_context(true, None);
 
         let result = resolve_auction_eids(Some(&kv), Some(&registry), &ec_context);
         assert!(
@@ -908,7 +907,7 @@ mod tests {
         let kv = KvIdentityGraph::failing("nonexistent_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
-        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let ec_context = make_ec_context(true, Some(&ec_id));
 
         // KV store doesn't exist, so the get() call will error — should return
         // empty Vec (degraded mode), not None.

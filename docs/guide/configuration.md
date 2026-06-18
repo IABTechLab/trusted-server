@@ -24,6 +24,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
@@ -37,7 +40,8 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
+export TRUSTED_SERVER__EC__PROVIDER=hmac
+export TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ### Generate Secure Secrets
@@ -58,6 +62,7 @@ fail and the service will return its startup-error response.
 | File                  | Purpose                         |
 | --------------------- | ------------------------------- |
 | `trusted-server.toml` | Main application configuration  |
+| `permissions.yaml`    | Country/region permission rules |
 | `fastly.toml`         | Fastly Compute service settings |
 | `.env.dev`            | Local development overrides     |
 
@@ -68,6 +73,8 @@ fail and the service will return its startup-error response.
 | `[publisher]`       | Domain, origin, proxy settings               |
 | `[ec]`              | Edge Cookie (EC) ID generation               |
 | `[tester_cookie]`   | Optional tester-cookie endpoint              |
+| `[device]`          | Device classification provider selection     |
+| `[geo]`             | Geolocation provider selection               |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
@@ -84,6 +91,9 @@ origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "replace-with-32-plus-byte-random-secret"
 
 [request_signing]
@@ -382,14 +392,24 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 
 ### `[ec]`
 
-| Field                     | Type           | Required | Description                                                             |
-| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
-| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
-| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
-| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
-| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
-| `partners`                | Array          | No       | Static partner registry entries                                         |
+| Field                     | Type           | Required | Description                                                                                               |
+| ------------------------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------- |
+| `provider`                | String or null | No       | Key of the active Edge Cookie provider, for example `"hmac"`. Omit to run statelessly with no Edge Cookie |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state                                           |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response                                                |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                                                       |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps                                   |
+| `partners`                | Array          | No       | Static partner registry entries                                                                           |
+
+The selected `provider` must have a matching `[ec.providers.<key>]` block. Selecting a provider with no configured block, or an unknown key, fails at startup.
+
+### `[ec.providers.hmac]`
+
+The built-in HMAC-over-client-IP provider, keyed `hmac`.
+
+| Field        | Type   | Required                    | Description                               |
+| ------------ | ------ | --------------------------- | ----------------------------------------- |
+| `passphrase` | String | Yes when `hmac` is selected | Publisher passphrase used as the HMAC key |
 
 ::: tip Partner keying
 `source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
@@ -399,8 +419,11 @@ Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_stor
 
 ```toml
 [ec]
-passphrase = "replace-with-32-plus-byte-random-secret"
+provider = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.providers.hmac]
+passphrase = "replace-with-32-plus-byte-random-secret"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -412,19 +435,28 @@ bidstream_enabled = true
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EC__PASSPHRASE=your-secret
+TRUSTED_SERVER__EC__PROVIDER=hmac
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=your-secret
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
+These `TRUSTED_SERVER__` overrides apply where deployment tooling merges environment values into the published configuration (for example test harnesses building an app-config blob). The running server reads its settings from the platform config store, so provider selection changes take effect when a new configuration is pushed, not per request.
+
 ### Field Details
 
-#### `passphrase`
+#### `provider`
 
-**Purpose**: Publisher passphrase used as HMAC key for EC ID generation.
+**Purpose**: Names the active Edge Cookie provider by its key. Omit to run statelessly with no Edge Cookie.
+
+**Validation**: Application startup fails if the selected key has no matching `[ec.providers.<key>]` block, or is unknown.
+
+#### `providers.hmac.passphrase`
+
+**Purpose**: Publisher passphrase used as HMAC key for EC ID generation, read when `provider = "hmac"`.
 
 **Security**:
 
-- Must be non-empty
+- At least 32 characters
 - Rotate periodically for security
 - Store securely (environment variable recommended)
 
@@ -438,6 +470,67 @@ openssl rand -hex 32
 **Validation**: Application startup fails if:
 
 - Empty string
+- Shorter than 32 characters
+
+## Device Configuration
+
+Selects how a request is classified into the coarse device signals the Edge Cookie bot gate uses, mirroring the Edge Cookie provider selection. These signals serve identifier gating and bot detection, not bid enrichment.
+
+### `[device]`
+
+| Field      | Type           | Required | Description                                                                                                                                                                         |
+| ---------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider` | String or null | No       | Key of the device-detection provider. Defaults to `builtin` (User-Agent only, no host-specific call). Set `fastly` to add the host's TLS (JA4) and HTTP/2 probabilistic identifiers |
+
+The default `builtin` provider classifies from the User-Agent alone and makes no host-specific call, so the default path stays host-neutral. Selecting an unknown provider key fails at startup.
+
+**Example**:
+
+```toml
+[device]
+provider = "builtin" # or "fastly" to add TLS and HTTP/2 evidence
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__DEVICE__PROVIDER=builtin
+```
+
+## Geo Configuration
+
+Selects how a client IP is resolved into geolocation (country, region, coordinates), mirroring the Edge Cookie provider selection. The resolved country also feeds the [permission model](/guide/permission-model).
+
+### `[geo]`
+
+| Field             | Type           | Required | Description                                                                                                                                                                                                                                               |
+| ----------------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`        | String or null | No       | Key of the geo provider. Omit to resolve no location and make no host geo call. Set `platform` to use the host's own geo lookup.                                                                                                                          |
+| `default_country` | String         | Yes      | Country (`US`) or country/region (`US/CA`) whose `permissions.yaml` rule applies when geo returns no country, or a country/region with no rule. Required, so there is always a default permission set and startup fails when unset. Validated at startup. |
+
+No provider is the default, so a default deployment is not tied to any host geo service. Selecting an unknown provider key fails at startup.
+
+**Example**:
+
+```toml
+[geo]
+provider = "platform"
+default_country = "US"
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__GEO__PROVIDER=platform
+```
+
+## Provider Permissions
+
+A provider advertises the technical permissions its data use requires, and Trusted Server runs the provider only when every required permission is set. This separates legal policy from the core, so the deployer brings the policy that decides how permissions are established. See the [Permission Model](/guide/permission-model) for the concept, the permission vocabulary, and how a request resolves.
+
+### Country and region rules (`permissions.yaml`)
+
+The country and region permission rules are defined in a human-editable `permissions.yaml` at the repository root, compiled into the build (not loaded at runtime). Edit that file and rebuild to change the policy. There is no `[permissions]` block in `trusted-server.toml`. It defines named **groups** (baselines such as `gdpr-eu`, `gdpr-uk`, `us-opt-out`) and **rules** that map a country or country/state to a group, with optional `+permission`/`-permission` tweaks. A request that matches no rule uses the required `[geo] default_country` set in `trusted-server.toml`. See the [Permission Model](/guide/permission-model) for the schema and the shipped defaults.
 
 ## Response Headers
 
@@ -1273,8 +1366,9 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `passphrase` ≥ 1 character
-- `passphrase` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
+- `provider`, when set, names a provider with a matching `[ec.providers.<key>]` block; an unknown or unconfigured selection fails at startup
+- `providers.hmac.passphrase` ≥ 32 characters
+- `providers.hmac.passphrase` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"`, case-insensitive)
 
 **Handler Validation**:
 
@@ -1331,7 +1425,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__EC__PASSPHRASE=$(cat /run/secrets/ec_secret)
+TRUSTED_SERVER__EC__PROVIDERS__HMAC__PASSPHRASE=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1385,7 +1479,7 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- `ec.passphrase` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `ec.providers.hmac.passphrase` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
 - Change to a secure random value (see generation commands above)

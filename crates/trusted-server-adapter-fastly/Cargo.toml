@@ -26,6 +26,8 @@ log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
+trusted-server-device-fastly = { workspace = true }
+trusted-server-geo-fastly = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 

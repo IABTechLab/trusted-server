@@ -1522,8 +1522,9 @@ impl PrebidAuctionProvider {
                     .map(|ac| ConsentedProvidersSettings {
                         consented_providers: Some(ac.clone()),
                     }),
-                // EIDs resolved from the KV identity graph and consent-gated
-                // in `handle_auction` via `gate_eids_by_consent`.
+                // EIDs resolved from the KV identity graph and gated on the
+                // resolved permission state in `handle_auction` via
+                // `gate_eids_by_permissions`.
                 eids: request.user.eids.clone(),
             }
             .to_ext(),
@@ -2487,7 +2488,13 @@ origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
+provider = "hmac"
+
+[ec.providers.hmac]
 passphrase = "test-secret-key-32-bytes-minimum"
+
+[geo]
+default_country = "FR"
 "#;
 
     /// Parse a TOML string containing only the `[integrations.prebid]` section
