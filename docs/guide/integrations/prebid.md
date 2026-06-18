@@ -35,6 +35,11 @@ client_side_bidders = ["rubicon"]
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
+# External bundle generation inputs used by `ts prebid bundle`.
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+user_id_modules = ["sharedIdSystem"]
+
 # Optional static per-bidder param overrides (shallow merge)
 [integrations.prebid.bid_param_overrides.criteo]
 networkId = 99999
@@ -71,6 +76,23 @@ set = { placementId = "_s2sHeaderPlacement" }
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                        |
 | `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)               |
 | `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                      |
+| `bundle.adapters`          | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                             |
+| `bundle.user_id_modules`   | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                       |
+
+## External Bundle Generation
+
+Use `ts prebid bundle` to build the publisher-specific browser bundle from
+`[integrations.prebid.bundle]` selections:
+
+```bash
+ts prebid bundle
+```
+
+The command writes generated artifacts to `dist/prebid/` by default and updates
+`external_bundle_sha256` and `external_bundle_sri` in `trusted-server.toml` from
+the generated manifest. Upload the generated JavaScript file manually and set
+`external_bundle_url` to the hosted HTTPS asset URL before running
+`ts config validate` or `ts config push`.
 
 ## Debug Mode
 

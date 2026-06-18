@@ -45,6 +45,10 @@ bidders = []
 debug = false
 client_side_bidders = []
 
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+# user_id_modules = ["sharedIdSystem"]
+
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]

@@ -47,13 +47,13 @@ origin so the integration preserves the current first-party deployment model.
 
 Current Prebid bundling path:
 
-1. `crates/js/lib/build-all.mjs` generates Prebid adapter and User ID module
+1. `crates/trusted-server-js/lib/build-all.mjs` generates Prebid adapter and User ID module
    imports.
-2. `crates/js/lib/src/integrations/prebid/index.ts` imports `prebid.js`, Prebid
+2. `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` imports `prebid.js`, Prebid
    modules, generated adapters, and generated User ID modules.
 3. Vite emits `tsjs-prebid.js`.
-4. `crates/js/build.rs` copies `tsjs-prebid.js` into Cargo `OUT_DIR`.
-5. `crates/js/src/bundle.rs` embeds it with generated `include_str!` metadata.
+4. `crates/trusted-server-js/build.rs` copies `tsjs-prebid.js` into Cargo `OUT_DIR`.
+5. `crates/trusted-server-js/src/bundle.rs` embeds it with generated `include_str!` metadata.
 6. `crates/trusted-server-core/src/integrations/prebid.rs` registers Prebid as a
    deferred JS module with `.with_deferred_js()`.
 7. `html_processor.rs` injects `/static/tsjs=tsjs-prebid.min.js` as a deferred
@@ -224,7 +224,7 @@ Publisher-existing Prebid mode is explicitly out of scope for Phase 1.
 Add a generation path outside the Cargo build, for example:
 
 ```bash
-node crates/js/lib/build-prebid-external.mjs \
+node crates/trusted-server-js/lib/build-prebid-external.mjs \
   --adapters exampleBidder,anotherExampleBidder \
   --user-id-modules sharedIdSystem,uid2IdSystem \
   --out dist/prebid/
