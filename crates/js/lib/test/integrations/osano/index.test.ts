@@ -20,6 +20,8 @@ type TestWindow = Window & {
 
 const MARKER_COOKIE = '_ts_consent_src';
 
+type UspCallback = (data?: { uspString?: string }, success?: boolean) => void;
+
 function clearAllCookies(): void {
   document.cookie.split(';').forEach((cookie) => {
     const name = cookie.split('=')[0].trim();
@@ -36,6 +38,14 @@ function setUspApi(uspString: string | undefined, success = true): void {
   (window as TestWindow).__uspapi = vi.fn((_command, _version, callback) => {
     callback(uspString === undefined ? {} : { uspString }, success);
   });
+}
+
+function setControlledUspApi(): UspCallback[] {
+  const callbacks: UspCallback[] = [];
+  (window as TestWindow).__uspapi = vi.fn((_command, _version, callback: UspCallback) => {
+    callbacks.push(callback);
+  });
+  return callbacks;
 }
 
 function setGppApi(
@@ -195,6 +205,31 @@ describe('integrations/osano consent mirror', () => {
     expect(getCookie(MARKER_COOKIE)).toBe('osano');
   });
 
+  it('does not let older overlapping mirror attempts overwrite newer consent', async () => {
+    const callbacks = setControlledUspApi();
+
+    const olderAttempt = mirrorOsanoConsent();
+    const newerAttempt = mirrorOsanoConsent();
+
+    const olderCallback = callbacks[0];
+    const newerCallback = callbacks[1];
+    if (!olderCallback || !newerCallback) {
+      throw new Error('should capture both USP API callbacks');
+    }
+
+    newerCallback({ uspString: '1YY-' }, true);
+
+    await expect(newerAttempt).resolves.toBe(true);
+    expect(getCookie('us_privacy')).toBe('1YY-');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+
+    olderCallback({ uspString: '1YN-' }, true);
+
+    await expect(olderAttempt).resolves.toBe(false);
+    expect(getCookie('us_privacy')).toBe('1YY-');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+  });
+
   it('preserves stale Osano-owned cookies until Osano is ready for clearing', async () => {
     vi.useFakeTimers();
     document.cookie = 'us_privacy=stale; path=/';
@@ -222,6 +257,40 @@ describe('integrations/osano consent mirror', () => {
     await vi.runOnlyPendingTimersAsync();
 
     expect(getCookie('us_privacy')).toBeUndefined();
+    expect(getCookie(MARKER_COOKIE)).toBeUndefined();
+  });
+
+  it('preserves stale Osano-owned GPP cookies until Osano is ready for clearing', async () => {
+    vi.useFakeTimers();
+    document.cookie = '__gpp=stale-gpp; path=/';
+    document.cookie = '__gpp_sid=7,8; path=/';
+    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
+    setOsanoStub();
+    setGppApi('', undefined);
+
+    initializeOsanoConsentMirror();
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(getCookie('__gpp')).toBe('stale-gpp');
+    expect(getCookie('__gpp_sid')).toBe('7,8');
+    expect(getCookie(MARKER_COOKIE)).toBe('osano');
+  });
+
+  it('clears stale Osano-owned GPP cookies when a ready API definitively has no value', async () => {
+    vi.useFakeTimers();
+    document.cookie = '__gpp=stale-gpp; path=/';
+    document.cookie = '__gpp_sid=7,8; path=/';
+    document.cookie = `${MARKER_COOKIE}=osano; path=/`;
+    const listeners = setOsanoStub();
+    setGppApi('', undefined);
+
+    initializeOsanoConsentMirror();
+    await vi.runOnlyPendingTimersAsync();
+    listeners['osano-cm-initialized']?.();
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(getCookie('__gpp')).toBeUndefined();
+    expect(getCookie('__gpp_sid')).toBeUndefined();
     expect(getCookie(MARKER_COOKIE)).toBeUndefined();
   });
 

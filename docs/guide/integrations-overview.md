@@ -10,6 +10,7 @@ Trusted Server provides built-in integrations with popular third-party services,
 | **Next.js**     | Script Rewriter  | None       | Rewrites Next.js data        | First-party Next.js routing | Production  |
 | **Permutive**   | Proxy + Rewriter | 6 routes   | Rewrites SDK URLs            | First-party audience data   | Production  |
 | **Sourcepoint** | Proxy + Rewriter | 2 routes   | Rewrites CMP asset URLs      | First-party CMP delivery    | Development |
+| **Osano**       | Browser Mirror   | None       | Consent cookie mirroring     | First-party consent signals | Development |
 | **Testlight**   | Proxy + Rewriter | 1 route    | Rewrites integration scripts | Testing/development         | Development |
 
 ## Integration Details
@@ -153,6 +154,35 @@ cache_ttl_seconds = 3600
 
 ---
 
+### Osano
+
+**What it does:** Mirrors Osano's browser IAB API consent signals into standard first-party consent cookies for later Trusted Server requests.
+
+**Key Features:**
+
+- Mirrors USP, GPP, and TCF consent signals
+- Writes `us_privacy`, `__gpp`, `__gpp_sid`, and `euconsent-v2`
+- Marks owned cookies with `_ts_consent_src=osano`
+- Preserves unmarked or foreign-owned consent cookies
+- Clears stale Osano-owned cookies only after Osano readiness
+
+**Configuration:**
+
+```toml
+[integrations.osano]
+enabled = true
+```
+
+**Endpoints:** None. Osano v1 only enables the browser consent mirror module.
+
+**Operational note:** Because mirroring runs in the browser after the page response starts, the first page request cannot include cookies written by the Osano mirror. Server-side consent behavior should rely on mirrored cookies from subsequent requests after Osano APIs are ready.
+
+**When to use:** You use Osano for consent management and want Osano's browser consent signals available to Trusted Server as standard first-party cookies.
+
+**Learn more:** [Osano Integration](./integrations/osano.md)
+
+---
+
 ### Testlight
 
 **What it does:** Testing/development integration for validating the integration system with OpenRTB-like auctions.
@@ -235,6 +265,10 @@ Do you use Permutive for audience data?
 Do you use Sourcepoint for consent management?
 ├─ Yes → Enable Sourcepoint integration
 └─ No → Skip Sourcepoint
+
+Do you use Osano for consent management?
+├─ Yes → Enable Osano integration
+└─ No → Skip Osano
 
 Are you developing/testing integrations?
 ├─ Yes → Enable Testlight integration

@@ -99,6 +99,7 @@ let osanoRetryCount = 0;
 let osanoReadyForClears = false;
 let osanoRetryTimer: number | undefined;
 let mirrorTimer: number | undefined;
+let mirrorGeneration = 0;
 let osanoEventHandlers: Map<string, (payload?: unknown) => void> | undefined;
 let focusHandler: (() => void) | undefined;
 let visibilityHandler: (() => void) | undefined;
@@ -183,12 +184,12 @@ function unavailableResult(): SignalResult {
   return { writes: [], clears: [], pending: false };
 }
 
-function emptyAfterOsanoReadyResult(cookieName: string): SignalResult {
+function emptyAfterOsanoReadyResult(cookieNames: string | string[]): SignalResult {
   if (!osanoReadyForClears) {
     return pendingResult();
   }
 
-  return signalResult([], [cookieName]);
+  return signalResult([], Array.isArray(cookieNames) ? cookieNames : [cookieNames]);
 }
 
 function finishOnce<T>(finish: (value: T) => void): (value: T) => void {
@@ -287,7 +288,7 @@ function readGppSignal(win: OsanoWindow): Promise<SignalResult> {
           return;
         }
 
-        done(signalResult([], [GPP_COOKIE_NAME, GPP_SID_COOKIE_NAME]));
+        done(emptyAfterOsanoReadyResult([GPP_COOKIE_NAME, GPP_SID_COOKIE_NAME]));
       });
     } catch (error) {
       log.debug('osano: __gpp ping failed', { error });
@@ -391,7 +392,13 @@ export async function mirrorOsanoConsent(): Promise<boolean> {
   const win = getWindow();
   if (!win) return false;
 
+  const generation = (mirrorGeneration += 1);
   const plan = await buildMirrorPlan(win);
+
+  if (generation !== mirrorGeneration) {
+    return false;
+  }
+
   return applyMirrorPlan(plan);
 }
 
@@ -496,6 +503,7 @@ export function resetOsanoConsentMirrorForTest(): void {
   osanoListenersInstalled = false;
   osanoRetryCount = 0;
   osanoReadyForClears = false;
+  mirrorGeneration = 0;
   osanoRetryTimer = undefined;
   mirrorTimer = undefined;
   osanoEventHandlers = undefined;

@@ -1137,18 +1137,17 @@ impl IntegrationRegistry {
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
     /// Always includes JS-only modules with no Rust-side registration.
-    /// Excludes integrations that have no JS module (e.g., "nextjs").
+    /// Includes enabled integrations only when the generated TSJS registry has a
+    /// corresponding browser module.
     #[must_use]
     pub fn js_module_ids(&self) -> Vec<&'static str> {
-        // Rust-only integrations with no corresponding JS module
-        const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
         // Core JS-only modules that do not have a Rust-side registration.
         const JS_ALWAYS: &[&str] = &["creative"];
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
         for id in &self.inner.enabled_integration_ids {
-            if !JS_EXCLUDED.contains(id) && !ids.contains(id) {
+            if trusted_server_js::module_bundle(id).is_some() && !ids.contains(id) {
                 ids.push(*id);
             }
         }
@@ -2008,6 +2007,31 @@ mod tests {
         assert!(
             deferred.contains(&"prebid"),
             "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_skip_enabled_integrations_without_generated_js_module() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("nextjs", &serde_json::json!({ "enabled": true }))
+            .expect("should insert nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let all = registry.js_module_ids();
+
+        assert!(
+            !all.contains(&"nextjs"),
+            "should not include enabled integrations without generated JS modules"
+        );
+
+        let metadata = registry.registered_integrations();
+        assert!(
+            metadata
+                .iter()
+                .any(|integration| integration.id == "nextjs"),
+            "should still register enabled Rust-only integrations"
         );
     }
 

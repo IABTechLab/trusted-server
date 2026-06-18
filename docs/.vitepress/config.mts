@@ -137,7 +137,10 @@ export default withMermaid(
             },
             {
               text: 'CMP',
-              items: [{ text: 'Didomi', link: '/guide/integrations/didomi' }],
+              items: [
+                { text: 'Didomi', link: '/guide/integrations/didomi' },
+                { text: 'Osano', link: '/guide/integrations/osano' },
+              ],
             },
             {
               text: 'Data',
