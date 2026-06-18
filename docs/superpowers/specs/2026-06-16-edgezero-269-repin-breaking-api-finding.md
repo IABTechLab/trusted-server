@@ -65,6 +65,15 @@
    convergence + typed config + entry-point) is a _separate, optional_ track —
    **not** forced by the repin (§11).
 
+8. **Superseded for Fastly by `feature/ts-cli-next` (§12).** Christian's "CLI"
+   branch already implements the end-to-end Fastly config-store migration — same
+   #269 pin, the `Body` fixes (graceful `ok_or_else`, not `.expect()`), the store
+   ids, the `config_payload` flatten/hash contract, **and runtime
+   Settings-from-store load** (`get_settings_from_services`). So our minimal-repin
+   (#771) is largely redundant for Fastly. **Revised: build on his branch**; our
+   real HTTP-layer deliverable is the **runtime-config-store spec** his CLI doc
+   references but never wrote. See §12.
+
 ---
 
 ## 1. What trusted-server actually consumes from edgezero
@@ -86,6 +95,10 @@ of `edgezero-core` plus one type from `edgezero-adapter-fastly`.
 `ProxyClient`/edgezero `proxy`, typed `AppConfig`, manifest `[stores.*]` /
 `[adapters.*]` tables. trusted-server's manifest is `trusted-server.toml` (a
 bespoke `Settings` struct in `settings.rs`), **not** an edgezero `edgezero.toml`.
+(Baseline as of the current pin / pre-`ts-cli-next`. Christian's branch adds an
+`edgezero.toml` and deletes `trusted-server.toml` — but still reads config through
+the **bespoke `PlatformConfigStore`**, not edgezero's first-class store/extractor,
+so this "uses none of …" list stays true even there. See §12.)
 
 ---
 
@@ -157,11 +170,30 @@ not `Body`; confirmed by source):
 `sourcepoint.rs:571` / `datadome.rs:323` (`rewrite_script_content() -> String`),
 `sourcepoint.rs:822` (`FromUtf8Error::into_bytes`).
 
-### Fix — three distinct shapes
+### Fix — style (updated per `feature/ts-cli-next`)
 
-All sinks are buffered (`Once`) bodies, so use an explicit `.expect()` with a
-`should`-style message (per CLAUDE.md), **not** `unwrap_or_default()`. If a future
-sink is genuinely streaming, branch on `None` / use `into_stream()`.
+> **Revised guidance.** Christian's branch already fixed these sinks and chose
+> **`into_bytes().ok_or_else(|| <error>)?`** (graceful error, no panic) for
+> production request/response handlers, `unwrap_or_default()` for
+> compression/test paths, and reserved `.expect()` for genuinely-unreachable
+> spots. That is **better than a blanket `.expect()`** — a streaming/empty body
+> must not panic the worker. **Adopt his approach:** propagate an error at
+> production handler sinks; only `.expect("should …")` where a buffered body is
+> truly invariant (and never `unwrap_or_default()` where an empty body would
+> silently corrupt behavior). Align with his exact per-sink choices when we
+> converge (§12).
+
+For a production handler sink, prefer (error variant illustrative — match the
+existing one at each call site, not necessarily `BadRequest`):
+
+```rust
+let bytes = req.into_body().into_bytes().ok_or_else(|| {
+    Report::new(TrustedServerError::BadRequest { message: "request body should be buffered".into() })
+})?;
+```
+
+The three mechanical shapes below still apply (substitute `ok_or_else(…)?` for
+`.expect(…)` at production sinks):
 
 ```rust
 // Shape A — value consumed directly (e.g. proxy.rs:38, publisher.rs:46)
@@ -468,9 +500,22 @@ shift per layer.
 
 **Still open:**
 
-1. Typed-config struct + `[stores.config]` id: the shared HTTP/CLI contract —
-   agree with Christian before either port lands (roadmap, not repin).
-2. wasm32-wasip1 + clippy + test legs of the verification gate (§10 covered host
+1. **Convergence with `feature/ts-cli-next` (§12).** Christian's branch already
+   implements the end-to-end Fastly config-store migration (repin + Body fix +
+   runtime Settings-from-store), so our minimal-repin (#771) is largely subsumed
+   for Fastly. Decide: rebase our HTTP work onto his config system vs keep the
+   PR14-stack repin. **Recommend: build on his.**
+2. **Body-fix style conflict** — his `ok_or_else` (graceful) vs our former
+   `.expect()`. Resolved in §2 (adopt his); confirm per-sink alignment on merge.
+3. **Secret-write conflict** — he punts secret-store writes (key rotation) until
+   edgezero exposes write primitives; our original migration design kept
+   write-CRUD in TS. Decide which holds.
+4. **Shared config contract — now CONCRETE, not "to agree":** store ids
+   `app_config` / `secrets` / `ec_identity_store` (his `edgezero.toml`) and the
+   `config_payload` flatten/hash rules (his core module). The remaining gap is
+   the **runtime-config-store spec** his doc references but never wrote — that is
+   our HTTP-layer deliverable (§12).
+5. wasm32-wasip1 + clippy + test legs of the verification gate (§10 covered host
    build only).
 
 ---
@@ -555,3 +600,82 @@ gets the same build signal without disturbing any open review.
 Conflicts will cluster in the files every layer rewrites — `publisher.rs`,
 `proxy.rs`, `request_signing/endpoints.rs`, `auction/endpoints.rs`. Run the §10
 gate (host + wasm + clippy + test) **per branch as the pin advances**, not once.
+
+---
+
+## 12. Convergence with `feature/ts-cli-next` (Christian's branch)
+
+Inspected 2026-06-18. The "CLI" branch is **not just CLI** — it is an
+**end-to-end config-store migration for the Fastly adapter**, off `main`, pinned
+to the **same #269 HEAD** (`2eeccc9`) we used. It already carries the repin, the
+`Body` fixes, the CLI crate, _and_ runtime Settings-loading from the config store.
+This materially changes our plan.
+
+### 12.1 What it already implements (overlaps our work)
+
+| Area                  | His branch                                                                                                                                   | Effect on us                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| #269 repin            | deps pinned `2eeccc9`                                                                                                                        | our repin (#771) duplicated for Fastly                       |
+| `Body` sink fixes     | `into_bytes().ok_or_else(…)?` (prod), `unwrap_or_default()` (compress/test)                                                                  | supersedes our `.expect()` style (§2)                        |
+| Store ids             | `edgezero.toml`: config `app_config`, secrets `secrets`, kv `ec_identity_store`                                                              | the shared seam, concrete                                    |
+| Config contract       | `trusted-server-core/src/config_payload.rs` — flatten all of `Settings` → entries + `sha256` (`ts-config-hash`/`ts-config-keys`), reversible | shared core module; CLI pushes, runtime reads                |
+| **Runtime load**      | adapter `main.rs`: `build_runtime_services()` → `get_settings_from_services()` reads `app_config`, rebuilds `Settings`                       | **this is the HTTP-layer pattern, already wired for Fastly** |
+| `trusted-server.toml` | **deleted**; replaced by `trusted-server.example.toml`                                                                                       | config now lives in the store, seeded via `ts config push`   |
+
+### 12.2 The HTTP-layer pattern, demonstrated
+
+`crates/trusted-server-adapter-fastly/src/main.rs` (his branch):
+
+```rust
+let runtime_services = build_runtime_services(&req, kv_store); // config store available first
+let settings = match get_settings_from_services(&runtime_services) { … }; // load Settings FROM store
+```
+
+`get_settings_from_services` → resolves the store name via
+`env_config.store_name("config", DEFAULT_CONFIG_STORE_ID)` (`= "app_config"`) →
+reads `ts-config-keys` / `ts-config-hash` / each entry →
+`settings_from_config_entries` (verifies hash) → `Settings`. **That entry-point
+sequence is exactly what "our HTTP layer" was meant to build.**
+
+**Crucial: he reads through the bespoke `PlatformConfigStore`, not edgezero's
+store surface.** `services.config_store()` returns `&dyn PlatformConfigStore`
+(impl `FastlyPlatformConfigStore`); he uses **none** of edgezero's #269
+`ConfigStore`/`StoreRegistry`/`Config` extractor/`RequestContext` (grep-confirmed:
+zero in his `main.rs`/`settings_data.rs`). So he converged the config **source**
+(toml → store) while **keeping `RuntimeServices` + the `platform/` layer** — i.e.
+he took our §6 **hybrid** path, not full edgezero adoption. This also keeps §1's
+"uses none of …" list accurate on his branch, and validates that our HTTP layer
+should bind the store via `PlatformConfigStore`, not edgezero's extractor.
+
+### 12.3 Runtime contract (new, important)
+
+A **missing key is a hard error** — there is **no `trusted-server.toml`
+fallback** anymore. The settings-error arm in `main.rs` **does serve a response**
+(`to_error_response(&e).send_to_client(); return;`) — so an unseeded store yields
+a **generic 500 on every route** (not a silent no-response), and that 500 is
+**indistinguishable from a real config bug**. Net: the worker **cannot serve real
+routes until the store is seeded** (`ts config push`). This is a new
+deploy-ordering requirement (seed-before-serve) and an operational risk — the HTTP
+layer should make the unseeded case **actionable** (clear message) and **correctly
+classified** (retryable 503, not 500). See the plan's Phase 2.
+
+### 12.4 Conflicts to resolve (see §9)
+
+1. **Body-fix style** — adopt his `ok_or_else` (done in §2); align per-sink.
+2. **Secret writes** — he punts key-rotation secret writes until edgezero adds
+   write primitives; our original migration design kept write-CRUD in TS. Decide.
+3. **Base branch** — his off `main`; ours off the PR14 stack. His already carries
+   repin+Body, so for Fastly our minimal-repin is redundant.
+4. **Whole-`Settings` vs two-tier** — he flattens _all_ of `Settings` into the
+   store (not our two-tier small `AppConfig`). One source of truth; bigger blast.
+
+### 12.5 Revised recommendation
+
+- **Build on his branch, don't run a parallel repin.** Our #771 minimal-repin is
+  superseded for Fastly; keep it only as the verified breaking-API reference.
+- **Our HTTP-layer deliverable = the "runtime-config-store spec" his CLI doc
+  references but never wrote** — document `get_settings_from_services`, the
+  flatten/reconstruct rules (shared `config_payload`), the seed-before-serve
+  contract, empty/malformed-store behavior, and non-Fastly adapter wiring.
+- **Keep our compiler-verified `Body` enumeration (§2/§10)** as the authoritative
+  sink reference when merging his ad-hoc fixes up the stack.

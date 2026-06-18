@@ -1,427 +1,267 @@
-# EdgeZero #269 Repin Implementation Plan
+# EdgeZero #269 HTTP-Layer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Repin trusted-server's edgezero dependency from its current pin (`38198f9` on the PR14 base; `170b74b` is the stack's _original_ PR1–13 pin) to post-#269 and fix the only forced code break (`Body::into_bytes` → `Option`), keeping the bespoke `platform/` layer unchanged.
+**Goal:** Land the HTTP-layer (runtime) half of adopting edgezero `stackpop/edgezero#269` in trusted-server — by **converging onto Christian's `feature/ts-cli-next`** (which already carries the repin, the `Body` fixes, and runtime Settings-from-config-store for Fastly), then closing the runtime gaps it leaves: seed-before-serve safety, secrets/KV runtime wiring, non-Fastly adapters, and the missing runtime-config-store spec.
 
-**Architecture:** Mechanical dependency bump on a dedicated branch off `feature/edgezero-pr14-entry-point-dual-path` (never in-place on a reviewed PR), then propagate up the stack by merge. The "test" for this work is the compiler + full CI gate: RED = build errors at `Body` sinks, GREEN = full gate passes. No new abstractions; the A/B/C convergence (store registry, typed `AppConfig`, entry-point) is **out of scope** — separate follow-on plans.
+**Architecture:** trusted-server keeps its bespoke `platform/` layer (`RuntimeServices` + `PlatformConfigStore`/`SecretStore`/`KvStore`). #269's only forced code break is `Body::into_bytes() → Option` (18 sinks — Appendix A). Christian's branch already fixes those and wires `get_settings_from_services()` to rebuild `Settings` from the `app_config` config store via the shared `config_payload` flatten/hash contract. Our work is the **runtime-side hardening + spec**, not a parallel repin.
 
-**Tech Stack:** Rust 2024, cargo, `wasm32-wasip1` (Fastly via Viceroy), edgezero git dep, `error-stack`.
+**Tech Stack:** Rust 2024, cargo, `wasm32-wasip1` (Fastly via Viceroy), edgezero git dep (`2eeccc9`, #269 HEAD), `error-stack`.
 
-**Source spec:** [2026-06-16-edgezero-269-repin-breaking-api-finding.md](../specs/2026-06-16-edgezero-269-repin-breaking-api-finding.md) — §2 (sink list), §5 (steps), §8 (gate), §11 (stack/merge-up).
+**Source spec:** [2026-06-16-edgezero-269-repin-breaking-api-finding.md](../specs/2026-06-16-edgezero-269-repin-breaking-api-finding.md) — esp. **§12** (convergence), §2 (sinks), §9 (decisions).
+
+---
+
+## Strategy change (why this plan was rewritten)
+
+The prior version of this plan was a standalone minimal-repin off PR14. Investigation of `feature/ts-cli-next` (2026-06-18, spec §12) showed that branch is **not just CLI** — it already implements the end-to-end Fastly config-store migration: same #269 pin, the `Body` fixes, store ids, the `config_payload` contract, **and** runtime `Settings`-from-store load. So a separate Fastly repin is **redundant**. This plan now **builds on his branch** and focuses on the runtime gaps. The verified `Body`-sink enumeration is preserved as Appendix A (still the authoritative sink reference when his ad-hoc fixes merge up the stack).
+
+---
+
+## Open decisions — resolve at Phase 0 before coding
+
+| #   | Decision                                                                                           | Recommendation                                                            |
+| --- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| D1  | Build on `feature/ts-cli-next` vs keep the PR14-stack minimal-repin                                | **Build on his** (his is end-to-end for Fastly; ours duplicates it)       |
+| D2  | Whole-`Settings` → store (his) vs two-tier small `AppConfig` (our spec §6)                         | **Adopt his whole-`Settings`** (one source of truth; already implemented) |
+| D3  | `Body` fix style                                                                                   | **His `ok_or_else` (graceful)** over `.expect()` (spec §2)                |
+| D4  | Empty/unseeded store behavior                                                                      | **Decide explicitly** (Phase 2) — today it's a hard fail / outage         |
+| D5  | CLI-driven secret push (he punts) vs runtime secret writes (already exist via `management_api.rs`) | Keep runtime rotation; treat CLI secret-push as a later follow-up         |
+| D6  | Branch/merge topology — his branch is off `main`, the stack is PR14→PR20                           | Phase 5 — confirm with team                                               |
+
+Do **not** start Phase 1 until **D1–D3** are confirmed (they set the base branch
+and code style). **D4–D6 are sequenced, not skipped:** D4 (empty-store response)
+is resolved in Phase 2 Step 5, D5 (secret-write boundary) in Phase 3 Step 2, D6
+(branch topology) in Phase 5 Step 1.
 
 ---
 
 ## Scope & non-goals
 
-**In scope:** repin the 4 `edgezero-*` deps; fix the 18 `Body::into_bytes` sinks (8 production + 10 test); reconcile the integration-tests lockfile; drop the two never-compiled adapter deps; pass the full gate; merge up PR14→PR20.
+**In scope:** converge onto his branch; verify the repin + `Body` fixes are complete against Appendix A; run the full gate (host, **wasm32-wasip1**, **`--all-targets`**, clippy, test) + integration-tests lockfile; harden runtime config-store loading (empty/malformed-store, seed-before-serve); confirm secrets/`ec_identity_store` KV runtime wiring; write the runtime-config-store spec; merge up the stack.
 
-**Out of scope (separate plans):** store convergence onto edgezero `ConfigStore`/`SecretStore`/`StoreRegistry` (spec §6 B); typed `AppConfig` two-tier config (§6 C / Christian's CLI port); entry-point `run_app`/`app!` adoption (§6 C). Do **not** start these here.
-
-**Key constraints:**
-
-- `as_bytes` changed but has **no** trusted-server sink — only `into_bytes` needs edits (spec §2).
-- All sinks are buffered (`Once`) bodies → fix with `.expect("should …")`, never `unwrap_or_default()`.
-- Line numbers below are **PR14-base**; they shift per branch. **Re-derive the exact sink set from the compiler on each branch** — do not trust hardcoded lines after PR14.
-- Pin to the #269 HEAD sha while #269 is open; **re-pin to edgezero `main` after #269 merges**.
+**Out of scope (separate plans):** the CLI crate itself (`ts config`/`audit` — Christian); CLI-driven secret push; full edgezero `run_app`/`app!`/extractor adoption (he kept the bespoke layer, so do we); non-Fastly adapter _feature_ parity beyond making them build.
 
 ---
 
-## File structure
+## File structure (what we touch / extend, on his branch)
 
-| File                                                          | Change                                               | Responsibility              |
-| ------------------------------------------------------------- | ---------------------------------------------------- | --------------------------- |
-| `Cargo.toml`                                                  | Modify lines 59–62                                   | The 4 `edgezero-*` git pins |
-| `Cargo.lock`                                                  | Regenerated                                          | Root lock                   |
-| `crates/integration-tests/Cargo.lock`                         | Reconcile                                            | Shared-dep lock (CI gate)   |
-| `crates/trusted-server-core/src/proxy.rs`                     | 5 sinks (38, 1550, 1665 prod; 2034, 2795, 2851 test) | proxy/asset body reads      |
-| `crates/trusted-server-core/src/publisher.rs`                 | 4 sinks (46 prod; 748, 1079, 1562 test)              | publisher body reads        |
-| `crates/trusted-server-core/src/auction/endpoints.rs`         | 1 sink (81 prod)                                     | auction body read           |
-| `crates/trusted-server-core/src/auction/formats.rs`           | 1 sink (444 test)                                    | auction test helper         |
-| `crates/trusted-server-core/src/request_signing/endpoints.rs` | 4 sinks (103, 246, 365 prod; 464 test)               | signing endpoint body reads |
-| `crates/trusted-server-core/src/integrations/prebid.rs`       | 1 sink (2067 test)                                   | prebid test                 |
-| `crates/trusted-server-core/src/integrations/testlight.rs`    | 1 sink (461 test)                                    | testlight test              |
-
-`http_util.rs:456` (`enforce_max_body_size(bytes: &[u8], …)`) is **not** a sink — no edit.
+| File                                                                                                                                                    | Role                                                      | Our action                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------- |
+| `Cargo.toml` / `Cargo.lock`                                                                                                                             | edgezero pinned `2eeccc9`                                 | verify; re-pin to `main` post-merge (Phase 5) |
+| `crates/trusted-server-core/src/config_payload.rs`                                                                                                      | flatten/hash contract (shared seam)                       | **read-only reference** — do not fork         |
+| `crates/trusted-server-core/src/settings_data.rs`                                                                                                       | `get_settings_from_services` runtime load                 | **harden** empty/malformed behavior (Phase 2) |
+| `crates/trusted-server-adapter-fastly/src/main.rs`                                                                                                      | entry point: build services → load settings               | **harden** the settings-error path (Phase 2)  |
+| `edgezero.toml`                                                                                                                                         | store ids: `app_config` / `secrets` / `ec_identity_store` | verify; reference in the spec                 |
+| `crates/trusted-server-core/src/{proxy,publisher,auction/endpoints,auction/formats,request_signing/endpoints}.rs`, `integrations/{prebid,testlight}.rs` | `Body` sinks                                              | **verify** all 18 covered (Appendix A)        |
+| `crates/trusted-server-adapter-{cloudflare,spin}`                                                                                                       | stubs, untouched by him                                   | **make build** under #269 (Phase 3)           |
+| `docs/superpowers/specs/<new>-runtime-config-store.md`                                                                                                  | the missing spec                                          | **create** (Phase 4)                          |
 
 ---
 
-## Fix shapes (apply the matching one at each sink)
+## Phase 0: Convergence decision + adopt the base
 
-```rust
-// Shape A — value consumed directly (body_as_reader; let body = …into_bytes())
-let body = resp.into_body().into_bytes()
-    .expect("should have a buffered body");
+- [ ] **Step 1: Confirm D1–D3** with the team (record in the spec §9). If D1 = "build on his," proceed; if "keep PR14-stack," fall back to Appendix B (the minimal-repin tasks).
 
-// Shape B — chained .to_vec()  (String::from_utf8(…into_bytes().to_vec()))
-String::from_utf8(
-    resp.into_body().into_bytes()
-        .expect("should have a buffered body")
-        .to_vec(),
-)
-
-// Shape C — bound, then borrowed into &[u8]/&Bytes  (enforce_max_body_size(&b)/from_slice(&b))
-let b = req.into_body().into_bytes()
-    .expect("should have a buffered request body");
-enforce_max_body_size(&b, …)?;
-serde_json::from_slice(&b)?;
-```
-
-`cargo fmt` will rewrap; write the one-liner and let it format.
-
----
-
-## Task 0: Create the dedicated branch off PR14
-
-**Files:** none (git only)
-
-- [ ] **Step 1: Branch off PR14 (not in-place, not main)**
+- [ ] **Step 2: Create the HTTP-layer branch off his branch**
 
 ```bash
 git fetch origin
-git checkout -b feature/edgezero-269-repin feature/edgezero-pr14-entry-point-dual-path
+# Record the exact SHA — his branch is an unmerged WIP and may force-push/rebase.
+git rev-parse origin/feature/ts-cli-next   # note this; if he rebases, re-base from the new SHA + coordinate
+git checkout -b feature/edgezero-269-http origin/feature/ts-cli-next
 ```
 
-- [ ] **Step 2: Confirm base + capture the authoritative "from" pin**
+- [ ] **Step 3: Baseline build (inherit his state)**
 
-Run: `git log -1 --format='%s' && grep -m1 'edgezero-core' Cargo.toml`
-Expected: PR14 tip; the dep line prints the **base pin = `rev = "38198f9…"`**.
-
-> Pin clarity: the Goal's `170b74b` is the _stack's original_ pin (PR1–13), **not
-> this branch's base.** PR14's base is `38198f9` (spec §11). The **only**
-> authoritative "from" value is whatever this grep prints — use that, not a
-> hardcoded sha, if the branch has advanced.
+Run: `cargo build --workspace --all-targets 2>/tmp/ez_base.log; echo "exit=$?"`
+Expected: **green** (his branch should already compile). If red, capture and triage before any new work.
 
 ---
 
-## Task 1: Repin edgezero to #269 + regenerate root lock
+## Phase 1: Verify the inherited repin + `Body` fixes
 
-**Files:** Modify `Cargo.toml:59-62`, regenerate `Cargo.lock`
+His `Body` fixes were ad-hoc (driven by his build), not enumerated. Verify completeness against Appendix A, and run the **full** gate (he is unlikely to have run wasm + `--all-targets` + clippy on every leg).
 
-- [ ] **Step 1: Repin all 4 deps**
+- [ ] **Step 1: Enumerate the sinks (locate, don't "prove")**
 
-Replace the base pin captured in Task 0 Step 2 (`rev = "38198f9…"` on the 4
-`edgezero-*` lines) with `rev = "2eeccc9748daba92b9adf6afe4df105e79269ae9"`
-(#269 HEAD). (After #269 merges, use the edgezero `main` sha instead — see spec §9.)
+Run: `git grep -nE 'into_bytes\(\)' crates/trusted-server-core/src -- 'proxy.rs' 'publisher.rs' 'auction/endpoints.rs' 'auction/formats.rs' 'request_signing/endpoints.rs' 'integrations/prebid.rs' 'integrations/testlight.rs'`
+Expect **18 sites** (8 prod + 10 test). Eyeball each has an `Option` handler
+(`.ok_or_else`/`.expect`/`.unwrap_or_default`). **Note: grep cannot prove
+correctness** — a fixed Shape-C `let b = …into_bytes().ok_or_else(…)?;` and a
+broken bare `.into_bytes()` both contain `.into_bytes()`. This step is enumeration
+only; the **authoritative completeness proof is Step 2's green `--all-targets` +
+`cargo test`.** Appendix A line numbers are **PR14-base and do NOT apply** to this
+`main`-based branch — trust the grep _count_ (18), not the numbers.
 
-- [ ] **Step 2: Resolve the lock FIRST — separate resolution failure from compile-RED**
-
-Run: `cargo generate-lockfile`
-Expected: lock resolves with no error. **If this fails** (MSRV / feature
-unification / `spin-sdk` graph — the spec's #1 transitive risk, §5.1/§10), STOP
-and surface it: that is a _resolution_ break, not the expected `Body` compile-RED,
-and must be triaged before continuing.
-
-- [ ] **Step 3: Capture the RED baseline (build only after the lock resolves)**
-
-Run: `cargo build --workspace --all-targets 2>/tmp/ez_red.log; grep -cE '^error' /tmp/ez_red.log`
-Expected: ~27 errors (`E0308`/`E0599`/`E0624`). This is the RED state. (Log goes to
-`/tmp` — keep build artifacts out of the repo tree.)
-
-- [ ] **Step 4: Sanity — every error is at a known `Body` sink file, nothing else**
-
-Filter by **location**, not error-kind (an unexpected break could share a kind):
-
-Run:
+- [ ] **Step 2: Full gate (the legs he likely skipped)**
 
 ```bash
-grep -A1 '^error' /tmp/ez_red.log | grep -- '-->' \
-  | grep -vE 'trusted-server-core/src/(proxy|publisher|auction/(endpoints|formats)|request_signing/endpoints|integrations/(prebid|testlight)|http_util)\.rs' \
-  && echo "UNEXPECTED — stop & investigate" || echo OK
+cargo build --workspace --all-targets
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
 ```
 
-Expected: `OK` (every error points into a known sink file from §2). Any other
-location ⇒ unexpected transitive break; STOP and surface it (spec §5).
+Expected: all green. Any failure here is the real signal — fix before Phase 2.
 
-- [ ] **Step 5: Commit the repin (still RED — that's expected)**
+- [ ] **Step 3: integration-tests lockfile**
+
+`crates/integration-tests` is a separate workspace that path-deps `trusted-server-core`.
+Run: `( cd crates/integration-tests && cargo build --workspace )` first (don't
+`generate-lockfile` — that can re-resolve and _cause_ drift). Only if it fails on
+shared-dep mismatch: `cargo update -p <crate> --precise <root-version>` (never
+blanket). Repeat for `crates/openrtb-codegen` if it drifts.
+
+- [ ] **Step 4: Commit any gate fixups**
 
 ```bash
-git add Cargo.toml Cargo.lock
-git commit -m "Repin edgezero to the extensible-cli branch (stackpop/edgezero PR 269)"
+git add crates Cargo.toml Cargo.lock && git commit -m "Complete Body sink coverage and pass full gate on #269" || echo "nothing to commit"
 ```
 
 ---
 
-## Task 2: Fix production sinks — `proxy.rs`
+## Phase 2: Runtime config-store hardening (the core HTTP-layer deliverable)
 
-**Files:** Modify `crates/trusted-server-core/src/proxy.rs` (sinks 38, 1550, 1665)
+**Problem (verified against his `main.rs`):** `get_settings_from_services` →
+`get_settings_from_config_store` reads `ts-config-keys` first; on an
+**empty/unseeded store** `read_config_entry`'s `?` propagates a `Configuration`
+error. His settings-error arm **does serve a response** —
+`to_error_response(&e).send_to_client(); return;` (not a bare return, not an
+opaque default; `fn main()` returns `()` and serves explicitly). So the issue is
+**not** "no response" — it is that **every route returns a generic error** until
+the store is seeded, and the error is **indistinguishable from a real config
+bug**. Fresh deploy before `ts config push` = **total outage with an opaque 500**.
+The gap our layer owns: make the unseeded case **actionable** (clear message) and
+**correctly classified** (retryable 503, not 500).
 
-- [ ] **Step 1: Confirm current errors (RED)**
+> **Call chain (read first):** `get_settings_from_services(&runtime_services)` →
+> `get_settings_from_config_store(&dyn PlatformConfigStore, &StoreName)` →
+> `read_config_entry` (per key) → `settings_from_config_entries` (hash verify).
+> The in-memory `PlatformConfigStore` fake **already exists** as
+> `MemoryConfigStore` in `settings_data.rs` tests (around line 84) — reuse it; do
+> not write a new one. Confirm the exact constructor (`MemoryConfigStore { entries }`
+> vs `::new(...)`) before writing the test below.
 
-Run: `cargo check --workspace 2>&1 | grep 'proxy.rs'`
-Expected: errors **within `proxy.rs`** (exact line numbers vary per branch — re-derive
-from this output; do not trust the §2 PR14 numbers after PR14). Expect a `body_as_reader`
-`Cursor::new(body.into_bytes())` site plus two POST-body `let body_bytes = req.into_body().into_bytes();` sites.
+- [ ] **Step 1: Write a failing test — empty store yields an actionable, typed error (not a generic read failure)**
 
-- [ ] **Step 2: Fix `body_as_reader` (Shape A)**
-
-`Cursor::new(body.into_bytes())` → `Cursor::new(body.into_bytes().expect("should have a buffered body"))`
-
-- [ ] **Step 3: Fix the two POST-body bindings (Shape C)**
-
-`let body_bytes = req.into_body().into_bytes();` →
-`let body_bytes = req.into_body().into_bytes().expect("should have a buffered request body");`
-
-> `replace_all` only if the two lines are byte-identical (same indentation). **Read
-> each site first**; if the replace count ≠ 2, fall back to per-site edits. Both are
-> production code (not test).
-
-- [ ] **Step 4: Verify proxy.rs errors cleared**
-
-Run: `cargo check --workspace 2>&1 | grep -c 'proxy.rs' ; echo done`
-Expected: `0` proxy.rs errors (other files may still error — fine).
-
----
-
-## Task 3: Fix production sinks — `publisher.rs` + `auction/endpoints.rs`
-
-**Files:** Modify `publisher.rs` (line 46), `auction/endpoints.rs` (line 81)
-
-- [ ] **Step 1: Fix `publisher.rs:46` `body_as_reader` (Shape A)**
-
-`std::io::Cursor::new(body.into_bytes())` → `std::io::Cursor::new(body.into_bytes().expect("should have a buffered body"))`
-
-- [ ] **Step 2: Fix `auction/endpoints.rs:81` (Shape C)**
-
-`let body_bytes = body.into_bytes();` → `let body_bytes = body.into_bytes().expect("should have a buffered request body");`
-
-- [ ] **Step 3: Verify both cleared**
-
-Run: `cargo check --workspace 2>&1 | grep -cE 'publisher.rs|auction/endpoints.rs'`
-Expected: `0`.
-
----
-
-## Task 4: Fix production sinks — `request_signing/endpoints.rs`
-
-**Files:** Modify `request_signing/endpoints.rs` (lines 103, 246, 365)
-
-- [ ] **Step 1: Fix all three `req.into_body()` bindings (Shape C)**
-
-`replace_all` of `    let body = req.into_body().into_bytes();` →
+In `settings_data.rs` tests (reuse `MemoryConfigStore`):
 
 ```rust
-    let body = req
-        .into_body()
-        .into_bytes()
-        .expect("should have a buffered request body");
+#[test]
+fn empty_config_store_reports_unseeded_not_generic_failure() {
+    let store = MemoryConfigStore::new(BTreeMap::new()); // no ts-config-keys
+    let err = get_settings_from_config_store(&store, &StoreName::from("app_config"))
+        .expect_err("empty store should error");
+    // assert it carries an actionable "config store not seeded — run `ts config push`" context
+    assert!(format!("{err:?}").contains("not seeded") || format!("{err:?}").contains("ts config push"));
+}
 ```
 
-> Expect 3 identical occurrences, all production. **Read the sites first**; if the
-> replace count ≠ 3 (indentation differs), fall back to per-site edits. The
-> `json_response(body: String)` site (`String::into_bytes`) is a false positive —
-> **do not touch** (verify by checking the receiver is `String`, not `Body`).
+- [ ] **Step 2: Run it — verify it fails** (`cargo test -p trusted-server-core empty_config_store -- --nocapture`). Expected: FAIL (current error message is generic "failed to read … key `ts-config-keys`").
 
-- [ ] **Step 2: Verify lib/bin build is GREEN**
+- [ ] **Step 3: Implement — distinguish "unseeded" from "read error"**
 
-Run: `cargo build --workspace`
-Expected: **success** (all 8 production sinks fixed). Tests still red — next.
+In `read_config_entry` / `get_settings_from_config_store`, when the **metadata** key (`ts-config-keys`) is absent, attach an actionable context (e.g. `TrustedServerError::Configuration` with `"config store `{store}`is not seeded — run`ts config push --adapter fastly`"`). Keep transport/read failures distinct.
 
-- [ ] **Step 3: Commit production fixes**
+- [ ] **Step 4: Run the test — verify it passes.**
+
+- [ ] **Step 5: Decide + implement the adapter response (D4)**
+
+His settings-error arm already serves via `to_error_response(&e).send_to_client(); return;`.
+Two options — **decide D4 here:**
+(a) keep the arm, but have `to_error_response` map the new "unseeded" error context
+to **503** (retryable) instead of 500; or
+(b) special-case the unseeded error in `main.rs` before `to_error_response`:
+`FastlyResponse::from_status(503).with_body_text_plain("config not provisioned — run `ts config push`").send_to_client(); return;`
+(matches the existing `from_status(...).with_body_text_plain(...).send_to_client()`
+idiom at `main.rs:119–121`). Add an adapter test asserting **503 + body** for the
+unseeded case. This turns an opaque 500 into an observable, actionable signal —
+and keeps real config bugs as 500.
+
+- [ ] **Step 6: Malformed-store test** — seed a `ts-config-hash` that doesn't match the entries; assert `settings_from_config_entries` errors on hash mismatch (his code already verifies; add the test if absent so the contract is locked).
+
+- [ ] **Step 7: Confirm secrets + KV runtime wiring**
+  - `secrets` store: request-signing reads signing keys via `PlatformSecretStore` (pre-existing `management_api.rs` provides write CRUD). Add/confirm a test that a missing signing secret degrades to a clear error, not a panic.
+  - `ec_identity_store` KV: `main.rs` starts `UnavailableKvStore` and EC routes lazily bind the configured store. Confirm a non-EC route still serves when EC KV is unavailable (existing behavior — add a regression test if missing).
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/trusted-server-core/src
-git commit -m "Adapt Body::into_bytes Option return at production sinks"
+git add crates && git commit -m "Harden runtime config-store load: actionable unseeded error and 503 response"
 ```
 
 ---
 
-## Task 5: Fix test sinks
+## Phase 3: Adapter + build-surface gaps
 
-**Files:** Modify `proxy.rs` (2034, 2795, 2851), `publisher.rs` (748, 1079, 1562), `auction/formats.rs` (444), `request_signing/endpoints.rs` (464), `integrations/prebid.rs` (2067), `integrations/testlight.rs` (461)
+- [ ] **Step 1: Make non-Fastly adapters build under #269**
 
-- [ ] **Step 1: Confirm test errors (RED)**
+First confirm what "builds" means for these stubs — spec §1 notes
+cloudflare/axum are **absent from the dependency graph** (not currently compiled).
+If the crate has no real wasm entry, "builds" = `cargo check -p trusted-server-adapter-cloudflare`
+on host; only use `--target wasm32-unknown-unknown` (install the target first) if
+it has a genuine worker entry point. Same judgment for spin.
+If they break on `Body`/edgezero churn, apply the Appendix A fix shapes. They are stubs — goal is **compiles**, not feature parity (out of scope).
 
-Run: `cargo build --workspace --all-targets 2>&1 | grep -E '^error' | wc -l`
-Expected: ~12 remaining errors, all in test code at the lines above.
+- [ ] **Step 2: Document the secret-write boundary (D5)**
 
-- [ ] **Step 2: Apply the matching shape at each test sink**
+Confirm: runtime key-rotation secret writes work via `management_api.rs` (pre-existing); CLI-driven secret _push_ is deferred (Christian punts it). Capture this split in the spec so it is a recorded decision, not an accident.
 
-- `String::from_utf8(… .into_bytes().to_vec())` → Shape B (`.expect("should have a buffered body")` before `.to_vec()`): `proxy.rs:2034`, `publisher.rs:748`, `prebid.rs:2067`, `request_signing/endpoints.rs:464`.
-- `serde_json::from_slice(&… .into_bytes())` → Shape C (bind, `.expect`, borrow): `auction/formats.rs:444`, `testlight.rs:461`.
-- `let x = … .into_bytes();` → Shape A (`.expect`): `proxy.rs:2795`, `proxy.rs:2851`, `publisher.rs:1079`, `publisher.rs:1562`.
-
-(The `request_signing/endpoints.rs:452` test helper is `str::as_bytes` — false positive, **do not touch**.)
-
-- [ ] **Step 3: Verify `--all-targets` is GREEN**
-
-Run: `cargo build --workspace --all-targets`
-Expected: **success** — all 18 sinks fixed.
-
-- [ ] **Step 4: Commit test fixes**
-
-```bash
-git add crates/trusted-server-core/src
-git commit -m "Adapt Body::into_bytes Option return in tests"
-```
+- [ ] **Step 3: Commit any adapter fixups.**
 
 ---
 
-## Task 6: Drop never-compiled adapter deps
+## Phase 4: Runtime-config-store spec (the doc his CLI design references but never wrote)
 
-**Files:** Modify `Cargo.toml` (remove `edgezero-adapter-axum`, `edgezero-adapter-cloudflare` from `[workspace.dependencies]`)
+- [ ] **Step 1: Write `docs/superpowers/specs/<date>-runtime-config-store.md`** covering:
+  - the load sequence (`build_runtime_services` → `get_settings_from_services` → `settings_from_config_entries`);
+  - the **shared `config_payload` contract** (escaping, sorted-key canonicalization, `sha256` over settings-only entries, `ts-config-*` reserved keys) — reference, do not duplicate;
+  - the **seed-before-serve** operational contract + the 503 unseeded behavior (Phase 2);
+  - empty / missing-key / malformed-hash / transport-error matrix;
+  - store-name resolution + `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` override;
+  - secrets/KV runtime read paths + the secret-write boundary (D5);
+  - non-Fastly adapter status.
 
-- [ ] **Step 1: Confirm they are absent from the graph**
-
-Run: `cargo tree -i edgezero-adapter-axum; cargo tree -i edgezero-adapter-cloudflare`
-Expected: both → "did not match any packages" (no member uses them — spec §1).
-
-- [ ] **Step 2: Remove the two lines from `Cargo.toml` `[workspace.dependencies]`**
-
-Delete the `edgezero-adapter-axum = …` and `edgezero-adapter-cloudflare = …` lines (keep `edgezero-adapter-fastly` and `edgezero-core`).
-
-- [ ] **Step 3: Verify still builds**
-
-Run: `cargo build --workspace --all-targets`
-Expected: success (nothing referenced them).
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add Cargo.toml Cargo.lock
-git commit -m "Drop unused edgezero axum/cloudflare workspace deps"
-```
-
-> If a future `trusted-server-adapter-{axum,cloudflare}` consumer lands, re-add then. Skip this task if the team prefers to keep them pinned for symmetry — note the decision.
+- [ ] **Step 2: Docs gate** — `cd docs && npm run format` (prettier-clean), then commit.
 
 ---
 
-## Task 7: Reconcile the integration-tests lockfile
+## Phase 5: Stack propagation + re-pin
 
-> **Ordering matters.** This runs _after_ all root dependency changes (repin Task 1
->
-> - drop-adapters Task 6) and _after_ `trusted-server-core` is GREEN (Tasks 2–5).
->   `crates/integration-tests` is a **separate workspace** that path-deps
->   `trusted-server-core` (`Cargo.toml:13`); building it any earlier fails on the
->   Body errors, not lock drift — confounding the check.
+- [ ] **Step 1: Reconcile topology (D6).** His branch is off `main`; the migration stack is PR14→PR20. Confirm with the team whether the HTTP-layer branch merges via `main` (with his) or threads the stack. Do not push/merge without approval.
 
-**Files:** `crates/integration-tests/Cargo.lock` (and `crates/openrtb-codegen/Cargo.lock` if it drifts)
+- [ ] **Step 2: Re-pin to edgezero `main` after #269 merges** — one-line dep change in `Cargo.toml`, regenerate lock, re-run the Phase 1 gate.
 
-- [ ] **Step 1: Resolve + build the integration-tests workspace**
-
-Run: `( cd crates/integration-tests && cargo generate-lockfile && cargo build --workspace 2>&1 | tail -20 )`
-Expected: lock resolves and it builds. Because core is now green, any failure here
-is a _real_ signal — shared-dep drift or a genuine break — not the Body RED.
-
-- [ ] **Step 2: If shared-dep drift, reconcile with targeted updates only**
-
-For each mismatched shared dep (e.g. `bytes`, `http`, `serde`):
-Run: `( cd crates/integration-tests && cargo update -p <crate> --precise <root-version> )`
-**Never** a blanket `cargo update`. (Project CI gate: shared direct deps must match
-root.) Repeat in `crates/openrtb-codegen` if it drifted.
-
-- [ ] **Step 3: Verify**
-
-Run: `( cd crates/integration-tests && cargo build --workspace )`
-Expected: success.
-
-- [ ] **Step 4: Commit if changed**
-
-```bash
-git add crates/integration-tests/Cargo.lock crates/openrtb-codegen/Cargo.lock
-git commit -m "Reconcile integration-tests lockfile after edgezero repin" || echo "nothing to commit"
-```
+- [ ] **Step 3: Open the PR (approval-gated).** Base = whatever Step 1 resolves. Assign `@me`. Summary: HTTP-layer convergence + runtime hardening + spec.
 
 ---
 
-## Task 8: Full verification gate
+## Risks & watch points
 
-**Files:** none (verification only)
-
-- [ ] **Step 1: Compile gate (host + all-targets)**
-
-Run: `cargo build --workspace --all-targets`
-Expected: success.
-
-- [ ] **Step 2: wasm32-wasip1 (Fastly deploy target)**
-
-Run: `cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1`
-Expected: success. (First leg not yet verified at spec-freeze — this is the gate that proves it.)
-
-- [ ] **Step 3: Tests**
-
-Run: `cargo test --workspace`
-Expected: pass. Watch for behavioral diffs in body-handling tests (they exercise the `.expect()` paths).
-
-- [ ] **Step 4: Clippy + fmt**
-
-Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check`
-Expected: clean.
-
-- [ ] **Step 5: integration-tests + JS gates (per CLAUDE.md CI)**
-
-Lock already reconciled (Task 7) — this just runs the suites.
-Run: `( cd crates/integration-tests && cargo test --workspace )` and `( cd crates/js/lib && npx vitest run )`
-Expected: pass (JS untouched — sanity only).
-
-- [ ] **Step 6: Commit any fmt fixups**
-
-```bash
-git add crates Cargo.toml Cargo.lock && git commit -m "Verification gate fixups" || echo "nothing to commit"
-```
-
-(Scope the add — never `git add -A`, which would sweep stray build logs into the commit.)
+| Risk                                                                                                                                             | Mitigation                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Fresh deploy = outage** (unseeded store, no fallback)                                                                                          | Phase 2: actionable error + 503; document seed-before-serve; consider a provisioning gate in deploy                                                                              |
+| His `Body` fixes incomplete vs our 18 sinks                                                                                                      | Phase 1 Step 1 cross-check against Appendix A                                                                                                                                    |
+| He likely didn't run wasm + `--all-targets` + clippy on every leg                                                                                | Phase 1 Step 2 runs the full matrix                                                                                                                                              |
+| Pinned to an **open, force-pushable** #269 ref                                                                                                   | Re-pin to `main` post-merge (Phase 5); rollback = revert the dep commit                                                                                                          |
+| **Building on a colleague's unmerged WIP branch** (`feature/ts-cli-next`) — it may rebase/force-push out from under us, vanishing our merge-base | Record its SHA at Phase 0 Step 2; if he rebases, re-base from the new SHA and coordinate before any merge; keep our additions as discrete commits so they re-cherry-pick cleanly |
+| integration-tests lockfile drift                                                                                                                 | Phase 1 Step 3, targeted `--precise` only                                                                                                                                        |
+| Branch topology (his off `main`, stack off PR14)                                                                                                 | Phase 5 Step 1, confirm with team                                                                                                                                                |
+| Whole-`Settings`-in-store enlarges blast radius of a bad push                                                                                    | hash verification (his) + malformed-store test (Phase 2 Step 6)                                                                                                                  |
 
 ---
 
-## Task 9: Open the PR (PR14-based dedicated branch)
+## Appendix A — verified `Body::into_bytes` sink reference (authoritative)
 
-**Files:** none
+From the compiler spike (spec §2/§10): **18 sink bindings, 8 production + 10 test-only**, all `into_bytes` (no `as_bytes` sink). The line numbers below are **PR14-base — they do NOT apply to the `main`-based `feature/ts-cli-next`**; use them only as a count/shape reference (8 prod + 10 test). On any branch, the compiler (`--all-targets`) is the source of truth. Use this to confirm Christian's ad-hoc fixes are complete and when merging up the stack.
 
-- [ ] **Step 1: Push + open PR targeting the PR14 branch (or wherever the stack lands)**
+- **Production (8):** `proxy.rs:38`, `publisher.rs:46`, `auction/endpoints.rs:81`, `proxy.rs:1550`, `proxy.rs:1665`, `request_signing/endpoints.rs:103/246/365`.
+- **Test-only (10):** `auction/formats.rs:444`, `prebid.rs:2067`, `testlight.rs:461`, `proxy.rs:2034/2795/2851`, `publisher.rs:748/1079/1562`, `request_signing/endpoints.rs:464`.
+- **Not a sink:** `http_util.rs:456` (the `enforce_max_body_size(bytes: &[u8], …)` signature).
+- **Fix style (D3):** production → `into_bytes().ok_or_else(|| <existing error>)?`; compression/test → `unwrap_or_default()`; only `.expect("should …")` where a buffered body is truly invariant.
 
-```bash
-git push -u origin feature/edgezero-269-repin
-gh pr create --base feature/edgezero-pr14-entry-point-dual-path \
-  --title "Repin edgezero to #269 and adapt Body::into_bytes Option return" \
-  --body "See docs/superpowers/specs/2026-06-16-edgezero-269-repin-breaking-api-finding.md"
-```
+## Appendix B — fallback: standalone minimal-repin (only if D1 = "keep PR14 stack")
 
-> Do not push or open the PR until the user approves (per project git rules). Confirm the base branch with the team — the stack tip may have advanced.
-
----
-
-## Task 10: Propagate up the stack (merge, not rebase)
-
-**Files:** none (per-branch merge + gate)
-
-> **Approval gate:** merging up mutates 6 review branches. Do **not** run this task
-> (or any `git push`) until the user approves — same rule as Task 9.
-
-For each branch PR15 → PR16 → PR17 → PR18 → PR19 → PR20, in order:
-
-- [ ] **Step 1: Merge the repin forward**
-
-```bash
-git checkout feature/edgezero-pr15-remove-fastly-core
-git merge feature/edgezero-269-repin    # merge, not rebase (team preference)
-```
-
-- [ ] **Step 2: Re-derive sinks from the compiler (line numbers/sink set shift per layer)**
-
-Run: `cargo build --workspace --all-targets 2>&1 | grep -E 'into_bytes|Body'`
-Resolve any new/moved sinks with the §2 fix shapes. PR15 (remove-fastly-core) and PR16+ move/delete these files — expect manual conflict resolution, not clean fast-forward.
-
-- [ ] **Step 3: Run the full gate (Task 8) on this branch**
-
-Expected: green before moving to the next branch up.
-
-- [ ] **Step 4: Commit the merge resolution (if any)**
-
-```bash
-git add -A && git commit --no-edit || echo "nothing to commit (clean fast-forward)"
-```
-
-Repeat for each branch up to PR20.
-
----
-
-## Follow-on plans (NOT this plan)
-
-Per spec §6/§9, after the repin lands and #269 merges to edgezero `main`:
-
-1. **Re-pin to `main`** (one-line dep change + gate).
-2. **Store convergence** (spec §6 B): map `PlatformConfigStore`/`SecretStore` reads onto edgezero `ConfigStore`/`SecretStore`/`StoreRegistry` + thin write-CRUD extension.
-3. **Typed `AppConfig` (two-tier)** + **CLI port** (spec §6 C / §7) — Christian. Shared contract = the config struct + `[stores.config]` id; agree before either starts.
-
-Each gets its own spec → plan cycle.
+If the team rejects building on his branch, the original minimal-repin still applies: branch off PR14, repin to `2eeccc9`, fix the Appendix A sinks with the D3 style, reconcile the integration-tests lock, full gate, merge up PR14→PR20. (This duplicates his Fastly work and is **not** recommended — see spec §12.)
