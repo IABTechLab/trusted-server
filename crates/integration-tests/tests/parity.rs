@@ -440,19 +440,18 @@ async fn unknown_route_returns_same_status_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
+async fn cf_legacy_admin_aliases_are_denied_locally_not_proxied() {
     // The production handler regex `^/_ts/admin` only matches the canonical
-    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases must not be
-    // registered as admin routes on Cloudflare. If they were, AuthMiddleware would
-    // not match them and unauthenticated callers would reach the real key
-    // handlers. With the aliases removed, each behaves like any other unrouted
-    // path: it falls through to the publisher fallback rather than the auth-gated
-    // admin route.
+    // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases are not
+    // auth-gated. They must be denied locally with 404 — never routed to the key
+    // handlers (which would execute admin operations), and never left unrouted to
+    // fall through to the publisher fallback, which forwards the request
+    // (including any `Authorization` header and key-management body) to the origin
+    // and leaks admin credentials.
     //
-    // Primary guard: assert the route table directly, analogous to the Fastly
-    // `NAMED_ROUTES` guard. A behavioral check alone can false-pass, because a
-    // reintroduced key handler could fail with the same fallback status and carry
-    // no `WWW-Authenticate` header in this no-store/no-origin environment.
+    // Primary guard: assert the route table directly. The legacy aliases must be
+    // registered (to the local deny) so they can never reach the publisher
+    // fallback as an unrouted path.
     let registered: Vec<(String, String)> = cf_router()
         .routes()
         .iter()
@@ -461,24 +460,23 @@ async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
     let is_registered =
         |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
 
-    assert!(
-        is_registered("POST", "/_ts/admin/keys/rotate"),
-        "canonical POST /_ts/admin/keys/rotate must be a registered admin route"
-    );
-    assert!(
-        is_registered("POST", "/_ts/admin/keys/deactivate"),
-        "canonical POST /_ts/admin/keys/deactivate must be a registered admin route"
-    );
-    assert!(
-        !is_registered("POST", "/admin/keys/rotate"),
-        "legacy POST /admin/keys/rotate must not be registered (would bypass `^/_ts/admin` auth)"
-    );
-    assert!(
-        !is_registered("POST", "/admin/keys/deactivate"),
-        "legacy POST /admin/keys/deactivate must not be registered (would bypass `^/_ts/admin` auth)"
-    );
+    for path in [
+        "/_ts/admin/keys/rotate",
+        "/_ts/admin/keys/deactivate",
+        "/admin/keys/rotate",
+        "/admin/keys/deactivate",
+    ] {
+        assert!(
+            is_registered("POST", path),
+            "POST {path} must be a registered route"
+        );
+    }
 
-    // Secondary guard: confirm the runtime behavior matches an unrouted path.
+    // Secondary guard: confirm runtime behavior. Canonical paths challenge
+    // unauthenticated callers (401). Legacy aliases are denied locally with 404
+    // and carry no auth challenge — a reintroduced key handler at these ungated
+    // paths would not return 404, and the publisher fallback would not either, so
+    // 404 proves the local deny ran.
     for alias in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         let (canonical_status, _) = cf_post_headers(&format!("/_ts{alias}"), "{}").await;
         assert_eq!(
@@ -487,20 +485,13 @@ async fn cf_legacy_admin_aliases_are_not_unauthenticated_admin_routes() {
         );
 
         let (alias_status, alias_headers) = cf_post_headers(alias, "{}").await;
-        assert_ne!(
-            alias_status, 401,
-            "legacy {alias} must not be an auth-gated admin route"
+        assert_eq!(
+            alias_status, 404,
+            "legacy {alias} must be denied locally with 404, not proxied or key-handled"
         );
         assert!(
             !alias_headers.contains_key("www-authenticate"),
             "legacy {alias} must not issue an admin auth challenge"
-        );
-
-        let (unknown_status, _) = cf_post_headers("/this-route-does-not-exist-abc123", "{}").await;
-        assert_eq!(
-            alias_status, unknown_status,
-            "legacy {alias} must fall through to the publisher fallback like an unknown path: \
-             alias={alias_status} unknown={unknown_status}"
         );
     }
 }
