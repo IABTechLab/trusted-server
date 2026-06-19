@@ -309,6 +309,11 @@ fn edge_request_to_fastly(
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
+        // `fastly::Request::new` derives a Host header from the request URI, so
+        // appending the edge request's own Host would leave a duplicate. Replace
+        // it instead to keep the in-memory request well-formed. The Host actually
+        // sent on the wire is still governed by the backend's `override_host`
+        // (see `BackendConfig::ensure`), which forces the value regardless.
         if name == edgezero_core::http::header::HOST {
             fastly_req.set_header(name.as_str(), value.as_bytes());
         } else {
