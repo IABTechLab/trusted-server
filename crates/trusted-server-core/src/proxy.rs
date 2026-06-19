@@ -1727,18 +1727,15 @@ pub async fn handle_first_party_proxy_rebuild(
         })
     })?;
 
-    // Enforce allowed_domains on the redirect target before issuing a new signed URL.
-    if let Ok(parsed_tsurl) = url::Url::parse(&tsurl) {
-        if let Some(host) = parsed_tsurl.host_str() {
-            if !redirect_is_permitted(&settings.proxy.allowed_domains, host) {
-                return Err(Report::new(TrustedServerError::Proxy {
-                    message: format!(
-                        "redirect to `{host}` blocked: host not in proxy allowed_domains"
-                    ),
-                }));
-            }
-        }
-    }
+    // Do not apply `proxy.allowed_domains` to the click target here. That setting
+    // governs server-side proxy *fetch* redirect-chain SSRF, not advertiser click
+    // 302s — and `handle_first_party_click` itself redirects any valid signed
+    // target without consulting it. Applying it only during rebuild would reject
+    // signed targets that normal click redirects still allow, a cross-adapter
+    // regression. The original signed click URL (including `tsurl`) is already
+    // validated above via `reconstruct_and_validate_signed_target`, and `tsurl`
+    // is a reserved signing parameter callers cannot alter, so the redirect host
+    // is fixed by the validated original.
 
     // Keep a snapshot before modifications for diagnostics
     let orig_before = orig.clone();
