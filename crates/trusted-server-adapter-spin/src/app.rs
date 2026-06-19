@@ -185,6 +185,14 @@ fn parse_client_addr(raw: &str) -> Option<IpAddr> {
 pub(crate) fn normalize_spin_request(req: &mut Request) {
     sanitize_forwarded_headers(req);
 
+    // Strip any client-supplied `x-forwarded-for`. Spin exposes no trusted
+    // upstream forwarded-for chain — the only trusted client IP comes from the
+    // synthetic `spin-client-addr` captured below. Shared proxy code forwards an
+    // inbound `x-forwarded-for` to origins and Prebid copies it into its outbound
+    // headers, so leaving it would let a Spin client spoof the IP seen by
+    // downstream services while `device.ip` uses the trusted runtime address.
+    req.headers_mut().remove("x-forwarded-for");
+
     // Re-derive the trusted client IP from the *last* `spin-client-addr` header
     // and overwrite `SpinRequestContext`, which `build_runtime_services` reads
     // for `ClientInfo::client_ip`. edgezero populates that context from the
@@ -857,6 +865,31 @@ mod tests {
         assert!(
             req.headers().get("spin-client-addr").is_none(),
             "should strip every spin-client-addr copy after capturing the trusted value"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_strips_client_supplied_x_forwarded_for() {
+        // A Spin client supplies a spoofed x-forwarded-for alongside the trusted
+        // synthetic spin-client-addr. The spoofed forwarded-for must be stripped
+        // so shared proxy/Prebid code cannot forward an attacker-controlled IP to
+        // downstream services, while the trusted client IP is taken from
+        // spin-client-addr.
+        let mut req = request_with(&[
+            ("spin-client-addr", "203.0.113.7:5000"),
+            ("x-forwarded-for", "198.51.100.99, 10.0.0.1"),
+        ]);
+
+        normalize_spin_request(&mut req);
+
+        assert!(
+            req.headers().get("x-forwarded-for").is_none(),
+            "should strip client-supplied x-forwarded-for"
+        );
+        assert_eq!(
+            SpinRequestContext::get(&req).and_then(|c| c.client_addr),
+            Some("203.0.113.7".parse().expect("should parse trusted IP")),
+            "trusted client IP must come from spin-client-addr, not the spoofed x-forwarded-for"
         );
     }
 
