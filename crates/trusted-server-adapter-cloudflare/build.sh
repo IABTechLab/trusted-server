@@ -26,6 +26,9 @@ cd "$SCRIPT_DIR"
 WORKER_BUILD_ROOT="$SCRIPT_DIR/.worker-build"
 WORKER_BUILD_BIN="$WORKER_BUILD_ROOT/bin/worker-build"
 if ! "$WORKER_BUILD_BIN" --version 2>/dev/null | grep -qE '0\.7\.'; then
-    cargo install -q --version '^0.7' --root "$WORKER_BUILD_ROOT" worker-build
+    # --force so a stale non-0.7 binary already in the root is overwritten;
+    # without it `cargo install` refuses to replace the existing binary and the
+    # guard can never self-heal an incompatible local worker-build.
+    cargo install -q --force --version '^0.7' --root "$WORKER_BUILD_ROOT" worker-build
 fi
 "$WORKER_BUILD_BIN" --release
