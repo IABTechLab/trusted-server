@@ -5,7 +5,7 @@ use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::{
-    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
+    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -289,6 +289,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // asset_cache_policy.apply_after_route_finalization.
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
 
+    // Pop the integration request-filter response effects (e.g. DataDome
+    // challenge/allow headers) threaded out by the dispatch path. Applied to the
+    // response after EC finalization and before send, mirroring legacy_main's
+    // `request_filter_effects` application. Must happen before the fastly
+    // conversion, which drops extensions.
+    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
@@ -335,6 +342,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                         ec_state.sharedid_cookie.as_deref(),
                         &mut response,
                     );
+                    if let Some(effects) = &request_filter_effects {
+                        effects.apply_to_response(&mut response);
+                    }
                     compat::to_fastly_response(response).send_to_client();
 
                     if ec_state.is_real_browser {
@@ -361,6 +371,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         }
     }
 
+    if let Some(effects) = &request_filter_effects {
+        effects.apply_to_response(&mut response);
+    }
     compat::to_fastly_response(response).send_to_client();
 }
 
@@ -1039,6 +1052,7 @@ fn run_pull_sync_after_send(
 
 pub(crate) fn resolve_publisher_response_buffered(
     publisher_response: PublisherResponse,
+    method: &Method,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<HttpResponse, Report<TrustedServerError>> {
@@ -1049,6 +1063,16 @@ pub(crate) fn resolve_publisher_response_buffered(
             body,
             params,
         } => {
+            // HEAD and bodiless statuses (204, 304) carry no body but may
+            // advertise the GET representation's length. `handle_publisher_request`
+            // already stripped the origin Content-Length for processable Stream
+            // responses, so rewriting it here to the buffered byte count (0)
+            // would replace it with a misleading length. Skip the buffer, the
+            // length rewrite, and the body replacement for those responses,
+            // mirroring the asset path's `asset_response_carries_body` guard.
+            if !publisher_response_carries_body(method, response.status()) {
+                return Ok(response);
+            }
             let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
             stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
             let bytes = output.into_inner();
@@ -1064,6 +1088,18 @@ pub(crate) fn resolve_publisher_response_buffered(
             Ok(response)
         }
     }
+}
+
+/// Returns `true` when a buffered publisher response should carry a body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) carry no body; rewriting
+/// their `Content-Length` to the (empty) buffered length would mislead clients
+/// and caches. This mirrors the asset path's `asset_response_carries_body`.
+fn publisher_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
@@ -1216,6 +1252,31 @@ mod tests {
         assert!(
             health_response(&req).is_none(),
             "should only short-circuit /health"
+        );
+    }
+
+    #[test]
+    fn publisher_response_carries_body_preserves_bodiless_content_length() {
+        // A processable GET 200 publisher response buffers a body and recomputes
+        // Content-Length.
+        assert!(
+            super::publisher_response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 publisher response should carry a buffered body"
+        );
+        // HEAD responses carry no body; recomputing Content-Length to 0 would
+        // mislead clients/caches about the GET representation length.
+        assert!(
+            !super::publisher_response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD publisher responses must not get a recomputed Content-Length"
+        );
+        // Bodiless statuses keep their metadata regardless of method.
+        assert!(
+            !super::publisher_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must not get a recomputed Content-Length"
+        );
+        assert!(
+            !super::publisher_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must not get a recomputed Content-Length"
         );
     }
 
