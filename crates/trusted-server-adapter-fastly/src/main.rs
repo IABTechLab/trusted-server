@@ -253,10 +253,13 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
-            // EC finalization may have just added the identity Set-Cookie, which
-            // the HttpResponse-stage cache guard could not see.
-            enforce_set_cookie_cache_privacy(&mut fastly_resp);
+            // Apply request-filter response effects (e.g. a DataDome allow
+            // Set-Cookie) before the final cache guard so any per-user cookie
+            // they add is covered. EC finalization above may also have added the
+            // identity Set-Cookie, which the HttpResponse-stage guard could not
+            // see — the guard runs last so it observes both.
             request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             fastly_resp.send_to_client();
 
             if is_real_browser {
@@ -284,10 +287,13 @@ fn main() {
                     &mut fastly_resp,
                 );
             }
-            // EC finalization may have just added the identity Set-Cookie, which
-            // the HttpResponse-stage cache guard could not see.
-            enforce_set_cookie_cache_privacy(&mut fastly_resp);
+            // Apply request-filter response effects (e.g. a DataDome allow
+            // Set-Cookie) before the final cache guard so any per-user cookie
+            // they add is covered. EC finalization above may also have added the
+            // identity Set-Cookie, which the HttpResponse-stage guard could not
+            // see — the guard runs last so it observes both.
             request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
             match futures::executor::block_on(stream_publisher_body_async(
@@ -324,7 +330,11 @@ fn main() {
             finalize_response(&settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
             let mut fastly_resp = compat::to_fastly_response_skeleton(response);
+            // A request filter (e.g. DataDome allow) can append a per-user
+            // Set-Cookie via response effects even on an otherwise cacheable
+            // asset, so guard against shared caching after applying them.
             request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             if let Err(e) =
                 futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
@@ -633,6 +643,22 @@ async fn route_request(
             false,
         ),
 
+        // Reject CORS preflight for the side-effecting page-bids endpoint at the
+        // adapter. The GET handler's legacy fallback trusts `X-TSJS-Page-Bids`
+        // precisely because this endpoint never grants a preflight; letting
+        // OPTIONS fall through to the publisher origin (which may return
+        // permissive CORS) would defeat that, allowing a cross-site page to
+        // trigger real PBS/APS auctions from a visitor's browser.
+        (Method::OPTIONS, "/__ts/page-bids") => {
+            let mut response = HttpResponse::new(EdgeBody::from("Forbidden"));
+            *response.status_mut() = edgezero_core::http::StatusCode::FORBIDDEN;
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            (Ok(response), false)
+        }
+
         // SPA/CSR navigation endpoint — returns slots + bids JSON for the given path
         (Method::GET, "/__ts/page-bids") => (
             handle_page_bids(
@@ -870,34 +896,41 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
     // stricter directive (e.g. `no-store`).
     // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
     // against a lowercased copy — `No-Store` / `Private` must count.
-    let already_uncacheable = response
+    if response.headers().contains_key(header::SET_COOKIE) {
+        // Surrogate cache headers must come off every cookie-bearing response,
+        // even one already carrying a stricter `no-store`/`private` directive —
+        // they are independent of Cache-Control and would otherwise let a shared
+        // cache store and replay one visitor's Set-Cookie.
+        response.headers_mut().remove("surrogate-control");
+        response.headers_mut().remove("fastly-surrogate-control");
+        let already_uncacheable = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+        if !already_uncacheable {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=0"),
+            );
+        }
+    }
+
+    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
+    // carry an uncacheable Cache-Control directive (`private` or `no-store`).
+    // Operator headers must not re-enable shared caching for them — neither by
+    // replacing Cache-Control nor by reintroducing the surrogate cache headers
+    // the privacy paths stripped.
+    let response_is_uncacheable = response
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
         .map(str::to_ascii_lowercase)
         .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-    if !already_uncacheable && response.headers().contains_key(header::SET_COOKIE) {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
-        );
-        response.headers_mut().remove("surrogate-control");
-        response.headers_mut().remove("fastly-surrogate-control");
-    }
-
-    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
-    // carry a private Cache-Control directive. Operator headers must not
-    // re-enable shared caching for them — neither by replacing Cache-Control nor
-    // by reintroducing the surrogate cache headers the privacy paths stripped.
-    let response_is_private = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private"));
 
     for (key, value) in &settings.response_headers {
-        if response_is_private
+        if response_is_uncacheable
             && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
                 || key.eq_ignore_ascii_case("surrogate-control")
                 || key.eq_ignore_ascii_case("fastly-surrogate-control"))
@@ -922,19 +955,26 @@ fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: 
 /// inherited from the origin or operator response headers — a shared cache must
 /// not be able to store and replay one visitor's EC cookie to others.
 ///
-/// Idempotent: a response already marked `private`/`no-store` is left untouched
-/// so a stricter directive is never weakened.
+/// Idempotent: a response already marked `private`/`no-store` keeps its stricter
+/// `Cache-Control`, but the surrogate cache headers are stripped regardless so a
+/// `no-store` cookie response can never retain shared Fastly cacheability.
 fn enforce_set_cookie_cache_privacy(response: &mut FastlyResponse) {
+    if response.get_header("set-cookie").is_none() {
+        return;
+    }
+    // Strip surrogate cache headers on every cookie-bearing response, even when
+    // keeping a stricter `no-store`/`private` directive — Surrogate-Control is
+    // independent of Cache-Control and would otherwise let a shared cache store
+    // and replay one visitor's Set-Cookie.
+    response.remove_header("surrogate-control");
+    response.remove_header("fastly-surrogate-control");
     let already_uncacheable = response
         .get_header_str("cache-control")
         .map(str::to_ascii_lowercase)
         .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-    if already_uncacheable || response.get_header("set-cookie").is_none() {
-        return;
+    if !already_uncacheable {
+        response.set_header("cache-control", "private, max-age=0");
     }
-    response.set_header("cache-control", "private, max-age=0");
-    response.remove_header("surrogate-control");
-    response.remove_header("fastly-surrogate-control");
 }
 
 fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {

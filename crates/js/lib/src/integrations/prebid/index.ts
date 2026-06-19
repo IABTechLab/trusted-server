@@ -343,6 +343,27 @@ function firstTargetingValue(values: string[] | undefined): string | undefined {
 }
 
 /**
+ * Find the publisher's original `pbjs.adUnits` entry for a refreshing slot.
+ *
+ * A TS-owned GPT slot may be defined on `${div_id}-container`, so the GPT
+ * element id used as the synthetic refresh ad unit code can differ from the
+ * inner `div_id` the publisher keyed their Prebid ad unit by. Try each candidate
+ * code in order and return the first matching ad unit, so container-backed slots
+ * still recover the publisher's configured params and bidders.
+ */
+function findRefreshAdUnit(
+  candidateCodes: Array<string | undefined>
+): TrustedServerAdUnit | undefined {
+  const adUnits = (pbjs.adUnits ?? []) as TrustedServerAdUnit[];
+  for (const code of candidateCodes) {
+    if (!code) continue;
+    const match = adUnits.find((unit) => unit.code === code);
+    if (match) return match;
+  }
+  return undefined;
+}
+
+/**
  * Collect the configured client-side bidder entries for a refreshing slot.
  *
  * Synthetic refresh ad units carry only the `trustedServer` bid. The
@@ -350,17 +371,16 @@ function firstTargetingValue(values: string[] | undefined): string | undefined {
  * already present on the ad unit, so without re-attaching them here publishers
  * that split demand between server-side and native Prebid adapters would lose
  * all client-side demand on refresh/scroll impressions. Bids are sourced from
- * the matching `pbjs.adUnits` entry (by ad unit code) so the publisher's
- * configured params are preserved.
+ * the matching `pbjs.adUnits` entry (by candidate ad unit code) so the
+ * publisher's configured params are preserved.
  */
 function clientSideBidsForRefresh(
-  code: string
+  candidateCodes: Array<string | undefined>
 ): Array<{ bidder: string; params: Record<string, unknown> }> {
   const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
   if (clientSideBidders.size === 0) return [];
 
-  const adUnits = (pbjs.adUnits ?? []) as TrustedServerAdUnit[];
-  const match = adUnits.find((unit) => unit.code === code);
+  const match = findRefreshAdUnit(candidateCodes);
   if (!match?.bids) return [];
 
   const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
@@ -379,15 +399,16 @@ function clientSideBidsForRefresh(
  * `requestBids` shim has no original server-side bidder entries to collect into
  * `bidderParams` — without this, refresh/scroll `/auction` requests send `{}`
  * and lose demand the publisher configured only on the initial ad unit. Source
- * the params from the matching `pbjs.adUnits` entry by code, covering both
- * states the initial auction can leave that entry in:
+ * the params from the matching `pbjs.adUnits` entry by candidate code, covering
+ * both states the initial auction can leave that entry in:
  *   - raw server-side bidder entries (`{ bidder, params }`) not yet folded, and
  *   - params already folded into that unit's `trustedServer` bid `bidderParams`
  *     by a prior `requestBids` call.
  */
-function serverSideBidderParamsForRefresh(code: string): Record<string, Record<string, unknown>> {
-  const adUnits = (pbjs.adUnits ?? []) as TrustedServerAdUnit[];
-  const match = adUnits.find((unit) => unit.code === code);
+function serverSideBidderParamsForRefresh(
+  candidateCodes: Array<string | undefined>
+): Record<string, Record<string, unknown>> {
+  const match = findRefreshAdUnit(candidateCodes);
   if (!match?.bids) return {};
 
   const clientSideBidders = new Set(getInjectedConfig()?.clientSideBidders ?? []);
@@ -737,17 +758,24 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         };
 
         const code = refreshSlotElementId(slot) ?? 'refresh-slot';
+        // A TS-owned slot may be defined on `${div_id}-container`, so the GPT
+        // element id used as the synthetic refresh code can differ from the
+        // inner `div_id` the publisher keyed their ad unit by. Recover from both.
+        const candidateCodes = [code, injectedSlot?.div_id];
         const tsParams: Record<string, unknown> = zone ? { [ZONE_KEY]: zone } : {};
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
-        const serverSideParams = serverSideBidderParamsForRefresh(code);
+        const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);
         if (Object.keys(serverSideParams).length > 0) {
           tsParams[BIDDER_PARAMS_KEY] = serverSideParams;
         }
         return {
           code,
           mediaTypes: { banner },
-          bids: [{ bidder: ADAPTER_CODE, params: tsParams }, ...clientSideBidsForRefresh(code)],
+          bids: [
+            { bidder: ADAPTER_CODE, params: tsParams },
+            ...clientSideBidsForRefresh(candidateCodes),
+          ],
         };
       });
 

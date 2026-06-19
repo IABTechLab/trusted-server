@@ -981,6 +981,74 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.adUnits = [];
   });
 
+  it('recovers params and client-side bids for container-backed slots by injected div_id', () => {
+    // A TS-owned GPT slot may be defined on `${div_id}-container`, but the
+    // publisher's Prebid ad unit is keyed by the inner div_id. The synthetic
+    // refresh code stays the GPT element id (so GPT can match it), while params
+    // and client-side bids are recovered from the injected div_id candidate.
+    (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
+    mockPbjs.adUnits = [
+      {
+        code: 'div-ad-x',
+        bids: [
+          { bidder: 'appnexus', params: { placementId: 12345 } },
+          { bidder: 'rubicon', params: { accountId: 1 } },
+        ],
+      },
+    ];
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-x-container'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'x_ad',
+          gam_unit_path: '/123/x',
+          div_id: 'div-ad-x',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            // Synthetic refresh code stays the GPT element id, not the div_id.
+            code: 'div-ad-x-container',
+            bids: [
+              {
+                bidder: 'trustedServer',
+                params: {
+                  zone: 'homepage',
+                  bidderParams: { appnexus: { placementId: 12345 } },
+                },
+              },
+              { bidder: 'rubicon', params: { accountId: 1 } },
+            ],
+          }),
+        ],
+      })
+    );
+
+    delete (window as any).__tsjs_prebid;
+    mockPbjs.adUnits = [];
+  });
+
   it('recovers server-side bidder params already folded onto the original trustedServer bid', () => {
     // After the initial auction, the requestBids shim has folded the publisher's
     // server-side params into the original ad unit's trustedServer bid. A later

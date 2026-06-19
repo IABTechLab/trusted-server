@@ -143,6 +143,21 @@ impl CreativeOpportunitySlot {
             format.validate_runtime(&self.id)?;
         }
 
+        // An explicit empty/whitespace `div_id` override is rejected: the
+        // injected JS resolves slots with `candidate.id.startsWith(slot.div_id)`,
+        // and every element id starts with the empty string, so an empty override
+        // would bind the slot to the first id-bearing element in the document.
+        if self
+            .div_id
+            .as_deref()
+            .is_some_and(|div_id| div_id.trim().is_empty())
+        {
+            return Err(format!(
+                "slot `{}` div_id override must not be empty",
+                self.id
+            ));
+        }
+
         if self
             .resolved_gam_unit_path(gam_network_id)
             .trim()
@@ -507,6 +522,32 @@ mod tests {
     fn resolved_div_id_defaults_to_slot_id() {
         let slot = make_slot("atf", vec!["/"]);
         assert_eq!(slot.resolved_div_id(), "atf");
+    }
+
+    #[test]
+    fn validate_runtime_rejects_empty_div_id_override() {
+        // An empty/whitespace div_id would resolve every slot to the first
+        // id-bearing element via `candidate.id.startsWith(slot.div_id)`.
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.compile_patterns();
+
+        slot.div_id = Some(String::new());
+        assert!(
+            slot.validate_runtime("1234").is_err(),
+            "empty div_id override should fail validation"
+        );
+
+        slot.div_id = Some("   ".to_string());
+        assert!(
+            slot.validate_runtime("1234").is_err(),
+            "whitespace-only div_id override should fail validation"
+        );
+
+        slot.div_id = Some("div-ad-x".to_string());
+        assert!(
+            slot.validate_runtime("1234").is_ok(),
+            "a concrete div_id override should pass validation"
+        );
     }
 
     #[test]

@@ -936,18 +936,12 @@ impl AuctionOrchestrator {
                 }
             }
 
-            // Defense-in-depth deadline guard, mirroring run_providers_parallel.
-            // Dispatch already caps each backend's first_byte_timeout at the
-            // remaining auction budget, so this should not fire in practice —
-            // it protects against the two paths drifting apart.
-            if remaining_budget_ms(auction_start, timeout_ms) == 0 && !remaining.is_empty() {
-                log::warn!(
-                    "Auction timeout ({}ms) reached during collection, dropping {} remaining request(s)",
-                    timeout_ms,
-                    remaining.len()
-                );
-                break;
-            }
+            // Drain every dispatched request. Each backend was capped with a
+            // first-byte timeout at dispatch time, so by the collect phase the
+            // remaining handles may already be ready even if wall-clock time
+            // elapsed while the origin was slow — dropping them here would
+            // discard SSP responses that already arrived. The mediator launch
+            // below still observes A_deadline via `remaining_budget_ms`.
         }
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {

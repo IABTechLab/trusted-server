@@ -638,8 +638,11 @@ fn route_result_to_fastly_response(
             &mut fastly_response,
         );
     }
-    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
+    // Mirror main's ordering: apply request-filter response effects (which may
+    // append a per-user Set-Cookie) before the final cache guard so the guard
+    // observes them.
     request_filter_effects.apply_to_fastly_response(&mut fastly_response);
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
     fastly_response
 }
 
@@ -1535,6 +1538,134 @@ fn enforce_set_cookie_cache_privacy_keeps_stricter_no_store() {
 }
 
 #[test]
+fn enforce_set_cookie_cache_privacy_strips_surrogate_on_no_store() {
+    // A `no-store` cookie response keeps its stricter Cache-Control but must still
+    // lose the surrogate cache headers — they are independent of Cache-Control and
+    // would otherwise let a shared cache store and replay the visitor's cookie.
+    let mut fastly_response = compat::to_fastly_response(
+        edge_response_builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("surrogate-control", "max-age=86400")
+            .header("fastly-surrogate-control", "max-age=86400")
+            .header(header::SET_COOKIE, "ec=abc; Path=/")
+            .body(EdgeBody::empty())
+            .expect("should build test response"),
+    );
+
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
+
+    assert_eq!(
+        fastly_response.get_header_str("cache-control"),
+        Some("no-store"),
+        "should keep the stricter no-store directive"
+    );
+    assert!(
+        fastly_response.get_header("surrogate-control").is_none(),
+        "no-store cookie responses must not retain Surrogate-Control"
+    );
+    assert!(
+        fastly_response
+            .get_header("fastly-surrogate-control")
+            .is_none(),
+        "no-store cookie responses must not retain Fastly-Surrogate-Control"
+    );
+}
+
+#[test]
+fn request_filter_set_cookie_after_guard_still_downgrades_cache() {
+    // A request filter (e.g. a DataDome allow) can append a per-user Set-Cookie via
+    // response effects. main applies those effects before the final cache guard, so
+    // an origin response still marked `public` with surrogate headers must be
+    // downgraded once the filter cookie is present.
+    use trusted_server_core::integrations::{HeaderMutation, RequestFilterEffects};
+
+    let mut fastly_response = compat::to_fastly_response(
+        edge_response_builder()
+            .status(StatusCode::OK)
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .header("surrogate-control", "max-age=86400")
+            .body(EdgeBody::empty())
+            .expect("should build test response"),
+    );
+
+    let effects = RequestFilterEffects {
+        request_headers: vec![],
+        response_headers: vec![HeaderMutation::append(
+            "set-cookie",
+            "datadome=allow; Path=/; HttpOnly",
+        )],
+    };
+
+    // Mirror main's ordering: apply effects first, then the guard.
+    effects.apply_to_fastly_response(&mut fastly_response);
+    super::enforce_set_cookie_cache_privacy(&mut fastly_response);
+
+    assert_eq!(
+        fastly_response.get_header_str("cache-control"),
+        Some("private, max-age=0"),
+        "a filter-added Set-Cookie must downgrade a public origin response"
+    );
+    assert!(
+        fastly_response.get_header("surrogate-control").is_none(),
+        "a filter-added Set-Cookie must strip surrogate cacheability"
+    );
+}
+
+#[test]
+fn finalize_response_no_store_cookie_blocks_operator_surrogate_reenable() {
+    // Operator response_headers must not re-add surrogate caching to a Set-Cookie
+    // response carrying the stricter `no-store` directive — the operator guard must
+    // treat no-store as protected, not just `private`.
+    let mut settings = create_test_settings();
+    settings
+        .response_headers
+        .insert("Surrogate-Control".to_string(), "max-age=86400".to_string());
+    settings.response_headers.insert(
+        "Fastly-Surrogate-Control".to_string(),
+        "max-age=86400".to_string(),
+    );
+    settings.response_headers.insert(
+        header::CACHE_CONTROL.as_str().to_string(),
+        "public, max-age=3600".to_string(),
+    );
+    let mut response = edge_response_builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::SET_COOKIE, "ec=abc; Path=/")
+        .body(EdgeBody::empty())
+        .expect("should build test response");
+
+    super::finalize_response(&settings, None, &mut response);
+
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "operator Cache-Control must not weaken the stricter no-store directive"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("surrogate-control")
+            .and_then(|v| v.to_str().ok()),
+        None,
+        "operator Surrogate-Control must not re-enable caching for a no-store cookie response"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("fastly-surrogate-control")
+            .and_then(|v| v.to_str().ok()),
+        None,
+        "operator Fastly-Surrogate-Control must not re-enable caching for a no-store cookie response"
+    );
+}
+
+#[test]
 fn finalize_response_leaves_stricter_no_store_untouched() {
     let settings = create_test_settings();
     let mut response = edge_response_builder()
@@ -1754,6 +1885,58 @@ fn page_bids_cross_site_request_is_rejected_at_the_route() {
         resp.get_status(),
         StatusCode::FORBIDDEN,
         "should reject cross-site page-bids requests"
+    );
+}
+
+#[test]
+fn page_bids_options_preflight_is_rejected_at_the_route() {
+    // OPTIONS must not fall through to the publisher origin (which may return
+    // permissive CORS); the GET handler's legacy `X-TSJS-Page-Bids` fallback
+    // relies on this endpoint never granting a preflight.
+    let base = base_route_settings_toml();
+    let prebid = prebid_integration_toml();
+    let config = format!(
+        r#"{base}
+
+{prebid}
+
+            [auction]
+            enabled = true
+            providers = ["prebid"]
+            timeout_ms = 2000
+
+            [creative_opportunities]
+            gam_network_id = "1234"
+        "#,
+    );
+    let settings =
+        Settings::from_toml(&config).expect("should parse page-bids route test settings");
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+
+    let req = Request::new(
+        Method::OPTIONS,
+        "https://test-publisher.com/__ts/page-bids?path=/2024/article/",
+    );
+    let services = test_runtime_services(&req);
+
+    let resp = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route page-bids preflight request",
+    );
+
+    assert_eq!(
+        resp.get_status(),
+        StatusCode::FORBIDDEN,
+        "should reject the page-bids CORS preflight at the adapter"
+    );
+    assert_eq!(
+        resp.get_header_str(header::CACHE_CONTROL),
+        Some("private, no-store"),
+        "preflight rejection must not be shared-cached"
     );
 }
 
