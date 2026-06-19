@@ -134,8 +134,8 @@ fn accept_encoding_qvalue(header_value: &str, target: &str) -> Option<f32> {
 /// Serves two types of bundles:
 /// - **Unified bundle** (`tsjs-unified.min.js`): core + immediate (non-deferred)
 ///   integration modules.
-/// - **Split module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
-///   modules loaded outside the main bundle (e.g., prebid).
+/// - **Deferred module** (`tsjs-{id}.min.js`): a single self-contained IIFE for
+///   modules loaded with `defer` (e.g., prebid).
 ///
 /// # Errors
 ///
@@ -181,11 +181,11 @@ pub fn handle_tsjs_dynamic(
     Ok(not_found_response())
 }
 
-/// Extract a module ID from a split-module filename like `tsjs-prebid.min.js`.
+/// Extract a module ID from a deferred-module filename like `tsjs-prebid.min.js`.
 ///
 /// Returns `Some(&'static str)` if the filename matches a known JS module ID,
 /// `None` otherwise. The caller must additionally verify that the module is
-/// both split-loaded and enabled via the [`IntegrationRegistry`].
+/// both deferred and enabled via the [`IntegrationRegistry`].
 #[must_use]
 fn parse_deferred_module_filename(filename: &str) -> Option<&'static str> {
     let stem = filename

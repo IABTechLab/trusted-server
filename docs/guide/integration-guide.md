@@ -212,7 +212,7 @@ impl IntegrationScriptRewriter for MyIntegration {
 `html_processor.rs` calls these hooks after applying the standard origin→first-party rewrite, so you can simply swap URLs, append query parameters, or mutate inline JSON. Use this to point `<script>` tags at your own tsjs-managed bundle (for example, `/static/tsjs=tsjs-testlight.min.js`) or to rewrite embedded Next.js payloads.
 
 ::: warning Removing Elements
-Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own split bundle (`tsjs-prebid.min.js`).
+Returning `AttributeRewriteAction::remove_element()` (or `ScriptRewriteAction::RemoveNode` for inline content) removes the element entirely, so integrations can drop publisher-provided markup when the Trusted Server already injects a safe alternative. Prebid, for example, removes publisher `prebid.js` tags because it ships its own deferred bundle (`tsjs-prebid.min.js`).
 :::
 
 ### 5b. Implement Head Injection (Optional)
@@ -251,7 +251,7 @@ Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder
 
 Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/integrations/` (for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build` script automatically discovers every file in that directory and produces a bundle named `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
 
-Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own split bundle automatically.
+Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own deferred bundle automatically.
 
 ### 8. Test Locally
 
@@ -273,7 +273,7 @@ Two built-in integrations demonstrate how the framework pieces fit together.
 Integrations are loaded in one of two ways:
 
 - **Immediate** (default) — concatenated into the main `tsjs-unified.min.js` bundle, loaded synchronously at `<head>` start.
-- **Split** — served as a separate `tsjs-{id}.min.js` tag outside the main bundle. Split modules usually use `<script defer>`, but modules with bootstrap ordering requirements can load synchronously. Integrations opt in by calling `.with_deferred_js()` on their registration builder.
+- **Deferred** — served as a separate `<script defer>` tag (`tsjs-{id}.min.js`), loaded after HTML parsing completes. Used for large modules that would otherwise block rendering. Integrations opt in by calling `.with_deferred_js()` on their registration builder.
 
 ### Testlight
 
@@ -288,9 +288,9 @@ Integrations are loaded in one of two ways:
 
 ### Prebid
 
-**Loading**: Split synchronous script after the main TSJS bundle
+**Loading**: Deferred (`<script defer>`)
 
-**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects EC IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate split bundle (`tsjs-prebid.min.js`) so it can initialize before publisher ad code attempts legacy Prebid loading.
+**Purpose**: Production Prebid Server bridge that owns `/first-party/ad` & `/third-party/ad`, injects EC IDs, rewrites creatives/notification URLs, and removes publisher-supplied Prebid scripts. The NPM-bundled Prebid.js is served as a separate deferred bundle (`tsjs-prebid.min.js`) to avoid blocking page rendering (168 KB).
 
 **Key files**:
 
@@ -322,11 +322,11 @@ Tests or scaffolding can inject configs by calling `settings.integrations.insert
 
 **3. HTML Rewrites Through the Registry**
 
-When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The Prebid module is loaded as a separate synchronous script tag immediately after the main TSJS bundle, so dropping the publisher assets prevents duplicate downloads and avoids races with publisher ad code that tries to load legacy Prebid. The server-injected config (`window.__tsjs_prebid`) is an inline script that runs before both bundles, ensuring configuration is available when the Prebid module auto-initializes.
+When the integration is enabled, the `IntegrationAttributeRewriter` removes any `<script src="prebid*.js">` or `<link href=…>` references that match `script_patterns`. The Prebid module is loaded as a separate `<script defer>` tag after the main TSJS bundle, so dropping the publisher assets prevents duplicate downloads. The server-injected config (`window.__tsjs_prebid`) is an inline script that runs before both bundles, ensuring configuration is available when the deferred Prebid module auto-initializes.
 
 **4. TSJS Assets & Testing**
 
-The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the split `tsjs-prebid.min.js` tag is present.
+The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
 
 **5. Hybrid EID forwarding**
 
