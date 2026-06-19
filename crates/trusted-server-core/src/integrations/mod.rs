@@ -71,6 +71,7 @@ pub(crate) fn ensure_integration_backend(
                 })?
                 .to_string(),
             port: parsed.port(),
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: first_byte_timeout.unwrap_or_else(|| Duration::from_secs(15)),
         })

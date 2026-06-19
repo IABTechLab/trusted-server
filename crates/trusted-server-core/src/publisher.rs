@@ -499,6 +499,7 @@ pub async fn handle_publisher_request(
             scheme: origin_scheme.clone(),
             host: origin_host_without_port.to_string(),
             port: parsed_origin.port(),
+            host_header_override: settings.publisher.origin_host_header_override.clone(),
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
         })

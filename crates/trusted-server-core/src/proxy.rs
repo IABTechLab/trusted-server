@@ -1058,6 +1058,7 @@ pub async fn handle_asset_proxy_request(
             scheme: scheme.to_string(),
             host: host.to_string(),
             port: target_url.port(),
+            host_header_override: None,
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         })
@@ -1241,6 +1242,7 @@ async fn proxy_with_redirects(
                 scheme: scheme.clone(),
                 host: host.to_string(),
                 port: parsed_url.port(),
+                host_header_override: None,
                 certificate_check: settings.proxy.certificate_check,
                 first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             })
