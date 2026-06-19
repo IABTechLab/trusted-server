@@ -699,8 +699,10 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
-    /// Mark this integration's JS module for deferred loading via
-    /// `<script defer>` instead of the main synchronous bundle.
+    /// Mark this integration's JS module for split loading outside the main bundle.
+    ///
+    /// Split modules usually load with `defer`, but the script tag policy can
+    /// choose synchronous loading for modules with bootstrap ordering needs.
     #[must_use]
     pub fn with_deferred_js(mut self) -> Self {
         self.registration.js_deferred = true;
@@ -1156,11 +1158,11 @@ impl IntegrationRegistry {
             .collect()
     }
 
-    /// Return JS module IDs that should be loaded with `<script defer>`.
+    /// Return JS module IDs that should be loaded as split scripts.
     ///
     /// Only includes modules registered with
     /// [`with_deferred_js`](IntegrationRegistrationBuilder::with_deferred_js)
-    /// that are actually enabled. Returns an empty vec when no deferred
+    /// that are actually enabled. Returns an empty vec when no split
     /// integrations are configured.
     #[must_use]
     pub fn js_module_ids_deferred(&self) -> Vec<&'static str> {

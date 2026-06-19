@@ -38,25 +38,39 @@ pub fn tsjs_unified_script_tag() -> String {
     tsjs_script_tag(&ids)
 }
 
-/// `/static` URL for a single deferred module with its own cache-busting hash.
+/// `/static` URL for a single split module with its own cache-busting hash.
 #[must_use]
 pub fn tsjs_deferred_script_src(module_id: &str) -> String {
     let hash = single_module_hash(module_id).unwrap_or_default();
     format!("/static/tsjs=tsjs-{module_id}.min.js?v={hash}")
 }
 
-/// `<script defer>` tag for a single deferred module.
+/// Return true when a split module must execute synchronously after the main bundle.
+fn tsjs_split_module_loads_synchronously(module_id: &str) -> bool {
+    module_id == "prebid"
+}
+
+/// `<script>` tag for a single split module.
+///
+/// Most split modules use `defer`, but Prebid must execute synchronously after
+/// the main TSJS bundle so publisher ad code observes the TSJS-owned `pbjs`
+/// before attempting legacy Prebid bundle loading.
 #[must_use]
 pub fn tsjs_deferred_script_tag(module_id: &str) -> String {
+    let defer_attr = if tsjs_split_module_loads_synchronously(module_id) {
+        ""
+    } else {
+        " defer"
+    };
     format!(
-        "<script src=\"{}\" defer></script>",
+        "<script src=\"{}\"{defer_attr}></script>",
         tsjs_deferred_script_src(module_id)
     )
 }
 
-/// Generate all deferred `<script defer>` tags for the given module IDs.
+/// Generate all split module `<script>` tags for the given module IDs.
 ///
-/// Returns an empty string when no deferred modules are present.
+/// Returns an empty string when no split modules are present.
 #[must_use]
 pub fn tsjs_deferred_script_tags(module_ids: &[&str]) -> String {
     module_ids
@@ -201,13 +215,24 @@ mod tests {
     }
 
     #[test]
-    fn tsjs_deferred_script_tag_marks_script_defer() {
+    fn tsjs_deferred_script_tag_loads_prebid_synchronously() {
         let src = tsjs_deferred_script_src("prebid");
 
         assert_eq!(
             tsjs_deferred_script_tag("prebid"),
+            format!("<script src=\"{src}\"></script>"),
+            "should generate a synchronous prebid script tag"
+        );
+    }
+
+    #[test]
+    fn tsjs_deferred_script_tag_marks_other_split_modules_defer() {
+        let src = tsjs_deferred_script_src("creative");
+
+        assert_eq!(
+            tsjs_deferred_script_tag("creative"),
             format!("<script src=\"{src}\" defer></script>"),
-            "should generate a deferred script tag"
+            "should defer non-prebid split module script tags"
         );
     }
 

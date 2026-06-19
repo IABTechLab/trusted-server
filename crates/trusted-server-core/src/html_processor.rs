@@ -232,11 +232,11 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                     for insert in integrations.head_inserts(&ctx) {
                         snippet.push_str(&insert);
                     }
-                    // Main bundle: core + non-deferred integrations (synchronous).
+                    // Main bundle: core + non-split integrations (synchronous).
                     let immediate_ids = integrations.js_module_ids_immediate();
                     snippet.push_str(&tsjs::tsjs_script_tag(&immediate_ids));
-                    // Deferred bundles: large modules like prebid loaded after
-                    // HTML parsing completes. Empty when none are enabled.
+                    // Split bundles: large modules like prebid load outside the
+                    // main bundle. Empty when none are enabled.
                     let deferred_ids = integrations.js_module_ids_deferred();
                     snippet.push_str(&tsjs::tsjs_deferred_script_tags(&deferred_ids));
                     el.prepend(&snippet, ContentType::Html);

@@ -1993,7 +1993,7 @@ passphrase = "test-secret-key-32-bytes-minimum"
         );
         assert!(
             processed.contains("tsjs-prebid.min.js"),
-            "Deferred prebid bundle should be injected"
+            "Split prebid bundle should be injected"
         );
     }
 
