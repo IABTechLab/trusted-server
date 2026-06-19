@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Request, Response, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -122,10 +122,11 @@ where
 /// `Transfer-Encoding` header since the buffered body is no longer chunked.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
+    method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response(publisher_response, settings, registry)?;
+    let mut response = buffer_publisher_response(publisher_response, method, settings, registry)?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
     Ok(response)
 }
@@ -149,9 +150,41 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the Cloudflare adapter.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
+
+/// HTTP methods the publisher fallback proxies, mirroring the Axum/Fastly
+/// adapters so a transparent edge proxy handles HEAD, CORS preflights, and
+/// non-GET/POST API calls rather than rejecting them.
+fn publisher_fallback_methods() -> [Method; 7] {
+    [
+        Method::GET,
+        Method::POST,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+    ]
+}
 
 /// Returns a [`RouterService`] that responds to every route with the startup error.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
@@ -171,15 +204,14 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         }
     };
 
-    RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::new(
-            Settings::default(),
-        )))
-        .get("/", make(Arc::clone(&message)))
-        .post("/", make(Arc::clone(&message)))
-        .get("/{*rest}", make(Arc::clone(&message)))
-        .post("/{*rest}", make(Arc::clone(&message)))
-        .build()
+    let mut router = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
+        Arc::new(Settings::default()),
+    ));
+    for method in publisher_fallback_methods() {
+        router = router.route("/", method.clone(), make(Arc::clone(&message)));
+        router = router.route("/{*rest}", method, make(Arc::clone(&message)));
+    }
+    router.build()
 }
 
 // ---------------------------------------------------------------------------
@@ -234,12 +266,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         async fn dispatch(
             state: Arc<AppState>,
             ctx: RequestContext,
-            allow_tsjs: bool,
         ) -> Result<Response, EdgeError> {
             let services = build_per_request_services(&ctx);
             let req = ctx.into_request();
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
+            // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
+            let allow_tsjs = method == Method::GET;
 
             let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
                 handle_tsjs_dynamic(&req, &state.registry)
@@ -265,28 +298,23 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 handle_publisher_request(&state.settings, &state.registry, &services, req)
                     .await
-                    .and_then(|pr| resolve_publisher_response(pr, &state.settings, &state.registry))
+                    .and_then(|pr| {
+                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
+                    })
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))
         }
 
-        let get_fallback = {
+        let fallback = {
             let s = Arc::clone(&state);
             move |ctx: RequestContext| {
                 let s = Arc::clone(&s);
-                dispatch(s, ctx, true)
-            }
-        };
-        let post_fallback = {
-            let s = Arc::clone(&state);
-            move |ctx: RequestContext| {
-                let s = Arc::clone(&s);
-                dispatch(s, ctx, false)
+                dispatch(s, ctx)
             }
         };
 
-        RouterService::builder()
+        let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
             .get(
@@ -305,11 +333,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
             //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
-            // registered: the production handler regex `^/_ts/admin` does not match
-            // them, so registering them as admin routes would expose the key
-            // handlers to unauthenticated callers. Unrouted, they fall through to
-            // the publisher fallback like any other unknown path.
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally
+            // with a 404: the production handler regex `^/_ts/admin` does not match
+            // them, and letting them fall through to the publisher fallback would
+            // forward the caller's `Authorization` header and key-management payload
+            // to the origin, leaking admin credentials.
             .post(
                 "/_ts/admin/keys/rotate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -320,6 +348,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 "/_ts/admin/keys/deactivate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_deactivate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/admin/keys/rotate",
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(legacy_admin_alias_denied())
+                }),
+            )
+            .post(
+                "/admin/keys/deactivate",
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(legacy_admin_alias_denied())
                 }),
             )
             .post(
@@ -367,11 +407,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
-            )
-            .get("/", get_fallback.clone())
-            .post("/", post_fallback.clone())
-            .get("/{*rest}", get_fallback)
-            .post("/{*rest}", post_fallback)
-            .build()
+            );
+
+        for method in publisher_fallback_methods() {
+            router = router.route("/", method.clone(), fallback.clone());
+            router = router.route("/{*rest}", method, fallback.clone());
+        }
+
+        router.build()
     }
 }

@@ -119,7 +119,7 @@ impl EcKvStore for FastlyEcKvStore {
                 store_name: self.store_name.clone(),
                 message: format!(
                     "Failed to list keys with prefix '{}'",
-                    &prefix[..prefix.len().min(8)],
+                    prefix.get(..8).unwrap_or(prefix),
                 ),
             })?;
 

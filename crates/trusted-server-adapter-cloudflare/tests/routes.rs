@@ -118,6 +118,34 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+    // Regression for the credential-leak finding: the production basic-auth regex
+    // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
+    // auth-gated. A POST carrying an `Authorization` header must be denied locally
+    // with 404, never proxied to the publisher origin (which would leak the admin
+    // credentials and key body). A publisher-fallback proxy without a backend
+    // would surface as a 5xx, so 404 proves the local deny ran.
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        let router = test_router();
+        let req = request_builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header("content-type", "application/json")
+            .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
+            .expect("should build authorized legacy-alias request");
+
+        let resp = router.oneshot(req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "legacy {path} with Authorization must be denied locally (404), not proxied to publisher"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route smoke tests — verify all adapter routes are registered and do not 5xx
 // ---------------------------------------------------------------------------
@@ -149,6 +177,8 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
+        ("POST", "/admin/keys/rotate"),
+        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),

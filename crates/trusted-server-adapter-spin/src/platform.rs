@@ -702,6 +702,12 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            // Spin's HTTP trigger does not expose TLS fingerprint or edge-server
+            // metadata to the guest, so these stay unset.
+            tls_ja4: None,
+            h2_fingerprint: None,
+            server_hostname: None,
+            server_region: None,
         })
         .build()
 }

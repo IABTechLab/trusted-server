@@ -70,6 +70,12 @@ toml = { workspace = true }
 url = { workspace = true }
 validator = { workspace = true }
 
+[features]
+default = []
+# Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
+# so downstream crates can build registries with stub integrations in their tests.
+test-utils = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }

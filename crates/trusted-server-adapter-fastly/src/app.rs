@@ -84,7 +84,9 @@ use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HandlerFuture, HeaderValue, Method, Request, Response};
+use edgezero_core::http::{
+    header, HandlerFuture, HeaderValue, Method, Request, Response, StatusCode,
+};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -99,20 +101,24 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::integrations::{
+    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome,
+};
+use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
+    AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
-use trusted_server_core::settings::Settings;
+use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -165,9 +171,11 @@ pub(crate) fn build_state_from_settings(
 /// Resolves per-request consent KV store services for routes that read consent data.
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// matches the legacy `route_request` behavior where a misconfigured consent store
-/// makes consent-dependent routes unavailable rather than proceeding without consent.
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
+/// intentional hardening over the legacy `route_request` path, which builds
+/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
+/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
+/// routes unavailable rather than proceeding without consent.
 ///
 /// # Errors
 ///
@@ -228,6 +236,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             client_ip,
             tls_protocol,
             tls_cipher,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -287,6 +296,10 @@ struct EcRequestState {
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
     services: RuntimeServices,
+    /// Geo lookup result reused by the pre-route request-filter step so it does
+    /// not repeat the lookup the legacy path also shares between EC setup and
+    /// filtering.
+    geo_info: Option<GeoInfo>,
     /// Error from [`EcContext`] creation. When set, handlers return this as
     /// the response without running the route handler (legacy parity: the
     /// legacy path short-circuits with an error response and a default
@@ -309,9 +322,11 @@ impl EcRequestState {
 
 /// Derives device signals from the request's `User-Agent` header.
 ///
-/// TLS and H2 fingerprints are unavailable in the `EdgeZero` request context
-/// (see module docs), so classification is UA-only on this path — matching
-/// the signals the legacy path effectively had after request conversion.
+/// Used as the fallback when no entry-point-captured [`DeviceSignals`] are
+/// present in the request extensions (see [`device_signals_for`]). TLS and H2
+/// fingerprints cannot be reconstructed from the `EdgeZero` request, so this
+/// fallback is UA-only — matching the signals the legacy path effectively had
+/// after request conversion.
 fn derive_request_device_signals(req: &Request) -> DeviceSignals {
     let user_agent = req
         .headers()
@@ -321,6 +336,22 @@ fn derive_request_device_signals(req: &Request) -> DeviceSignals {
     DeviceSignals::derive(user_agent, None, None)
 }
 
+/// Returns the device signals for an `EdgeZero` request.
+///
+/// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
+/// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
+/// real values — and stores them in the request extensions. Reading them back
+/// here preserves the bot gate's browser classification, which the `EdgeZero`
+/// request cannot expose on its own. Falls back to UA-only
+/// [`derive_request_device_signals`] when the extension is absent (e.g. in
+/// tests that dispatch without the entry point).
+fn device_signals_for(req: &Request) -> DeviceSignals {
+    req.extensions()
+        .get::<DeviceSignals>()
+        .cloned()
+        .unwrap_or_else(|| derive_request_device_signals(req))
+}
+
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
@@ -328,7 +359,7 @@ fn build_ec_request_state(
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
-    let device_signals = derive_request_device_signals(req);
+    let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
         log::info!(
@@ -380,6 +411,7 @@ fn build_ec_request_state(
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),
+        geo_info,
         setup_error,
     }
 }
@@ -388,30 +420,111 @@ fn build_ec_request_state(
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Result of the pre-route integration request-filter step.
+enum PreRoute {
+    /// A filter elected to respond (or errored); return this response without
+    /// running the route handler. Carries the accumulated response effects.
+    ShortCircuit {
+        response: Response,
+        effects: RequestFilterEffects,
+    },
+    /// Continue to the route handler; apply these response effects afterward.
+    Continue { effects: RequestFilterEffects },
+}
+
+/// Runs the integration request-filter pipeline before route dispatch.
+///
+/// Mirrors the legacy `route_request` ordering: filters run after auth
+/// (`AuthMiddleware` on this path) and before route matching. Request header
+/// mutations are applied to `req` so the routed handler observes them; response
+/// effects are returned for the entry point to apply after EC finalization. A
+/// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
+async fn run_pre_route_filters(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &mut Request,
+    geo_info: Option<&GeoInfo>,
+) -> PreRoute {
+    match state
+        .registry
+        .filter_request(RequestFilterRegistryInput {
+            settings: &state.settings,
+            services,
+            req,
+            geo_info,
+        })
+        .await
+    {
+        Ok(RequestFilterRegistryOutcome::Continue(effects)) => PreRoute::Continue { effects },
+        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => PreRoute::ShortCircuit {
+            response: *response,
+            effects,
+        },
+        Err(report) => {
+            log::error!("Failed to run integration request filters: {report:?}");
+            PreRoute::ShortCircuit {
+                response: http_error(&report),
+                effects: RequestFilterEffects::default(),
+            }
+        }
+    }
+}
+
+/// Attaches the EC finalize state and any non-empty request-filter response
+/// effects to a dispatched response via extensions, so `edgezero_main` can run
+/// EC finalization and apply the filter effects after it (legacy ordering).
+fn attach_dispatch_extensions(
+    mut response: Response,
+    ec: EcRequestState,
+    effects: RequestFilterEffects,
+) -> Response {
+    response.extensions_mut().insert(ec.into_finalize_state());
+    if !effects.response_headers.is_empty() {
+        response.extensions_mut().insert(effects);
+    }
+    response
+}
+
 async fn execute_named(
     state: Arc<AppState>,
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let req = ctx.into_request();
+    let mut req = ctx.into_request();
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
-    // legacy route_request.
+    // legacy route_request. Batch-sync also skips request filters, matching
+    // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
         return Ok(run_batch_sync(&state, &services, req));
     }
 
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
-    let mut response = match ec.setup_error.take() {
-        Some(report) => http_error(&report),
-        None => run_named_route(&state, &services, req, handler, &mut ec)
-            .await
-            .unwrap_or_else(|e| http_error(&e)),
-    };
-    response.extensions_mut().insert(ec.into_finalize_state());
-    Ok(response)
+    // EcContext creation errors short-circuit before filters, mirroring legacy:
+    // the legacy path returns its error response before running filter_request.
+    if let Some(report) = ec.setup_error.take() {
+        let response = http_error(&report);
+        return Ok(attach_dispatch_extensions(
+            response,
+            ec,
+            RequestFilterEffects::default(),
+        ));
+    }
+
+    let effects =
+        match run_pre_route_filters(&state, &services, &mut req, ec.geo_info.as_ref()).await {
+            PreRoute::ShortCircuit { response, effects } => {
+                return Ok(attach_dispatch_extensions(response, ec, effects));
+            }
+            PreRoute::Continue { effects } => effects,
+        };
+
+    let response = run_named_route(&state, &services, req, handler, &mut ec)
+        .await
+        .unwrap_or_else(|e| http_error(&e));
+    Ok(attach_dispatch_extensions(response, ec, effects))
 }
 
 async fn run_named_route(
@@ -430,6 +543,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
             unreachable!("batch-sync should be handled by run_batch_sync")
@@ -490,7 +604,7 @@ async fn run_named_route(
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
-    let device_signals = derive_request_device_signals(&req);
+    let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
@@ -524,16 +638,29 @@ async fn execute_fallback(
     Ok(dispatch_fallback(&state, &services, req).await)
 }
 
-async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
+async fn dispatch_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    mut req: Request,
+) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
     if let Some(report) = ec.setup_error.take() {
-        let mut response = http_error(&report);
-        response.extensions_mut().insert(ec.into_finalize_state());
-        return response;
+        let response = http_error(&report);
+        return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
     }
+
+    // Pre-route integration request filters (DataDome protection, etc.) run
+    // before the route-type decision, matching legacy `route_request` ordering.
+    let effects = match run_pre_route_filters(state, services, &mut req, ec.geo_info.as_ref()).await
+    {
+        PreRoute::ShortCircuit { response, effects } => {
+            return attach_dispatch_extensions(response, ec, effects);
+        }
+        PreRoute::Continue { effects } => effects,
+    };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
         handle_tsjs_dynamic(&req, &state.registry)
@@ -560,6 +687,18 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
                 }))
             })
     } else {
+        // Asset-route fallback (GET/HEAD), mirroring the legacy catch-all arm:
+        // matched asset paths proxy to the configured asset origin instead of the
+        // publisher origin. Must be checked after tsjs/integration routes and
+        // before the publisher fallback. Asset responses skip EC finalization
+        // (no EcFinalizeState attached), matching legacy's `should_finalize_ec = false`.
+        let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+            .then(|| state.settings.asset_route_for_path(&path))
+            .flatten();
+        if let Some(asset_route) = matched_asset_route {
+            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
+        }
+
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
@@ -580,16 +719,136 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
                 handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
                     .await
                     .and_then(|pub_response| {
-                        buffer_publisher_response(pub_response, &state.settings, &state.registry)
+                        buffer_publisher_response(
+                            pub_response,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                        )
                     })
             }
             Err(e) => Err(e),
         }
     };
 
-    let mut response = result.unwrap_or_else(|e| http_error(&e));
-    response.extensions_mut().insert(ec.into_finalize_state());
-    response
+    let response = result.unwrap_or_else(|e| http_error(&e));
+    attach_dispatch_extensions(response, ec, effects)
+}
+
+/// Returns `true` when an asset response should carry a buffered body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
+/// representation length in their `Content-Length` header while carrying no
+/// body. Rewriting that header to the buffered byte count (0) would corrupt the
+/// metadata, so those responses keep the origin's `Content-Length` untouched.
+fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
+/// Handles the asset-route fallback on the `EdgeZero` path, mirroring the legacy
+/// `route_request` asset branch.
+///
+/// Proxies the request to the configured asset origin and threads the
+/// [`AssetProxyCachePolicy`] out via response extensions so `edgezero_main`
+/// can reapply protected cache directives after finalization. EC finalization
+/// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
+/// legacy `should_finalize_ec = false` behavior for asset responses.
+///
+/// Unlike legacy `route_request`, which streams asset bodies straight to the
+/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
+/// converts the whole response before sending, so there is no streaming seam
+/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
+/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
+/// uncapped streaming are both resolved by the streaming cutover (issue #495);
+/// whether assets get a dedicated cap is deferred to that work.
+async fn dispatch_asset_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    asset_route: &ProxyAssetRoute,
+    effects: &RequestFilterEffects,
+) -> Response {
+    log::info!("No explicit route matched; proxying via configured asset route");
+
+    let method = req.method().clone();
+
+    match handle_asset_proxy_request(&state.settings, services, req, asset_route).await {
+        Ok(asset_response) => {
+            let cache_policy = asset_response.cache_policy();
+            let (mut response, stream_body) = asset_response.into_response_and_body();
+
+            if let Some(body) = stream_body {
+                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
+                    .await
+                {
+                    Ok(bytes) => {
+                        // Preserve the origin's Content-Length for HEAD and
+                        // bodiless statuses; only body-bearing responses get a
+                        // recomputed length and the buffered body attached.
+                        if asset_response_carries_body(&method, response.status()) {
+                            response.headers_mut().insert(
+                                header::CONTENT_LENGTH,
+                                HeaderValue::from(bytes.len() as u64),
+                            );
+                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
+                        }
+                    }
+                    Err(report) => {
+                        let mut response = http_error(&report);
+                        response
+                            .extensions_mut()
+                            .insert(AssetProxyCachePolicy::NoStorePrivate);
+                        attach_request_filter_effects(&mut response, effects);
+                        return response;
+                    }
+                }
+            }
+
+            response.extensions_mut().insert(cache_policy);
+            attach_request_filter_effects(&mut response, effects);
+            response
+        }
+        Err(report) => {
+            let mut response = http_error(&report);
+            response
+                .extensions_mut()
+                .insert(AssetProxyCachePolicy::NoStorePrivate);
+            attach_request_filter_effects(&mut response, effects);
+            response
+        }
+    }
+}
+
+/// Attaches non-empty request-filter response effects to an asset response.
+///
+/// Asset responses skip EC finalization but still carry filter effects so the
+/// entry point applies them after finalization, matching the legacy asset
+/// streaming path which applies `request_filter_effects` to every asset
+/// response.
+fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilterEffects) {
+    if !effects.response_headers.is_empty() {
+        response.extensions_mut().insert(effects.clone());
+    }
+}
+
+/// Buffers a streaming asset body into memory, bounded by `max_bytes`
+/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
+/// [`dispatch_asset_fallback`]).
+///
+/// # Errors
+///
+/// Returns an error if the body exceeds the configured cap or the underlying
+/// stream yields an error.
+async fn buffer_asset_body(
+    body: edgezero_core::body::Body,
+    max_bytes: usize,
+) -> Result<Vec<u8>, Report<TrustedServerError>> {
+    let mut output = BoundedWriter::new(max_bytes);
+    stream_asset_body(body, &mut output).await?;
+    Ok(output.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +867,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the `EdgeZero` path.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -658,6 +934,9 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
+    /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
+    /// reach the publisher fallback (which would leak admin credentials).
+    LegacyAdminDenied,
     BatchSync,
     Identify,
     Auction,
@@ -694,11 +973,21 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
     },
-    // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
-    // registered: the production basic-auth handler regex `^/_ts/admin` does not
-    // match them, so registering them as admin routes would expose the key
-    // handlers to unauthenticated callers. Unrouted, they fall through to the
-    // organic/publisher path like any other unknown route.
+    // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
+    // 404 instead of executing key operations: the production basic-auth handler
+    // regex `^/_ts/admin` does not match them, and letting them fall through to
+    // the publisher fallback would forward the caller's `Authorization` header
+    // and key-management payload to the origin, leaking admin credentials.
+    NamedRoute {
+        path: "/admin/keys/rotate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::LegacyAdminDenied,
+    },
+    NamedRoute {
+        path: "/admin/keys/deactivate",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::LegacyAdminDenied,
+    },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
         primary_methods: &[Method::POST],
@@ -824,13 +1113,13 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_per_request_services, build_state_from_settings, startup_error_router, AppState,
-        TrustedServerApp, NAMED_ROUTES,
-    };
-
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use super::{
+        build_per_request_services, build_state_from_settings, startup_error_router, AppState,
+        NamedRouteHandler, TrustedServerApp, NAMED_ROUTES,
+    };
 
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
@@ -841,7 +1130,12 @@ mod tests {
     use futures::executor::block_on;
     use serde_json::json;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
+    use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
+        RequestFilterEffects, RequestFilterInput,
+    };
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1007,8 +1301,8 @@ mod tests {
         );
     }
 
-    fn test_router() -> RouterService {
-        let settings = Settings::from_toml(
+    fn test_settings() -> Settings {
+        Settings::from_toml(
             r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -1044,9 +1338,79 @@ mod tests {
             timeout_ms = 2000
             "#,
         )
-        .expect("should parse test settings");
-        let state = build_state_from_settings(settings).expect("should build test state");
+        .expect("should parse test settings")
+    }
+
+    fn test_router() -> RouterService {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Builds a router whose `AppState` uses a registry containing the given
+    /// request filters (and no routes), so dispatch-level request-filter
+    /// behavior can be exercised without a real integration.
+    fn router_with_request_filters(
+        filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    ) -> RouterService {
+        let settings = test_settings();
+        let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
+            .expect("should build orchestrator");
+        let registry = IntegrationRegistry::from_request_filters(filters);
+        let default_kv_store =
+            Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        let state = Arc::new(super::AppState {
+            settings: Arc::new(settings),
+            orchestrator: Arc::new(orchestrator),
+            registry: Arc::new(registry),
+            default_kv_store,
+        });
+        TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Continues routing while mutating the request and emitting a response
+    /// header effect — mirrors `DataDome`'s allow path.
+    struct RecordingRequestFilter;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for RecordingRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: vec![HeaderMutation::set("x-filter-ran", "1")],
+                response_headers: vec![HeaderMutation::set("x-filter-effect", "applied")],
+            }))
+        }
+    }
+
+    /// Short-circuits routing with a 403 — mirrors a `DataDome` challenge/block.
+    struct ChallengeRequestFilter;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for ChallengeRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "challenge"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            let mut response = edgezero_core::http::Response::new(Body::from("blocked"));
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            Ok(RequestFilterDecision::Respond {
+                response: Box::new(response),
+                effects: RequestFilterEffects {
+                    request_headers: Vec::new(),
+                    response_headers: vec![HeaderMutation::set("x-challenge", "1")],
+                },
+            })
+        }
     }
 
     #[test]
@@ -1103,6 +1467,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn asset_response_carries_body_preserves_bodiless_content_length() {
+        // GET/200 buffers a body and recomputes Content-Length.
+        assert!(
+            super::asset_response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 asset response should carry a buffered body"
+        );
+        // HEAD advertises the origin representation length with no body — the
+        // recomputed (zero) length must not overwrite it.
+        assert!(
+            !super::asset_response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD asset responses must preserve the origin Content-Length"
+        );
+        // Bodiless statuses keep their origin metadata regardless of method.
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must preserve the origin Content-Length"
+        );
+        assert!(
+            !super::asset_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must preserve the origin Content-Length"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Full EdgeZero dispatch-path tests
     // ---------------------------------------------------------------------------
@@ -1141,34 +1529,98 @@ mod tests {
     }
 
     #[test]
-    fn legacy_admin_aliases_are_not_registered_admin_routes() {
-        // Security guard for the legacy non-`/_ts` admin aliases. AuthMiddleware
-        // authorizes by matching the configured handler regex against the request
-        // path, and the production regex `^/_ts/admin` does not match
-        // `/admin/keys/*`. So the legacy aliases must not appear in the named-route
-        // table — registering them would let unauthenticated callers reach the key
-        // rotate/deactivate handlers. Only the canonical `/_ts/admin/keys/*` paths
-        // are registered admin routes; the legacy aliases fall through to the
-        // publisher fallback like any other unrouted path. (Canonical auth-gating
-        // is covered by `dispatch_auth_rejected_401_carries_finalize_headers`.)
-        let registered: Vec<&str> = NAMED_ROUTES.iter().map(|route| route.path).collect();
+    fn legacy_admin_aliases_route_to_local_deny_not_key_handlers() {
+        // Security guard for the legacy non-`/_ts` admin aliases. They must be
+        // registered to the local `LegacyAdminDenied` 404 handler — not the
+        // rotate/deactivate key handlers, and not left unrouted. Leaving them
+        // unrouted would fall through to the publisher fallback, which forwards
+        // the request (including the `Authorization` header and key-management
+        // payload) to the origin, leaking admin credentials. Mapping them to the
+        // key handlers would expose key operations, since the production
+        // basic-auth regex `^/_ts/admin` does not match `/admin/keys/*`.
+        let handler_for = |path: &str| {
+            NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .map(|route| route.handler)
+        };
 
         assert!(
-            registered.contains(&"/_ts/admin/keys/rotate"),
-            "canonical /_ts/admin/keys/rotate must be a registered admin route"
+            matches!(
+                handler_for("/_ts/admin/keys/rotate"),
+                Some(NamedRouteHandler::RotateKey)
+            ),
+            "canonical /_ts/admin/keys/rotate must map to the rotate handler"
         );
         assert!(
-            registered.contains(&"/_ts/admin/keys/deactivate"),
-            "canonical /_ts/admin/keys/deactivate must be a registered admin route"
+            matches!(
+                handler_for("/_ts/admin/keys/deactivate"),
+                Some(NamedRouteHandler::DeactivateKey)
+            ),
+            "canonical /_ts/admin/keys/deactivate must map to the deactivate handler"
         );
         assert!(
-            !registered.contains(&"/admin/keys/rotate"),
-            "legacy /admin/keys/rotate must not be registered (would bypass `^/_ts/admin` auth)"
+            matches!(
+                handler_for("/admin/keys/rotate"),
+                Some(NamedRouteHandler::LegacyAdminDenied)
+            ),
+            "legacy /admin/keys/rotate must map to the local deny handler, not the key handler"
         );
         assert!(
-            !registered.contains(&"/admin/keys/deactivate"),
-            "legacy /admin/keys/deactivate must not be registered (would bypass `^/_ts/admin` auth)"
+            matches!(
+                handler_for("/admin/keys/deactivate"),
+                Some(NamedRouteHandler::LegacyAdminDenied)
+            ),
+            "legacy /admin/keys/deactivate must map to the local deny handler, not the key handler"
         );
+    }
+
+    #[test]
+    fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+        // Regression for the credential-leak finding: with a production-shaped
+        // config (only `^/_ts/admin` is auth-gated, so `/admin/keys/*` is NOT
+        // matched by any handler), a POST to a legacy alias carrying an
+        // `Authorization` header must be denied locally with 404 — never proxied
+        // to the publisher origin (which would leak the admin credentials and the
+        // key-management body). A publisher-fallback proxy without a backend would
+        // surface as a 5xx, so a 404 proves the deny route ran instead.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse production-shaped settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+            let req = request_builder()
+                .method(Method::POST)
+                .uri(format!("https://test-publisher.com{path}"))
+                .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .body(Body::from("{\"key_id\":\"leak-me\"}"))
+                .expect("should build authorized legacy-alias request");
+
+            let response = block_on(router.oneshot(req));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "POST {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
     }
 
     #[test]
@@ -1233,6 +1685,54 @@ mod tests {
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
             "publisher fallback responses should carry EcFinalizeState for entry-point EC finalization"
+        );
+    }
+
+    #[test]
+    fn browser_device_signals_from_extension_reach_ec_finalize_state() {
+        // Regression guard for the EdgeZero JA4/H2 signal loss: `edgezero_main`
+        // derives DeviceSignals from the original FastlyRequest (the only place
+        // get_tls_ja4/get_client_h2_fingerprint return real values) and stores
+        // them in the request extensions. A browser-shaped signal must survive
+        // dispatch so the EC bot gate classifies the request as a real browser
+        // and keeps the KV-backed generation/finalize path active.
+        let router = test_router();
+        let mut req = empty_request(Method::GET, "/some-page");
+        req.extensions_mut().insert(DeviceSignals::derive(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        ));
+
+        let response = block_on(router.oneshot(req));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            finalize.is_real_browser,
+            "browser-shaped JA4/H2 signals from the request extension must mark the request as a real browser"
+        );
+    }
+
+    #[test]
+    fn missing_device_signals_extension_classifies_as_non_browser() {
+        // Without the entry-point-captured signals, the reconstructed request
+        // cannot expose JA4/H2, so the bot gate falls back to non-browser. This
+        // documents the regression the extension threading fixes: the same
+        // request that looks like a browser above is treated as a bot here.
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        let finalize = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("fallback response should carry EcFinalizeState");
+        assert!(
+            !finalize.is_real_browser,
+            "a request without captured device signals should not be classified as a real browser"
         );
     }
 
@@ -1370,6 +1870,123 @@ mod tests {
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "integration routes should be unaffected by a missing consent KV store"
+        );
+    }
+
+    #[test]
+    fn dispatch_fallback_asset_route_skips_ec_finalization() {
+        // Parity guard for the configured asset-route fallback: a GET matching a
+        // proxy.asset_routes prefix must dispatch through the asset proxy (not the
+        // publisher fallback) and skip EC finalization. Without a live asset
+        // backend the proxy errors, but the response must carry the asset cache
+        // policy and must NOT carry an EcFinalizeState — proving the asset branch
+        // ran instead of the publisher fallback (which always attaches one).
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.image/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+
+        assert!(
+            response
+                .extensions()
+                .get::<trusted_server_core::proxy::AssetProxyCachePolicy>()
+                .is_some(),
+            "asset-route responses should carry the asset cache policy"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_none(),
+            "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
+    #[test]
+    fn dispatch_runs_request_filter_and_threads_response_effects() {
+        // Regression guard for the EdgeZero request-filter bypass: the publisher
+        // fallback must run the integration request-filter pipeline (DataDome
+        // protection registers here) and thread the filter's response effects out
+        // via extensions so the entry point applies them after EC finalization.
+        // Without a live backend the publisher proxy errors, but the response must
+        // still carry the RequestFilterEffects the filter emitted — proving the
+        // filter ran on the dispatch path.
+        let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        let effects = response
+            .extensions()
+            .get::<RequestFilterEffects>()
+            .expect("dispatched response should carry request-filter effects");
+        assert!(
+            effects
+                .response_headers
+                .iter()
+                .any(|m| m.name == "x-filter-effect"),
+            "the filter's response-header effect must be threaded out for the entry point to apply"
+        );
+    }
+
+    #[test]
+    fn dispatch_short_circuits_when_request_filter_responds() {
+        // Regression guard: a request filter that responds (a DataDome
+        // challenge/block) must short-circuit routing before the publisher
+        // fallback, return its own response, still carry EcFinalizeState (legacy
+        // parity: Respond keeps EC finalization), and thread its response effects.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a filter Respond must short-circuit routing with its own response"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_some(),
+            "a short-circuit filter response should still carry EcFinalizeState (legacy parity)"
+        );
+        let effects = response
+            .extensions()
+            .get::<RequestFilterEffects>()
+            .expect("short-circuit response should carry request-filter effects");
+        assert!(
+            effects
+                .response_headers
+                .iter()
+                .any(|m| m.name == "x-challenge"),
+            "the filter's response-header effect must be threaded out"
         );
     }
 }

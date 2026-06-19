@@ -83,10 +83,11 @@ fn build_state_with_settings(
 /// origin response fails safely instead of exhausting the Wasm heap.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
+    method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response(publisher_response, settings, registry)
+    buffer_publisher_response(publisher_response, method, settings, registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +565,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 handle_publisher_request(&state.settings, &state.registry, &services, req)
                     .await
-                    .and_then(|pr| resolve_publisher_response(pr, &state.settings, &state.registry))
+                    .and_then(|pr| {
+                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
+                    })
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))

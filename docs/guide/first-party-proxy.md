@@ -25,9 +25,11 @@ flowchart TD
 
 ## Core Endpoints
 
-### `/first-party/proxy` - Asset Proxy
+### `/first-party/proxy` - Signed Asset Proxy
 
 Proxies third-party assets with automatic HTML/CSS rewriting.
+
+For publisher-owned asset paths that should route directly to a configured origin without `tstoken`, use [Asset Routes](/guide/asset-routes). Asset routes support path-prefix matching, private S3 origins, and Fastly Image Optimizer profile tables.
 
 **Request**:
 
@@ -57,7 +59,7 @@ GET /first-party/proxy?tsurl=https://example.com/ad.html&tstoken=signature
 4. **Processes** response based on content type:
    - **HTML** (`text/html`) - Rewrites all URLs, returns `text/html`
    - **CSS** (`text/css`) - Rewrites `url()` values, returns `text/css`
-   - **Images** - Detects pixels, sets `image/*` if missing
+   - **Images** - Detects pixels, sets `application/octet-stream` if missing
    - **Other** - Passthrough without modification
 
 **Example**:
@@ -291,12 +293,12 @@ For the detailed signing algorithm, validation steps, and security notes, see [P
 
 **Triggers**:
 
-- Response `Content-Type: image/*`, OR
+- Response `Content-Type` starts with `image/`, OR
 - Request `Accept` header contains `image/`
 
 **Process**:
 
-1. Set `Content-Type: image/*` if missing
+1. Set `Content-Type: application/octet-stream` if missing
 2. Detect likely pixels with heuristics:
    - `Content-Length` ≤ 256 bytes
    - URL contains `/pixel`, `/p.gif`, `/1x1`, `/track`
@@ -423,6 +425,18 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-random-secret"
 ```
+
+### Asset Routes
+
+Use `[[proxy.asset_routes]]` when a first-party path prefix should proxy directly to another asset origin.
+
+```toml
+[[proxy.asset_routes]]
+prefix = "/assets/"
+origin_url = "https://assets.example.com"
+```
+
+Asset routes are intended for publisher-owned paths, not third-party creative URLs. They support optional path rewrites, private S3 origin signing, and Fastly Image Optimizer metadata. See [Asset Routes](/guide/asset-routes) for full configuration and operational guidance.
 
 ### Proxy Allowlist
 

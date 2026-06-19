@@ -12,6 +12,7 @@ use crate::constants::HEADER_X_TS_EC;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -245,14 +246,37 @@ impl IntegrationEndpoint {
 }
 
 /// Trait implemented by integration proxies that expose HTTP endpoints.
+///
+/// `Send + Sync` bounds are required so trait objects can be stored in
+/// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
+/// request context. The `?Send` on the async methods is intentional — see the
+/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
+/// the full explanation. On wasm32 these bounds are compatible because the runtime is
+/// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
     /// Integration identifier used for logging and optional URL namespace.
     /// Use this with the `namespaced_*` helper methods to automatically prefix routes.
     fn integration_name(&self) -> &'static str;
 
+    /// Returns the URL path prefix for this integration's proxy routes.
+    ///
+    /// Override this to provide a custom, customer-specific proxy path that is
+    /// harder for ad blockers to target. When not overridden, defaults to
+    /// `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn proxy_prefix(&self) -> String {
+    ///     "/my-custom-path".to_string()  // instead of /integrations/didomi
+    /// }
+    /// ```
+    fn proxy_prefix(&self) -> String {
+        format!("/integrations/{}", self.integration_name())
+    }
+
     /// Routes handled by this integration.
-    /// to automatically namespace routes under `/integrations/{integration_name()}/`,
+    /// to automatically namespace routes under the proxy prefix,
     /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
@@ -265,63 +289,227 @@ pub trait IntegrationProxy: Send + Sync {
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>>;
 
     /// Helper to create a namespaced GET endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.namespaced_get("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn get(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.post("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn post(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.put("/users")  // becomes /integrations/my_integration/users
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn put(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn delete(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn patch(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::patch(full_path)
+    }
+}
+
+/// Input passed to integration request filters.
+pub struct RequestFilterInput<'a> {
+    pub settings: &'a Settings,
+    pub services: &'a RuntimeServices,
+    pub request: &'a Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
+    /// Whether the request matches a registered integration proxy route.
+    pub is_integration_route: bool,
+}
+
+/// How a header mutation should be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderMutationMode {
+    Set,
+    Append,
+}
+
+/// Header mutation requested by an integration filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderMutation {
+    pub name: String,
+    pub value: String,
+    pub mode: HeaderMutationMode,
+}
+
+impl HeaderMutation {
+    #[must_use]
+    pub fn set(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            mode: HeaderMutationMode::Set,
+        }
+    }
+
+    #[must_use]
+    pub fn append(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            mode: HeaderMutationMode::Append,
+        }
+    }
+}
+
+/// Request and response effects returned by request filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFilterEffects {
+    pub request_headers: Vec<HeaderMutation>,
+    pub response_headers: Vec<HeaderMutation>,
+}
+
+impl RequestFilterEffects {
+    fn extend(&mut self, next: Self) {
+        self.request_headers.extend(next.request_headers);
+        self.response_headers.extend(next.response_headers);
+    }
+
+    fn apply_to_request(&self, req: &mut Request<EdgeBody>) {
+        for mutation in &self.request_headers {
+            apply_header_mutation_to_request(req, mutation);
+        }
+    }
+
+    pub fn apply_to_response(&self, response: &mut Response<EdgeBody>) {
+        for mutation in &self.response_headers {
+            apply_header_mutation_to_response(response, mutation);
+        }
+    }
+}
+
+/// Decision returned by an integration request filter.
+pub enum RequestFilterDecision {
+    Continue(RequestFilterEffects),
+    Respond {
+        response: Box<Response<EdgeBody>>,
+        effects: RequestFilterEffects,
+    },
+}
+
+/// Input passed to [`IntegrationRegistry::filter_request`].
+pub struct RequestFilterRegistryInput<'a> {
+    pub settings: &'a Settings,
+    pub services: &'a RuntimeServices,
+    pub req: &'a mut Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
+}
+
+/// Outcome returned by [`IntegrationRegistry::filter_request`].
+pub enum RequestFilterRegistryOutcome {
+    Continue(RequestFilterEffects),
+    Respond {
+        response: Box<Response<EdgeBody>>,
+        effects: RequestFilterEffects,
+    },
+}
+
+/// Trait for integration-provided pre-routing request filters.
+#[async_trait(?Send)]
+pub trait IntegrationRequestFilter: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+
+    /// Filter an incoming request before normal route matching.
+    async fn filter_request(
+        &self,
+        input: RequestFilterInput<'_>,
+    ) -> Result<RequestFilterDecision, Report<TrustedServerError>>;
+}
+
+fn is_forbidden_filter_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "host"
+    ) || lower.starts_with("x-ts-")
+}
+
+fn apply_header_mutation_to_request(req: &mut Request<EdgeBody>, mutation: &HeaderMutation) {
+    if is_forbidden_filter_header(&mutation.name) {
+        log::warn!(
+            "Skipping forbidden request-filter header: {}",
+            mutation.name
+        );
+        return;
+    }
+
+    let Ok(name) = http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
+        log::warn!("Skipping invalid request-filter header: {}", mutation.name);
+        return;
+    };
+    let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
+        log::warn!(
+            "Skipping invalid request-filter header value: {}",
+            mutation.name
+        );
+        return;
+    };
+
+    match mutation.mode {
+        HeaderMutationMode::Set => {
+            req.headers_mut().insert(name, value);
+        }
+        HeaderMutationMode::Append => {
+            req.headers_mut().append(name, value);
+        }
+    }
+}
+
+fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation: &HeaderMutation) {
+    if is_forbidden_filter_header(&mutation.name) {
+        log::warn!(
+            "Skipping forbidden response-filter header: {}",
+            mutation.name
+        );
+        return;
+    }
+
+    let Ok(name) = http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
+        log::warn!("Skipping invalid response-filter header: {}", mutation.name);
+        return;
+    };
+    let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
+        log::warn!(
+            "Skipping invalid response-filter header value: {}",
+            mutation.name
+        );
+        return;
+    };
+
+    match mutation.mode {
+        HeaderMutationMode::Set => {
+            response.headers_mut().insert(name, value);
+        }
+        HeaderMutationMode::Append => {
+            response.headers_mut().append(name, value);
+        }
     }
 }
 
@@ -399,6 +587,7 @@ pub struct IntegrationRegistration {
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
 
 impl IntegrationRegistration {
@@ -423,6 +612,7 @@ impl IntegrationRegistrationBuilder {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
             },
         }
     }
@@ -463,6 +653,12 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
+        self.registration.request_filters.push(filter);
+        self
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -496,6 +692,7 @@ struct IntegrationRegistryInner {
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -513,6 +710,7 @@ impl Default for IntegrationRegistryInner {
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
+            request_filters: Vec::new(),
             deferred_js_ids: Vec::new(),
         }
     }
@@ -526,6 +724,7 @@ pub struct IntegrationMetadata {
     pub attribute_rewriters: usize,
     pub script_selectors: Vec<&'static str>,
     pub head_injectors: usize,
+    pub request_filters: usize,
 }
 
 impl IntegrationMetadata {
@@ -536,6 +735,7 @@ impl IntegrationMetadata {
             attribute_rewriters: 0,
             script_selectors: Vec::new(),
             head_injectors: 0,
+            request_filters: 0,
         }
     }
 }
@@ -636,6 +836,9 @@ impl IntegrationRegistry {
                 inner
                     .head_injectors
                     .extend(registration.head_injectors.into_iter());
+                inner
+                    .request_filters
+                    .extend(registration.request_filters.into_iter());
                 if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
@@ -666,6 +869,63 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn has_route(&self, method: &Method, path: &str) -> bool {
         self.find_route(method, path).is_some()
+    }
+
+    /// Run pre-routing request filters.
+    ///
+    /// Request header mutations are applied immediately so later filters and
+    /// route handlers observe enriched headers. Response mutations are returned
+    /// to the adapter so it can apply them after normal response finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an integration request filter returns an error.
+    pub async fn filter_request(
+        &self,
+        input: RequestFilterRegistryInput<'_>,
+    ) -> Result<RequestFilterRegistryOutcome, Report<TrustedServerError>> {
+        let RequestFilterRegistryInput {
+            settings,
+            services,
+            req,
+            geo_info,
+        } = input;
+        let mut accumulated = RequestFilterEffects::default();
+        let is_integration_route = self.has_route(req.method(), req.uri().path());
+
+        for filter in &self.inner.request_filters {
+            let decision = filter
+                .filter_request(RequestFilterInput {
+                    settings,
+                    services,
+                    request: req,
+                    geo_info,
+                    is_integration_route,
+                })
+                .await?;
+
+            match decision {
+                RequestFilterDecision::Continue(effects) => {
+                    effects.apply_to_request(req);
+                    accumulated.extend(RequestFilterEffects {
+                        request_headers: Vec::new(),
+                        response_headers: effects.response_headers,
+                    });
+                }
+                RequestFilterDecision::Respond { response, effects } => {
+                    accumulated.extend(RequestFilterEffects {
+                        request_headers: Vec::new(),
+                        response_headers: effects.response_headers,
+                    });
+                    return Ok(RequestFilterRegistryOutcome::Respond {
+                        response,
+                        effects: accumulated,
+                    });
+                }
+            }
+        }
+
+        Ok(RequestFilterRegistryOutcome::Continue(accumulated))
     }
 
     /// Dispatch a proxy request when an integration handles the path.
@@ -813,6 +1073,13 @@ impl IntegrationRegistry {
             entry.head_injectors += 1;
         }
 
+        for filter in &self.inner.request_filters {
+            let entry = map
+                .entry(filter.integration_id())
+                .or_insert_with(|| IntegrationMetadata::new(filter.integration_id()));
+            entry.request_filters += 1;
+        }
+
         map.into_values().collect()
     }
 
@@ -883,6 +1150,7 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -909,6 +1177,30 @@ impl IntegrationRegistry {
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
+                request_filters: Vec::new(),
+                deferred_js_ids: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
+                head_router: Router::new(),
+                options_router: Router::new(),
+                routes: Vec::new(),
+                html_rewriters: Vec::new(),
+                script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
+                request_filters,
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -971,6 +1263,7 @@ impl IntegrationRegistry {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -1004,6 +1297,25 @@ mod tests {
             _req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    struct EnrichingRequestFilter;
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for EnrichingRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "enriching"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
+                response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
+            }))
         }
     }
 
@@ -1101,6 +1413,46 @@ mod tests {
             "/integrations/test/echo",
             "should expose the HTTP request path to the proxy"
         );
+    }
+
+    #[test]
+    fn filter_request_applies_request_headers_and_returns_response_headers() {
+        let registry =
+            IntegrationRegistry::from_request_filters(vec![Arc::new(EnrichingRequestFilter)]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let outcome =
+            futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+                settings: &settings,
+                services: &services,
+                req: &mut req,
+                geo_info: None,
+            }))
+            .expect("should run request filter");
+
+        assert_eq!(
+            req.headers()
+                .get("x-datadome-isbot")
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "should apply DataDome-style request enrichment before routing"
+        );
+        match outcome {
+            RequestFilterRegistryOutcome::Continue(effects) => {
+                assert_eq!(
+                    effects.response_headers,
+                    vec![HeaderMutation::set("x-dd-b", "allowed")],
+                    "should return downstream response header effects for finalization"
+                );
+            }
+            RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
+        }
     }
 
     #[test]
@@ -1441,6 +1793,7 @@ mod tests {
             EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
             path: "/integrations/test/ec",
@@ -1489,6 +1842,7 @@ mod tests {
             EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::GET,
             path: "/integrations/test/ec",
@@ -1534,6 +1888,7 @@ mod tests {
             EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
         let services = crate::platform::test_support::noop_services();
+
         let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
             method: &Method::POST,
             path: "/integrations/test/ec",

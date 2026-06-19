@@ -34,6 +34,7 @@ use std::time::Duration;
 
 mod error;
 mod http;
+mod image_optimizer;
 mod kv;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -45,6 +46,10 @@ pub use error::PlatformError;
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,
+};
+pub use image_optimizer::{
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
