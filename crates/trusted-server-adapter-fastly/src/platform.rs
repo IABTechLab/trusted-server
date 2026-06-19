@@ -309,7 +309,11 @@ fn edge_request_to_fastly(
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
-        fastly_req.append_header(name.as_str(), value.as_bytes());
+        if name == edgezero_core::http::header::HOST {
+            fastly_req.set_header(name.as_str(), value.as_bytes());
+        } else {
+            fastly_req.append_header(name.as_str(), value.as_bytes());
+        }
     }
     match body {
         edgezero_core::body::Body::Once(bytes) => {
@@ -609,6 +613,24 @@ mod tests {
 
     fn noop_kv_store() -> Arc<dyn PlatformKvStore> {
         Arc::new(NoopKvStore)
+    }
+
+    #[test]
+    fn edge_request_to_fastly_replaces_url_derived_host_header() {
+        let request = request_builder()
+            .method("GET")
+            .uri("https://origin.example.com/")
+            .header(edgezero_core::http::header::HOST, "www.example.com")
+            .body(Body::empty())
+            .expect("should build request");
+
+        let fastly_req = edge_request_to_fastly(request).expect("should convert request");
+
+        assert_eq!(
+            fastly_req.get_header_str(fastly::http::header::HOST),
+            Some("www.example.com"),
+            "should replace the URL-derived Host instead of appending a duplicate"
+        );
     }
 
     // --- FastlyPlatformBackend::predict_name --------------------------------
