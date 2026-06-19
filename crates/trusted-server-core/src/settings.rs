@@ -55,7 +55,12 @@ pub struct Publisher {
     /// uncompressed pages. That platform limit is removed once true streaming
     /// lands (tracked for PR 15, issue #495), after which this setting becomes
     /// the sole ceiling.
+    ///
+    /// Must be at least 1: a zero-byte cap fails every non-empty buffered
+    /// publisher response at request time, so it is rejected at config
+    /// validation instead.
     #[serde(default = "default_max_buffered_body_bytes")]
+    #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
 }
 
@@ -3575,6 +3580,35 @@ origin_host_header_overide = "www.example.com""#,
             from_toml.publisher.max_buffered_body_bytes,
             Publisher::default().max_buffered_body_bytes,
             "TOML default and Publisher::default() must stay aligned"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_buffered_body_bytes() {
+        // A zero-byte cap fails every non-empty buffered publisher response at
+        // request time, so it must be rejected at config validation instead of
+        // silently breaking traffic.
+        let result = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+            max_buffered_body_bytes = 0
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "publisher.max_buffered_body_bytes = 0 must fail config validation"
         );
     }
 

@@ -151,7 +151,7 @@ async fn dispatch_fallback(
 
     handle_publisher_request(&state.settings, &state.registry, services, req)
         .await
-        .and_then(|pr| buffer_publisher_response(pr, &state.settings, &state.registry))
+        .and_then(|pr| buffer_publisher_response(pr, &method, &state.settings, &state.registry))
 }
 
 fn fallback_handler(

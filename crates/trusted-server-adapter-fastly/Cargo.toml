@@ -28,3 +28,4 @@ urlencoding = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
