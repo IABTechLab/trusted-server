@@ -101,8 +101,11 @@ use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
-use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::{ClientInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::integrations::{
+    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome,
+};
+use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
@@ -247,6 +250,10 @@ struct EcRequestState {
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
+    /// Geo lookup result reused by the pre-route request-filter step so it does
+    /// not repeat the lookup the legacy path also shares between EC setup and
+    /// filtering.
+    geo_info: Option<GeoInfo>,
     /// Error from [`EcContext`] creation. When set, handlers return this as
     /// the response without running the route handler (legacy parity: the
     /// legacy path short-circuits with an error response and a default
@@ -342,6 +349,7 @@ fn build_ec_request_state(
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        geo_info,
         setup_error,
     }
 }
@@ -350,30 +358,111 @@ fn build_ec_request_state(
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Result of the pre-route integration request-filter step.
+enum PreRoute {
+    /// A filter elected to respond (or errored); return this response without
+    /// running the route handler. Carries the accumulated response effects.
+    ShortCircuit {
+        response: Response,
+        effects: RequestFilterEffects,
+    },
+    /// Continue to the route handler; apply these response effects afterward.
+    Continue { effects: RequestFilterEffects },
+}
+
+/// Runs the integration request-filter pipeline before route dispatch.
+///
+/// Mirrors the legacy `route_request` ordering: filters run after auth
+/// (`AuthMiddleware` on this path) and before route matching. Request header
+/// mutations are applied to `req` so the routed handler observes them; response
+/// effects are returned for the entry point to apply after EC finalization. A
+/// filter that responds (e.g. a `DataDome` challenge) short-circuits routing.
+async fn run_pre_route_filters(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: &mut Request,
+    geo_info: Option<&GeoInfo>,
+) -> PreRoute {
+    match state
+        .registry
+        .filter_request(RequestFilterRegistryInput {
+            settings: &state.settings,
+            services,
+            req,
+            geo_info,
+        })
+        .await
+    {
+        Ok(RequestFilterRegistryOutcome::Continue(effects)) => PreRoute::Continue { effects },
+        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => PreRoute::ShortCircuit {
+            response: *response,
+            effects,
+        },
+        Err(report) => {
+            log::error!("Failed to run integration request filters: {report:?}");
+            PreRoute::ShortCircuit {
+                response: http_error(&report),
+                effects: RequestFilterEffects::default(),
+            }
+        }
+    }
+}
+
+/// Attaches the EC finalize state and any non-empty request-filter response
+/// effects to a dispatched response via extensions, so `edgezero_main` can run
+/// EC finalization and apply the filter effects after it (legacy ordering).
+fn attach_dispatch_extensions(
+    mut response: Response,
+    ec: EcRequestState,
+    effects: RequestFilterEffects,
+) -> Response {
+    response.extensions_mut().insert(ec.into_finalize_state());
+    if !effects.response_headers.is_empty() {
+        response.extensions_mut().insert(effects);
+    }
+    response
+}
+
 async fn execute_named(
     state: Arc<AppState>,
     ctx: RequestContext,
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let req = ctx.into_request();
+    let mut req = ctx.into_request();
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
-    // legacy route_request.
+    // legacy route_request. Batch-sync also skips request filters, matching
+    // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
         return Ok(run_batch_sync(&state, req));
     }
 
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
-    let mut response = match ec.setup_error.take() {
-        Some(report) => http_error(&report),
-        None => run_named_route(&state, &services, req, handler, &mut ec)
-            .await
-            .unwrap_or_else(|e| http_error(&e)),
-    };
-    response.extensions_mut().insert(ec.into_finalize_state());
-    Ok(response)
+    // EcContext creation errors short-circuit before filters, mirroring legacy:
+    // the legacy path returns its error response before running filter_request.
+    if let Some(report) = ec.setup_error.take() {
+        let response = http_error(&report);
+        return Ok(attach_dispatch_extensions(
+            response,
+            ec,
+            RequestFilterEffects::default(),
+        ));
+    }
+
+    let effects =
+        match run_pre_route_filters(&state, &services, &mut req, ec.geo_info.as_ref()).await {
+            PreRoute::ShortCircuit { response, effects } => {
+                return Ok(attach_dispatch_extensions(response, ec, effects));
+            }
+            PreRoute::Continue { effects } => effects,
+        };
+
+    let response = run_named_route(&state, &services, req, handler, &mut ec)
+        .await
+        .unwrap_or_else(|e| http_error(&e));
+    Ok(attach_dispatch_extensions(response, ec, effects))
 }
 
 async fn run_named_route(
@@ -486,16 +575,29 @@ async fn execute_fallback(
     Ok(dispatch_fallback(&state, &services, req).await)
 }
 
-async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
+async fn dispatch_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    mut req: Request,
+) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
     let mut ec = build_ec_request_state(&state.settings, services, &req);
     if let Some(report) = ec.setup_error.take() {
-        let mut response = http_error(&report);
-        response.extensions_mut().insert(ec.into_finalize_state());
-        return response;
+        let response = http_error(&report);
+        return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
     }
+
+    // Pre-route integration request filters (DataDome protection, etc.) run
+    // before the route-type decision, matching legacy `route_request` ordering.
+    let effects = match run_pre_route_filters(state, services, &mut req, ec.geo_info.as_ref()).await
+    {
+        PreRoute::ShortCircuit { response, effects } => {
+            return attach_dispatch_extensions(response, ec, effects);
+        }
+        PreRoute::Continue { effects } => effects,
+    };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
         handle_tsjs_dynamic(&req, &state.registry)
@@ -531,7 +633,7 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
             .then(|| state.settings.asset_route_for_path(&path))
             .flatten();
         if let Some(asset_route) = matched_asset_route {
-            return dispatch_asset_fallback(state, services, req, asset_route).await;
+            return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
         }
 
         // Generate an EC ID if needed — mirrors the legacy catch-all arm.
@@ -551,15 +653,15 @@ async fn dispatch_fallback(state: &AppState, services: &RuntimeServices, req: Re
             .and_then(|pub_response| {
                 crate::resolve_publisher_response_buffered(
                     pub_response,
+                    &method,
                     &state.settings,
                     &state.registry,
                 )
             })
     };
 
-    let mut response = result.unwrap_or_else(|e| http_error(&e));
-    response.extensions_mut().insert(ec.into_finalize_state());
-    response
+    let response = result.unwrap_or_else(|e| http_error(&e));
+    attach_dispatch_extensions(response, ec, effects)
 }
 
 /// Returns `true` when an asset response should carry a buffered body and a
@@ -596,6 +698,7 @@ async fn dispatch_asset_fallback(
     services: &RuntimeServices,
     req: Request,
     asset_route: &ProxyAssetRoute,
+    effects: &RequestFilterEffects,
 ) -> Response {
     log::info!("No explicit route matched; proxying via configured asset route");
 
@@ -627,12 +730,14 @@ async fn dispatch_asset_fallback(
                         response
                             .extensions_mut()
                             .insert(AssetProxyCachePolicy::NoStorePrivate);
+                        attach_request_filter_effects(&mut response, effects);
                         return response;
                     }
                 }
             }
 
             response.extensions_mut().insert(cache_policy);
+            attach_request_filter_effects(&mut response, effects);
             response
         }
         Err(report) => {
@@ -640,8 +745,21 @@ async fn dispatch_asset_fallback(
             response
                 .extensions_mut()
                 .insert(AssetProxyCachePolicy::NoStorePrivate);
+            attach_request_filter_effects(&mut response, effects);
             response
         }
+    }
+}
+
+/// Attaches non-empty request-filter response effects to an asset response.
+///
+/// Asset responses skip EC finalization but still carry filter effects so the
+/// entry point applies them after finalization, matching the legacy asset
+/// streaming path which applies `request_filter_effects` to every asset
+/// response.
+fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilterEffects) {
+    if !effects.response_headers.is_empty() {
+        response.extensions_mut().insert(effects.clone());
     }
 }
 
@@ -903,6 +1021,8 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{build_state_from_settings, startup_error_router, TrustedServerApp};
 
     use edgezero_core::body::Body;
@@ -913,6 +1033,10 @@ mod tests {
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
+        RequestFilterEffects, RequestFilterInput,
+    };
     use trusted_server_core::settings::Settings;
 
     fn empty_request(method: Method, path: &str) -> edgezero_core::http::Request {
@@ -927,8 +1051,8 @@ mod tests {
             .expect("should build request")
     }
 
-    fn test_router() -> RouterService {
-        let settings = Settings::from_toml(
+    fn test_settings() -> Settings {
+        Settings::from_toml(
             r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -964,9 +1088,83 @@ mod tests {
             timeout_ms = 2000
             "#,
         )
-        .expect("should parse test settings");
-        let state = build_state_from_settings(settings).expect("should build test state");
+        .expect("should parse test settings")
+    }
+
+    fn test_router() -> RouterService {
+        let state = build_state_from_settings(test_settings()).expect("should build test state");
         TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Builds a router whose `AppState` uses a registry containing the given
+    /// request filters (and no routes), so dispatch-level request-filter
+    /// behavior can be exercised without a real integration.
+    fn router_with_request_filters(
+        filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    ) -> RouterService {
+        let settings = test_settings();
+        let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
+            .expect("should build orchestrator");
+        let partner_registry =
+            trusted_server_core::ec::registry::PartnerRegistry::from_config(&settings.ec.partners)
+                .expect("should build partner registry");
+        let registry = IntegrationRegistry::from_request_filters(filters);
+        let kv_store =
+            Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
+        let state = Arc::new(super::AppState {
+            settings: Arc::new(settings),
+            orchestrator: Arc::new(orchestrator),
+            registry: Arc::new(registry),
+            partner_registry: Arc::new(partner_registry),
+            kv_store,
+        });
+        TrustedServerApp::routes_for_state(&state)
+    }
+
+    /// Continues routing while mutating the request and emitting a response
+    /// header effect — mirrors `DataDome`'s allow path.
+    struct RecordingRequestFilter;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for RecordingRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: vec![HeaderMutation::set("x-filter-ran", "1")],
+                response_headers: vec![HeaderMutation::set("x-filter-effect", "applied")],
+            }))
+        }
+    }
+
+    /// Short-circuits routing with a 403 — mirrors a `DataDome` challenge/block.
+    struct ChallengeRequestFilter;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for ChallengeRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "challenge"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            let mut response = edgezero_core::http::Response::new(Body::from("blocked"));
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            Ok(RequestFilterDecision::Respond {
+                response: Box::new(response),
+                effects: RequestFilterEffects {
+                    request_headers: Vec::new(),
+                    response_headers: vec![HeaderMutation::set("x-challenge", "1")],
+                },
+            })
+        }
     }
 
     #[test]
@@ -1390,6 +1588,65 @@ mod tests {
         assert!(
             build_state_from_settings(settings).is_err(),
             "duplicate partner source_domain must fail state construction (fail closed)"
+        );
+    }
+
+    #[test]
+    fn dispatch_runs_request_filter_and_threads_response_effects() {
+        // Regression guard for the EdgeZero request-filter bypass: the publisher
+        // fallback must run the integration request-filter pipeline (DataDome
+        // protection registers here) and thread the filter's response effects out
+        // via extensions so the entry point applies them after EC finalization.
+        // Without a live backend the publisher proxy errors, but the response must
+        // still carry the RequestFilterEffects the filter emitted — proving the
+        // filter ran on the dispatch path.
+        let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        let effects = response
+            .extensions()
+            .get::<RequestFilterEffects>()
+            .expect("dispatched response should carry request-filter effects");
+        assert!(
+            effects
+                .response_headers
+                .iter()
+                .any(|m| m.name == "x-filter-effect"),
+            "the filter's response-header effect must be threaded out for the entry point to apply"
+        );
+    }
+
+    #[test]
+    fn dispatch_short_circuits_when_request_filter_responds() {
+        // Regression guard: a request filter that responds (a DataDome
+        // challenge/block) must short-circuit routing before the publisher
+        // fallback, return its own response, still carry EcFinalizeState (legacy
+        // parity: Respond keeps EC finalization), and thread its response effects.
+        let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a filter Respond must short-circuit routing with its own response"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<super::EcFinalizeState>()
+                .is_some(),
+            "a short-circuit filter response should still carry EcFinalizeState (legacy parity)"
+        );
+        let effects = response
+            .extensions()
+            .get::<RequestFilterEffects>()
+            .expect("short-circuit response should carry request-filter effects");
+        assert!(
+            effects
+                .response_headers
+                .iter()
+                .any(|m| m.name == "x-challenge"),
+            "the filter's response-header effect must be threaded out"
         );
     }
 }

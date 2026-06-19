@@ -1223,7 +1223,7 @@ impl IntegrationRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
         Self {
