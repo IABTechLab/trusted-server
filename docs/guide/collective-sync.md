@@ -1,6 +1,6 @@
-# Collective Sync Architecture
+# Edge Cookie External Sync Architecture
 
-Trusted Server supports cross-publisher data sharing through a **Collective Sync** model. Publishers who share the same EC secret key can synchronize user data across their properties, enabling privacy-preserving audience insights without third-party cookies.
+Trusted Server supports ID syncing. Publishers who have engaged in an agreement with identity partners can use our sync endpoints found below.
 
 ## Overview
 
@@ -31,11 +31,11 @@ sequenceDiagram
 
 ## Architecture Principles
 
-| Component        | Role            | Characteristics                                        |
-| ---------------- | --------------- | ------------------------------------------------------ |
-| **KV Store**     | Hot cache       | Fast reads (~1ms), edge-local, eventually consistent   |
-| **Object Store** | Source of truth | Durable, supports range queries, sync endpoint         |
-| **Secret Key**   | Shared salt     | Distributed out-of-band, enables collective membership |
+| Component        | Role            | Characteristics                                           |
+| ---------------- | --------------- | --------------------------------------------------------- |
+| **KV Store**     | Hot cache       | Fast reads (~1ms), edge-local, eventually consistent      |
+| **Object Store** | Source of truth | Durable, supports range queries, sync endpoint            |
+| **Secret Key**   | Shared salt     | Distributed out-of-band, enables a data sharing agreement |
 
 ## Configuration
 
@@ -105,7 +105,7 @@ The Object Store maintains a richer record with full history:
 
 ### Initial Sync
 
-When a new publisher joins the collective, they perform a full sync:
+When a new publisher has a new agreement, they perform a full sync:
 
 ```http
 GET /sync?type=full
