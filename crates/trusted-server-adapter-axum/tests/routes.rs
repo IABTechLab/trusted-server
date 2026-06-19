@@ -71,6 +71,8 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
+        ("POST", "/admin/keys/rotate"),
+        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
@@ -84,21 +86,25 @@ fn all_explicit_routes_are_registered() {
     }
 }
 
-/// Verify the legacy non-`/_ts` admin aliases are NOT registered as explicit
-/// routes, matching the Fastly and Cloudflare adapters.
+/// Verify the legacy non-`/_ts` admin aliases ARE registered — to the local
+/// deny handler — matching the Fastly and Cloudflare adapters.
 ///
 /// The production basic-auth handler regex (`^/_ts/admin`) does not match
-/// `/admin/keys/*`, so registering those aliases as admin routes would expose
-/// key operations to unauthenticated callers. Unrouted, they fall through to the
-/// publisher fallback like any unknown path. This guard pins the cross-adapter
-/// agreement so the divergence cannot silently reappear.
+/// `/admin/keys/*`, so these aliases are not auth-gated. Leaving them unrouted
+/// would let them fall through to the publisher fallback, which forwards the
+/// request (including `Authorization` and key body) to the origin, leaking admin
+/// credentials. Registering them to a local 404 deny fails closed instead. This
+/// guard pins the cross-adapter agreement so the divergence cannot silently
+/// reappear.
 #[test]
-fn legacy_admin_aliases_are_not_registered() {
+fn legacy_admin_aliases_are_registered_to_local_deny() {
     let routes = registered_routes();
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
         assert!(
-            !routes.iter().any(|(_, p)| p == path),
-            "legacy {path} must not be a registered route (would bypass `^/_ts/admin` auth); registered routes: {routes:?}"
+            routes
+                .iter()
+                .any(|(method, p)| method == "POST" && p == path),
+            "legacy {path} must be registered (to the local deny) so it never reaches the publisher fallback; registered routes: {routes:?}"
         );
     }
 }
@@ -245,6 +251,38 @@ async fn admin_route_without_credentials_returns_401() {
         401,
         "admin route must return 401 without credentials"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+    // Regression for the credential-leak finding: the production basic-auth regex
+    // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
+    // auth-gated. A POST carrying an `Authorization` header must be denied locally
+    // with 404, never proxied to the publisher origin (which would leak the admin
+    // credentials and key body). A publisher-fallback proxy without a backend
+    // would surface as a 5xx, so 404 proves the local deny ran.
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        let mut svc = make_service();
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header("content-type", "application/json")
+            .body(AxumBody::from("{\"key_id\":\"leak-me\"}"))
+            .expect("should build authorized legacy-alias request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "legacy {path} with Authorization must be denied locally (404), not proxied to publisher"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

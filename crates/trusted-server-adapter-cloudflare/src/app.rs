@@ -150,6 +150,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the Cloudflare adapter.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Startup error fallback
 // ---------------------------------------------------------------------------
@@ -316,11 +333,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
             //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
-            // registered: the production handler regex `^/_ts/admin` does not match
-            // them, so registering them as admin routes would expose the key
-            // handlers to unauthenticated callers. Unrouted, they fall through to
-            // the publisher fallback like any other unknown path.
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally
+            // with a 404: the production handler regex `^/_ts/admin` does not match
+            // them, and letting them fall through to the publisher fallback would
+            // forward the caller's `Authorization` header and key-management payload
+            // to the origin, leaking admin credentials.
             .post(
                 "/_ts/admin/keys/rotate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -331,6 +348,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 "/_ts/admin/keys/deactivate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_deactivate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/admin/keys/rotate",
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(legacy_admin_alias_denied())
+                }),
+            )
+            .post(
+                "/admin/keys/deactivate",
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(legacy_admin_alias_denied())
                 }),
             )
             .post(
