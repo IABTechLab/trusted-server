@@ -306,6 +306,13 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // asset_cache_policy.apply_after_route_finalization.
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
 
+    // Pop the integration request-filter response effects (e.g. DataDome
+    // challenge/allow headers) threaded out by the dispatch path. Applied to the
+    // response after EC finalization and before send, mirroring legacy_main's
+    // `request_filter_effects` application. Must happen before the fastly
+    // conversion, which drops extensions.
+    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
@@ -360,6 +367,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                         ec_state.sharedid_cookie.as_deref(),
                         &mut response,
                     );
+                    if let Some(effects) = &request_filter_effects {
+                        effects.apply_to_response(&mut response);
+                    }
                     compat::to_fastly_response(response).send_to_client();
 
                     if ec_state.is_real_browser {
@@ -386,6 +396,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         }
     }
 
+    if let Some(effects) = &request_filter_effects {
+        effects.apply_to_response(&mut response);
+    }
     compat::to_fastly_response(response).send_to_client();
 }
 

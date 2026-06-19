@@ -109,6 +109,50 @@ jobs:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           RUST_LOG: info
 
+  integration-tests-edgezero:
+    name: integration tests (EdgeZero entry point)
+    needs: prepare-artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up integration test runtime
+        id: shared-setup
+        uses: ./.github/actions/setup-integration-test-env
+        with:
+          origin-port: ${{ env.ORIGIN_PORT }}
+          check-dependency-versions: "false"
+          install-viceroy: "true"
+          build-wasm: "false"
+          build-test-images: "false"
+
+      - name: Download integration test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-artifacts
+          path: ${{ env.ARTIFACTS_DIR }}
+
+      # Exercises the EdgeZero entry point against the same WASM binary by
+      # pointing Viceroy at a config store with `edgezero_enabled = "true"`.
+      # Scoped to the container-free EC lifecycle suite (minimal TCP origin), a
+      # focused parity subset covering Fastly request conversion, config-store
+      # dispatch, publisher fallback proxying, and end-to-end EC/API wiring on
+      # the EdgeZero path. The legacy `integration-tests` job above still covers
+      # the full framework matrix.
+      - name: Run EdgeZero EC lifecycle tests
+        run: >-
+          cargo test
+          --manifest-path crates/integration-tests/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+          test_ec_lifecycle_fastly
+          -- --include-ignored --test-threads=1
+        env:
+          WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template-edgezero.toml
+          RUST_LOG: info
+
   browser-tests:
     name: browser integration tests
     needs: prepare-artifacts
