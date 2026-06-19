@@ -1316,6 +1316,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn publisher_request_sends_configured_host_header_override() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"origin response".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let _ = handle_publisher_request(&settings, &registry, &services, req)
+            .await
+            .expect("should proxy publisher request");
+
+        let recorded_headers = stub.recorded_request_headers();
+        let outbound_headers = recorded_headers
+            .first()
+            .expect("should record one outbound request");
+        let outbound_host = outbound_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.as_str());
+
+        assert_eq!(
+            outbound_host,
+            Some("www.example.com"),
+            "should send configured host override to outbound request"
+        );
+    }
+
     #[test]
     fn stream_publisher_body_preserves_gzip_round_trip() {
         use flate2::write::GzEncoder;
