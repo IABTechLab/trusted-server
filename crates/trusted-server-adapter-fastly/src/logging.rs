@@ -86,6 +86,7 @@ pub(crate) fn init_logger() {
         .expect("should build Logger");
 
     fern::Dispatch::new()
+        .level(max_level)
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{} {} [{}] {}",
