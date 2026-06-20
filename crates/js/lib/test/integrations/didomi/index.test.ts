@@ -4,10 +4,15 @@ import { installDidomiSdkProxy } from '../../../src/integrations/didomi';
 
 const ORIGINAL_WINDOW = global.window;
 
+type TestDidomiWindow = Window & {
+  didomiConfig?: any;
+  __tsjs_didomi?: { proxyPath?: string };
+};
+
 function createWindow(url: string) {
   return {
     location: new URL(url) as unknown as Location,
-  } as Window & { didomiConfig?: any };
+  } as TestDidomiWindow;
 }
 
 describe('integrations/didomi', () => {
@@ -40,5 +45,13 @@ describe('integrations/didomi', () => {
     expect(testWindow.didomiConfig.sdkPath).toBe(
       'https://example.com/integrations/didomi/consent/'
     );
+  });
+
+  it('uses the server-injected custom proxy path', () => {
+    testWindow.__tsjs_didomi = { proxyPath: '/my-custom-consent/' };
+
+    installDidomiSdkProxy();
+
+    expect(testWindow.didomiConfig.sdkPath).toBe('https://example.com/my-custom-consent/');
   });
 });

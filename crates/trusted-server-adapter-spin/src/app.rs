@@ -1,5 +1,7 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use edgezero_adapter_spin::SpinRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -26,7 +28,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
-use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
+use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
 
 // ---------------------------------------------------------------------------
@@ -81,10 +83,11 @@ fn build_state_with_settings(
 /// origin response fails safely instead of exhausting the Wasm heap.
 fn resolve_publisher_response(
     publisher_response: PublisherResponse,
+    method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
 ) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response(publisher_response, settings, registry)
+    buffer_publisher_response(publisher_response, method, settings, registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,14 +112,20 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // Named routes paired with the methods they handle directly. Every other
 // publisher-fallback method on these paths is routed to the fallback so it
 // reaches the publisher origin rather than a router-level 405.
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
+//
+// The EC API routes that the Fastly entry point registers — POST
+// `/_ts/api/v1/batch-sync`, GET/OPTIONS `/_ts/api/v1/identify` — are
+// intentionally absent here, matching the Axum and Cloudflare adapters: those
+// handlers require a platform KV `ec_store` (and, for batch-sync, a partner
+// registry and rate limiter) that the portability adapters do not yet wire.
+// On Spin these paths fall through to the publisher/integration fallback,
+// identical to the other non-Fastly adapters.
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 9] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
-        ("/admin/keys/rotate", &[Method::POST]),
-        ("/admin/keys/deactivate", &[Method::POST]),
         ("/auction", &[Method::POST]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
@@ -135,12 +144,26 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
 // synthetic header. Returns None when the URL has no scheme or host.
 fn scheme_host_from_spin_url(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = url.split_once("://")?;
-    let host = rest.split('/').next()?;
+    let authority = rest.split('/').next()?;
+    // Strip optional `userinfo@` so a `scheme://user@host/…` URL yields the bare
+    // host. Not reachable from Spin's runtime today (it never emits userinfo), so
+    // this is cosmetic robustness rather than a security fix.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if scheme.is_empty() || host.is_empty() {
         None
     } else {
         Some((scheme.to_ascii_lowercase(), host.to_string()))
     }
+}
+
+// Parses an IP from a `spin-client-addr` value: `ip:port`, `[ip6]:port`, or a
+// bare IP with no port. Mirrors the parsing Spin's runtime applies; kept local
+// because edgezero's equivalent helper is crate-private.
+fn parse_client_addr(raw: &str) -> Option<IpAddr> {
+    if let Ok(sock) = raw.parse::<SocketAddr>() {
+        return Some(sock.ip());
+    }
+    raw.parse::<IpAddr>().ok()
 }
 
 // Strips client-spoofable forwarded headers, reconstructs the trusted Host and
@@ -159,13 +182,68 @@ fn scheme_host_from_spin_url(url: &str) -> Option<(String, String)> {
 // which rejects a relative path. Rebuilding an absolute URI from the trusted
 // scheme+host lets those handlers validate the signed target instead of failing
 // with "Invalid URL".
-fn normalize_spin_request(req: &mut Request) {
+pub(crate) fn normalize_spin_request(req: &mut Request) {
     sanitize_forwarded_headers(req);
 
-    let Some((scheme, host)) = req
+    // Strip any client-supplied `x-forwarded-for`. Spin exposes no trusted
+    // upstream forwarded-for chain — the only trusted client IP comes from the
+    // synthetic `spin-client-addr` captured below. Shared proxy code forwards an
+    // inbound `x-forwarded-for` to origins and Prebid copies it into its outbound
+    // headers, so leaving it would let a Spin client spoof the IP seen by
+    // downstream services while `device.ip` uses the trusted runtime address.
+    req.headers_mut().remove("x-forwarded-for");
+
+    // Re-derive the trusted client IP from the *last* `spin-client-addr` header
+    // and overwrite `SpinRequestContext`, which `build_runtime_services` reads
+    // for `ClientInfo::client_ip`. edgezero populates that context from the
+    // *first* `spin-client-addr` match, but Spin's WASI HTTP bridge appends its
+    // synthetic header *after* the original client headers — so a client can send
+    // its own `spin-client-addr` ahead of Spin's and forge the IP that EC ID
+    // hashing, `/auction` `device.ip`, and integration `X-Forwarded-For` consume.
+    // Selecting the last occurrence pins the value to the trusted runtime one.
+    let trusted_client_addr = req
         .headers()
-        .get("spin-full-url")
+        .get_all("spin-client-addr")
+        .iter()
+        .next_back()
         .and_then(|v| v.to_str().ok())
+        .and_then(parse_client_addr);
+    let existing_full_url = SpinRequestContext::get(req).and_then(|c| c.full_url.clone());
+    SpinRequestContext::insert(
+        req,
+        SpinRequestContext {
+            client_addr: trusted_client_addr,
+            full_url: existing_full_url,
+        },
+    );
+
+    // Spin's WASI HTTP bridge copies synthetic `spin-client-addr` and
+    // `spin-full-url` headers onto the core request. They are runtime metadata,
+    // not client- or application-supplied headers. The trusted `spin-client-addr`
+    // value is captured into `SpinRequestContext` above; remove every copy here so
+    // the shared publisher/integration handlers neither forward them to publisher
+    // origins nor mistake them for client-controlled input. `spin-full-url` is
+    // consumed below to derive the trusted scheme/host.
+    req.headers_mut().remove("spin-client-addr");
+
+    // Spin's WASI HTTP bridge appends its synthetic `spin-full-url` *after* the
+    // original client headers, so when duplicate names are present the trusted
+    // runtime value is the last one. `HeaderMap::remove` returns the *first*
+    // value, which a client could control by sending its own `spin-full-url`
+    // ahead of Spin's synthetic one — letting it choose the host/scheme consumed
+    // by publisher HTML rewriting, integration URL rewriting, and request
+    // signing. Select the last occurrence as the trusted authority, then strip
+    // every copy so none reach publisher origins or the shared handlers.
+    let trusted_full_url = req
+        .headers()
+        .get_all("spin-full-url")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    req.headers_mut().remove("spin-full-url");
+    let Some((scheme, host)) = trusted_full_url
+        .as_deref()
         .and_then(scheme_host_from_spin_url)
     else {
         return;
@@ -352,7 +430,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /admin/keys/rotate
+        // /_ts/admin/keys/rotate
         let s = Arc::clone(&state);
         let rotate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -364,7 +442,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /admin/keys/deactivate
+        // /_ts/admin/keys/deactivate
         let s = Arc::clone(&state);
         let deactivate_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -382,6 +460,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
+                // Request normalization (forwarded-header stripping, trusted
+                // Host/scheme/client-IP derivation) is applied centrally by
+                // `NormalizeMiddleware` before this handler runs, so the signed
+                // OpenRTB metadata that auction signing derives from
+                // `RequestInfo::from_request` uses the trusted runtime authority.
                 let req = ctx.into_request();
                 let ec_context = EcContext::default();
                 Ok(handle_auction(
@@ -404,8 +487,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let mut req = ctx.into_request();
-                normalize_spin_request(&mut req);
+                let req = ctx.into_request();
                 Ok(handle_first_party_proxy(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -418,8 +500,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let mut req = ctx.into_request();
-                normalize_spin_request(&mut req);
+                let req = ctx.into_request();
                 Ok(handle_first_party_click(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -432,8 +513,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let mut req = ctx.into_request();
-                normalize_spin_request(&mut req);
+                let req = ctx.into_request();
                 Ok(handle_first_party_proxy_sign(&s.settings, &services, req)
                     .await
                     .unwrap_or_else(|e| http_error(&e)))
@@ -447,8 +527,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             async move {
                 let services = build_runtime_services(&ctx);
-                let mut req = ctx.into_request();
-                normalize_spin_request(&mut req);
+                let req = ctx.into_request();
                 Ok(
                     handle_first_party_proxy_rebuild(&s.settings, &services, req)
                         .await
@@ -463,9 +542,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = build_runtime_services(&ctx);
-            let mut req = ctx.into_request();
-
-            normalize_spin_request(&mut req);
+            let req = ctx.into_request();
 
             let path = req.uri().path().to_owned();
             let method = req.method().clone();
@@ -496,7 +573,9 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 handle_publisher_request(&state.settings, &state.registry, &services, req)
                     .await
-                    .and_then(|pr| resolve_publisher_response(pr, &state.settings, &state.registry))
+                    .and_then(|pr| {
+                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
+                    })
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -514,6 +593,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         let mut builder = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            // Innermost middleware: normalize every routed request (strip
+            // spoofable forwarded headers, derive the trusted Host/scheme/client-IP
+            // from Spin's synthetic runtime headers) so no handler can opt out of
+            // the de-spoofing invariant. Runs after auth so the basic-auth gate
+            // continues to see the original request, matching prior behaviour.
+            .middleware(NormalizeMiddleware::new())
             // Cheap liveness probe, matching the Fastly/Axum adapters. Registered
             // explicitly so it is not absorbed by the publisher `/{*rest}` fallback.
             .get("/health", |_ctx: RequestContext| async {
@@ -524,11 +609,14 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
-            .post("/_ts/admin/keys/rotate", rotate_handler.clone())
-            .post("/_ts/admin/keys/deactivate", deactivate_handler.clone())
-            // Legacy non-`/_ts` aliases, kept for parity with the Fastly adapter.
-            .post("/admin/keys/rotate", rotate_handler)
-            .post("/admin/keys/deactivate", deactivate_handler)
+            //
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
+            // registered: the production handler regex `^/_ts/admin` does not match
+            // them, so registering them as admin routes would expose the key
+            // handlers to unauthenticated callers. Unrouted, they fall through to
+            // the publisher fallback like any other unknown path.
+            .post("/_ts/admin/keys/rotate", rotate_handler)
+            .post("/_ts/admin/keys/deactivate", deactivate_handler)
             .post("/auction", auction_handler)
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
@@ -614,6 +702,7 @@ mod tests {
         // http scheme and an attacker-controlled host via forwarded headers.
         let mut req = request_with(&[
             ("spin-full-url", "https://www.publisher.example/cars/"),
+            ("spin-client-addr", "203.0.113.7:5000"),
             ("x-forwarded-proto", "http"),
             ("x-forwarded-host", "evil.example"),
             ("forwarded", "host=evil.example;proto=http"),
@@ -629,6 +718,16 @@ mod tests {
         assert!(
             req.headers().get("forwarded").is_none(),
             "should strip spoofable forwarded header"
+        );
+        // Spin runtime synthetic headers must not survive onto the request that
+        // is forwarded to publisher origins or shared integration handlers.
+        assert!(
+            req.headers().get("spin-full-url").is_none(),
+            "should strip the consumed spin-full-url synthetic header"
+        );
+        assert!(
+            req.headers().get("spin-client-addr").is_none(),
+            "should strip the spin-client-addr synthetic header"
         );
         assert_eq!(
             req.headers()
@@ -685,6 +784,121 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("https"),
             "should still inject the trusted scheme"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_uses_trusted_spin_full_url_over_client_duplicate() {
+        // Spin appends its synthetic `spin-full-url` after the client's headers,
+        // so a client that prepends its own `spin-full-url` would win a
+        // first-match lookup. The trusted authority must come from the last
+        // (Spin-supplied) value, never the attacker's prepended one.
+        let mut builder = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/first-party/proxy");
+        // Attacker-controlled value first, trusted Spin synthetic value last.
+        builder = builder.header("spin-full-url", "https://evil.example/attacker/path");
+        builder = builder.header("spin-full-url", "https://www.publisher.example/cars/");
+        let mut req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+
+        normalize_spin_request(&mut req);
+
+        // All `spin-full-url` copies are stripped after normalization.
+        assert!(
+            req.headers().get("spin-full-url").is_none(),
+            "should strip every spin-full-url copy"
+        );
+        // The trusted (last) authority wins — the attacker's host never appears.
+        assert_eq!(
+            req.headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("www.publisher.example"),
+            "should use the trusted last spin-full-url host, not the client duplicate"
+        );
+        assert_eq!(
+            req.uri().to_string(),
+            "https://www.publisher.example/first-party/proxy",
+            "should rebuild the absolute URI from the trusted authority, not evil.example"
+        );
+        assert_ne!(
+            req.uri().host(),
+            Some("evil.example"),
+            "the attacker-supplied spin-full-url must never become the runtime authority"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_uses_trusted_last_client_addr_over_client_duplicate() {
+        // Spin appends its synthetic `spin-client-addr` after the client's
+        // headers, but edgezero parses `SpinRequestContext::client_addr` from the
+        // *first* match — so a client can prepend its own `spin-client-addr` and
+        // forge the IP. Normalization must re-derive the trusted client IP from the
+        // last (Spin-supplied) value so `build_runtime_services` cannot be fooled.
+        let mut builder = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/");
+        // Attacker-controlled value first, trusted Spin synthetic value last.
+        builder = builder.header("spin-client-addr", "203.0.113.10:1234");
+        builder = builder.header("spin-client-addr", "198.51.100.7:5678");
+        let mut req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        // Simulate edgezero's first-match population of the context.
+        SpinRequestContext::insert(
+            &mut req,
+            SpinRequestContext {
+                client_addr: Some("203.0.113.10".parse().expect("should parse spoofed IP")),
+                full_url: None,
+            },
+        );
+
+        normalize_spin_request(&mut req);
+
+        assert_eq!(
+            SpinRequestContext::get(&req).and_then(|c| c.client_addr),
+            Some("198.51.100.7".parse().expect("should parse trusted IP")),
+            "should use the trusted last spin-client-addr, not the client-spoofed first value"
+        );
+        assert!(
+            req.headers().get("spin-client-addr").is_none(),
+            "should strip every spin-client-addr copy after capturing the trusted value"
+        );
+    }
+
+    #[test]
+    fn normalize_spin_request_strips_client_supplied_x_forwarded_for() {
+        // A Spin client supplies a spoofed x-forwarded-for alongside the trusted
+        // synthetic spin-client-addr. The spoofed forwarded-for must be stripped
+        // so shared proxy/Prebid code cannot forward an attacker-controlled IP to
+        // downstream services, while the trusted client IP is taken from
+        // spin-client-addr.
+        let mut req = request_with(&[
+            ("spin-client-addr", "203.0.113.7:5000"),
+            ("x-forwarded-for", "198.51.100.99, 10.0.0.1"),
+        ]);
+
+        normalize_spin_request(&mut req);
+
+        assert!(
+            req.headers().get("x-forwarded-for").is_none(),
+            "should strip client-supplied x-forwarded-for"
+        );
+        assert_eq!(
+            SpinRequestContext::get(&req).and_then(|c| c.client_addr),
+            Some("203.0.113.7".parse().expect("should parse trusted IP")),
+            "trusted client IP must come from spin-client-addr, not the spoofed x-forwarded-for"
+        );
+    }
+
+    #[test]
+    fn scheme_host_from_spin_url_strips_userinfo() {
+        assert_eq!(
+            scheme_host_from_spin_url("https://user:pass@www.publisher.example/path"),
+            Some(("https".to_string(), "www.publisher.example".to_string())),
+            "should strip userinfo and keep only the host authority"
         );
     }
 

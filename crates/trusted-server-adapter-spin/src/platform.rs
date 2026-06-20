@@ -196,8 +196,16 @@ fn spin_secret_variable_name(
 
 /// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
 ///
-/// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV TTL
-/// support is determined by the underlying `EdgeZero` Spin KV implementation.
+/// Delegates all operations through `KvHandle`'s raw-bytes API. Spin KV has no
+/// native TTL support, so [`put_bytes_with_ttl`](KvStore::put_bytes_with_ttl)
+/// *errors* (`KvError::Validation`) rather than silently writing a non-expiring
+/// record — the privacy-safe failure mode. Consequently TTL-backed consent
+/// persistence (`save_consent_to_kv`) is unavailable on Spin: each write returns
+/// the error, which the core caller logs and treats as non-fatal (consistent
+/// with all adapters — failing to persist consent never breaks the request, and
+/// not persisting is the safe direction). Operators configuring
+/// `settings.consent.consent_store` on Spin should expect stored-consent
+/// fallback not to function.
 struct KvHandleAdapter(KvHandle);
 
 #[async_trait::async_trait(?Send)]
@@ -694,6 +702,12 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            // Spin's HTTP trigger does not expose TLS fingerprint or edge-server
+            // metadata to the guest, so these stay unset.
+            tls_ja4: None,
+            h2_fingerprint: None,
+            server_hostname: None,
+            server_region: None,
         })
         .build()
 }
@@ -710,6 +724,19 @@ impl PlatformGeo for NullGeo {
     }
 }
 
+/// Reads the client IP from [`SpinRequestContext`].
+///
+/// The value is the immediate TCP peer reported by Spin's `spin-client-addr`,
+/// re-derived from the *trusted last* header occurrence by
+/// [`crate::app::normalize_spin_request`] (which overwrites the context before
+/// this runs) so a client cannot forge it with a prepended duplicate.
+///
+/// Trust assumption: this is the real client IP only when Spin terminates the
+/// client connection directly. Behind an untrusted reverse proxy or load
+/// balancer it is the proxy's address, and the real client IP would live in a
+/// spoofable forwarded header — unlike the CDN-trusted context the Fastly and
+/// Cloudflare adapters receive. Deployments fronting Spin with such a hop must
+/// account for this.
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
     edgezero_adapter_spin::SpinRequestContext::get(ctx.request()).and_then(|c| c.client_addr)
 }

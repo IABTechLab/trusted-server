@@ -1764,6 +1764,7 @@ mod tests {
                 client_ip: None,
                 tls_protocol: None,
                 tls_cipher: None,
+                ..ClientInfo::default()
             })
             .build()
     }

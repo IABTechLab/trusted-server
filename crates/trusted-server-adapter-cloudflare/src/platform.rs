@@ -485,6 +485,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }

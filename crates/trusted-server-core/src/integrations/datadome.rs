@@ -42,7 +42,7 @@
 //!
 //! 1. **SDK Loading**: Browser requests `/integrations/datadome/tags.js`
 //! 2. **Proxy & Rewrite**: Trusted Server fetches from `js.datadome.co`, rewrites internal
-//!    URLs to first-party paths using [`DATADOME_URL_PATTERN`]
+//!    URLs to first-party paths using `DATADOME_URL_PATTERN`
 //! 3. **Signal Collection**: SDK sends signals to `/integrations/datadome/js/`
 //! 4. **Transparent Proxy**: Trusted Server forwards to `api-js.datadome.co`, returns response
 //!
@@ -64,19 +64,31 @@ use http::header;
 use http::{Method, StatusCode};
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use url::Url;
 use validator::Validate;
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
     AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationEndpoint, IntegrationProxy, IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, IntegrationRequestFilter, RequestFilterDecision, RequestFilterInput,
+    INTEGRATION_MAX_BODY_BYTES, UPSTREAM_SDK_MAX_RESPONSE_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
 
-const DATADOME_INTEGRATION_ID: &str = "datadome";
+mod protection;
+mod protection_scope;
+
+pub use protection_scope::{
+    ProtectionExclusionRuleConfig, ProtectionIpCidrSourceConfig, ProtectionMatcherConfig,
+};
+
+use protection_scope::ProtectionScope;
+
+pub(super) const DATADOME_INTEGRATION_ID: &str = "datadome";
 
 /// Regex pattern for matching and rewriting `DataDome` URLs in script content.
 ///
@@ -102,6 +114,7 @@ static DATADOME_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Configuration for `DataDome` integration.
 #[derive(Debug, Clone, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct DataDomeConfig {
     /// Enable/disable the integration
     #[serde(default = "default_enabled")]
@@ -127,6 +140,79 @@ pub struct DataDomeConfig {
     /// Whether to rewrite `DataDome` script URLs in HTML to first-party paths
     #[serde(default = "default_rewrite_sdk")]
     pub rewrite_sdk: bool,
+
+    /// Whether to call `DataDome` Protection API before route matching.
+    #[serde(default)]
+    pub enable_protection: bool,
+
+    /// Runtime secret store containing the `DataDome` server-side key.
+    #[serde(default = "default_server_side_key_secret_store")]
+    pub server_side_key_secret_store: String,
+
+    /// Secret name containing the `DataDome` server-side key.
+    #[serde(default = "default_server_side_key_secret_name")]
+    pub server_side_key_secret_name: String,
+
+    /// Base URL for the `DataDome` Protection API.
+    #[serde(default = "default_protection_api_origin")]
+    #[validate(url)]
+    pub protection_api_origin: String,
+
+    /// First-byte timeout for Protection API calls, in milliseconds.
+    #[serde(default = "default_timeout_ms")]
+    #[validate(range(min = 1, max = 10000))]
+    pub timeout_ms: u32,
+
+    /// HTTP methods excluded from Protection API validation.
+    #[serde(
+        default = "default_protection_excluded_methods",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub protection_excluded_methods: Vec<String>,
+
+    /// Client autonomous system numbers excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_asns: Vec<u32>,
+
+    /// Client IP CIDR ranges excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_ip_cidrs: Vec<String>,
+
+    /// Config Store-backed client IP CIDR ranges excluded from Protection API validation.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub protection_excluded_ip_cidr_sources: Vec<ProtectionIpCidrSourceConfig>,
+
+    /// Cache TTL for Config Store-backed IP CIDR lists, in seconds.
+    #[serde(default = "default_protection_ip_list_cache_ttl_seconds")]
+    #[validate(range(min = 1, max = 86400))]
+    pub protection_ip_list_cache_ttl_seconds: u64,
+
+    /// Structured exclusion rules for Protection API validation.
+    #[serde(
+        default = "default_protection_exclusion_rules",
+        deserialize_with = "crate::settings::vec_from_seq_or_map"
+    )]
+    pub protection_exclusion_rules: Vec<ProtectionExclusionRuleConfig>,
+
+    /// Reserved flag for future GraphQL payload extraction.
+    #[serde(default)]
+    pub enable_graphql_support: bool,
+
+    /// `DataDome` client-side key used for auto-injecting the browser tag.
+    #[serde(default)]
+    pub client_side_key: String,
+
+    /// Whether to auto-inject the `DataDome` browser tag when a client-side key exists.
+    #[serde(default = "default_inject_client_side_tag")]
+    pub inject_client_side_tag: bool,
+
+    /// URL used for the injected `DataDome` browser tag.
+    #[serde(default = "default_client_side_tag_url")]
+    pub client_side_tag_url: String,
+
+    /// Options assigned to `window.ddoptions` before loading the browser tag.
+    #[serde(default = "default_client_side_configuration")]
+    pub client_side_configuration: JsonValue,
 }
 
 fn default_enabled() -> bool {
@@ -149,6 +235,76 @@ fn default_rewrite_sdk() -> bool {
     true
 }
 
+fn default_protection_api_origin() -> String {
+    "https://api-fastly.datadome.co".to_string()
+}
+
+fn default_server_side_key_secret_store() -> String {
+    "ts_secrets".to_string()
+}
+
+fn default_server_side_key_secret_name() -> String {
+    "datadome_server_side_key".to_string()
+}
+
+fn default_timeout_ms() -> u32 {
+    1500
+}
+
+fn default_static_asset_exclusion_pattern() -> String {
+    r"(?i)\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|webm|webp|bmp|gif|ico|jpeg|jpg|png|svg|svgz|swf|eot|otf|ttf|woff|woff2|css|less|js|map)$".to_string()
+}
+
+fn default_protection_excluded_methods() -> Vec<String> {
+    vec!["OPTIONS".to_string()]
+}
+
+fn default_protection_ip_list_cache_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_protection_exclusion_rules() -> Vec<ProtectionExclusionRuleConfig> {
+    vec![ProtectionExclusionRuleConfig {
+        id: "default-static-assets".to_string(),
+        enabled: true,
+        methods: Vec::new(),
+        matcher: ProtectionMatcherConfig::PathRegex {
+            patterns: vec![default_static_asset_exclusion_pattern()],
+        },
+    }]
+}
+
+fn default_inject_client_side_tag() -> bool {
+    true
+}
+
+fn default_client_side_tag_url() -> String {
+    "/integrations/datadome/tags.js".to_string()
+}
+
+fn default_client_side_configuration() -> JsonValue {
+    serde_json::json!({ "ajaxListenerPath": true })
+}
+
+fn is_unsafe_client_side_tag_path_char(ch: char) -> bool {
+    ch.is_ascii_control() || ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`')
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 impl Default for DataDomeConfig {
     fn default() -> Self {
         Self {
@@ -157,6 +313,22 @@ impl Default for DataDomeConfig {
             api_origin: default_api_origin(),
             cache_ttl_seconds: default_cache_ttl(),
             rewrite_sdk: default_rewrite_sdk(),
+            enable_protection: false,
+            server_side_key_secret_store: default_server_side_key_secret_store(),
+            server_side_key_secret_name: default_server_side_key_secret_name(),
+            protection_api_origin: default_protection_api_origin(),
+            timeout_ms: default_timeout_ms(),
+            protection_excluded_methods: default_protection_excluded_methods(),
+            protection_excluded_asns: Vec::new(),
+            protection_excluded_ip_cidrs: Vec::new(),
+            protection_excluded_ip_cidr_sources: Vec::new(),
+            protection_ip_list_cache_ttl_seconds: default_protection_ip_list_cache_ttl_seconds(),
+            protection_exclusion_rules: default_protection_exclusion_rules(),
+            enable_graphql_support: false,
+            client_side_key: String::new(),
+            inject_client_side_tag: default_inject_client_side_tag(),
+            client_side_tag_url: default_client_side_tag_url(),
+            client_side_configuration: default_client_side_configuration(),
         }
     }
 }
@@ -170,11 +342,112 @@ impl IntegrationConfig for DataDomeConfig {
 /// `DataDome` integration implementation.
 pub struct DataDomeIntegration {
     config: DataDomeConfig,
+    protection_scope: ProtectionScope,
 }
 
 impl DataDomeIntegration {
+    #[cfg(test)]
     fn new(config: DataDomeConfig) -> Arc<Self> {
-        Arc::new(Self { config })
+        Self::try_new(config).expect("should create DataDome integration")
+    }
+
+    fn try_new(mut config: DataDomeConfig) -> Result<Arc<Self>, Report<TrustedServerError>> {
+        config.server_side_key_secret_store =
+            config.server_side_key_secret_store.trim().to_string();
+        config.server_side_key_secret_name = config.server_side_key_secret_name.trim().to_string();
+        config.protection_api_origin = config.protection_api_origin.trim().to_string();
+        config.client_side_tag_url = config.client_side_tag_url.trim().to_string();
+
+        if config.enable_protection {
+            if config.server_side_key_secret_store.is_empty()
+                || config.server_side_key_secret_name.is_empty()
+            {
+                return Err(Report::new(Self::error(
+                    "server_side_key_secret_store and server_side_key_secret_name are required when enable_protection is true",
+                )));
+            }
+            Self::validate_protection_api_origin(&config.protection_api_origin)?;
+        }
+
+        if config.inject_client_side_tag {
+            Self::validate_client_side_tag_url(&config.client_side_tag_url)?;
+        }
+
+        if config.enable_graphql_support {
+            log::warn!("[datadome] enable_graphql_support is reserved and ignored in v1");
+        }
+
+        let protection_scope = ProtectionScope::compile(&config)?;
+
+        Ok(Arc::new(Self {
+            config,
+            protection_scope,
+        }))
+    }
+
+    fn validate_protection_api_origin(origin: &str) -> Result<(), Report<TrustedServerError>> {
+        let parsed = Url::parse(origin).map_err(|err| {
+            Report::new(Self::error(format!("Invalid protection_api_origin: {err}")))
+        })?;
+
+        if !parsed.scheme().eq_ignore_ascii_case("https") {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must use https when enable_protection is true",
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must include a host",
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must not include credentials",
+            )));
+        }
+        if !matches!(parsed.path(), "" | "/")
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Report::new(Self::error(
+                "protection_api_origin must be an origin URL without path, query, or fragment",
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_client_side_tag_url(tag_url: &str) -> Result<(), Report<TrustedServerError>> {
+        if tag_url.starts_with('/') && !tag_url.starts_with("//") {
+            if tag_url.chars().any(is_unsafe_client_side_tag_path_char) {
+                return Err(Report::new(Self::error(
+                    "client_side_tag_url root-relative paths must not include unsafe characters",
+                )));
+            }
+            return Ok(());
+        }
+
+        let parsed = Url::parse(tag_url).map_err(|err| {
+            Report::new(Self::error(format!("Invalid client_side_tag_url: {err}")))
+        })?;
+
+        if !parsed.scheme().eq_ignore_ascii_case("https") {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must be root-relative or use https",
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must include a host when absolute",
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Report::new(Self::error(
+                "client_side_tag_url must not include credentials",
+            )));
+        }
+
+        Ok(())
     }
 
     fn error(message: impl Into<String>) -> TrustedServerError {
@@ -473,6 +746,50 @@ impl IntegrationProxy for DataDomeIntegration {
     }
 }
 
+#[async_trait(?Send)]
+impl IntegrationRequestFilter for DataDomeIntegration {
+    fn integration_id(&self) -> &'static str {
+        DATADOME_INTEGRATION_ID
+    }
+
+    async fn filter_request(
+        &self,
+        input: RequestFilterInput<'_>,
+    ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+        Ok(self.filter_protection_request(input).await)
+    }
+}
+
+impl IntegrationHeadInjector for DataDomeIntegration {
+    fn integration_id(&self) -> &'static str {
+        DATADOME_INTEGRATION_ID
+    }
+
+    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+        if !self.config.inject_client_side_tag || self.config.client_side_key.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let key = serde_json::to_string(&self.config.client_side_key)
+            .unwrap_or_else(|err| {
+                log::warn!("[datadome] Failed to serialize client-side key: {err}");
+                "\"\"".to_string()
+            })
+            .replace("</", "<\\/");
+        let tag_url = escape_html_attribute(&self.config.client_side_tag_url);
+        let options = serde_json::to_string(&self.config.client_side_configuration)
+            .unwrap_or_else(|err| {
+                log::warn!("[datadome] Failed to serialize client-side configuration: {err}");
+                "{}".to_string()
+            })
+            .replace("</", "<\\/");
+
+        vec![format!(
+            "<script>window.ddjskey={key};window.ddoptions={options};</script><script src=\"{tag_url}\" async></script>"
+        )]
+    }
+}
+
 impl IntegrationAttributeRewriter for DataDomeIntegration {
     fn integration_id(&self) -> &'static str {
         DATADOME_INTEGRATION_ID
@@ -527,7 +844,7 @@ fn build(
         config.rewrite_sdk
     );
 
-    Ok(Some(DataDomeIntegration::new(config)))
+    Ok(Some(DataDomeIntegration::try_new(config)?))
 }
 
 /// Register the `DataDome` integration with Trusted Server.
@@ -543,12 +860,16 @@ pub fn register(
         return Ok(None);
     };
 
-    Ok(Some(
-        IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
-            .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
-            .build(),
-    ))
+    let mut builder = IntegrationRegistration::builder(DATADOME_INTEGRATION_ID)
+        .with_proxy(integration.clone())
+        .with_attribute_rewriter(integration.clone())
+        .with_head_injector(integration.clone());
+
+    if integration.config.enable_protection {
+        builder = builder.with_request_filter(integration);
+    }
+
+    Ok(Some(builder.build()))
 }
 
 #[cfg(test)]
@@ -566,6 +887,7 @@ mod tests {
             api_origin: "https://api-js.datadome.co".to_string(),
             cache_ttl_seconds: 3600,
             rewrite_sdk: true,
+            ..DataDomeConfig::default()
         }
     }
 
@@ -737,6 +1059,210 @@ mod tests {
         assert_eq!(
             integration.build_api_url("/js/check", Some("foo=bar")),
             "https://api-js.datadome.co/js/check?foo=bar"
+        );
+    }
+
+    fn html_context_for_tests(
+        document_state: &crate::integrations::IntegrationDocumentState,
+    ) -> IntegrationHtmlContext<'_> {
+        IntegrationHtmlContext {
+            request_host: "publisher.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+            document_state,
+        }
+    }
+
+    #[test]
+    fn protection_secret_defaults_match_sample_config() {
+        let config = DataDomeConfig::default();
+
+        assert_eq!(config.server_side_key_secret_store, "ts_secrets");
+        assert_eq!(
+            config.server_side_key_secret_name,
+            "datadome_server_side_key"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_server_side_key_secret_store() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_store = " ".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject empty store"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:?}").contains("server_side_key_secret_store"),
+            "should mention secret store config"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_server_side_key_secret_name() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.server_side_key_secret_name = " ".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject empty name"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:?}").contains("server_side_key_secret_name"),
+            "should mention secret name config"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_https_protection_api_origin() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.protection_api_origin = "http://api-fastly.datadome.co".to_string();
+
+        let err = match DataDomeIntegration::try_new(config) {
+            Ok(_) => panic!("should reject plaintext Protection API origin"),
+            Err(err) => err,
+        };
+
+        assert!(
+            format!("{err:?}").contains("must use https"),
+            "should require HTTPS for the server-side key transport"
+        );
+    }
+
+    #[test]
+    fn protection_enabled_requires_origin_only_protection_api_origin() {
+        for origin in [
+            "https://api-fastly.datadome.co/custom",
+            "https://api-fastly.datadome.co?region=test",
+            "https://api-fastly.datadome.co#fragment",
+            "https://user:pass@api-fastly.datadome.co",
+        ] {
+            let mut config = test_config();
+            config.enable_protection = true;
+            config.protection_api_origin = origin.to_string();
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject non-origin Protection API URL: {origin}"),
+                Err(err) => err,
+            };
+
+            assert!(
+                format!("{err:?}").contains("protection_api_origin"),
+                "should explain rejected Protection API origin {origin}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protection_enabled_accepts_https_protection_api_origin_with_trailing_slash() {
+        let mut config = test_config();
+        config.enable_protection = true;
+        config.protection_api_origin = "https://api-fastly.datadome.co/".to_string();
+
+        DataDomeIntegration::try_new(config)
+            .expect("should accept HTTPS origin URL with optional trailing slash");
+    }
+
+    #[test]
+    fn client_side_tag_url_requires_root_relative_or_https() {
+        for tag_url in [
+            "",
+            "tags.js",
+            "//example.com/tags.js",
+            "http://example.com/tags.js",
+            "/tags.js\" data-bad=\"1",
+        ] {
+            let mut config = test_config();
+            config.client_side_tag_url = tag_url.to_string();
+
+            let err = match DataDomeIntegration::try_new(config) {
+                Ok(_) => panic!("should reject unsafe client-side tag URL: {tag_url}"),
+                Err(err) => err,
+            };
+
+            assert!(
+                format!("{err:?}").contains("client_side_tag_url"),
+                "should explain rejected client-side tag URL {tag_url}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_side_tag_url_accepts_https_absolute_url() {
+        let mut config = test_config();
+        config.client_side_tag_url = "https://example.com/tags.js?version=1".to_string();
+
+        DataDomeIntegration::try_new(config).expect("should accept HTTPS client-side tag URL");
+    }
+
+    #[test]
+    fn head_injector_escapes_client_side_tag_url_attribute() {
+        let mut config = test_config();
+        config.client_side_key = "test-client-key".to_string();
+        config.client_side_tag_url = "/integrations/datadome/tags.js?one=1&two=2".to_string();
+        let integration = DataDomeIntegration::new(config);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert!(
+            inserts[0].contains(
+                "<script src=\"/integrations/datadome/tags.js?one=1&amp;two=2\" async></script>"
+            ),
+            "should HTML-escape the DataDome tag URL attribute"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_client_side_tag_when_key_configured() {
+        let mut config = test_config();
+        config.client_side_key = "test-client-key".to_string();
+        config.client_side_configuration = serde_json::json!({ "ajaxListenerPath": true });
+        let integration = DataDomeIntegration::new(config);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+
+        let inserts = integration.head_inserts(&ctx);
+
+        assert_eq!(inserts.len(), 1, "should emit one combined DataDome insert");
+        assert!(
+            inserts[0].contains("window.ddjskey=\"test-client-key\""),
+            "should serialize the configured client-side key"
+        );
+        assert!(
+            inserts[0].contains("window.ddoptions={\"ajaxListenerPath\":true}"),
+            "should serialize DataDome client-side options"
+        );
+        assert!(
+            inserts[0].contains("<script src=\"/integrations/datadome/tags.js\" async></script>"),
+            "should load the configured DataDome tag URL"
+        );
+    }
+
+    #[test]
+    fn head_injector_omits_client_side_tag_when_disabled_or_blank() {
+        let mut blank_key = test_config();
+        blank_key.client_side_key = " ".to_string();
+        let integration = DataDomeIntegration::new(blank_key);
+        let document_state = crate::integrations::IntegrationDocumentState::default();
+        let ctx = html_context_for_tests(&document_state);
+        assert!(
+            integration.head_inserts(&ctx).is_empty(),
+            "should not inject a tag without a client-side key"
+        );
+
+        let mut disabled = test_config();
+        disabled.client_side_key = "test-client-key".to_string();
+        disabled.inject_client_side_tag = false;
+        let integration = DataDomeIntegration::new(disabled);
+        assert!(
+            integration.head_inserts(&ctx).is_empty(),
+            "should not inject a tag when injection is disabled"
         );
     }
 

@@ -12,7 +12,7 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 
 # Allow cloudflare-specific overrides on top (not committed).
 # Copy .env.cloudflare.dev.example → .env.cloudflare.dev to customise.
-[ -f "$SCRIPT_DIR/.env.cloudflare.dev" ] && . "$SCRIPT_DIR/.env.cloudflare.dev"
+[ -f "$SCRIPT_DIR/.env.cloudflare.dev" ] && set -a && . "$SCRIPT_DIR/.env.cloudflare.dev" && set +a
 
 # worker-build must run from the crate root (where Cargo.toml lives) regardless
 # of which directory wrangler was invoked from.
@@ -33,4 +33,4 @@ if [ -z "$WORKER_VERSION" ]; then
   echo "error: could not determine the worker crate version from Cargo.lock" >&2
   exit 1
 fi
-cargo install -q --version "=$WORKER_VERSION" worker-build && worker-build --release
+cargo install -q --force --version "=$WORKER_VERSION" worker-build && worker-build --release

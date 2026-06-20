@@ -26,12 +26,14 @@ pub mod sourcepoint;
 pub mod testlight;
 
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationDocumentState, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationHtmlPostProcessor,
-    IntegrationMetadata, IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder,
-    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput,
-    ScriptRewriteAction,
+    AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
+    IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
+    IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
+    IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
+    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -146,6 +148,7 @@ fn integration_backend_spec(
             })?
             .to_string(),
         port: parsed.port(),
+        host_header_override: None,
         certificate_check,
         first_byte_timeout,
     })

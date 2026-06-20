@@ -5,17 +5,18 @@ use trusted_server_core::streaming_processor::StreamProcessor as _;
 
 fn make_config() -> HtmlProcessorConfig {
     HtmlProcessorConfig {
-        origin_host: "origin.bench.com".to_string(),
-        request_host: "proxy.bench.com".to_string(),
+        origin_host: "origin.bench.example.com".to_string(),
+        request_host: "proxy.bench.example.com".to_string(),
         request_scheme: "https".to_string(),
         integrations: IntegrationRegistry::default(),
+        max_buffered_body_bytes: 16 * 1024 * 1024,
     }
 }
 
 fn make_html(size_kb: usize) -> Vec<u8> {
-    let link_block = r#"<a href="https://origin.bench.com/page">Link</a>
-<img src="https://origin.bench.com/img.png">
-<div data-ad-unit="/test/banner"><a href="https://origin.bench.com/ad">Ad</a></div>
+    let link_block = r#"<a href="https://origin.bench.example.com/page">Link</a>
+<img src="https://origin.bench.example.com/img.png">
+<div data-ad-unit="/test/banner"><a href="https://origin.bench.example.com/ad">Ad</a></div>
 "#;
 
     let body_content = link_block.repeat((size_kb * 1024) / link_block.len() + 1);

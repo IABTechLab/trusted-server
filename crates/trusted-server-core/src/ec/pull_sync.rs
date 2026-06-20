@@ -170,6 +170,7 @@ pub fn dispatch_pull_sync(
             scheme,
             host,
             port,
+            host_header_override: None,
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         }) {
