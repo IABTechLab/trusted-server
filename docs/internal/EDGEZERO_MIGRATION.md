@@ -55,8 +55,8 @@ Before advancing any stage, activate the canary switch:
    rate hold at baseline. There is no production per-branch route signal to tail
    (see [Monitoring](#monitoring)); the `routing request through legacy path
 (rollout_pct=0)` line is emitted at `debug!`, so it surfaces only in local
-   Viceroy runs started with `EDGEZERO_LOG_LEVEL=debug` (the logger defaults to
-   `Info`, which suppresses it).
+   Viceroy runs, where the logger auto-raises to `debug` via
+   `FASTLY_HOSTNAME=localhost` (production stays at `Info`, which suppresses it).
 
 ### Stage 1 — 1%
 
@@ -129,9 +129,9 @@ Rollback is **immediate, no deploy required**.
 > branch yet.** The per-request route decision is emitted only at `log::debug!`
 > (`should_route_to_edgezero` in the Fastly entry point), and the Fastly logger
 > defaults to `Info` (`logging::init_logger`), so these lines do not reach the
-> production log endpoint — production Fastly Compute does not surface the
-> `EDGEZERO_LOG_LEVEL` override that would raise the level. They can be made
-> visible only in local Viceroy runs that set `EDGEZERO_LOG_LEVEL=debug`. No
+> production log endpoint. The logger auto-raises to `debug` only under Viceroy,
+> detected via the guest-visible `FASTLY_HOSTNAME=localhost` signal, so the route
+> decision is visible only in local runs and never in production. No
 > `x-edgezero-path` response-path marker exists (deferred
 > follow-up), and no Fastly real-time-stats traffic split is configured for this
 > decision. Until a production-safe per-branch signal is added, canary
@@ -147,10 +147,11 @@ that appears and tracks the rollout steps implicates the EdgeZero branch:
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> For local pre-production validation under Viceroy, start the simulator with
-> `EDGEZERO_LOG_LEVEL=debug` (the logger defaults to `Info`, which suppresses
-> these lines) — for example `EDGEZERO_LOG_LEVEL=debug fastly compute serve`.
-> The route-decision log lines are then:
+> For local pre-production validation under Viceroy, start the simulator normally
+> (`fastly compute serve`). Viceroy exposes `FASTLY_HOSTNAME=localhost` to guest
+> code, and the Fastly logger raises the route-decision level to `debug` in that
+> local environment while production stays at `Info`. The route-decision log lines
+> are then:
 >
 > - `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — partial-stage canary traffic.
 > - `routing request through legacy path (bucket=N, rollout_pct=M)` — partial-stage legacy traffic.

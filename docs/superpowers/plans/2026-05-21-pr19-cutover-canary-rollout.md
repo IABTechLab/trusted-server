@@ -220,7 +220,7 @@ fn rollout_one_routes_exactly_one_bucket() {
 - [ ] **Step 2: Run tests — verify they FAIL**
 
 ```bash
-cargo test-fastly 2>&1 | head -40
+cargo test-fastly
 ```
 
 Expected: compile errors for `parse_rollout_pct`, `fnv1a_bucket`, `canary_routes_to_edgezero` not found.
@@ -273,7 +273,7 @@ fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
 - [ ] **Step 4: Run tests — verify they PASS**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: `test result: ok. N passed; 0 failed`
@@ -329,7 +329,17 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
                 0
             }
         },
-        Ok(None) => 100,
+        Ok(None) => {
+            // Absent key fails safe to legacy, matching every other failure branch
+            // (unreadable flag, invalid value, read error all resolve to legacy).
+            // Deleting the key can never trigger a full cutover. Fires per-request
+            // when the key is absent and edgezero_enabled=true, so emit at debug to
+            // avoid a per-request log flood at production QPS.
+            log::debug!(
+                "edgezero_rollout_pct key absent, defaulting to 0 (legacy path — fail safe)"
+            );
+            0
+        }
         Err(e) => {
             log::warn!(
                 "failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)"
@@ -400,19 +410,19 @@ fn main() {
 - [ ] **Step 4: Run tests, fmt, and clippy**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: all tests pass.
 
 ```bash
-cargo fmt --all -- --check 2>&1 | tail -10
+cargo fmt --all -- --check
 ```
 
 Expected: no diff. If there is output, run `cargo fmt --all` to fix, then re-check.
 
 ```bash
-cargo clippy -p trusted-server-adapter-fastly --all-targets --all-features -- -D warnings 2>&1 | tail -20
+cargo clippy-fastly
 ```
 
 Expected: no warnings. (`--all-targets` covers the test binary so the new test code is also linted.)
@@ -463,7 +473,7 @@ In `fastly.toml`, within `[local_server.config_stores.trusted_server_config.cont
 - [ ] **Step 2: Verify local Viceroy still starts without errors**
 
 ```bash
-cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 2>&1 | tail -5
+cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1
 ```
 
 Expected: `Finished release profile [optimized] target(s)`
@@ -609,7 +619,7 @@ Rollback is **immediate, no deploy required**.
 
 Fastly real-time stats dashboard, **aggregate service metrics only**. There is no
 production per-branch (EdgeZero vs legacy) route attribution: route-decision logs are
-emitted at `debug!` and Fastly Compute does not surface `EDGEZERO_LOG_LEVEL`, so they
+emitted at `debug!`, and production Compute keeps the logger at `Info`, so they
 appear only in local Viceroy runs. No `x-edgezero-path` / real-time-stats branch split
 exists yet (tracked as a follow-up). Verify each stage by watching aggregate metrics move
 as `rollout_pct` is stepped, not by per-request branch tagging.
@@ -621,8 +631,9 @@ Key signals at each canary stage:
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> Route-decision log lines are **local Viceroy only** (run with `EDGEZERO_LOG_LEVEL=debug`;
-> the logger defaults to `Info` and suppresses them in production):
+> Route-decision log lines are **local Viceroy only** (the logger auto-raises to
+> `debug` under Viceroy via `FASTLY_HOSTNAME=localhost`; production stays at `Info`
+> and suppresses them):
 > `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
 > `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
 
@@ -646,7 +657,7 @@ cd docs && cat package.json | grep -A3 '"format"'
 If the glob is `"*.md"` (flat), update it to `"**/*.md"` before proceeding. Then:
 
 ```bash
-cd docs && npm run format -- --check 2>&1 | tail -10
+cd docs && npm run format -- --check
 ```
 
 Expected: `All matched files use Prettier code style!` (or no diff output)
@@ -671,7 +682,7 @@ instant rollback procedure."
 - [ ] **Run full test suite**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: all tests pass, including the 10 new canary routing tests.
@@ -679,8 +690,8 @@ Expected: all tests pass, including the 10 new canary routing tests.
 - [ ] **Run fmt and clippy**
 
 ```bash
-cargo fmt --all -- --check 2>&1 | tail -10
-cargo clippy -p trusted-server-adapter-fastly --all-targets --all-features -- -D warnings 2>&1 | tail -10
+cargo fmt --all -- --check
+cargo clippy-fastly
 ```
 
 Expected: both clean.
@@ -717,4 +728,4 @@ Open PR:
 - **No new dependencies** — FNV-1a is inlined, not a crate import.
 - **Fail-safe** — absent, invalid, or unreadable `edgezero_rollout_pct` all produce 0 (all legacy), never 100. A missing or misconfigured key can never accidentally route traffic to EdgeZero; rollout requires an explicit percentage.
 - **No handler or core changes** — all changes are confined to `main.rs` entry-point logic and `fastly.toml`.
-- **Sticky routing** — client IP hash is deterministic; the same user always gets the same path at a given `rollout_pct`, preventing split-session bugs.
+- **Sticky routing** — client IP hash is deterministic; the same client IP gets the same path at a given `rollout_pct`, but NAT sharing and IP changes can re-bucket users.
