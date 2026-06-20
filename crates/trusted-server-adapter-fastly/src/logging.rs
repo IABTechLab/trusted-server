@@ -16,20 +16,31 @@ fn target_label(target: &str) -> &str {
     }
 }
 
-/// Environment variable that overrides the Fastly logger's maximum level.
+/// Environment variable that explicitly overrides the Fastly logger's maximum level.
 ///
-/// Production ships at `Info`; this override exists for local pre-production
-/// validation under Viceroy, where raising the level to `debug` makes the
-/// `should_route_to_edgezero` route-decision lines observable. Production Fastly
-/// Compute does not surface arbitrary process environment variables, so the
-/// override is effectively local-only and the level stays at the safe default
-/// when the variable is unset or unparseable.
-///
-/// Fastly-only by design: this knob is safe here *because* Compute hides runtime
-/// env vars. It must not be copied verbatim into the axum/spin/cloudflare
-/// adapters, which run where env vars are readable — there it would reintroduce
-/// the per-request production debug flood this path deliberately avoids.
+/// Production ships at `Info`. `fastly compute serve`/Viceroy does not propagate
+/// arbitrary shell environment variables into the Compute guest, so this override
+/// only takes effect where the guest environment is populated deliberately (e.g.
+/// the integration-test harness). Routine local validation does not depend on it —
+/// see [`init_logger`], which auto-raises the level under Viceroy via the
+/// [`LOCAL_HOSTNAME_ENV`] signal. The level stays at the safe default when this
+/// variable is unset or unparseable.
 const LOG_LEVEL_ENV: &str = "EDGEZERO_LOG_LEVEL";
+
+/// Fastly-provided hostname environment variable, visible to guest code.
+///
+/// Viceroy (`fastly compute serve`) reports [`LOCAL_HOSTNAME`]; production cache
+/// nodes report their real hostname. [`init_logger`] reads it to raise the log
+/// level for local route-decision observability without affecting production.
+///
+/// Fastly-specific by design: this signal exists *because* Compute exposes a
+/// guest-visible hostname that is fixed to `localhost` only under the simulator.
+/// It must not be copied verbatim into the axum/spin/cloudflare adapters, where
+/// it carries no such meaning and would mis-detect the runtime environment.
+const LOCAL_HOSTNAME_ENV: &str = "FASTLY_HOSTNAME";
+
+/// Hostname value Viceroy reports for [`LOCAL_HOSTNAME_ENV`] in local runs.
+const LOCAL_HOSTNAME: &str = "localhost";
 
 /// Resolves the logger's maximum level from an optional configured value,
 /// falling back to `Info` when it is absent or not a recognised level filter.
@@ -45,17 +56,26 @@ fn resolve_max_level(configured: Option<&str>) -> log::LevelFilter {
 /// Each line is prefixed with an RFC 3339 timestamp, level, and the final segment
 /// of the record's target module path.
 ///
-/// The maximum level defaults to `Info`. Setting the [`LOG_LEVEL_ENV`]
-/// environment variable (e.g. `EDGEZERO_LOG_LEVEL=debug`) overrides it for local
-/// Viceroy validation — the value is used as-is, so `error`/`off` lowers it just
-/// as `debug` raises it; see [`resolve_max_level`].
+/// The maximum level defaults to `Info`. Under Viceroy (`fastly compute serve`)
+/// it is auto-raised to `debug` so route-decision lines are observable locally,
+/// detected via the [`LOCAL_HOSTNAME_ENV`] signal. An explicit [`LOG_LEVEL_ENV`]
+/// value takes precedence where the guest environment is populated — the value is
+/// used as-is, so `error`/`off` lowers it just as `debug` raises it; see
+/// [`resolve_max_level`].
 ///
 /// # Panics
 ///
 /// Panics if the Fastly logger cannot be built or if the global logger has already
 /// been set.
 pub(crate) fn init_logger() {
-    let configured = std::env::var(LOG_LEVEL_ENV).ok();
+    let configured = std::env::var(LOG_LEVEL_ENV).ok().or_else(|| {
+        // Viceroy reports the guest host as `localhost`; production cache nodes
+        // report their real hostname. Raise to debug only in that local
+        // environment so route-decision lines surface under `fastly compute
+        // serve` while production stays at the safe `Info` default.
+        (std::env::var(LOCAL_HOSTNAME_ENV).as_deref() == Ok(LOCAL_HOSTNAME))
+            .then(|| "debug".to_owned())
+    });
     let max_level = resolve_max_level(configured.as_deref());
 
     let logger = Logger::builder()
