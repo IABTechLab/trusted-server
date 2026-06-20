@@ -113,6 +113,14 @@ export interface TsjsApi {
    * client-side auction that would clear the just-applied TS targeting.
    */
   adInitRefreshInProgress?: boolean;
+  /**
+   * True once the publisher has called `googletag.pubads().disableInitialLoad()`.
+   * GPT exposes no getter for this state, so it is tracked by wrapping the
+   * setter. When set, `display()` only registers a slot and the ad request must
+   * come from a `refresh()`; adInit() uses this to refresh its own freshly
+   * defined slots so they are not left blank.
+   */
+  gptInitialLoadDisabled?: boolean;
   /** Guards SPA pushState hook installation. */
   spaHookInstalled?: boolean;
 }

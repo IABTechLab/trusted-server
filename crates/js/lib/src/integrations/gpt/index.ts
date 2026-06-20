@@ -106,6 +106,7 @@ interface GoogleTagPubAdsService {
   addEventListener(event: string, fn: (e: SlotRenderEndedEvent) => void): void;
   refresh(slots?: GoogleTagSlot[]): void;
   getSlots?(): GoogleTagSlot[];
+  disableInitialLoad?(): void;
 }
 
 interface GoogleTag {
@@ -371,8 +372,48 @@ function queueWinBillingBeacon(url: string): boolean {
  * Idempotent: destroys previously created TS-managed slots before redefining them,
  * so it is safe to call again after SPA navigation updates `tsjs.adSlots`/`tsjs.bids`.
  */
+/**
+ * Track whether the publisher disabled GPT initial load.
+ *
+ * GPT exposes no getter for the initial-load-disabled flag, so wrap
+ * `pubads().disableInitialLoad()` to record it on `window.tsjs`. With initial
+ * load disabled, `display()` only registers a slot — the ad request must come
+ * from a later `refresh()`. adInit() reads this to refresh its own freshly
+ * defined slots so they are not left blank.
+ *
+ * Installed via the command queue so it runs before the publisher's own
+ * `disableInitialLoad()` call (the TS core script is injected ahead of the
+ * publisher's GPT setup). Idempotent per pubads service.
+ *
+ * Only hooks an existing `googletag` stub — it never creates one. A plain module
+ * import that does not activate the GPT integration must not touch
+ * `window.googletag`. When the GPT shim is active it creates the stub before
+ * `installTsAdInit` runs, so the detector is still queued ahead of the
+ * publisher's GPT setup.
+ */
+function installInitialLoadDetector(ts: TsjsApi): void {
+  const win = window as GptWindow;
+  const cmd = win.googletag?.cmd;
+  if (!cmd) return;
+  cmd.push(() => {
+    const pubads = win.googletag?.pubads?.();
+    if (!pubads) return;
+    const service = pubads as GoogleTagPubAdsService & { __tsInitialLoadHooked?: boolean };
+    if (typeof service.disableInitialLoad !== 'function' || service.__tsInitialLoadHooked) {
+      return;
+    }
+    const original = service.disableInitialLoad.bind(service);
+    service.disableInitialLoad = function () {
+      ts.gptInitialLoadDisabled = true;
+      return original();
+    };
+    service.__tsInitialLoadHooked = true;
+  });
+}
+
 export function installTsAdInit(): void {
   const ts = (window.tsjs ??= {} as TsjsApi);
+  installInitialLoadDetector(ts);
   ts.adInit = function () {
     const slots = ts.adSlots ?? [];
     // Snapshot bids at adInit() call time — correct for targeting setup.
@@ -524,16 +565,28 @@ export function installTsAdInit(): void {
       // enabled, so this runs unconditionally for any newly-defined slots.
       slotsToDisplay.forEach((divId) => g.display?.(divId));
 
-      if (slotsToRefresh.length > 0) {
+      // Slots needing an explicit ad request via refresh(). Reused
+      // publisher-owned slots always need one to pick up the just-applied
+      // server-side targeting. TS-defined slots are normally fetched by the
+      // display() above — but when the publisher called
+      // pubads().disableInitialLoad(), display() only registers the slot and the
+      // ad request must come from refresh(). Without this, a TS-owned
+      // first-impression slot renders blank on initial-load-disabled pages. Only
+      // add them in that case; otherwise display() + refresh() would
+      // double-request the impression.
+      const slotsNeedingRefresh = ts.gptInitialLoadDisabled
+        ? slotsToRefresh.concat(newSlots)
+        : slotsToRefresh;
+
+      if (slotsNeedingRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
-        // server-side targeting to GAM for reused publisher-owned slots. If
-        // slim-Prebid has wrapped refresh(), it must pass this call straight
-        // through — not clear the targeting and run a duplicate client-side
-        // auction. Later publisher-initiated refreshes of the same slots still
-        // go through the wrapper normally.
+        // server-side targeting to GAM. If slim-Prebid has wrapped refresh(), it
+        // must pass this call straight through — not clear the targeting and run
+        // a duplicate client-side auction. Later publisher-initiated refreshes of
+        // the same slots still go through the wrapper normally.
         ts.adInitRefreshInProgress = true;
         try {
-          g.pubads!().refresh(slotsToRefresh);
+          g.pubads!().refresh(slotsNeedingRefresh);
         } finally {
           ts.adInitRefreshInProgress = false;
         }

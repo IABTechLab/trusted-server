@@ -19,6 +19,29 @@
   var ts = (window.tsjs = window.tsjs || {});
   if (ts.adInit) return;
 
+  // Track whether the publisher disabled GPT initial load. GPT exposes no
+  // getter for this, so wrap pubads().disableInitialLoad() to record it. With
+  // initial load disabled, display() only registers a slot and the ad request
+  // must come from a later refresh(); adInit() reads this to refresh its own
+  // freshly defined slots so they are not left blank. Pushed onto the command
+  // queue so it runs before the publisher's own disableInitialLoad() call.
+  (window.googletag = window.googletag || { cmd: [] }).cmd.push(function () {
+    var pubads = googletag.pubads && googletag.pubads();
+    if (
+      !pubads ||
+      typeof pubads.disableInitialLoad !== "function" ||
+      pubads.__tsInitialLoadHooked
+    ) {
+      return;
+    }
+    var original = pubads.disableInitialLoad.bind(pubads);
+    pubads.disableInitialLoad = function () {
+      ts.gptInitialLoadDisabled = true;
+      return original();
+    };
+    pubads.__tsInitialLoadHooked = true;
+  });
+
   ts.adInit = function () {
     var slots = ts.adSlots || [];
     var bids = ts.bids || {};
@@ -120,7 +143,15 @@
       slotsToDisplay.forEach(function (divId) {
         googletag.display(divId);
       });
-      if (slotsToRefresh.length > 0) {
+      // Reused publisher-owned slots always need a refresh to pick up the
+      // server-side targeting. TS-defined slots are fetched by display() above
+      // unless the publisher disabled initial load, in which case display() only
+      // registers them and refresh() must request the ad — otherwise they render
+      // blank. Only add them in that case to avoid double-requesting.
+      var slotsNeedingRefresh = ts.gptInitialLoadDisabled
+        ? slotsToRefresh.concat(newSlots)
+        : slotsToRefresh;
+      if (slotsNeedingRefresh.length > 0) {
         // One-shot bypass: this internal refresh delivers the just-applied
         // server-side targeting to GAM. If slim-Prebid has already wrapped
         // refresh(), it must pass this call straight through — not clear the
@@ -128,7 +159,7 @@
         // bundle's adInit() in crates/js/lib/src/integrations/gpt/index.ts.
         ts.adInitRefreshInProgress = true;
         try {
-          googletag.pubads().refresh(slotsToRefresh);
+          googletag.pubads().refresh(slotsNeedingRefresh);
         } finally {
           ts.adInitRefreshInProgress = false;
         }

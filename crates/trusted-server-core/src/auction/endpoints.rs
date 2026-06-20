@@ -207,10 +207,23 @@ pub async fn handle_auction(
     // current request does not include them, fall back to the persisted
     // `ts-eids` cookie so later requests can still forward the browser's
     // full OpenRTB-style EID structure.
-    let client_eids = resolve_client_auction_eids(
-        body.eids.as_ref(),
-        extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-    );
+    //
+    // Gate this on the same identity-consent condition as the EC ID
+    // (`ec_id.is_some()`, which is already filtered by `ec_context.ec_allowed()`).
+    // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
+    // denied but a non-personalized auction may still run — could forward
+    // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
+    // only strips on TCF/GDPR signals. This matches the publisher and
+    // `/__ts/page-bids` paths, which also resolve client EIDs only when
+    // `ec_id.is_some()`.
+    let client_eids = if ec_id.is_some() {
+        resolve_client_auction_eids(
+            body.eids.as_ref(),
+            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
+        )
+    } else {
+        None
+    };
 
     // Resolve partner EIDs from the KV identity graph when the user has
     // a valid EC and both KV and partner stores are available.
@@ -606,6 +619,133 @@ mod tests {
         assert!(
             seatbid_empty,
             "gated auction must return no bids, got: {parsed}"
+        );
+    }
+
+    /// Provider that records whether the auction request it received carried
+    /// EIDs, then fails its launch so no real transport handle is needed.
+    struct EidCapturingProvider {
+        had_eids: Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidCapturingProvider {
+        fn provider_name(&self) -> &'static str {
+            "eid_capturing_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            *self.had_eids.lock().expect("should lock captured eids") =
+                Some(request.user.eids.is_some());
+            Err(Report::new(TrustedServerError::Auction {
+                message: "capture only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("capture-backend".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_strips_client_eids_when_ec_identity_denied() {
+        // US-state opt-out via GPC: the server-side auction consent gate still
+        // allows a non-personalized auction, but EC identity use is denied
+        // (`ec_allowed()` is false) and `gate_eids_by_consent` does not strip
+        // because no TCF signal is present and GDPR does not apply. Client EIDs
+        // supplied in the request body/cookie must NOT be forwarded — the
+        // outgoing auction request must have `user.eids == None`.
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["eid_capturing_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        let had_eids = Arc::new(std::sync::Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::clone(&had_eids),
+        }));
+        let services = noop_services();
+
+        // US-state jurisdiction with an explicit GPC opt-out: auction allowed,
+        // EC identity denied.
+        let ec_context = EcContext::new_for_test(
+            None,
+            ConsentContext {
+                jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+                gpc: true,
+                ..ConsentContext::default()
+            },
+        );
+
+        // Persistent EIDs supplied in both the request body and the ts-eids cookie.
+        let cookie_payload = json!([
+            {
+                "source": "sharedid.org",
+                "uids": [{ "id": "cookie_uid", "atype": 3 }]
+            }
+        ]);
+        let encoded_cookie = BASE64
+            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
+        let body = json!({
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ],
+            "eids": [
+                {
+                    "source": "id5-sync.com",
+                    "uids": [{ "id": "body_uid", "atype": 1 }]
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header("cookie", format!("{COOKIE_TS_EIDS}={encoded_cookie}"))
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        // The capturing provider fails its launch, so the auction errors overall;
+        // the assertion is on the EIDs observed by the provider, not the result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await;
+
+        assert_eq!(
+            *had_eids.lock().expect("should lock captured eids"),
+            Some(false),
+            "outgoing auction request must carry no EIDs when EC identity is denied"
         );
     }
 

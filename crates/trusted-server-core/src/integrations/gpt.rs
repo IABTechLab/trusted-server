@@ -1232,6 +1232,35 @@ mod tests {
     }
 
     #[test]
+    fn head_inserts_bootstrap_refreshes_ts_slots_when_initial_load_disabled() {
+        // Mirrors the bundle: when the publisher calls disableInitialLoad(),
+        // display() only registers a TS-defined slot, so the bootstrap must also
+        // refresh those slots or they render blank.
+        let config = test_config();
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+        let combined = integration.head_inserts(&ctx).join("");
+        assert!(
+            combined.contains("disableInitialLoad"),
+            "bootstrap should wrap disableInitialLoad() to detect the disabled state"
+        );
+        assert!(
+            combined.contains("gptInitialLoadDisabled"),
+            "bootstrap should record the initial-load-disabled state on window.tsjs"
+        );
+        assert!(
+            combined.contains("slotsNeedingRefresh"),
+            "bootstrap should refresh TS-defined slots when initial load is disabled"
+        );
+    }
+
+    #[test]
     fn head_injector_integration_id() {
         let integration = GptIntegration::new(test_config());
         assert_eq!(
