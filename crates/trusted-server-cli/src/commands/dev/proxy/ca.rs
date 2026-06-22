@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::net::IpAddr;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -196,9 +199,13 @@ impl CertAuthority {
         fs::set_permissions(ca_dir, fs::Permissions::from_mode(0o700))
             .change_context(CaError::Dir)?;
         fs::write(cert_path, cert_pem).change_context(CaError::Io)?;
-        fs::write(key_path, key_pem).change_context(CaError::Io)?;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))
+        let mut key_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(key_path)
             .change_context(CaError::Io)?;
+        key_file.write_all(key_pem.as_bytes()).change_context(CaError::Io)?;
         Ok(())
     }
 }
