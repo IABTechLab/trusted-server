@@ -49,6 +49,35 @@ The cookie domain comes from `[publisher].cookie_domain`.
 curl -i "https://edge.example.com/_ts/set-tester"
 ```
 
+### GET /\_ts/clear-tester
+
+Clears the first-party tester marker cookie for QA or troubleshooting workflows.
+
+**Configuration:** Uses the same `[tester_cookie].enabled` flag as `/_ts/set-tester`.
+
+**Response when enabled:**
+
+- **Status:** `204 No Content`
+- **Headers:**
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+The cookie domain comes from `[publisher].cookie_domain`.
+
+**Response when disabled:**
+
+- **Status:** `404 Not Found`
+- **Set-Cookie:** none
+
+**Example:**
+
+```bash
+curl -i "https://edge.example.com/_ts/clear-tester"
+```
+
 ---
 
 ## First-Party Endpoints

@@ -21,8 +21,8 @@ proxy_secret = "change-me-proxy-secret"
 # Raise it for deployments serving larger publisher pages:
 # max_buffered_body_bytes = 16777216  # 16 MiB
 
-# Tester-cookie endpoint. When enabled, GET /_ts/set-tester sets
-# ts-tester=true on publisher.cookie_domain.
+# Tester-cookie endpoints. When enabled, GET /_ts/set-tester sets
+# ts-tester=true and GET /_ts/clear-tester clears it on publisher.cookie_domain.
 [tester_cookie]
 enabled = false
 

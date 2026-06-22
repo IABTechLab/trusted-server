@@ -326,14 +326,14 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 
 ## Tester Cookie Configuration
 
-Settings for the optional tester-cookie endpoint. This feature is disabled by
+Settings for the optional tester-cookie endpoints. This feature is disabled by
 default and should only be enabled for intentional QA or troubleshooting flows.
 
 ### `[tester_cookie]`
 
-| Field     | Type    | Required | Description                                                  |
-| --------- | ------- | -------- | ------------------------------------------------------------ |
-| `enabled` | Boolean | No       | Enables `GET /_ts/set-tester` to set `ts-tester=true` cookie |
+| Field     | Type    | Required | Description                                        |
+| --------- | ------- | -------- | -------------------------------------------------- |
+| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
 
 When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
 
@@ -342,7 +342,14 @@ Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; Sa
 Cache-Control: no-store, private
 ```
 
-When disabled, the route returns `404 Not Found` and does not set a cookie.
+`GET /_ts/clear-tester` returns `204 No Content` and clears the cookie:
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+When disabled, both routes return `404 Not Found` and do not set a cookie.
 
 ::: warning
 The cookie is scoped with `[publisher].cookie_domain`, not the EC-specific
