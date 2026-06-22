@@ -15,7 +15,7 @@
     "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\""
   },
   "dependencies": {
-    "prebid.js": "^10.26.0"
+    "prebid.js": "^11.19.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
@@ -32,7 +32,7 @@
     "prettier": "^3.2.5",
     "typescript": "^5.5.4",
     "typescript-eslint": "^8.56.1",
-    "vite": "^7.3.1",
-    "vitest": "^4.0.8"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.9"
   }
 }
