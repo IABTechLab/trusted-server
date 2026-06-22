@@ -1715,10 +1715,20 @@ pub struct DebugConfig {
     pub inject_adm_for_testing: bool,
 }
 
+/// Tester-cookie endpoint configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct TesterCookieConfig {
+    /// Enable tester-cookie endpoints that set and clear `ts-tester`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
+    #[serde(default)]
+    pub tester_cookie: TesterCookieConfig,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -2404,6 +2414,10 @@ mod tests {
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
+        assert!(
+            !settings.tester_cookie.enabled,
+            "tester-cookie route should default to disabled"
+        );
         assert_eq!(
             settings.publisher.ec_cookie_domain(),
             ".test-publisher.com",
@@ -2420,6 +2434,25 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn tester_cookie_enabled_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse tester-cookie config");
+
+        assert!(
+            settings.tester_cookie.enabled,
+            "tester-cookie config should enable the route"
+        );
     }
 
     #[test]

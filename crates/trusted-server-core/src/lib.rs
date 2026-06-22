@@ -17,6 +17,7 @@
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
 //! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
 //! - [`test_support`]: Testing utilities and mocks
+//! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
 
 #![cfg_attr(
     test,
@@ -68,6 +69,7 @@ pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
+pub mod tester_cookie;
 pub mod tsjs;
 
 #[cfg(test)]
