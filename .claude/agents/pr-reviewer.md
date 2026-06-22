@@ -285,8 +285,19 @@ if [ -n "$WT" ]; then
         # second fetch would re-pull whatever the PR head looks like *now*
         # (which could have moved between the verify and the reset), so
         # don't fetch again; just reset to the already-verified $HEAD_REF.
+        #
+        # `reset --hard` + `clean -fd` restores tracked files and removes
+        # untracked non-ignored files, but leaves *ignored* artefacts behind.
+        # A prior invocation interrupted after running `node build-all.mjs`
+        # (step 7e) leaves a stale `crates/js/dist/` from the old head or a
+        # discarded suggestion; `crates/js/build.rs` consumes those bundles
+        # via `include_str!()`, so the leftover would leak into this pass's
+        # Rust compile output. Wipe that one ignored input before starting —
+        # `-x` is scoped to `crates/js/dist` so it doesn't blow away the
+        # `target/` and `node_modules/` caches that speed up verification.
         git -C "$WT" reset --hard "$HEAD_REF"
         git -C "$WT" clean -fd
+        git -C "$WT" clean -fdx crates/js/dist
     else
         # A directory exists at $WT but git doesn't know about it (aborted
         # prior session, manual `rm -rf` of the metadata, etc.). Refuse to
