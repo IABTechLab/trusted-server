@@ -23,6 +23,7 @@
 //! | POST | `/admin/keys/deactivate` (legacy alias) | [`handle_deactivate_key`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
+//! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
@@ -119,6 +120,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::tester_cookie::handle_set_tester;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -549,6 +551,7 @@ async fn run_named_route(
                 )
             }
         }
+        NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -905,6 +908,7 @@ enum NamedRouteHandler {
     DeactivateKey,
     BatchSync,
     Identify,
+    SetTester,
     Auction,
     FirstPartyProxy,
     FirstPartyClick,
@@ -961,6 +965,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/api/v1/identify",
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::Identify,
+    },
+    NamedRoute {
+        path: "/_ts/set-tester",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::SetTester,
     },
     NamedRoute {
         path: "/auction",
@@ -1476,6 +1485,47 @@ mod tests {
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "POST batch-sync without ec_store should fail with the KvStore error, not reach the publisher"
+        );
+    }
+
+    #[test]
+    fn dispatch_set_tester_is_disabled_by_default() {
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "disabled tester-cookie route should return 404"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "disabled tester-cookie route should not set a cookie"
+        );
+    }
+
+    #[test]
+    fn dispatch_set_tester_sets_cookie_on_configured_domain() {
+        let mut settings = test_settings();
+        settings.tester_cookie.enabled = true;
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "enabled tester-cookie route should return no content"
+        );
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set tester cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert_eq!(
+            set_cookie, "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax",
+            "tester cookie should use publisher.cookie_domain"
         );
     }
 
