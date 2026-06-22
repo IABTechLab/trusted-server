@@ -393,12 +393,6 @@ impl RequestFilterEffects {
             apply_header_mutation_to_response(response, mutation);
         }
     }
-
-    pub fn apply_to_fastly_response(&self, response: &mut fastly::Response) {
-        for mutation in &self.response_headers {
-            apply_header_mutation_to_fastly_response(response, mutation);
-        }
-    }
 }
 
 /// Decision returned by an integration request filter.
@@ -515,40 +509,6 @@ fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation
         }
         HeaderMutationMode::Append => {
             response.headers_mut().append(name, value);
-        }
-    }
-}
-
-fn apply_header_mutation_to_fastly_response(
-    response: &mut fastly::Response,
-    mutation: &HeaderMutation,
-) {
-    if is_forbidden_filter_header(&mutation.name) {
-        log::warn!(
-            "Skipping forbidden response-filter header: {}",
-            mutation.name
-        );
-        return;
-    }
-
-    let Ok(name) = fastly::http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
-        log::warn!("Skipping invalid response-filter header: {}", mutation.name);
-        return;
-    };
-    let Ok(value) = fastly::http::HeaderValue::from_str(&mutation.value) else {
-        log::warn!(
-            "Skipping invalid response-filter header value: {}",
-            mutation.name
-        );
-        return;
-    };
-
-    match mutation.mode {
-        HeaderMutationMode::Set => {
-            response.set_header(name, value);
-        }
-        HeaderMutationMode::Append => {
-            response.append_header(name, value);
         }
     }
 }
@@ -1223,7 +1183,7 @@ impl IntegrationRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
         Self {

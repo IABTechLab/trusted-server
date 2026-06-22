@@ -156,6 +156,7 @@ impl DataDomeIntegration {
             scheme: parsed.scheme().to_string(),
             host: host.to_string(),
             port: parsed.port(),
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
         };
@@ -648,6 +649,7 @@ mod tests {
     use crate::platform::test_support::{
         build_services_with_config_and_secret, HashMapSecretStore, NoopConfigStore, NoopSecretStore,
     };
+    use crate::settings::Settings;
 
     use super::*;
 
@@ -732,6 +734,39 @@ mod tests {
     fn truncate_utf8_preserves_char_boundaries() {
         assert_eq!(truncate_utf8("ééé", 4), "éé");
         assert_eq!(truncate_utf8("ééé", -4), "éé");
+    }
+
+    #[test]
+    fn protection_skips_options_preflight_to_preserve_cors() {
+        // CORS preflight guard: OPTIONS requests pass through the integration
+        // request-filter pipeline before `cors_preflight_identify`. DataDome must
+        // not challenge a preflight — browsers do not follow a challenge response
+        // on a preflight, so a challenged OPTIONS would silently break the
+        // identify API's CORS. The filter must return Continue without calling
+        // the Protection API.
+        let services = build_services_with_config_and_secret(NoopConfigStore, NoopSecretStore);
+        let settings = Settings::default();
+        let request = request_builder()
+            .method(Method::OPTIONS.as_str())
+            .uri("https://publisher.example/_ts/api/v1/identify")
+            .body(EdgeBody::empty())
+            .expect("should build OPTIONS preflight request");
+        let integration = protection_integration();
+
+        let decision = futures::executor::block_on(integration.filter_protection_request(
+            RequestFilterInput {
+                settings: &settings,
+                services: &services,
+                request: &request,
+                geo_info: None,
+                is_integration_route: false,
+            },
+        ));
+
+        assert!(
+            matches!(decision, RequestFilterDecision::Continue(_)),
+            "DataDome must not challenge an OPTIONS preflight; a challenge would break CORS for the identify API"
+        );
     }
 
     #[test]
