@@ -1,6 +1,9 @@
 pub mod ca;
 pub mod config;
 pub mod rewrite;
+pub mod server;
+
+use std::sync::Arc;
 
 use error_stack::ResultExt as _;
 
@@ -114,12 +117,18 @@ pub enum CaCommand {
 /// Returns [`ProxyError`] if configuration, the CA, the server, or browser
 /// orchestration fails.
 pub fn run(args: ProxyArgs) -> Result<(), error_stack::Report<ProxyError>> {
-    let cfg = config::resolve(&args).change_context(ProxyError::Config)?;
-    output::info(&format!(
-        "ts dev proxy: listen={} rules={} launch={:?}",
-        cfg.listen,
-        cfg.rules.0.len(),
-        cfg.launch,
-    ));
-    Ok(())
+    let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
+    let ca = Arc::new(
+        ca::CertAuthority::load_or_generate(&cfg.ca_dir).change_context(ProxyError::CertAuthority)?,
+    );
+    // PAC generation arrives in Task 6; serve a DIRECT stub for now.
+    let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
+    let runtime = tokio::runtime::Runtime::new().change_context(ProxyError::Server)?;
+    runtime.block_on(async move {
+        let listener = server::bind(cfg.listen)
+            .await
+            .change_context(ProxyError::Server)?;
+        output::info(&format!("ts dev proxy listening on {}", cfg.listen));
+        server::serve_on(listener, cfg, ca, pac).await
+    })
 }

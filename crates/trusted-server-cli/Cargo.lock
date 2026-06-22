@@ -1846,11 +1846,13 @@ name = "trusted-server-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "clap",
  "derive_more",
  "directories",
  "env_logger",
  "error-stack",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "log",
@@ -1862,6 +1864,8 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2011,6 +2015,24 @@ checksum = "a6430a72df5eb332242960fe84b3002a241163998241eb596d4f739b9757061d"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

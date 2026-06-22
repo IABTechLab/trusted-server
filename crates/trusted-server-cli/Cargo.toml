@@ -18,8 +18,11 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 rustls = "0.23"
 tokio-rustls = "0.26"
+webpki-roots = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 rustls-pemfile = "2"
@@ -34,6 +37,7 @@ directories = "5"
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", features = ["blocking"] }
+x509-parser = "0.16"
 
 [lints.clippy]
 unwrap_used = "deny"
