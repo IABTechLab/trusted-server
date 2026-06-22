@@ -17,7 +17,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 ///
 /// Returns a static validation reason when the value is not a valid `Host`
 /// header override.
-pub(crate) fn validate_host_header_override_value(value: &str) -> Result<(), &'static str> {
+pub fn validate_host_header_override_value(value: &str) -> Result<(), &'static str> {
     if value.is_empty() {
         return Err("must not be empty");
     }

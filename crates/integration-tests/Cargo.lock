@@ -996,7 +996,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=170b74b#170b74bd2c9933b7d561f7ccdb67c53b239e9527"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1024,7 +1024,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=170b74b#170b74bd2c9933b7d561f7ccdb67c53b239e9527"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2142,9 +2142,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lol_html"
@@ -3410,9 +3410,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "itoa",
  "memchr",
@@ -4146,7 +4146,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subtle",
- "tokio",
  "toml",
  "trusted-server-js",
  "trusted-server-openrtb",

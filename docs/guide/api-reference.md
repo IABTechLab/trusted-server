@@ -8,7 +8,75 @@ Quick reference for all Trusted Server HTTP endpoints.
 - [Edge Cookie Endpoints](#edge-cookie-endpoints) - Identity sync and enrichment
 - [Request Signing](#request-signing-endpoints) - Cryptographic signing and key management
 - [TSJS Library](#tsjs-library-endpoint) - JavaScript library serving
+- [Utility Endpoints](#utility-endpoints) - Optional operational helpers
 - [Integration Endpoints](#integration-endpoints) - Third-party service proxying
+
+---
+
+## Utility Endpoints
+
+### GET /\_ts/set-tester
+
+Sets a first-party tester marker cookie for QA or troubleshooting workflows.
+
+**Configuration:** Disabled by default. Enable with:
+
+```toml
+[tester_cookie]
+enabled = true
+```
+
+**Response when enabled:**
+
+- **Status:** `204 No Content`
+- **Headers:**
+
+```http
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Cache-Control: no-store, private
+```
+
+The cookie domain comes from `[publisher].cookie_domain`.
+
+**Response when disabled:**
+
+- **Status:** `404 Not Found`
+- **Set-Cookie:** none
+
+**Example:**
+
+```bash
+curl -i "https://edge.example.com/_ts/set-tester"
+```
+
+### GET /\_ts/clear-tester
+
+Clears the first-party tester marker cookie for QA or troubleshooting workflows.
+
+**Configuration:** Uses the same `[tester_cookie].enabled` flag as `/_ts/set-tester`.
+
+**Response when enabled:**
+
+- **Status:** `204 No Content`
+- **Headers:**
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+The cookie domain comes from `[publisher].cookie_domain`.
+
+**Response when disabled:**
+
+- **Status:** `404 Not Found`
+- **Set-Cookie:** none
+
+**Example:**
+
+```bash
+curl -i "https://edge.example.com/_ts/clear-tester"
+```
 
 ---
 
