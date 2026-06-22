@@ -973,7 +973,7 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Permutive, Testlight). For other
+Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
 integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
 
 ### Common Fields
@@ -1095,6 +1095,29 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
+
+### Osano Integration
+
+**Section**: `[integrations.osano]`
+
+| Field     | Type    | Default | Description                             |
+| --------- | ------- | ------- | --------------------------------------- |
+| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+
+**Example**:
+
+```toml
+[integrations.osano]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+```
+
+The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
 
 ### Permutive Integration
 
