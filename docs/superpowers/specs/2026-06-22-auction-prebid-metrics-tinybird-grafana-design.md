@@ -157,7 +157,8 @@ Auction-level (denormalized onto every row):
 | `page_path`          | String    | path only, no query string             |
 | `country`            | String    | from geo lookup                        |
 | `region`             | String    | from geo lookup; nullable              |
-| `is_mobile`          | UInt8     | 0=desktop, 1=mobile, 2=unknown; see note |
+| `is_mobile`          | UInt8     | 0=desktop, 1=mobile, 2=unknown          |
+| `is_known_browser`   | UInt8     | 0=bot, 1=browser, 2=unknown (JA4/H2)    |
 | `gdpr_applies`       | UInt8     | 0/1                                    |
 | `consent_present`    | UInt8     | 0/1                                    |
 | `slot_count`         | UInt16    |                                        |
@@ -185,20 +186,24 @@ Per seat-response:
 Privacy note: no `ec_id`, no full URL, no IP, no user agent string. Geo is kept
 at country/region granularity only.
 
-`is_mobile` note: the auction request carries only the raw `user_agent`; the
-0/1/2 classifier already exists as `DeviceSignals.is_mobile`
-([ec/device.rs](../../../crates/trusted-server-core/src/ec/device.rs)) but is
-computed in the adapter and not currently threaded into the auction request.
-Phase 1 either plumbs that value into `AuctionEventContext` or computes
-`is_mobile` from `user_agent` at build time using the same parser. Tablet is not
-distinguished. If neither is cheap, defer the column to Phase 2 and ship without
-it.
+Device signals note: both `is_mobile` (0/1/2) and the bot-vs-browser bit come
+from `derive_device_signals()`, already computed in the adapter before routing
+at [main.rs:409](../../../crates/trusted-server-adapter-fastly/src/main.rs#L409)
+(`DeviceSignals`, [ec/device.rs](../../../crates/trusted-server-core/src/ec/device.rs)).
+Phase 1 threads that struct into `AuctionEventContext`; no UA re-parsing.
+`is_known_browser` maps `DeviceSignals.known_browser: Option<bool>` to 1/0/2 and
+lets the yield dashboard exclude bot traffic. Tablet is not distinguished.
 
-`price_cpm` note: `Bid.price` is `Option<f64>` and is `None` for providers that
-return an encoded price decoded only by the mediation layer (APS/TAM). CPM
-distributions therefore cover only providers that expose a decoded CPM; rows
-with null price still count toward bid/win/no-bid rates. State this on the CPM
-panel so it is not read as total-market CPM.
+`price_cpm` note: `Bid.price` is `Option<f64>`. In this repo the APS adapter
+deliberately leaves it `None` and stores the encoded `amznbid`/`amznp` in
+metadata for the mediation layer to decode
+([integrations/aps.rs:407](../../../crates/trusted-server-core/src/integrations/aps.rs#L407),
+locked by `test_aps_bids_have_no_decoded_price`). So **raw per-seat CPM excludes
+APS/TAM**, but the **winning** bid can still carry a decoded CPM via
+`mediator_response`/`winning_bids`, so winner-CPM may include APS. Rows with null
+price still count toward bid/win/no-bid rates. Label the CPM panel so it is not
+read as total-market CPM. Decoding `amznbid` at ingest to recover per-seat APS
+CPM needs the Amazon price table and is out of scope.
 
 ### B. Tinybird (auction yield)
 
@@ -278,7 +283,11 @@ rows:
   rows: set the endpoint message type to a blank/raw format (no syslog prefix),
   confirm newline batching, and check Tinybird's quarantine table for rejects.
   This is the one piece that cannot be fully validated from code and must be
-  tested against the real endpoints.
+  tested against the real endpoints. **Fallback:** Tinybird Cloud's Events API
+  is a documented, known-good target for Fastly HTTPS logging. If the
+  self-managed HTTPS framing proves fiddly, point the same endpoints at hosted
+  Tinybird to de-risk ingestion, trading the saved cost for usage-based pricing.
+  The datasources/pipes are identical (as-code), so it is a host swap.
 - **Schema drift.** The edge NDJSON shape and the Tinybird datasource schema
   must stay in sync. Keep the Rust struct and the `.datasource` definition
   reviewed together; a malformed row is dropped by Tinybird (quarantine), so add
@@ -307,8 +316,9 @@ rows:
 - A live auction produces N rows in `auction_events_raw` (one per seat-response,
   including no-bid and error rows) with correct `is_win` flags and no PII.
 - The yield dashboard shows fill rate, win rate by seat, no-bid rate, CPM
-  quantiles (decoded-CPM providers only), and per-seat latency for a chosen
-  time range, filterable by publisher and provider.
+  quantiles (decoded-CPM bids plus mediated winners; APS raw bids excluded),
+  and per-seat latency for a chosen time range, filterable by publisher,
+  provider, and bot-vs-browser.
 - The ops dashboard shows QPS, status-class error rate, endpoint latency
   quantiles, and cache hit ratio from `access_logs_raw`.
 - Tinybird quarantine stays empty under normal traffic; a malformed row is
