@@ -27,6 +27,9 @@ pub enum ConfigError {
     /// `--basic-auth`/file value was not `USER:PASS`.
     #[display("--basic-auth must be USER:PASS")]
     BasicAuth,
+    /// `--basic-auth-file` could not be read.
+    #[display("cannot read --basic-auth-file `{path}`")]
+    BasicAuthFile { path: String },
     /// An unknown browser name was passed to `--launch`.
     #[display("unknown browser `{value}` (expected chrome|firefox|safari|all)")]
     Browser { value: String },
@@ -187,7 +190,8 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
 /// Credential precedence: `--basic-auth-file` > `--basic-auth`.
 fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError> {
     if let Some(path) = &args.basic_auth_file {
-        let raw = std::fs::read_to_string(path).map_err(|_| ConfigError::BasicAuth)?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| ConfigError::BasicAuthFile { path: path.clone() })?;
         return Ok(Some(BasicAuth::parse(raw.trim())?));
     }
     match &args.basic_auth {
@@ -277,5 +281,21 @@ mod tests {
             vec![Browser::Firefox, Browser::Chrome]
         );
         assert!(Browser::parse_list("netscape").is_err(), "unknown browser errors");
+    }
+
+    #[test]
+    fn basic_auth_file_missing_is_a_file_error() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let missing = dir.path().join("no-such-file.txt");
+
+        let mut args = base_args();
+        args.map = vec!["a.example.com=b.edgecompute.app".into()];
+        args.basic_auth_file = Some(missing.to_string_lossy().into_owned());
+
+        let err = resolve(&args).expect_err("should fail when file is missing");
+        assert!(
+            matches!(err.current_context(), ConfigError::BasicAuthFile { .. }),
+            "should be a BasicAuthFile error, not BasicAuth"
+        );
     }
 }
