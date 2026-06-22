@@ -37,6 +37,9 @@ impl Authority {
         let default_port = if plaintext { 80 } else { 443 };
         let (host, port) = match raw.rsplit_once(':') {
             Some((h, p)) => {
+                if p.is_empty() {
+                    return Err(RuleError::Port { value: raw.to_string() });
+                }
                 let port = p
                     .parse::<u16>()
                     .map_err(|_| RuleError::Port { value: raw.to_string() })?;
@@ -100,7 +103,7 @@ impl RuleTable {
             .rsplit_once(':')
             .map_or(host, |(h, _)| h)
             .to_ascii_lowercase();
-        self.0.iter().find(|r| r.from == needle)
+        self.0.iter().find(|r| r.from.to_ascii_lowercase() == needle)
     }
 }
 
@@ -207,6 +210,7 @@ mod tests {
         assert_eq!(out.sni, "to.edgecompute.app", "SNI is TO host only, no port");
         assert_eq!(out.host_header, "www.example-publisher.com", "default Host is FROM");
         assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host is FROM");
+        assert!(out.scheme_is_tls, "TLS rule yields a TLS outcome");
     }
 
     #[test]
@@ -216,5 +220,15 @@ mod tests {
         assert_eq!(out.sni, "localhost", "SNI never carries a port");
         assert_eq!(out.host_header, "localhost:3000", "rewrite-host sends TO host:port");
         assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host stays FROM");
+        assert!(!out.scheme_is_tls, "plaintext rule yields a non-TLS outcome");
+    }
+
+    #[test]
+    fn rejects_empty_or_missing_port() {
+        let err = Authority::parse("host.example.com:", true).expect_err("should reject trailing colon");
+        assert!(
+            matches!(err, RuleError::Port { .. }),
+            "trailing colon should be a Port error, got: {err}"
+        );
     }
 }
