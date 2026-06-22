@@ -12,6 +12,7 @@ members = [
 exclude = [
     "crates/integration-tests",
     "crates/openrtb-codegen",
+    "crates/trusted-server-cli",
 ]
 
 default-members = [
