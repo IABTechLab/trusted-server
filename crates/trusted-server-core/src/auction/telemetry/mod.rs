@@ -6,6 +6,6 @@
 pub mod types;
 
 pub use types::{
-    AuctionObservationContext, AuctionSource, EventKind, ProviderCallOutcome,
-    ProviderCallStatus, ProviderRole, TerminalOutcome, TerminalStatus,
+    to_ndjson, AuctionEventRow, AuctionObservationContext, AuctionSource, EventKind,
+    ProviderCallOutcome, ProviderCallStatus, ProviderRole, TerminalOutcome, TerminalStatus,
 };
