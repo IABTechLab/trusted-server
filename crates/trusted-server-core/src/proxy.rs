@@ -1253,7 +1253,7 @@ async fn proxy_with_redirects(
                 message: "unsupported scheme".to_string(),
             }));
         }
-        if request_headers.require_https && scheme != "https" {
+        if redirect_policy.require_https && scheme != "https" {
             log::warn!("request to `{}` blocked: HTTPS is required", current_url);
             return Err(Report::new(TrustedServerError::Forbidden {
                 message: "non-HTTPS proxy target blocked".to_string(),
@@ -1403,7 +1403,7 @@ async fn proxy_with_redirects(
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
         if next_scheme != "http" && next_scheme != "https" {
-            if request_headers.require_https {
+            if redirect_policy.require_https {
                 log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
                 return Err(Report::new(TrustedServerError::Forbidden {
                     message: "non-HTTPS redirect blocked".to_string(),
@@ -1417,7 +1417,7 @@ async fn proxy_with_redirects(
                 redirect_policy.stream_passthrough,
             );
         }
-        if request_headers.require_https && next_scheme != "https" {
+        if redirect_policy.require_https && next_scheme != "https" {
             log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
             return Err(Report::new(TrustedServerError::Forbidden {
                 message: "non-HTTPS redirect blocked".to_string(),
@@ -4699,36 +4699,37 @@ mod tests {
     // below verify that proxy_request threads config.allowed_domains through
     // the initial target check and redirect hops.
 
-    #[tokio::test]
-    async fn proxy_request_blocks_non_https_target_when_https_only() {
-        let settings = create_test_settings();
-        let services = crate::platform::test_support::build_services_with_http_client(Arc::new(
-            StreamingResponseHttpClient,
-        )
-            as Arc<dyn PlatformHttpClient>);
-        let req = build_http_request(
-            Method::GET,
-            "https://edge.example/integrations/prebid/bundle.js",
-        );
-        let config = ProxyRequestConfig::new("http://assets.example/prebid/trusted-prebid.js")
-            .without_ec_id()
-            .without_forward_headers()
-            .with_streaming()
-            .with_https_only();
+    #[test]
+    fn proxy_request_blocks_non_https_target_when_https_only() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let services = crate::platform::test_support::build_services_with_http_client(
+                Arc::new(StreamingResponseHttpClient) as Arc<dyn PlatformHttpClient>,
+            );
+            let req = build_http_request(
+                Method::GET,
+                "https://edge.example/integrations/prebid/bundle.js",
+            );
+            let config = ProxyRequestConfig::new("http://assets.example/prebid/trusted-prebid.js")
+                .without_ec_id()
+                .without_forward_headers()
+                .with_streaming()
+                .with_https_only();
 
-        let err = proxy_request(&settings, req, config, &services)
-            .await
-            .expect_err("should block non-HTTPS target before proxying");
+            let err = proxy_request(&settings, req, config, &services)
+                .await
+                .expect_err("should block non-HTTPS target before proxying");
 
-        assert_eq!(
-            err.current_context().status_code(),
-            StatusCode::FORBIDDEN,
-            "HTTPS-only proxy requests should reject http targets"
-        );
-        assert!(
-            matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
-            "should return a forbidden error"
-        );
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::FORBIDDEN,
+                "HTTPS-only proxy requests should reject http targets"
+            );
+            assert!(
+                matches!(err.current_context(), TrustedServerError::Forbidden { .. }),
+                "should return a forbidden error"
+            );
+        });
     }
 
     #[test]
