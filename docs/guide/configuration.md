@@ -61,6 +61,7 @@ openssl rand -base64 32
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
 | `[ec]`              | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
@@ -154,13 +155,14 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type   | Required | Description                                                   |
-| ----------------------------- | ------ | -------- | ------------------------------------------------------------- |
-| `domain`                      | String | Yes      | Publisher's apex domain name                                  |
-| `cookie_domain`               | String | Yes      | Domain for non-EC cookies (typically with leading dot)        |
-| `origin_url`                  | String | Yes      | Full URL of publisher origin server                           |
-| `origin_host_header_override` | String | No       | Outbound Host header to send while connecting to `origin_url` |
-| `proxy_secret`                | String | Yes      | Secret key for encrypting/signing proxy URLs                  |
+| Field                         | Type    | Required | Description                                                                             |
+| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
+| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
+| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
+| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
+| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
+| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
+| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -185,6 +187,7 @@ TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
+TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
 ### Field Details
@@ -288,6 +291,84 @@ openssl rand -base64 32
 ::: danger Security Warning
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
+
+#### `max_buffered_body_bytes`
+
+**Purpose**: Upper bound on the in-memory buffer used when a publisher origin
+response must be processed in full (HTML rewriting and integration injection)
+instead of streamed.
+
+**Usage**:
+
+- Caps the _decoded, post-rewrite_ output buffer for any buffered publisher
+  response on both the legacy and EdgeZero paths.
+- Exceeding the cap fails the response (mapped to a 5xx proxy error) rather than
+  allocating past the limit, preventing Wasm-heap exhaustion on highly
+  compressible documents.
+
+**Default**: `16777216` (16 MiB).
+
+**Effective Fastly limit**: On Fastly the practical ceiling for a publisher page
+is lower. The platform HTTP client rejects any origin response whose raw (still
+compressed) body exceeds **10 MiB** before this buffer is filled, so raising the
+value only helps highly compressible pages whose decoded size exceeds 16 MiB
+while their compressed origin body stays under 10 MiB. Raising it above ~10 MiB
+does not lift the platform cap for uncompressed pages.
+
+**Minimum**: Must be at least `1`. A value of `0` is rejected at startup because
+a zero-byte cap fails every non-empty buffered response.
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+```
+
+## Tester Cookie Configuration
+
+Settings for the optional tester-cookie endpoints. This feature is disabled by
+default and should only be enabled for intentional QA or troubleshooting flows.
+
+### `[tester_cookie]`
+
+| Field     | Type    | Required | Description                                        |
+| --------- | ------- | -------- | -------------------------------------------------- |
+| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+
+When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
+
+```http
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Cache-Control: no-store, private
+```
+
+`GET /_ts/clear-tester` returns `204 No Content` and clears the cookie:
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+When disabled, both routes return `404 Not Found` and do not set a cookie.
+
+::: warning
+The cookie is scoped with `[publisher].cookie_domain`, not the EC-specific
+computed domain. Keep `cookie_domain` aligned with the browser scope where your
+QA tooling expects to read `ts-tester`.
+:::
+
+**Example**:
+
+```toml
+[tester_cookie]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
+```
 
 ## EC Configuration
 
@@ -899,7 +980,7 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Permutive, Testlight). For other
+Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
 integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
 
 ### Common Fields
@@ -1022,6 +1103,29 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
 
+### Osano Integration
+
+**Section**: `[integrations.osano]`
+
+| Field     | Type    | Default | Description                             |
+| --------- | ------- | ------- | --------------------------------------- |
+| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+
+**Example**:
+
+```toml
+[integrations.osano]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+```
+
+The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
+
 ### Permutive Integration
 
 **Section**: `[integrations.permutive]`
@@ -1116,6 +1220,58 @@ TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
+
+## Runtime Feature Flags
+
+Unlike the TOML/environment settings above (which are baked into the Wasm binary
+at build time), the EdgeZero entry point is toggled at **runtime** through a
+Fastly Config Store. This lets operators switch request handling without
+rebuilding or redeploying the binary.
+
+### `edgezero_enabled`
+
+**Purpose**: Routes incoming requests through the EdgeZero entry point instead of
+the legacy entry point.
+
+**Source**: Fastly Config Store, not `trusted-server.toml` or an environment
+variable.
+
+| Property        | Value                                              |
+| --------------- | -------------------------------------------------- |
+| Config store    | `trusted_server_config`                            |
+| Key             | `edgezero_enabled`                                 |
+| Accepted "true" | `true` or `1` (whitespace-trimmed, any ASCII case) |
+| Any other value | Treated as disabled (legacy path)                  |
+
+**Fallback behavior** (fail-safe to the legacy path):
+
+- If the `trusted_server_config` store cannot be opened, requests use the legacy
+  path.
+- If the `edgezero_enabled` key is missing or cannot be read, requests use the
+  legacy path.
+- Any value other than `true`/`1` keeps the legacy path.
+
+**Local development** (`fastly.toml`):
+
+```toml
+[local_server.config_stores]
+  [local_server.config_stores.trusted_server_config]
+    format = "inline-toml"
+    [local_server.config_stores.trusted_server_config.contents]
+      edgezero_enabled = "true"
+```
+
+**Production setup** (Fastly CLI):
+
+```bash
+# Create the store (once) and attach it to the service, then set the key.
+fastly config-store create --name trusted_server_config
+fastly config-store-entry create \
+  --store-id <STORE_ID> --key edgezero_enabled --value true
+```
+
+**Rollback**: Set `edgezero_enabled` to `false` (or delete the key) to return all
+traffic to the legacy path immediately — no rebuild or redeploy required.
 
 ## Validation
 

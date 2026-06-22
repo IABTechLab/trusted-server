@@ -20,7 +20,7 @@ use crate::redacted::Redacted;
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Publisher {
     #[validate(custom(function = validate_publisher_domain))]
@@ -39,6 +39,51 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
+    /// Maximum number of bytes buffered when a publisher origin response is
+    /// post-processed in full (HTML rewriting/injection) instead of streamed.
+    /// This caps the *decoded, post-rewrite* output buffer and applies to any
+    /// such buffered response on **both** the legacy and `EdgeZero` paths;
+    /// exceeding it fails the response rather than allocating past the cap.
+    /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
+    ///
+    /// On Fastly the *effective* ceiling for a publisher page is lower: the
+    /// platform HTTP client rejects any origin response whose raw (still
+    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
+    /// raising this value only helps highly compressible pages whose decoded
+    /// size exceeds the 16 MiB default while their compressed origin body stays
+    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
+    /// uncompressed pages. That platform limit is removed once true streaming
+    /// lands (tracked for PR 15, issue #495), after which this setting becomes
+    /// the sole ceiling.
+    ///
+    /// Must be at least 1: a zero-byte cap fails every non-empty buffered
+    /// publisher response at request time, so it is rejected at config
+    /// validation instead.
+    #[serde(default = "default_max_buffered_body_bytes")]
+    #[validate(range(min = 1, message = "must be at least 1 byte"))]
+    pub max_buffered_body_bytes: usize,
+}
+
+fn default_max_buffered_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+impl Default for Publisher {
+    /// Hand-written so `max_buffered_body_bytes` matches the serde default
+    /// ([`default_max_buffered_body_bytes`]) instead of `usize`'s `0`. A derived
+    /// `Default` would set a zero-byte cap, which fails buffered post-processing
+    /// immediately when `Publisher::default()` / `Settings::default()` are used
+    /// programmatically (tests, helpers) rather than deserialized from TOML.
+    fn default() -> Self {
+        Self {
+            domain: String::default(),
+            cookie_domain: String::default(),
+            origin_url: String::default(),
+            origin_host_header_override: None,
+            proxy_secret: Redacted::default(),
+            max_buffered_body_bytes: default_max_buffered_body_bytes(),
+        }
+    }
 }
 
 impl Publisher {
@@ -78,6 +123,7 @@ impl Publisher {
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
+    ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
@@ -1653,10 +1699,20 @@ pub struct DebugConfig {
     pub ja4_endpoint_enabled: bool,
 }
 
+/// Tester-cookie endpoint configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct TesterCookieConfig {
+    /// Enable tester-cookie endpoints that set and clear `ts-tester`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
+    #[serde(default)]
+    pub tester_cookie: TesterCookieConfig,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -2315,6 +2371,10 @@ mod tests {
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
+        assert!(
+            !settings.tester_cookie.enabled,
+            "tester-cookie route should default to disabled"
+        );
         assert_eq!(
             settings.publisher.ec_cookie_domain(),
             ".test-publisher.com",
@@ -2331,6 +2391,25 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn tester_cookie_enabled_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse tester-cookie config");
+
+        assert!(
+            settings.tester_cookie.enabled,
+            "tester-cookie config should enable the route"
+        );
     }
 
     #[test]
@@ -3413,6 +3492,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
@@ -3423,6 +3503,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
@@ -3433,6 +3514,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://localhost:9090".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -3443,6 +3525,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "localhost:9090".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
@@ -3453,6 +3536,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://192.168.1.1:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
@@ -3463,6 +3547,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "http://[::1]:8080".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -3475,6 +3560,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com:8443".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -3488,9 +3574,75 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
+    }
+
+    #[test]
+    fn publisher_default_max_buffered_body_bytes_matches_config_default() {
+        // The manual `Default` impl must agree with the serde default applied
+        // when the key is omitted from TOML, so programmatic `Publisher::default()`
+        // does not silently produce a zero-byte buffer cap.
+        assert_eq!(
+            Publisher::default().max_buffered_body_bytes,
+            super::default_max_buffered_body_bytes(),
+            "Publisher::default() must use the same buffer cap as the TOML default"
+        );
+
+        let from_toml = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse settings without max_buffered_body_bytes");
+        assert_eq!(
+            from_toml.publisher.max_buffered_body_bytes,
+            Publisher::default().max_buffered_body_bytes,
+            "TOML default and Publisher::default() must stay aligned"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_buffered_body_bytes() {
+        // A zero-byte cap fails every non-empty buffered publisher response at
+        // request time, so it must be rejected at config validation instead of
+        // silently breaking traffic.
+        let result = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+            max_buffered_body_bytes = 0
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+        );
     }
 
     #[test]
