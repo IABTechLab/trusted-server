@@ -1702,7 +1702,7 @@ pub struct DebugConfig {
 /// Tester-cookie endpoint configuration.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct TesterCookieConfig {
-    /// Enable `GET /_ts/set-tester`, which sets `ts-tester=true`.
+    /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
 }
