@@ -20,7 +20,7 @@ hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 rustls-pemfile = "2"
 clap = { version = "4", features = ["derive"] }
