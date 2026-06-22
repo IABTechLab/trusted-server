@@ -166,6 +166,13 @@ fn test_ec_lifecycle_fastly() {
 
     log::info!("EC lifecycle tests: Viceroy running at {}", process.base_url);
 
+    // Canary: prove the EdgeZero entry point is actually active before running
+    // scenarios that also pass on the legacy path. main() silently falls back to
+    // legacy when the config store cannot be read, so without this a regression
+    // could green this job while exercising legacy instead of EdgeZero.
+    common::ec::assert_edgezero_entry_point(&process.base_url)
+        .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
+
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
         scenario
