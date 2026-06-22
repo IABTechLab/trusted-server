@@ -84,7 +84,7 @@ impl From<String> for StoreName {
 
 impl From<&str> for StoreName {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 
@@ -111,7 +111,7 @@ impl From<String> for StoreId {
 
 impl From<&str> for StoreId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 

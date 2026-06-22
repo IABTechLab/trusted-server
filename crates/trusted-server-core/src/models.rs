@@ -9,7 +9,10 @@ use serde::Deserialize;
 ///
 /// Contains all the information needed to display an ad and track
 /// its performance through various callbacks.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "model includes fields deserialized for external ad-server compatibility"
+)]
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AdResponse {
@@ -158,7 +161,7 @@ mod tests {
         });
 
         let result: Result<AdResponse, _> = serde_json::from_value(json_data);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -193,7 +196,7 @@ mod tests {
         });
 
         let result: Result<Callback, _> = serde_json::from_value(json_data);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -215,24 +218,24 @@ mod tests {
     #[test]
     fn test_ad_response_debug_format() {
         let callback = Callback {
-            callback_type: "test".to_string(),
-            url: "https://test.com".to_string(),
+            callback_type: "test".to_owned(),
+            url: "https://test.com".to_owned(),
         };
 
         let ad_response = AdResponse {
-            network_id: "123".to_string(),
-            site_id: "456".to_string(),
-            page_id: "789".to_string(),
-            format_id: "000".to_string(),
-            advertiser_id: "111".to_string(),
-            campaign_id: "222".to_string(),
-            insertion_id: "333".to_string(),
-            creative_id: "444".to_string(),
-            creative_url: "https://example.com/ad.jpg".to_string(),
+            network_id: "123".to_owned(),
+            site_id: "456".to_owned(),
+            page_id: "789".to_owned(),
+            format_id: "000".to_owned(),
+            advertiser_id: "111".to_owned(),
+            campaign_id: "222".to_owned(),
+            insertion_id: "333".to_owned(),
+            creative_id: "444".to_owned(),
+            creative_url: "https://example.com/ad.jpg".to_owned(),
             callbacks: vec![callback],
         };
 
-        let debug_str = format!("{:?}", ad_response);
+        let debug_str = format!("{ad_response:?}");
         assert!(debug_str.contains("AdResponse"));
         assert!(debug_str.contains("network_id"));
         assert!(debug_str.contains("123"));
@@ -241,11 +244,11 @@ mod tests {
     #[test]
     fn test_callback_debug_format() {
         let callback = Callback {
-            callback_type: "debug_test".to_string(),
-            url: "https://debug.test.com".to_string(),
+            callback_type: "debug_test".to_owned(),
+            url: "https://debug.test.com".to_owned(),
         };
 
-        let debug_str = format!("{:?}", callback);
+        let debug_str = format!("{callback:?}");
         assert!(debug_str.contains("Callback"));
         assert!(debug_str.contains("callback_type"));
         assert!(debug_str.contains("debug_test"));
@@ -276,10 +279,7 @@ mod tests {
             let callback: Callback =
                 serde_json::from_value(json_data).expect("should deserialize callback type");
             assert_eq!(callback.callback_type, cb_type);
-            assert_eq!(
-                callback.url,
-                format!("https://example.com/track/{}", cb_type)
-            );
+            assert_eq!(callback.url, format!("https://example.com/track/{cb_type}"));
         }
     }
 }

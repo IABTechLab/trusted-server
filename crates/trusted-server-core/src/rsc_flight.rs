@@ -65,12 +65,12 @@ impl RscFlightUrlRewriter {
             .map(|rest| format!("http://{rest}"));
 
         Self {
-            origin_url: origin_url.to_string(),
+            origin_url: origin_url.to_owned(),
             origin_http_url,
-            origin_host: origin_host.to_string(),
+            origin_host: origin_host.to_owned(),
             origin_protocol_relative,
             request_url,
-            request_host: request_host.to_string(),
+            request_host: request_host.to_owned(),
             request_protocol_relative,
             state: RowState::Id,
             row_id: Vec::new(),
@@ -360,7 +360,7 @@ mod tests {
         let output_str = String::from_utf8(output).expect("should be valid UTF-8");
 
         let rewritten_t_content = r#"{"url":"https://proxy.example.com/page"}"#;
-        let expected = format!("1:T{:x},{}", rewritten_t_content.len(), rewritten_t_content,);
+        let expected = format!("1:T{:x},{}", rewritten_t_content.len(), rewritten_t_content);
 
         assert_eq!(
             output_str, expected,

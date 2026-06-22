@@ -11,7 +11,7 @@ cargo test -p $ARGUMENTS
 If $ARGUMENTS is "js" or "javascript", run:
 
 ```bash
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 ```
 
 Report results and investigate any failures.

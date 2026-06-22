@@ -2,20 +2,22 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use hex::encode;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
 include!(concat!(env!("OUT_DIR"), "/tsjs_modules.rs"));
 
 /// Return the JS bundle content for a given module ID (e.g., "core", "prebid").
 #[must_use]
+#[inline]
 pub fn module_bundle(id: &str) -> Option<&'static str> {
     module_map().get(id).copied()
 }
 
 /// Return all available module IDs, in discovery order (core first).
 #[must_use]
+#[inline]
 pub fn all_module_ids() -> Vec<&'static str> {
-    TSJS_MODULES.iter().map(|m| m.id).collect()
+    TSJS_MODULES.iter().map(|module| module.id).collect()
 }
 
 /// Concatenate core + the requested integration modules into a single JS string.
@@ -23,6 +25,7 @@ pub fn all_module_ids() -> Vec<&'static str> {
 /// Core is always included first regardless of whether it appears in `ids`.
 /// Each IIFE is separated by `;\n` for safety.
 #[must_use]
+#[inline]
 pub fn concatenate_modules(ids: &[&str]) -> String {
     let map = module_map();
     let mut parts: Vec<&str> = Vec::new();
@@ -47,6 +50,7 @@ pub fn concatenate_modules(ids: &[&str]) -> String {
 
 /// SHA-256 hash of the concatenated modules, for cache-busting URLs.
 #[must_use]
+#[inline]
 pub fn concatenated_hash(ids: &[&str]) -> String {
     let body = concatenate_modules(ids);
     let mut hasher = Sha256::new();
@@ -58,6 +62,7 @@ pub fn concatenated_hash(ids: &[&str]) -> String {
 ///
 /// Used for cache-busting URLs of deferred modules served individually.
 #[must_use]
+#[inline]
 pub fn single_module_hash(id: &str) -> Option<String> {
     module_bundle(id).map(|content| {
         let mut hasher = Sha256::new();
@@ -68,5 +73,10 @@ pub fn single_module_hash(id: &str) -> Option<String> {
 
 fn module_map() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    MAP.get_or_init(|| TSJS_MODULES.iter().map(|m| (m.id, m.bundle)).collect())
+    MAP.get_or_init(|| {
+        TSJS_MODULES
+            .iter()
+            .map(|module| (module.id, module.bundle))
+            .collect()
+    })
 }

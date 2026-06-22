@@ -135,7 +135,7 @@ fn handle_batch_sync_with_writer(
         ));
     }
 
-    let body_bytes = req.into_body().into_bytes();
+    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_BODY_SIZE {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,

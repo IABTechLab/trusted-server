@@ -80,7 +80,7 @@
 
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::FastlyRequestContext;
+use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -1316,8 +1316,10 @@ mod tests {
         });
         let router = startup_error_router(&report);
 
-        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")));
-        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")));
+        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")))
+            .expect("router oneshot should produce a response");
+        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             head_response.status(),
@@ -1407,7 +1409,8 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
-        let response = block_on(router.oneshot(req));
+        let response =
+            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1435,7 +1438,8 @@ mod tests {
         for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
             let req = empty_request(Method::POST, path);
 
-            let response = block_on(router.oneshot(req));
+            let response =
+                block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
             assert_eq!(
                 response.status(),
@@ -1453,7 +1457,8 @@ mod tests {
         // gateway error without a live backend.
         let router = test_router();
         let response =
-            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
+            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")))
+                .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1469,7 +1474,8 @@ mod tests {
         // require_identity_graph fails with a KvStore error (503) — proving
         // the request was NOT proxied to the publisher origin.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1487,7 +1493,8 @@ mod tests {
         // error (503).
         let router = test_router();
         let response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")))
+                .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1499,7 +1506,8 @@ mod tests {
     #[test]
     fn dispatch_set_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1518,7 +1526,8 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1540,7 +1549,8 @@ mod tests {
     #[test]
     fn dispatch_clear_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1559,7 +1569,8 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1585,7 +1596,8 @@ mod tests {
         // point via response extensions — even on error responses — so that
         // edgezero_main can run ec_finalize_response and pull sync.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
+            .expect("router oneshot should produce a response");
 
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
@@ -1610,7 +1622,8 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
 
-        let response = block_on(router.oneshot(req));
+        let response =
+            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         let finalize = response
             .extensions()
@@ -1629,7 +1642,8 @@ mod tests {
         // documents the regression the extension threading fixes: the same
         // request that looks like a browser above is treated as a bot here.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
+            .expect("router oneshot should produce a response");
 
         let finalize = response
             .extensions()
@@ -1665,7 +1679,7 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = block_on(router.oneshot(req));
+        let _ = block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         let observed = captured
             .lock()
@@ -1712,7 +1726,8 @@ mod tests {
         let response = block_on(router.oneshot(empty_request(
             Method::GET,
             "/.well-known/trusted-server.json",
-        )));
+        )))
+        .expect("router oneshot should produce a response");
 
         assert!(
             response
@@ -1735,7 +1750,8 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::HEAD, "/first-party/proxy");
 
-        let response = block_on(router.oneshot(req));
+        let response =
+            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         assert_ne!(
             response.status(),
@@ -1756,7 +1772,8 @@ mod tests {
             .body(Body::from(body))
             .expect("should build auction request");
 
-        let response = block_on(router.oneshot(req));
+        let response =
+            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1780,7 +1797,8 @@ mod tests {
             "/",
         );
 
-        let response = block_on(router.oneshot(req));
+        let response =
+            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),
@@ -1802,7 +1820,8 @@ mod tests {
         let router = TrustedServerApp::routes_for_state(&state);
 
         let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/admin/keys/rotate")));
+            block_on(router.oneshot(empty_request(Method::POST, "/admin/keys/rotate")))
+                .expect("router oneshot should produce a response");
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
@@ -1814,7 +1833,8 @@ mod tests {
             .uri("/auction")
             .body(Body::from(r#"{"adUnits":[]}"#))
             .expect("should build auction request");
-        let auction_response = block_on(router.oneshot(auction_request));
+        let auction_response = block_on(router.oneshot(auction_request))
+            .expect("router oneshot should produce a response");
         assert_eq!(
             auction_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1822,7 +1842,8 @@ mod tests {
         );
 
         let publisher_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
+            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")))
+                .expect("router oneshot should produce a response");
         assert_eq!(
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1833,7 +1854,8 @@ mod tests {
         // is wired only into the publisher and auction branches of dispatch_fallback, not into
         // the integration proxy branch. A missing consent store must not 503 integration routes.
         let integration_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")))
+                .expect("router oneshot should produce a response");
         assert_ne!(
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1881,7 +1903,8 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")))
+            .expect("router oneshot should produce a response");
 
         assert!(
             response
@@ -1909,7 +1932,8 @@ mod tests {
         // still carry the RequestFilterEffects the filter emitted — proving the
         // filter ran on the dispatch path.
         let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
+            .expect("router oneshot should produce a response");
 
         let effects = response
             .extensions()
@@ -1931,7 +1955,8 @@ mod tests {
         // fallback, return its own response, still carry EcFinalizeState (legacy
         // parity: Respond keeps EC finalization), and thread its response effects.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
+            .expect("router oneshot should produce a response");
 
         assert_eq!(
             response.status(),

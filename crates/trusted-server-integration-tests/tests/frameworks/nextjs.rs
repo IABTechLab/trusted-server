@@ -11,7 +11,7 @@ use testcontainers::{GenericImage, ImageExt as _};
 ///
 /// ```bash
 /// docker build -t test-nextjs:latest \
-///   crates/integration-tests/fixtures/frameworks/nextjs/
+///   crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 /// ```
 pub struct NextJs;
 

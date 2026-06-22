@@ -72,8 +72,8 @@ eligible request to carry the consent state to Trusted Server.
 Add a new module:
 
 ```text
-crates/js/lib/src/integrations/osano/index.ts
-crates/js/lib/test/integrations/osano/index.test.ts
+crates/trusted-server-js/lib/src/integrations/osano/index.ts
+crates/trusted-server-js/lib/test/integrations/osano/index.test.ts
 ```
 
 The module is JS-only but should be explicitly enabled through integration
@@ -254,14 +254,14 @@ ready, or TCF only in GDPR jurisdictions.
 
 ## Files touched
 
-| File                                                      | Change                                                                    |
-| --------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `crates/js/lib/src/integrations/osano/index.ts`           | New JS-only Osano consent mirror                                          |
-| `crates/js/lib/test/integrations/osano/index.test.ts`     | New Vitest coverage for mirroring and ownership rules                     |
-| `crates/trusted-server-core/src/integrations/osano.rs`    | New minimal integration config/registration for explicit JS enablement    |
-| `crates/trusted-server-core/src/integrations/registry.rs` | Remove consent mirrors from unconditional `JS_ALWAYS`; include via config |
-| `trusted-server.toml`                                     | Document disabled-by-default Osano integration block                      |
-| `crates/js/lib/src/integrations/*` build output           | Generated bundle output changes via existing JS build pipeline            |
+| File                                                                 | Change                                                                    |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `crates/trusted-server-js/lib/src/integrations/osano/index.ts`       | New JS-only Osano consent mirror                                          |
+| `crates/trusted-server-js/lib/test/integrations/osano/index.test.ts` | New Vitest coverage for mirroring and ownership rules                     |
+| `crates/trusted-server-core/src/integrations/osano.rs`               | New minimal integration config/registration for explicit JS enablement    |
+| `crates/trusted-server-core/src/integrations/registry.rs`            | Remove consent mirrors from unconditional `JS_ALWAYS`; include via config |
+| `trusted-server.toml`                                                | Document disabled-by-default Osano integration block                      |
+| `crates/trusted-server-js/lib/src/integrations/*` build output       | Generated bundle output changes via existing JS build pipeline            |
 
 No changes are expected in Rust consent decoding or EC gating.
 
@@ -304,8 +304,8 @@ Use a local HTML fixture or controlled test page that stubs Osano/IAB APIs:
 Run when implementing:
 
 ```bash
-cd crates/js/lib && npx vitest run
-cd crates/js/lib && node build-all.mjs
+cd crates/trusted-server-js/lib && npx vitest run
+cd crates/trusted-server-js/lib && node build-all.mjs
 cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings

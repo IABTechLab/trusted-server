@@ -14,13 +14,13 @@
 
 ## File Map
 
-| File                                                        | Action | Responsibility                                      |
-| ----------------------------------------------------------- | ------ | --------------------------------------------------- |
-| `crates/trusted-server-core/src/consent/types.rs`           | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
-| `crates/trusted-server-core/src/consent/gpp.rs`             | Modify | Decode US sections, extract `sale_opt_out`          |
-| `crates/trusted-server-core/src/consent/mod.rs`             | Modify | Add GPP US branch in `allows_ec_creation()`, tests  |
-| `crates/js/lib/src/integrations/sourcepoint/index.ts`       | Create | localStorage auto-discovery, cookie mirroring       |
-| `crates/js/lib/test/integrations/sourcepoint/index.test.ts` | Create | Vitest tests for cookie mirroring                   |
+| File                                                                       | Action | Responsibility                                      |
+| -------------------------------------------------------------------------- | ------ | --------------------------------------------------- |
+| `crates/trusted-server-core/src/consent/types.rs`                          | Modify | Add `us_sale_opt_out: Option<bool>` to `GppConsent` |
+| `crates/trusted-server-core/src/consent/gpp.rs`                            | Modify | Decode US sections, extract `sale_opt_out`          |
+| `crates/trusted-server-core/src/consent/mod.rs`                            | Modify | Add GPP US branch in `allows_ec_creation()`, tests  |
+| `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`       | Create | localStorage auto-discovery, cookie mirroring       |
+| `crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts` | Create | Vitest tests for cookie mirroring                   |
 
 ---
 
@@ -447,11 +447,11 @@ git commit -m "Recognize GPP US sale opt-out in EC consent gating"
 
 **Files:**
 
-- Create: `crates/js/lib/src/integrations/sourcepoint/index.ts`
+- Create: `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`
 
 - [ ] **Step 1: Write the test file first**
 
-Create `crates/js/lib/test/integrations/sourcepoint/index.test.ts`:
+Create `crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts`:
 
 ```typescript
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -553,12 +553,12 @@ describe('integrations/sourcepoint', () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd crates/js/lib && npx vitest run test/integrations/sourcepoint/index.test.ts`
+Run: `cd crates/trusted-server-js/lib && npx vitest run test/integrations/sourcepoint/index.test.ts`
 Expected: FAIL — module `../../../src/integrations/sourcepoint` does not exist.
 
 - [ ] **Step 3: Implement the integration**
 
-Create `crates/js/lib/src/integrations/sourcepoint/index.ts`:
+Create `crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts`:
 
 ```typescript
 import { log } from '../../core/log'
@@ -640,24 +640,24 @@ export default mirrorSourcepointConsent
 
 - [ ] **Step 4: Run tests**
 
-Run: `cd crates/js/lib && npx vitest run test/integrations/sourcepoint/index.test.ts`
+Run: `cd crates/trusted-server-js/lib && npx vitest run test/integrations/sourcepoint/index.test.ts`
 Expected: all 6 tests pass.
 
 - [ ] **Step 5: Run the full JS test suite**
 
-Run: `cd crates/js/lib && npx vitest run`
+Run: `cd crates/trusted-server-js/lib && npx vitest run`
 Expected: all tests pass (existing + new).
 
 - [ ] **Step 6: Format**
 
-Run: `cd crates/js/lib && npm run format`
+Run: `cd crates/trusted-server-js/lib && npm run format`
 Expected: no formatting issues.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/js/lib/src/integrations/sourcepoint/index.ts \
-       crates/js/lib/test/integrations/sourcepoint/index.test.ts
+git add crates/trusted-server-js/lib/src/integrations/sourcepoint/index.ts \
+       crates/trusted-server-js/lib/test/integrations/sourcepoint/index.test.ts
 git commit -m "Add Sourcepoint JS integration for GPP consent cookie mirroring"
 ```
 
@@ -669,7 +669,7 @@ git commit -m "Add Sourcepoint JS integration for GPP consent cookie mirroring"
 
 - [ ] **Step 1: Build the JS bundles**
 
-Run: `cd crates/js/lib && node build-all.mjs`
+Run: `cd crates/trusted-server-js/lib && node build-all.mjs`
 Expected: builds successfully, `dist/tsjs-sourcepoint.js` appears in the output.
 
 - [ ] **Step 2: Full Rust build**
@@ -694,10 +694,10 @@ Expected: no formatting issues.
 
 - [ ] **Step 6: Full JS test suite**
 
-Run: `cd crates/js/lib && npx vitest run`
+Run: `cd crates/trusted-server-js/lib && npx vitest run`
 Expected: all tests pass.
 
 - [ ] **Step 7: JS format check**
 
-Run: `cd crates/js/lib && npm run format`
+Run: `cd crates/trusted-server-js/lib && npm run format`
 Expected: no formatting issues.

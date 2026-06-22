@@ -35,7 +35,7 @@ pub mod tests {
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
             "#
-        .to_string()
+        .to_owned()
     }
 
     #[must_use]

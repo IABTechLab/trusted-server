@@ -52,7 +52,7 @@ pub(crate) fn rewrite_bare_host_at_boundaries(
             replaced_any = true;
             search = end;
         } else {
-            out.push_str(&text[search..pos + 1]);
+            out.push_str(&text[search..=pos]);
             search = pos + 1;
         }
     }
