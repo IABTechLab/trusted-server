@@ -102,7 +102,7 @@ tokio-rustls = "0.26"
 rcgen = "0.13"
 time = "0.3"
 rustls-pemfile = "2"
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 error-stack = "0.6"
 derive_more = { version = "2.0", features = ["display", "error"] }
 log = "0.4"
@@ -274,7 +274,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080", env = "TS_DEV_PROXY_LISTEN")]
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).
@@ -282,15 +282,15 @@ pub struct ProxyArgs {
     pub allow_non_loopback: bool,
 
     /// Browsers to launch + configure (comma list or `all`).
-    #[arg(long, value_name = "LIST", env = "TS_DEV_PROXY_LAUNCH")]
+    #[arg(long, value_name = "LIST")]
     pub launch: Option<String>,
 
     /// Send `Host: <TO>` upstream instead of the default `<FROM>`.
-    #[arg(long, env = "TS_DEV_PROXY_REWRITE_HOST")]
+    #[arg(long)]
     pub rewrite_host: bool,
 
     /// Inject `Authorization: Basic …` (convenience only — visible in `ps`).
-    #[arg(long, value_name = "USER:PASS", env = "TS_DEV_PROXY_BASIC_AUTH")]
+    #[arg(long, value_name = "USER:PASS")]
     pub basic_auth: Option<String>,
 
     /// Read `USER:PASS` from a file (preferred over `--basic-auth`).
@@ -298,7 +298,7 @@ pub struct ProxyArgs {
     pub basic_auth_file: Option<String>,
 
     /// Skip upstream certificate verification.
-    #[arg(long, env = "TS_DEV_PROXY_INSECURE")]
+    #[arg(long)]
     pub insecure: bool,
 
     /// Connect to upstream over plaintext HTTP.
@@ -645,9 +645,9 @@ git commit -m "Add rewrite core with rule matching and header outcomes"
 
 ---
 
-## Task 3: Config resolution (args + env + rule construction)
+## Task 3: Config resolution (args + rule construction)
 
-Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective settings. Pure logic except project-config inference, which is deferred to Task 7 (here, missing rules produce a clear error). Implements spec §10.1 precedence (flags > env > inference > defaults). Scalar env vars (`TS_DEV_PROXY_LISTEN`/`LAUNCH`/`BASIC_AUTH`/`REWRITE_HOST`/`INSECURE`) arrive via clap's `env`; `TS_DEV_PROXY_MAP` is read **explicitly** in `build_rules` (clap `env` on a `Vec` can't express the "only when no `--map`/`-f`/`-t`" rule).
+Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective settings. Pure logic except project-config inference, which is deferred to Task 7 (here, missing rules produce a clear error). Implements spec §10.1 precedence (flags > inference > defaults). The tool is **flags-only** — there are no `TS_DEV_PROXY_*` environment-variable overrides.
 
 **Files:**
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/config.rs`
@@ -703,22 +703,6 @@ mod tests {
         let mut args = base_args();
         args.map = vec!["not-a-map".into()];
         assert!(resolve(&args).is_err(), "malformed --map errors");
-    }
-
-    #[test]
-    fn env_map_used_only_when_no_map_or_from_to() {
-        // SAFETY: single-threaded test; set then remove the env var.
-        // Used when no --map/-f/-t: env rule applies.
-        unsafe { std::env::set_var("TS_DEV_PROXY_MAP", "a.example.com=b.edgecompute.app,c.example.com=d.edgecompute.app") };
-        let cfg = resolve(&base_args()).expect("env map resolves");
-        assert!(cfg.rules.first_match("a.example.com").is_some(), "first env rule applied");
-        assert!(cfg.rules.first_match("c.example.com").is_some(), "second env rule applied");
-        // Ignored when a flag rule is present (flags > env).
-        let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        let cfg = resolve(&args).expect("flag rule resolves");
-        assert!(cfg.rules.first_match("a.example.com").is_none(), "env ignored when --map present");
-        unsafe { std::env::remove_var("TS_DEV_PROXY_MAP") };
     }
 
     #[test]
@@ -877,25 +861,6 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
     args.ca_dir.as_ref().map_or_else(default_ca_dir, PathBuf::from)
 }
 
-/// Warns about unrecognized `TS_DEV_PROXY_*` environment variables (spec §10.3).
-/// `TS_DEV_PROXY_CA_DIR` is intentionally absent here — `--ca-dir` is not
-/// env-driven, so setting it warns (and is ignored).
-fn warn_unknown_env() {
-    const KNOWN: &[&str] = &[
-        "TS_DEV_PROXY_LISTEN",
-        "TS_DEV_PROXY_MAP",
-        "TS_DEV_PROXY_LAUNCH",
-        "TS_DEV_PROXY_BASIC_AUTH",
-        "TS_DEV_PROXY_REWRITE_HOST",
-        "TS_DEV_PROXY_INSECURE",
-    ];
-    for (name, _) in std::env::vars() {
-        if name.starts_with("TS_DEV_PROXY_") && !KNOWN.contains(&name.as_str()) {
-            crate::output::warn(&format!("ignoring unknown environment variable {name}"));
-        }
-    }
-}
-
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
     let preserve_host = !args.rewrite_host;
@@ -905,16 +870,6 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
         rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
-    }
-    // TS_DEV_PROXY_MAP is consulted only when NO --map/-f/-t was given (flags > env,
-    // spec §10.1/§10.3). clap's `env` on a Vec can't express that, so read it here.
-    if args.map.is_empty() && args.from.is_none() && args.to.is_none() {
-        if let Ok(env_map) = std::env::var("TS_DEV_PROXY_MAP") {
-            for entry in env_map.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                let (from, to) = entry.split_once('=').ok_or(ConfigError::Rule)?;
-                rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
-            }
-        }
     }
     // NOTE: lone --to / lone --from + project-config inference is added in Task 7.
     Ok(RuleTable(rules))
@@ -931,7 +886,6 @@ fn make_rule(from: &str, to: &str, preserve_host: bool, plaintext: bool) -> Resu
 /// Returns [`ConfigError`] on malformed rules, an invalid/forbidden listen
 /// address, malformed credentials, or an unknown browser.
 pub fn resolve(args: &ProxyArgs) -> error_stack::Result<ResolvedConfig, ConfigError> {
-    warn_unknown_env();
     let rules = build_rules(args).map_err(Report::from)?;
     if rules.0.is_empty() {
         return Err(Report::new(ConfigError::NoRule));
@@ -968,8 +922,7 @@ pub fn resolve(args: &ProxyArgs) -> error_stack::Result<ResolvedConfig, ConfigEr
     })
 }
 
-/// Credential precedence: `--basic-auth-file` > `--basic-auth` > env (the env
-/// value already arrives via clap's `env` on `--basic-auth`).
+/// Credential precedence: `--basic-auth-file` > `--basic-auth`.
 fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError> {
     if let Some(path) = &args.basic_auth_file {
         let raw = std::fs::read_to_string(path).map_err(|_| ConfigError::BasicAuth)?;
@@ -985,7 +938,7 @@ fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" config::`
-Expected: PASS (7 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 5: Wire `resolve` into `run` and lint**
 
@@ -1801,7 +1754,7 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 - §7 CA (load-or-generate, 0600/0700, mint+cache, install/uninstall) → Tasks 4, 6. ✓
 - §8 rewrite (Authority/RuleTable/matching/header outcomes/port-vs-SNI) → Task 2. ✓
 - §9 browser orchestration (HTTPS-only Chrome/Firefox, Safari PAC + active-service) → Task 6. ✓
-- §10 config (precedence, env, inference) → Tasks 3, 7. ✓
+- §10 config (precedence, inference; flags-only — no env vars) → Tasks 3, 7. ✓
 - §11 security (non-loopback guard, redaction, credential input, blind-tunnel privacy) → Tasks 3, 5. ✓
 - §12 constants → encoded in Tasks 2/4 (ports, ALPN, validity, CN). ✓
 - §13 error handling → Task 5 status mapping + Task 8 troubleshooting table. ✓
@@ -1812,11 +1765,13 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 
 **Type consistency:** `Authority::{host,host_with_port,is_default_port}` (now scheme-relative via the stored `default_port`), `RuleTable::first_match`, `rewrite_for → RewriteOutcome{sni,host_header,orig_host,scheme_is_tls}`, `ResolvedConfig`, `config::ca_dir`, `CertAuthority::{load_or_generate,server_config,cert_path}`, `server::{bind,serve_on}`, `Browser::parse_list`, `generate_pac` are used consistently across tasks.
 
-**Review-round fixes (2026-06-22):** (1) crate is a **lib + bin** so integration tests reach internal modules; (2) `ca` subcommands resolve via `config::ca_dir` *before* rule resolution; (3) `run` binds the listener, spawns `serve_on`, launches browsers via `spawn_blocking`, then awaits the server — correct ordering and the runtime stays alive; (4) `Authority` stores its scheme `default_port` so `:80`/`:443` are kept/omitted per scheme; (5) `TS_DEV_PROXY_MAP` is parsed explicitly in `build_rules` with flags-over-env precedence.
+**Review-round fixes (2026-06-22):** (1) crate is a **lib + bin** so integration tests reach internal modules; (2) `ca` subcommands resolve via `config::ca_dir` *before* rule resolution; (3) `run` binds the listener, spawns `serve_on`, launches browsers via `spawn_blocking`, then awaits the server — correct ordering and the runtime stays alive; (4) `Authority` stores its scheme `default_port` so `:80`/`:443` are kept/omitted per scheme.
 
 **Second review round (2026-06-22):** (6) `ca` is a **nested** subcommand (`ProxySub::Ca { action }`) so the path is `ts dev proxy ca <action>`, not `ts dev proxy <action>`; (7) `ca path`/`ca install` call `load_or_generate` first so a fresh machine works before any proxy run; (8) `default_ca_dir` builds `…/trusted-server/dev-proxy` from `XDG_DATA_HOME`/`BaseDirs` (not `ProjectDirs`, which yields a reverse-DNS leaf); (9) CA validity is ~10 years and the leaf ≤ 90 days, both `now`-relative via `time`; (10) the blind-tunnel and basic-auth E2E tests have real assertions, plus a new keep-alive/sequential-request test.
 
-**Third review round (2026-06-22):** (11) `mint` builds the SAN explicitly — `SanType::IpAddress` for an IP-literal host, `SanType::DnsName` otherwise (spec §8.3), with a `127.0.0.1` test; (12) `resolve` calls `warn_unknown_env`, warning on unrecognized `TS_DEV_PROXY_*` vars (spec §10.3).
+**Third review round (2026-06-22):** (11) `mint` builds the SAN explicitly — `SanType::IpAddress` for an IP-literal host, `SanType::DnsName` otherwise (spec §8.3), with a `127.0.0.1` test.
+
+**Scope change (2026-06-22):** environment-variable support (`TS_DEV_PROXY_*`, former spec §10.3) was **dropped** — the tool is flags-only. `ProxyArgs` no longer carries clap `env`, `build_rules` has no `TS_DEV_PROXY_MAP` path, and `warn_unknown_env` is gone (config tests: 6).
 
 ---
 

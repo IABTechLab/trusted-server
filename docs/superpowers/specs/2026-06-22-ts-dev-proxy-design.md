@@ -124,7 +124,7 @@ ts dev proxy [OPTIONS]
 | `--allow-non-loopback` | flag | false | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11). |
 | `--launch` | `chrome,firefox,safari` \| `all` | _unset_ | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser). |
 | `--rewrite-host` | flag | false | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3). |
-| `--basic-auth` | `USER:PASS` | — | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file` or `TS_DEV_PROXY_BASIC_AUTH`. |
+| `--basic-auth` | `USER:PASS` | — | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`. |
 | `--basic-auth-file` | `PATH` | — | Read `USER:PASS` from a file (preferred over `--basic-auth`). |
 | `--insecure` | flag | false | Skip **upstream** certificate verification. |
 | `--upstream-plaintext` | flag | false | Connect to upstream over HTTP (e.g. `localhost:3000`). |
@@ -460,7 +460,7 @@ with the others.
 
 ### 10.1 Precedence
 
-CLI flags > env vars (§10.3) > project-config inference (§10.2) > built-in
+CLI flags > project-config inference (§10.2) > built-in
 defaults. `--map`/`-f`/`-t` rules are unioned (first-match-wins by declared
 order). `--from` and `--to` may be supplied independently: a lone `--to` pairs
 with the inferred `FROM`, and a lone `--from` pairs with the inferred `TO`
@@ -485,27 +485,13 @@ config so the common case is argument-free:
   upstream = "trusted-server-example.edgecompute.app"
   ```
 
-Until `[dev_proxy].upstream` (or `TS_DEV_PROXY_MAP`) exists, zero-arg `ts dev
-proxy` cannot infer `TO`: exit with a clear error showing the inferred `FROM` and
-asking for `--to`/`--map`. If `FROM` is ambiguous (multiple publishers), list
-candidates.
+Until `[dev_proxy].upstream` exists, zero-arg `ts dev proxy` cannot infer `TO`:
+exit with a clear error showing the inferred `FROM` and asking for `--to`/`--map`.
+If `FROM` is ambiguous (multiple publishers), list candidates.
 
-### 10.3 Environment variables
-
-Each variable is honored **only when its corresponding flag is absent** (flags >
-env > inference > defaults, §10.1) and is read once at startup.
-
-| Variable | Maps to | Syntax / behavior |
-|---|---|---|
-| `TS_DEV_PROXY_LISTEN` | `--listen` | `ADDR` (e.g. `127.0.0.1:8080`). |
-| `TS_DEV_PROXY_MAP` | `--map` | `FROM=TO[,FROM=TO…]` (comma-separated, first-match-wins). Used only when **no** `--map`/`-f`/`-t` is given — the two sources are not merged. |
-| `TS_DEV_PROXY_LAUNCH` | `--launch` | `chrome,firefox,safari` \| `all`. |
-| `TS_DEV_PROXY_BASIC_AUTH` | `--basic-auth` | `USER:PASS`. If more than one auth source is set, precedence is `--basic-auth-file` > `--basic-auth` > env. |
-| `TS_DEV_PROXY_REWRITE_HOST` | `--rewrite-host` | `1`/`true` sends `Host = TO`. |
-| `TS_DEV_PROXY_INSECURE` | `--insecure` | `1`/`true` skips upstream verification. |
-
-`--ca-dir` is intentionally **not** env-driven (it changes which CA is trusted —
-keep it explicit). Unknown `TS_DEV_PROXY_*` names are ignored with a warning.
+The tool is **flags-only** — there are no `TS_DEV_PROXY_*` environment-variable
+overrides. Every setting is a CLI flag (§4); the only file inputs are
+`trusted-server.toml` (inference, §10.2) and `--basic-auth-file`.
 
 ---
 
@@ -532,9 +518,8 @@ keep it explicit). Unknown `TS_DEV_PROXY_*` names are ignored with a warning.
 - **No secret logging.** Redact `Authorization` and `Cookie`; log method, host,
   path, and chosen upstream only.
 - **Credential input.** `--basic-auth USER:PASS` is **convenience only** — argv
-  is visible via `ps` and shell history. Prefer `--basic-auth-file` or the
-  `TS_DEV_PROXY_BASIC_AUTH` env var; the file is read once at startup and never
-  logged.
+  is visible via `ps` and shell history. Prefer `--basic-auth-file`; the file is
+  read once at startup and never logged.
 - **Only matched hosts are decrypted.** Launched browsers proxy **HTTPS only**
   (§9) and unmatched CONNECT authorities are blind-tunneled (§5), so unrelated
   browsing is never MITM'd.
