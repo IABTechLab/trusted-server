@@ -7,7 +7,7 @@ cargo test --workspace
 Then run JS tests:
 
 ```bash
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 ```
 
 Report results for both. If any test fails, investigate and suggest a fix.
