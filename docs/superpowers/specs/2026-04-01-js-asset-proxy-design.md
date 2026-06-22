@@ -60,15 +60,15 @@ proxy = "disabled"
 
 ### Fields
 
-| Field                        | Required | Description                                                      |
-| ---------------------------- | -------: | ---------------------------------------------------------------- |
-| `enabled`                    |      Yes | Enables or disables the integration.                             |
-| `cache_ttl_seconds`          |       No | Optional downstream cache TTL override for all assets. When unset, preserve the upstream cache policy. |
-| `assets`                     |      Yes | List of JavaScript assets the proxy may serve.                   |
+| Field                        | Required | Description                                                                                                            |
+| ---------------------------- | -------: | ---------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                    |      Yes | Enables or disables the integration.                                                                                   |
+| `cache_ttl_seconds`          |       No | Optional downstream cache TTL override for all assets. When unset, preserve the upstream cache policy.                 |
+| `assets`                     |      Yes | List of JavaScript assets the proxy may serve.                                                                         |
 | `assets[].path`              |      Yes | Stable identifier for logs, tests, and response diagnostics; exact first-party request path handled by Trusted Server. |
-| `assets[].origin_url`        |      Yes | Exact upstream JavaScript URL to fetch or match for page rewriting. |
-| `assets[].proxy`             |       No | Per-asset proxy behavior: `enabled`, `disabled`, or `blocked`. Defaults to `enabled`. |
-| `assets[].cache_ttl_seconds` |       No | Per-asset downstream cache TTL override. Takes precedence over the integration-level value. |
+| `assets[].origin_url`        |      Yes | Exact upstream JavaScript URL to fetch or match for page rewriting.                                                    |
+| `assets[].proxy`             |       No | Per-asset proxy behavior: `enabled`, `disabled`, or `blocked`. Defaults to `enabled`.                                  |
+| `assets[].cache_ttl_seconds` |       No | Per-asset downstream cache TTL override. Takes precedence over the integration-level value.                            |
 
 ### Validation
 
@@ -91,11 +91,11 @@ The implementation may use stricter validation if it keeps the configuration con
 
 Each asset has a `proxy` setting that controls both page rewriting and route registration:
 
-| Value      | Behavior |
-| ---------- | -------- |
+| Value      | Behavior                                                                                                                                                                                |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`  | Rewrite exact matching `<script src="<origin_url>">` references to the configured first-party `path`, register one exact `GET` route for that path, and proxy requests to `origin_url`. |
-| `disabled` | Keep the asset in configuration but perform no page rewriting, no blocking, and no route registration. |
-| `blocked`  | Remove exact matching `<script src="<origin_url>">` elements from HTML and do not register a proxy route. |
+| `disabled` | Keep the asset in configuration but perform no page rewriting, no blocking, and no route registration.                                                                                  |
+| `blocked`  | Remove exact matching `<script src="<origin_url>">` elements from HTML and do not register a proxy route.                                                                               |
 
 Page rewriting and blocking match only the exact configured `origin_url`. They do not match by host, path prefix, wildcard, or partial URL.
 
