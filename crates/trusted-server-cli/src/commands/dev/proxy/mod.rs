@@ -41,7 +41,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080", env = "TS_DEV_PROXY_LISTEN")]
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).
@@ -49,15 +49,15 @@ pub struct ProxyArgs {
     pub allow_non_loopback: bool,
 
     /// Browsers to launch + configure (comma list or `all`).
-    #[arg(long, value_name = "LIST", env = "TS_DEV_PROXY_LAUNCH")]
+    #[arg(long, value_name = "LIST")]
     pub launch: Option<String>,
 
     /// Send `Host: <TO>` upstream instead of the default `<FROM>`.
-    #[arg(long, env = "TS_DEV_PROXY_REWRITE_HOST")]
+    #[arg(long)]
     pub rewrite_host: bool,
 
     /// Inject `Authorization: Basic …` (convenience only — visible in `ps`).
-    #[arg(long, value_name = "USER:PASS", env = "TS_DEV_PROXY_BASIC_AUTH")]
+    #[arg(long, value_name = "USER:PASS")]
     pub basic_auth: Option<String>,
 
     /// Read `USER:PASS` from a file (preferred over `--basic-auth`).
@@ -65,7 +65,7 @@ pub struct ProxyArgs {
     pub basic_auth_file: Option<String>,
 
     /// Skip upstream certificate verification.
-    #[arg(long, env = "TS_DEV_PROXY_INSECURE")]
+    #[arg(long)]
     pub insecure: bool,
 
     /// Connect to upstream over plaintext HTTP.

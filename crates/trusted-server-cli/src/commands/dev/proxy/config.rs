@@ -1,4 +1,4 @@
-//! Resolves `ProxyArgs` (+ env, defaults) into a concrete [`ResolvedConfig`].
+//! Resolves `ProxyArgs` (+ defaults) into a concrete [`ResolvedConfig`].
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -122,26 +122,6 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
     args.ca_dir.as_ref().map_or_else(default_ca_dir, PathBuf::from)
 }
 
-/// Warns about unrecognized `TS_DEV_PROXY_*` environment variables (spec §10.3).
-///
-/// `TS_DEV_PROXY_CA_DIR` is intentionally absent here — `--ca-dir` is not
-/// env-driven, so setting it warns (and is ignored).
-fn warn_unknown_env() {
-    const KNOWN: &[&str] = &[
-        "TS_DEV_PROXY_LISTEN",
-        "TS_DEV_PROXY_MAP",
-        "TS_DEV_PROXY_LAUNCH",
-        "TS_DEV_PROXY_BASIC_AUTH",
-        "TS_DEV_PROXY_REWRITE_HOST",
-        "TS_DEV_PROXY_INSECURE",
-    ];
-    for (name, _) in std::env::vars() {
-        if name.starts_with("TS_DEV_PROXY_") && !KNOWN.contains(&name.as_str()) {
-            crate::output::warn(&format!("ignoring unknown environment variable {name}"));
-        }
-    }
-}
-
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
     let preserve_host = !args.rewrite_host;
@@ -151,16 +131,6 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
         rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
-    }
-    // TS_DEV_PROXY_MAP is consulted only when NO --map/-f/-t was given (flags > env,
-    // spec §10.1/§10.3). clap's `env` on a Vec can't express that, so read it here.
-    if args.map.is_empty() && args.from.is_none() && args.to.is_none()
-        && let Ok(env_map) = std::env::var("TS_DEV_PROXY_MAP")
-    {
-        for entry in env_map.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let (from, to) = entry.split_once('=').ok_or(ConfigError::Rule)?;
-            rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
-        }
     }
     // NOTE: lone --to / lone --from + project-config inference is added in Task 7.
     Ok(RuleTable(rules))
@@ -178,7 +148,6 @@ fn make_rule(from: &str, to: &str, preserve_host: bool, plaintext: bool) -> Resu
 /// Returns [`ConfigError`] on malformed rules, an invalid/forbidden listen
 /// address, malformed credentials, or an unknown browser.
 pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> {
-    warn_unknown_env();
     let rules = build_rules(args).map_err(Report::from)?;
     if rules.0.is_empty() {
         return Err(Report::new(ConfigError::NoRule));
@@ -215,8 +184,7 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
     })
 }
 
-/// Credential precedence: `--basic-auth-file` > `--basic-auth` > env (the env
-/// value already arrives via clap's `env` on `--basic-auth`).
+/// Credential precedence: `--basic-auth-file` > `--basic-auth`.
 fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError> {
     if let Some(path) = &args.basic_auth_file {
         let raw = std::fs::read_to_string(path).map_err(|_| ConfigError::BasicAuth)?;
@@ -273,36 +241,6 @@ mod tests {
         let mut args = base_args();
         args.map = vec!["not-a-map".into()];
         assert!(resolve(&args).is_err(), "malformed --map errors");
-    }
-
-    #[test]
-    fn env_map_used_only_when_no_map_or_from_to() {
-        // SAFETY: single-threaded test; set then remove the env var.
-        // Used when no --map/-f/-t: env rule applies.
-        unsafe {
-            std::env::set_var(
-                "TS_DEV_PROXY_MAP",
-                "a.example.com=b.edgecompute.app,c.example.com=d.edgecompute.app",
-            )
-        };
-        let cfg = resolve(&base_args()).expect("env map resolves");
-        assert!(
-            cfg.rules.first_match("a.example.com").is_some(),
-            "first env rule applied"
-        );
-        assert!(
-            cfg.rules.first_match("c.example.com").is_some(),
-            "second env rule applied"
-        );
-        // Ignored when a flag rule is present (flags > env).
-        let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        let cfg = resolve(&args).expect("flag rule resolves");
-        assert!(
-            cfg.rules.first_match("a.example.com").is_none(),
-            "env ignored when --map present"
-        );
-        unsafe { std::env::remove_var("TS_DEV_PROXY_MAP") };
     }
 
     #[test]
