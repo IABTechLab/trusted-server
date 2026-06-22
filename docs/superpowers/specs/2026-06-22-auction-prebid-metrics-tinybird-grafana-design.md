@@ -41,8 +41,9 @@ served from our own cluster host, so the URLs differ from `api.tinybird.co`.
 
 ```
 edge (handle_auction)
-  -> build event rows from OrchestrationResult (pure fn, off hot path)
-  -> Fastly real-time log endpoint "ts_auction_events" (NDJSON, async batched)
+  -> build event rows from OrchestrationResult (pure fn, cheap, inline)
+  -> sink: buffered non-blocking write, host flushes async
+  -> Fastly real-time log endpoint "ts_auction_events" (NDJSON, batched delivery)
   -> self-managed Tinybird Events API  POST https://<tb-host>/v0/events?name=auction_events_raw
   -> landing datasource (append-only, 30-day TTL)
   -> materialized views (per-minute rollups)
@@ -61,8 +62,8 @@ edge (every request)
    privacy. Page URL is reduced to `page_path` (no query string). No per-user
    identifier leaves the edge in this pipeline.
 2. **Raw retention is 30 days** via TTL on `auction_events_raw` and
-   `access_logs_raw`. Per-minute rollups in materialized views may be retained
-   longer.
+   `access_logs_raw`. Per-minute rollups in materialized views are retained 13
+   months (adjustable), since they are small.
 3. **Phase 1 ships ops and yield together** so the operations team and the
    revenue team both get visibility in the first release.
 4. **Tinybird is self-managed (`tb infra`)**, not Tinybird Cloud, to start, for
@@ -105,22 +106,44 @@ Implications for this design:
 
 ### A. Edge event emission (Rust, `trusted-server-core`)
 
-A pure function `build_auction_events(result: &OrchestrationResult, ctx: ...) ->
-Vec<AuctionEvent>` converts orchestration output into rows at the grain **one
-row per (auction x provider x seat-response)**. A provider that returns no bid
-emits exactly one row with `status = nobid` and a null `price_cpm`. A provider
-error emits one row with `status = error`. Each row carries the auction-level
-fields denormalized.
+Two pieces, split along the existing layering. The codebase keeps
+`trusted-server-core` platform-agnostic (it logs through the `log` facade and
+reaches Fastly only through a platform `services` abstraction); the Fastly
+adapter owns `log_fastly` and the real endpoints. The metrics path follows the
+same split:
 
-Serialization writes NDJSON (one JSON object per line) directly to a dedicated
-Fastly log endpoint via `fastly::log::Endpoint::from_name("ts_auction_events")`
-and `writeln!`. It deliberately bypasses the `log`/fern text formatter used for
-`tslog` so the stream is clean JSON with no `timestamp LEVEL [module]` prefix.
-Fastly real-time logging batches and POSTs asynchronously after the response is
-sent, so there is no hot-path cost.
+- **Builder (core, pure).** `build_auction_events(result: &OrchestrationResult,
+  ctx: &AuctionEventContext) -> Vec<AuctionEvent>` converts orchestration output
+  into rows at the grain **one row per (auction x provider x seat-response)**. A
+  provider that returns no bid emits one row with `status = nobid` and a null
+  `price_cpm`; a provider error emits one row with `status = error`. Each row
+  carries the auction-level fields denormalized. The builder must include
+  `mediator_response` when a mediator is configured, since the winner can come
+  from there, not only from `provider_responses`.
+- **Sink (abstraction in core, implementation in adapter).** Core defines a
+  small `AuctionEventSink` trait (or a method on the existing platform services
+  object that already provides `services.geo()`). The Fastly adapter implements
+  it with a dedicated endpoint via `fastly::log::Endpoint::from_name(
+  "ts_auction_events")` and `writeln!`, emitting NDJSON (one JSON object per
+  line) with no `timestamp LEVEL [module]` prefix, deliberately bypassing the
+  fern formatter used for `tslog`. Tests use a no-op or in-memory sink, which
+  also keeps the native (non-Fastly) build clean.
+
+`is_win` is set by matching each provider/seat bid against `winning_bids`
+(keyed by `slot_id`, value a full `Bid` clone) on `(slot_id, bidder, ad_id)`.
+`ad_id` is `Option`, so when it is absent (e.g. APS/TAM) the match falls back to
+`(slot_id, bidder)` and may be ambiguous if one seat returns multiple bids for a
+slot; acceptable for analytics, noted as a known imprecision.
+
+The sink write is a non-blocking, host-buffered append performed during request
+handling; the Fastly host flushes to the log endpoint asynchronously, so it does
+not add measurable response latency. There is no synchronous network call on the
+request path.
 
 Emission happens regardless of consent state (the rows contain no PII). Consent
-flags are recorded as booleans for analysis, not used to gate emission.
+state is recorded as booleans (`gdpr_applies` from `consent.gdpr_applies`,
+`consent_present` from whether a consent context exists) for analysis, not used
+to gate emission.
 
 #### `auction_events_raw` row schema
 
@@ -133,8 +156,8 @@ Auction-level (denormalized onto every row):
 | `publisher_domain`   | String    |                                        |
 | `page_path`          | String    | path only, no query string             |
 | `country`            | String    | from geo lookup                        |
-| `region`             | String    | from geo lookup                        |
-| `device_type`        | String    | derived from UA/signals                |
+| `region`             | String    | from geo lookup; nullable              |
+| `is_mobile`          | UInt8     | 0=desktop, 1=mobile, 2=unknown; see note |
 | `gdpr_applies`       | UInt8     | 0/1                                    |
 | `consent_present`    | UInt8     | 0/1                                    |
 | `slot_count`         | UInt16    |                                        |
@@ -162,6 +185,21 @@ Per seat-response:
 Privacy note: no `ec_id`, no full URL, no IP, no user agent string. Geo is kept
 at country/region granularity only.
 
+`is_mobile` note: the auction request carries only the raw `user_agent`; the
+0/1/2 classifier already exists as `DeviceSignals.is_mobile`
+([ec/device.rs](../../../crates/trusted-server-core/src/ec/device.rs)) but is
+computed in the adapter and not currently threaded into the auction request.
+Phase 1 either plumbs that value into `AuctionEventContext` or computes
+`is_mobile` from `user_agent` at build time using the same parser. Tablet is not
+distinguished. If neither is cheap, defer the column to Phase 2 and ship without
+it.
+
+`price_cpm` note: `Bid.price` is `Option<f64>` and is `None` for providers that
+return an encoded price decoded only by the mediation layer (APS/TAM). CPM
+distributions therefore cover only providers that expose a decoded CPM; rows
+with null price still count toward bid/win/no-bid rates. State this on the CPM
+panel so it is not read as total-market CPM.
+
 ### B. Tinybird (auction yield)
 
 - **Landing datasource** `auction_events_raw`: `ENGINE MergeTree`, sorting key
@@ -183,13 +221,19 @@ stored, so definitions stay in one place.
 
 ### C. Tinybird (ops)
 
-A second Fastly real-time log endpoint `ts_access_logs` emits one access line
-per request to `access_logs_raw`: `event_ts`, `method`, `path` (normalized to a
-route label so cardinality stays bounded), `status`, `time_elapsed_ms`,
-`cache_state` (HIT/MISS/PASS from `fastly_info.state`), `country`. A per-minute
-materialized view drives QPS, status-code class rates, endpoint latency
-quantiles, and cache hit ratio. This replaces what `fastly-exporter` would give
-for ops; the tradeoff (no POP-level analytics aggregates) was accepted.
+No per-request access logging exists today (the adapter logs only errors,
+warnings, and specific conditions). So this is a new cross-cutting emission in
+the adapter, added where the response is finalized in the top-level request flow
+([adapter/.../main.rs](../../../crates/trusted-server-adapter-fastly/src/main.rs)),
+since `status` and elapsed time are known only there. It writes one line per
+request to a second endpoint `ts_access_logs` -> `access_logs_raw`: `event_ts`,
+`method`, `path` (normalized to a bounded route label, not the raw path, so
+cardinality stays bounded), `status`, `time_elapsed_ms`, `cache_state`
+(HIT/MISS/PASS), `country`. Same buffered, non-blocking write as the auction
+sink, so no added latency. A per-minute materialized view drives QPS,
+status-code class rates, endpoint latency quantiles, and cache hit ratio. This
+replaces what `fastly-exporter` would give for ops; the tradeoff (no POP-level
+analytics aggregates) was accepted.
 
 ### D. Grafana
 
@@ -225,16 +269,51 @@ rows:
 - **Single-node availability.** Self-managed `tb infra` is single-node with no
   HA today. A Tinybird outage loses analytics for the window only (Fastly
   logging is fire-and-forget); it must never sit on the auction request path.
+- **Fastly HTTPS delivery framing (highest integration unknown).** Fastly's
+  HTTPS real-time log endpoint batches multiple log lines per delivery and can
+  prepend framing depending on the endpoint's message-type/format settings.
+  Tinybird's Events API wants a clean NDJSON body (one JSON object per line),
+  the right `Content-Type`, and the Bearer token header. Before building
+  dashboards, verify end to end that a batched Fastly delivery lands as valid
+  rows: set the endpoint message type to a blank/raw format (no syslog prefix),
+  confirm newline batching, and check Tinybird's quarantine table for rejects.
+  This is the one piece that cannot be fully validated from code and must be
+  tested against the real endpoints.
 - **Schema drift.** The edge NDJSON shape and the Tinybird datasource schema
   must stay in sync. Keep the Rust struct and the `.datasource` definition
-  reviewed together; a malformed row is dropped by Tinybird, so add an ingest
-  error check to the dashboard.
+  reviewed together; a malformed row is dropped by Tinybird (quarantine), so add
+  an ingest-error / quarantine check to the dashboard.
 - **Token handling.** The Tinybird ingest token is configured on the Fastly log
   endpoint (Authorization header), provisioned as a Fastly service resource, not
   committed to the repo.
 - **Ingress reachability.** Fastly's HTTPS log sink must reach `<tb-host>` over
   public TLS, so the self-managed cluster needs a resolvable, TLS-terminated
   gateway. Restrict it to token auth and, where feasible, Fastly source ranges.
+
+## Prerequisites (provisioned outside the repo)
+
+- Self-managed Tinybird cluster via `tb infra`, with a TLS-terminated gateway
+  reachable from Fastly (`<tb-host>`).
+- Two Tinybird ingest tokens (or one scoped to both datasources) and a read
+  token for Grafana.
+- Two Fastly real-time log endpoints on the service: `ts_auction_events` and
+  `ts_access_logs`, each configured with the `<tb-host>` Events API URL, the
+  Bearer token header, and a raw/blank message format.
+- Grafana with the Tinybird datasource (or grafana-infinity) pointed at
+  `<tb-host>`.
+
+## Success criteria
+
+- A live auction produces N rows in `auction_events_raw` (one per seat-response,
+  including no-bid and error rows) with correct `is_win` flags and no PII.
+- The yield dashboard shows fill rate, win rate by seat, no-bid rate, CPM
+  quantiles (decoded-CPM providers only), and per-seat latency for a chosen
+  time range, filterable by publisher and provider.
+- The ops dashboard shows QPS, status-class error rate, endpoint latency
+  quantiles, and cache hit ratio from `access_logs_raw`.
+- Tinybird quarantine stays empty under normal traffic; a malformed row is
+  visible on the ingest-error panel.
+- No measurable change in `/auction` response latency attributable to emission.
 
 ## Out of scope
 
