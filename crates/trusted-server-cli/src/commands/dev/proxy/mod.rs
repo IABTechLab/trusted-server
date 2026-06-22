@@ -2,6 +2,8 @@ pub mod ca;
 pub mod config;
 pub mod rewrite;
 
+use error_stack::ResultExt as _;
+
 use crate::output;
 
 /// Errors surfaced by `ts dev proxy`.
@@ -108,9 +110,16 @@ pub enum CaCommand {
 /// Runs `ts dev proxy`.
 ///
 /// # Errors
+///
 /// Returns [`ProxyError`] if configuration, the CA, the server, or browser
 /// orchestration fails.
 pub fn run(args: ProxyArgs) -> Result<(), error_stack::Report<ProxyError>> {
-    output::info(&format!("ts dev proxy: listen={}", args.listen));
+    let cfg = config::resolve(&args).change_context(ProxyError::Config)?;
+    output::info(&format!(
+        "ts dev proxy: listen={} rules={} launch={:?}",
+        cfg.listen,
+        cfg.rules.0.len(),
+        cfg.launch,
+    ));
     Ok(())
 }
