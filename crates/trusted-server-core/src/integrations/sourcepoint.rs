@@ -112,6 +112,17 @@ static SP_ORIGIN_UNIFIED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Sourcepoint origin+unified regex should compile")
 });
 
+/// Matches root-relative asset attributes inside Sourcepoint HTML apps.
+///
+/// Sourcepoint privacy-manager HTML uses root-relative script and stylesheet
+/// paths like `/PrivacyManagerUS…`. When served through the first-party proxy,
+/// those paths must keep flowing through `/integrations/sourcepoint/cdn` rather
+/// than resolving against the publisher origin root.
+static SP_ROOT_RELATIVE_ASSET_ATTR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(\b(?:src|href)\s*=\s*)(['"])(/[^/'"][^'"]*)(['"])"#)
+        .expect("Sourcepoint root-relative asset regex should compile")
+});
+
 /// Configuration for the Sourcepoint first-party proxy.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct SourcepointConfig {
@@ -136,6 +147,12 @@ pub struct SourcepointConfig {
     #[serde(default = "default_cache_ttl")]
     #[validate(range(min = 60, max = 86400))]
     pub cache_ttl_seconds: u32,
+    /// Debug-only override that forces inserted Sourcepoint message containers visible.
+    #[serde(default)]
+    pub debug_force_banner_visible: bool,
+    /// Debug-only override that clears Sourcepoint state before the CMP loads.
+    #[serde(default)]
+    pub debug_clear_state_on_load: bool,
 }
 
 impl IntegrationConfig for SourcepointConfig {
@@ -496,6 +513,30 @@ impl SourcepointIntegration {
             .into_owned()
     }
 
+    /// Rewrite Sourcepoint HTML app asset URLs through the CDN proxy.
+    ///
+    /// Sourcepoint privacy-manager apps are hosted from CDN subpaths like
+    /// `/us_pm/index.html`, but the HTML points at root-relative assets such as
+    /// `/PrivacyManagerUS.b9d1f.css`. Without rewriting, browsers request those
+    /// assets from the publisher origin root and receive 404s.
+    fn rewrite_html_content(content: &str) -> String {
+        SP_ROOT_RELATIVE_ASSET_ATTR_PATTERN
+            .replace_all(content, |caps: &regex::Captures| {
+                let full_match = &caps[0];
+                let attr_prefix = &caps[1];
+                let open_quote = &caps[2];
+                let path = &caps[3];
+                let close_quote = &caps[4];
+
+                if path.starts_with(SOURCEPOINT_CDN_PREFIX) {
+                    return full_match.to_string();
+                }
+
+                format!("{attr_prefix}{open_quote}{SOURCEPOINT_CDN_PREFIX}{path}{close_quote}")
+            })
+            .into_owned()
+    }
+
     /// Returns `true` for CDN paths that are likely JavaScript bundles.
     ///
     /// Used to decide whether to request uncompressed content from upstream so
@@ -507,6 +548,11 @@ impl SourcepointIntegration {
         path.ends_with(".js") || path.ends_with(".mjs") || path.starts_with("/unified/")
     }
 
+    /// Returns `true` for CDN paths that are likely HTML app documents.
+    fn is_likely_html_path(path: &str) -> bool {
+        path.ends_with(".html") || path.ends_with(".htm")
+    }
+
     /// Returns `true` when the response `Content-Type` looks like JavaScript.
     fn is_javascript_response(response: &Response<EdgeBody>) -> bool {
         response
@@ -514,6 +560,15 @@ impl SourcepointIntegration {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("javascript") || ct.contains("ecmascript"))
+    }
+
+    /// Returns `true` when the response `Content-Type` looks like HTML.
+    fn is_html_response(response: &Response<EdgeBody>) -> bool {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/html") || ct.contains("application/xhtml"))
     }
 
     fn remove_vary_accept_encoding(response: &mut Response<EdgeBody>) {
@@ -569,6 +624,104 @@ impl SourcepointIntegration {
         );
 
         *response.body_mut() = EdgeBody::from(rewritten.into_bytes());
+    }
+
+    fn rewrite_html_response(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        forwarded_cookies: bool,
+    ) {
+        response.headers_mut().remove(header::CONTENT_ENCODING);
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+        Self::remove_vary_accept_encoding(response);
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        *response.body_mut() = EdgeBody::from(rewritten.into_bytes());
+        self.apply_cache_headers(response, forwarded_cookies);
+    }
+
+    fn debug_clear_state_script() -> String {
+        concat!(
+            "<script>",
+            "(function(){try{",
+            "if(window.__tsjs_sourcepoint_debug_clear_state_installed)return;",
+            "window.__tsjs_sourcepoint_debug_clear_state_installed=true;",
+            "if(window.console&&console.warn)console.warn(\"Sourcepoint debug_clear_state_on_load enabled; clearing Sourcepoint consent state\");",
+            "function m(n){",
+            "n=String(n||\"\").toLowerCase();",
+            "return n.indexOf(\"_sp\")!==-1||n.indexOf(\"sp_\")!==-1||n.indexOf(\"sourcepoint\")!==-1||n.indexOf(\"consent\")!==-1||n.indexOf(\"gpp\")!==-1||n.indexOf(\"usnat\")!==-1||n.indexOf(\"privacy\")!==-1||n.indexOf(\"ccpa\")!==-1;",
+            "}",
+            "function clearStorage(store,label){",
+            "if(!store)return;",
+            "var keys=[];",
+            "for(var i=0;i<store.length;i++){var k=store.key(i);if(m(k))keys.push(k)}",
+            "for(var j=0;j<keys.length;j++){if(window.console&&console.debug)console.debug(\"Sourcepoint debug: removing \"+label,keys[j]);store.removeItem(keys[j])}",
+            "}",
+            "clearStorage(window.localStorage,\"localStorage\");",
+            "clearStorage(window.sessionStorage,\"sessionStorage\");",
+            "var paths=[\"/\",\"/integrations\",\"/integrations/sourcepoint\",\"/integrations/sourcepoint/cdn\",\"/integrations/sourcepoint/cdn/us_pm\"];",
+            "var cookies=document.cookie?document.cookie.split(\"; \"):[];",
+            "for(var c=0;c<cookies.length;c++){",
+            "var name=cookies[c].split(\"=\")[0];",
+            "if(!m(name))continue;",
+            "for(var p=0;p<paths.length;p++){",
+            "document.cookie=name+\"=; path=\"+paths[p]+\"; max-age=0\";",
+            "document.cookie=name+\"=; path=\"+paths[p]+\"; max-age=0; Secure; SameSite=Lax\";",
+            "}",
+            "}",
+            "}catch(e){if(window.console&&console.warn)console.warn(\"Sourcepoint: failed to clear debug state\",e)}})();",
+            "</script>",
+        )
+        .to_string()
+    }
+
+    fn debug_force_banner_script() -> String {
+        concat!(
+            "<script>",
+            "(function(){try{",
+            "if(window.__tsjs_sourcepoint_force_banner_visible_installed)return;",
+            "window.__tsjs_sourcepoint_force_banner_visible_installed=true;",
+            "if(window.console&&console.warn)console.warn(\"Sourcepoint debug_force_banner_visible enabled; forcing Sourcepoint message containers visible\");",
+            "function force(el){",
+            "if(!el||!el.id||!/^sp_message_container_/.test(el.id))return;",
+            "el.style.setProperty(\"display\",\"block\",\"important\");",
+            "el.style.setProperty(\"visibility\",\"visible\",\"important\");",
+            "el.style.setProperty(\"opacity\",\"1\",\"important\");",
+            "el.style.setProperty(\"pointer-events\",\"auto\",\"important\");",
+            "var f=el.querySelector(\"iframe[id^='sp_message_iframe_']\");",
+            "if(f){",
+            "f.style.setProperty(\"display\",\"block\",\"important\");",
+            "f.style.setProperty(\"visibility\",\"visible\",\"important\");",
+            "f.style.setProperty(\"opacity\",\"1\",\"important\");",
+            "}",
+            "}",
+            "function scan(root){",
+            "if(!root||root.nodeType!==1)return;",
+            "if(root.id&&/^sp_message_container_/.test(root.id))force(root);",
+            "if(root.querySelectorAll){",
+            "var nodes=root.querySelectorAll(\"[id^='sp_message_container_']\");",
+            "for(var i=0;i<nodes.length;i++)force(nodes[i]);",
+            "}",
+            "}",
+            "scan(document.documentElement);",
+            "var checks=0;",
+            "var timer=window.setInterval(function(){",
+            "checks++;",
+            "scan(document.documentElement);",
+            "if(checks>=80)window.clearInterval(timer);",
+            "},250);",
+            "new MutationObserver(function(muts){",
+            "for(var i=0;i<muts.length;i++){",
+            "for(var j=0;j<muts[i].addedNodes.length;j++)scan(muts[i].addedNodes[j]);",
+            "}",
+            "}).observe(document.documentElement,{childList:true,subtree:true});",
+            "}catch(e){if(window.console&&console.warn)console.warn(\"Sourcepoint: failed to install debug force banner visibility\",e)}})();",
+            "</script>",
+        )
+        .to_string()
     }
 }
 
@@ -703,11 +856,14 @@ impl IntegrationProxy for SourcepointIntegration {
         let forwarded_cookies =
             self.copy_headers(services.client_info.client_ip, &source_req, &mut proxy_req);
 
-        // Request uncompressed content only for paths that are likely
-        // JavaScript (the files we need to regex-rewrite).  All other CDN
-        // responses (images, JSON API responses, CSS) keep the client's
-        // original Accept-Encoding for efficiency.
-        if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
+        // Request uncompressed content only for paths that are likely text
+        // responses we need to rewrite. All other CDN responses (images, JSON
+        // API responses, CSS) keep the client's original Accept-Encoding for
+        // efficiency.
+        if self.config.rewrite_sdk
+            && (Self::is_likely_javascript_path(target_path)
+                || Self::is_likely_html_path(target_path))
+        {
             proxy_req.headers_mut().insert(
                 header::ACCEPT_ENCODING,
                 HeaderValue::from_static("identity"),
@@ -830,6 +986,71 @@ impl IntegrationProxy for SourcepointIntegration {
             return Ok(response);
         }
 
+        // Rewrite root-relative asset URLs inside Sourcepoint HTML apps so
+        // privacy-manager iframes can load their CSS and JavaScript through the
+        // first-party CDN proxy.
+        if method == Method::GET
+            && response.status() == StatusCode::OK
+            && self.config.rewrite_sdk
+            && Self::is_html_response(&response)
+        {
+            log::info!("Sourcepoint: rewriting HTML response body for {path}");
+
+            let content_length = response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            match content_length {
+                Some(len) if len > MAX_REWRITE_BODY_SIZE => {
+                    log::warn!(
+                        "Sourcepoint: response body for {path} exceeds {} bytes \
+                         (Content-Length: {len}), skipping rewrite (reason: known_length_too_large)",
+                        MAX_REWRITE_BODY_SIZE
+                    );
+                    self.apply_cache_headers(&mut response, forwarded_cookies);
+                    return Ok(response);
+                }
+                None => {
+                    log::warn!(
+                        "Sourcepoint: no Content-Length for {path}, \
+                         skipping rewrite to avoid unbounded memory read (reason: missing_content_length)"
+                    );
+                    self.apply_cache_headers(&mut response, forwarded_cookies);
+                    return Ok(response);
+                }
+                Some(_) => {}
+            }
+
+            let (resp_parts, resp_body) = response.into_parts();
+            let body_bytes = collect_response_bounded(
+                resp_body,
+                MAX_REWRITE_BODY_SIZE as usize,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
+            let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
+
+            let body = match String::from_utf8(body_bytes) {
+                Ok(text) => text,
+                Err(err) => {
+                    log::warn!(
+                        "Sourcepoint: upstream body for {path} is not valid UTF-8 \
+                         at byte offset {}, passing through unmodified",
+                        err.utf8_error().valid_up_to()
+                    );
+                    *response.body_mut() = EdgeBody::from(err.into_bytes());
+                    self.apply_cache_headers(&mut response, forwarded_cookies);
+                    return Ok(response);
+                }
+            };
+            let rewritten = Self::rewrite_html_content(&body);
+
+            self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
+            return Ok(response);
+        }
+
         self.apply_cache_headers(&mut response, forwarded_cookies);
         Ok(response)
     }
@@ -867,11 +1088,20 @@ impl IntegrationHeadInjector for SourcepointIntegration {
 
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut inserts = vec![format!(
-            "<script>window.__tsjs_sourcepoint={{\"rewriteSdk\":{}}};</script>",
-            self.config.rewrite_sdk
+            "<script>window.__tsjs_sourcepoint={{\"rewriteSdk\":{},\"debugForceBannerVisible\":{},\"debugClearStateOnLoad\":{}}};</script>",
+            self.config.rewrite_sdk,
+            self.config.debug_force_banner_visible,
+            self.config.debug_clear_state_on_load,
         )];
 
+        if self.config.debug_clear_state_on_load {
+            inserts.push(Self::debug_clear_state_script());
+        }
+
         if !self.config.rewrite_sdk {
+            if self.config.debug_force_banner_visible {
+                inserts.push(Self::debug_force_banner_script());
+            }
             return inserts;
         }
 
@@ -925,6 +1155,10 @@ impl IntegrationHeadInjector for SourcepointIntegration {
             cdn_prefix = SOURCEPOINT_CDN_PREFIX,
         ));
 
+        if self.config.debug_force_banner_visible {
+            inserts.push(Self::debug_force_banner_script());
+        }
+
         inserts
     }
 }
@@ -943,6 +1177,8 @@ mod tests {
             cdn_origin: default_cdn_origin(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         }
     }
 
@@ -1076,6 +1312,45 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_html_root_relative_assets_to_cdn_proxy_prefix() {
+        let input = concat!(
+            r#"<link rel="manifest" href="/manifest.json">"#,
+            r#"<link href='/PrivacyManagerUS.b9d1f.css' rel="preload">"#,
+            r#"<script src="/PrivacyManagerUS.1234.js"></script>"#,
+            r#"<script src="//cdn.example.com/keep.js"></script>"#,
+            "<a href=\"#privacy\">Privacy</a>",
+            r#"<script src="/integrations/sourcepoint/cdn/already.js"></script>"#,
+        );
+
+        let output = SourcepointIntegration::rewrite_html_content(input);
+
+        assert!(
+            output.contains(r#"href="/integrations/sourcepoint/cdn/manifest.json""#),
+            "should rewrite root-relative manifest path: {output}"
+        );
+        assert!(
+            output.contains(r#"href='/integrations/sourcepoint/cdn/PrivacyManagerUS.b9d1f.css'"#),
+            "should rewrite single-quoted stylesheet path: {output}"
+        );
+        assert!(
+            output.contains(r#"src="/integrations/sourcepoint/cdn/PrivacyManagerUS.1234.js""#),
+            "should rewrite root-relative script path: {output}"
+        );
+        assert!(
+            output.contains(r#"src="//cdn.example.com/keep.js""#),
+            "should not rewrite protocol-relative paths: {output}"
+        );
+        assert!(
+            output.contains("href=\"#privacy\""),
+            "should not rewrite fragment links: {output}"
+        );
+        assert!(
+            output.contains(r#"src="/integrations/sourcepoint/cdn/already.js""#),
+            "should not double-prefix already rewritten paths: {output}"
+        );
+    }
+
+    #[test]
     fn registers_sourcepoint_routes() {
         let mut settings = create_test_settings();
         settings
@@ -1131,6 +1406,19 @@ mod tests {
     }
 
     #[test]
+    fn identifies_likely_html_paths() {
+        assert!(SourcepointIntegration::is_likely_html_path(
+            "/us_pm/index.html"
+        ));
+        assert!(SourcepointIntegration::is_likely_html_path(
+            "/privacy-manager.htm"
+        ));
+        assert!(!SourcepointIntegration::is_likely_html_path(
+            "/PrivacyManagerUS.b9d1f.css"
+        ));
+    }
+
+    #[test]
     fn head_injector_emits_config_script_plus_trap_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
@@ -1150,7 +1438,9 @@ mod tests {
 
         let config_script = &inserts[0];
         assert!(
-            config_script.contains("window.__tsjs_sourcepoint={\"rewriteSdk\":true}"),
+            config_script.contains(
+                "window.__tsjs_sourcepoint={\"rewriteSdk\":true,\"debugForceBannerVisible\":false,\"debugClearStateOnLoad\":false}"
+            ),
             "should emit rewrite SDK config script: {config_script}"
         );
 
@@ -1211,12 +1501,158 @@ mod tests {
             "should emit only config script when rewrite_sdk is false"
         );
         assert!(
-            inserts[0].contains("window.__tsjs_sourcepoint={\"rewriteSdk\":false}"),
+            inserts[0].contains(
+                "window.__tsjs_sourcepoint={\"rewriteSdk\":false,\"debugForceBannerVisible\":false,\"debugClearStateOnLoad\":false}"
+            ),
             "should flag rewriteSdk false"
         );
         assert!(
             !inserts[0].contains("Object.defineProperty"),
             "should not emit runtime trap when rewrite_sdk is disabled"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_debug_force_banner_script_when_enabled() {
+        let mut cfg = config(true);
+        cfg.debug_force_banner_visible = true;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.prospecta.com",
+            request_scheme: "https",
+            origin_host: "origin.prospecta.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit config, rewrite trap, and debug force script"
+        );
+        assert!(
+            inserts[0].contains(
+                "window.__tsjs_sourcepoint={\"rewriteSdk\":true,\"debugForceBannerVisible\":true,\"debugClearStateOnLoad\":false}"
+            ),
+            "should expose debug force flag in config script"
+        );
+
+        let debug_script = &inserts[2];
+        assert!(
+            debug_script.contains("debug_force_banner_visible enabled"),
+            "should warn that debug forcing is enabled: {debug_script}"
+        );
+        assert!(
+            debug_script.contains("sp_message_container_"),
+            "should target Sourcepoint message containers: {debug_script}"
+        );
+        assert!(
+            debug_script.contains("setProperty(\"display\",\"block\",\"important\")"),
+            "should force display block with important priority: {debug_script}"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_debug_force_banner_script_when_rewrite_disabled() {
+        let mut cfg = config(true);
+        cfg.rewrite_sdk = false;
+        cfg.debug_force_banner_visible = true;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.prospecta.com",
+            request_scheme: "https",
+            origin_host: "origin.prospecta.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts.len(),
+            2,
+            "should emit config plus debug force script when rewrite is disabled"
+        );
+        assert!(
+            !inserts
+                .iter()
+                .any(|insert| insert.contains("Object.defineProperty")),
+            "should not install runtime rewrite trap when rewrite_sdk is disabled"
+        );
+        assert!(
+            inserts[1].contains("sp_message_container_"),
+            "should still emit debug force script"
+        );
+    }
+
+    #[test]
+    fn head_injector_emits_debug_clear_state_script_when_enabled() {
+        let mut cfg = config(true);
+        cfg.debug_clear_state_on_load = true;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.prospecta.com",
+            request_scheme: "https",
+            origin_host: "origin.prospecta.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts.len(),
+            3,
+            "should emit config, debug clear script, and rewrite trap"
+        );
+        assert!(
+            inserts[0].contains(
+                "window.__tsjs_sourcepoint={\"rewriteSdk\":true,\"debugForceBannerVisible\":false,\"debugClearStateOnLoad\":true}"
+            ),
+            "should expose debug clear flag in config script"
+        );
+        assert!(
+            inserts[1].contains("debug_clear_state_on_load enabled"),
+            "should warn that debug state clearing is enabled: {}",
+            inserts[1]
+        );
+        assert!(
+            inserts[1].contains("localStorage") && inserts[1].contains("document.cookie"),
+            "should clear Sourcepoint storage and cookies: {}",
+            inserts[1]
+        );
+        assert!(
+            inserts[2].contains("Object.defineProperty"),
+            "should keep rewrite trap after debug clear script"
+        );
+    }
+
+    #[test]
+    fn head_injector_orders_debug_clear_before_debug_force() {
+        let mut cfg = config(true);
+        cfg.debug_clear_state_on_load = true;
+        cfg.debug_force_banner_visible = true;
+        let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "ts.prospecta.com",
+            request_scheme: "https",
+            origin_host: "origin.prospecta.com",
+            document_state: &document_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+        assert_eq!(
+            inserts.len(),
+            4,
+            "should emit config, debug clear, rewrite trap, and debug force"
+        );
+        assert!(
+            inserts[1].contains("debug_clear_state_on_load enabled"),
+            "should clear state before later scripts run"
+        );
+        assert!(
+            inserts[3].contains("debug_force_banner_visible enabled"),
+            "should force visibility after state clearing"
         );
     }
 
@@ -1228,6 +1664,8 @@ mod tests {
             cdn_origin: "http://169.254.169.254".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_err(),
@@ -1243,6 +1681,8 @@ mod tests {
             cdn_origin: "ftp://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(cfg.validate().is_err(), "should reject non-HTTP(S) scheme");
     }
@@ -1255,6 +1695,8 @@ mod tests {
             cdn_origin: "https://cdn-eu.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_err(),
@@ -1270,6 +1712,8 @@ mod tests {
             cdn_origin: "https://cdn.privacy-mgmt.com/edge".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_err(),
@@ -1285,6 +1729,8 @@ mod tests {
             cdn_origin: "https://cdn.privacy-mgmt.com?edge=1".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_err(),
@@ -1300,6 +1746,8 @@ mod tests {
             cdn_origin: "https://cdn.privacy-mgmt.com#edge".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_err(),
@@ -1315,6 +1763,8 @@ mod tests {
             cdn_origin: "https://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_ok(),
@@ -1330,6 +1780,8 @@ mod tests {
             cdn_origin: "http://cdn.privacy-mgmt.com".to_string(),
             auth_cookie_name: None,
             cache_ttl_seconds: default_cache_ttl(),
+            debug_force_banner_visible: false,
+            debug_clear_state_on_load: false,
         };
         assert!(
             cfg.validate().is_ok(),
@@ -1346,6 +1798,8 @@ mod tests {
                 cdn_origin: default_cdn_origin(),
                 auth_cookie_name: Some(auth_cookie_name.to_string()),
                 cache_ttl_seconds: default_cache_ttl(),
+                debug_force_banner_visible: false,
+                debug_clear_state_on_load: false,
             };
 
             assert!(
@@ -1377,6 +1831,8 @@ mod tests {
                 cdn_origin: default_cdn_origin(),
                 auth_cookie_name: Some(auth_cookie_name.to_string()),
                 cache_ttl_seconds: default_cache_ttl(),
+                debug_force_banner_visible: false,
+                debug_clear_state_on_load: false,
             };
 
             assert!(
@@ -1677,6 +2133,39 @@ mod tests {
         assert_eq!(
             get_header_str(&response, header::CONTENT_TYPE),
             Some("application/javascript; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_sets_html_headers_and_body() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+
+        set_header(&mut response, header::VARY, "Accept-Encoding, Origin");
+        set_header(&mut response, header::CONTENT_ENCODING, "gzip");
+        set_header(&mut response, header::CONTENT_LENGTH, "4");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "<html></html>".to_string(), false);
+
+        assert_eq!(
+            get_header_str(&response, header::CONTENT_TYPE),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(get_header_str(&response, header::VARY), Some("Origin"));
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+
+        let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some(expected_cache_control.as_str())
+        );
+
+        let body = take_body_bytes(response);
+        assert_eq!(
+            String::from_utf8(body).expect("should decode rewritten HTML response"),
+            "<html></html>"
         );
     }
 

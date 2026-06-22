@@ -11,6 +11,7 @@ The Sourcepoint integration:
 - Rewrites JavaScript response bodies so webpack chunks and API calls route through the proxy
 - Injects a `window._sp_` property trap for config URLs set by Next.js hydration chunks
 - Installs a client-side script guard for dynamically inserted Sourcepoint assets
+- Optionally clears Sourcepoint state and forces message containers visible for local debugging
 
 ## Configuration
 
@@ -24,17 +25,23 @@ cdn_origin = "https://cdn.privacy-mgmt.com"
 # Optional: forward a custom Sourcepoint authCookie name upstream.
 # auth_cookie_name = "sp_auth"
 cache_ttl_seconds = 3600
+# Debug only: clear Sourcepoint state before load and force hidden message containers visible.
+# Do not enable these in production.
+# debug_clear_state_on_load = false
+# debug_force_banner_visible = false
 ```
 
 ### Configuration Options
 
-| Option              | Type             | Default                        | Description                                                                                                                                                                |
-| ------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`           | boolean          | `false`                        | Enable the Sourcepoint integration                                                                                                                                         |
-| `rewrite_sdk`       | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                                                                                                  |
-| `cdn_origin`        | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                                                                                                     |
-| `auth_cookie_name`  | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies. Names must be 1-64 characters and contain only letters, numbers, `_`, or `-` |
-| `cache_ttl_seconds` | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers                                                                                          |
+| Option                       | Type             | Default                        | Description                                                                                                                                                                |
+| ---------------------------- | ---------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                    | boolean          | `false`                        | Enable the Sourcepoint integration                                                                                                                                         |
+| `rewrite_sdk`                | boolean          | `true`                         | Rewrite matching Sourcepoint URLs in HTML                                                                                                                                  |
+| `cdn_origin`                 | string           | `https://cdn.privacy-mgmt.com` | Sourcepoint CDN origin                                                                                                                                                     |
+| `auth_cookie_name`           | string or `null` | `null`                         | Optional custom Sourcepoint `authCookie` name to forward upstream alongside built-in cookies. Names must be 1-64 characters and contain only letters, numbers, `_`, or `-` |
+| `cache_ttl_seconds`          | integer          | `3600`                         | Cache TTL applied to successful CDN responses when the origin omits cache headers                                                                                          |
+| `debug_clear_state_on_load`  | boolean          | `false`                        | Debug-only override that clears Sourcepoint local/session storage and matching cookies before Sourcepoint loads. Do not enable in production                               |
+| `debug_force_banner_visible` | boolean          | `false`                        | Debug-only override that forces inserted `sp_message_container_*` elements visible. Do not enable in production                                                            |
 
 ## Endpoints
 

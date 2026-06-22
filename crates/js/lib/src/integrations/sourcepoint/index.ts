@@ -5,6 +5,8 @@ import { installSourcepointGuard } from './script_guard';
 type SourcepointWindow = Window & {
   __tsjs_sourcepoint?: {
     rewriteSdk?: boolean;
+    debugForceBannerVisible?: boolean;
+    debugClearStateOnLoad?: boolean;
   };
 };
 
