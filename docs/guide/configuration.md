@@ -61,6 +61,7 @@ openssl rand -base64 32
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
 | `[ec]`              | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
@@ -321,6 +322,45 @@ a zero-byte cap fails every non-empty buffered response.
 
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+```
+
+## Tester Cookie Configuration
+
+Settings for the optional tester-cookie endpoint. This feature is disabled by
+default and should only be enabled for intentional QA or troubleshooting flows.
+
+### `[tester_cookie]`
+
+| Field     | Type    | Required | Description                                                  |
+| --------- | ------- | -------- | ------------------------------------------------------------ |
+| `enabled` | Boolean | No       | Enables `GET /_ts/set-tester` to set `ts-tester=true` cookie |
+
+When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
+
+```http
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Cache-Control: no-store, private
+```
+
+When disabled, the route returns `404 Not Found` and does not set a cookie.
+
+::: warning
+The cookie is scoped with `[publisher].cookie_domain`, not the EC-specific
+computed domain. Keep `cookie_domain` aligned with the browser scope where your
+QA tooling expects to read `ts-tester`.
+:::
+
+**Example**:
+
+```toml
+[tester_cookie]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 ```
 
 ## EC Configuration
