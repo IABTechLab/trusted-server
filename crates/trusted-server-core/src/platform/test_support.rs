@@ -805,6 +805,7 @@ mod tests {
             scheme: "https".to_owned(),
             host: "example.com".to_owned(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         };

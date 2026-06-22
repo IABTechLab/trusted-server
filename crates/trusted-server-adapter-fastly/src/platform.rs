@@ -157,6 +157,7 @@ pub struct FastlyPlatformBackend;
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
+        .host_header_override(spec.host_header_override.as_deref())
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
 }
@@ -308,7 +309,16 @@ fn edge_request_to_fastly(
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
-        fastly_req.append_header(name.as_str(), value.as_bytes());
+        // `fastly::Request::new` derives a Host header from the request URI, so
+        // appending the edge request's own Host would leave a duplicate. Replace
+        // it instead to keep the in-memory request well-formed. The Host actually
+        // sent on the wire is still governed by the backend's `override_host`
+        // (see `BackendConfig::ensure`), which forces the value regardless.
+        if name == edgezero_core::http::header::HOST {
+            fastly_req.set_header(name.as_str(), value.as_bytes());
+        } else {
+            fastly_req.append_header(name.as_str(), value.as_bytes());
+        }
     }
     match body {
         edgezero_core::body::Body::Once(bytes) => {
@@ -614,6 +624,24 @@ mod tests {
         Arc::new(NoopKvStore)
     }
 
+    #[test]
+    fn edge_request_to_fastly_replaces_url_derived_host_header() {
+        let request = request_builder()
+            .method("GET")
+            .uri("https://origin.example.com/")
+            .header(edgezero_core::http::header::HOST, "www.example.com")
+            .body(Body::empty())
+            .expect("should build request");
+
+        let fastly_req = edge_request_to_fastly(request).expect("should convert request");
+
+        assert_eq!(
+            fastly_req.get_header_str(fastly::http::header::HOST),
+            Some("www.example.com"),
+            "should replace the URL-derived Host instead of appending a duplicate"
+        );
+    }
+
     // --- FastlyPlatformBackend::predict_name --------------------------------
 
     #[test]
@@ -623,6 +651,7 @@ mod tests {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -638,12 +667,35 @@ mod tests {
     }
 
     #[test]
+    fn predict_name_includes_host_header_override_suffix() {
+        let backend = FastlyPlatformBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "origin.example.com".to_string(),
+            port: None,
+            host_header_override: Some("www.example.com".to_string()),
+            certificate_check: true,
+            first_byte_timeout: Duration::from_secs(15),
+        };
+
+        let name = backend
+            .predict_name(&spec)
+            .expect("should compute backend name for host header override");
+
+        assert_eq!(
+            name, "backend_https_origin_example_com_443_oh_www_example_com_t15000",
+            "should match BackendConfig naming convention with host header override"
+        );
+    }
+
+    #[test]
     fn predict_name_includes_nocert_suffix_when_cert_check_disabled() {
         let backend = FastlyPlatformBackend;
         let spec = PlatformBackendSpec {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -665,6 +717,7 @@ mod tests {
             scheme: "https".to_string(),
             host: String::new(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -681,6 +734,7 @@ mod tests {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
         };
