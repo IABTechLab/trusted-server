@@ -35,19 +35,23 @@ render in Grafana. Tinybird is the always-on stateful aggregator that Compute
 cannot be. Ops and yield both land in Tinybird so there is a single store and a
 single Grafana datasource.
 
+Tinybird runs **self-managed** (`tb infra`), not Tinybird Cloud, to control
+cost (see Deployment below). The Events API and published pipe endpoints are
+served from our own cluster host, so the URLs differ from `api.tinybird.co`.
+
 ```
 edge (handle_auction)
   -> build event rows from OrchestrationResult (pure fn, off hot path)
   -> Fastly real-time log endpoint "ts_auction_events" (NDJSON, async batched)
-  -> Tinybird Events API  POST /v0/events?name=auction_events_raw
+  -> self-managed Tinybird Events API  POST https://<tb-host>/v0/events?name=auction_events_raw
   -> landing datasource (append-only, 30-day TTL)
   -> materialized views (per-minute rollups)
   -> published pipe endpoints
-  -> Grafana (Tinybird datasource)
+  -> Grafana (Tinybird datasource -> <tb-host>)
 
 edge (every request)
   -> Fastly real-time log endpoint "ts_access_logs" (one access line / request)
-  -> Tinybird Events API  POST /v0/events?name=access_logs_raw
+  -> self-managed Tinybird Events API  POST https://<tb-host>/v0/events?name=access_logs_raw
   -> rollups -> endpoints -> Grafana (ops panels)
 ```
 
@@ -61,6 +65,41 @@ edge (every request)
    longer.
 3. **Phase 1 ships ops and yield together** so the operations team and the
    revenue team both get visibility in the first release.
+4. **Tinybird is self-managed (`tb infra`)**, not Tinybird Cloud, to start, for
+   cost control. See Deployment.
+
+## Deployment: self-managed Tinybird
+
+Per the `tb infra` model
+(<https://www.tinybird.co/blog/tb-infra>), `tb infra` generates Kubernetes
+manifests for a containerized Tinybird that runs in our own AWS account. It
+deploys the OLAP database (ClickHouse), the ingestion APIs (Events API), an API
+gateway for published endpoints, and observability and backpressure components.
+Management still goes through `cloud.tinybird.co` by selecting the self-managed
+region, or by connecting the UI to the local image.
+
+Implications for this design:
+
+- **Hosts change.** Ingestion is `POST https://<tb-host>/v0/events?name=...` and
+  pipe endpoints are served from `<tb-host>`, where `<tb-host>` is our cluster's
+  gateway ingress, not `api.tinybird.co`. Auth is unchanged: Bearer tokens.
+- **Fastly must reach `<tb-host>`.** The cluster gateway needs a
+  publicly resolvable, TLS-terminated ingress so Fastly's HTTPS real-time log
+  sink can POST to it. Lock it down to token auth and, if possible, restrict
+  source ranges to Fastly.
+- **Single-node to start.** The current `tb infra` offering is single-node with
+  no HA, no S3-persistence optimization, and manual vertical scaling. That is
+  acceptable here because this pipeline is a non-critical, fire-and-forget
+  analytics sink: if Tinybird is down, Fastly real-time logging buffers and
+  then drops, auctions are unaffected, and we lose analytics for the outage
+  window only. It must never be on the auction request path.
+- **Sizing.** Plan reference is 4+ CPU / 16GB+ RAM / 100GB+ SSD, roughly
+  $150 to $600+ per month of infrastructure, traded against Tinybird Cloud's
+  usage-based pricing. Confirm the node size against expected ingest volume
+  (see Risks: log volume).
+- **Migration path.** Datasources, pipes, and endpoints are defined as code
+  (`.datasource` / `.pipe` files), so moving to multi-node self-managed or to
+  Tinybird Cloud later is a redeploy against a different host, not a rewrite.
 
 ## Components
 
@@ -155,7 +194,8 @@ for ops; the tradeoff (no POP-level analytics aggregates) was accepted.
 ### D. Grafana
 
 Tinybird Grafana datasource (or grafana-infinity against the published endpoint
-URLs with a read token) drives one dashboard with two rows:
+URLs with a read token), pointed at `<tb-host>`, drives one dashboard with two
+rows:
 
 - Ops: QPS, error-rate by status class, p50/p95/p99 endpoint latency, cache hit
   ratio.
@@ -176,9 +216,15 @@ URLs with a read token) drives one dashboard with two rows:
 
 ## Risks and notes
 
-- **Log volume.** Grain is N rows per auction (N = providers x responding
-  seats). At high QPS this multiplies ingest volume into Tinybird. The 30-day
-  raw TTL and rollup MVs bound storage; monitor ingest cost after launch.
+- **Log volume vs node size.** Grain is N rows per auction (N = providers x
+  responding seats). At high QPS this multiplies ingest volume into Tinybird,
+  and on single-node self-managed there is no autoscaling, so volume has to fit
+  the chosen node. The 30-day raw TTL and rollup MVs bound storage; size the
+  node against measured ingest and add a sampling knob on the ops access-log
+  stream if needed.
+- **Single-node availability.** Self-managed `tb infra` is single-node with no
+  HA today. A Tinybird outage loses analytics for the window only (Fastly
+  logging is fire-and-forget); it must never sit on the auction request path.
 - **Schema drift.** The edge NDJSON shape and the Tinybird datasource schema
   must stay in sync. Keep the Rust struct and the `.datasource` definition
   reviewed together; a malformed row is dropped by Tinybird, so add an ingest
@@ -186,6 +232,9 @@ URLs with a read token) drives one dashboard with two rows:
 - **Token handling.** The Tinybird ingest token is configured on the Fastly log
   endpoint (Authorization header), provisioned as a Fastly service resource, not
   committed to the repo.
+- **Ingress reachability.** Fastly's HTTPS log sink must reach `<tb-host>` over
+  public TLS, so the self-managed cluster needs a resolvable, TLS-terminated
+  gateway. Restrict it to token auth and, where feasible, Fastly source ranges.
 
 ## Out of scope
 
