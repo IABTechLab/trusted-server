@@ -31,13 +31,12 @@ use serde::Deserialize;
 use url::Url;
 use validator::{Validate, ValidationError};
 
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, collect_response_bounded, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
-    INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -882,8 +881,12 @@ impl IntegrationProxy for SourcepointIntegration {
             }
         }
 
-        let backend_name = BackendConfig::from_url(&self.config.cdn_origin, true)
-            .change_context(Self::error("Failed to configure Sourcepoint backend"))?;
+        let backend_name = ensure_integration_backend(
+            services,
+            &self.config.cdn_origin,
+            SOURCEPOINT_INTEGRATION_ID,
+            None,
+        )?;
 
         let mut response = services
             .http_client()
