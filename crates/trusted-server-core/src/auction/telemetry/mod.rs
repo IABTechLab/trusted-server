@@ -6,5 +6,6 @@
 pub mod types;
 
 pub use types::{
-    AuctionSource, EventKind, ProviderCallStatus, ProviderRole, TerminalStatus,
+    AuctionObservationContext, AuctionSource, EventKind, ProviderCallOutcome,
+    ProviderCallStatus, ProviderRole, TerminalOutcome, TerminalStatus,
 };
