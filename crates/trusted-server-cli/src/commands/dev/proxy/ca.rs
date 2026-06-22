@@ -96,7 +96,9 @@ impl CertAuthority {
             CertificateParams::from_ca_cert_pem(&cert_pem).change_context(CaError::Generate)?;
         let ca_cert_der = pem_to_cert_der(&cert_pem)?;
         // Reconstruct the Certificate struct so we can pass it as issuer to signed_by.
-        let ca_cert = ca_params.self_signed(&ca_key).change_context(CaError::Generate)?;
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .change_context(CaError::Generate)?;
 
         Ok(Self {
             ca_cert,
@@ -177,7 +179,9 @@ impl CertAuthority {
         let key = KeyPair::generate().change_context(CaError::Generate)?;
         let mut params =
             CertificateParams::new(Vec::<String>::new()).change_context(CaError::Generate)?;
-        params.distinguished_name.push(DnType::CommonName, CA_COMMON_NAME);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, CA_COMMON_NAME);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         // ~10 years from generation (spec §7.1); rotate via `ca regenerate`.
@@ -205,7 +209,9 @@ impl CertAuthority {
             .mode(0o600)
             .open(key_path)
             .change_context(CaError::Io)?;
-        key_file.write_all(key_pem.as_bytes()).change_context(CaError::Io)?;
+        key_file
+            .write_all(key_pem.as_bytes())
+            .change_context(CaError::Io)?;
         Ok(())
     }
 }

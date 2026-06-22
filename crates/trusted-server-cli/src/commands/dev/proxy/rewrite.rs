@@ -38,19 +38,27 @@ impl Authority {
         let (host, port) = match raw.rsplit_once(':') {
             Some((h, p)) => {
                 if p.is_empty() {
-                    return Err(RuleError::Port { value: raw.to_string() });
+                    return Err(RuleError::Port {
+                        value: raw.to_string(),
+                    });
                 }
-                let port = p
-                    .parse::<u16>()
-                    .map_err(|_| RuleError::Port { value: raw.to_string() })?;
+                let port = p.parse::<u16>().map_err(|_| RuleError::Port {
+                    value: raw.to_string(),
+                })?;
                 (h, port)
             }
             None => (raw, default_port),
         };
         if host.is_empty() {
-            return Err(RuleError::EmptyHost { value: raw.to_string() });
+            return Err(RuleError::EmptyHost {
+                value: raw.to_string(),
+            });
         }
-        Ok(Self { host: host.to_ascii_lowercase(), port, default_port })
+        Ok(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+            default_port,
+        })
     }
 
     /// The bare hostname (for SNI and connection target).
@@ -103,7 +111,9 @@ impl RuleTable {
             .rsplit_once(':')
             .map_or(host, |(h, _)| h)
             .to_ascii_lowercase();
-        self.0.iter().find(|r| r.from.to_ascii_lowercase() == needle)
+        self.0
+            .iter()
+            .find(|r| r.from.to_ascii_lowercase() == needle)
     }
 }
 
@@ -155,7 +165,11 @@ mod tests {
         assert_eq!(a.host(), "staging.example.net", "should keep host");
         assert_eq!(a.port, 443, "should default to 443 for TLS");
         assert!(a.is_default_port(), "443 is default for TLS");
-        assert_eq!(a.host_with_port(), "staging.example.net", "default port omitted");
+        assert_eq!(
+            a.host_with_port(),
+            "staging.example.net",
+            "default port omitted"
+        );
     }
 
     #[test]
@@ -171,7 +185,11 @@ mod tests {
         assert_eq!(a.port, 3000, "should parse explicit port");
         assert!(!a.is_default_port(), "3000 is not default");
         assert_eq!(a.host(), "localhost", "SNI host must exclude port");
-        assert_eq!(a.host_with_port(), "localhost:3000", "Host header includes non-default port");
+        assert_eq!(
+            a.host_with_port(),
+            "localhost:3000",
+            "Host header includes non-default port"
+        );
     }
 
     #[test]
@@ -179,19 +197,43 @@ mod tests {
         // TLS authority on :80 is NOT default — :80 must appear in Host.
         let tls_80 = Authority::parse("host.example.com:80", false).expect("parse");
         assert!(!tls_80.is_default_port(), "80 is not the TLS default");
-        assert_eq!(tls_80.host_with_port(), "host.example.com:80", "Host keeps :80 for TLS");
+        assert_eq!(
+            tls_80.host_with_port(),
+            "host.example.com:80",
+            "Host keeps :80 for TLS"
+        );
         // Plaintext authority on :443 is NOT default — :443 must appear in Host.
         let plain_443 = Authority::parse("host.example.com:443", true).expect("parse");
-        assert!(!plain_443.is_default_port(), "443 is not the plaintext default");
-        assert_eq!(plain_443.host_with_port(), "host.example.com:443", "Host keeps :443 for plaintext");
+        assert!(
+            !plain_443.is_default_port(),
+            "443 is not the plaintext default"
+        );
+        assert_eq!(
+            plain_443.host_with_port(),
+            "host.example.com:443",
+            "Host keeps :443 for plaintext"
+        );
     }
 
     #[test]
     fn matching_is_case_insensitive_and_port_stripped() {
-        let table = RuleTable(vec![rule("www.example-publisher.com", "to.edgecompute.app", true, false)]);
-        let m = table.first_match("WWW.Example-Publisher.COM:443").expect("should match");
-        assert_eq!(m.from, "www.example-publisher.com", "match ignores case and port");
-        assert!(table.first_match("other.example.com").is_none(), "unmatched host returns None");
+        let table = RuleTable(vec![rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app",
+            true,
+            false,
+        )]);
+        let m = table
+            .first_match("WWW.Example-Publisher.COM:443")
+            .expect("should match");
+        assert_eq!(
+            m.from, "www.example-publisher.com",
+            "match ignores case and port"
+        );
+        assert!(
+            table.first_match("other.example.com").is_none(),
+            "unmatched host returns None"
+        );
     }
 
     #[test]
@@ -200,16 +242,37 @@ mod tests {
             rule("a.example.com", "first.edgecompute.app", true, false),
             rule("a.example.com", "second.edgecompute.app", true, false),
         ]);
-        assert_eq!(table.first_match("a.example.com").expect("should match").to.host(), "first.edgecompute.app");
+        assert_eq!(
+            table
+                .first_match("a.example.com")
+                .expect("should match")
+                .to
+                .host(),
+            "first.edgecompute.app"
+        );
     }
 
     #[test]
     fn rewrite_default_preserves_from_host_and_sets_sni_to_to() {
-        let r = rule("www.example-publisher.com", "to.edgecompute.app:8443", true, false);
+        let r = rule(
+            "www.example-publisher.com",
+            "to.edgecompute.app:8443",
+            true,
+            false,
+        );
         let out = rewrite_for(&r);
-        assert_eq!(out.sni, "to.edgecompute.app", "SNI is TO host only, no port");
-        assert_eq!(out.host_header, "www.example-publisher.com", "default Host is FROM");
-        assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host is FROM");
+        assert_eq!(
+            out.sni, "to.edgecompute.app",
+            "SNI is TO host only, no port"
+        );
+        assert_eq!(
+            out.host_header, "www.example-publisher.com",
+            "default Host is FROM"
+        );
+        assert_eq!(
+            out.orig_host, "www.example-publisher.com",
+            "X-Orig-Host is FROM"
+        );
         assert!(out.scheme_is_tls, "TLS rule yields a TLS outcome");
     }
 
@@ -218,14 +281,24 @@ mod tests {
         let r = rule("www.example-publisher.com", "localhost:3000", false, true);
         let out = rewrite_for(&r);
         assert_eq!(out.sni, "localhost", "SNI never carries a port");
-        assert_eq!(out.host_header, "localhost:3000", "rewrite-host sends TO host:port");
-        assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host stays FROM");
-        assert!(!out.scheme_is_tls, "plaintext rule yields a non-TLS outcome");
+        assert_eq!(
+            out.host_header, "localhost:3000",
+            "rewrite-host sends TO host:port"
+        );
+        assert_eq!(
+            out.orig_host, "www.example-publisher.com",
+            "X-Orig-Host stays FROM"
+        );
+        assert!(
+            !out.scheme_is_tls,
+            "plaintext rule yields a non-TLS outcome"
+        );
     }
 
     #[test]
     fn rejects_empty_or_missing_port() {
-        let err = Authority::parse("host.example.com:", true).expect_err("should reject trailing colon");
+        let err =
+            Authority::parse("host.example.com:", true).expect_err("should reject trailing colon");
         assert!(
             matches!(err, RuleError::Port { .. }),
             "trailing colon should be a Port error, got: {err}"

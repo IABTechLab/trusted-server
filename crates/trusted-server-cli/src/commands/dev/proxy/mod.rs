@@ -119,7 +119,8 @@ pub enum CaCommand {
 pub fn run(args: ProxyArgs) -> Result<(), error_stack::Report<ProxyError>> {
     let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
     let ca = Arc::new(
-        ca::CertAuthority::load_or_generate(&cfg.ca_dir).change_context(ProxyError::CertAuthority)?,
+        ca::CertAuthority::load_or_generate(&cfg.ca_dir)
+            .change_context(ProxyError::CertAuthority)?,
     );
     // PAC generation arrives in Task 6; serve a DIRECT stub for now.
     let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");

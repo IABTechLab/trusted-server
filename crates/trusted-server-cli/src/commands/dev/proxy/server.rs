@@ -133,7 +133,11 @@ async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
-    Ok(RequestHead { method, target, raw: buf })
+    Ok(RequestHead {
+        method,
+        target,
+        raw: buf,
+    })
 }
 
 async fn handle_connection(

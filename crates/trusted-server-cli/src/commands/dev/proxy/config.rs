@@ -55,7 +55,10 @@ impl BasicAuth {
 
     fn parse(raw: &str) -> Result<Self, ConfigError> {
         let (user, pass) = raw.split_once(':').ok_or(ConfigError::BasicAuth)?;
-        Ok(Self { user: user.to_string(), pass: pass.to_string() })
+        Ok(Self {
+            user: user.to_string(),
+            pass: pass.to_string(),
+        })
     }
 }
 
@@ -84,7 +87,9 @@ impl Browser {
                 "chrome" => Ok(Self::Chrome),
                 "firefox" => Ok(Self::Firefox),
                 "safari" => Ok(Self::Safari),
-                other => Err(ConfigError::Browser { value: other.to_string() }),
+                other => Err(ConfigError::Browser {
+                    value: other.to_string(),
+                }),
             })
             .collect()
     }
@@ -122,7 +127,9 @@ fn default_ca_dir() -> PathBuf {
 /// subcommands work without a `--map`/`--to` (spec §4.2).
 #[must_use]
 pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
-    args.ca_dir.as_ref().map_or_else(default_ca_dir, PathBuf::from)
+    args.ca_dir
+        .as_ref()
+        .map_or_else(default_ca_dir, PathBuf::from)
 }
 
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
@@ -139,9 +146,19 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     Ok(RuleTable(rules))
 }
 
-fn make_rule(from: &str, to: &str, preserve_host: bool, plaintext: bool) -> Result<Rule, ConfigError> {
+fn make_rule(
+    from: &str,
+    to: &str,
+    preserve_host: bool,
+    plaintext: bool,
+) -> Result<Rule, ConfigError> {
     let to = Authority::parse(to, plaintext).map_err(|_| ConfigError::Rule)?;
-    Ok(Rule { from: from.to_ascii_lowercase(), to, preserve_host, plaintext })
+    Ok(Rule {
+        from: from.to_ascii_lowercase(),
+        to,
+        preserve_host,
+        plaintext,
+    })
 }
 
 /// Resolves arguments into a [`ResolvedConfig`].
@@ -159,13 +176,17 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
     let listen: SocketAddr = args
         .listen
         .parse()
-        .change_context_lazy(|| ConfigError::Listen { value: args.listen.clone() })?;
+        .change_context_lazy(|| ConfigError::Listen {
+            value: args.listen.clone(),
+        })?;
     let is_loopback = match listen.ip() {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     };
     if !is_loopback && !args.allow_non_loopback {
-        return Err(Report::new(ConfigError::NonLoopback { value: args.listen.clone() }));
+        return Err(Report::new(ConfigError::NonLoopback {
+            value: args.listen.clone(),
+        }));
     }
 
     let launch = match &args.launch {
@@ -221,7 +242,10 @@ mod tests {
         args.from = Some("www.example-publisher.com".into());
         args.to = Some("to.edgecompute.app".into());
         let cfg = resolve(&args).expect("should resolve");
-        let rule = cfg.rules.first_match("www.example-publisher.com").expect("rule present");
+        let rule = cfg
+            .rules
+            .first_match("www.example-publisher.com")
+            .expect("rule present");
         assert!(rule.preserve_host, "default preserves FROM host");
         assert_eq!(rule.to.host(), "to.edgecompute.app");
     }
@@ -252,7 +276,10 @@ mod tests {
         let mut args = base_args();
         args.map = vec!["a.example.com=b.edgecompute.app".into()];
         args.listen = "0.0.0.0:8080".into();
-        assert!(resolve(&args).is_err(), "non-loopback without flag is rejected");
+        assert!(
+            resolve(&args).is_err(),
+            "non-loopback without flag is rejected"
+        );
         args.allow_non_loopback = true;
         assert!(resolve(&args).is_ok(), "non-loopback allowed with flag");
     }
@@ -280,7 +307,10 @@ mod tests {
             Browser::parse_list("firefox,chrome").expect("parses"),
             vec![Browser::Firefox, Browser::Chrome]
         );
-        assert!(Browser::parse_list("netscape").is_err(), "unknown browser errors");
+        assert!(
+            Browser::parse_list("netscape").is_err(),
+            "unknown browser errors"
+        );
     }
 
     #[test]

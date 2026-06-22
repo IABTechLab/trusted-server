@@ -244,7 +244,10 @@ pub async fn spawn_proxy_as_non_loopback(
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("should bind proxy listener on loopback");
-    let real_port = listener.local_addr().expect("should read proxy addr").port();
+    let real_port = listener
+        .local_addr()
+        .expect("should read proxy addr")
+        .port();
     // Override listen so is_loopback computed in serve_on is false.
     cfg.listen = format!("0.0.0.0:{real_port}")
         .parse()
