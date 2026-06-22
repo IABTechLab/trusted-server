@@ -890,9 +890,16 @@ impl AuctionOrchestrator {
                     break;
                 }
             };
-            remaining = select_result.remaining;
+            // Destructure so transport failures can be attributed to a provider
+            // via `failed_backend_name`, mirroring run_providers_parallel.
+            let crate::platform::PlatformSelectResult {
+                ready,
+                remaining: new_remaining,
+                failed_backend_name,
+            } = select_result;
+            remaining = new_remaining;
 
-            match select_result.ready {
+            match ready {
                 Ok(platform_response) => {
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
                     if let Some((provider_name, start_time, provider)) =
@@ -920,8 +927,14 @@ impl AuctionOrchestrator {
                             }
                             Err(e) => {
                                 log::warn!("Provider '{}' parse failed: {:?}", provider_name, e);
-                                responses
-                                    .push(AuctionResponse::error(&provider_name, response_time_ms));
+                                // Mirror the parallel path so a parse failure is
+                                // attributed (error_type + message) in provider_details.
+                                responses.push(provider_error_response(
+                                    &provider_name,
+                                    response_time_ms,
+                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    &e,
+                                ));
                             }
                         }
                     } else {
@@ -932,7 +945,32 @@ impl AuctionOrchestrator {
                     }
                 }
                 Err(e) => {
-                    log::warn!("A provider request failed during collection: {:?}", e);
+                    // Mirror the parallel path: attribute the transport failure to
+                    // the provider behind `failed_backend_name` so it appears in
+                    // provider_details instead of vanishing.
+                    if let Some(ref backend_name) = failed_backend_name {
+                        if let Some((provider_name, start_time, _)) =
+                            backend_to_provider.remove(backend_name)
+                        {
+                            let response_time_ms = start_time.elapsed().as_millis() as u64;
+                            log::warn!("Provider '{}' request failed: {:?}", provider_name, e);
+                            responses.push(provider_transport_failed_response(
+                                &provider_name,
+                                response_time_ms,
+                            ));
+                        } else {
+                            log::warn!(
+                                "A provider request failed (backend '{}' not tracked): {:?}",
+                                backend_name,
+                                e
+                            );
+                        }
+                    } else {
+                        log::warn!(
+                            "A provider request failed during collection (backend not identified): {:?}",
+                            e
+                        );
+                    }
                 }
             }
 

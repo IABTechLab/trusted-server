@@ -36,6 +36,48 @@ const ALLOWED_SLOT_FIELDS: &[&str] = &[
     "providers",
 ];
 
+/// Fields the runtime [`CreativeOpportunityFormat`] accepts.
+///
+/// Mirrors the struct's `#[serde(deny_unknown_fields)]`; the build path
+/// deserializes formats as raw JSON, so a typo like `mediatype` (for
+/// `media_type`) would otherwise embed and fail runtime settings load.
+///
+/// [`CreativeOpportunityFormat`]: crate::creative_opportunities::CreativeOpportunityFormat
+const ALLOWED_FORMAT_FIELDS: &[&str] = &["width", "height", "media_type"];
+
+/// Provider keys the runtime [`SlotProviders`] accepts.
+///
+/// [`SlotProviders`]: crate::creative_opportunities::SlotProviders
+const ALLOWED_PROVIDER_FIELDS: &[&str] = &["aps", "prebid"];
+
+/// Fields the runtime [`ApsSlotParams`] accepts.
+///
+/// [`ApsSlotParams`]: crate::creative_opportunities::ApsSlotParams
+const ALLOWED_APS_FIELDS: &[&str] = &["slot_id"];
+
+/// Fields the runtime [`PrebidSlotParams`] accepts.
+///
+/// [`PrebidSlotParams`]: crate::creative_opportunities::PrebidSlotParams
+const ALLOWED_PREBID_FIELDS: &[&str] = &["bidders"];
+
+/// Rejects any key in `object` that is not in `allowed`, mirroring the runtime
+/// struct's `#[serde(deny_unknown_fields)]`.
+///
+/// `context` names the offending object in the error (e.g. `` slot `atf`
+/// format ``) so a build failure points at the exact config location.
+fn reject_unknown_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{context} has unknown field '{key}'"));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that `value` is a `price_granularity` the runtime can deserialize.
 ///
 /// The build context types `price_granularity` as a `String`, so an invalid
@@ -114,10 +156,58 @@ pub(crate) fn validate_creative_slot(
     // `#[serde(deny_unknown_fields)]`. The raw-JSON build path would otherwise
     // accept env-injected typos that the runtime rejects at settings load.
     if let Some(object) = slot.as_object() {
-        for key in object.keys() {
-            if !ALLOWED_SLOT_FIELDS.contains(&key.as_str()) {
-                return Err(format!("slot `{id}` has unknown field '{key}'"));
+        reject_unknown_keys(object, ALLOWED_SLOT_FIELDS, &format!("slot `{id}`"))?;
+    }
+
+    // Reject nested unknown/mistyped fields too. The runtime's typed structs are
+    // all `#[serde(deny_unknown_fields)]`, but the raw-JSON build path bypasses
+    // those checks, so a config like `formats=[{width,height,mediatype}]` or
+    // `providers={aps={slotId}}` would otherwise pass the build and fail runtime
+    // settings load.
+    if let Some(formats) = slot.get("formats").and_then(serde_json::Value::as_array) {
+        for format in formats {
+            if let Some(object) = format.as_object() {
+                reject_unknown_keys(
+                    object,
+                    ALLOWED_FORMAT_FIELDS,
+                    &format!("slot `{id}` format"),
+                )?;
             }
+        }
+    }
+    if let Some(providers) = slot.get("providers").and_then(serde_json::Value::as_object) {
+        reject_unknown_keys(
+            providers,
+            ALLOWED_PROVIDER_FIELDS,
+            &format!("slot `{id}` providers"),
+        )?;
+        if let Some(aps) = providers.get("aps").and_then(serde_json::Value::as_object) {
+            reject_unknown_keys(
+                aps,
+                ALLOWED_APS_FIELDS,
+                &format!("slot `{id}` providers.aps"),
+            )?;
+        }
+        if let Some(prebid) = providers
+            .get("prebid")
+            .and_then(serde_json::Value::as_object)
+        {
+            reject_unknown_keys(
+                prebid,
+                ALLOWED_PREBID_FIELDS,
+                &format!("slot `{id}` providers.prebid"),
+            )?;
+        }
+    }
+
+    // An explicit empty/whitespace `div_id` override is rejected, mirroring
+    // `CreativeOpportunitySlot::validate_runtime`: the injected JS resolves slots
+    // with `candidate.id.startsWith(slot.div_id)`, and every element id starts
+    // with the empty string, so an empty override would bind the slot to the
+    // first id-bearing element in the document.
+    if let Some(div_id) = slot.get("div_id").and_then(serde_json::Value::as_str) {
+        if div_id.trim().is_empty() {
+            return Err(format!("slot `{id}` div_id override must not be empty"));
         }
     }
 
@@ -341,6 +431,96 @@ mod tests {
         let err = validate_creative_slot(&slot, "123456789")
             .expect_err("blank GAM unit path must fail at build time");
         assert!(err.contains("GAM unit path"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_blank_div_id_override() {
+        // An empty div_id override binds the slot to the first id-bearing
+        // element at runtime, so validate_runtime rejects it — the build must
+        // too, or a CI-green config fails settings load on the deployed service.
+        let slot = json!({
+            "id": "atf",
+            "div_id": "  ",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("blank div_id override must fail at build time");
+        assert!(
+            err.contains("div_id override must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_format_field() {
+        // `mediatype` is a typo for `media_type`; the runtime format struct is
+        // deny_unknown_fields, so the build must reject it.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250, "mediatype": "banner" }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("unknown format field must fail at build time");
+        assert!(err.contains("unknown field 'mediatype'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_provider_field() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "providers": { "appnexus": {} }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("unknown provider field must fail at build time");
+        assert!(err.contains("unknown field 'appnexus'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_aps_field() {
+        // `slotId` is a typo for `slot_id`.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "providers": { "aps": { "slotId": "abc" } }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("unknown aps field must fail at build time");
+        assert!(err.contains("unknown field 'slotId'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_prebid_field() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "providers": { "prebid": { "bidder": {} } }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("unknown prebid field must fail at build time");
+        assert!(err.contains("unknown field 'bidder'"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_well_formed_nested_provider_config() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250, "media_type": "banner" }],
+            "providers": {
+                "aps": { "slot_id": "abc" },
+                "prebid": { "bidders": {} }
+            }
+        });
+        assert!(
+            validate_creative_slot(&slot, "123456789").is_ok(),
+            "well-formed nested provider config must be accepted"
+        );
     }
 
     #[test]

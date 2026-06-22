@@ -661,8 +661,15 @@ export function installSpaAuctionHook(): void {
   ts.spaHookInstalled = true;
 
   let inflight: AbortController | null = null;
+  // Last path an auction was run for. popstate fires for hash-only and
+  // same-pathname back/forward (scroll restoration), and pushState/replaceState
+  // can be called with the current URL, so guard every entry point against
+  // re-requesting impressions for a path we already loaded.
+  let currentPath = location.pathname;
 
   async function onNavigate(path: string): Promise<void> {
+    if (path === currentPath) return;
+    currentPath = path;
     inflight?.abort();
     const controller = new AbortController();
     inflight = controller;
@@ -696,12 +703,10 @@ export function installSpaAuctionHook(): void {
   function patchHistoryMethod(method: 'pushState' | 'replaceState'): void {
     const original = history[method].bind(history);
     history[method] = function (state: unknown, unused: string, url?: string | URL | null): void {
-      const prevPath = location.pathname;
       original(state, unused, url);
       const newPath = url ? new URL(String(url), location.href).pathname : location.pathname;
-      if (newPath !== prevPath) {
-        void onNavigate(newPath);
-      }
+      // onNavigate no-ops when newPath equals the last loaded path.
+      void onNavigate(newPath);
     };
   }
 

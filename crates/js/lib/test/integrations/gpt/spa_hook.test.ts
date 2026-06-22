@@ -21,6 +21,12 @@ async function flushAsync(): Promise<void> {
 
 describe('installSpaAuctionHook', () => {
   let fetchStub: ReturnType<typeof vi.fn>;
+  // popstate listeners registered by each module import. In production the hook
+  // installs once (guarded by `ts.spaHookInstalled`), but tests wipe
+  // `window.tsjs` and re-import per test, so without explicit removal the
+  // listeners accumulate on the shared window and all fire on every dispatch.
+  let popstateHandlers: EventListenerOrEventListenerObject[] = [];
+  const realAddEventListener = window.addEventListener.bind(window);
 
   beforeEach(() => {
     vi.resetModules();
@@ -31,6 +37,11 @@ describe('installSpaAuctionHook', () => {
     history.replaceState = originalReplaceState;
     fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
+    popstateHandlers = [];
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
+      if (type === 'popstate' && listener) popstateHandlers.push(listener);
+      return realAddEventListener(type, listener, options);
+    });
   });
 
   afterEach(() => {
@@ -40,6 +51,10 @@ describe('installSpaAuctionHook', () => {
     originalReplaceState({}, '', '/');
     // Drop any ad containers inserted by a test so DOM state does not leak.
     document.body.innerHTML = '';
+    // Remove this test's popstate listener(s) so they do not fire in later tests.
+    popstateHandlers.forEach((handler) => window.removeEventListener('popstate', handler));
+    popstateHandlers = [];
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -155,7 +170,7 @@ describe('installSpaAuctionHook', () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
-  it('fetches on replaceState and popstate navigation', async () => {
+  it('fetches on replaceState navigation', async () => {
     fetchStub.mockResolvedValue({
       ok: true,
       json: async () => ({ slots: [], bids: {} }),
@@ -168,13 +183,42 @@ describe('installSpaAuctionHook', () => {
       '/__ts/page-bids?path=%2Freplaced',
       expect.objectContaining({ credentials: 'include' })
     );
+  });
 
+  it('fetches on popstate navigation to a new path', async () => {
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    await importGptModule();
+
+    // Browsers change the URL out-of-band on back/forward, then fire popstate.
+    // Use the unwrapped history method so the patched handler is not invoked.
+    originalReplaceState({}, '', '/popped');
     window.dispatchEvent(new PopStateEvent('popstate'));
     await flushAsync();
-    expect(fetchStub).toHaveBeenLastCalledWith(
-      '/__ts/page-bids?path=%2Freplaced',
+    expect(fetchStub).toHaveBeenCalledWith(
+      '/__ts/page-bids?path=%2Fpopped',
       expect.objectContaining({ credentials: 'include' })
     );
+  });
+
+  it('does not re-fetch on popstate to the same path', async () => {
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    await importGptModule();
+
+    history.replaceState({}, '', '/replaced');
+    await flushAsync();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+
+    // popstate on the same path (hash-only change or scroll-restoration
+    // back/forward) must not re-request impressions.
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await flushAsync();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
   });
 
   it('drops a stale response that resolves after a newer navigation started', async () => {

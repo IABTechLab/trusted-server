@@ -1036,12 +1036,6 @@ pub struct AuctionDispatch<'a> {
 ///
 /// Returns a [`TrustedServerError`] if the proxy request fails or the
 /// origin backend is unreachable.
-///
-/// # Panics
-///
-/// Panics if `should_run_auction` is `true` but `settings.creative_opportunities` is `None`.
-/// This is a logic invariant: `should_run_auction` is only set when creative opportunities
-/// are configured, so this state is unreachable in practice.
 pub async fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
@@ -1679,11 +1673,6 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
     matches!(encoding, "" | "identity" | "gzip" | "deflate" | "br")
 }
 
-/// Normalizes the client-supplied `path` query parameter before glob matching.
-///
-/// The SPA hook sends `location.pathname`, but the parameter is
-/// client-controlled: strip any query string or fragment and force a leading
-/// `/` so slot `page_patterns` always match against a canonical path shape.
 /// Same-origin gate for `/__ts/page-bids`.
 ///
 /// The endpoint is a side-effecting GET: it dispatches real PBS/APS auctions
@@ -1713,6 +1702,11 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
     }
 }
 
+/// Normalizes the client-supplied `path` query parameter before glob matching.
+///
+/// The SPA hook sends `location.pathname`, but the parameter is
+/// client-controlled: strip any query string or fragment and force a leading
+/// `/` so slot `page_patterns` always match against a canonical path shape.
 fn normalize_page_bids_path(raw: &str) -> String {
     let path = raw.split(['?', '#']).next().unwrap_or("");
     if path.starts_with('/') {

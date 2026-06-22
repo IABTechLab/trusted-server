@@ -222,9 +222,22 @@ impl CreativeOpportunitySlot {
             .page_patterns
             .iter()
             .filter_map(|pattern| {
-                Pattern::new(pattern)
-                    .or_else(|_| Pattern::new(&pattern.replace("**", "*")))
-                    .ok()
+                match Pattern::new(pattern).or_else(|_| Pattern::new(&pattern.replace("**", "*"))) {
+                    Ok(compiled) => Some(compiled),
+                    Err(_) => {
+                        // Build-time validation only requires *one* valid pattern
+                        // per slot, so a mixed valid/invalid set passes the build
+                        // with the bad pattern silently dropped here. Warn so the
+                        // operator can see the slot matches fewer pages than
+                        // configured.
+                        log::warn!(
+                            "slot `{}`: dropping page pattern '{}' — it does not compile as a glob",
+                            self.id,
+                            pattern
+                        );
+                        None
+                    }
+                }
             })
             .collect();
     }
@@ -370,6 +383,11 @@ pub struct PrebidSlotParams {
     ///
     /// Leave empty (or omit `bidders` in config) to auto-expand all
     /// `config.bidders` with zone-aware param overrides.
+    ///
+    /// Note: when this map is non-empty it is forwarded verbatim, so a slot's
+    /// `targeting.zone` is **not** injected for these bidders (the `trustedServer`
+    /// expansion key that carries it is only added when `bidders` is empty). Set
+    /// explicit per-bidder params only when you do not need zone-aware overrides.
     #[serde(default)]
     pub bidders: HashMap<String, serde_json::Value>,
 }

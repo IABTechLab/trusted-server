@@ -477,9 +477,12 @@ impl IntegrationHeadInjector for GptIntegration {
     /// Prebid Universal Creative request proves the TS creative rendered.
     /// It does **not** trigger refresh auctions or handle GPT slot refresh events.
     ///
-    /// Post-`window.load`, slim-Prebid takes over: it listens for GPT refresh
-    /// events, runs client-side auctions, and sets targeting for subsequent
-    /// impressions. SPA pushState navigation is also slim-Prebid's domain.
+    /// Post-`window.load`, slim-Prebid owns scroll and GPT refresh: it listens
+    /// for GPT refresh events, runs client-side auctions, and sets targeting for
+    /// subsequent impressions. SPA navigation is handled separately by
+    /// `installSpaAuctionHook()` in the GPT bundle, which re-runs the server-side
+    /// auction via `GET /__ts/page-bids` on pushState / replaceState / popstate
+    /// route changes (see `auction/endpoints.rs`).
     /// The `POST /auction` endpoint is not involved in scroll or refresh flows.
     fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
         let mut scripts = vec![
@@ -490,9 +493,14 @@ impl IntegrationHeadInjector for GptIntegration {
         ];
 
         if let Some(ref url) = self.config.slim_prebid_url {
+            // JSON-encode the URL, then escape `</` so a configured value
+            // containing the literal `</script>` cannot close this inline tag and
+            // let trailing markup execute (standard JSON-in-HTML mitigation).
+            let encoded = serde_json::to_string(url)
+                .expect("should serialize string")
+                .replace("</", "<\\/");
             scripts.push(format!(
-                "<script>window.__tsjs_slim_prebid_url={};</script>",
-                serde_json::to_string(url).expect("should serialize string")
+                "<script>window.__tsjs_slim_prebid_url={encoded};</script>"
             ));
         }
 
@@ -1295,6 +1303,44 @@ mod tests {
             inserts[2],
             r#"<script>window.__tsjs_slim_prebid_url="https://cdn.example.com/tsjs-prebid.min.js";</script>"#,
             "should emit the slim-Prebid URL as a JSON-encoded string assignment"
+        );
+    }
+
+    #[test]
+    fn head_inserts_escapes_script_terminator_in_slim_prebid_url() {
+        // A configured URL containing `</script>` must not close the inline tag.
+        let config = GptConfig {
+            slim_prebid_url: Some("https://cdn.example.com/x</script><img src=x>".to_string()),
+            ..test_config()
+        };
+        let integration = GptIntegration::new(config);
+        let doc_state = IntegrationDocumentState::default();
+        let ctx = IntegrationHtmlContext {
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "example.com",
+            document_state: &doc_state,
+        };
+
+        let inserts = integration.head_inserts(&ctx);
+
+        // The injected `</script><img ...>` must be neutralised: the only
+        // `</script>` left is the tag's own legitimate closer.
+        assert!(
+            !inserts[2].contains("</script><img"),
+            "should escape the injected </script> terminator, got: {}",
+            inserts[2]
+        );
+        assert_eq!(
+            inserts[2].matches("</script>").count(),
+            1,
+            "only the tag's own closing </script> should remain, got: {}",
+            inserts[2]
+        );
+        assert!(
+            inserts[2].contains("<\\/script>"),
+            "should emit the escaped terminator, got: {}",
+            inserts[2]
         );
     }
 

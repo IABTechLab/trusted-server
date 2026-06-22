@@ -113,9 +113,10 @@
         // Keep in sync with TS_INITIAL_TARGETING_KEY in index.ts
         s.setTargeting("ts_initial", "1");
         // Map both the inner div and the GPT slot's element ID (the
-        // "-container" div when TS defined the slot there) so slotRenderEnded
-        // — which reports the GPT slot element ID — can find the slot for
-        // nurl/burl beacon firing.
+        // "-container" div when TS defined the slot there) into divToSlotId.
+        // This bootstrap fires no beacons and registers no slotRenderEnded
+        // listener; the map is consumed by the bundle's render bridge (index.ts)
+        // once it loads, which reports the GPT slot element ID.
         divToSlotId[actualDivId] = slot.id;
         var slotElementId = s.getSlotElementId();
         if (slotElementId && slotElementId !== actualDivId) {

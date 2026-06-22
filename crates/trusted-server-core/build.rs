@@ -3,18 +3,12 @@
 // in the build context, so `dead_code` is expected.
 #![allow(clippy::unwrap_used, clippy::panic, dead_code)]
 
-// Stub out dependencies for build.rs context
-mod glob {
-    pub struct Pattern;
-    impl Pattern {
-        pub fn new(_: &str) -> Result<Self, String> {
-            Ok(Pattern)
-        }
-        pub fn matches(&self, _: &str) -> bool {
-            false
-        }
-    }
-}
+// `glob` is a real build-dependency (see Cargo.toml `[build-dependencies]`), so
+// `creative_slot_build_check::pattern_compiles` resolves `glob::Pattern::new`
+// against the actual glob crate. It must NOT be stubbed here: a stub that always
+// returned `Ok` would let an invalid env-injected pattern such as
+// `page_patterns = ["["]` pass the build-time check and embed into the config,
+// only to be dropped by the real glob crate at runtime settings load.
 
 #[path = "src/error.rs"]
 mod error;
