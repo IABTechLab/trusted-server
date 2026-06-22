@@ -5,6 +5,19 @@
 //! - Pluggable content processors (text replacement, HTML rewriting, etc.)
 //! - Memory-efficient streaming
 //! - UTF-8 boundary handling
+//!
+//! # Platform notes
+//!
+//! This module is **platform-agnostic** (verified 2026-03-31; see
+//! `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`). It has zero
+//! `fastly` imports. [`StreamingPipeline::process`] is generic over
+//! `R: Read + W: Write` — any reader or writer works, including
+//! any platform body type (which implements `std::io::Read`) or standard
+//! `std::io::Cursor<&[u8]>`.
+//!
+//! Future adapters (Cloudflare Workers, Axum, Spin) do not need to implement any compression or
+//! streaming interface. See `crate::platform` module doc for the
+//! authoritative note.
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};

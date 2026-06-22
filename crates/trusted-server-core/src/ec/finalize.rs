@@ -5,7 +5,8 @@
 
 use std::collections::HashSet;
 
-use fastly::Response;
+use edgezero_core::body::Body as EdgeBody;
+use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::settings::Settings;
@@ -44,7 +45,7 @@ pub fn ec_finalize_response(
     registry: &PartnerRegistry,
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
-    response: &mut Response,
+    response: &mut Response<EdgeBody>,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
@@ -110,7 +111,7 @@ pub fn ec_finalize_response(
 pub fn set_ec_cookie_on_response(
     settings: &Settings,
     ec_context: &EcContext,
-    response: &mut Response,
+    response: &mut Response<EdgeBody>,
 ) {
     if let Some(ec_id) = ec_context.ec_value() {
         set_ec_cookie(settings, response, ec_id);
@@ -122,14 +123,19 @@ pub fn set_ec_cookie_on_response(
 /// In addition to the fixed [`EC_RESPONSE_HEADERS`], this also strips dynamic
 /// `X-ts-<source_domain>` headers for registered partners. Other `x-ts-*`
 /// headers are intentionally preserved because they may be set by non-EC middleware.
-fn clear_ec_headers_on_response(response: &mut Response, registry: Option<&PartnerRegistry>) {
+fn clear_ec_headers_on_response(
+    response: &mut Response<EdgeBody>,
+    registry: Option<&PartnerRegistry>,
+) {
     for header in EC_RESPONSE_HEADERS {
-        response.remove_header(*header);
+        response.headers_mut().remove(*header);
     }
 
     if let Some(registry) = registry {
         for partner in registry.all() {
-            response.remove_header(partner_response_header(&partner.source_domain).as_str());
+            response
+                .headers_mut()
+                .remove(partner_response_header(&partner.source_domain).as_str());
         }
     }
 }
@@ -141,7 +147,7 @@ fn partner_response_header(source_domain: &str) -> String {
 /// Clears EC cookie and removes EC-specific response headers.
 ///
 /// Used when the request carries an explicit withdrawal signal.
-pub fn clear_ec_on_response(settings: &Settings, response: &mut Response) {
+pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBody>) {
     expire_ec_cookie(settings, response);
     clear_ec_headers_on_response(response, None);
 }
@@ -175,12 +181,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderValue;
+
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::create_test_settings;
+
+    fn empty_response() -> Response<EdgeBody> {
+        Response::builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build test response")
+    }
+
+    fn set_header(response: &mut Response<EdgeBody>, name: &str, value: &str) {
+        response.headers_mut().insert(
+            http::header::HeaderName::from_bytes(name.as_bytes())
+                .expect("should parse header name"),
+            HeaderValue::from_str(value).expect("should parse header value"),
+        );
+    }
+
+    fn get_header<'a>(response: &'a Response<EdgeBody>, name: &str) -> Option<&'a HeaderValue> {
+        response.headers().get(name)
+    }
+
+    fn get_header_str<'a>(response: &'a Response<EdgeBody>, name: &str) -> Option<&'a str> {
+        response.headers().get(name).and_then(|v| v.to_str().ok())
+    }
 
     fn make_context(
         ec_value: Option<&str>,
@@ -328,29 +359,28 @@ mod tests {
     #[test]
     fn clear_ec_on_response_removes_headers_and_expires_cookie() {
         let settings = create_test_settings();
-        let mut response = Response::new();
-        response.set_header("x-ts-ec", "abc");
-        response.set_header("x-ts-eids", "[]");
-        response.set_header("x-ts-unrelated", "keep-me");
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "abc");
+        set_header(&mut response, "x-ts-eids", "[]");
+        set_header(&mut response, "x-ts-unrelated", "keep-me");
 
         clear_ec_on_response(&settings, &mut response);
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "should remove x-ts-ec"
         );
         assert!(
-            response.get_header("x-ts-eids").is_none(),
+            get_header(&response, "x-ts-eids").is_none(),
             "should remove x-ts-eids"
         );
         assert_eq!(
-            response.get_header_str("x-ts-unrelated"),
+            get_header_str(&response, "x-ts-unrelated"),
             Some("keep-me"),
             "should preserve unrelated x-ts headers without a partner registry"
         );
 
-        let set_cookie = response
-            .get_header("set-cookie")
+        let set_cookie = get_header(&response, "set-cookie")
             .expect("should append Set-Cookie for expiry")
             .to_str()
             .expect("should render set-cookie as utf-8");
@@ -373,11 +403,11 @@ mod tests {
         };
         let ec_context =
             make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent);
-        let mut response = Response::new();
-        response.set_header("x-ts-ec", "stale");
-        response.set_header("x-ts-eids", "[]");
-        response.set_header("x-ts-ssp.example.com", "partner-uid-123");
-        response.set_header("x-ts-unrelated", "keep-me");
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "stale");
+        set_header(&mut response, "x-ts-eids", "[]");
+        set_header(&mut response, "x-ts-ssp.example.com", "partner-uid-123");
+        set_header(&mut response, "x-ts-unrelated", "keep-me");
 
         let partners = vec![make_partner("ssp.example.com")];
         let test_registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -392,24 +422,23 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "withdrawal should clear x-ts-ec header"
         );
         assert!(
-            response.get_header("x-ts-eids").is_none(),
+            get_header(&response, "x-ts-eids").is_none(),
             "withdrawal should clear x-ts-eids header"
         );
         assert!(
-            response.get_header("x-ts-ssp.example.com").is_none(),
+            get_header(&response, "x-ts-ssp.example.com").is_none(),
             "withdrawal should clear registered partner header"
         );
         assert_eq!(
-            response.get_header_str("x-ts-unrelated"),
+            get_header_str(&response, "x-ts-unrelated"),
             Some("keep-me"),
             "withdrawal should preserve unrelated x-ts header"
         );
-        let set_cookie = response
-            .get_header("set-cookie")
+        let set_cookie = get_header(&response, "set-cookie")
             .expect("withdrawal should expire cookie")
             .to_str()
             .expect("set-cookie should be utf-8");
@@ -431,7 +460,7 @@ mod tests {
             false,
             Jurisdiction::NonRegulated,
         );
-        let mut response = Response::new();
+        let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
         ec_finalize_response(
@@ -445,11 +474,11 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "returning user should not set x-ts-ec"
         );
         assert!(
-            response.get_header("set-cookie").is_none(),
+            get_header(&response, "set-cookie").is_none(),
             "returning user should not refresh or repair cookie"
         );
     }
@@ -465,7 +494,7 @@ mod tests {
             false,
             Jurisdiction::NonRegulated,
         );
-        let mut response = Response::new();
+        let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
         ec_finalize_response(
@@ -479,11 +508,11 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "returning user should not set x-ts-ec"
         );
         assert!(
-            response.get_header("set-cookie").is_none(),
+            get_header(&response, "set-cookie").is_none(),
             "returning user should not refresh cookie"
         );
     }
@@ -499,7 +528,7 @@ mod tests {
             true,
             Jurisdiction::NonRegulated,
         );
-        let mut response = Response::new();
+        let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
         ec_finalize_response(
@@ -513,11 +542,11 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "generated EC without KV should not set response header"
         );
         assert!(
-            response.get_header("set-cookie").is_none(),
+            get_header(&response, "set-cookie").is_none(),
             "generated EC without KV should not set cookie"
         );
     }
@@ -526,7 +555,7 @@ mod tests {
     fn finalize_denied_without_cookie_is_noop() {
         let settings = create_test_settings();
         let ec_context = make_context(None, None, false, false, Jurisdiction::Unknown);
-        let mut response = Response::new();
+        let mut response = empty_response();
 
         let test_registry = PartnerRegistry::empty();
         ec_finalize_response(
@@ -540,11 +569,11 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "should not set EC header"
         );
         assert!(
-            response.get_header("set-cookie").is_none(),
+            get_header(&response, "set-cookie").is_none(),
             "should not mutate cookie when there is nothing to revoke"
         );
     }
@@ -560,9 +589,9 @@ mod tests {
             false,
             Jurisdiction::Unknown,
         );
-        let mut response = Response::new();
-        response.set_header("x-ts-ec", &ec_id);
-        response.set_header("x-ts-eids", "[]");
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", &ec_id);
+        set_header(&mut response, "x-ts-eids", "[]");
 
         let test_registry = PartnerRegistry::empty();
         ec_finalize_response(
@@ -576,15 +605,15 @@ mod tests {
         );
 
         assert!(
-            response.get_header("x-ts-ec").is_none(),
+            get_header(&response, "x-ts-ec").is_none(),
             "should strip EC header when consent cannot be verified"
         );
         assert!(
-            response.get_header("x-ts-eids").is_none(),
+            get_header(&response, "x-ts-eids").is_none(),
             "should strip EID header when consent cannot be verified"
         );
         assert!(
-            response.get_header("set-cookie").is_none(),
+            get_header(&response, "set-cookie").is_none(),
             "should not expire the cookie without an explicit withdrawal signal"
         );
     }

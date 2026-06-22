@@ -24,6 +24,7 @@ use fastly::http::{Method, StatusCode};
 use fastly::{Request, Response};
 use trusted_server_core::platform::{PlatformError, PlatformSecretStore, StoreName};
 
+use crate::backend::BackendConfig;
 use crate::platform::FastlyPlatformSecretStore;
 
 const FASTLY_API_HOST: &str = "https://api.fastly.com";
@@ -122,8 +123,6 @@ impl FastlyManagementApiClient {
     /// be registered, or [`PlatformError::SecretStore`] if the API key cannot
     /// be read.
     pub(crate) fn new() -> Result<Self, Report<PlatformError>> {
-        use trusted_server_core::backend::BackendConfig;
-
         let backend_name = BackendConfig::from_url(FASTLY_API_HOST, true)
             .change_context(PlatformError::Backend)
             .attach("failed to register Fastly management API backend")?;
