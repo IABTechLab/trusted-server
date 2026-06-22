@@ -443,6 +443,51 @@ pub struct OwnedProcessResponseParams {
     pub(crate) price_granularity: PriceGranularity,
 }
 
+/// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
+/// byte limit would be exceeded.
+///
+/// Used to bound in-WASM-heap buffering of decoded/re-written publisher bodies.
+/// A highly-compressible origin response can sit under the platform raw-body cap
+/// yet expand past a safe heap size after decode and post-processing; this writer
+/// turns that into a recoverable error instead of an out-of-memory abort.
+pub struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    /// Creates a writer that accepts at most `limit` bytes before erroring.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Consumes the writer and returns the buffered bytes.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Stream the publisher response body through the processing pipeline.
 ///
 /// Called by the adapter after `stream_to_client()` has committed the response
@@ -1246,6 +1291,12 @@ pub async fn handle_publisher_request(
 
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
+    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
+    // origin. On the EdgeZero path the entry point re-injects this header from
+    // trusted Fastly TLS metadata so in-process scheme detection works; the
+    // legacy path never sets it. Either way it is an internal edge signal that
+    // must not leak to publisher backends.
+    req.headers_mut().remove("fastly-ssl");
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -2165,10 +2216,9 @@ mod tests {
             .header("cookie", format!("ts-ec={cookie_ec}; other=value"))
             .body(EdgeBody::empty())
             .expect("should build test request");
-        let fastly_req = crate::compat::to_fastly_request_ref(&req);
 
-        let ec_context =
-            EcContext::read_from_request(&settings, &fastly_req).expect("should read EC context");
+        let ec_context = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert_eq!(
             ec_context.ec_value(),
@@ -2196,9 +2246,8 @@ mod tests {
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
         let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
-        let fastly_req = crate::compat::to_fastly_request_ref(&req);
         let mut ec_context =
-            EcContext::read_from_request(settings, &fastly_req).expect("should read EC context");
+            EcContext::read_from_request(settings, &req, services).expect("should read EC context");
         handle_publisher_request(
             settings,
             integration_registry,
@@ -4094,8 +4143,7 @@ mod tests {
             slots: &[CreativeOpportunitySlot],
             req: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
-            let fastly_req = crate::compat::to_fastly_request_ref(&req);
-            let ec_context = EcContext::read_from_request(settings, &fastly_req)
+            let ec_context = EcContext::read_from_request(settings, &req, &noop_services())
                 .expect("should read EC context");
             run_page_bids_response_with_ec(settings, orchestrator, slots, &ec_context, req).await
         }

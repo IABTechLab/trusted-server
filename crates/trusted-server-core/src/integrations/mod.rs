@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use url::Url;
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformBackendSpec, RuntimeServices};
+use crate::platform::{PlatformBackendSpec, RuntimeServices, DEFAULT_FIRST_BYTE_TIMEOUT};
 use crate::settings::Settings;
 
 pub mod adserver_mock;
@@ -52,33 +52,106 @@ pub(crate) fn ensure_integration_backend(
     integration: &'static str,
     first_byte_timeout: Option<Duration>,
 ) -> Result<String, Report<TrustedServerError>> {
-    let parsed = Url::parse(url).change_context(TrustedServerError::Integration {
-        integration: integration.to_string(),
-        message: "Invalid upstream URL".to_string(),
-    })?;
-
     services
         .backend()
-        .ensure(&PlatformBackendSpec {
-            scheme: parsed.scheme().to_string(),
-            host: parsed
-                .host_str()
-                .ok_or_else(|| {
-                    Report::new(TrustedServerError::Integration {
-                        integration: integration.to_string(),
-                        message: "Upstream URL missing host".to_string(),
-                    })
-                })?
-                .to_string(),
-            port: parsed.port(),
-            host_header_override: None,
-            certificate_check: true,
-            first_byte_timeout: first_byte_timeout.unwrap_or_else(|| Duration::from_secs(15)),
-        })
+        .ensure(&integration_backend_spec(
+            url,
+            integration,
+            true,
+            first_byte_timeout.unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
+        )?)
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),
             message: "Failed to register backend".to_string(),
         })
+}
+
+/// Registers or retrieves a platform backend for the given URL with a custom
+/// first-byte timeout.
+///
+/// Parses `url`, builds a [`PlatformBackendSpec`] with TLS enabled and the
+/// given `first_byte_timeout`, and delegates to
+/// [`crate::platform::PlatformBackend::ensure`].
+///
+/// # Errors
+///
+/// Returns an error when `url` cannot be parsed, is missing a host, or the
+/// backend registration fails.
+pub(crate) fn ensure_integration_backend_with_timeout(
+    services: &RuntimeServices,
+    url: &str,
+    integration: &'static str,
+    first_byte_timeout: Duration,
+) -> Result<String, Report<TrustedServerError>> {
+    services
+        .backend()
+        .ensure(&integration_backend_spec(
+            url,
+            integration,
+            true,
+            first_byte_timeout,
+        )?)
+        .change_context(TrustedServerError::Integration {
+            integration: integration.to_string(),
+            message: "Failed to register backend".to_string(),
+        })
+}
+
+/// Compute the deterministic platform backend name for a URL without registering it.
+///
+/// Parses `url`, builds a [`PlatformBackendSpec`], and delegates to
+/// [`crate::platform::PlatformBackend::predict_name`].
+///
+/// # Errors
+///
+/// Returns an error when the URL cannot be parsed, is missing a host, or the
+/// platform backend cannot predict a name for the spec.
+pub(crate) fn predict_integration_backend_name(
+    services: &RuntimeServices,
+    url: &str,
+    integration: &'static str,
+    first_byte_timeout: Duration,
+) -> Result<String, Report<TrustedServerError>> {
+    services
+        .backend()
+        .predict_name(&integration_backend_spec(
+            url,
+            integration,
+            true,
+            first_byte_timeout,
+        )?)
+        .change_context(TrustedServerError::Integration {
+            integration: integration.to_string(),
+            message: "Failed to predict backend name".to_string(),
+        })
+}
+
+fn integration_backend_spec(
+    url: &str,
+    integration: &'static str,
+    certificate_check: bool,
+    first_byte_timeout: Duration,
+) -> Result<PlatformBackendSpec, Report<TrustedServerError>> {
+    let parsed = Url::parse(url).change_context(TrustedServerError::Integration {
+        integration: integration.to_string(),
+        message: format!("Invalid upstream URL: {url}"),
+    })?;
+    Ok(PlatformBackendSpec {
+        scheme: parsed.scheme().to_string(),
+        host: parsed
+            .host_str()
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::Integration {
+                    integration: integration.to_string(),
+                    message: "Upstream URL missing host".to_string(),
+                })
+            })?
+            .to_string(),
+        port: parsed.port(),
+        host_header_override: None,
+        certificate_check,
+        first_byte_timeout,
+    })
 }
 
 /// Maximum body size accepted by integration proxy endpoints (256 KiB).

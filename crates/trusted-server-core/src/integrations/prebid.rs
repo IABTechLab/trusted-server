@@ -16,15 +16,15 @@ use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
 };
-use crate::backend::BackendConfig;
 use crate::consent_config::ConsentForwardingMode;
 use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::http_util::RequestInfo;
 use crate::integrations::{
-    collect_response_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
+    collect_response_bounded, ensure_integration_backend_with_timeout,
+    predict_integration_backend_name, AttributeRewriteAction, IntegrationAttributeContext,
+    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
+    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
     UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
 use crate::openrtb::{
@@ -1649,12 +1649,21 @@ impl AuctionProvider for PrebidAuctionProvider {
         );
         *pbs_req.body_mut() = EdgeBody::from(pbs_body);
 
-        let backend_name = ensure_integration_backend(
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout in ensure_integration_backend, which is for proxy endpoints.
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = ensure_integration_backend_with_timeout(
             context.services,
             &self.config.server_url,
             "prebid",
-            Some(Duration::from_millis(u64::from(context.timeout_ms))),
-        )?;
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for Prebid Server endpoint: {}",
+                self.config.server_url
+            ),
+        })?;
         let pending = context
             .services
             .http_client()
@@ -1738,15 +1747,16 @@ impl AuctionProvider for PrebidAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        BackendConfig::backend_name_for_url(
+    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+        predict_integration_backend_name(
+            services,
             &self.config.server_url,
-            true,
+            PREBID_INTEGRATION_ID,
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {
             log::error!(
-                "Failed to create backend for Prebid server URL '{}': {e:?}",
+                "Failed to predict backend name for Prebid server URL '{}': {e:?}",
                 self.config.server_url
             );
         })
@@ -1805,7 +1815,13 @@ mod tests {
     use crate::integrations::{
         AttributeRewriteAction, IntegrationDocumentState, IntegrationRegistry,
     };
-    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::test_support::{
+        build_services_with_http_client, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
+        StubHttpClient,
+    };
+    use crate::platform::{
+        ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
+    };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
     use crate::test_support::tests::crate_test_settings_str;
@@ -1837,6 +1853,58 @@ mod tests {
             suppress_nurl: false,
             suppress_nurl_bidders: Vec::new(),
         }
+    }
+
+    struct PredictOnlyBackend;
+
+    impl PlatformBackend for PredictOnlyBackend {
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(format!(
+                "predicted_{}_{}_{}",
+                spec.scheme,
+                spec.host,
+                spec.first_byte_timeout.as_millis()
+            ))
+        }
+
+        fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            Ok("unused".to_string())
+        }
+    }
+
+    fn services_with_backend(backend: impl PlatformBackend + 'static) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(backend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo {
+                client_ip: None,
+                tls_protocol: None,
+                tls_cipher: None,
+                ..ClientInfo::default()
+            })
+            .build()
+    }
+
+    #[test]
+    fn prebid_backend_name_delegates_to_platform_backend_prediction() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let services = services_with_backend(PredictOnlyBackend);
+
+        let backend_name = provider
+            .backend_name(&services, 123)
+            .expect("should predict backend name through platform backend");
+
+        assert_eq!(
+            backend_name, "predicted_https_prebid.example_123",
+            "should use PlatformBackend::predict_name instead of duplicating the naming scheme"
+        );
     }
 
     fn create_test_auction_request() -> AuctionRequest {

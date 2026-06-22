@@ -551,7 +551,7 @@ mod tests {
             100
         }
 
-        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("panic-backend".to_string())
         }
     }
@@ -658,7 +658,7 @@ mod tests {
             100
         }
 
-        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("capture-backend".to_string())
         }
     }
@@ -1102,42 +1102,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn auction_rejects_oversized_body() {
-        use edgezero_core::body::Body as EdgeBody;
-        use http::{Method, Request as HttpRequest, StatusCode};
+    #[test]
+    fn auction_rejects_oversized_body() {
+        futures::executor::block_on(async {
+            use edgezero_core::body::Body as EdgeBody;
+            use http::{Method, Request as HttpRequest, StatusCode};
 
-        use crate::auction::build_orchestrator;
-        use crate::consent::ConsentContext;
-        use crate::ec::EcContext;
-        use crate::platform::test_support::noop_services;
-        use crate::test_support::tests::create_test_settings;
+            use crate::auction::build_orchestrator;
+            use crate::consent::ConsentContext;
+            use crate::ec::EcContext;
+            use crate::platform::test_support::noop_services;
+            use crate::test_support::tests::create_test_settings;
 
-        let settings = create_test_settings();
-        let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
-        let services = noop_services();
-        let ec_context = EcContext::new_for_test(None, ConsentContext::default());
-        let oversized = vec![b'x'; MAX_AUCTION_BODY_SIZE + 1];
-        let req = HttpRequest::builder()
-            .method(Method::POST)
-            .uri("https://test.com/auction")
-            .body(EdgeBody::from(oversized))
-            .expect("should build request");
-        let response = handle_auction(
-            &settings,
-            &orchestrator,
-            None,
-            None,
-            &ec_context,
-            &services,
-            req,
-        )
-        .await
-        .expect("should return 413 response for oversized body");
-        assert_eq!(
-            response.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "should return 413 for auction body over limit"
-        );
+            let settings = create_test_settings();
+            let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+            let services = noop_services();
+            let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+            let oversized = vec![b'x'; MAX_AUCTION_BODY_SIZE + 1];
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://test.com/auction")
+                .body(EdgeBody::from(oversized))
+                .expect("should build request");
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &ec_context,
+                &services,
+                req,
+            )
+            .await
+            .expect("should return 413 response for oversized body");
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "should return 413 for auction body over limit"
+            );
+        });
     }
 }

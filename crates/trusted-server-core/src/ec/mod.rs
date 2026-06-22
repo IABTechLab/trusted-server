@@ -58,16 +58,17 @@ pub fn log_id(ec_id: &str) -> String {
 }
 
 use cookie::CookieJar;
+use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use fastly::Request;
+use http::Request;
 
-use crate::compat;
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
 use crate::constants::COOKIE_TS_EC;
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
@@ -91,9 +92,8 @@ struct RequestEc {
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-fn parse_ec_from_request(req: &Request) -> Result<RequestEc, Report<TrustedServerError>> {
-    let http_req = compat::from_fastly_headers_ref(req);
-    let jar = handle_request_cookies(&http_req)?;
+fn parse_ec_from_request(req: &Request<EdgeBody>) -> Result<RequestEc, Report<TrustedServerError>> {
+    let jar = handle_request_cookies(req)?;
     let cookie_ec = jar
         .as_ref()
         .and_then(|j| j.get(COOKIE_TS_EC))
@@ -121,7 +121,7 @@ fn request_ec_id_if_allowed(value: &str, source: &str) -> Option<String> {
 /// # Errors
 ///
 /// - [`TrustedServerError::InvalidHeaderValue`] if cookie parsing fails
-pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<TrustedServerError>> {
+pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<TrustedServerError>> {
     let parsed = parse_ec_from_request(req)?;
     let ec_id = parsed.cookie_ec.filter(|v| is_valid_ec_id(v));
     if let Some(ref id) = ec_id {
@@ -135,7 +135,7 @@ pub fn get_ec_id(req: &fastly::Request) -> Result<Option<String>, Report<Trusted
 /// Created via [`read_from_request`](Self::read_from_request) during
 /// pre-routing, then optionally mutated by
 /// [`generate_if_needed`](Self::generate_if_needed) in organic handlers.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EcContext {
     /// The EC ID value, if one exists (from request) or was generated.
     ec_value: Option<String>,
@@ -175,9 +175,10 @@ impl EcContext {
     /// Returns an error if cookie parsing fails.
     pub fn read_from_request(
         settings: &Settings,
-        req: &Request,
+        req: &Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<Self, Report<TrustedServerError>> {
-        Self::read_from_request_with_geo(settings, req, None)
+        Self::read_from_request_with_geo(settings, req, services, None)
     }
 
     /// Reads EC state from an incoming request using pre-extracted geo data.
@@ -190,7 +191,8 @@ impl EcContext {
     /// Returns an error if cookie parsing fails.
     pub fn read_from_request_with_geo(
         settings: &Settings,
-        req: &Request,
+        req: &Request<EdgeBody>,
+        services: &RuntimeServices,
         geo_info: Option<&GeoInfo>,
     ) -> Result<Self, Report<TrustedServerError>> {
         let parsed = parse_ec_from_request(req)?;
@@ -202,16 +204,20 @@ impl EcContext {
             log::trace!("Existing EC ID found: {}", log_id(id));
         }
 
-        // Capture the client IP now — the request body may be consumed later.
-        let client_ip = generation::extract_client_ip(req).ok();
-        let http_req = compat::from_fastly_headers_ref(req);
+        // Capture the client IP from platform services (normalized).
+        let client_ip = services
+            .client_info()
+            .client_ip
+            .map(generation::normalize_ip);
 
         // Build consent context from request-local cookies, headers, and geo.
         let consent = consent_mod::build_consent_context(&ConsentPipelineInput {
             jar: parsed.jar.as_ref(),
-            req: &http_req,
+            req,
             config: &settings.consent,
             geo: geo_info,
+            ec_id: None,
+            kv_store: None,
         });
 
         log::info!(
@@ -482,18 +488,17 @@ pub(crate) fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::HeaderValue;
 
-    fn create_test_request(headers: &[(&str, &str)]) -> Request {
-        let mut req = Request::new("GET", "http://example.com");
+    fn create_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
+        let mut builder = Request::builder().method("GET").uri("http://example.com");
         for &(key, value) in headers {
-            req.set_header(
-                key,
-                HeaderValue::from_str(value).expect("should create valid header value"),
-            );
+            builder = builder.header(key, value);
         }
-        req
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build test request")
     }
 
     /// Creates a valid EC ID for testing: `{64hex}.{6alnum}`.
@@ -507,7 +512,8 @@ mod tests {
         let ec_id = valid_ec_id("a", "HdrEc1");
         let req = create_test_request(&[("x-ts-ec", &ec_id)]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert!(ec.ec_value().is_none(), "should ignore EC from header");
         assert!(!ec.ec_was_present(), "should not detect EC from header");
@@ -522,7 +528,8 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert_eq!(ec.ec_value(), Some(ec_id.as_str()));
         assert!(ec.ec_was_present(), "should detect EC from cookie");
@@ -538,7 +545,8 @@ mod tests {
         let cookie = format!("ts-ec={cookie_id}");
         let req = create_test_request(&[("x-ts-ec", &header_id), ("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert_eq!(
             ec.ec_value(),
@@ -553,7 +561,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert!(ec.ec_value().is_none(), "should have no EC value");
         assert!(!ec.ec_was_present(), "should not detect EC");
@@ -567,7 +576,8 @@ mod tests {
         let cookie = format!("ts-ec={cookie_id}");
         let req = create_test_request(&[("x-ts-ec", "malformed-header"), ("cookie", &cookie)]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert_eq!(
             ec.ec_value(),
@@ -582,7 +592,8 @@ mod tests {
         let settings = create_test_settings();
         let req = create_test_request(&[("x-ts-ec", "bad-header"), ("cookie", "ts-ec=bad-cookie")]);
 
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
 
         assert!(
             ec.ec_value().is_none(),
@@ -605,7 +616,8 @@ mod tests {
         let cookie = format!("ts-ec={ec_id}");
         let req = create_test_request(&[("cookie", &cookie)]);
 
-        let mut ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
         ec.generate_if_needed(&settings, None)
             .expect("should not error when EC already exists");
 
@@ -625,7 +637,8 @@ mod tests {
         let cookie_ec = valid_ec_id("e", "CkVal1");
         let cookie = format!("ts-ec={cookie_ec}");
         let req = create_test_request(&[("cookie", &cookie)]);
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
         assert_eq!(
             ec.existing_cookie_ec_id(),
             Some(cookie_ec.as_str()),
@@ -635,7 +648,8 @@ mod tests {
         // With only header (no cookie)
         let header_ec = valid_ec_id("f", "HdrVl1");
         let req = create_test_request(&[("x-ts-ec", &header_ec)]);
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
         assert!(
             ec.existing_cookie_ec_id().is_none(),
             "should return None when only header is present"
@@ -646,7 +660,8 @@ mod tests {
         let cookie_ec2 = valid_ec_id("b", "Ck0002");
         let cookie2 = format!("ts-ec={cookie_ec2}");
         let req = create_test_request(&[("x-ts-ec", &header_ec2), ("cookie", &cookie2)]);
-        let ec = EcContext::read_from_request(&settings, &req).expect("should read EC context");
+        let ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context");
         assert_eq!(
             ec.ec_value(),
             Some(cookie_ec2.as_str()),

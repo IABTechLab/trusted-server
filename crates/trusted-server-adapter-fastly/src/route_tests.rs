@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::compat;
 use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
@@ -14,7 +15,7 @@ use trusted_server_core::auction::{
     build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
     AuctionResponse,
 };
-use trusted_server_core::compat;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
@@ -626,7 +627,6 @@ fn route_result_to_fastly_response(
     super::finalize_response(settings, geo_info.as_ref(), &mut response);
     asset_cache_policy.apply_after_route_finalization(&mut response);
 
-    let mut fastly_response = compat::to_fastly_response(response);
     if should_finalize_ec {
         ec_finalize_response(
             settings,
@@ -635,15 +635,23 @@ fn route_result_to_fastly_response(
             partner_registry,
             eids_cookie.as_deref(),
             sharedid_cookie.as_deref(),
-            &mut fastly_response,
+            &mut response,
         );
     }
-    // Mirror main's ordering: apply request-filter response effects (which may
-    // append a per-user Set-Cookie) before the final cache guard so the guard
-    // observes them.
-    request_filter_effects.apply_to_fastly_response(&mut fastly_response);
+    // Apply request-filter response effects (which may append a per-user
+    // Set-Cookie) before the final cache guard so the guard observes them.
+    request_filter_effects.apply_to_response(&mut response);
+    let mut fastly_response = compat::to_fastly_response(response);
     super::enforce_set_cookie_cache_privacy(&mut fastly_response);
     fastly_response
+}
+
+fn browser_device_signals() -> DeviceSignals {
+    DeviceSignals::derive(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+        Some("t13d1516h2_000000000000_000000000000"),
+        None,
+    )
 }
 
 fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
@@ -682,6 +690,7 @@ fn route_auction_with_stack(
         &services,
         &[],
         compat::from_fastly_request(req),
+        browser_device_signals(),
     ))
     .expect("should route auction request");
     route_result_to_fastly_response(settings, &services, &partner_registry, route_result)
@@ -706,6 +715,7 @@ fn route_buffered_response(
         services,
         &[],
         compat::from_fastly_request(req),
+        browser_device_signals(),
     ))
     .expect(expect_message);
     route_result_to_fastly_response(settings, services, &partner_registry, route_result)
@@ -1030,6 +1040,7 @@ fn routes_use_request_local_consent() {
         &discovery_services,
         &[],
         compat::from_fastly_request(discovery_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route discovery request");
     assert_eq!(
@@ -1048,6 +1059,7 @@ fn routes_use_request_local_consent() {
         &admin_services,
         &[],
         compat::from_fastly_request(admin_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route admin request");
     assert_eq!(
@@ -1267,6 +1279,7 @@ fn asset_routes_stream_asset_responses_directly() {
         &services,
         &[],
         req,
+        browser_device_signals(),
     ))
     .expect("should route streaming asset request");
 
@@ -1580,14 +1593,12 @@ fn request_filter_set_cookie_after_guard_still_downgrades_cache() {
     // downgraded once the filter cookie is present.
     use trusted_server_core::integrations::{HeaderMutation, RequestFilterEffects};
 
-    let mut fastly_response = compat::to_fastly_response(
-        edge_response_builder()
-            .status(StatusCode::OK)
-            .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .header("surrogate-control", "max-age=86400")
-            .body(EdgeBody::empty())
-            .expect("should build test response"),
-    );
+    let mut edge_response = edge_response_builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header("surrogate-control", "max-age=86400")
+        .body(EdgeBody::empty())
+        .expect("should build test response");
 
     let effects = RequestFilterEffects {
         request_headers: vec![],
@@ -1598,7 +1609,8 @@ fn request_filter_set_cookie_after_guard_still_downgrades_cache() {
     };
 
     // Mirror main's ordering: apply effects first, then the guard.
-    effects.apply_to_fastly_response(&mut fastly_response);
+    effects.apply_to_response(&mut edge_response);
+    let mut fastly_response = compat::to_fastly_response(edge_response);
     super::enforce_set_cookie_cache_privacy(&mut fastly_response);
 
     assert_eq!(

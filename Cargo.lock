@@ -750,7 +750,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=170b74b#170b74bd2c9933b7d561f7ccdb67c53b239e9527"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -771,7 +771,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=170b74b#170b74bd2c9933b7d561f7ccdb67c53b239e9527"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -799,7 +799,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=170b74b#170b74bd2c9933b7d561f7ccdb67c53b239e9527"
+source = "git+https://github.com/stackpop/edgezero?rev=38198f9839b70aef03ab971ae5876982773fc2a1#38198f9839b70aef03ab971ae5876982773fc2a1"
 dependencies = [
  "log",
  "proc-macro2",
@@ -2576,9 +2576,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -2692,6 +2692,7 @@ dependencies = [
  "serde_json",
  "toml",
  "trusted-server-core",
+ "url",
  "urlencoding",
 ]
 

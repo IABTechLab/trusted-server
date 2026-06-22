@@ -15,6 +15,11 @@ origin_url = "https://origin.test-publisher.com"
 # Optional: override outbound Host header while connecting to origin_url.
 # origin_host_header_override = "www.example.com"
 proxy_secret = "change-me-proxy-secret"
+# Maximum bytes buffered when a publisher response is post-processed in full (HTML
+# rewriting/injection) instead of streamed. Applies on both the legacy and EdgeZero paths.
+# Defaults to 16 MiB when omitted; responses exceeding the cap return 502 (proxy error).
+# Raise it for deployments serving larger publisher pages:
+# max_buffered_body_bytes = 16777216  # 16 MiB
 
 [ec]
 passphrase = "local-dev-passphrase-32-bytes-min"

@@ -627,7 +627,7 @@ pub(crate) fn build_services_with_secret_and_http_client(
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::DEFAULT_FIRST_BYTE_TIMEOUT;
+    use crate::platform::DEFAULT_FIRST_BYTE_TIMEOUT;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
 

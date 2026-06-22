@@ -23,7 +23,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 trusted-server-core = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 edgezero-core = { workspace = true, features = ["test-utils"] }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
