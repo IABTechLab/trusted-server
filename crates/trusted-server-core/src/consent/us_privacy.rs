@@ -14,7 +14,7 @@
 //!
 //! - [IAB US Privacy String specification](https://github.com/InteractiveAdvertisingBureau/USPrivacy/blob/master/CCPA/US%20Privacy%20String.md)
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 
 use super::types::{ConsentDecodeError, PrivacyFlag, UsPrivacy};
 
@@ -34,10 +34,10 @@ pub fn decode_us_privacy(s: &str) -> Result<UsPrivacy, Report<ConsentDecodeError
     }
 
     let version = match chars[0] {
-        '1' => 1u8,
+        '1' => 1_u8,
         other => {
             return Err(Report::new(ConsentDecodeError::InvalidUsPrivacy {
-                reason: format!("unsupported version '{}', expected '1'", other),
+                reason: format!("unsupported version '{other}', expected '1'"),
             }));
         }
     };

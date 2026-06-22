@@ -12,7 +12,7 @@ use testcontainers::{GenericImage, ImageExt as _};
 ///
 /// ```bash
 /// docker build -t test-wordpress:latest \
-///   crates/integration-tests/fixtures/frameworks/wordpress/
+///   crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 /// ```
 pub struct WordPress;
 

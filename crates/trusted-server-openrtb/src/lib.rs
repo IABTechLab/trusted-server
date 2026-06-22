@@ -2,14 +2,12 @@
 //!
 //! Types are generated from the IAB `OpenRTB` proto file via `prost-build`, then
 //! post-processed to add serde JSON support and `ext` fields. See
-//! `crates/openrtb/generate.sh` and the `openrtb-codegen` crate for the
+//! `crates/trusted-server-openrtb/generate.sh` and the `trusted-server-openrtb-codegen` crate for the
 //! generation pipeline.
-
-use serde::Serialize;
-use serde_json::{Map, Value};
-
-/// Convenience alias for a JSON object used in `OpenRTB` `ext` fields.
-pub type Object = Map<String, Value>;
+#![allow(
+    clippy::pub_use,
+    reason = "OpenRTB exposes generated nested proto types as a flat public API"
+)]
 
 /// Serde helper that serializes `Option<bool>` as `Option<i32>` (`1`/`0`).
 ///
@@ -17,35 +15,44 @@ pub type Object = Map<String, Value>;
 /// but the IAB proto file defines them as `bool`. This module bridges the gap
 /// so that the Rust types use `bool` while the JSON wire format uses integers.
 /// Deserialization accepts both forms for robustness.
-#[allow(clippy::missing_errors_doc)]
+#[allow(
+    clippy::missing_errors_doc,
+    reason = "serde helpers expose the signature required by serde"
+)]
 pub mod bool_as_int {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize as _, Deserializer, Serializer};
 
+    #[inline]
     pub fn serialize<S: Serializer>(
         value: &Option<bool>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         match value {
-            Some(true) => serializer.serialize_some(&1i32),
-            Some(false) => serializer.serialize_some(&0i32),
+            Some(true) => serializer.serialize_some(&1_i32),
+            Some(false) => serializer.serialize_some(&0_i32),
             None => serializer.serialize_none(),
         }
     }
 
+    #[inline]
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<bool>, D::Error> {
         let value = Option::<serde_json::Value>::deserialize(deserializer)?;
         match value {
-            Some(serde_json::Value::Bool(b)) => Ok(Some(b)),
-            Some(serde_json::Value::Number(n)) => Ok(Some(
-                n.as_i64()
-                    .map_or_else(|| n.as_f64().is_some_and(|f| f != 0.0), |i| i != 0),
-            )),
+            Some(serde_json::Value::Bool(boolean_value)) => Ok(Some(boolean_value)),
+            Some(serde_json::Value::Number(number)) => Ok(Some(number.as_i64().map_or_else(
+                || {
+                    number
+                        .as_f64()
+                        .is_some_and(|float_value| float_value != 0.0_f64)
+                },
+                |integer_value| integer_value != 0,
+            ))),
             // Some bidders send boolean-as-int fields as strings (e.g.
             // `"secure": "1"` instead of `"secure": 1`). Accept the common
             // string representations for robustness.
-            Some(serde_json::Value::String(ref s)) => match s.as_str() {
+            Some(serde_json::Value::String(string_value)) => match string_value.as_str() {
                 "1" | "true" => Ok(Some(true)),
                 "0" | "false" => Ok(Some(false)),
                 other => {
@@ -60,34 +67,38 @@ pub mod bool_as_int {
     }
 }
 
-/// Convert a serializable struct into an `Option<Object>` suitable for an
-/// `OpenRTB` `ext` field. Returns `None` when serialization produces an empty
-/// map (i.e. all fields were skipped), so that `ext` is omitted from the JSON
-/// output rather than emitting `"ext": {}`.
-///
-/// Types that need `to_ext()` must explicitly implement this trait (no blanket
-/// impl) to avoid polluting autocomplete on unrelated `Serialize` types.
-pub trait ToExt: Serialize {
-    /// Serialize `self` into an `OpenRTB` extension object.
-    fn to_ext(&self) -> Option<Object> {
-        match serde_json::to_value(self) {
-            Ok(Value::Object(map)) if !map.is_empty() => Some(map),
-            _ => None,
-        }
-    }
-}
-
-// Generated from proto/openrtb.proto. Regenerate with `./crates/openrtb/generate.sh`.
+// Generated from proto/openrtb.proto. Regenerate with `./crates/trusted-server-openrtb/generate.sh`.
 // Suppress clippy on generated code — doc comments and method signatures come
 // from prost codegen and are not worth hand-editing.
 #[allow(
     dead_code,
+    clippy::absolute_paths,
+    clippy::allow_attributes_without_reason,
     clippy::doc_markdown,
+    clippy::indexing_slicing,
     clippy::must_use_candidate,
+    clippy::pedantic,
+    clippy::restriction,
     clippy::return_self_not_must_use,
-    clippy::struct_excessive_bools
+    clippy::struct_excessive_bools,
+    reason = "generated OpenRTB bindings preserve prost-generated signatures and paths"
 )]
 mod generated;
+
+// Codegen module — included here only for testing; the same source is
+// `include!`'d by `crates/trusted-server-openrtb-codegen/src/main.rs` for the actual code generation.
+#[cfg(test)]
+#[allow(
+    clippy::arbitrary_source_item_ordering,
+    clippy::arithmetic_side_effects,
+    clippy::else_if_without_else,
+    clippy::format_push_string,
+    clippy::indexing_slicing,
+    clippy::min_ident_chars,
+    clippy::string_slice,
+    reason = "codegen is test-only text transformation logic for generated OpenRTB bindings"
+)]
+mod codegen;
 
 // Re-export nested types at crate root for flat, ergonomic access.
 // These correspond to the top-level OpenRTB 2.6 objects that are nested inside
@@ -130,15 +141,42 @@ pub use generated::bid_request::Video;
 pub use generated::bid_request::eid::Uid;
 pub use generated::bid_response::{Bid, SeatBid};
 
-// Codegen module — included here only for testing; the same source is
-// `include!`'d by `openrtb-codegen/src/main.rs` for the actual code generation.
-#[cfg(test)]
-mod codegen;
+/// Convenience alias for a JSON object used in `OpenRTB` `ext` fields.
+pub type Object = serde_json::Map<String, serde_json::Value>;
+
+/// Convert a serializable struct into an `Option<Object>` suitable for an
+/// `OpenRTB` `ext` field. Returns `None` when serialization produces an empty
+/// map (i.e. all fields were skipped), so that `ext` is omitted from the JSON
+/// output rather than emitting `"ext": {}`.
+///
+/// Types that need `to_ext()` must explicitly implement this trait (no blanket
+/// impl) to avoid polluting autocomplete on unrelated `Serialize` types.
+pub trait ToExt: serde::Serialize {
+    /// Serialize `self` into an `OpenRTB` extension object.
+    #[inline]
+    fn to_ext(&self) -> Option<Object> {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(map)) if !map.is_empty() => Some(map),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::BidRequest;
     use serde_json::json;
+
+    /// Helper struct to exercise `bool_as_int` through serde round-trips.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct BoolAsIntWrapper {
+        #[serde(
+            with = "crate::bool_as_int",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        flag: Option<bool>,
+    }
 
     #[test]
     fn preserves_openrtb_26_privacy_dooh_and_refresh_fields() {
@@ -148,30 +186,30 @@ mod tests {
                 {
                     "id": "imp-1",
                     "banner": {
-                        "w": 300,
-                        "h": 250
+                        "w": 300_i32,
+                        "h": 250_i32
                     },
                     "qty": {
-                        "multiplier": 14.2,
-                        "sourcetype": 1,
+                        "multiplier": 14.2_f64,
+                        "sourcetype": 1_i32,
                         "vendor": "measurement.example"
                     },
                     "dt": 1_735_689_600_000.0_f64,
                     "refresh": {
                         "refsettings": [
                             {
-                                "reftype": 1,
-                                "minint": 30
+                                "reftype": 1_i32,
+                                "minint": 30_i32
                             }
                         ],
-                        "count": 2
+                        "count": 2_i32
                     },
                     "video": {
                         "mimes": ["video/mp4"],
                         "durfloors": [
                             {
-                                "mindur": 1,
-                                "bidfloor": 5.0
+                                "mindur": 1_i32,
+                                "bidfloor": 5.0_f64
                             }
                         ]
                     }
@@ -180,13 +218,13 @@ mod tests {
             "dooh": {
                 "id": "screen-group-1",
                 "venuetype": ["retail"],
-                "venuetypetax": 1,
+                "venuetypetax": 1_i32,
                 "domain": "inventory.example"
             },
             "regs": {
                 "gpp": "DBABMA~CPXxRfAPXxRfAAfKABENB-CgAAAAAAAAAAYgAAAAAAAA",
-                "gpp_sid": [7],
-                "gdpr": 1
+                "gpp_sid": [7_i32],
+                "gdpr": 1_i32
             },
             "acat": ["IAB1"]
         });
@@ -255,26 +293,11 @@ mod tests {
             "id": "req-1",
             "imp": [],
             "totally_unknown_field": "surprise",
-            "another_unknown": 42
+            "another_unknown": 42_i32
         });
         let bid_request: BidRequest =
             serde_json::from_value(payload).expect("should ignore unknown fields");
         assert_eq!(bid_request.id.as_deref(), Some("req-1"));
-    }
-
-    // ========================================================================
-    // bool_as_int edge-case tests
-    // ========================================================================
-
-    /// Helper struct to exercise `bool_as_int` through serde round-trips.
-    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-    struct BoolAsIntWrapper {
-        #[serde(
-            with = "crate::bool_as_int",
-            skip_serializing_if = "Option::is_none",
-            default
-        )]
-        flag: Option<bool>,
     }
 
     #[test]
@@ -339,14 +362,14 @@ mod tests {
     fn bool_as_int_round_trips_true_as_1() {
         let wrapper = BoolAsIntWrapper { flag: Some(true) };
         let json = serde_json::to_value(&wrapper).expect("should serialize");
-        assert_eq!(json["flag"], 1, "true should serialize as 1");
+        assert_eq!(json["flag"], 1_i32, "true should serialize as 1");
     }
 
     #[test]
     fn bool_as_int_round_trips_false_as_0() {
         let wrapper = BoolAsIntWrapper { flag: Some(false) };
         let json = serde_json::to_value(&wrapper).expect("should serialize");
-        assert_eq!(json["flag"], 0, "false should serialize as 0");
+        assert_eq!(json["flag"], 0_i32, "false should serialize as 0");
     }
 
     #[test]

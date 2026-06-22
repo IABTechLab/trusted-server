@@ -25,8 +25,6 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        # The pin matters because upstream Viceroy > v0.16.4 has bumped MSRV
-        # beyond the rustc pin in `rust-toolchain.toml`.
         run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
@@ -46,7 +44,7 @@ jobs:
 
       - name: Install Viceroy
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/fastly/Viceroy --tag v${{ steps.viceroy-version.outputs.viceroy-version }} viceroy
+        run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
       - name: Run tests
         run: cargo test --workspace
@@ -64,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/js/lib
+        working-directory: crates/trusted-server-js/lib
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +77,7 @@ jobs:
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: crates/js/lib/package.json
+          cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
         run: npm ci

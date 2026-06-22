@@ -4,7 +4,7 @@
 #
 # Build:
 #   docker build -t test-wordpress:latest \
-#     crates/integration-tests/fixtures/frameworks/wordpress/
+#     crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 #
 # Run manually:
 #   docker run -p 8080:80 test-wordpress:latest

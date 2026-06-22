@@ -29,7 +29,10 @@ const MAX_EIDS_COOKIE_BYTES: usize = 8 * 1024;
 struct LegacyCookieEid {
     source: String,
     id: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "legacy cookie field is deserialized for compatibility but not emitted"
+    )]
     atype: u8,
 }
 
@@ -180,12 +183,9 @@ fn collect_prebid_eid_updates(
     cookie_value: &str,
     registry: &PartnerRegistry,
 ) -> Vec<PartnerIdUpdate> {
-    let eids = match parse_prebid_eids_cookie(cookie_value) {
-        Ok(eids) => eids,
-        Err(_) => {
-            log::trace!("Prebid EIDs: failed to decode ts-eids cookie; dropping");
-            return Vec::new();
-        }
+    let Ok(eids) = parse_prebid_eids_cookie(cookie_value) else {
+        log::trace!("Prebid EIDs: failed to decode ts-eids cookie; dropping");
+        return Vec::new();
     };
 
     let mut updates = Vec::new();

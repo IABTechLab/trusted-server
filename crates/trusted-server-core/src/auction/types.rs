@@ -273,12 +273,12 @@ mod tests {
 
     fn make_bid(bidder: &str) -> Bid {
         Bid {
-            slot_id: "slot-1".to_string(),
+            slot_id: "slot-1".to_owned(),
             price: Some(1.0),
-            currency: "USD".to_string(),
+            currency: "USD".to_owned(),
             creative: None,
             adomain: None,
-            bidder: bidder.to_string(),
+            bidder: bidder.to_owned(),
             width: 300,
             height: 250,
             nurl: None,

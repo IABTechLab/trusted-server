@@ -2,7 +2,7 @@
 /bin
 /pkg
 /target
-/crates/integration-tests/target
+/crates/trusted-server-integration-tests/target
 
 # env
 .env*
@@ -32,7 +32,7 @@ src/*.html
 /benchmark-results/**
 
 # Playwright browser tests
-/crates/integration-tests/browser/node_modules/
-/crates/integration-tests/browser/test-results/
-/crates/integration-tests/browser/playwright-report/
-/crates/integration-tests/browser/.browser-test-state.json
+/crates/trusted-server-integration-tests/browser/node_modules/
+/crates/trusted-server-integration-tests/browser/test-results/
+/crates/trusted-server-integration-tests/browser/playwright-report/
+/crates/trusted-server-integration-tests/browser/.browser-test-state.json
