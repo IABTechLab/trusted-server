@@ -125,6 +125,10 @@ jobs:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/integration-tests/fixtures/configs/viceroy-template-edgezero.toml
+          # Opt into the EdgeZero entry-point canary in test_ec_lifecycle_fastly.
+          # Only set here, so the legacy integration-tests job runs the same
+          # scenarios through legacy_main without asserting the EdgeZero-only 405.
+          EXPECT_EDGEZERO_ENTRY_POINT: "true"
           RUST_LOG: info
 
   browser-tests:
