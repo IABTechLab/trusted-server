@@ -194,16 +194,26 @@ Phase 1 threads that struct into `AuctionEventContext`; no UA re-parsing.
 `is_known_browser` maps `DeviceSignals.known_browser: Option<bool>` to 1/0/2 and
 lets the yield dashboard exclude bot traffic. Tablet is not distinguished.
 
-`price_cpm` note: `Bid.price` is `Option<f64>`. In this repo the APS adapter
-deliberately leaves it `None` and stores the encoded `amznbid`/`amznp` in
-metadata for the mediation layer to decode
-([integrations/aps.rs:407](../../../crates/trusted-server-core/src/integrations/aps.rs#L407),
-locked by `test_aps_bids_have_no_decoded_price`). So **raw per-seat CPM excludes
-APS/TAM**, but the **winning** bid can still carry a decoded CPM via
-`mediator_response`/`winning_bids`, so winner-CPM may include APS. Rows with null
-price still count toward bid/win/no-bid rates. Label the CPM panel so it is not
-read as total-market CPM. Decoding `amznbid` at ingest to recover per-seat APS
-CPM needs the Amazon price table and is out of scope.
+`price_cpm` note: `Bid.price` is `Option<f64>`, so the design handles decoded
+and undecoded prices uniformly. Whether APS per-seat CPM is present depends on
+which APS adapter is wired, not on this design:
+
+- The adapter currently in the repo uses the legacy targeting-key flow: it
+  leaves `price = None` and stores the encoded `amznbid`/`amznp` in metadata for
+  the mediation layer to decode
+  ([integrations/aps.rs:407](../../../crates/trusted-server-core/src/integrations/aps.rs#L407),
+  locked by `test_aps_bids_have_no_decoded_price`). Under this adapter, raw
+  per-seat CPM excludes APS, though the mediated **winner** can still carry a
+  decoded CPM via `mediator_response`/`winning_bids`.
+- Amazon's newer OpenRTB Prebid Server adapter (`POST
+  https://web.ads.aps.amazon-adsystem.com/e/pb/bid`) returns a standard decoded
+  `seatbid[].bid[].price`. When TS uses that path, APS `price` populates like any
+  other bidder and `price_cpm` fills for APS seats with **no schema or pipe
+  change**, because both already treat price as nullable.
+
+Either way, rows with null price still count toward bid/win/no-bid rates. Label
+the CPM panel so a window with the legacy adapter is not read as total-market
+CPM.
 
 ### B. Tinybird (auction yield)
 
@@ -316,9 +326,10 @@ rows:
 - A live auction produces N rows in `auction_events_raw` (one per seat-response,
   including no-bid and error rows) with correct `is_win` flags and no PII.
 - The yield dashboard shows fill rate, win rate by seat, no-bid rate, CPM
-  quantiles (decoded-CPM bids plus mediated winners; APS raw bids excluded),
-  and per-seat latency for a chosen time range, filterable by publisher,
-  provider, and bot-vs-browser.
+  quantiles (any seat with a decoded price; under the legacy APS adapter that
+  excludes APS raw bids but still includes mediated winners), and per-seat
+  latency for a chosen time range, filterable by publisher, provider, and
+  bot-vs-browser.
 - The ops dashboard shows QPS, status-class error rate, endpoint latency
   quantiles, and cache hit ratio from `access_logs_raw`.
 - Tinybird quarantine stays empty under normal traffic; a malformed row is
