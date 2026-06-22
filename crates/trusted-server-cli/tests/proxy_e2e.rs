@@ -91,3 +91,20 @@ async fn keep_alive_serves_multiple_sequential_requests() {
         "second request reused the tunnel"
     );
 }
+
+#[tokio::test]
+async fn unmatched_connect_off_loopback_is_refused_with_403() {
+    // The proxy is set up with no rule matching "unmapped.example.com", and the
+    // server is made to believe it is bound on a non-loopback interface.  An
+    // unmatched CONNECT must be refused with 403, never blind-tunnelled (spec §5).
+    let cfg = support::test_config_without_rules();
+    let ca = Arc::new(support::dev_ca());
+
+    let proxy = support::spawn_proxy_as_non_loopback(cfg, ca).await;
+    let status = support::connect_and_read_status(proxy, "unmapped.example.com:443").await;
+
+    assert!(
+        status.contains(" 403 "),
+        "off-loopback unmatched CONNECT must be refused with 403, got: {status}"
+    );
+}

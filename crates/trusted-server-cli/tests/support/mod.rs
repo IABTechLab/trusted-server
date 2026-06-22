@@ -229,6 +229,53 @@ async fn spawn_proxy(cfg: config::ResolvedConfig, ca: Arc<ca::CertAuthority>) ->
     addr
 }
 
+/// Spawns a proxy that behaves as if it were bound on a non-loopback address,
+/// while the actual socket is on loopback so the test can connect without
+/// privilege.
+///
+/// The trick: bind the listener on `127.0.0.1:0` (real socket), then patch
+/// `cfg.listen` to `0.0.0.0:<port>` before handing it to `serve_on`. The
+/// server derives `is_loopback = false` from `cfg.listen`, so CONNECT requests
+/// to unmatched authorities are refused with `403` instead of blind-tunnelled.
+pub async fn spawn_proxy_as_non_loopback(
+    mut cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind proxy listener on loopback");
+    let real_port = listener.local_addr().expect("should read proxy addr").port();
+    // Override listen so is_loopback computed in serve_on is false.
+    cfg.listen = format!("0.0.0.0:{real_port}")
+        .parse()
+        .expect("should parse non-loopback socket addr");
+    let connect_addr: SocketAddr = format!("127.0.0.1:{real_port}")
+        .parse()
+        .expect("should parse loopback connect addr");
+    let cfg = Arc::new(cfg);
+    let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
+    tokio::spawn(async move {
+        let _ = server::serve_on(listener, cfg, ca, pac).await;
+    });
+    connect_addr
+}
+
+/// Sends a `CONNECT` request to `proxy` and returns the status line received.
+/// Unlike `proxy_connect`, this does not assert on the status — it just returns
+/// it so callers can check for `403` or other rejection codes.
+pub async fn connect_and_read_status(proxy: SocketAddr, authority: &str) -> String {
+    let mut stream = TcpStream::connect(proxy)
+        .await
+        .expect("should connect to proxy");
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("should send CONNECT");
+    stream.flush().await.expect("should flush CONNECT");
+    read_status_line(&mut stream).await
+}
+
 // ---- client legs: a no-verify verifier so the test can trust either CA ----
 
 #[derive(Debug)]

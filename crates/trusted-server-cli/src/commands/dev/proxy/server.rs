@@ -82,10 +82,14 @@ fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
-/// The first request line of an accepted connection, peeked far enough to route.
+/// The first request head of an accepted connection, buffered for routing.
 struct RequestHead {
     method: String,
     target: String,
+    /// The raw bytes consumed from the client socket (the full HTTP head up to
+    /// and including `\r\n\r\n`). Retained so they can be forwarded verbatim
+    /// when the request is blind-forwarded as plain HTTP (spec §8.4).
+    raw: Vec<u8>,
 }
 
 impl RequestHead {
@@ -101,10 +105,12 @@ impl RequestHead {
     }
 }
 
-/// Reads bytes until the end of the first request line and parses method/target.
+/// Reads bytes until the end of the request head (`\r\n\r\n`) and parses
+/// method/target from the first request line.
 ///
-/// Only the request line is consumed; for `CONNECT` the rest of the head (the
-/// blank-line terminator) is drained so the client's `200` arrives cleanly.
+/// The raw bytes are retained on the returned [`RequestHead`] so that a stray
+/// absolute-form plain-HTTP request can be forwarded unchanged (spec §8.4) —
+/// `blind_forward_http` writes them to the upstream before piping the remainder.
 async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report<ProxyError>> {
     let mut buf = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
@@ -127,7 +133,7 @@ async fn read_request_head(client: &mut TcpStream) -> Result<RequestHead, Report
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
-    Ok(RequestHead { method, target })
+    Ok(RequestHead { method, target, raw: buf })
 }
 
 async fn handle_connection(
@@ -245,9 +251,11 @@ async fn serve_pac(client: &mut TcpStream, pac: &str) -> Result<(), Report<Proxy
     client.flush().await.change_context(ProxyError::Server)
 }
 
-/// Blind-forwards a stray absolute-form plain-HTTP request on loopback by
-/// connecting to its authority and replaying the original head. Best-effort:
-/// failures are logged, never fatal.
+/// Blind-forwards a stray absolute-form plain-HTTP request on loopback.
+///
+/// Connects to the target authority, writes the already-buffered request head
+/// verbatim, then pipes the remaining bytes bidirectionally (spec §8.4).
+/// Best-effort: failures are logged, never fatal.
 async fn blind_forward_http(
     mut client: TcpStream,
     head: &RequestHead,
@@ -266,6 +274,12 @@ async fn blind_forward_http(
             return respond_status_line(&mut client, StatusCode::BAD_GATEWAY).await;
         }
     };
+    // Replay the buffered request head so the upstream receives a complete,
+    // unchanged request (the socket only held the remainder after the head).
+    if let Err(err) = upstream.write_all(&head.raw).await {
+        log::warn!("plain-HTTP forward to {host}:{port} failed writing head: {err}");
+        return Ok(());
+    }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
 }
