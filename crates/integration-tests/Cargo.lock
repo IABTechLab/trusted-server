@@ -4146,7 +4146,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subtle",
- "tokio",
  "toml",
  "trusted-server-js",
  "trusted-server-openrtb",

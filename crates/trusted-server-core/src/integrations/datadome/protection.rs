@@ -156,6 +156,7 @@ impl DataDomeIntegration {
             scheme: parsed.scheme().to_string(),
             host: host.to_string(),
             port: parsed.port(),
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(u64::from(self.config.timeout_ms)),
         };

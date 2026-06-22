@@ -13,11 +13,10 @@ use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
-use fastly::geo::geo_lookup;
+use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
-use trusted_server_core::backend::BackendConfig;
-use trusted_server_core::geo::geo_from_fastly;
+use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -35,7 +34,7 @@ use trusted_server_core::platform::{
 ///
 /// Stateless — the store name is supplied per call, matching the trait
 /// signature. This replaces the store-name-at-construction pattern of
-/// [`trusted_server_core::storage::FastlyConfigStore`].
+/// the legacy `FastlyConfigStore` (removed).
 ///
 /// # Write cost
 ///
@@ -84,8 +83,8 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 /// Fastly [`SecretStore`]-backed implementation of [`PlatformSecretStore`].
 ///
 /// Stateless — the store name is supplied per call. This replaces the
-/// store-name-at-construction pattern of
-/// [`trusted_server_core::storage::FastlySecretStore`].
+/// store-name-at-construction pattern of the legacy `FastlySecretStore`
+/// (removed).
 ///
 /// # Write cost
 ///
@@ -157,6 +156,7 @@ pub struct FastlyPlatformBackend;
 fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
     BackendConfig::new(&spec.scheme, &spec.host)
         .port(spec.port)
+        .host_header_override(spec.host_header_override.as_deref())
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
 }
@@ -329,8 +329,7 @@ fn edge_request_to_fastly(
 /// `take_body_bytes()` copies the full origin response into a single
 /// allocation.  This cap prevents oversized origin responses from exhausting
 /// the WASM address space.  The Content-Length pre-check avoids the copy
-/// entirely for responses that declare their size.  Streaming response support
-/// will remove this limit in PR 15.
+/// entirely for responses that declare their size.
 const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
@@ -493,13 +492,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 
         let (ready, failed_backend_name) = match result {
             Ok(fastly_resp) => {
-                let backend_name = fastly_resp
-                    .get_backend_name()
-                    .unwrap_or_else(|| {
-                        log::warn!("select: response has no backend name, correlation will fail");
-                        ""
-                    })
-                    .to_string();
+                let Some(backend_name) = fastly_resp.get_backend_name().map(str::to_string) else {
+                    return Err(Report::new(PlatformError::HttpClient)
+                        .attach("select: response has no backend name; correlation impossible"));
+                };
                 (
                     fastly_response_to_platform(fastly_resp, backend_name, false),
                     None,
@@ -528,10 +524,24 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 // FastlyPlatformGeo
 // ---------------------------------------------------------------------------
 
-/// Fastly geo-lookup implementation of [`PlatformGeo`].
+/// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
 ///
-/// Uses [`geo_from_fastly`] from `trusted_server_core::geo` to avoid
-/// duplicating the field-mapping logic present in `GeoInfo::from_request`.
+/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
+/// that field mapping is never duplicated.
+fn geo_from_fastly(geo: &Geo) -> GeoInfo {
+    GeoInfo {
+        city: geo.city().to_string(),
+        country: geo.country_code().to_string(),
+        continent: format!("{:?}", geo.continent()),
+        latitude: geo.latitude(),
+        longitude: geo.longitude(),
+        metro_code: geo.metro_code(),
+        region: geo.region().map(str::to_string),
+        asn: None,
+    }
+}
+
+/// Fastly geo-lookup implementation of [`PlatformGeo`].
 pub struct FastlyPlatformGeo;
 
 impl PlatformGeo for FastlyPlatformGeo {
@@ -585,7 +595,6 @@ pub fn build_runtime_services(
 ///
 /// Returns [`KvError::Unavailable`] when the store does not exist, or
 /// [`KvError::Internal`] when the Fastly SDK fails to open it.
-#[allow(dead_code)]
 pub fn open_kv_store(store_name: &str) -> Result<Arc<dyn PlatformKvStore>, KvError> {
     FastlyKvStore::open(store_name).map(|store| Arc::new(store) as Arc<dyn PlatformKvStore>)
 }
@@ -619,6 +628,7 @@ mod tests {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -640,6 +650,7 @@ mod tests {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -661,6 +672,7 @@ mod tests {
             scheme: "https".to_string(),
             host: String::new(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
         };
@@ -677,6 +689,7 @@ mod tests {
             scheme: "https".to_string(),
             host: "origin.example.com".to_string(),
             port: None,
+            host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
         };

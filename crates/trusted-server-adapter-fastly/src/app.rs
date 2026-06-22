@@ -89,7 +89,6 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
-use trusted_server_core::compat;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
@@ -123,8 +122,8 @@ use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
-    FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo, FastlyPlatformHttpClient,
-    FastlyPlatformSecretStore, UnavailableKvStore,
+    open_kv_store, FastlyPlatformBackend, FastlyPlatformConfigStore, FastlyPlatformGeo,
+    FastlyPlatformHttpClient, FastlyPlatformSecretStore, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,8 +138,7 @@ pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
-    pub(crate) partner_registry: Arc<PartnerRegistry>,
-    pub(crate) kv_store: Arc<dyn PlatformKvStore>,
+    pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -158,20 +156,43 @@ pub(crate) fn build_state_from_settings(
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
-    // Build the partner registry up front so invalid `ec.partners` config fails
-    // closed at startup — `routes()` falls back to `startup_error_router`, which
-    // serves the structured error for every route. This mirrors legacy_main,
-    // which builds the registry before routing and aborts on failure, and
-    // prevents fallback responses from being served with a bad EC config.
-    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
-    let kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+
+    let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
+
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
-        partner_registry: Arc::new(partner_registry),
-        kv_store,
+        default_kv_store,
     }))
+}
+
+/// Resolves per-request consent KV store services for routes that read consent data.
+///
+/// When `settings.consent.consent_store` is configured and the named KV store cannot
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
+/// matches the legacy `route_request` behavior where a misconfigured consent store
+/// makes consent-dependent routes unavailable rather than proceeding without consent.
+///
+/// # Errors
+///
+/// Returns an error when the configured consent store cannot be opened.
+pub(crate) fn runtime_services_for_consent_route(
+    settings: &Settings,
+    runtime_services: &RuntimeServices,
+) -> Result<RuntimeServices, Report<TrustedServerError>> {
+    let Some(store_name) = settings.consent.consent_store.as_deref() else {
+        return Ok(runtime_services.clone());
+    };
+
+    open_kv_store(store_name)
+        .map(|store| runtime_services.clone().with_kv_store(store))
+        .map_err(|e| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_string(),
+                message: e.to_string(),
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +211,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
-        .kv_store(Arc::clone(&state.kv_store))
+        .kv_store(Arc::clone(&state.default_kv_store))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
@@ -237,6 +258,9 @@ pub(crate) struct EcFinalizeState {
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
+    /// Per-request services carried to the entry point so the pull-sync
+    /// dispatcher can reuse the same platform HTTP client.
+    pub(crate) services: RuntimeServices,
 }
 
 /// Per-request EC identity state built before dispatch, mirroring the
@@ -250,6 +274,7 @@ struct EcRequestState {
     eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
+    services: RuntimeServices,
     /// Geo lookup result reused by the pre-route request-filter step so it does
     /// not repeat the lookup the legacy path also shares between EC setup and
     /// filtering.
@@ -269,8 +294,25 @@ impl EcRequestState {
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
+            services: self.services,
         }
     }
+}
+
+/// Derives device signals from the request's `User-Agent` header.
+///
+/// Used as the fallback when no entry-point-captured [`DeviceSignals`] are
+/// present in the request extensions (see [`device_signals_for`]). TLS and H2
+/// fingerprints cannot be reconstructed from the `EdgeZero` request, so this
+/// fallback is UA-only — matching the signals the legacy path effectively had
+/// after request conversion.
+fn derive_request_device_signals(req: &Request) -> DeviceSignals {
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    DeviceSignals::derive(user_agent, None, None)
 }
 
 /// Returns the device signals for an `EdgeZero` request.
@@ -278,26 +320,24 @@ impl EcRequestState {
 /// `edgezero_main` derives [`DeviceSignals`] from the original `FastlyRequest`
 /// — the only place Fastly's TLS JA4 and HTTP/2 fingerprint accessors return
 /// real values — and stores them in the request extensions. Reading them back
-/// here preserves the bot gate's browser classification, which a synthetic
-/// request reconstructed from `EdgeZero` HTTP types cannot expose. Falls back
-/// to deriving from the reconstructed request when the extension is absent
-/// (e.g. in tests that dispatch without the entry point).
+/// here preserves the bot gate's browser classification, which the `EdgeZero`
+/// request cannot expose on its own. Falls back to UA-only
+/// [`derive_request_device_signals`] when the extension is absent (e.g. in
+/// tests that dispatch without the entry point).
 fn device_signals_for(req: &Request) -> DeviceSignals {
     req.extensions()
         .get::<DeviceSignals>()
         .cloned()
-        .unwrap_or_else(|| crate::derive_device_signals(&compat::to_fastly_request_ref(req)))
+        .unwrap_or_else(|| derive_request_device_signals(req))
 }
 
-/// Builds the per-request EC state from a headers-only fastly request copy,
-/// mirroring the legacy `route_request` prelude step by step.
+/// Builds the per-request EC state, mirroring the pre-routing prelude of the
+/// legacy `route_request` step by step.
 fn build_ec_request_state(
     settings: &Settings,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
-    let fastly_ref = compat::to_fastly_request_ref(req);
-
     let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
@@ -309,8 +349,8 @@ fn build_ec_request_state(
         );
     }
 
-    let eids_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
+    let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
+    let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let geo_info = services
         .geo()
@@ -321,7 +361,7 @@ fn build_ec_request_state(
         });
 
     let (ec_context, setup_error) =
-        match EcContext::read_from_request_with_geo(settings, &fastly_ref, geo_info.as_ref()) {
+        match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
                 (context, None)
@@ -349,6 +389,7 @@ fn build_ec_request_state(
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        services: services.clone(),
         geo_info,
         setup_error,
     }
@@ -436,7 +477,7 @@ async fn execute_named(
     // legacy route_request. Batch-sync also skips request filters, matching
     // legacy, which returns before the filter step for this route.
     if matches!(handler, NamedRouteHandler::BatchSync) {
-        return Ok(run_batch_sync(&state, req));
+        return Ok(run_batch_sync(&state, &services, req));
     }
 
     let mut ec = build_ec_request_state(&state.settings, &services, &req);
@@ -486,27 +527,30 @@ async fn run_named_route(
             unreachable!("batch-sync should be handled by run_batch_sync")
         }
         NamedRouteHandler::Identify => {
-            let fastly_ref = compat::to_fastly_request_ref(&req);
             if req.method() == Method::OPTIONS {
-                cors_preflight_identify(&state.settings, &fastly_ref)
-                    .map(compat::from_fastly_response)
+                cors_preflight_identify(&state.settings, &req)
             } else {
                 let kv = crate::require_identity_graph(&state.settings)?;
+                let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
                     &kv,
-                    &state.partner_registry,
-                    &fastly_ref,
+                    &partner_registry,
+                    &req,
                     &ec.ec_context,
                 )
-                .map(compat::from_fastly_response)
             }
         }
         NamedRouteHandler::Auction => {
-            let registry_ref = if state.partner_registry.is_empty() {
+            // The auction reads consent data, so the consent KV store must be
+            // available — fail closed with 503 when it is configured but
+            // cannot be opened, matching legacy behavior.
+            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let registry_ref = if partner_registry.is_empty() {
                 None
             } else {
-                Some(state.partner_registry.as_ref())
+                Some(&partner_registry)
             };
             handle_auction(
                 &state.settings,
@@ -514,7 +558,7 @@ async fn run_named_route(
                 ec.kv_graph.as_ref(),
                 registry_ref,
                 &ec.ec_context,
-                services,
+                &consent_services,
                 req,
             )
             .await
@@ -537,20 +581,16 @@ async fn run_named_route(
 /// Handles `POST /_ts/api/v1/batch-sync`, mirroring the legacy arm: identity
 /// graph + partner registry + rate limiter, with a default EC context for
 /// response finalization.
-fn run_batch_sync(state: &AppState, req: Request) -> Response {
-    // Device signals and cookies come from a headers-only fastly copy taken
-    // before the conversion below consumes the request body.
-    let fastly_ref = compat::to_fastly_request_ref(&req);
+fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
-    let eids_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_TS_EIDS);
-    let sharedid_cookie = crate::extract_cookie_value(&fastly_ref, COOKIE_SHAREDID);
+    let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
+        let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
         let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-        let fastly_req = compat::to_fastly_request(req);
-        handle_batch_sync(&kv, &state.partner_registry, &limiter, fastly_req)
-            .map(compat::from_fastly_response)
+        handle_batch_sync(&kv, &partner_registry, &limiter, req)
     });
 
     let mut response = result.unwrap_or_else(|e| http_error(&e));
@@ -562,6 +602,7 @@ fn run_batch_sync(state: &AppState, req: Request) -> Response {
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
+        services: services.clone(),
     });
     response
 }
@@ -648,16 +689,24 @@ async fn dispatch_fallback(
             }
         }
 
-        handle_publisher_request(&state.settings, &state.registry, services, req)
-            .await
-            .and_then(|pub_response| {
-                crate::resolve_publisher_response_buffered(
-                    pub_response,
-                    &method,
-                    &state.settings,
-                    &state.registry,
-                )
-            })
+        // Publisher pages read consent data, so the consent KV store must be
+        // available — fail closed with 503 when it is configured but cannot
+        // be opened, matching legacy behavior.
+        match runtime_services_for_consent_route(&state.settings, services) {
+            Ok(publisher_services) => {
+                handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
+                    .await
+                    .and_then(|pub_response| {
+                        crate::resolve_publisher_response_buffered(
+                            pub_response,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                        )
+                    })
+            }
+            Err(e) => Err(e),
+        }
     };
 
     let response = result.unwrap_or_else(|e| http_error(&e));
@@ -788,8 +837,7 @@ async fn buffer_asset_body(
 /// mirroring [`crate::http_error_response`] exactly.
 ///
 /// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types. The
-/// duplication will be removed when `legacy_main` is deleted in PR 15.
+/// uses fastly HTTP types while this path uses `edgezero_core` types.
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
@@ -1023,13 +1071,14 @@ impl Hooks for TrustedServerApp {
 mod tests {
     use std::sync::Arc;
 
-    use super::{build_state_from_settings, startup_error_router, TrustedServerApp};
+    use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
 
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
     use edgezero_core::router::RouterService;
     use error_stack::Report;
     use futures::executor::block_on;
+    use serde_json::json;
     use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
@@ -1039,10 +1088,54 @@ mod tests {
     };
     use trusted_server_core::settings::Settings;
 
+    fn settings_with_missing_consent_store() -> Settings {
+        Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/(_ts/)?admin"
+                username = "admin"
+                password = "admin-pass"
+
+                [publisher]
+                domain = "test-publisher.com"
+                cookie_domain = ".test-publisher.com"
+                origin_url = "https://origin.test-publisher.com"
+                proxy_secret = "unit-test-proxy-secret"
+
+                [ec]
+                passphrase = "test-passphrase-at-least-32-bytes!!"
+
+                [request_signing]
+                enabled = false
+                config_store_id = "test-config-store-id"
+                secret_store_id = "test-secret-store-id"
+
+                [consent]
+                consent_store = "missing-consent-store"
+
+                [integrations.prebid]
+                enabled = true
+                server_url = "https://test-prebid.com/openrtb2/auction"
+
+                [integrations.datadome]
+                enabled = true
+
+                [auction]
+                enabled = true
+                providers = ["prebid"]
+                timeout_ms = 2000
+            "#,
+        )
+        .expect("should parse EdgeZero app test settings")
+    }
+
+    fn app_state_for_settings(settings: Settings) -> Arc<AppState> {
+        build_state_from_settings(settings).expect("should build app state from settings")
+    }
+
     fn empty_request(method: Method, path: &str) -> edgezero_core::http::Request {
-        // EC request-state construction converts requests to fastly requests,
-        // which require absolute URLs — mirror the absolute URIs that the
-        // fastly adapter provides in production.
+        // Production requests arrive with absolute URIs from the fastly
+        // adapter — mirror that here so URI-derived logic behaves the same.
         let uri = format!("https://test-publisher.com{path}");
         request_builder()
             .method(method)
@@ -1105,18 +1198,14 @@ mod tests {
         let settings = test_settings();
         let orchestrator = trusted_server_core::auction::build_orchestrator(&settings)
             .expect("should build orchestrator");
-        let partner_registry =
-            trusted_server_core::ec::registry::PartnerRegistry::from_config(&settings.ec.partners)
-                .expect("should build partner registry");
         let registry = IntegrationRegistry::from_request_filters(filters);
-        let kv_store =
+        let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
             settings: Arc::new(settings),
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
-            partner_registry: Arc::new(partner_registry),
-            kv_store,
+            default_kv_store,
         });
         TrustedServerApp::routes_for_state(&state)
     }
@@ -1254,9 +1343,9 @@ mod tests {
         // Verifies FinalizeResponseMiddleware is outermost: an auth-rejected 401
         // must still carry standard TS headers before reaching the client.
         //
-        // The test settings protects `^/_ts/admin` with basic-auth.
-        // Sending the request without an Authorization header causes AuthMiddleware
-        // to short-circuit with a 401, which then bubbles through
+        // Test settings protect `^/(_ts/)?admin` with basic-auth. Sending the
+        // request without an Authorization header causes AuthMiddleware to
+        // short-circuit with a 401, which then bubbles through
         // FinalizeResponseMiddleware for header injection.
         //
         // This is safe to run without Viceroy: enforce_basic_auth is pure Rust
@@ -1457,6 +1546,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_auction_with_missing_consent_store_returns_503() {
+        let state = app_state_for_settings(settings_with_missing_consent_store());
+        let router = TrustedServerApp::routes_for_state(&state);
+        let body = json!({ "adUnits": [] }).to_string();
+        let req = request_builder()
+            .method(Method::POST)
+            .uri("/auction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("should build auction request");
+
+        let response = block_on(router.oneshot(req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auction route should fail closed when configured consent store cannot be opened"
+        );
+    }
+
+    #[test]
     fn dispatch_unregistered_method_returns_405_at_router_level() {
         // Documents the known router-level behavior for verbs outside the
         // publisher_fallback_methods() list (e.g. TRACE, CONNECT): the RouterService
@@ -1484,6 +1594,51 @@ mod tests {
                 .get(HEADER_X_GEO_INFO_AVAILABLE)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; main.rs entry-point covers this"
+        );
+    }
+
+    #[test]
+    fn edgezero_missing_consent_store_breaks_only_consent_routes() {
+        let state = app_state_for_settings(settings_with_missing_consent_store());
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        let admin_response =
+            block_on(router.oneshot(empty_request(Method::POST, "/admin/keys/rotate")));
+        assert_eq!(
+            admin_response.status(),
+            StatusCode::UNAUTHORIZED,
+            "admin auth behavior should not depend on consent KV availability"
+        );
+
+        let auction_request = request_builder()
+            .method(Method::POST)
+            .uri("/auction")
+            .body(Body::from(r#"{"adUnits":[]}"#))
+            .expect("should build auction request");
+        let auction_response = block_on(router.oneshot(auction_request));
+        assert_eq!(
+            auction_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auction should fail closed when configured consent KV cannot be opened"
+        );
+
+        let publisher_response =
+            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
+        assert_eq!(
+            publisher_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "publisher fallback should fail closed when configured consent KV cannot be opened"
+        );
+
+        // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
+        // is wired only into the publisher and auction branches of dispatch_fallback, not into
+        // the integration proxy branch. A missing consent store must not 503 integration routes.
+        let integration_response =
+            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        assert_ne!(
+            integration_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "integration routes should be unaffected by a missing consent KV store"
         );
     }
 
@@ -1542,52 +1697,6 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_none(),
             "asset-route responses must skip EC finalization (no EcFinalizeState)"
-        );
-    }
-
-    #[test]
-    fn build_state_rejects_invalid_partner_config() {
-        // Fail-closed parity: invalid ec.partners config must fail at state
-        // construction so routes() degrades to startup_error_router instead of
-        // serving fallback responses with a bad EC config (the legacy path
-        // aborts before routing on the same condition).
-        let settings = Settings::from_toml(
-            r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [request_signing]
-            enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
-
-            [[ec.partners]]
-            name = "Partner One"
-            source_domain = "partner.example.com"
-            api_token = "0123456789012345678901234567890001"
-
-            [[ec.partners]]
-            name = "Partner Two"
-            source_domain = "partner.example.com"
-            api_token = "0123456789012345678901234567890002"
-            "#,
-        )
-        .expect("should parse settings with duplicate partner domains");
-
-        assert!(
-            build_state_from_settings(settings).is_err(),
-            "duplicate partner source_domain must fail state construction (fail closed)"
         );
     }
 

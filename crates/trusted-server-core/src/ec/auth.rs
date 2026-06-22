@@ -3,7 +3,8 @@
 //! Used by both `/_ts/api/v1/identify` and `/_ts/api/v1/batch-sync` so
 //! authentication hardening stays consistent across endpoints.
 
-use fastly::Request;
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
 
 use super::partner::hash_api_key;
 use super::registry::{PartnerConfig, PartnerRegistry};
@@ -11,9 +12,12 @@ use super::registry::{PartnerConfig, PartnerRegistry};
 /// Authenticates a request via Bearer token, returning the matching partner.
 pub(super) fn authenticate_bearer<'r>(
     registry: &'r PartnerRegistry,
-    req: &Request,
+    req: &Request<EdgeBody>,
 ) -> Option<&'r PartnerConfig> {
-    let header_value = req.get_header_str("authorization")?;
+    let header_value = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())?;
     let token = parse_bearer_token(header_value)?;
     let key_hash = hash_api_key(token);
     registry.find_by_api_key_hash(&key_hash)
@@ -77,7 +81,11 @@ mod tests {
     #[test]
     fn authenticate_bearer_returns_none_for_missing_header() {
         let registry = PartnerRegistry::empty();
-        let req = Request::new("GET", "https://edge.example.com/_ts/api/v1/identify");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.example.com/_ts/api/v1/identify")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
 
         let result = authenticate_bearer(&registry, &req);
         assert!(result.is_none(), "should return None without auth header");
@@ -86,8 +94,12 @@ mod tests {
     #[test]
     fn authenticate_bearer_returns_none_for_malformed_header() {
         let registry = PartnerRegistry::empty();
-        let mut req = Request::new("GET", "https://edge.example.com/_ts/api/v1/identify");
-        req.set_header("authorization", "Basic dXNlcjpwYXNz");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.example.com/_ts/api/v1/identify")
+            .header("authorization", "Basic dXNlcjpwYXNz")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
 
         let result = authenticate_bearer(&registry, &req);
         assert!(
@@ -100,8 +112,12 @@ mod tests {
     fn authenticate_bearer_returns_matching_partner_for_valid_token() {
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
-        let mut req = Request::new("GET", "https://edge.example.com/_ts/api/v1/identify");
-        req.set_header("authorization", format!("Bearer {VALID_API_TOKEN}"));
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.example.com/_ts/api/v1/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
 
         let result = authenticate_bearer(&registry, &req).expect("should authenticate partner");
         assert_eq!(

@@ -15,7 +15,8 @@
 
 use std::borrow::Cow;
 
-use fastly::http::header;
+use edgezero_core::body::Body as EdgeBody;
+use http::{header, HeaderValue, Response};
 
 use crate::constants::COOKIE_TS_EC;
 use crate::settings::Settings;
@@ -125,7 +126,7 @@ pub(crate) fn create_ec_cookie(settings: &Settings, ec_id: &str) -> String {
 ///
 /// Debug-asserts that `ec_id` passes [`super::generation::is_valid_ec_id`]
 /// as a defense-in-depth check against cookie injection.
-pub fn set_ec_cookie(settings: &Settings, response: &mut fastly::Response, ec_id: &str) {
+pub fn set_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>, ec_id: &str) {
     if !is_safe_cookie_value(ec_id) {
         log::warn!(
             "Rejecting EC ID for Set-Cookie: value of {} bytes contains characters illegal in a cookie value",
@@ -139,25 +140,53 @@ pub fn set_ec_cookie(settings: &Settings, response: &mut fastly::Response, ec_id
         "EC ID must be validated before cookie creation: got '{ec_id}'"
     );
 
-    response.append_header(header::SET_COOKIE, create_ec_cookie(settings, ec_id));
+    match HeaderValue::from_str(&create_ec_cookie(settings, ec_id)) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice — is_safe_cookie_value and the debug
+            // assertion above gate the value, and format_set_cookie emits
+            // only controlled bytes. Logged for defense-in-depth symmetry
+            // with the rejection logging above.
+            log::warn!("Skipping EC Set-Cookie: invalid header value: {e}");
+        }
+    }
 }
 
 /// Expires the EC cookie by setting `Max-Age=0`.
 ///
 /// Used when a user revokes consent — the browser will delete the cookie
 /// on receipt of this header.
-pub fn expire_ec_cookie(settings: &Settings, response: &mut fastly::Response) {
-    response.append_header(
-        header::SET_COOKIE,
-        format_set_cookie(&settings.publisher.ec_cookie_domain(), "", 0),
-    );
+pub fn expire_ec_cookie(settings: &Settings, response: &mut Response<EdgeBody>) {
+    match HeaderValue::from_str(&format_set_cookie(
+        &settings.publisher.ec_cookie_domain(),
+        "",
+        0,
+    )) {
+        Ok(val) => {
+            response.headers_mut().append(header::SET_COOKIE, val);
+        }
+        Err(e) => {
+            // Unreachable in practice: format_set_cookie emits only
+            // controlled bytes from operator-trusted configuration.
+            log::warn!("Skipping EC cookie expiry Set-Cookie: invalid header value: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::tests::create_test_settings;
-    use fastly::http::header;
+    use http::header;
+
+    fn empty_response() -> Response<EdgeBody> {
+        Response::builder()
+            .status(200)
+            .body(EdgeBody::empty())
+            .expect("should build test response")
+    }
 
     /// A valid EC ID for use in cookie tests.
     const TEST_EC_ID: &str =
@@ -181,11 +210,12 @@ mod tests {
     #[test]
     fn set_ec_cookie_appends_header() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         set_ec_cookie(&settings, &mut response, TEST_EC_ID);
 
         let cookie_header = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("should have Set-Cookie header");
         let cookie_str = cookie_header.to_str().expect("should be valid UTF-8");
 
@@ -227,11 +257,11 @@ mod tests {
     #[test]
     fn set_ec_cookie_rejects_semicolon() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         set_ec_cookie(&settings, &mut response, "evil; Domain=.attacker.com");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "should not set Set-Cookie when value contains a semicolon"
         );
     }
@@ -239,11 +269,11 @@ mod tests {
     #[test]
     fn set_ec_cookie_rejects_crlf() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         set_ec_cookie(&settings, &mut response, "evil\r\nX-Injected: header");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "should not set Set-Cookie when value contains CRLF"
         );
     }
@@ -251,11 +281,11 @@ mod tests {
     #[test]
     fn set_ec_cookie_rejects_space() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         set_ec_cookie(&settings, &mut response, "bad value");
 
         assert!(
-            response.get_header(header::SET_COOKIE).is_none(),
+            response.headers().get(header::SET_COOKIE).is_none(),
             "should not set Set-Cookie when value contains whitespace"
         );
     }
@@ -304,11 +334,12 @@ mod tests {
     #[test]
     fn expire_ec_cookie_sets_max_age_zero() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         expire_ec_cookie(&settings, &mut response);
 
         let cookie_header = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("should have Set-Cookie header");
         let cookie_str = cookie_header.to_str().expect("should be valid UTF-8");
 
@@ -329,11 +360,12 @@ mod tests {
     #[test]
     fn expire_ec_cookie_matches_security_attributes() {
         let settings = create_test_settings();
-        let mut response = fastly::Response::new();
+        let mut response = empty_response();
         expire_ec_cookie(&settings, &mut response);
 
         let cookie_header = response
-            .get_header(header::SET_COOKIE)
+            .headers()
+            .get(header::SET_COOKIE)
             .expect("should have Set-Cookie header");
         let cookie_str = cookie_header.to_str().expect("should be valid UTF-8");
 

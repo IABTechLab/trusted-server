@@ -14,7 +14,6 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionOrchestrator;
 use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::compat;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
@@ -54,6 +53,8 @@ use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod app;
+mod backend;
+mod compat;
 mod error;
 mod logging;
 mod management_api;
@@ -290,9 +291,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
 
     // Pop the integration request-filter response effects (e.g. DataDome
     // challenge/allow headers) threaded out by the dispatch path. Applied to the
-    // converted fastly response after EC finalization and before send, mirroring
-    // legacy_main's `request_filter_effects.apply_to_fastly_response`. Must
-    // happen before the fastly conversion, which drops extensions.
+    // response after EC finalization and before send, mirroring legacy_main's
+    // `request_filter_effects` application. Must happen before the fastly
+    // conversion, which drops extensions.
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
     if !take_finalize_sentinel(&mut response) {
@@ -323,13 +324,11 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         policy.apply_after_route_finalization(&mut response);
     }
 
-    let mut fastly_resp = compat::to_fastly_response(response);
-
     // EC response lifecycle, mirroring legacy_main: finalize EC cookies and
-    // request headers on the converted fastly response, send it, then run
-    // pull sync for recognized browsers. When settings or the partner
-    // registry cannot be loaded the response is sent without EC finalization
-    // rather than dropped.
+    // request headers on the response, send it, then run pull sync for
+    // recognized browsers. When settings or the partner registry cannot be
+    // loaded the response is sent without EC finalization rather than
+    // dropped.
     if let Some(ec_state) = ec_state {
         match get_settings() {
             Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
@@ -341,16 +340,21 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                         &partner_registry,
                         ec_state.eids_cookie.as_deref(),
                         ec_state.sharedid_cookie.as_deref(),
-                        &mut fastly_resp,
+                        &mut response,
                     );
                     if let Some(effects) = &request_filter_effects {
-                        effects.apply_to_fastly_response(&mut fastly_resp);
+                        effects.apply_to_response(&mut response);
                     }
-                    fastly_resp.send_to_client();
+                    compat::to_fastly_response(response).send_to_client();
 
                     if ec_state.is_real_browser {
                         if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
-                            run_pull_sync_after_send(&settings, &partner_registry, &context);
+                            run_pull_sync_after_send(
+                                &settings,
+                                &partner_registry,
+                                &context,
+                                &ec_state.services,
+                            );
                         }
                     }
                     return;
@@ -368,9 +372,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     }
 
     if let Some(effects) = &request_filter_effects {
-        effects.apply_to_fastly_response(&mut fastly_resp);
+        effects.apply_to_response(&mut response);
     }
-    fastly_resp.send_to_client();
+    compat::to_fastly_response(response).send_to_client();
 }
 
 fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
@@ -392,10 +396,9 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// includes config-store open failures, key-read errors, missing keys, and
 /// any value other than the accepted `"true"` / `"1"` forms.
 ///
-/// The thin fastly<->http conversion layer (via `compat::from_fastly_request` /
-/// `compat::to_fastly_response`) lives here in the adapter crate. `compat.rs`
-/// will be deleted in PR 15 once this legacy path is retired.
-// TODO: delete after Phase 5 EdgeZero cutover - see issue #495
+/// The thin fastly↔http conversion layer (via `compat::from_fastly_request` /
+/// `compat::to_fastly_response`) lives here in the adapter crate.
+// TODO: delete after Phase 5 EdgeZero cutover — see issue #495
 fn legacy_main(mut req: FastlyRequest) {
     let state = match build_state() {
         Ok(state) => state,
@@ -433,7 +436,9 @@ fn legacy_main(mut req: FastlyRequest) {
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let runtime_services = build_runtime_services(&req, std::sync::Arc::clone(&state.kv_store));
+    let device_signals = derive_device_signals(&req);
+    let runtime_services =
+        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
     let http_req = compat::from_fastly_request(req);
 
     let route_result = futures::executor::block_on(route_request(
@@ -443,6 +448,7 @@ fn legacy_main(mut req: FastlyRequest) {
         &partner_registry,
         &runtime_services,
         http_req,
+        device_signals,
     ))
     .unwrap_or_else(|e| RouteResult {
         outcome: HandlerOutcome::Buffered(http_error_response(&e)),
@@ -487,7 +493,6 @@ fn legacy_main(mut req: FastlyRequest) {
         HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
-            let mut fastly_resp = compat::to_fastly_response(response);
             if should_finalize_ec {
                 ec_finalize_response(
                     &state.settings,
@@ -496,15 +501,20 @@ fn legacy_main(mut req: FastlyRequest) {
                     &partner_registry,
                     eids_cookie.as_deref(),
                     sharedid_cookie.as_deref(),
-                    &mut fastly_resp,
+                    &mut response,
                 );
             }
-            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
-            fastly_resp.send_to_client();
+            request_filter_effects.apply_to_response(&mut response);
+            compat::to_fastly_response(response).send_to_client();
 
             if is_real_browser {
                 if let Some(context) = build_pull_sync_context(&ec_context) {
-                    run_pull_sync_after_send(&state.settings, &partner_registry, &context);
+                    run_pull_sync_after_send(
+                        &state.settings,
+                        &partner_registry,
+                        &context,
+                        &runtime_services,
+                    );
                 }
             }
         }
@@ -515,7 +525,6 @@ fn legacy_main(mut req: FastlyRequest) {
         } => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
-            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
             if should_finalize_ec {
                 ec_finalize_response(
                     &state.settings,
@@ -524,10 +533,11 @@ fn legacy_main(mut req: FastlyRequest) {
                     &partner_registry,
                     eids_cookie.as_deref(),
                     sharedid_cookie.as_deref(),
-                    &mut fastly_resp,
+                    &mut response,
                 );
             }
-            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
+            request_filter_effects.apply_to_response(&mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
             match stream_publisher_body(
@@ -554,15 +564,20 @@ fn legacy_main(mut req: FastlyRequest) {
 
             if is_real_browser && stream_succeeded {
                 if let Some(context) = build_pull_sync_context(&ec_context) {
-                    run_pull_sync_after_send(&state.settings, &partner_registry, &context);
+                    run_pull_sync_after_send(
+                        &state.settings,
+                        &partner_registry,
+                        &context,
+                        &runtime_services,
+                    );
                 }
             }
         }
         HandlerOutcome::AssetStreaming { mut response, body } => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
-            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
-            request_filter_effects.apply_to_fastly_response(&mut fastly_resp);
+            request_filter_effects.apply_to_response(&mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
             let mut streaming_body = fastly_resp.stream_to_client();
             if let Err(e) =
                 futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
@@ -625,15 +640,8 @@ async fn route_request(
     partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
     mut req: HttpRequest,
+    device_signals: DeviceSignals,
 ) -> Result<RouteResult, Report<TrustedServerError>> {
-    // Build a Fastly request reference for APIs that require fastly types
-    // (EcContext, device signals, cookie extraction).  This is headers/method/URI
-    // only — body has already been moved into `req`.
-    let fastly_req_ref = compat::to_fastly_request_ref(&req);
-
-    // Extract device signals from TLS/H2/UA.  TLS fingerprints are available
-    // on the fastly request reference even without the body.
-    let device_signals = derive_device_signals(&fastly_req_ref);
     let is_real_browser = device_signals.looks_like_browser();
 
     if !is_real_browser {
@@ -646,8 +654,8 @@ async fn route_request(
     }
 
     // Extract the Prebid EIDs and SharedID cookies before routing.
-    let eids_cookie = extract_cookie_value(&fastly_req_ref, COOKIE_TS_EIDS);
-    let sharedid_cookie = extract_cookie_value(&fastly_req_ref, COOKIE_SHAREDID);
+    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
+    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
 
     // Extract geo info.
     let geo_info = runtime_services
@@ -678,13 +686,12 @@ async fn route_request(
             Ok(None) => {}
             Err(e) => return Err(e),
         }
-        let fastly_req = compat::to_fastly_request(req);
         let result = require_identity_graph(settings).and_then(|kv| {
             let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-            handle_batch_sync(&kv, partner_registry, &limiter, fastly_req)
+            handle_batch_sync(&kv, partner_registry, &limiter, req)
         });
         let outcome = match result {
-            Ok(fastly_resp) => HandlerOutcome::Buffered(compat::from_fastly_response(fastly_resp)),
+            Ok(resp) => HandlerOutcome::Buffered(resp),
             Err(e) => HandlerOutcome::Buffered(http_error_response(&e)),
         };
         return Ok(RouteResult {
@@ -701,23 +708,27 @@ async fn route_request(
     }
 
     // Build EC context using the fastly request reference (headers/method/URI).
-    let mut ec_context =
-        match EcContext::read_from_request_with_geo(settings, &fastly_req_ref, geo_info.as_ref()) {
-            Ok(context) => context,
-            Err(err) => {
-                return Ok(RouteResult {
-                    outcome: HandlerOutcome::Buffered(http_error_response(&err)),
-                    ec_context: EcContext::default(),
-                    finalize_kv_graph: None,
-                    eids_cookie,
-                    sharedid_cookie,
-                    is_real_browser,
-                    should_finalize_ec: true,
-                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                    request_filter_effects: RequestFilterEffects::default(),
-                });
-            }
-        };
+    let mut ec_context = match EcContext::read_from_request_with_geo(
+        settings,
+        &req,
+        runtime_services,
+        geo_info.as_ref(),
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            return Ok(RouteResult {
+                outcome: HandlerOutcome::Buffered(http_error_response(&err)),
+                ec_context: EcContext::default(),
+                finalize_kv_graph: None,
+                eids_cookie,
+                sharedid_cookie,
+                is_real_browser,
+                should_finalize_ec: true,
+                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
+                request_filter_effects: RequestFilterEffects::default(),
+            });
+        }
+    };
 
     // Pass device signals to EcContext so they are stored on new entries.
     ec_context.set_device_signals(device_signals);
@@ -835,17 +846,12 @@ async fn route_request(
             )
         }
         (Method::GET, "/_ts/api/v1/identify") => {
-            let fastly_ref = compat::to_fastly_request_ref(&req);
-            let outcome = require_identity_graph(settings).and_then(|kv| {
-                handle_identify(settings, &kv, partner_registry, &fastly_ref, &ec_context)
-                    .map(compat::from_fastly_response)
-            });
+            let outcome = require_identity_graph(settings)
+                .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context));
             (outcome, false)
         }
         (Method::OPTIONS, "/_ts/api/v1/identify") => {
-            let fastly_ref = compat::to_fastly_request_ref(&req);
-            let outcome =
-                cors_preflight_identify(settings, &fastly_ref).map(compat::from_fastly_response);
+            let outcome = cors_preflight_identify(settings, &req);
             (outcome, false)
         }
 
@@ -1030,6 +1036,7 @@ fn run_pull_sync_after_send(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
     context: &PullSyncContext,
+    services: &RuntimeServices,
 ) {
     let kv = match require_identity_graph(settings) {
         Ok(kv) => kv,
@@ -1040,7 +1047,7 @@ fn run_pull_sync_after_send(
     };
 
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context);
+    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context, services);
 }
 
 pub(crate) fn resolve_publisher_response_buffered(
@@ -1136,8 +1143,8 @@ pub(crate) fn require_identity_graph(
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
-pub(crate) fn extract_cookie_value(req: &FastlyRequest, name: &str) -> Option<String> {
-    let cookie_header = req.get_header_str("cookie")?;
+pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
+    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some((key, value)) = pair.split_once('=') {

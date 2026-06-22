@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use crate::compat;
 use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::response_builder as edge_response_builder;
@@ -14,7 +15,7 @@ use trusted_server_core::auction::{
     build_orchestrator, AuctionContext, AuctionOrchestrator, AuctionProvider, AuctionRequest,
     AuctionResponse,
 };
-use trusted_server_core::compat;
+use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
@@ -599,7 +600,6 @@ fn route_result_to_fastly_response(
     super::finalize_response(settings, geo_info.as_ref(), &mut response);
     asset_cache_policy.apply_after_route_finalization(&mut response);
 
-    let mut fastly_response = compat::to_fastly_response(response);
     if should_finalize_ec {
         ec_finalize_response(
             settings,
@@ -608,11 +608,19 @@ fn route_result_to_fastly_response(
             partner_registry,
             eids_cookie.as_deref(),
             sharedid_cookie.as_deref(),
-            &mut fastly_response,
+            &mut response,
         );
     }
-    request_filter_effects.apply_to_fastly_response(&mut fastly_response);
-    fastly_response
+    request_filter_effects.apply_to_response(&mut response);
+    compat::to_fastly_response(response)
+}
+
+fn browser_device_signals() -> DeviceSignals {
+    DeviceSignals::derive(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+        Some("t13d1516h2_000000000000_000000000000"),
+        None,
+    )
 }
 
 fn route_auction(settings: &Settings, body: impl Into<Vec<u8>>) -> fastly::Response {
@@ -641,6 +649,7 @@ fn route_auction_with_stack(
         &partner_registry,
         &services,
         compat::from_fastly_request(req),
+        browser_device_signals(),
     ))
     .expect("should route auction request");
     route_result_to_fastly_response(settings, &services, &partner_registry, route_result)
@@ -664,6 +673,7 @@ fn route_buffered_response(
         &partner_registry,
         services,
         compat::from_fastly_request(req),
+        browser_device_signals(),
     ))
     .expect(expect_message);
     route_result_to_fastly_response(settings, services, &partner_registry, route_result)
@@ -983,6 +993,7 @@ fn routes_use_request_local_consent() {
         &partner_registry,
         &discovery_services,
         compat::from_fastly_request(discovery_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route discovery request");
     assert_eq!(
@@ -1000,6 +1011,7 @@ fn routes_use_request_local_consent() {
         &partner_registry,
         &admin_services,
         compat::from_fastly_request(admin_fastly_req),
+        DeviceSignals::derive("", None, None),
     ))
     .expect("should route admin request");
     assert_eq!(
@@ -1218,6 +1230,7 @@ fn asset_routes_stream_asset_responses_directly() {
         &partner_registry,
         &services,
         req,
+        browser_device_signals(),
     ))
     .expect("should route streaming asset request");
 
