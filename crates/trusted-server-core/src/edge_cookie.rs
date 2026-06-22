@@ -38,7 +38,7 @@ pub fn generate_ec_id(
         .map(normalize_ip)
         .unwrap_or_else(|| "unknown".to_string());
 
-    log::trace!("Input for fresh EC ID: client_ip={}", client_ip);
+    log::trace!("Generating fresh EC ID from normalized client context");
 
     generate_canonical_ec_id(settings, &client_ip)
 }
@@ -61,7 +61,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
         .and_then(|h| h.to_str().ok())
     {
         if ec_id_has_only_allowed_chars(ec_id) {
-            log::trace!("Using existing EC ID from header: {}", ec_id);
+            log::trace!("Using existing EC ID from header");
             return Ok(Some(ec_id.to_string()));
         }
         log::warn!("Rejected EC ID from x-ts-ec header with disallowed characters");
@@ -72,7 +72,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
             if let Some(cookie) = jar.get(COOKIE_TS_EC) {
                 let value = cookie.value();
                 if ec_id_has_only_allowed_chars(value) {
-                    log::trace!("Using existing EC ID from cookie: {}", value);
+                    log::trace!("Using existing EC ID from cookie");
                     return Ok(Some(value.to_string()));
                 }
                 log::warn!("Rejected EC ID from cookie with disallowed characters");
@@ -108,7 +108,7 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
 
     // If no existing EC ID found, generate a fresh one
     let ec_id = generate_ec_id(settings, services)?;
-    log::trace!("No existing EC ID, generated: {}", ec_id);
+    log::trace!("No existing EC ID found; generated a fresh EC ID");
     Ok(ec_id)
 }
 

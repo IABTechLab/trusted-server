@@ -236,11 +236,11 @@ pub fn load_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) -> Option<
     let bytes = match futures::executor::block_on(store.get_bytes(ec_id)) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            log::debug!("Consent KV lookup miss for '{ec_id}'");
+            log::debug!("Consent KV lookup miss");
             return None;
         }
         Err(e) => {
-            log::debug!("Consent KV lookup error for '{ec_id}': {e}");
+            log::debug!("Consent KV lookup error: {e}");
             return None;
         }
     };
@@ -248,13 +248,13 @@ pub fn load_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) -> Option<
     match serde_json::from_slice::<KvConsentEntry>(&bytes) {
         Ok(entry) => {
             log::info!(
-                "Loaded consent from KV store for '{ec_id}' (stored_at_ds={})",
+                "Loaded consent from KV store (stored_at_ds={})",
                 entry.stored_at_ds
             );
             Some(context_from_entry(&entry))
         }
         Err(e) => {
-            log::warn!("Failed to deserialize consent KV entry for '{ec_id}': {e}");
+            log::warn!("Failed to deserialize consent KV entry: {e}");
             None
         }
     }
@@ -286,7 +286,7 @@ pub fn save_consent_to_kv(
     let fp = consent_fingerprint(ctx);
 
     if fingerprint_unchanged(store, ec_id, &fp) {
-        log::debug!("Consent unchanged for '{ec_id}' (fp={fp}), skipping write");
+        log::debug!("Consent unchanged; skipping write");
         return;
     }
 
@@ -296,7 +296,7 @@ pub fn save_consent_to_kv(
     let body = match serde_json::to_vec(&entry) {
         Ok(body) => Bytes::from(body),
         Err(e) => {
-            log::warn!("Failed to serialize consent entry for '{ec_id}': {e}");
+            log::warn!("Failed to serialize consent entry: {e}");
             return;
         }
     };
@@ -305,10 +305,10 @@ pub fn save_consent_to_kv(
 
     match futures::executor::block_on(store.put_bytes_with_ttl(ec_id, body, ttl)) {
         Ok(()) => {
-            log::info!("Saved consent to KV store for '{ec_id}' (fp={fp}, ttl={max_age_days}d)");
+            log::info!("Saved consent to KV store (ttl={max_age_days}d)");
         }
         Err(e) => {
-            log::warn!("Failed to write consent to KV store for '{ec_id}': {e}");
+            log::warn!("Failed to write consent to KV store: {e}");
         }
     }
 }
@@ -323,10 +323,10 @@ pub fn save_consent_to_kv(
 pub fn delete_consent_from_kv(store: &dyn PlatformKvStore, ec_id: &str) {
     match futures::executor::block_on(store.delete(ec_id)) {
         Ok(()) => {
-            log::info!("Deleted consent KV entry for '{ec_id}' (consent revoked)");
+            log::info!("Deleted consent KV entry (consent revoked)");
         }
         Err(e) => {
-            log::warn!("Failed to delete consent KV entry for '{ec_id}': {e}");
+            log::warn!("Failed to delete consent KV entry: {e}");
         }
     }
 }
