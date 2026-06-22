@@ -32,7 +32,7 @@ const ALPHANUMERIC_CHARSET: &[u8] =
 /// - **IPv4:** decimal-dotted notation (e.g. `"192.168.1.1"`)
 /// - **IPv6:** first 4 segments as zero-padded lowercase hex without
 ///   separators (e.g. `"20010db885a30000"`)
-fn normalize_ip(ip: IpAddr) -> String {
+pub(crate) fn normalize_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ipv4) => ipv4.to_string(),
         IpAddr::V6(ipv6) => {
@@ -98,23 +98,6 @@ pub fn generate_ec_id(
     log::trace!("Generated fresh EC ID: {}", super::log_id(&ec_id));
 
     Ok(ec_id)
-}
-
-/// Extracts and normalizes the client IP from a request.
-///
-/// Returns the normalized IP as a string suitable for HMAC input.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::EdgeCookie`] when the client IP is unavailable
-/// (e.g. in certain test or proxy configurations). EC generation requires
-/// a valid client IP — there is no fallback.
-pub fn extract_client_ip(req: &fastly::Request) -> Result<String, Report<TrustedServerError>> {
-    req.get_client_ip_addr().map(normalize_ip).ok_or_else(|| {
-        Report::new(TrustedServerError::EdgeCookie {
-            message: "Client IP required for EC generation but unavailable".to_string(),
-        })
-    })
 }
 
 /// Extracts the stable 64-character hex prefix from an EC ID.

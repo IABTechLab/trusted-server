@@ -37,7 +37,7 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
 /// On Fastly Compute the service is the edge — there is no upstream proxy that
 /// legitimately sets these. Stripping them forces [`RequestInfo::from_request`]
 /// to fall back to the trustworthy `Host` header and [`ClientInfo`] TLS detection.
-pub(crate) const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
+pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
     "x-forwarded-proto",
@@ -216,7 +216,7 @@ fn normalize_scheme(value: &str) -> Option<String> {
 /// 1. Fastly SDK TLS detection methods (most reliable)
 /// 2. Forwarded header (RFC 7239)
 /// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (least reliable, can be spoofed)
+/// 4. Fastly-SSL header (trusted on `EdgeZero` path; can be spoofed on legacy path)
 /// 5. Default to HTTP
 fn detect_request_scheme(
     req: &Request<EdgeBody>,
@@ -257,7 +257,9 @@ fn detect_request_scheme(
         }
     }
 
-    // 4. Check Fastly-SSL header (can be spoofed by clients, use as last resort)
+    // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
+    //    authoritative Fastly TLS metadata after spoofable headers are stripped,
+    //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
     if let Some(ssl) = req.headers().get("fastly-ssl") {
         if let Ok(ssl_str) = ssl.to_str() {
             if ssl_str == "1" || ssl_str.to_lowercase() == "true" {
