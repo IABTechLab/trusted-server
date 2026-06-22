@@ -758,8 +758,8 @@ fn build_asset_proxy_target_url(
     Ok(target_url)
 }
 
-fn asset_path_skips_image_optimizer(target_url: &url::Url) -> bool {
-    let lower_path = target_url.path().to_ascii_lowercase();
+fn asset_path_skips_image_optimizer(path: &str) -> bool {
+    let lower_path = path.to_ascii_lowercase();
     lower_path.ends_with(".svg") || lower_path.ends_with(".svgz")
 }
 
@@ -1037,12 +1037,15 @@ pub async fn handle_asset_proxy_request(
     req: Request<EdgeBody>,
     route: &ProxyAssetRoute,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
+    let incoming_path = req.uri().path();
     let incoming_query = req.uri().query().unwrap_or("");
-    let mut target_url = build_asset_proxy_target_url(route, req.uri().path(), incoming_query)?;
-    let skip_image_optimizer = asset_path_skips_image_optimizer(&target_url);
+    let mut target_url = build_asset_proxy_target_url(route, incoming_path, incoming_query)?;
+    let skip_image_optimizer = asset_path_skips_image_optimizer(incoming_path)
+        || asset_path_skips_image_optimizer(target_url.path());
     let image_optimizer = if skip_image_optimizer {
         log::debug!(
-            "Skipping Image Optimizer for unsupported SVG asset path: {}",
+            "Skipping Image Optimizer for unsupported SVG asset path: incoming={}, target={}",
+            incoming_path,
             target_url.path()
         );
         None
@@ -3313,7 +3316,7 @@ mod tests {
         ] {
             let target_url = url::Url::parse(url).expect("should parse target URL");
             assert!(
-                asset_path_skips_image_optimizer(&target_url),
+                asset_path_skips_image_optimizer(target_url.path()),
                 "should skip Image Optimizer for {url}"
             );
         }
@@ -3328,7 +3331,7 @@ mod tests {
         ] {
             let target_url = url::Url::parse(url).expect("should parse target URL");
             assert!(
-                !asset_path_skips_image_optimizer(&target_url),
+                !asset_path_skips_image_optimizer(target_url.path()),
                 "should allow Image Optimizer for {url}"
             );
         }
@@ -3851,6 +3854,51 @@ mod tests {
                 stub.recorded_image_optimizer_options(),
                 vec![None],
                 "SVG assets should bypass Image Optimizer metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn handle_asset_proxy_request_skips_image_optimizer_for_incoming_svg() {
+        futures::executor::block_on(async {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut settings = create_test_settings();
+            let mut profile_set = test_profile_set();
+            profile_set.unknown_profile = UnknownProfilePolicy::Reject;
+            settings.image_optimizer = ImageOptimizerSettings {
+                profile_sets: HashMap::from([("default_images".to_string(), profile_set)]),
+            };
+            let req = build_http_request(
+                Method::GET,
+                "https://www.example.com/.image/object-id/logo.svg?profile=unknown&ar=1-1",
+            );
+            let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
+            route.path_pattern = Some(r"^/\.image/([^/]+)/[^/]+\.([^/.]+)$".to_string());
+            route.target_path = Some("/image/upload/$1".to_string());
+            route.image_optimizer = Some(AssetImageOptimizerConfig {
+                enabled: true,
+                region: "us_east".to_string(),
+                profile_set: "default_images".to_string(),
+                origin_query: None,
+            });
+
+            handle_asset_proxy_request(&settings, &services, req, &route)
+                .await
+                .expect("should proxy incoming SVG asset without Image Optimizer profile parsing");
+
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://assets.example.com/image/upload/object-id"],
+                "should strip profile-table query even when SVG target path omits extension"
+            );
+            assert_eq!(
+                stub.recorded_image_optimizer_options(),
+                vec![None],
+                "incoming SVG assets should bypass Image Optimizer metadata"
             );
         });
     }
