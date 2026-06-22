@@ -17,5 +17,18 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # worker-build must run from the crate root (where Cargo.toml lives) regardless
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
-command -v worker-build >/dev/null 2>&1 || cargo install -q --version '^0.7' worker-build
+
+# worker-build must match the worker crate's 0.7 API surface pinned in Cargo.toml.
+# A globally installed worker-build 0.8.x rejects worker 0.7 with
+# "Unsupported version worker@0.7.x, expected at least worker@0.8.4", so check the
+# installed major.minor and (re)install ^0.7 when it is absent or mismatched
+# rather than only when it is missing.
+worker_build_version=""
+if command -v worker-build >/dev/null 2>&1; then
+    worker_build_version="$(worker-build --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+fi
+case "$worker_build_version" in
+    0.7.*) ;;
+    *) cargo install -q --version '^0.7' --force worker-build ;;
+esac
 worker-build --release
