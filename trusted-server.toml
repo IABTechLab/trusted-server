@@ -128,6 +128,9 @@ cdn_origin = "https://cdn.privacy-mgmt.com"
 # auth_cookie_name = "sp_auth"
 cache_ttl_seconds = 3600
 
+[integrations.osano]
+enabled = false
+
 [integrations.permutive]
 enabled = false
 organization_id = ""
