@@ -4,8 +4,8 @@ use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
 use url::Url;
 
-use crate::error::TrustedServerError;
-use crate::host_header::validate_host_header_override_value;
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::host_header::validate_host_header_override_value;
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]
@@ -214,10 +214,7 @@ impl<'a> BackendConfig<'a> {
         if self.scheme.eq_ignore_ascii_case("https") {
             builder = builder.enable_ssl().sni_hostname(self.host);
             if self.certificate_check {
-                builder = builder
-                    .enable_ssl()
-                    .sni_hostname(self.host)
-                    .check_certificate(self.host);
+                builder = builder.check_certificate(self.host);
             } else {
                 log::warn!("INSECURE: certificate check disabled for backend: {backend_name}");
             }
@@ -247,11 +244,9 @@ impl<'a> BackendConfig<'a> {
 
     /// Parse an origin URL into its (scheme, host, port) components.
     ///
-    /// Centralises URL parsing so that [`from_url`](Self::from_url),
-    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout),
-    /// [`from_url_with_host_header_override`](Self::from_url_with_host_header_override),
-    /// and [`backend_name_for_url`](Self::backend_name_for_url) share one
-    /// code-path.
+    /// Centralises URL parsing so that [`from_url`](Self::from_url) and
+    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
+    /// share one code-path.
     fn parse_origin(
         origin_url: &str,
     ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
@@ -318,25 +313,6 @@ impl<'a> BackendConfig<'a> {
         )
     }
 
-    /// Parse an origin URL and ensure a dynamic backend with a custom Host header.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the URL cannot be parsed or lacks a host, or if
-    /// backend creation fails.
-    pub fn from_url_with_host_header_override(
-        origin_url: &str,
-        certificate_check: bool,
-        host_header_override: Option<&str>,
-    ) -> Result<String, Report<TrustedServerError>> {
-        Self::from_url_with_first_byte_timeout_and_host_header_override(
-            origin_url,
-            certificate_check,
-            DEFAULT_FIRST_BYTE_TIMEOUT,
-            host_header_override,
-        )
-    }
-
     fn from_url_with_first_byte_timeout_and_host_header_override(
         origin_url: &str,
         certificate_check: bool,
@@ -351,37 +327,6 @@ impl<'a> BackendConfig<'a> {
             .first_byte_timeout(first_byte_timeout)
             .host_header_override(host_header_override)
             .ensure()
-    }
-
-    /// Compute the backend name that
-    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
-    /// would produce for the given URL and timeout, **without** registering a
-    /// backend.
-    ///
-    /// This is useful when callers need the name for mapping purposes (e.g. the
-    /// auction orchestrator correlating responses to providers) but want the
-    /// actual registration to happen later with specific settings.
-    ///
-    /// The `first_byte_timeout` must match the value that will be used at
-    /// registration time so that the predicted name is correct.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the URL cannot be parsed or lacks a host.
-    pub fn backend_name_for_url(
-        origin_url: &str,
-        certificate_check: bool,
-        first_byte_timeout: Duration,
-    ) -> Result<String, Report<TrustedServerError>> {
-        let (scheme, host, port) = Self::parse_origin(origin_url)?;
-
-        let (name, _) = BackendConfig::new(&scheme, &host)
-            .port(port)
-            .certificate_check(certificate_check)
-            .first_byte_timeout(first_byte_timeout)
-            .compute_name()?;
-
-        Ok(name)
     }
 }
 

@@ -1,5 +1,5 @@
 use config::{Config, Environment, File, FileFormat};
-use error_stack::{Report, ResultExt as _};
+use error_stack::{Report, ResultExt};
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
@@ -20,7 +20,7 @@ use crate::redacted::Redacted;
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct Publisher {
     #[validate(custom(function = validate_publisher_domain))]
@@ -39,6 +39,51 @@ pub struct Publisher {
     /// Keep this secret stable to allow existing links to decode.
     #[validate(custom(function = validate_redacted_not_empty))]
     pub proxy_secret: Redacted<String>,
+    /// Maximum number of bytes buffered when a publisher origin response is
+    /// post-processed in full (HTML rewriting/injection) instead of streamed.
+    /// This caps the *decoded, post-rewrite* output buffer and applies to any
+    /// such buffered response on **both** the legacy and `EdgeZero` paths;
+    /// exceeding it fails the response rather than allocating past the cap.
+    /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
+    ///
+    /// On Fastly the *effective* ceiling for a publisher page is lower: the
+    /// platform HTTP client rejects any origin response whose raw (still
+    /// compressed) body exceeds 10 MiB before this buffer is ever filled, so
+    /// raising this value only helps highly compressible pages whose decoded
+    /// size exceeds the 16 MiB default while their compressed origin body stays
+    /// under 10 MiB. Raising it above ~10 MiB does not lift the platform cap for
+    /// uncompressed pages. That platform limit is removed once true streaming
+    /// lands (tracked for PR 15, issue #495), after which this setting becomes
+    /// the sole ceiling.
+    ///
+    /// Must be at least 1: a zero-byte cap fails every non-empty buffered
+    /// publisher response at request time, so it is rejected at config
+    /// validation instead.
+    #[serde(default = "default_max_buffered_body_bytes")]
+    #[validate(range(min = 1, message = "must be at least 1 byte"))]
+    pub max_buffered_body_bytes: usize,
+}
+
+fn default_max_buffered_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+impl Default for Publisher {
+    /// Hand-written so `max_buffered_body_bytes` matches the serde default
+    /// ([`default_max_buffered_body_bytes`]) instead of `usize`'s `0`. A derived
+    /// `Default` would set a zero-byte cap, which fails buffered post-processing
+    /// immediately when `Publisher::default()` / `Settings::default()` are used
+    /// programmatically (tests, helpers) rather than deserialized from TOML.
+    fn default() -> Self {
+        Self {
+            domain: String::default(),
+            cookie_domain: String::default(),
+            origin_url: String::default(),
+            origin_host_header_override: None,
+            proxy_secret: Redacted::default(),
+            max_buffered_body_bytes: default_max_buffered_body_bytes(),
+        }
+    }
 }
 
 impl Publisher {
@@ -78,21 +123,19 @@ impl Publisher {
     ///     origin_url: "https://origin.example.com:8080".to_string(),
     ///     origin_host_header_override: None,
     ///     proxy_secret: Redacted::new("proxy-secret".to_string()),
+    ///     max_buffered_body_bytes: 16 * 1024 * 1024,
     /// };
     /// assert_eq!(publisher.origin_host(), "origin.example.com:8080");
     /// ```
-    #[allow(
-        dead_code,
-        reason = "used by doctests and callers outside build.rs path inclusion"
-    )]
+    #[allow(dead_code)]
     #[must_use]
     pub fn origin_host(&self) -> String {
         Url::parse(&self.origin_url)
             .ok()
             .and_then(|url| {
                 url.host_str().map(|host| match url.port() {
-                    Some(port) => format!("{host}:{port}"),
-                    None => host.to_owned(),
+                    Some(port) => format!("{}:{}", host, port),
+                    None => host.to_string(),
                 })
             })
             .unwrap_or_else(|| self.origin_url.clone())
@@ -123,13 +166,7 @@ impl IntegrationSettings {
     /// # Errors
     ///
     /// Returns an error if the configuration cannot be serialized to JSON.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "used by tests and available for runtime configuration assembly"
-        )
-    )]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert_config<T>(
         &mut self,
         integration_id: impl Into<String>,
@@ -140,7 +177,7 @@ impl IntegrationSettings {
     {
         let json =
             serde_json::to_value(value).change_context(TrustedServerError::Configuration {
-                message: "Failed to serialize integration configuration".to_owned(),
+                message: "Failed to serialize integration configuration".to_string(),
             })?;
         self.entries.insert(integration_id.into(), json);
         Ok(())
@@ -196,8 +233,9 @@ impl IntegrationSettings {
     where
         T: IntegrationConfig,
     {
-        let Some(raw) = self.entries.get(integration_id) else {
-            return Ok(None);
+        let raw = match self.entries.get(integration_id) {
+            Some(value) => value,
+            None => return Ok(None),
         };
 
         if Self::is_explicitly_disabled(raw) {
@@ -502,10 +540,7 @@ pub struct Rewrite {
 
 impl Rewrite {
     /// Checks if a URL should be excluded from rewriting based on domain matching
-    #[allow(
-        dead_code,
-        reason = "used by URL rewriting tests and optional integration configuration"
-    )]
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_excluded(&self, url: &str) -> bool {
         // Parse URL to extract host
@@ -519,7 +554,7 @@ impl Rewrite {
         for domain in &self.exclude_domains {
             if let Some(suffix) = domain.strip_prefix("*.") {
                 // Wildcard: *.example.com matches both example.com and sub.example.com
-                if host == suffix || host.ends_with(&format!(".{suffix}")) {
+                if host == suffix || host.ends_with(&format!(".{}", suffix)) {
                     return true;
                 }
             } else if host == domain {
@@ -1664,10 +1699,20 @@ pub struct DebugConfig {
     pub ja4_endpoint_enabled: bool,
 }
 
+/// Tester-cookie endpoint configuration.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct TesterCookieConfig {
+    /// Enable `GET /_ts/set-tester`, which sets `ts-tester=true`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
+    #[serde(default)]
+    pub tester_cookie: TesterCookieConfig,
     #[serde(default)]
     #[validate(nested)]
     pub ec: Ec,
@@ -1706,7 +1751,7 @@ impl Settings {
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let mut settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
-                message: "Failed to deserialize TOML configuration".to_owned(),
+                message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
         settings.proxy.normalize();
@@ -1746,13 +1791,13 @@ impl Settings {
             .add_source(environment)
             .build()
             .change_context(TrustedServerError::Configuration {
-                message: "Failed to build configuration".to_owned(),
+                message: "Failed to build configuration".to_string(),
             })?;
         let mut settings: Self =
             config
                 .try_deserialize()
                 .change_context(TrustedServerError::Configuration {
-                    message: "Failed to deserialize configuration".to_owned(),
+                    message: "Failed to deserialize configuration".to_string(),
                 })?;
 
         settings.integrations.normalize();
@@ -2215,9 +2260,9 @@ where
             .collect(),
         JsonValue::Object(map) => {
             let mut items: Vec<(usize, T)> = Vec::with_capacity(map.len());
-            for (k, val) in map {
+            for (k, val) in map.into_iter() {
                 let idx = k.parse::<usize>().map_err(|_| {
-                    serde::de::Error::custom(format!("Invalid index '{k}' in map for Vec field"))
+                    serde::de::Error::custom(format!("Invalid index '{}' in map for Vec field", k))
                 })?;
                 let parsed: T = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
                 items.push((idx, parsed));
@@ -2266,7 +2311,8 @@ where
             }
         }
         other => Err(serde::de::Error::custom(format!(
-            "expected array, map of indices, or parseable string, got {other}"
+            "expected array, map of indices, or parseable string, got {}",
+            other
         ))),
     }
 }
@@ -2325,6 +2371,10 @@ mod tests {
         );
         assert_eq!(settings.publisher.domain, "test-publisher.com");
         assert_eq!(settings.publisher.cookie_domain, ".test-publisher.com");
+        assert!(
+            !settings.tester_cookie.enabled,
+            "tester-cookie route should default to disabled"
+        );
         assert_eq!(
             settings.publisher.ec_cookie_domain(),
             ".test-publisher.com",
@@ -2341,6 +2391,25 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn tester_cookie_enabled_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse tester-cookie config");
+
+        assert!(
+            settings.tester_cookie.enabled,
+            "tester-cookie config should enable the route"
+        );
     }
 
     #[test]
@@ -2497,7 +2566,7 @@ origin_host_header_overide = "www.example.com""#,
 
     #[test]
     fn test_settings_missing_required_fields() {
-        let re = Regex::new("origin_url = .*").expect("regex should compile");
+        let re = Regex::new(r"origin_url = .*").expect("regex should compile");
 
         let toml_str = crate_test_settings_str();
         let toml_str = re.replace(&toml_str, "");
@@ -2643,12 +2712,19 @@ origin_host_header_overide = "www.example.com""#,
     fn test_prebid_bidders_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}PREBID{ENVIRONMENT_VARIABLE_SEPARATOR}BIDDERS"
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         // Ensure no external override interferes
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -2666,7 +2742,7 @@ origin_host_header_overide = "www.example.com""#,
                         .expect("Prebid config should exist with env override");
                     assert_eq!(
                         cfg.bidders,
-                        vec!["smartadserver".to_owned(), "rubicon".to_owned()]
+                        vec!["smartadserver".to_string(), "rubicon".to_string()]
                     );
                 });
             },
@@ -2678,15 +2754,28 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let env_key0 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}PREBID{ENVIRONMENT_VARIABLE_SEPARATOR}BIDDERS{ENVIRONMENT_VARIABLE_SEPARATOR}0"
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}0",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let env_key1 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}PREBID{ENVIRONMENT_VARIABLE_SEPARATOR}BIDDERS{ENVIRONMENT_VARIABLE_SEPARATOR}1"
+            "{}{}INTEGRATIONS{}PREBID{}BIDDERS{}1",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         // Also ensure origin_url env is a plain string (avoid any external env interference)
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -2706,7 +2795,7 @@ origin_host_header_overide = "www.example.com""#,
                             .expect("Prebid config should exist with indexed env override");
                         assert_eq!(
                             cfg.bidders,
-                            vec!["smartadserver".to_owned(), "openx".to_owned()]
+                            vec!["smartadserver".to_string(), "openx".to_string()]
                         );
                     });
                 });
@@ -2718,11 +2807,18 @@ origin_host_header_overide = "www.example.com""#,
     fn test_prebid_bid_param_overrides_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}PREBID{ENVIRONMENT_VARIABLE_SEPARATOR}BID_PARAM_OVERRIDES"
+            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDES",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -2761,11 +2857,18 @@ origin_host_header_overide = "www.example.com""#,
     fn test_prebid_bid_param_override_rules_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}PREBID{ENVIRONMENT_VARIABLE_SEPARATOR}BID_PARAM_OVERRIDE_RULES"
+            "{}{}INTEGRATIONS{}PREBID{}BID_PARAM_OVERRIDE_RULES",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -3027,27 +3130,54 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         // Override handler 0 via env vars
         let path_key_0 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}PATH"
+            "{}{}HANDLERS{}0{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let username_key_0 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}USERNAME"
+            "{}{}HANDLERS{}0{}USERNAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let password_key_0 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}PASSWORD"
+            "{}{}HANDLERS{}0{}PASSWORD",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         // Admin handler at index 1 (required for admin endpoint coverage)
         let path_key_1 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}PATH"
+            "{}{}HANDLERS{}1{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let username_key_1 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}USERNAME"
+            "{}{}HANDLERS{}1{}USERNAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let password_key_1 = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}PASSWORD"
+            "{}{}HANDLERS{}1{}PASSWORD",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         temp_env::with_vars(
@@ -3077,37 +3207,90 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_0_name_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}NAME"
+            "{}{}EC{}PARTNERS{}0{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_0_source_domain_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}SOURCE_DOMAIN"
+            "{}{}EC{}PARTNERS{}0{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_0_openrtb_atype_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}OPENRTB_ATYPE"
+            "{}{}EC{}PARTNERS{}0{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_0_bidstream_enabled_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}BIDSTREAM_ENABLED"
+            "{}{}EC{}PARTNERS{}0{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_0_api_token_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}API_TOKEN"
+            "{}{}EC{}PARTNERS{}0{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_1_name_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}NAME"
+            "{}{}EC{}PARTNERS{}1{}NAME",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_1_source_domain_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}SOURCE_DOMAIN"
+            "{}{}EC{}PARTNERS{}1{}SOURCE_DOMAIN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_1_openrtb_atype_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}OPENRTB_ATYPE"
+            "{}{}EC{}PARTNERS{}1{}OPENRTB_ATYPE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_1_bidstream_enabled_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}BIDSTREAM_ENABLED"
+            "{}{}EC{}PARTNERS{}1{}BIDSTREAM_ENABLED",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let partner_1_api_token_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}EC{ENVIRONMENT_VARIABLE_SEPARATOR}PARTNERS{ENVIRONMENT_VARIABLE_SEPARATOR}1{ENVIRONMENT_VARIABLE_SEPARATOR}API_TOKEN"
+            "{}{}EC{}PARTNERS{}1{}API_TOKEN",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         temp_env::with_vars(
@@ -3154,10 +3337,17 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         let path_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}HANDLERS{ENVIRONMENT_VARIABLE_SEPARATOR}0{ENVIRONMENT_VARIABLE_SEPARATOR}PATH"
+            "{}{}HANDLERS{}0{}PATH",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         temp_env::with_var(
@@ -3176,7 +3366,8 @@ origin_host_header_overide = "www.example.com""#,
     fn test_response_headers_override_with_json_env() {
         let toml_str = crate_test_settings_str();
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}RESPONSE_HEADERS",
+            "{}{}RESPONSE_HEADERS",
+            ENVIRONMENT_VARIABLE_PREFIX, ENVIRONMENT_VARIABLE_SEPARATOR,
         );
 
         temp_env::with_var(
@@ -3188,11 +3379,11 @@ origin_host_header_overide = "www.example.com""#,
                 assert_eq!(settings.response_headers.len(), 2);
                 assert_eq!(
                     settings.response_headers.get("X-Robots-Tag"),
-                    Some(&"noindex".to_owned())
+                    Some(&"noindex".to_string())
                 );
                 assert_eq!(
                     settings.response_headers.get("X-Custom-Header"),
-                    Some(&"custom value".to_owned())
+                    Some(&"custom value".to_string())
                 );
             },
         );
@@ -3210,7 +3401,10 @@ origin_host_header_overide = "www.example.com""#,
     fn test_set_env() {
         temp_env::with_var(
             format!(
-                "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+                "{}{}PUBLISHER{}ORIGIN_URL",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR
             ),
             Some("https://change-publisher.com"),
             || {
@@ -3231,7 +3425,10 @@ origin_host_header_overide = "www.example.com""#,
 
         temp_env::with_var(
             format!(
-                "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+                "{}{}PUBLISHER{}ORIGIN_URL",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR
             ),
             Some("https://change-publisher.com"),
             || {
@@ -3249,7 +3446,10 @@ origin_host_header_overide = "www.example.com""#,
     #[test]
     fn test_origin_host_header_override_env() {
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_HOST_HEADER_OVERRIDE"
+            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         temp_env::with_var(env_key, Some("www.example.com"), || {
@@ -3267,7 +3467,10 @@ origin_host_header_overide = "www.example.com""#,
     #[test]
     fn test_origin_host_header_override_env_typo_fails_closed() {
         let env_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_HOST_HEADER_OVERIDE"
+            "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERIDE",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         temp_env::with_var(env_key, Some("www.example.com"), || {
@@ -3284,61 +3487,67 @@ origin_host_header_overide = "www.example.com""#,
     fn test_publisher_origin_host() {
         // Test with full URL including port
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "https://origin.example.com:8080".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com:8080".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com:8080");
 
         // Test with URL without port (default HTTPS port)
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "https://origin.example.com".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "origin.example.com");
 
         // Test with HTTP URL with explicit port
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "http://localhost:9090".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "http://localhost:9090".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
         // Test with URL without protocol (fallback to original)
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "localhost:9090".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "localhost:9090".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "localhost:9090");
 
         // Test with IPv4 address
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "http://192.168.1.1:8080".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "http://192.168.1.1:8080".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "192.168.1.1:8080");
 
         // Test with IPv6 address
         let publisher = Publisher {
-            domain: "example.com".to_owned(),
-            cookie_domain: ".example.com".to_owned(),
-            origin_url: "http://[::1]:8080".to_owned(),
+            domain: "example.com".to_string(),
+            cookie_domain: ".example.com".to_string(),
+            origin_url: "http://[::1]:8080".to_string(),
             origin_host_header_override: None,
-            proxy_secret: Redacted::new("test-secret".to_owned()),
+            proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(publisher.origin_host(), "[::1]:8080");
     }
@@ -3351,6 +3560,7 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com:8443".to_string(),
             origin_host_header_override: None,
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
         assert_eq!(publisher.origin_host_header(), "origin.example.com:8443");
@@ -3364,9 +3574,75 @@ origin_host_header_overide = "www.example.com""#,
             origin_url: "https://origin.example.com".to_string(),
             origin_host_header_override: Some("www.example.com".to_string()),
             proxy_secret: Redacted::new("test-secret".to_string()),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
 
         assert_eq!(publisher.origin_host_header(), "www.example.com");
+    }
+
+    #[test]
+    fn publisher_default_max_buffered_body_bytes_matches_config_default() {
+        // The manual `Default` impl must agree with the serde default applied
+        // when the key is omitted from TOML, so programmatic `Publisher::default()`
+        // does not silently produce a zero-byte buffer cap.
+        assert_eq!(
+            Publisher::default().max_buffered_body_bytes,
+            super::default_max_buffered_body_bytes(),
+            "Publisher::default() must use the same buffer cap as the TOML default"
+        );
+
+        let from_toml = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse settings without max_buffered_body_bytes");
+        assert_eq!(
+            from_toml.publisher.max_buffered_body_bytes,
+            Publisher::default().max_buffered_body_bytes,
+            "TOML default and Publisher::default() must stay aligned"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_buffered_body_bytes() {
+        // A zero-byte cap fails every non-empty buffered publisher response at
+        // request time, so it must be rejected at config validation instead of
+        // silently breaking traffic.
+        let result = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "example.com"
+            cookie_domain = ".example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "unit-test-proxy-secret"
+            max_buffered_body_bytes = 0
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        );
+        assert!(
+            result.is_err(),
+            "publisher.max_buffered_body_bytes = 0 must fail config validation"
+        );
     }
 
     #[test]
@@ -3376,17 +3652,24 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
         let integration_prefix = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}TESTLIGHT{ENVIRONMENT_VARIABLE_SEPARATOR}"
+            "{}{}INTEGRATIONS{}TESTLIGHT{}",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
 
-        let endpoint_key = format!("{integration_prefix}ENDPOINT");
-        let timeout_key = format!("{integration_prefix}TIMEOUT_MS");
-        let rewrite_key = format!("{integration_prefix}REWRITE_SCRIPTS");
-        let enabled_key = format!("{integration_prefix}ENABLED");
+        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
+        let timeout_key = format!("{}TIMEOUT_MS", integration_prefix);
+        let rewrite_key = format!("{}REWRITE_SCRIPTS", integration_prefix);
+        let enabled_key = format!("{}ENABLED", integration_prefix);
 
         temp_env::with_var(
             origin_key,
@@ -3508,8 +3791,9 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert GPT config");
 
-        let Err(err) = IntegrationRegistry::new(&settings) else {
-            panic!("enabled invalid integration should fail registry startup");
+        let err = match IntegrationRegistry::new(&settings) {
+            Ok(_) => panic!("enabled invalid integration should fail registry startup"),
+            Err(err) => err,
         };
         assert!(
             err.to_string().contains("Integration 'gpt'"),
@@ -3548,8 +3832,9 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert adserver mock config");
 
-        let Err(err) = build_orchestrator(&settings) else {
-            panic!("enabled invalid provider config should fail startup");
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("enabled invalid provider config should fail startup"),
+            Err(err) => err,
         };
         assert!(
             err.to_string().contains("Integration 'adserver_mock'"),
@@ -3571,8 +3856,9 @@ origin_host_header_overide = "www.example.com""#,
             )
             .expect("should insert prebid config");
 
-        let Err(err) = build_orchestrator(&settings) else {
-            panic!("empty prebid server_url should fail startup");
+        let err = match build_orchestrator(&settings) {
+            Ok(_) => panic!("empty prebid server_url should fail startup"),
+            Err(err) => err,
         };
         assert!(
             err.to_string()
@@ -3591,10 +3877,14 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str();
 
         let integration_prefix = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}INTEGRATIONS{ENVIRONMENT_VARIABLE_SEPARATOR}TESTLIGHT{ENVIRONMENT_VARIABLE_SEPARATOR}",
+            "{}{}INTEGRATIONS{}TESTLIGHT{}",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
         );
-        let enabled_key = format!("{integration_prefix}ENABLED");
-        let endpoint_key = format!("{integration_prefix}ENDPOINT");
+        let enabled_key = format!("{}ENABLED", integration_prefix);
+        let endpoint_key = format!("{}ENDPOINT", integration_prefix);
 
         temp_env::with_var(enabled_key, Some("true"), || {
             temp_env::with_var(
@@ -3641,7 +3931,10 @@ origin_host_header_overide = "www.example.com""#,
 
         temp_env::with_var(
             format!(
-                "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}DOMAIN",
+                "{}{}PUBLISHER{}DOMAIN",
+                ENVIRONMENT_VARIABLE_PREFIX,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
+                ENVIRONMENT_VARIABLE_SEPARATOR,
             ),
             Some("env-override.com"),
             || {
@@ -3657,7 +3950,7 @@ origin_host_header_overide = "www.example.com""#,
     #[test]
     fn test_rewrite_is_excluded() {
         let rewrite = Rewrite {
-            exclude_domains: vec!["cdn.example.com".to_owned(), "*.example2.com".to_owned()],
+            exclude_domains: vec!["cdn.example.com".to_string(), "*.example2.com".to_string()],
         };
 
         // Exact domain match
@@ -3701,19 +3994,19 @@ origin_host_header_overide = "www.example.com""#,
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert_eq!(
             settings.auction.allowed_context_keys,
-            HashSet::from(["permutive_segments".to_owned(), "lockr_ids".to_owned()])
+            HashSet::from(["permutive_segments".to_string(), "lockr_ids".to_string()])
         );
     }
 
     #[test]
     fn test_auction_empty_allowed_context_keys_blocks_all() {
         let toml_str = crate_test_settings_str()
-            + "
+            + r#"
             [auction]
             enabled = true
             providers = []
             allowed_context_keys = []
-            ";
+            "#;
         let settings = Settings::from_toml(&toml_str).expect("should parse valid TOML");
         assert!(
             settings.auction.allowed_context_keys.is_empty(),
@@ -3727,13 +4020,16 @@ origin_host_header_overide = "www.example.com""#,
     fn proxy_normalize_trims_and_lowercases() {
         let mut proxy = Proxy {
             certificate_check: true,
-            allowed_domains: vec!["  AD.EXAMPLE.COM  ".to_owned(), "*.Example.Org".to_owned()],
+            allowed_domains: vec![
+                "  AD.EXAMPLE.COM  ".to_string(),
+                "*.Example.Org".to_string(),
+            ],
             asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
             proxy.allowed_domains,
-            vec!["ad.example.com".to_owned(), "*.example.org".to_owned()],
+            vec!["ad.example.com".to_string(), "*.example.org".to_string()],
             "should trim and lowercase each entry"
         );
     }
@@ -3743,17 +4039,17 @@ origin_host_header_overide = "www.example.com""#,
         let mut proxy = Proxy {
             certificate_check: true,
             allowed_domains: vec![
-                "example.com".to_owned(),
-                "   ".to_owned(),
-                String::new(),
-                "cdn.example.com".to_owned(),
+                "example.com".to_string(),
+                "   ".to_string(),
+                "".to_string(),
+                "cdn.example.com".to_string(),
             ],
             asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
             proxy.allowed_domains,
-            vec!["example.com".to_owned(), "cdn.example.com".to_owned()],
+            vec!["example.com".to_string(), "cdn.example.com".to_string()],
             "should drop blank and whitespace-only entries"
         );
     }
@@ -3762,13 +4058,13 @@ origin_host_header_overide = "www.example.com""#,
     fn proxy_normalize_removes_bare_wildcard() {
         let mut proxy = Proxy {
             certificate_check: true,
-            allowed_domains: vec!["*".to_owned(), "tracker.com".to_owned()],
+            allowed_domains: vec!["*".to_string(), "tracker.com".to_string()],
             asset_routes: vec![],
         };
         proxy.normalize();
         assert_eq!(
             proxy.allowed_domains,
-            vec!["tracker.com".to_owned()],
+            vec!["tracker.com".to_string()],
             "should remove bare \"*\" (invalid pattern that blocks all traffic)"
         );
     }
@@ -3777,7 +4073,7 @@ origin_host_header_overide = "www.example.com""#,
     fn proxy_normalize_bare_wildcard_alone_yields_open_mode() {
         let mut proxy = Proxy {
             certificate_check: true,
-            allowed_domains: vec!["*".to_owned()],
+            allowed_domains: vec!["*".to_string()],
             asset_routes: vec![],
         };
         proxy.normalize();
@@ -3791,7 +4087,7 @@ origin_host_header_overide = "www.example.com""#,
     fn proxy_normalize_all_blank_yields_empty_list() {
         let mut proxy = Proxy {
             certificate_check: true,
-            allowed_domains: vec!["  ".to_owned(), "\t".to_owned()],
+            allowed_domains: vec!["  ".to_string(), "\t".to_string()],
             asset_routes: vec![],
         };
         proxy.normalize();
@@ -4331,7 +4627,10 @@ origin_host_header_overide = "www.example.com""#,
         let settings = Settings::from_toml(&toml_str).expect("should parse TOML");
         assert_eq!(
             settings.proxy.allowed_domains,
-            vec!["ad.example.com".to_owned(), "*.cdn.example.com".to_owned()],
+            vec![
+                "ad.example.com".to_string(),
+                "*.cdn.example.com".to_string()
+            ],
             "from_toml should normalize allowed_domains"
         );
     }
@@ -4470,7 +4769,10 @@ origin_host_header_overide = "www.example.com""#,
             allowed_domains = ["  AD.EXAMPLE.COM  ", "  ", "*.CDN.Example.Com"]
             "#;
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -4480,7 +4782,10 @@ origin_host_header_overide = "www.example.com""#,
                     Settings::from_toml_and_env(&toml_str).expect("should parse TOML with env");
                 assert_eq!(
                     settings.proxy.allowed_domains,
-                    vec!["ad.example.com".to_owned(), "*.cdn.example.com".to_owned()],
+                    vec![
+                        "ad.example.com".to_string(),
+                        "*.cdn.example.com".to_string()
+                    ],
                     "from_toml_and_env should normalize allowed_domains"
                 );
             },
@@ -4497,7 +4802,7 @@ origin_host_header_overide = "www.example.com""#,
             "evil.com;path=/",
         ] {
             let mut settings = create_test_settings();
-            settings.publisher.cookie_domain = bad_domain.to_owned();
+            settings.publisher.cookie_domain = bad_domain.to_string();
             assert!(
                 settings.validate().is_err(),
                 "should reject cookie_domain containing metacharacters: {bad_domain:?}"
@@ -4508,7 +4813,7 @@ origin_host_header_overide = "www.example.com""#,
     #[test]
     fn test_publisher_accepts_valid_cookie_domain() {
         let mut settings = create_test_settings();
-        settings.publisher.cookie_domain = ".example.com".to_owned();
+        settings.publisher.cookie_domain = ".example.com".to_string();
         assert!(
             settings.validate().is_ok(),
             "should accept a valid cookie_domain"
@@ -4537,7 +4842,7 @@ origin_host_header_overide = "www.example.com""#,
             config_store_id = "test-config-store-id"
             secret_store_id = "test-secret-store-id"
         "#
-        .to_owned()
+        .to_string()
     }
 
     #[test]
@@ -4593,7 +4898,10 @@ origin_host_header_overide = "www.example.com""#,
     #[test]
     fn from_toml_and_env_rejects_config_without_admin_handler() {
         let origin_key = format!(
-            "{ENVIRONMENT_VARIABLE_PREFIX}{ENVIRONMENT_VARIABLE_SEPARATOR}PUBLISHER{ENVIRONMENT_VARIABLE_SEPARATOR}ORIGIN_URL"
+            "{}{}PUBLISHER{}ORIGIN_URL",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
         );
         temp_env::with_var(
             origin_key,
@@ -4664,7 +4972,7 @@ origin_host_header_overide = "www.example.com""#,
             assert!(
                 router_source.contains(endpoint),
                 "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/trusted-server-adapter-fastly/src/main.rs \u{2014} remove it from ADMIN_ENDPOINTS or \
+                 crates/trusted-server-adapter-fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
                  add the route back to the router"
             );
         }
@@ -4693,7 +5001,7 @@ origin_host_header_overide = "www.example.com""#,
             assert!(
                 Settings::ADMIN_ENDPOINTS.contains(route),
                 "Router has admin route \"{route}\" that is missing from \
-                 Settings::ADMIN_ENDPOINTS \u{2014} add it to ensure auth coverage"
+                 Settings::ADMIN_ENDPOINTS — add it to ensure auth coverage"
             );
         }
     }

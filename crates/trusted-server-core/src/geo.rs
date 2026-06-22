@@ -1,14 +1,13 @@
 //! Geographic location utilities for the trusted server.
 //!
-//! This module provides a Fastly-to-core geo mapping helper and response-header
-//! injection for the platform-neutral [`GeoInfo`] type.
+//! This module provides response-header injection for the platform-neutral
+//! [`GeoInfo`] type.
 //!
 //! The [`GeoInfo`] data type is defined in [`crate::platform`] as platform-
 //! neutral data; this module re-exports it and adds helper methods for HTTP
 //! response header injection.
 
 use edgezero_core::body::Body as EdgeBody;
-use fastly::geo::Geo;
 use http::{HeaderValue, Response};
 
 pub use crate::platform::GeoInfo;
@@ -17,27 +16,6 @@ use crate::constants::{
     HEADER_X_GEO_CITY, HEADER_X_GEO_CONTINENT, HEADER_X_GEO_COORDINATES, HEADER_X_GEO_COUNTRY,
     HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_GEO_METRO_CODE, HEADER_X_GEO_REGION,
 };
-
-/// Convert a Fastly [`Geo`] value into a [`GeoInfo`].
-///
-/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
-/// that field mapping is never duplicated.
-pub fn geo_from_fastly(geo: &Geo) -> GeoInfo {
-    let asn = match geo.as_number() {
-        0 => None,
-        n => Some(n),
-    };
-    GeoInfo {
-        city: geo.city().to_owned(),
-        country: geo.country_code().to_owned(),
-        continent: format!("{:?}", geo.continent()),
-        latitude: geo.latitude(),
-        longitude: geo.longitude(),
-        metro_code: geo.metro_code(),
-        region: geo.region().map(str::to_string),
-        asn,
-    }
-}
 
 impl GeoInfo {
     /// Sets geo information headers on the response.
@@ -122,14 +100,14 @@ mod tests {
 
     fn sample_geo_info() -> GeoInfo {
         GeoInfo {
-            city: "San Francisco".to_owned(),
-            country: "US".to_owned(),
-            continent: "NorthAmerica".to_owned(),
+            city: "San Francisco".to_string(),
+            country: "US".to_string(),
+            continent: "NorthAmerica".to_string(),
             latitude: 37.7749,
             longitude: -122.4194,
             metro_code: 807,
-            region: Some("CA".to_owned()),
-            asn: Some(7922),
+            region: Some("CA".to_string()),
+            asn: None,
         }
     }
 

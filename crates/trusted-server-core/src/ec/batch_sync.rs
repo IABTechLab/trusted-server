@@ -12,9 +12,9 @@
 //! semantics: unchanged UIDs are accepted without a write; different UIDs
 //! replace the stored value regardless of timestamp.
 
-use error_stack::{Report, ResultExt as _};
-use fastly::http::StatusCode;
-use fastly::{Request, Response};
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
@@ -71,10 +71,7 @@ struct SyncMapping {
     partner_uid: String,
     // Retained for API compatibility. The EC KV body no longer stores
     // per-partner timestamps, so this does not order writes.
-    #[allow(
-        dead_code,
-        reason = "legacy request field is accepted for wire compatibility but not persisted"
-    )]
+    #[allow(dead_code)]
     timestamp: u64,
 }
 
@@ -104,19 +101,19 @@ pub fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
-    mut req: Request,
-) -> Result<Response, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, &mut req)
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
 }
 
 fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
-    req: &mut Request,
-) -> Result<Response, Report<TrustedServerError>> {
+    req: Request<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // 1. Authenticate
-    let Some(partner) = authenticate_bearer(registry, req) else {
+    let Some(partner) = authenticate_bearer(registry, &req) else {
         return Ok(error_response(StatusCode::UNAUTHORIZED, "invalid_token"));
     };
 
@@ -131,14 +128,14 @@ fn handle_batch_sync_with_writer(
 
     // 3. Parse body (with size limit to prevent OOM before validation)
     const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if content_length_exceeds_limit(req, MAX_BODY_SIZE) {
+    if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body_too_large",
         ));
     }
 
-    let body_bytes = req.take_body_bytes();
+    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_BODY_SIZE {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -174,8 +171,10 @@ fn handle_batch_sync_with_writer(
     json_response(status, &response_body)
 }
 
-fn content_length_exceeds_limit(req: &Request, max_body_size: usize) -> bool {
-    req.get_header_str("content-length")
+fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -> bool {
+    req.headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|content_length| content_length > max_body_size)
 }
@@ -242,21 +241,24 @@ fn process_mappings(
 fn json_response<T: serde::Serialize>(
     status: StatusCode,
     body: &T,
-) -> Result<Response, Report<TrustedServerError>> {
-    let body = serde_json::to_string(body).change_context(TrustedServerError::EdgeCookie {
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let body_str = serde_json::to_string(body).change_context(TrustedServerError::EdgeCookie {
         message: "Failed to serialize batch sync response".to_owned(),
     })?;
-
-    Ok(Response::from_status(status)
-        .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body(body))
+    Ok(Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body_str))
+        .expect("should build json response"))
 }
 
-fn error_response(status: StatusCode, reason: &str) -> Response {
+fn error_response(status: StatusCode, reason: &str) -> Response<EdgeBody> {
     let body = serde_json::json!({ "error": reason });
-    Response::from_status(status)
-        .with_content_type(fastly::mime::APPLICATION_JSON)
-        .with_body(body.to_string())
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(EdgeBody::from(body.to_string()))
+        .expect("should build error response")
 }
 
 #[cfg(test)]
@@ -350,11 +352,13 @@ mod tests {
         }
     }
 
-    fn authorized_batch_request(body: &str) -> Request {
-        let mut req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
-        req.set_header("authorization", "Bearer test-token-32-bytes-minimum-value");
-        req.set_body(body.to_owned());
-        req
+    fn authorized_batch_request(body: &str) -> Request<EdgeBody> {
+        Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+            .body(EdgeBody::from(body.to_owned()))
+            .expect("should build authorized batch request")
     }
 
     fn test_registry() -> PartnerRegistry {
@@ -367,8 +371,13 @@ mod tests {
 
     #[test]
     fn content_length_exceeds_limit_detects_oversized_header() {
-        let mut req = authorized_batch_request("{}");
-        req.set_header("content-length", "2097153");
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+            .header("content-length", "2097153")
+            .body(EdgeBody::from("{}"))
+            .expect("should build test request");
 
         assert!(
             content_length_exceeds_limit(&req, 2 * 1024 * 1024),
@@ -379,8 +388,13 @@ mod tests {
     #[test]
     fn content_length_exceeds_limit_ignores_missing_or_malformed_header() {
         let missing = authorized_batch_request("{}");
-        let mut malformed = authorized_batch_request("{}");
-        malformed.set_header("content-length", "not-a-number");
+        let malformed = Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+            .header("content-length", "not-a-number")
+            .body(EdgeBody::from("{}"))
+            .expect("should build test request");
 
         assert!(
             !content_length_exceeds_limit(&missing, 2 * 1024 * 1024),
@@ -399,14 +413,19 @@ mod tests {
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
-        let mut req = authorized_batch_request("not-json");
-        req.set_header("content-length", "2097153");
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+            .header("content-length", "2097153")
+            .body(EdgeBody::from("not-json"))
+            .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, &mut req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
             .expect("should return oversized response");
 
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should reject from content-length before parsing body"
         );
@@ -420,14 +439,19 @@ mod tests {
             should_exceed: false,
         };
         let oversized_body = "{".repeat((2 * 1024 * 1024) + 1);
-        let mut req = authorized_batch_request(&oversized_body);
-        req.set_header("content-length", "not-a-number");
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+            .header("content-length", "not-a-number")
+            .body(EdgeBody::from(oversized_body))
+            .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, &mut req)
+        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
             .expect("should return oversized response");
 
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should reject oversized body even when content-length is malformed"
         );
@@ -490,12 +514,16 @@ mod tests {
         let limiter = MockRateLimiter {
             should_exceed: false,
         };
-        let req = Request::new("POST", "https://edge.example.com/_ts/api/v1/batch-sync");
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
 
         let response =
             handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
         assert_eq!(
-            response.get_status(),
+            response.status(),
             StatusCode::UNAUTHORIZED,
             "should return 401 for missing auth"
         );

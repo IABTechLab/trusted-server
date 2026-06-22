@@ -17,6 +17,7 @@
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
 //! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
 //! - [`test_support`]: Testing utilities and mocks
+//! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
 
 #![cfg_attr(
     test,
@@ -34,9 +35,6 @@ pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
-pub mod backend;
-#[doc(hidden)]
-pub mod compat;
 pub mod consent;
 pub mod consent_config;
 pub mod constants;
@@ -46,7 +44,7 @@ pub mod ec;
 pub(crate) mod edge_cookie;
 pub mod error;
 pub mod geo;
-pub(crate) mod host_header;
+pub mod host_header;
 pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
@@ -66,6 +64,7 @@ pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
+pub mod tester_cookie;
 pub mod tsjs;
 
 #[cfg(test)]

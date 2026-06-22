@@ -55,6 +55,16 @@ build = """
             env = "FASTLY_KEY"
 
     [local_server.config_stores]
+        [local_server.config_stores.trusted_server_config]
+            format = "inline-toml"
+        [local_server.config_stores.trusted_server_config.contents]
+            # "true" / "1" (case-insensitive) enable the EdgeZero path. Missing,
+            # unreadable, or any other value falls back to the legacy entry point.
+            # Keep "false" until EdgeZero parity is verified end to end (issue #495).
+            # EC API routes and the EC identity lifecycle are ported; the remaining
+            # intentional deviations are documented in adapter-fastly/src/app.rs.
+            edgezero_enabled = "false"
+
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]

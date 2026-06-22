@@ -363,7 +363,7 @@ impl AuctionOrchestrator {
             // Get the backend name for this provider to map responses back.
             // Must be computed after effective_timeout since the timeout is
             // part of the backend name.
-            let backend_name = match provider.backend_name(effective_timeout) {
+            let backend_name = match provider.backend_name(context.services, effective_timeout) {
                 Some(name) => name,
                 None => {
                     log::warn!(
@@ -798,7 +798,7 @@ mod tests {
             2000
         }
 
-        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some(self.backend.to_string())
         }
     }
@@ -882,7 +882,7 @@ mod tests {
             2000
         }
 
-        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
             Some("launch-failing-backend".to_string())
         }
     }
@@ -1055,63 +1055,67 @@ mod tests {
     // of requiring real platform backends. An `#[ignore]` integration test
     // exercising the full path via Viceroy would also catch regressions.
 
-    #[tokio::test]
-    async fn test_no_providers_configured() {
-        let config = AuctionConfig {
-            enabled: true,
-            providers: vec![],
-            mediator: None,
-            timeout_ms: 2000,
-            creative_store: "creative_store".to_string(),
-            allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
-        };
+    #[test]
+    fn test_no_providers_configured() {
+        futures::executor::block_on(async {
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec![],
+                mediator: None,
+                timeout_ms: 2000,
+                creative_store: "creative_store".to_string(),
+                allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+            };
 
-        let orchestrator = AuctionOrchestrator::new(config);
+            let orchestrator = AuctionOrchestrator::new(config);
 
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://test.com/test")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let context = create_test_auction_context(&settings, &req, 2000);
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://test.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = create_test_auction_context(&settings, &req, 2000);
 
-        let result = orchestrator.run_auction(&request, &context).await;
+            let result = orchestrator.run_auction(&request, &context).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(format!("{}", err).contains("No providers configured"));
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(format!("{}", err).contains("No providers configured"));
+        });
     }
 
-    #[tokio::test]
-    async fn provider_launch_failures_error_when_no_requests_launch() {
-        let config = AuctionConfig {
-            enabled: true,
-            providers: vec!["launch-failing".to_string()],
-            timeout_ms: 2000,
-            ..Default::default()
-        };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(LaunchFailingProvider));
+    #[test]
+    fn provider_launch_failures_error_when_no_requests_launch() {
+        futures::executor::block_on(async {
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["launch-failing".to_string()],
+                timeout_ms: 2000,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(LaunchFailingProvider));
 
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://test.com/test")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let context = create_test_auction_context(&settings, &req, 2000);
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://test.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = create_test_auction_context(&settings, &req, 2000);
 
-        let result = orchestrator.run_auction(&request, &context).await;
+            let result = orchestrator.run_auction(&request, &context).await;
 
-        let err = result.expect_err("should fail when every provider launch fails");
-        assert!(
-            err.to_string()
-                .contains("All 1 configured provider(s) skipped or failed to launch"),
-            "should explain that no configured provider request launched"
-        );
+            let err = result.expect_err("should fail when every provider launch fails");
+            assert!(
+                err.to_string()
+                    .contains("All 1 configured provider(s) skipped or failed to launch"),
+                "should explain that no configured provider request launched"
+            );
+        });
     }
 
     #[test]
@@ -1166,87 +1170,89 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn select_error_is_attributed_to_correct_provider() {
-        // Arrange: two stub providers backed by distinct backend names.
-        // The stub HTTP client injects a select() error for the first request
-        // that completes (backend-a). backend-b should still produce a success.
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-a
-        stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-b
-        stub.push_select_error(); // first select() reports backend-a as failed
+    #[test]
+    fn select_error_is_attributed_to_correct_provider() {
+        futures::executor::block_on(async {
+            // Arrange: two stub providers backed by distinct backend names.
+            // The stub HTTP client injects a select() error for the first request
+            // that completes (backend-a). backend-b should still produce a success.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-a
+            stub.push_response(200, b"{}".to_vec()); // consumed by send_async for backend-b
+            stub.push_select_error(); // first select() reports backend-a as failed
 
-        let services = build_services_with_http_client(stub);
-        // SAFETY: `Box::leak` creates a `'static` reference for test use only.
-        // The leaked allocation is bounded to the test process lifetime.
-        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
 
-        let config = AuctionConfig {
-            enabled: true,
-            providers: vec!["provider-a".to_string(), "provider-b".to_string()],
-            timeout_ms: 2000,
-            mediator: None,
-            ..Default::default()
-        };
-        let mut orchestrator = AuctionOrchestrator::new(config);
-        orchestrator.register_provider(Arc::new(StubAuctionProvider {
-            name: "provider-a",
-            backend: "backend-a",
-        }));
-        orchestrator.register_provider(Arc::new(StubAuctionProvider {
-            name: "provider-b",
-            backend: "backend-b",
-        }));
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-a",
+                backend: "backend-a",
+            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-b",
+                backend: "backend-b",
+            }));
 
-        let request = create_test_auction_request();
-        let settings = create_test_settings();
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri("https://example.com/test")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build request");
-        let context = AuctionContext {
-            settings: &settings,
-            request: &req,
-            timeout_ms: 2000,
-            provider_responses: None,
-            services,
-        };
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
 
-        // Act
-        let result = orchestrator
-            .run_auction(&request, &context)
-            .await
-            .expect("should complete auction even when one provider errors");
+            // Act
+            let result = orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("should complete auction even when one provider errors");
 
-        // Assert: exactly two responses — one error, one success.
-        assert_eq!(
-            result.provider_responses.len(),
-            2,
-            "should collect responses from both providers"
-        );
+            // Assert: exactly two responses — one error, one success.
+            assert_eq!(
+                result.provider_responses.len(),
+                2,
+                "should collect responses from both providers"
+            );
 
-        let provider_a = result
-            .provider_responses
-            .iter()
-            .find(|r| r.provider == "provider-a")
-            .expect("should have provider-a response");
-        let provider_b = result
-            .provider_responses
-            .iter()
-            .find(|r| r.provider == "provider-b")
-            .expect("should have provider-b response");
+            let provider_a = result
+                .provider_responses
+                .iter()
+                .find(|r| r.provider == "provider-a")
+                .expect("should have provider-a response");
+            let provider_b = result
+                .provider_responses
+                .iter()
+                .find(|r| r.provider == "provider-b")
+                .expect("should have provider-b response");
 
-        assert_eq!(
-            provider_a.status,
-            BidStatus::Error,
-            "provider-a should be marked error — select() Err was attributed via failed_backend_name"
-        );
-        assert_eq!(
-            provider_b.status,
-            BidStatus::Success,
-            "provider-b should succeed — error was correctly isolated to provider-a"
-        );
+            assert_eq!(
+                provider_a.status,
+                BidStatus::Error,
+                "provider-a should be marked error — select() Err was attributed via failed_backend_name"
+            );
+            assert_eq!(
+                provider_b.status,
+                BidStatus::Success,
+                "provider-b should succeed — error was correctly isolated to provider-a"
+            );
+        });
     }
 
     #[test]

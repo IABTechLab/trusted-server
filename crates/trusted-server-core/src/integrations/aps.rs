@@ -14,12 +14,15 @@ use validator::Validate;
 
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, MediaType};
-use crate::backend::BackendConfig;
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_response_bounded, ensure_integration_backend, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
+    collect_response_bounded, ensure_integration_backend_with_timeout,
+    predict_integration_backend_name, UPSTREAM_RTB_MAX_RESPONSE_BYTES,
 };
-use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
+use crate::platform::{
+    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
+};
+
 use crate::settings::IntegrationConfig;
 
 // ============================================================================
@@ -515,12 +518,21 @@ impl AuctionProvider for ApsAuctionProvider {
                 message: "Failed to build APS request".to_string(),
             })?;
 
-        let backend_name = ensure_integration_backend(
+        // Uses context.timeout_ms (auction-scoped) rather than the 15 s fixed
+        // timeout in ensure_integration_backend, which is for proxy endpoints.
+        // Send request asynchronously with auction-scoped timeout
+        let backend_name = ensure_integration_backend_with_timeout(
             context.services,
             &self.config.endpoint,
             "aps",
-            Some(Duration::from_millis(u64::from(context.timeout_ms))),
-        )?;
+            Duration::from_millis(u64::from(context.timeout_ms)),
+        )
+        .change_context(TrustedServerError::Auction {
+            message: format!(
+                "Failed to resolve backend for APS endpoint: {}",
+                self.config.endpoint
+            ),
+        })?;
 
         let pending = context
             .services
@@ -586,15 +598,16 @@ impl AuctionProvider for ApsAuctionProvider {
         self.config.enabled
     }
 
-    fn backend_name(&self, timeout_ms: u32) -> Option<String> {
-        BackendConfig::backend_name_for_url(
+    fn backend_name(&self, services: &RuntimeServices, timeout_ms: u32) -> Option<String> {
+        predict_integration_backend_name(
+            services,
             &self.config.endpoint,
-            true,
+            "aps",
             Duration::from_millis(u64::from(timeout_ms)),
         )
         .inspect_err(|e| {
             log::error!(
-                "Failed to create backend for APS endpoint '{}': {e:?}",
+                "Failed to predict backend name for APS endpoint '{}': {e:?}",
                 self.config.endpoint
             );
         })

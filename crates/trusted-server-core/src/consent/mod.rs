@@ -8,9 +8,10 @@
 //!    auction pipeline and populates `OpenRTB` bid requests.
 //!
 //! Consent is interpreted from request cookies, headers, geolocation, and
-//! publisher policy defaults. The consent pipeline does not read from or write
-//! to KV storage; EC identity lifecycle state is managed separately by the EC
-//! identity graph.
+//! publisher policy defaults. When the caller supplies an EC ID and a KV
+//! store via [`ConsentPipelineInput`], the pipeline also loads persisted
+//! consent as a fallback and persists cookie-sourced consent on change. EC
+//! identity lifecycle state is managed separately by the EC identity graph.
 //!
 //! # Supported signals
 //!
@@ -37,6 +38,7 @@ pub mod tcf;
 pub mod types;
 pub mod us_privacy;
 
+pub use crate::storage::kv_store as kv;
 pub use extraction::extract_consent_signals;
 pub use types::{
     ConsentContext, ConsentSource, PrivacyFlag, RawConsentSignals, TcfConsent, UsPrivacy,
@@ -73,6 +75,17 @@ pub struct ConsentPipelineInput<'a> {
     pub config: &'a ConsentConfig,
     /// Geolocation data from the request (for jurisdiction detection).
     pub geo: Option<&'a GeoInfo>,
+    /// EC ID for KV Store consent persistence.
+    ///
+    /// When set along with `kv_store`, enables:
+    /// - **Read fallback**: loads consent from KV when cookies are absent.
+    /// - **Write-on-change**: persists cookie-sourced consent to KV.
+    pub ec_id: Option<&'a str>,
+    /// KV store for consent persistence.
+    ///
+    /// `None` when consent persistence is not configured for this request, or
+    /// when the caller intentionally skips consent KV access.
+    pub kv_store: Option<&'a dyn crate::platform::PlatformKvStore>,
 }
 
 /// Extracts, decodes, and normalizes consent signals from a request.
@@ -87,9 +100,16 @@ pub struct ConsentPipelineInput<'a> {
 /// 6. Builds a [`ConsentContext`] with both raw and decoded data.
 /// 7. Logs a summary for observability.
 ///
-/// The returned context reflects request-local consent signals plus policy
-/// defaults only. This function does not load persisted consent from KV and
-/// does not persist consent to KV.
+/// When [`ConsentPipelineInput::ec_id`] and [`ConsentPipelineInput::kv_store`]
+/// are both set, the pipeline also:
+///
+/// - **Read fallback**: loads consent persisted in KV for the EC ID when the
+///   request carries no consent signals.
+/// - **Write-on-change**: persists cookie-sourced consent to KV after the
+///   context is built (skipping empty contexts and unchanged fingerprints).
+///
+/// Without those inputs the returned context reflects request-local consent
+/// signals plus policy defaults only.
 ///
 /// Decoding failures are logged and the corresponding decoded field is set to
 /// `None` — the raw string is still preserved for proxy-mode forwarding.
@@ -99,6 +119,20 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
 
     if input.geo.is_none() {
         log_missing_geo_warning_once();
+    }
+
+    // Read fallback: when the request carries no consent signals, fall back
+    // to consent persisted in KV for this EC ID (when persistence is wired).
+    if signals.is_empty() {
+        if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
+            if let Some(mut ctx) = kv::load_consent_from_kv(store, ec_id) {
+                // Jurisdiction is request-local: derive it from the current
+                // geo rather than the value stored with the persisted entry.
+                ctx.jurisdiction = jurisdiction::detect_jurisdiction(input.geo, input.config);
+                log_consent_context(&ctx);
+                return ctx;
+            }
+        }
     }
 
     // In proxy mode, skip decoding entirely.
@@ -133,6 +167,13 @@ pub fn build_consent_context(input: &ConsentPipelineInput<'_>) -> ConsentContext
     apply_tcf_conflict_resolution(&mut ctx, input.config);
     apply_expiration_check(&mut ctx, input.config);
     apply_gpc_us_privacy(&mut ctx, input.config);
+
+    // Write-on-change: persist cookie-sourced consent for this EC ID (when
+    // persistence is wired). The helper skips empty contexts and unchanged
+    // fingerprints internally.
+    if let (Some(ec_id), Some(store)) = (input.ec_id, input.kv_store) {
+        kv::save_consent_to_kv(store, ec_id, &ctx, input.config.max_consent_age_days);
+    }
 
     log_consent_context(&ctx);
     ctx
@@ -753,6 +794,8 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            ec_id: None,
+            kv_store: None,
         });
 
         assert_eq!(
@@ -780,6 +823,8 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            ec_id: None,
+            kv_store: None,
         });
 
         assert!(
@@ -808,6 +853,8 @@ mod tests {
             req: &req,
             config: &config,
             geo: None,
+            ec_id: None,
+            kv_store: None,
         });
 
         assert!(
@@ -1314,6 +1361,163 @@ mod tests {
         assert!(
             allows_ec_creation(&ctx),
             "GPP without US section should fall through to us_privacy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Consent KV read-fallback / write-on-change pipeline tests
+    // -----------------------------------------------------------------------
+
+    struct InMemoryKvStore {
+        entries: std::sync::Mutex<std::collections::HashMap<String, bytes::Bytes>>,
+    }
+
+    impl InMemoryKvStore {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl crate::platform::PlatformKvStore for InMemoryKvStore {
+        async fn get_bytes(
+            &self,
+            key: &str,
+        ) -> Result<Option<bytes::Bytes>, crate::platform::KvError> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("should lock entries")
+                .get(key)
+                .cloned())
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+        ) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            _ttl: std::time::Duration,
+        ) -> Result<(), crate::platform::KvError> {
+            self.put_bytes(key, value).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), crate::platform::KvError> {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .remove(key);
+            Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<edgezero_core::key_value_store::KvPage, crate::platform::KvError> {
+            Ok(edgezero_core::key_value_store::KvPage::default())
+        }
+    }
+
+    #[test]
+    fn pipeline_persists_cookie_sourced_consent_to_kv() {
+        let jar = parse_cookies_to_jar("us_privacy=1YNN");
+        let req = build_request();
+        let config = ConsentConfig::default();
+        let store = InMemoryKvStore::new();
+
+        let ctx = build_consent_context(&ConsentPipelineInput {
+            jar: Some(&jar),
+            req: &req,
+            config: &config,
+            geo: None,
+            ec_id: Some("test-ec-id"),
+            kv_store: Some(&store),
+        });
+
+        assert_eq!(
+            ctx.raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should build cookie-sourced consent"
+        );
+        let persisted = crate::consent::kv::load_consent_from_kv(&store, "test-ec-id")
+            .expect("should persist cookie-sourced consent to KV");
+        assert_eq!(
+            persisted.raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "persisted consent should round-trip the cookie signal"
+        );
+    }
+
+    #[test]
+    fn pipeline_falls_back_to_kv_consent_when_request_has_no_signals() {
+        let config = ConsentConfig::default();
+        let store = InMemoryKvStore::new();
+
+        // First request carries a consent cookie — persisted to KV.
+        let jar = parse_cookies_to_jar("us_privacy=1YNN");
+        let req = build_request();
+        build_consent_context(&ConsentPipelineInput {
+            jar: Some(&jar),
+            req: &req,
+            config: &config,
+            geo: None,
+            ec_id: Some("test-ec-id"),
+            kv_store: Some(&store),
+        });
+
+        // Second request has no consent signals — must fall back to KV.
+        let bare_req = build_request();
+        let ctx = build_consent_context(&ConsentPipelineInput {
+            jar: None,
+            req: &bare_req,
+            config: &config,
+            geo: None,
+            ec_id: Some("test-ec-id"),
+            kv_store: Some(&store),
+        });
+
+        assert_eq!(
+            ctx.raw_us_privacy.as_deref(),
+            Some("1YNN"),
+            "should load persisted consent when the request carries no signals"
+        );
+    }
+
+    #[test]
+    fn pipeline_skips_kv_when_persistence_not_wired() {
+        let jar = parse_cookies_to_jar("us_privacy=1YNN");
+        let req = build_request();
+        let config = ConsentConfig::default();
+        let store = InMemoryKvStore::new();
+
+        // ec_id is absent, so the pipeline must not touch the KV store.
+        build_consent_context(&ConsentPipelineInput {
+            jar: Some(&jar),
+            req: &req,
+            config: &config,
+            geo: None,
+            ec_id: None,
+            kv_store: Some(&store),
+        });
+
+        assert!(
+            crate::consent::kv::load_consent_from_kv(&store, "test-ec-id").is_none(),
+            "should not persist consent without an EC ID"
         );
     }
 }

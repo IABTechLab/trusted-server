@@ -5,9 +5,9 @@
 
 use std::net::IpAddr;
 
-use error_stack::{Report, ResultExt as _};
-use hmac::{Hmac, Mac as _};
-use rand::Rng as _;
+use error_stack::{Report, ResultExt};
+use hmac::{Hmac, Mac};
+use rand::Rng;
 use sha2::Sha256;
 
 use crate::error::TrustedServerError;
@@ -32,7 +32,7 @@ const ALPHANUMERIC_CHARSET: &[u8] =
 /// - **IPv4:** decimal-dotted notation (e.g. `"192.168.1.1"`)
 /// - **IPv6:** first 4 segments as zero-padded lowercase hex without
 ///   separators (e.g. `"20010db885a30000"`)
-fn normalize_ip(ip: IpAddr) -> String {
+pub(crate) fn normalize_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ipv4) => ipv4.to_string(),
         IpAddr::V6(ipv6) => {
@@ -86,7 +86,7 @@ pub fn generate_ec_id(
 ) -> Result<String, Report<TrustedServerError>> {
     let mut mac = HmacSha256::new_from_slice(settings.ec.passphrase.expose().as_bytes())
         .change_context(TrustedServerError::EdgeCookie {
-            message: "Failed to create HMAC instance".to_owned(),
+            message: "Failed to create HMAC instance".to_string(),
         })?;
     mac.update(client_ip.as_bytes());
     let hmac_hash = hex::encode(mac.finalize().into_bytes());
@@ -98,23 +98,6 @@ pub fn generate_ec_id(
     log::trace!("Generated fresh EC ID: {}", super::log_id(&ec_id));
 
     Ok(ec_id)
-}
-
-/// Extracts and normalizes the client IP from a request.
-///
-/// Returns the normalized IP as a string suitable for HMAC input.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::EdgeCookie`] when the client IP is unavailable
-/// (e.g. in certain test or proxy configurations). EC generation requires
-/// a valid client IP — there is no fallback.
-pub fn extract_client_ip(req: &fastly::Request) -> Result<String, Report<TrustedServerError>> {
-    req.get_client_ip_addr().map(normalize_ip).ok_or_else(|| {
-        Report::new(TrustedServerError::EdgeCookie {
-            message: "Client IP required for EC generation but unavailable".to_owned(),
-        })
-    })
 }
 
 /// Extracts the stable 64-character hex prefix from an EC ID.
