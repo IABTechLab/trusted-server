@@ -66,7 +66,7 @@ mod route_tests;
 use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
-use crate::platform::{build_runtime_services, FastlyPlatformGeo};
+use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
@@ -241,6 +241,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
+    // Capture the full ClientInfo (TLS protocol/cipher, JA4, H2 fingerprint, and
+    // server hostname/region) from the original FastlyRequest before conversion.
+    // These accessors only return real values on the client request; the
+    // reconstructed EdgeZero request cannot expose them. Stored in the request
+    // extensions so `build_per_request_services` reads the authoritative metadata
+    // that integration bot protection (e.g. DataDome) serializes, instead of
+    // defaulting those fields to empty as the EdgeZero context alone would.
+    let client_info = client_info_from_request(&req);
+
     // Derive device signals from the original FastlyRequest before conversion.
     // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
     // return real values on the client request; a synthetic request rebuilt from
@@ -263,6 +272,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             Ok(mut core_req) => {
                 core_req.extensions_mut().insert(config_store);
                 core_req.extensions_mut().insert(device_signals);
+                core_req.extensions_mut().insert(client_info);
                 futures::executor::block_on(app.router().oneshot(core_req))
             }
             Err(e) => {

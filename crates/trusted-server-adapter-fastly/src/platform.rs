@@ -586,16 +586,30 @@ pub fn build_runtime_services(
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
-        .client_info(ClientInfo {
-            client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
-            tls_ja4: req.get_tls_ja4().map(str::to_string),
-            h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
-            server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
-            server_region: std::env::var("FASTLY_REGION").ok(),
-        })
+        .client_info(client_info_from_request(req))
         .build()
+}
+
+/// Extract [`ClientInfo`] from the original Fastly request.
+///
+/// Fastly's TLS, JA4, and HTTP/2 fingerprint accessors only return real values
+/// on the client request before it is converted to platform HTTP types. This
+/// must therefore be called at the adapter entry point, while the original
+/// [`fastly::Request`] is still available. Used by both [`build_runtime_services`]
+/// (legacy path) and the `EdgeZero` entry point, which stores the result in the
+/// request extensions so `build_per_request_services` can read back the same
+/// bot-protection metadata the reconstructed request cannot expose.
+#[must_use]
+pub fn client_info_from_request(req: &Request) -> ClientInfo {
+    ClientInfo {
+        client_ip: req.get_client_ip_addr(),
+        tls_protocol: req.get_tls_protocol().map(str::to_string),
+        tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+        tls_ja4: req.get_tls_ja4().map(str::to_string),
+        h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
+        server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
+        server_region: std::env::var("FASTLY_REGION").ok(),
+    }
 }
 
 /// Open a named KV store as a [`PlatformKvStore`] implementation.
