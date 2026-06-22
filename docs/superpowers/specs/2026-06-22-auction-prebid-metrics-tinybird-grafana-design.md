@@ -217,11 +217,11 @@ rows:
 ## Risks and notes
 
 - **Log volume vs node size.** Grain is N rows per auction (N = providers x
-  responding seats). At high QPS this multiplies ingest volume into Tinybird,
-  and on single-node self-managed there is no autoscaling, so volume has to fit
-  the chosen node. The 30-day raw TTL and rollup MVs bound storage; size the
-  node against measured ingest and add a sampling knob on the ops access-log
-  stream if needed.
+  responding seats). At high QPS this multiplies ingest volume into Tinybird.
+  For this testing phase the mitigation is vertical scaling of the single node;
+  manual resize is acceptable and no autoscaling is expected. The 30-day raw TTL
+  and rollup MVs bound storage. Sampling the ops access-log stream is deferred
+  and revisited only if a larger or multi-node deployment is needed later.
 - **Single-node availability.** Self-managed `tb infra` is single-node with no
   HA today. A Tinybird outage loses analytics for the window only (Fastly
   logging is fire-and-forget); it must never sit on the auction request path.
