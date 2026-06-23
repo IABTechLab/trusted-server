@@ -68,20 +68,46 @@ pub fn ca_install(cert_path: &Path) {
 
 /// Removes the dev CA from the macOS login keychain (spec §7.3).
 ///
-/// On non-macOS systems, prints a manual note. Never panics.
-pub fn ca_uninstall() {
+/// Returns `true` when the CA is confirmed absent afterward (removed, or never
+/// installed), and `false` when a removal may have failed and old trust could
+/// remain — in which case it warns loudly. There can be more than one entry with
+/// the CA's common name after repeated installs, so it deletes until none are
+/// found. On non-macOS systems, prints a manual note and returns `true`. Never
+/// panics.
+pub fn ca_uninstall() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("security")
-            .args(["delete-certificate", "-c", CA_COMMON_NAME])
-            .status();
-        match status {
-            Ok(s) if s.success() => output::info("CA removed from keychain"),
-            _ => output::info("CA was not found in keychain (already removed or never installed)"),
+        // Delete every keychain entry matching the CA's CN; stop when none remain.
+        for _ in 0..16 {
+            let present = Command::new("security")
+                .args(["find-certificate", "-c", CA_COMMON_NAME])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !present {
+                output::info("CA is not present in the keychain (removed or never installed)");
+                return true;
+            }
+            let deleted = Command::new("security")
+                .args(["delete-certificate", "-c", CA_COMMON_NAME])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !deleted {
+                break;
+            }
         }
+        output::warn(
+            "could not fully remove the dev CA from the keychain; it may still be trusted — \
+             remove it manually via Keychain Access to revoke trust",
+        );
+        false
     }
     #[cfg(not(target_os = "macos"))]
-    output::info("remove the dev CA from your OS trust store manually");
+    {
+        output::info("remove the dev CA from your OS trust store manually");
+        true
+    }
 }
 
 /// Launches and configures each requested browser against the proxy (spec §9).
@@ -414,9 +440,10 @@ fn launch_safari(cfg: &ResolvedConfig) {
     );
     if let Err(err) = std::fs::write(&restore_path, &restore_contents) {
         output::warn(&format!(
-            "Safari: could not write proxy restore file: {err}; \
-             PAC URL will not be automatically restored on exit"
+            "Safari: could not write the proxy restore file ({err}); skipping Safari \
+             auto-configuration so the system proxy is not changed without a way to restore it"
         ));
+        return;
     }
 
     // Changing the system network proxy requires admin, so the `networksetup`
@@ -570,16 +597,27 @@ fn get_auto_proxy_state(service: &str) -> (Option<String>, bool) {
 /// Builds the manual `networksetup` command line that recovers `service`'s prior
 /// auto-proxy state, for printing when the automatic restore fails.
 #[cfg(target_os = "macos")]
+/// Single-quotes a value for safe inclusion in a printed POSIX shell command
+/// (handles spaces, `&`, and other metacharacters; embedded `'` are escaped).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn manual_restore_command(service: &str, prior_url: Option<&str>, prior_enabled: bool) -> String {
+    let svc = shell_quote(service);
     match prior_url {
         Some(url) if prior_enabled => {
-            format!("sudo networksetup -setautoproxyurl \"{service}\" {url}")
+            format!(
+                "sudo networksetup -setautoproxyurl {svc} {}",
+                shell_quote(url)
+            )
         }
         Some(url) => format!(
-            "sudo networksetup -setautoproxyurl \"{service}\" {url} && \
-             sudo networksetup -setautoproxystate \"{service}\" off"
+            "sudo networksetup -setautoproxyurl {svc} {url} && \
+             sudo networksetup -setautoproxystate {svc} off",
+            url = shell_quote(url)
         ),
-        None => format!("sudo networksetup -setautoproxystate \"{service}\" off"),
+        None => format!("sudo networksetup -setautoproxystate {svc} off"),
     }
 }
 
@@ -637,6 +675,23 @@ fn restore_auto_proxy(
 mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::{Authority, Rule, RuleTable};
+
+    #[test]
+    fn shell_quote_wraps_and_escapes() {
+        // Metacharacters (`&`, space, `?`) are neutralized by single-quoting.
+        assert_eq!(
+            shell_quote("http://h/proxy.pac?a=1&b=2"),
+            "'http://h/proxy.pac?a=1&b=2'",
+            "ampersand/query must be quoted, not left bare"
+        );
+        assert_eq!(shell_quote("a b"), "'a b'", "spaces are quoted");
+        // An embedded single quote is closed, escaped, and reopened.
+        assert_eq!(
+            shell_quote("it's"),
+            r"'it'\''s'",
+            "embedded quote is escaped"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -135,7 +135,9 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
                     .change_context(ProxyError::CertAuthority)?;
                 browser::ca_install(&cert_path);
             }
-            CaCommand::Uninstall => browser::ca_uninstall(),
+            CaCommand::Uninstall => {
+                browser::ca_uninstall();
+            }
             CaCommand::Regenerate => {
                 // Revoke OS trust for the OLD CA first. The old and new CA share
                 // CA_COMMON_NAME, so `ca_uninstall` (delete-by-CN, a no-op when
