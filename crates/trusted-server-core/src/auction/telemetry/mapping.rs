@@ -4,9 +4,7 @@
 //! telemetry builder. It performs no I/O and does not modify the auction.
 
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::auction::telemetry::types::{
-    ProviderCallOutcome, ProviderCallStatus, ProviderRole,
-};
+use crate::auction::telemetry::types::{ProviderCallOutcome, ProviderCallStatus, ProviderRole};
 use crate::auction::types::{AuctionResponse, BidStatus};
 
 /// Build one provider-call outcome per provider response, plus one for the
@@ -72,8 +70,8 @@ fn clamp_u16(value: usize) -> u16 {
 mod tests {
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use crate::auction::telemetry::types::{ProviderCallStatus, ProviderRole};
+    use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use std::collections::HashMap;
 
     fn bid(slot: &str, bidder: &str) -> Bid {
@@ -133,10 +131,22 @@ mod tests {
     fn maps_each_status_to_the_expected_provider_call_status() {
         let res = result(
             vec![
-                response("prebid", BidStatus::Success, 40, vec![bid("s1", "kargo")], None),
+                response(
+                    "prebid",
+                    BidStatus::Success,
+                    40,
+                    vec![bid("s1", "kargo")],
+                    None,
+                ),
                 response("rubicon", BidStatus::NoBid, 30, vec![], None),
                 response("ix", BidStatus::Error, 10, vec![], Some("launch_failed")),
-                response("appnexus", BidStatus::Error, 55, vec![], Some("parse_response")),
+                response(
+                    "appnexus",
+                    BidStatus::Error,
+                    55,
+                    vec![],
+                    Some("parse_response"),
+                ),
                 response("openx", BidStatus::Error, 60, vec![], Some("transport")),
                 response("smaato", BidStatus::Error, 5, vec![], None),
                 response("teads", BidStatus::Pending, 70, vec![], None),
@@ -146,27 +156,69 @@ mod tests {
 
         let calls = provider_calls_from_result(&res);
 
-        assert_eq!(calls.len(), 7, "should emit one outcome per provider response");
-        assert_eq!(calls[0].status, ProviderCallStatus::Success, "Success maps to Success");
+        assert_eq!(
+            calls.len(),
+            7,
+            "should emit one outcome per provider response"
+        );
+        assert_eq!(
+            calls[0].status,
+            ProviderCallStatus::Success,
+            "Success maps to Success"
+        );
         assert_eq!(calls[0].bid_count, Some(1), "should count returned bids");
-        assert_eq!(calls[0].response_time_ms, Some(40), "should carry response time");
-        assert_eq!(calls[0].role, ProviderRole::Bidder, "provider responses are bidders");
-        assert_eq!(calls[1].status, ProviderCallStatus::NoBid, "NoBid maps to NoBid");
-        assert_eq!(calls[2].status, ProviderCallStatus::LaunchError, "launch_failed maps to LaunchError");
-        assert_eq!(calls[3].status, ProviderCallStatus::ParseError, "parse_response maps to ParseError");
-        assert_eq!(calls[4].status, ProviderCallStatus::TransportError, "transport maps to TransportError");
+        assert_eq!(
+            calls[0].response_time_ms,
+            Some(40),
+            "should carry response time"
+        );
+        assert_eq!(
+            calls[0].role,
+            ProviderRole::Bidder,
+            "provider responses are bidders"
+        );
+        assert_eq!(
+            calls[1].status,
+            ProviderCallStatus::NoBid,
+            "NoBid maps to NoBid"
+        );
+        assert_eq!(
+            calls[2].status,
+            ProviderCallStatus::LaunchError,
+            "launch_failed maps to LaunchError"
+        );
+        assert_eq!(
+            calls[3].status,
+            ProviderCallStatus::ParseError,
+            "parse_response maps to ParseError"
+        );
+        assert_eq!(
+            calls[4].status,
+            ProviderCallStatus::TransportError,
+            "transport maps to TransportError"
+        );
         assert_eq!(
             calls[5].status,
             ProviderCallStatus::TransportError,
             "an Error with no recognized error_type falls back to TransportError"
         );
-        assert_eq!(calls[6].status, ProviderCallStatus::Timeout, "Pending maps to Timeout");
+        assert_eq!(
+            calls[6].status,
+            ProviderCallStatus::Timeout,
+            "Pending maps to Timeout"
+        );
     }
 
     #[test]
     fn appends_a_mediator_outcome_when_present() {
         let res = result(
-            vec![response("prebid", BidStatus::Success, 40, vec![bid("s1", "kargo")], None)],
+            vec![response(
+                "prebid",
+                BidStatus::Success,
+                40,
+                vec![bid("s1", "kargo")],
+                None,
+            )],
             Some(response("mediator", BidStatus::Success, 12, vec![], None)),
         );
 
@@ -174,7 +226,14 @@ mod tests {
 
         assert_eq!(calls.len(), 2, "should append one outcome for the mediator");
         let mediator = calls.last().expect("should have a mediator outcome");
-        assert_eq!(mediator.role, ProviderRole::Mediator, "mediator outcome uses the Mediator role");
-        assert_eq!(mediator.provider, "mediator", "should carry the mediator provider name");
+        assert_eq!(
+            mediator.role,
+            ProviderRole::Mediator,
+            "mediator outcome uses the Mediator role"
+        );
+        assert_eq!(
+            mediator.provider, "mediator",
+            "should carry the mediator provider name"
+        );
     }
 }
