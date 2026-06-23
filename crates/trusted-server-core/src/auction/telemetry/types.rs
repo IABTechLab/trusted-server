@@ -298,7 +298,11 @@ mod tests {
             gdpr_applies: false,
             consent_present: true,
         };
-        assert_eq!(ctx.source, AuctionSource::AuctionApi, "should retain source");
+        assert_eq!(
+            ctx.source,
+            AuctionSource::AuctionApi,
+            "should retain source"
+        );
         assert_eq!(ctx.region.as_deref(), Some("CA"), "should retain region");
     }
 
@@ -323,8 +327,7 @@ mod tests {
             "should render NoBid as the single token nobid"
         );
         assert_eq!(
-            serde_json::to_string(&EventKind::ProviderCall)
-                .expect("should serialize kind"),
+            serde_json::to_string(&EventKind::ProviderCall).expect("should serialize kind"),
             "\"provider_call\"",
             "should use snake_case wire form"
         );
@@ -349,13 +352,26 @@ mod tests {
         ];
         let ndjson = to_ndjson(&rows).expect("should serialize rows");
         let lines: Vec<&str> = ndjson.split('\n').collect();
-        assert_eq!(lines.len(), 2, "should emit one line per row with no trailing newline");
+        assert_eq!(
+            lines.len(),
+            2,
+            "should emit one line per row with no trailing newline"
+        );
         for line in &lines {
             let value: serde_json::Value =
                 serde_json::from_str(line).expect("each line should be valid JSON");
-            assert!(value.get("event_kind").is_some(), "should always include event_kind");
-            assert!(value.get("auction_id").is_some(), "should always include auction_id");
-            assert!(value.get("region").is_some(), "should include region key even when null");
+            assert!(
+                value.get("event_kind").is_some(),
+                "should always include event_kind"
+            );
+            assert!(
+                value.get("auction_id").is_some(),
+                "should always include auction_id"
+            );
+            assert!(
+                value.get("region").is_some(),
+                "should include region key even when null"
+            );
         }
     }
 }
