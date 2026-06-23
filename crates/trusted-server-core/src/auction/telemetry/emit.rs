@@ -9,6 +9,7 @@ use crate::auction::telemetry::context::build_observation_context;
 use crate::auction::telemetry::mapping::build_completed_auction_events;
 use crate::auction::telemetry::types::AuctionSource;
 use crate::auction::types::AuctionRequest;
+use crate::ec::device::DeviceSignals;
 use crate::platform::RuntimeServices;
 
 /// Build and emit completed-auction telemetry for a finished auction.
@@ -18,6 +19,23 @@ pub fn emit_completed_auction_telemetry(
     request: &AuctionRequest,
     result: &OrchestrationResult,
 ) {
+    let user_agent = request
+        .device
+        .as_ref()
+        .and_then(|device| device.user_agent.as_deref())
+        .unwrap_or("");
+    let client_info = services.client_info();
+    let signals = DeviceSignals::derive(
+        user_agent,
+        client_info.tls_ja4.as_deref(),
+        client_info.h2_fingerprint.as_deref(),
+    );
+    // Map the optional browser-legitimacy bit to the 0/1/2 schema column.
+    let is_known_browser = match signals.known_browser {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => 2,
+    };
     let observation = build_observation_context(
         source,
         &request.publisher.domain,
@@ -27,8 +45,8 @@ pub fn emit_completed_auction_telemetry(
             .as_ref()
             .and_then(|device| device.geo.as_ref()),
         request.user.consent.as_ref(),
-        2,
-        2,
+        signals.is_mobile,
+        is_known_browser,
     );
     let slot_count = u16::try_from(request.slots.len()).unwrap_or(u16::MAX);
     let rows = build_completed_auction_events(&observation, slot_count, result);
@@ -39,7 +57,7 @@ pub fn emit_completed_auction_telemetry(
 mod tests {
     use super::*;
     use crate::auction::telemetry::{EventKind, InMemorySink};
-    use crate::auction::types::{PublisherInfo, UserInfo};
+    use crate::auction::types::{DeviceInfo, PublisherInfo, UserInfo};
     use crate::platform::test_support::noop_services;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -102,6 +120,42 @@ mod tests {
         assert_eq!(
             summary.page_path, "/news",
             "should carry the normalized page path"
+        );
+    }
+
+    #[test]
+    fn derives_is_mobile_from_user_agent() {
+        let sink = Arc::new(InMemorySink::default());
+        let services = noop_services().with_auction_event_sink(sink.clone());
+        let mut req = request();
+        req.device = Some(DeviceInfo {
+            user_agent: Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+                    .to_string(),
+            ),
+            ip: None,
+            geo: None,
+        });
+
+        emit_completed_auction_telemetry(
+            &services,
+            AuctionSource::AuctionApi,
+            &req,
+            &empty_result(),
+        );
+
+        let rows = sink.rows();
+        let summary = rows
+            .iter()
+            .find(|r| r.event_kind == EventKind::Summary)
+            .expect("should emit a summary row");
+        assert_eq!(
+            summary.is_mobile, 1,
+            "an iPhone user agent should classify as mobile"
+        );
+        assert_eq!(
+            summary.is_known_browser, 2,
+            "with no JA4/H2 fingerprint the browser-legitimacy signal is unknown"
         );
     }
 }
