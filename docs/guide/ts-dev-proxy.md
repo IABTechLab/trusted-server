@@ -226,14 +226,17 @@ The tool is flags-only; there are no environment variable overrides.
 
 ## Browser details
 
-| Browser | How the proxy is configured                                                                                                                                               | CA trust                                        |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| Chrome  | Temp `--user-data-dir`; `--proxy-server="https=127.0.0.1:<port>"` (HTTPS only — plain HTTP goes direct)                                                                   | macOS login keychain via `ca install`           |
-| Firefox | Temp profile with `user.js` setting `network.proxy.ssl` (HTTPS only — `network.proxy.http` is unset so plain HTTP goes direct)                                            | CA imported into the profile's NSS DB at launch |
-| Safari  | System PAC at `http://127.0.0.1:<port>/proxy.pac` via `networksetup` on the active network service, scoped to the configured `FROM` hosts; prior setting restored on exit | macOS login keychain via `ca install`           |
+| Browser | How the proxy is configured                                                                                                                                                                                                 | CA trust                                        |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| Chrome  | Temp `--user-data-dir`; `--proxy-server="https=127.0.0.1:<port>"` (HTTPS only — plain HTTP goes direct)                                                                                                                     | macOS login keychain via `ca install`           |
+| Firefox | Temp profile with `user.js` setting `network.proxy.ssl` (HTTPS only — `network.proxy.http` is unset so plain HTTP goes direct)                                                                                              | CA imported into the profile's NSS DB at launch |
+| Safari  | System PAC at `http://127.0.0.1:<port>/proxy.pac` via `networksetup` on the active network service, scoped to the configured `FROM` hosts; then opens Safari at the first rule's `FROM` URL; prior setting restored on exit | macOS login keychain via `ca install`           |
 
-Safari's system proxy change is system-wide (all apps) while the proxy is
-running. On a clean exit the prior setting is restored. After a hard kill (`SIGKILL`)
+Unlike Chrome/Firefox (which run in a throwaway profile), Safari uses your
+**system** proxy settings, so `--launch safari` sets the macOS auto-proxy on the
+active network service (e.g. Wi-Fi) and then opens Safari at the `FROM` URL. The
+change is system-wide (all apps) but PAC-scoped to the `FROM` hosts, and only
+while the proxy runs. On a clean exit the prior setting is restored. After a hard kill (`SIGKILL`)
 the next `ts dev proxy` run detects and restores the leftover state, or prints
 the manual `networksetup` command.
 

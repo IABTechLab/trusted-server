@@ -378,9 +378,16 @@ fn launch_safari(cfg: &ResolvedConfig) {
 
     match set_result {
         Ok(s) if s.success() => {
-            output::info(&format!(
-                "Safari: PAC URL set for '{service}'; open Safari and browse to a proxied host"
-            ));
+            // Open Safari at the first rule's FROM URL, like Chrome and Firefox do.
+            if let Some(rule) = cfg.rules.0.first() {
+                let url = format!("https://{}", rule.from);
+                let _ = Command::new("open").args(["-a", "Safari", &url]).status();
+                output::info(&format!("Safari: PAC set for '{service}'; opened {url}"));
+            } else {
+                output::info(&format!(
+                    "Safari: PAC URL set for '{service}'; open Safari and browse to a proxied host"
+                ));
+            }
         }
         _ => {
             output::warn(&format!(
