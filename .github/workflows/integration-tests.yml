@@ -33,6 +33,11 @@ jobs:
           install-viceroy: "false"
           build-cloudflare: "true"
 
+      - name: Generate integration Viceroy configs
+        run: ./scripts/generate-integration-viceroy-configs.sh
+        env:
+          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+
       - name: Package integration test artifacts
         run: |
           mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")" "$CF_BUILD_ARTIFACT_PATH"
@@ -107,6 +112,7 @@ jobs:
           AXUM_BINARY_PATH: ${{ env.AXUM_ARTIFACT_PATH }}
           CLOUDFLARE_WRANGLER_DIR: ${{ github.workspace }}/crates/trusted-server-adapter-cloudflare
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
           RUST_LOG: info
 
   integration-tests-edgezero:
@@ -150,10 +156,10 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/trusted-server-integration-tests/fixtures/configs/viceroy-template-edgezero.toml
-          # Opt into the EdgeZero entry-point canary in test_ec_lifecycle_fastly.
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-edgezero.toml
+          # Opt into the EdgeZero entry-point probe in test_ec_lifecycle_fastly.
           # Only set here, so the legacy integration-tests job runs the same
-          # scenarios through legacy_main without asserting the EdgeZero-only 405.
+          # scenarios through legacy_main without the EdgeZero diagnostic probe.
           EXPECT_EDGEZERO_ENTRY_POINT: "true"
           RUST_LOG: info
 
@@ -202,7 +208,7 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
           TEST_FRAMEWORK: nextjs
           PLAYWRIGHT_HTML_REPORT: playwright-report-nextjs
         run: npx playwright test
@@ -221,7 +227,7 @@ jobs:
         env:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-          VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml
+          VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-legacy.toml
           TEST_FRAMEWORK: wordpress
           PLAYWRIGHT_HTML_REPORT: playwright-report-wordpress
         run: npx playwright test

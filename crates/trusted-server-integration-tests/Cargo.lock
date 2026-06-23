@@ -1009,7 +1009,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "futures",
  "futures-util",
  "http",
@@ -1017,29 +1017,6 @@ dependencies = [
  "redb",
  "reqwest 0.13.4",
  "serde_json",
- "simple_logger",
- "thiserror",
- "tokio",
- "tower 0.5.3",
- "tracing",
-]
-
-[[package]]
-name = "edgezero-adapter-axum"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bytes",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e)",
- "futures",
- "futures-util",
- "http",
- "log",
- "redb",
- "reqwest 0.13.4",
  "simple_logger",
  "thiserror",
  "tokio",
@@ -1056,7 +1033,7 @@ dependencies = [
  "async-trait",
  "brotli",
  "bytes",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "flate2",
  "futures",
  "futures-util",
@@ -1074,7 +1051,7 @@ dependencies = [
  "async-trait",
  "brotli",
  "bytes",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "flate2",
  "futures",
  "futures-util",
@@ -1095,7 +1072,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
- "edgezero-macros 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-macros",
  "futures",
  "futures-util",
  "http",
@@ -1117,51 +1094,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "edgezero-core"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
-dependencies = [
- "anyhow",
- "async-compression",
- "async-stream",
- "async-trait",
- "bytes",
- "edgezero-macros 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e)",
- "futures",
- "futures-util",
- "http",
- "http-body",
- "log",
- "matchit 0.9.2",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror",
- "toml",
- "tower-service",
- "tracing",
- "validator",
- "web-time",
-]
-
-[[package]]
 name = "edgezero-macros"
 version = "0.1.0"
 source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
-dependencies = [
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "syn 2.0.118",
- "toml",
- "validator",
-]
-
-[[package]]
-name = "edgezero-macros"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e#ce6bcf74b529d9066d08ba87b2971af8379eb29e"
 dependencies = [
  "log",
  "proc-macro2",
@@ -4380,8 +4315,8 @@ name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "edgezero-adapter-axum 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-adapter-axum",
+ "edgezero-core",
  "error-stack",
  "futures",
  "log",
@@ -4398,7 +4333,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "edgezero-adapter-cloudflare",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "error-stack",
  "js-sys",
  "log",
@@ -4416,7 +4351,7 @@ dependencies = [
  "brotli",
  "bytes",
  "edgezero-adapter-spin",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "error-stack",
  "flate2",
  "log",
@@ -4438,7 +4373,7 @@ dependencies = [
  "cookie",
  "derive_more 2.1.1",
  "ed25519-dalek",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc)",
+ "edgezero-core",
  "error-stack",
  "flate2",
  "futures",
@@ -4475,8 +4410,8 @@ dependencies = [
  "axum",
  "bytes",
  "derive_more 2.1.1",
- "edgezero-adapter-axum 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e)",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ce6bcf74b529d9066d08ba87b2971af8379eb29e)",
+ "edgezero-adapter-axum",
+ "edgezero-core",
  "env_logger",
  "error-stack",
  "http",
@@ -4488,6 +4423,7 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "tokio",
+ "toml",
  "tower 0.4.13",
  "trusted-server-adapter-axum",
  "trusted-server-adapter-cloudflare",

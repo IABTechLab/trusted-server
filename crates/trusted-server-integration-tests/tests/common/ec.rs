@@ -271,8 +271,7 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Asserts the response has a specific HTTP status code.
-/// Asserts the running Viceroy instance is serving the `EdgeZero` entry point.
+/// Sends a non-fatal diagnostic probe for the EdgeZero entry point.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
