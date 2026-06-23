@@ -6,6 +6,7 @@ members = [
     "crates/trusted-server-cli",
     "crates/trusted-server-js",
     "crates/trusted-server-openrtb",
+    "crates/trusted-server-kitchen-sink",
 ]
 # trusted-server-integration-tests is intentionally excluded from workspace members because it
 # requires a native target (testcontainers, reqwest) while the workspace default
@@ -68,6 +69,7 @@ tempfile = "3.24"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 toml = "1.1"
 trusted-server-core = { path = "crates/trusted-server-core" }
+trusted-server-kitchen-sink = { path = "crates/trusted-server-kitchen-sink" }
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }

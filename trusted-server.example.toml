@@ -127,3 +127,5 @@ example_segments = "segments"
 
 [debug]
 ja4_endpoint_enabled = false
+# Public diagnostic fixture at /_ts/kitchen-sink/ when enabled.
+kitchen_sink_enabled = false

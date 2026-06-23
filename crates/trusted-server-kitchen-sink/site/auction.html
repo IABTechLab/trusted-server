@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auction Orchestration · Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Direct /auction test for Trusted Server static kitchen sink.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+  <script defer src="assets/auction.js"></script>
+</head>
+<body data-page="auction">
+  <header class="site-header">
+    <div class="site-header__inner">
+      <a class="brand" href="./">
+        Trusted Server Kitchen Sink
+        <small>Auction orchestration</small>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="./" data-nav="home">Home</a>
+        <a href="auction.html" data-nav="auction">Auction</a>
+        <a href="prebid.html" data-nav="prebid">Prebid</a>
+        <a href="creative-proxy.html" data-nav="creative">Creative Proxy</a>
+        <a href="identity.html" data-nav="identity">Identity</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="badge-row">
+        <span class="badge badge--success">POST /auction</span>
+        <span class="badge">OpenRTB response</span>
+        <span class="badge">Sandboxed iframes</span>
+      </div>
+      <h1>Direct auction orchestration test.</h1>
+      <p>Build a TSJS-style ad request, send it to the same-origin Trusted Server auction endpoint, and render winning creatives.</p>
+    </section>
+
+    <section class="card">
+      <form id="auction-form">
+        <div class="form-grid">
+          <label>
+            Auction endpoint
+            <input id="auction-endpoint" name="endpoint" value="/auction" autocomplete="off">
+          </label>
+          <label>
+            Timeout (ms)
+            <input id="auction-timeout" name="timeout" type="number" min="250" max="10000" step="250" value="2500">
+          </label>
+          <label class="inline-check" style="align-self: end;">
+            <input id="auction-debug" type="checkbox" checked>
+            Include debug context
+          </label>
+        </div>
+
+        <div class="form-grid" style="margin-top: 1rem;">
+          <fieldset>
+            <legend>Slots</legend>
+            <div id="slot-controls" class="checkbox-list"></div>
+          </fieldset>
+          <fieldset>
+            <legend>Bidders</legend>
+            <div id="bidder-controls" class="checkbox-list"></div>
+          </fieldset>
+          <label>
+            Optional auction-level EIDs JSON
+            <textarea id="auction-eids" spellcheck="false" placeholder='[{"source":"sharedid.org","uids":[{"id":"demo-user","atype":1}]}]'></textarea>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button type="submit">Run auction</button>
+          <button type="button" class="secondary" id="render-fixture">Render fixture response</button>
+          <button type="button" class="ghost" id="clear-slots">Clear slots</button>
+          <span id="auction-status" class="status-line">Idle</span>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" style="margin-top: 1rem;">
+      <div class="panel-header">
+        <h2>Ad slots</h2>
+        <span class="muted">Returned creatives are rendered below by <code>impid</code>.</span>
+      </div>
+      <div class="ad-grid">
+        <article class="ad-slot" data-ad-slot="header-banner" data-width="728" data-height="90">
+          <div class="ad-slot__head"><strong>header-banner</strong><span class="ad-slot__meta">728×90</span></div>
+          <div class="ad-slot__mount"><div class="ad-placeholder">No creative rendered yet</div></div>
+        </article>
+        <article class="ad-slot" data-ad-slot="in-content" data-width="300" data-height="250">
+          <div class="ad-slot__head"><strong>in-content</strong><span class="ad-slot__meta">300×250</span></div>
+          <div class="ad-slot__mount"><div class="ad-placeholder">No creative rendered yet</div></div>
+        </article>
+        <article class="ad-slot" data-ad-slot="sidebar-rail" data-width="300" data-height="600">
+          <div class="ad-slot__head"><strong>sidebar-rail</strong><span class="ad-slot__meta">300×600</span></div>
+          <div class="ad-slot__mount"><div class="ad-placeholder">No creative rendered yet</div></div>
+        </article>
+        <article class="ad-slot" data-ad-slot="sticky-footer" data-width="320" data-height="50">
+          <div class="ad-slot__head"><strong>sticky-footer</strong><span class="ad-slot__meta">320×50</span></div>
+          <div class="ad-slot__mount"><div class="ad-placeholder">No creative rendered yet</div></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="grid grid--wide" style="margin-top: 1rem;">
+      <article class="card">
+        <div class="panel-header">
+          <h2>Request</h2>
+          <button class="ghost" data-copy-target="#auction-request-json">Copy</button>
+        </div>
+        <pre id="auction-request-json">Run an auction to see the request.</pre>
+      </article>
+      <article class="card">
+        <div class="panel-header">
+          <h2>Response</h2>
+          <button class="ghost" data-copy-target="#auction-response-json">Copy</button>
+        </div>
+        <pre id="auction-response-json">Run an auction to see the response.</pre>
+      </article>
+    </section>
+
+    <section class="card" style="margin-top: 1rem;">
+      <div class="panel-header">
+        <h2>Event log</h2>
+        <button class="ghost" id="clear-log">Clear log</button>
+      </div>
+      <div id="auction-log" class="log"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Expected path: browser → Trusted Server <code>/auction</code> → auction providers → OpenRTB response → sandboxed iframe render.</p>
+  </footer>
+</body>
+</html>

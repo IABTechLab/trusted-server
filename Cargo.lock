@@ -3870,6 +3870,7 @@ dependencies = [
  "temp-env",
  "toml",
  "trusted-server-js",
+ "trusted-server-kitchen-sink",
  "trusted-server-openrtb",
  "url",
  "urlencoding",
@@ -3885,6 +3886,14 @@ dependencies = [
  "hex",
  "sha2 0.10.9",
  "which",
+]
+
+[[package]]
+name = "trusted-server-kitchen-sink"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
 ]
 
 [[package]]

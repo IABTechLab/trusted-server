@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Identity Diagnostics · Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Identity and EID diagnostics for Trusted Server static kitchen sink.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+  <script defer src="assets/diagnostics.js"></script>
+</head>
+<body data-page="identity">
+  <header class="site-header">
+    <div class="site-header__inner">
+      <a class="brand" href="./">
+        Trusted Server Kitchen Sink
+        <small>Identity diagnostics</small>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="./" data-nav="home">Home</a>
+        <a href="auction.html" data-nav="auction">Auction</a>
+        <a href="prebid.html" data-nav="prebid">Prebid</a>
+        <a href="creative-proxy.html" data-nav="creative">Creative Proxy</a>
+        <a href="identity.html" data-nav="identity">Identity</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="badge-row">
+        <span class="badge badge--success">Cookie inspector</span>
+        <span class="badge">EID diagnostics</span>
+        <span class="badge">Tester cookie</span>
+      </div>
+      <h1>Identity and browser signal diagnostics.</h1>
+      <p>
+        Inspect Trusted Server cookies, browser privacy signals, and any Prebid User ID EIDs available on the page.
+      </p>
+    </section>
+
+    <section class="grid grid--wide">
+      <article class="card">
+        <div class="panel-header">
+          <h2>Summary</h2>
+          <button id="refresh-diagnostics" class="secondary">Refresh</button>
+        </div>
+        <dl id="identity-summary" class="table-like"></dl>
+        <div class="actions">
+          <button id="set-tester-cookie">GET /_ts/set-tester</button>
+          <button id="clear-local-test-data" class="ghost">Clear local test data</button>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="panel-header">
+          <h2>Environment JSON</h2>
+          <button class="ghost" data-copy-target="#identity-environment-json">Copy</button>
+        </div>
+        <pre id="identity-environment-json" data-environment>{}</pre>
+      </article>
+    </section>
+
+    <section class="grid grid--wide" style="margin-top: 1rem;">
+      <article class="card">
+        <div class="panel-header">
+          <h2>Cookies</h2>
+          <button class="ghost" data-copy-target="#identity-cookies-json">Copy</button>
+        </div>
+        <pre id="identity-cookies-json">Refresh diagnostics to inspect cookies.</pre>
+      </article>
+
+      <article class="card">
+        <div class="panel-header">
+          <h2>Prebid EIDs</h2>
+          <button class="ghost" data-copy-target="#identity-eids-json">Copy</button>
+        </div>
+        <pre id="identity-eids-json">Refresh diagnostics to inspect pbjs.getUserIdsAsEids().</pre>
+      </article>
+    </section>
+
+    <section class="card" style="margin-top: 1rem;">
+      <div class="panel-header">
+        <h2>Event log</h2>
+        <button class="ghost" id="clear-identity-log">Clear log</button>
+      </div>
+      <div id="identity-log" class="log"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Tester cookie endpoint must be enabled in Trusted Server config. Static-only visits will not provide <code>/_ts/set-tester</code>.</p>
+  </footer>
+</body>
+</html>

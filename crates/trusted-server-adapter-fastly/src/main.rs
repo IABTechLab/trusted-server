@@ -37,6 +37,7 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::kitchen_sink::{handle_kitchen_sink_request, is_kitchen_sink_path};
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
@@ -970,6 +971,17 @@ async fn route_request(
                     }))
                 });
             (result, true)
+        }
+        (_, path) if is_kitchen_sink_path(path) => {
+            if is_real_browser && is_navigation_request(&req) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv_graph.as_ref()) {
+                    log::warn!("EC generation failed for kitchen-sink navigation: {err:?}");
+                }
+            }
+            (
+                handle_kitchen_sink_request(settings, integration_registry, runtime_services, &req),
+                false,
+            )
         }
 
         // No known route matched, proxy to an asset origin or publisher origin as fallback

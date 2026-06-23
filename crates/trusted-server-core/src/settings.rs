@@ -1731,6 +1731,13 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+    /// Expose the embedded kitchen-sink fixture at `GET /_ts/kitchen-sink/`.
+    ///
+    /// When `false` (the default), kitchen-sink paths return 404 and do not
+    /// fall through to the publisher origin. Enable only for intentional
+    /// integration diagnostics because the fixture is public when enabled.
+    #[serde(default)]
+    pub kitchen_sink_enabled: bool,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -2442,6 +2449,55 @@ mod tests {
         );
 
         settings.validate().expect("Failed to validate settings");
+    }
+
+    #[test]
+    fn debug_kitchen_sink_defaults_to_disabled() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse valid test settings");
+
+        assert!(
+            !settings.debug.kitchen_sink_enabled,
+            "kitchen sink should default to disabled"
+        );
+    }
+
+    #[test]
+    fn debug_kitchen_sink_enabled_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [debug]
+            kitchen_sink_enabled = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml_str).expect("should parse debug config");
+
+        assert!(
+            settings.debug.kitchen_sink_enabled,
+            "kitchen sink should parse as enabled"
+        );
+    }
+
+    #[test]
+    fn debug_unknown_fields_are_rejected() {
+        let toml_str = format!(
+            r#"{}
+
+            [debug]
+            unknown_debug_field = true
+        "#,
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml_str).expect_err("should reject unknown debug field");
+
+        assert!(
+            format!("{err:?}").contains("unknown_debug_field"),
+            "error should mention the unknown field: {err:?}"
+        );
     }
 
     #[test]

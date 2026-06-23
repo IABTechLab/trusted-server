@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Embedded Trusted Server kitchen sink for testing Trusted Server features.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="home">
+  <header class="site-header">
+    <div class="site-header__inner">
+      <a class="brand" href="./">
+        Trusted Server Kitchen Sink
+        <small>embedded diagnostic fixture</small>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="./" data-nav="home">Home</a>
+        <a href="auction.html" data-nav="auction">Auction</a>
+        <a href="prebid.html" data-nav="prebid">Prebid</a>
+        <a href="creative-proxy.html" data-nav="creative">Creative Proxy</a>
+        <a href="identity.html" data-nav="identity">Identity</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="badge-row">
+        <span class="badge badge--success">Static HTML</span>
+        <span class="badge">Vanilla JS</span>
+        <span class="badge">Trusted Server kitchen sink</span>
+        <span class="badge badge--warning">Test through Trusted Server for /auction</span>
+      </div>
+      <h1>Embedded publisher fixture for testing Trusted Server.</h1>
+      <p>
+        This site intentionally avoids WordPress, Next.js, and build-time framework behavior so Trusted Server
+        auction, Prebid, creative rewriting, and identity flows can be tested in isolation.
+      </p>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>Auction orchestration</h2>
+        <p>POST a TSJS-style payload to same-origin <code>/auction</code>, inspect the OpenRTB response, and render returned creatives into sandboxed iframes.</p>
+        <p><a class="button" href="auction.html">Open auction test</a></p>
+      </article>
+
+      <article class="card">
+        <h2>Prebid shim</h2>
+        <p>Exercise a publisher-style Prebid page with ad units, zones, bidder params, and the Trusted Server <code>trustedServer</code> adapter path.</p>
+        <p><a class="button" href="prebid.html">Open Prebid test</a></p>
+      </article>
+
+      <article class="card">
+        <h2>Creative proxy</h2>
+        <p>Probe external image/click assets and render fixture creatives to verify first-party URL rewriting when proxied by Trusted Server.</p>
+        <p><a class="button" href="creative-proxy.html">Open creative test</a></p>
+      </article>
+
+      <article class="card">
+        <h2>Identity diagnostics</h2>
+        <p>Inspect Trusted Server cookies, tester-cookie behavior, browser privacy signals, and available Prebid EIDs.</p>
+        <p><a class="button" href="identity.html">Open diagnostics</a></p>
+      </article>
+    </section>
+
+    <section class="grid grid--wide" style="margin-top: 1rem;">
+      <article class="card">
+        <div class="panel-header">
+          <h2>Environment</h2>
+          <button class="ghost" data-copy-target="#environment-json">Copy</button>
+        </div>
+        <pre id="environment-json" data-environment>{}</pre>
+      </article>
+
+      <article class="card">
+        <div class="panel-header">
+          <h2>Smoke test</h2>
+          <button id="run-smoke-auction">POST /auction</button>
+        </div>
+        <p class="muted">
+          This should succeed only when the page is served through a Trusted Server edge domain with auction enabled.
+          Static-only visits normally return 404 or another non-auction response.
+        </p>
+        <pre id="smoke-output">Click “POST /auction” to run a minimal request.</pre>
+      </article>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Trusted Server embedded kitchen sink. Enable it with debug.kitchen_sink_enabled and open /_ts/kitchen-sink/ through Trusted Server.</p>
+  </footer>
+</body>
+</html>
