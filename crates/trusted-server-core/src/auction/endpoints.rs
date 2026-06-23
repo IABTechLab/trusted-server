@@ -9,9 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::auction::telemetry::{
-    build_completed_auction_events, build_observation_context, AuctionSource,
-};
+use crate::auction::telemetry::{emit_completed_auction_telemetry, AuctionSource};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
@@ -273,25 +271,14 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
-    // Emit completed-auction telemetry. The sink write is buffered and
-    // non-blocking in production and a no-op by default in tests, so this never
-    // affects the response. Device signals are unknown (`2`) until a later plan
-    // threads them through.
-    let observation = build_observation_context(
+    // Emit completed-auction telemetry off the response path via the shared
+    // helper. Buffered/non-blocking in production, no-op by default in tests.
+    emit_completed_auction_telemetry(
+        services,
         AuctionSource::AuctionApi,
-        &auction_request.publisher.domain,
-        auction_request.publisher.page_url.as_deref(),
-        auction_request
-            .device
-            .as_ref()
-            .and_then(|device| device.geo.as_ref()),
-        auction_request.user.consent.as_ref(),
-        2,
-        2,
+        &auction_request,
+        &result,
     );
-    let slot_count = u16::try_from(auction_request.slots.len()).unwrap_or(u16::MAX);
-    let telemetry_rows = build_completed_auction_events(&observation, slot_count, &result);
-    services.auction_event_sink().emit(&telemetry_rows);
 
     // Convert to OpenRTB response format with inline creative HTML
     convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
