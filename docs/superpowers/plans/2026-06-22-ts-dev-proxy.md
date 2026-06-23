@@ -1615,7 +1615,7 @@ pub fn launch(browsers: &[Browser], cfg: &ResolvedConfig) -> error_stack::Result
 }
 ```
 
-Implement `launch_chrome` (temp `--user-data-dir`, `--proxy-server="https=127.0.0.1:<port>"`, `--no-first-run`, open the first rule's `FROM` URL), `launch_firefox` (temp profile, write `user.js` with `network.proxy.type=1` + `network.proxy.ssl`/`network.proxy.ssl_port` only, `certutil -A` into the profile NSS DB), and `launch_safari` (serve PAC via the server's local route; detect the active service via `route -n get default` → device → `networksetup -listnetworkserviceorder` mapping → `networksetup -setautoproxyurl <service> http://127.0.0.1:<port>/proxy.pac`; persist prior state to a file and restore on exit + on next run). Each helper logs manual steps on failure and continues.
+Implement `launch_chrome` (temp `--user-data-dir`, `--proxy-server="https=127.0.0.1:<port>"`, `--no-first-run`, open the first rule's `FROM` URL), `launch_firefox` (temp profile, write `user.js` with `network.proxy.type=1` + `network.proxy.ssl`/`network.proxy.ssl_port` only, `certutil -A` into the profile NSS DB), and `launch_safari` (serve PAC via the server's local route; detect the active service via `route -n get default` → device → `networksetup -listnetworkserviceorder` mapping → `networksetup -setautoproxyurl <service> http://127.0.0.1:<port>/proxy.pac`; then open the first rule's `FROM` URL in Safari via `open -a Safari`; persist prior state to a file and restore on exit + on next run). Each helper logs manual steps on failure and continues.
 
 - [ ] **Step 4: Run the PAC test to verify it passes**
 
