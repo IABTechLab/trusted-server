@@ -93,6 +93,25 @@ async fn keep_alive_serves_multiple_sequential_requests() {
 }
 
 #[tokio::test]
+async fn mismatched_host_over_mitm_tunnel_is_refused_with_421() {
+    // CONNECT a mapped host (so the tunnel is MITM'd), then send a request whose
+    // Host header matches NO rule. It must be refused with 421 (Misdirected
+    // Request), never rerouted through the CONNECT-authority rule — otherwise a
+    // client could CONNECT a mapped host and smuggle traffic for any other host
+    // through that rule (spec §8.2).
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let status = support::drive_request_with_host_header(cfg, ca, "unmapped.example.com").await;
+
+    assert_eq!(
+        status, 421,
+        "a Host that matches no rule must be refused with 421, not rerouted"
+    );
+}
+
+#[tokio::test]
 async fn unmatched_connect_off_loopback_is_refused_with_403() {
     // The proxy is set up with no rule matching "unmapped.example.com", and the
     // server is made to believe it is bound on a non-loopback interface.  An

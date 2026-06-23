@@ -202,6 +202,12 @@ impl CertAuthority {
         fs::create_dir_all(ca_dir).change_context(CaError::Dir)?;
         fs::set_permissions(ca_dir, fs::Permissions::from_mode(0o700))
             .change_context(CaError::Dir)?;
+        // Clear any stale pair first so `create_new` on the key always succeeds
+        // and the written cert/key pair is always self-consistent. A leftover
+        // key from a prior partial write would otherwise survive next to the new
+        // cert, leaving a mismatched (cert, key) that future runs would load.
+        fs::remove_file(cert_path).ok();
+        fs::remove_file(key_path).ok();
         fs::write(cert_path, cert_pem).change_context(CaError::Io)?;
         let mut key_file = OpenOptions::new()
             .write(true)

@@ -413,6 +413,35 @@ pub async fn drive_sequential_requests(
     results
 }
 
+/// CONNECTs to the mapped [`FROM_HOST`] (so the tunnel is MITM'd), then sends a
+/// single `GET /` over it carrying an arbitrary `Host` header, and returns the
+/// response status. Used to prove a `Host` that matches no rule is refused with
+/// `421` rather than rerouted through the CONNECT-authority rule (spec §8.2).
+pub async fn drive_request_with_host_header(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+    host_header: &str,
+) -> u16 {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: {host_header}\r\nConnection: keep-alive\r\n\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send request over tunnel");
+    tls.flush().await.expect("should flush request");
+    read_http_response(&mut tls).await.status
+}
+
 /// Reads one HTTP/1.1 response (head + Content-Length body) and parses the echo.
 async fn read_http_response<S>(stream: &mut S) -> ProxiedResponse
 where

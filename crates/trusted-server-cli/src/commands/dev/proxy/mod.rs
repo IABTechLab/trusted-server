@@ -137,6 +137,11 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
             }
             CaCommand::Uninstall => browser::ca_uninstall(),
             CaCommand::Regenerate => {
+                // Revoke OS trust for the OLD CA first. The old and new CA share
+                // CA_COMMON_NAME, so `ca_uninstall` (delete-by-CN, a no-op when
+                // absent) removes the soon-to-be-stale cert from the keychain
+                // before we replace the files on disk.
+                browser::ca_uninstall();
                 std::fs::remove_file(&cert_path).ok();
                 std::fs::remove_file(ca_dir.join("ca-key.pem")).ok();
                 ca::CertAuthority::load_or_generate(&ca_dir)

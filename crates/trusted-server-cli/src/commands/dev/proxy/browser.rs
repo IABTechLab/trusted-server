@@ -373,6 +373,25 @@ fn launch_safari(cfg: &ResolvedConfig) {
     let port = cfg.listen.port();
     let pac_url = format!("http://127.0.0.1:{port}/proxy.pac");
 
+    // A restore file left by a previous (hard-killed) run records the user's real
+    // original proxy state. The startup recovery in `run()` is non-interactive, so
+    // it may have failed to restore. If we captured state now we would record the
+    // dead dev-proxy PAC as the "original" and lose the user's setting forever.
+    // So first try an interactive restore; only proceed once the file is gone
+    // (meaning the current system state really is the user's original).
+    let restore_path = cfg.ca_dir.join(SAFARI_RESTORE_FILE);
+    if restore_path.exists() {
+        restore_system_proxy_if_pending(&cfg.ca_dir, true);
+        if restore_path.exists() {
+            output::warn(
+                "Safari: a previous proxy setting is still pending restore; skipping Safari \
+                 auto-configuration to avoid losing it. Restore it first (see the printed \
+                 networksetup command).",
+            );
+            return;
+        }
+    }
+
     let service = detect_network_service();
     let Some(service) = service else {
         output::warn(&format!(
@@ -382,11 +401,12 @@ fn launch_safari(cfg: &ResolvedConfig) {
         return;
     };
 
-    // Read prior state (URL + enabled flag) before changing anything.
+    // Read prior state (URL + enabled flag) before changing anything. The
+    // restore file (if any) was cleared above, so this captures the user's real
+    // original setting, not a stale dev-proxy PAC.
     let (prior_url, prior_enabled) = get_auto_proxy_state(&service);
 
     // Persist the prior state so it can be recovered even after a hard kill.
-    let restore_path = cfg.ca_dir.join(SAFARI_RESTORE_FILE);
     let restore_contents = format!(
         "{service}\n{url}\n{enabled}\n",
         url = prior_url.as_deref().unwrap_or(""),
@@ -480,14 +500,17 @@ fn detect_network_service() -> Option<String> {
 ///
 /// Both lines start with `(`, so the service line (`(N) Name`) is distinguished
 /// from the hardware-port line by the digit after `(`; the device is matched on
-/// the exact `Device: <interface>` marker.
+/// the exact `Device:` field value (so `en1` does not match `Device: en11`).
 #[cfg(target_os = "macos")]
 fn service_for_interface(ns_output: &str, interface: &str) -> Option<String> {
-    let device_marker = format!("Device: {interface}");
     let mut last_service: Option<String> = None;
     for line in ns_output.lines() {
         let trimmed = line.trim();
-        if trimmed.contains(&device_marker) {
+        // Match the `Device:` field exactly: take the value after `Device: `,
+        // strip the trailing `)`, and compare — `en1` must not match `en11`.
+        if let Some(after) = trimmed.split_once("Device: ")
+            && after.1.trim_end_matches(')').trim() == interface
+        {
             return last_service;
         }
         // Service-name line "(N) Name": a '(' immediately followed by a digit
@@ -618,10 +641,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn service_for_interface_maps_device_to_service() {
-        // Real shape of `networksetup -listnetworkserviceorder` output.
+        // Real shape of `networksetup -listnetworkserviceorder` output. `en1` and
+        // `en11` both appear so the test proves the `Device:` match is exact (a
+        // substring match would let `en1` match `Device: en11`).
         let ns = "An asterisk (*) denotes that a network service is disabled.\n\
                   (1) Display Ethernet\n\
                   (Hardware Port: Display Ethernet, Device: en11)\n\
+                  \n\
+                  (4) Thunderbolt Bridge\n\
+                  (Hardware Port: Thunderbolt Bridge, Device: en1)\n\
                   \n\
                   (7) Wi-Fi\n\
                   (Hardware Port: Wi-Fi, Device: en0)\n";
@@ -634,6 +662,11 @@ mod tests {
             service_for_interface(ns, "en11").as_deref(),
             Some("Display Ethernet"),
             "en11 should map to Display Ethernet"
+        );
+        assert_eq!(
+            service_for_interface(ns, "en1").as_deref(),
+            Some("Thunderbolt Bridge"),
+            "en1 should map to Thunderbolt Bridge, not cross-match Device: en11"
         );
         assert_eq!(
             service_for_interface(ns, "en99"),

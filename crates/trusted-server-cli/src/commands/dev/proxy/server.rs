@@ -330,11 +330,13 @@ async fn mitm(
 
 /// Rewrites one decrypted request and forwards it to the upstream.
 ///
-/// Each request is matched by its inbound `Host` header (falling back to the
-/// CONNECT authority), so a keep-alive tunnel that carries requests for several
-/// hosts routes each one by its own `Host` (spec §8.2). If a request's `Host`
-/// matches no rule, the rule that matched the CONNECT authority is used as a
-/// fallback, keeping an already-MITM'd tunnel usable.
+/// Each request is routed by its own inbound `Host` (before any rewrite), so a
+/// keep-alive tunnel that carries requests for several hosts routes each one
+/// independently (spec §8.2). A request whose `Host` matches no rule is **not**
+/// rerouted through the CONNECT-authority rule — it is refused with `421`
+/// (Misdirected Request), so a client cannot `CONNECT mapped.example` then send
+/// `Host: other.example` to smuggle traffic through a rule it never matched. The
+/// CONNECT authority is consulted only when the request carries no `Host` at all.
 ///
 /// This is infallible at the hyper layer — upstream errors become a `502` so
 /// the keep-alive tunnel survives a single bad request (spec §11).
@@ -350,15 +352,19 @@ async fn forward_request(
         return Ok(status_response(StatusCode::NOT_IMPLEMENTED));
     }
 
-    // Match on the inbound Host (before any rewrite), else the CONNECT
-    // authority; fall back to the CONNECT-authority rule when neither matches.
-    let match_host = request_host(&req).unwrap_or_else(|| connect_host.to_string());
-    let Some(rule) = rules
-        .first_match(&match_host)
-        .or_else(|| rules.first_match(connect_host))
-    else {
-        // Should not happen: MITM is only entered on a CONNECT-authority match.
-        return Ok(status_response(StatusCode::BAD_GATEWAY));
+    // Route by the request's own Host when present (spec §8.2). A Host that
+    // matches no rule is refused (421) rather than rerouted through the CONNECT
+    // authority. Only a request with no Host falls back to the CONNECT authority.
+    let rule = match request_host(&req) {
+        Some(host) => match rules.first_match(&host) {
+            Some(rule) => rule,
+            None => return Ok(status_response(StatusCode::MISDIRECTED_REQUEST)),
+        },
+        None => match rules.first_match(connect_host) {
+            Some(rule) => rule,
+            // Should not happen: MITM is only entered on a CONNECT-authority match.
+            None => return Ok(status_response(StatusCode::BAD_GATEWAY)),
+        },
     };
     let outcome = rewrite_for(rule);
     let upstream_host = rule.to.host().to_string();
