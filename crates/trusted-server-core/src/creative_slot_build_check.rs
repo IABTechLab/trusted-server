@@ -104,6 +104,57 @@ pub(crate) fn validate_price_granularity(value: &str) -> Result<(), String> {
     })
 }
 
+/// Accepted `media_type` values, mirroring the runtime [`MediaType`] enum's
+/// `#[serde(rename_all = "lowercase")]` variants.
+///
+/// The build path types a format's `media_type` as raw JSON, so a value such as
+/// `"bannerr"` would embed cleanly and then fail runtime settings load — the real
+/// [`MediaType`] enum cannot deserialize it. A crate-context test
+/// (`media_type_values_match_runtime_enum`) asserts this list stays in lockstep
+/// with the enum's `Deserialize` impl, so the two cannot drift.
+///
+/// [`MediaType`]: crate::auction::types::MediaType
+const MEDIA_TYPE_VALUES: &[&str] = &["banner", "video", "native"];
+
+/// Validate a format's `media_type` value against the runtime [`MediaType`] enum.
+///
+/// # Errors
+///
+/// Returns an error string when `value` is not a JSON string naming one of the
+/// runtime [`MediaType`] variants.
+///
+/// [`MediaType`]: crate::auction::types::MediaType
+fn validate_media_type(value: &serde_json::Value, slot_id: &str) -> Result<(), String> {
+    let media_type = value
+        .as_str()
+        .ok_or_else(|| format!("slot `{slot_id}` format media_type must be a string"))?;
+    if !MEDIA_TYPE_VALUES.contains(&media_type) {
+        return Err(format!(
+            "slot `{slot_id}` format media_type '{media_type}' is invalid; expected one of: banner, video, native"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that `value` is a string→string map, mirroring a runtime
+/// `HashMap<String, String>` field.
+///
+/// # Errors
+///
+/// Returns an error string when `value` is not a JSON object or any of its values
+/// is not a JSON string. `context` names the offending field in the error.
+fn validate_string_map(value: &serde_json::Value, context: &str) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{context} must be a map of string keys to string values"))?;
+    for (key, entry) in object {
+        if !entry.is_string() {
+            return Err(format!("{context} value for '{key}' must be a string"));
+        }
+    }
+    Ok(())
+}
+
 /// Returns `true` when `id` is non-empty and only `[A-Za-z0-9_-]`.
 fn is_valid_slot_id(id: &str) -> bool {
     !id.is_empty()
@@ -172,6 +223,12 @@ pub(crate) fn validate_creative_slot(
                     ALLOWED_FORMAT_FIELDS,
                     &format!("slot `{id}` format"),
                 )?;
+                // Validate the nested `media_type` value, not just the field
+                // name: a value like `"bannerr"` passes the key check but the
+                // runtime `MediaType` enum cannot deserialize it.
+                if let Some(media_type) = object.get("media_type") {
+                    validate_media_type(media_type, id)?;
+                }
             }
         }
     }
@@ -187,6 +244,15 @@ pub(crate) fn validate_creative_slot(
                 ALLOWED_APS_FIELDS,
                 &format!("slot `{id}` providers.aps"),
             )?;
+            // `ApsSlotParams::slot_id` is a `String`; a non-string value embeds
+            // cleanly but fails runtime deserialization.
+            if let Some(slot_id_value) = aps.get("slot_id") {
+                if !slot_id_value.is_string() {
+                    return Err(format!(
+                        "slot `{id}` providers.aps.slot_id must be a string"
+                    ));
+                }
+            }
         }
         if let Some(prebid) = providers
             .get("prebid")
@@ -197,6 +263,29 @@ pub(crate) fn validate_creative_slot(
                 ALLOWED_PREBID_FIELDS,
                 &format!("slot `{id}` providers.prebid"),
             )?;
+            // `PrebidSlotParams::bidders` is a map; a non-object value (e.g. a
+            // bare string or array) fails runtime deserialization.
+            if let Some(bidders) = prebid.get("bidders") {
+                if !bidders.is_object() {
+                    return Err(format!(
+                        "slot `{id}` providers.prebid.bidders must be a map of bidder names to params"
+                    ));
+                }
+            }
+        }
+    }
+
+    // `targeting` is a runtime `HashMap<String, String>`; a non-string value
+    // (e.g. `targeting = { pos = 1 }`) embeds cleanly but fails settings load.
+    if let Some(targeting) = slot.get("targeting") {
+        validate_string_map(targeting, &format!("slot `{id}` targeting"))?;
+    }
+
+    // `floor_price` is an `Option<f64>`; a non-numeric value would fail the
+    // runtime deserialization the build path otherwise bypasses.
+    if let Some(floor_price) = slot.get("floor_price") {
+        if !floor_price.is_null() && floor_price.as_f64().is_none() {
+            return Err(format!("slot `{id}` floor_price must be a number"));
         }
     }
 
@@ -208,6 +297,18 @@ pub(crate) fn validate_creative_slot(
     if let Some(div_id) = slot.get("div_id").and_then(serde_json::Value::as_str) {
         if div_id.trim().is_empty() {
             return Err(format!("slot `{id}` div_id override must not be empty"));
+        }
+    }
+
+    // `page_patterns` is a runtime `Vec<String>`; a non-string entry (e.g.
+    // `page_patterns = [123]`) fails deserialization. The validity check below
+    // skips non-strings via `filter_map`, so reject them explicitly first.
+    if let Some(patterns) = slot
+        .get("page_patterns")
+        .and_then(serde_json::Value::as_array)
+    {
+        if patterns.iter().any(|p| !p.is_string()) {
+            return Err(format!("slot `{id}` page_patterns entries must be strings"));
         }
     }
 
@@ -520,6 +621,151 @@ mod tests {
         assert!(
             validate_creative_slot(&slot, "123456789").is_ok(),
             "well-formed nested provider config must be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_media_type() {
+        // `bannerr` passes the field-name check but the runtime MediaType enum
+        // cannot deserialize it, so settings load would fail on the service.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250, "media_type": "bannerr" }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("invalid media_type must fail at build time");
+        assert!(
+            err.contains("media_type 'bannerr' is invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_media_type() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250, "media_type": 1 }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-string media_type must fail at build time");
+        assert!(err.contains("media_type must be a string"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_all_media_types() {
+        for media_type in ["banner", "video", "native"] {
+            let slot = json!({
+                "id": "atf",
+                "page_patterns": ["/20**"],
+                "formats": [{ "width": 300, "height": 250, "media_type": media_type }]
+            });
+            assert!(
+                validate_creative_slot(&slot, "123456789").is_ok(),
+                "'{media_type}' should be a valid media_type"
+            );
+        }
+    }
+
+    #[test]
+    fn media_type_values_match_runtime_enum() {
+        use crate::auction::types::MediaType;
+        // Every listed value must deserialize into the runtime enum.
+        for value in super::MEDIA_TYPE_VALUES {
+            serde_json::from_value::<MediaType>(json!(value))
+                .unwrap_or_else(|_| panic!("'{value}' should deserialize into MediaType"));
+        }
+        // Exhaustive match so a newly added MediaType variant forces this test
+        // (and MEDIA_TYPE_VALUES) to be updated, preventing silent drift.
+        for variant in [MediaType::Banner, MediaType::Video, MediaType::Native] {
+            let covered = match variant {
+                MediaType::Banner => "banner",
+                MediaType::Video => "video",
+                MediaType::Native => "native",
+            };
+            assert!(
+                super::MEDIA_TYPE_VALUES.contains(&covered),
+                "MEDIA_TYPE_VALUES is missing runtime variant '{covered}'"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_string_targeting_value() {
+        // `targeting` is a runtime HashMap<String, String>; a numeric value
+        // embeds cleanly but fails settings load.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "targeting": { "pos": 1 }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-string targeting value must fail at build time");
+        assert!(
+            err.contains("targeting value for 'pos' must be a string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_aps_slot_id() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "providers": { "aps": { "slot_id": 123 } }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-string aps slot_id must fail at build time");
+        assert!(
+            err.contains("providers.aps.slot_id must be a string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_object_prebid_bidders() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "providers": { "prebid": { "bidders": "appnexus" } }
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-object prebid bidders must fail at build time");
+        assert!(
+            err.contains("providers.prebid.bidders must be a map"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_floor_price() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 300, "height": 250 }],
+            "floor_price": "high"
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-numeric floor_price must fail at build time");
+        assert!(err.contains("floor_price must be a number"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_string_page_pattern_entry() {
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": [123],
+            "formats": [{ "width": 300, "height": 250 }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("non-string page_patterns entry must fail at build time");
+        assert!(
+            err.contains("page_patterns entries must be strings"),
+            "got: {err}"
         );
     }
 

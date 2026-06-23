@@ -6,8 +6,7 @@ use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::{
-    header, HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
-    StatusCode,
+    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -16,10 +15,7 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionOrchestrator;
 use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::constants::{
-    COOKIE_SHAREDID, COOKIE_TS_EIDS, ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION,
-    HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV, HEADER_X_TS_VERSION,
-};
+use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -374,6 +370,11 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                     if let Some(effects) = &request_filter_effects {
                         effects.apply_to_response(&mut response);
                     }
+                    // Final cache guard: EC finalization and request-filter
+                    // effects above may have added a per-user Set-Cookie after
+                    // `apply_finalize_headers` ran, so re-apply the privacy
+                    // downgrade before send, mirroring legacy_main.
+                    crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
                     compat::to_fastly_response(response).send_to_client();
 
                     if ec_state.is_real_browser {
@@ -403,6 +404,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     if let Some(effects) = &request_filter_effects {
         effects.apply_to_response(&mut response);
     }
+    // Final cache guard for the no-EC-finalization fallback: request-filter
+    // effects may still have added a per-user Set-Cookie after finalize headers.
+    crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
     compat::to_fastly_response(response).send_to_client();
 }
 
@@ -1212,84 +1216,10 @@ fn publisher_response_carries_body(method: &Method, status: StatusCode) -> bool 
 /// version/staging, then operator-configured `settings.response_headers`.
 /// This means operators can intentionally override any managed header.
 fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
-    if let Some(geo) = geo_info {
-        geo.set_response_headers(response);
-    } else {
-        response.headers_mut().insert(
-            HEADER_X_GEO_INFO_AVAILABLE,
-            HeaderValue::from_static("false"),
-        );
-    }
-
-    if let Ok(v) = ::std::env::var(ENV_FASTLY_SERVICE_VERSION) {
-        if let Ok(value) = HeaderValue::from_str(&v) {
-            response.headers_mut().insert(HEADER_X_TS_VERSION, value);
-        } else {
-            log::warn!("Skipping invalid FASTLY_SERVICE_VERSION response header value");
-        }
-    }
-    if ::std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
-        response
-            .headers_mut()
-            .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
-    }
-
-    // Any response that sets a per-user cookie (notably the EC identity cookie
-    // minted on a visitor's first navigation) must never be shared-cached, or a
-    // shared cache could replay one user's Set-Cookie to others. The publisher
-    // path only forces `private` for HTML that carries inline ad data, so this
-    // net covers ordinary navigations whose sole per-user payload is the cookie.
-    // Skip when the response is already uncacheable so we don't clobber a
-    // stricter directive (e.g. `no-store`).
-    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
-    // against a lowercased copy — `No-Store` / `Private` must count.
-    if response.headers().contains_key(header::SET_COOKIE) {
-        // Surrogate cache headers must come off every cookie-bearing response,
-        // even one already carrying a stricter `no-store`/`private` directive —
-        // they are independent of Cache-Control and would otherwise let a shared
-        // cache store and replay one visitor's Set-Cookie.
-        response.headers_mut().remove("surrogate-control");
-        response.headers_mut().remove("fastly-surrogate-control");
-        let already_uncacheable = response
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-        if !already_uncacheable {
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("private, max-age=0"),
-            );
-        }
-    }
-
-    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
-    // carry an uncacheable Cache-Control directive (`private` or `no-store`).
-    // Operator headers must not re-enable shared caching for them — neither by
-    // replacing Cache-Control nor by reintroducing the surrogate cache headers
-    // the privacy paths stripped.
-    let response_is_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-
-    for (key, value) in &settings.response_headers {
-        if response_is_uncacheable
-            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || key.eq_ignore_ascii_case("surrogate-control")
-                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
-        {
-            continue;
-        }
-        let header_name = HeaderName::from_bytes(key.as_bytes())
-            .expect("settings.response_headers validated at load time");
-        let header_value =
-            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
-        response.headers_mut().insert(header_name, header_value);
-    }
+    // Legacy and EdgeZero paths share one protected finalizer so the cache /
+    // Set-Cookie privacy hardening cannot drift between them. `HttpResponse` and
+    // the middleware's `Response` are the same `edgezero_core::http::Response`.
+    apply_finalize_headers(settings, geo_info, response);
 }
 
 /// Forces cookie-bearing Fastly responses to stay private to shared caches.

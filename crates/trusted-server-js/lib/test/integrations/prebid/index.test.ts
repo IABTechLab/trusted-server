@@ -864,6 +864,57 @@ describe('prebid/installRefreshHandler', () => {
     );
   });
 
+  it('scopes the GPT targeting call to the refreshed slot code', () => {
+    const setTargetingForGPTAsync = vi.fn();
+    (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;
+    // Run the bidsBackHandler synchronously so the targeting call fires.
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    const originalRefresh = vi.fn();
+    // Only the header slot is refreshed; the footer slot must be untouched.
+    const headerSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-header'),
+      getTargeting: vi.fn(() => []),
+      clearTargeting: vi.fn().mockReturnThis(),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [headerSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'header_ad',
+          gam_unit_path: '/123/header',
+          div_id: 'div-ad-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'header' },
+        },
+        {
+          id: 'footer_ad',
+          gam_unit_path: '/123/footer',
+          div_id: 'div-ad-footer',
+          formats: [[728, 90]],
+          targeting: { zone: 'footer' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh([headerSlot]);
+
+    expect(setTargetingForGPTAsync).toHaveBeenCalledTimes(1);
+    expect(setTargetingForGPTAsync).toHaveBeenCalledWith(['div-ad-header']);
+    expect(originalRefresh).toHaveBeenCalledWith([headerSlot], undefined);
+
+    delete (mockPbjs as any).setTargetingForGPTAsync;
+  });
+
   it('includes configured client-side bidders in refresh ad units', () => {
     (window as any).__tsjs_prebid = { clientSideBidders: ['rubicon'] };
     // Original publisher ad unit carries a client-side rubicon bid.

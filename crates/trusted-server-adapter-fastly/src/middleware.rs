@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use edgezero_adapter_fastly::context::FastlyRequestContext;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderName, HeaderValue, Response, StatusCode};
+use edgezero_core::http::{header, HeaderName, HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
 use std::net::IpAddr;
@@ -181,13 +181,19 @@ where
 /// Applies all standard Trusted Server response headers to the given response.
 ///
 /// Mirrors [`crate::finalize_response`] exactly, operating on [`Response`] from
-/// `edgezero_core::http` instead of `HttpResponse`.
+/// `edgezero_core::http` instead of `HttpResponse`. [`crate::finalize_response`]
+/// delegates here so the legacy and `EdgeZero` paths share one protected
+/// finalizer.
 ///
 /// Header write order (last write wins):
 /// 1. Geo headers (`x-geo-*`) — or `X-Geo-Info-Available: false` when absent
 /// 2. `X-TS-Version` from `FASTLY_SERVICE_VERSION` env var
 /// 3. `X-TS-ENV: staging` when `FASTLY_IS_STAGING == "1"`
-/// 4. `settings.response_headers` — operator-configured overrides applied last
+/// 4. Set-Cookie cache privacy — strip surrogate cache headers and downgrade
+///    `Cache-Control` to `private, max-age=0` on cookie-bearing responses
+/// 5. `settings.response_headers` — operator-configured overrides, except the
+///    cache-controlling headers are skipped on uncacheable (`private`/`no-store`)
+///    responses so operators cannot re-enable shared caching for per-user payloads
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_info: Option<&GeoInfo>,
@@ -216,13 +222,76 @@ pub(crate) fn apply_finalize_headers(
             .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));
     }
 
+    // Any response that sets a per-user cookie (notably the EC identity cookie)
+    // must never be shared-cached, or a shared cache could replay one user's
+    // Set-Cookie to others. Skip when the response is already uncacheable so we
+    // don't clobber a stricter directive (e.g. `no-store`).
+    enforce_set_cookie_cache_privacy(response);
+
+    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
+    // carry an uncacheable Cache-Control directive (`private` or `no-store`).
+    // Operator headers must not re-enable shared caching for them — neither by
+    // replacing Cache-Control nor by reintroducing the surrogate cache headers
+    // the privacy paths stripped.
+    let response_is_uncacheable = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+
     for (key, value) in &settings.response_headers {
+        if response_is_uncacheable
+            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
+                || key.eq_ignore_ascii_case("surrogate-control")
+                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
+        {
+            continue;
+        }
         let header_name = HeaderName::from_bytes(key.as_bytes())
             .expect("should be a valid header name: response_headers validated in prepare_runtime");
         let header_value = HeaderValue::from_str(value).expect(
             "should be a valid header value: response_headers validated in prepare_runtime",
         );
         response.headers_mut().insert(header_name, header_value);
+    }
+}
+
+/// Forces cookie-bearing responses to stay private to shared caches.
+///
+/// Mirrors [`crate::enforce_set_cookie_cache_privacy`] for the [`Response`] type
+/// from `edgezero_core::http`. The `EdgeZero` entry point re-applies this after
+/// [`ec_finalize_response`](trusted_server_core::ec::finalize::ec_finalize_response)
+/// and request-filter effects, because the EC identity `Set-Cookie` is written
+/// after [`apply_finalize_headers`] runs and would otherwise reach a shared cache
+/// with inherited `public`/surrogate cache headers.
+///
+/// Idempotent: a response already marked `private`/`no-store` keeps its stricter
+/// `Cache-Control`, but the surrogate cache headers are stripped regardless so a
+/// `no-store` cookie response can never retain shared cacheability.
+pub(crate) fn enforce_set_cookie_cache_privacy(response: &mut Response) {
+    if !response.headers().contains_key(header::SET_COOKIE) {
+        return;
+    }
+    // Surrogate cache headers must come off every cookie-bearing response, even
+    // one already carrying a stricter `no-store`/`private` directive — they are
+    // independent of Cache-Control and would otherwise let a shared cache store
+    // and replay one visitor's Set-Cookie.
+    response.headers_mut().remove("surrogate-control");
+    response.headers_mut().remove("fastly-surrogate-control");
+    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
+    // against a lowercased copy — `No-Store` / `Private` must count.
+    let already_uncacheable = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    if !already_uncacheable {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=0"),
+        );
     }
 }
 
@@ -339,6 +408,149 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
             "should set X-Geo-Info-Available: false when no geo info is available"
+        );
+    }
+
+    fn response_with_headers(pairs: &[(&'static str, &'static str)]) -> Response {
+        let mut response = empty_response();
+        for (key, value) in pairs {
+            response.headers_mut().insert(
+                HeaderName::from_static(key),
+                HeaderValue::from_static(value),
+            );
+        }
+        response
+    }
+
+    #[test]
+    fn apply_finalize_headers_downgrades_public_set_cookie_response() {
+        // A per-user cookie response that arrives shared-cacheable (origin-public
+        // plus a surrogate directive) must be downgraded so a shared cache cannot
+        // store and replay one visitor's Set-Cookie.
+        let settings = settings_with_response_headers(vec![]);
+        let mut response = response_with_headers(&[
+            ("set-cookie", "ts-ec=abc; Path=/"),
+            ("cache-control", "public, max-age=600"),
+            ("surrogate-control", "max-age=600"),
+        ]);
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=0"),
+            "should downgrade a public cookie response to private"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip surrogate-control from a cookie-bearing response"
+        );
+    }
+
+    #[test]
+    fn apply_finalize_headers_blocks_operator_surrogate_on_private_response() {
+        // Operator response_headers must not re-enable shared caching for an
+        // uncacheable (private) per-user response — neither by replacing
+        // Cache-Control nor by reintroducing surrogate cache headers.
+        let settings = settings_with_response_headers(vec![
+            ("cache-control", "public, max-age=3600"),
+            ("surrogate-control", "max-age=3600"),
+            ("x-operator", "kept"),
+        ]);
+        let mut response = response_with_headers(&[("cache-control", "private, max-age=0")]);
+
+        apply_finalize_headers(&settings, None, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=0"),
+            "operator cache-control must not weaken a private response"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "operator surrogate-control must not be applied to a private response"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-operator")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept"),
+            "non-cache operator headers must still apply"
+        );
+    }
+
+    #[test]
+    fn enforce_set_cookie_cache_privacy_downgrades_late_cookie() {
+        // Mirrors the EdgeZero post-ec_finalize guard: a Set-Cookie added after
+        // finalize headers ran (origin-public response) must be downgraded.
+        let mut response = response_with_headers(&[
+            ("set-cookie", "ts-ec=abc; Path=/"),
+            ("cache-control", "public, max-age=600"),
+            ("surrogate-control", "max-age=600"),
+        ]);
+
+        enforce_set_cookie_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=0"),
+            "should downgrade a late public cookie response to private"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip surrogate-control from the late cookie response"
+        );
+    }
+
+    #[test]
+    fn enforce_set_cookie_cache_privacy_keeps_stricter_no_store() {
+        // Idempotent: a stricter no-store directive is preserved, but surrogate
+        // headers still come off.
+        let mut response = response_with_headers(&[
+            ("set-cookie", "ts-ec=abc; Path=/"),
+            ("cache-control", "no-store"),
+            ("surrogate-control", "max-age=600"),
+        ]);
+
+        enforce_set_cookie_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "should keep the stricter no-store directive"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should strip surrogate-control even when keeping no-store"
+        );
+    }
+
+    #[test]
+    fn enforce_set_cookie_cache_privacy_ignores_cookieless_response() {
+        let mut response = response_with_headers(&[("cache-control", "public, max-age=600")]);
+
+        enforce_set_cookie_cache_privacy(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=600"),
+            "should leave a cookieless response untouched"
         );
     }
 

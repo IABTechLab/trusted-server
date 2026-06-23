@@ -89,6 +89,49 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('skips adInit on an empty page-bids response with no prior TS state', async () => {
+    // A gated page-bids response (auction kill switch or consent denial) returns
+    // no slots. With no prior TS state to sweep, the hook must not call adInit()
+    // so a consent-denied navigation cannot activate the publisher's GPT setup.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/gated-route');
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([]);
+    expect(ts.bids).toEqual({});
+    expect(adInit).not.toHaveBeenCalled();
+  });
+
+  it('runs adInit on an empty page-bids response when prior TS state exists', async () => {
+    // When TS touched slots on a previous navigation, an empty response still
+    // needs adInit() to sweep the stale TS targeting from those slots.
+    fetchStub.mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], bids: {} }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    ts.prevSlotTargetingKeys = { 'div-prev': ['hb_pb'] };
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    history.pushState({}, '', '/cleanup-route');
+    await flushAsync();
+
+    expect(ts.adSlots).toEqual([]);
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('defers applying bids until the route ad container is inserted', async () => {
     fetchStub.mockResolvedValue({
       ok: true,

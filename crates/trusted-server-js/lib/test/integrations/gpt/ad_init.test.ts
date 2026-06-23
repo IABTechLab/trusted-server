@@ -337,6 +337,40 @@ describe('installTsAdInit', () => {
     expect((window as TestWindow).tsjs!.prevSlotTargetingKeys).toEqual({});
   });
 
+  it('does not enable GPT services when the page-bids response has no slots', async () => {
+    // A gated page-bids response returns no slots. With nothing to display or
+    // refresh and services not already enabled, adInit() must not call
+    // enableSingleRequest()/enableServices() and activate the publisher's GPT
+    // services on a consent-denied or kill-switched navigation.
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const enableServices = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn(),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices,
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [],
+      bids: {},
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    (window as TestWindow).tsjs!.adInit!();
+
+    expect(mockPubads.enableSingleRequest).not.toHaveBeenCalled();
+    expect(enableServices).not.toHaveBeenCalled();
+    expect((window as TestWindow).tsjs!.servicesEnabled).toBeFalsy();
+    expect(mockPubads.refresh).not.toHaveBeenCalled();
+  });
+
   it('keeps the GAM path when debug adm is present', async () => {
     const slotEl = document.getElementById('div-atf-sidebar')!;
     const mockSlot = {

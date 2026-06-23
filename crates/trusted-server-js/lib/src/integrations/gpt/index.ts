@@ -536,8 +536,18 @@ export function installTsAdInit(): void {
       ts.divToSlotId = divToSlotId;
       ts.prevSlotTargetingKeys = nextSlotTargetingKeys;
 
-      // enableSingleRequest and enableServices must only be called once per page load.
-      if (!ts.servicesEnabled) {
+      // Whether this call produced any TS slot to render. A gated page-bids
+      // response (auction kill switch or consent denial) returns no slots, so
+      // the loops above leave these empty.
+      const hasRenderableWork = slotsToDisplay.length > 0 || slotsToRefresh.length > 0;
+
+      // enableSingleRequest and enableServices must only be called once per page
+      // load. Skip activating GPT services when TS has nothing to display or
+      // refresh and has not already enabled them: a consent-denied or
+      // kill-switched navigation must not turn on the publisher's GPT services
+      // or race their own setup. The targeting sweep above still runs so stale
+      // TS targeting from a prior navigation is cleared.
+      if (!ts.servicesEnabled && hasRenderableWork) {
         g.pubads!().enableSingleRequest();
         g.enableServices?.();
         ts.servicesEnabled = true;
@@ -693,7 +703,17 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
-      ts.adInit?.();
+      // An empty page-bids response (auction kill switch or consent gate) carries
+      // no TS slots. Only run adInit() when there are slots to apply or prior TS
+      // state to sweep — otherwise a consent-denied or kill-switched navigation
+      // must not enter the GPT command queue and risk activating services.
+      const hasPriorTsState =
+        (ts.prevGptSlots?.length ?? 0) > 0 ||
+        Object.keys(ts.prevSlotTargetingKeys ?? {}).length > 0 ||
+        Object.keys(ts.divToSlotId ?? {}).length > 0;
+      if (data.slots.length > 0 || hasPriorTsState) {
+        ts.adInit?.();
+      }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       log.warn('SPA auction hook: fetch failed', err);

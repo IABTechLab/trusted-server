@@ -779,10 +779,15 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         };
       });
 
+      // Scope GPT targeting to just the synthetic refresh ad units. An unscoped
+      // call would set hb_* targeting on every ad unit with known bids, mutating
+      // unrelated GPT slots whose targeting this wrapper only cleared for
+      // `targetSlots` — leaving their next request dependent on stale state.
+      const refreshAdUnitCodes = adUnits.map((unit) => unit.code);
       pbjs.requestBids({
         adUnits,
         bidsBackHandler: () => {
-          pbjs.setTargetingForGPTAsync?.();
+          pbjs.setTargetingForGPTAsync?.(refreshAdUnitCodes);
           originalRefresh(targetSlots, opts);
         },
         timeout: timeoutMs,

@@ -748,6 +748,8 @@ impl AuctionOrchestrator {
             let provider = match self.providers.get(provider_name) {
                 Some(p) => p,
                 None => {
+                    // lgtm[rust/cleartext-logging]
+                    // The provider name is a static config identifier (e.g. "prebid"), not a secret.
                     log::warn!("Provider '{}' not registered, skipping", provider_name);
                     continue;
                 }
@@ -1108,6 +1110,8 @@ impl AuctionOrchestrator {
                     }
                 }
                 None => {
+                    // lgtm[rust/cleartext-logging]
+                    // The mediator name is a static config identifier, not a secret.
                     log::warn!("Mediator '{}' not registered", mediator_name);
                     (None, self.select_winning_bids(&responses, &floor_prices))
                 }
