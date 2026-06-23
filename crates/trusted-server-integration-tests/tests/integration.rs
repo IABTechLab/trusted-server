@@ -176,7 +176,7 @@ fn test_ec_lifecycle_fastly() {
     // read (main() falls back to legacy_main).
     if std::env::var("EXPECT_EDGEZERO_ENTRY_POINT").as_deref() == Ok("true") {
         common::ec::assert_edgezero_entry_point(&process.base_url)
-            .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
+            .expect("EdgeZero entry-point probe request failed");
     }
 
     for scenario in EcScenario::all() {
