@@ -36,11 +36,11 @@ pub struct ProxyArgs {
     #[arg(long = "map", value_name = "FROM=TO")]
     pub map: Vec<String>,
 
-    /// Shorthand single-rule FROM (optional when inferable from config).
+    /// Shorthand single-rule FROM (pairs with `--to`).
     #[arg(short = 'f', long = "from", value_name = "HOST")]
     pub from: Option<String>,
 
-    /// Shorthand single-rule TO (`HOST[:PORT]`).
+    /// Shorthand single-rule TO (`HOST[:PORT]`; pairs with `--from`).
     #[arg(short = 't', long = "to", value_name = "HOST[:PORT]")]
     pub to: Option<String>,
 

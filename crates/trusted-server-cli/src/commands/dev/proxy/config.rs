@@ -1,7 +1,7 @@
 //! Resolves `ProxyArgs` (+ defaults) into a concrete [`ResolvedConfig`].
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use base64::Engine as _;
 use error_stack::{Report, ResultExt as _};
@@ -12,8 +12,8 @@ use super::rewrite::{Authority, Rule, RuleTable};
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
 pub enum ConfigError {
-    /// No usable rule could be formed and none was inferable.
-    #[display("no rewrite rule: pass --map FROM=TO (or --to with an inferable FROM)")]
+    /// No usable rule was passed.
+    #[display("no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)")]
     NoRule,
     /// A `--map`/authority value was malformed.
     #[display("invalid rule value")]
@@ -132,37 +132,7 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
         .map_or_else(default_ca_dir, PathBuf::from)
 }
 
-/// Reads `publisher.domain` from `<project_dir>/trusted-server.toml`.
-///
-/// Returns `None` if the file is missing, the key is absent, or parsing fails.
-fn infer_from_host(project_dir: &Path) -> Option<String> {
-    let path = project_dir.join("trusted-server.toml");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let table: toml::Table = raw.parse().ok()?;
-    table
-        .get("publisher")?
-        .as_table()?
-        .get("domain")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-/// Reads `[dev_proxy].upstream` from `<project_dir>/trusted-server.toml`.
-///
-/// Returns `None` if the file is missing, the key is absent, or parsing fails.
-fn infer_to_host(project_dir: &Path) -> Option<String> {
-    let path = project_dir.join("trusted-server.toml");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let table: toml::Table = raw.parse().ok()?;
-    table
-        .get("dev_proxy")?
-        .as_table()?
-        .get("upstream")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-fn build_rules(args: &ProxyArgs, project_dir: &Path) -> Result<RuleTable, ConfigError> {
+fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
     let preserve_host = !args.rewrite_host;
     for entry in &args.map {
@@ -171,18 +141,6 @@ fn build_rules(args: &ProxyArgs, project_dir: &Path) -> Result<RuleTable, Config
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
         rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
-    }
-    if rules.is_empty() && args.map.is_empty() {
-        let from = args.from.clone().or_else(|| infer_from_host(project_dir));
-        let to = args.to.clone().or_else(|| infer_to_host(project_dir));
-        if let (Some(from), Some(to)) = (from, to) {
-            rules.push(make_rule(
-                &from,
-                &to,
-                preserve_host,
-                args.upstream_plaintext,
-            )?);
-        }
     }
     Ok(RuleTable(rules))
 }
@@ -202,18 +160,14 @@ fn make_rule(
     })
 }
 
-/// Resolves arguments into a [`ResolvedConfig`], consulting `project_dir` for
-/// `trusted-server.toml` inference.
+/// Resolves arguments into a [`ResolvedConfig`].
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError`] on malformed rules, an invalid/forbidden listen
 /// address, malformed credentials, or an unknown browser.
-pub fn resolve_in(
-    args: &ProxyArgs,
-    project_dir: &Path,
-) -> Result<ResolvedConfig, Report<ConfigError>> {
-    let rules = build_rules(args, project_dir).map_err(Report::from)?;
+pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> {
+    let rules = build_rules(args).map_err(Report::from)?;
     if rules.0.is_empty() {
         return Err(Report::new(ConfigError::NoRule));
     }
@@ -251,18 +205,6 @@ pub fn resolve_in(
         basic_auth,
         ca_dir,
     })
-}
-
-/// Resolves arguments into a [`ResolvedConfig`], inferring missing rule parts
-/// from `trusted-server.toml` in the current working directory.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] on malformed rules, an invalid/forbidden listen
-/// address, malformed credentials, or an unknown browser.
-pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> {
-    let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    resolve_in(args, &project_dir)
 }
 
 /// Credential precedence: `--basic-auth-file` > `--basic-auth`.
@@ -386,71 +328,13 @@ mod tests {
         );
     }
 
-    /// Writes a minimal `trusted-server.toml` into `dir` with the given content.
-    fn write_toml(dir: &tempfile::TempDir, content: &str) {
-        std::fs::write(dir.path().join("trusted-server.toml"), content)
-            .expect("should write trusted-server.toml");
-    }
-
     #[test]
-    fn lone_to_pairs_with_inferred_from() {
-        let dir = tempfile::tempdir().expect("should create temp dir");
-        write_toml(
-            &dir,
-            "[publisher]\ndomain = \"www.example-publisher.com\"\n",
-        );
-
-        let mut args = base_args();
-        args.to = Some("some.edgecompute.app".into());
-
-        let cfg = resolve_in(&args, dir.path()).expect("should resolve with inferred FROM");
-        let rule = cfg
-            .rules
-            .first_match("www.example-publisher.com")
-            .expect("should have a rule matching the inferred FROM domain");
-        assert_eq!(
-            rule.to.host(),
-            "some.edgecompute.app",
-            "TO should be the value passed via --to"
-        );
-    }
-
-    #[test]
-    fn zero_arg_requires_dev_proxy_upstream() {
-        let dir = tempfile::tempdir().expect("should create temp dir");
-        write_toml(
-            &dir,
-            "[publisher]\ndomain = \"www.example-publisher.com\"\n",
-        );
-
+    fn no_rule_passed_is_a_no_rule_error() {
         let args = base_args();
-        let err = resolve_in(&args, dir.path())
-            .expect_err("should error when [dev_proxy].upstream is absent");
+        let err = resolve(&args).expect_err("should error when no rule is passed");
         assert!(
             matches!(err.current_context(), ConfigError::NoRule),
-            "should be a NoRule error when TO cannot be inferred"
-        );
-    }
-
-    #[test]
-    fn zero_arg_infers_both_when_present() {
-        let dir = tempfile::tempdir().expect("should create temp dir");
-        write_toml(
-            &dir,
-            "[publisher]\ndomain = \"www.example-publisher.com\"\n\n[dev_proxy]\nupstream = \"origin.edgecompute.app\"\n",
-        );
-
-        let args = base_args();
-        let cfg = resolve_in(&args, dir.path())
-            .expect("should resolve when both publisher.domain and dev_proxy.upstream are set");
-        let rule = cfg
-            .rules
-            .first_match("www.example-publisher.com")
-            .expect("should have a rule matching the inferred FROM domain");
-        assert_eq!(
-            rule.to.host(),
-            "origin.edgecompute.app",
-            "TO should be the inferred dev_proxy.upstream"
+            "should be a NoRule error when no --map/-f/-t is given"
         );
     }
 }
