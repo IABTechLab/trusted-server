@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod ca;
 pub mod config;
 pub mod rewrite;
@@ -116,20 +117,66 @@ pub enum CaCommand {
 ///
 /// Returns [`ProxyError`] if configuration, the CA, the server, or browser
 /// orchestration fails.
-pub fn run(args: ProxyArgs) -> Result<(), error_stack::Report<ProxyError>> {
+pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<ProxyError>> {
+    // CA subcommands need only the CA directory — handle them before rule resolution.
+    if let Some(ProxySub::Ca { action }) = &args.command {
+        let ca_dir = config::ca_dir(&args);
+        let cert_path = ca::CertAuthority::cert_path(&ca_dir);
+        match action {
+            CaCommand::Path => {
+                // Ensure the CA exists so the printed path points at a real file.
+                ca::CertAuthority::load_or_generate(&ca_dir)
+                    .change_context(ProxyError::CertAuthority)?;
+                output::info(&cert_path.display().to_string());
+            }
+            CaCommand::Install => {
+                // A fresh machine has no CA yet — generate before trusting it.
+                ca::CertAuthority::load_or_generate(&ca_dir)
+                    .change_context(ProxyError::CertAuthority)?;
+                browser::ca_install(&cert_path);
+            }
+            CaCommand::Uninstall => browser::ca_uninstall(),
+            CaCommand::Regenerate => {
+                std::fs::remove_file(&cert_path).ok();
+                std::fs::remove_file(ca_dir.join("ca-key.pem")).ok();
+                ca::CertAuthority::load_or_generate(&ca_dir)
+                    .change_context(ProxyError::CertAuthority)?;
+                output::info("regenerated CA — re-run `ca install` to trust it");
+            }
+        }
+        return Ok(());
+    }
+
     let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)
             .change_context(ProxyError::CertAuthority)?,
     );
-    // PAC generation arrives in Task 6; serve a DIRECT stub for now.
-    let pac: Arc<str> = Arc::from("function FindProxyForURL(u, h) { return \"DIRECT\"; }");
+    let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
+
     let runtime = tokio::runtime::Runtime::new().change_context(ProxyError::Server)?;
     runtime.block_on(async move {
+        // Bind first: the port is open and connections queue before we launch browsers.
         let listener = server::bind(cfg.listen)
             .await
             .change_context(ProxyError::Server)?;
         output::info(&format!("ts dev proxy listening on {}", cfg.listen));
-        server::serve_on(listener, cfg, ca, pac).await
+        let server = tokio::spawn(server::serve_on(
+            listener,
+            Arc::clone(&cfg),
+            Arc::clone(&ca),
+            Arc::clone(&pac),
+        ));
+
+        if !cfg.launch.is_empty() {
+            // Browser launch spawns processes (blocking) — keep it off the reactor thread.
+            let launch_cfg = Arc::clone(&cfg);
+            tokio::task::spawn_blocking(move || browser::launch(&launch_cfg.launch, &launch_cfg))
+                .await
+                .change_context(ProxyError::Browser)??;
+        }
+
+        // Keep the runtime alive: serve until the accept loop ends (Ctrl-C / drop).
+        server.await.change_context(ProxyError::Server)?
     })
 }
