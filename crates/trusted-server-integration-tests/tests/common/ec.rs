@@ -71,7 +71,9 @@ impl EcTestClient {
             let Ok(cookie_str) = value.to_str() else {
                 continue;
             };
-            let Some((name, raw_value)) = cookie_str.split(';').next().and_then(|s| s.split_once('=')) else {
+            let Some((name, raw_value)) =
+                cookie_str.split(';').next().and_then(|s| s.split_once('='))
+            else {
                 continue;
             };
 
@@ -269,8 +271,7 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Asserts the response has a specific HTTP status code.
-/// Asserts the running Viceroy instance is serving the EdgeZero entry point.
+/// Sends a non-fatal diagnostic probe for the EdgeZero entry point.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
@@ -337,10 +338,11 @@ pub fn assert_json_response(resp: Response, expected_status: u16) -> TestResult<
 /// Checks whether the response expires (deletes) the `ts-ec` cookie.
 pub fn is_ec_cookie_expired(resp: &Response) -> bool {
     for value in resp.headers().get_all("set-cookie") {
-        if let Ok(cookie_str) = value.to_str() {
-            if cookie_str.starts_with("ts-ec=") && cookie_str.contains("Max-Age=0") {
-                return true;
-            }
+        if let Ok(cookie_str) = value.to_str()
+            && cookie_str.starts_with("ts-ec=")
+            && cookie_str.contains("Max-Age=0")
+        {
+            return true;
         }
     }
     false

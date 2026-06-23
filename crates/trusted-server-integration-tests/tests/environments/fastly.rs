@@ -9,9 +9,9 @@ use std::process::{Child, Command, Stdio};
 /// Fastly Compute runtime using Viceroy local simulator.
 ///
 /// Spawns a `viceroy` child process with the WASM binary and the
-/// Viceroy-specific `fastly.toml` config (KV stores, secrets).
-/// The application config (origin URL, integrations) is baked into
-/// the WASM binary at build time.
+/// generated Viceroy config (runtime resources plus Trusted Server app-config
+/// blob). Legacy-path settings are still baked into the WASM binary at build
+/// time; the EdgeZero-path settings come from the generated `app_config` blob.
 pub struct FastlyViceroy;
 
 impl RuntimeEnvironment for FastlyViceroy {
@@ -63,25 +63,23 @@ impl RuntimeEnvironment for FastlyViceroy {
 }
 
 impl FastlyViceroy {
-    /// Path to the Viceroy-specific `fastly.toml` template.
+    /// Path to the generated Viceroy configuration.
     ///
     /// This contains `[local_server]` configuration (backends, KV stores,
-    /// secret stores) that Viceroy needs, separate from the application config.
+    /// secret stores) plus generated test application config stores.
     ///
-    /// Honors the `VICEROY_CONFIG_PATH` environment variable so a CI job can
-    /// point the same WASM binary at an alternative config store — e.g. the
-    /// EdgeZero fixture that sets `trusted_server_config.edgezero_enabled =
-    /// "true"` to exercise the EdgeZero entry point. Mirrors the browser
-    /// harness's `global-setup.ts`, which reads the same variable. Falls back to
-    /// the default legacy template when unset.
+    /// Honors the `VICEROY_CONFIG_PATH` environment variable so CI jobs can
+    /// point the same WASM binary at generated legacy or EdgeZero configs. This
+    /// mirrors the browser harness's `global-setup.ts`, which reads the same
+    /// variable. Falls back to the local generated legacy config path when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {
-        if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH") {
-            if !path.is_empty() {
-                return std::path::PathBuf::from(path);
-            }
+        if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH")
+            && !path.is_empty()
+        {
+            return std::path::PathBuf::from(path);
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/configs/viceroy-template.toml")
+            .join("../../target/integration-test-artifacts/configs/viceroy-legacy.toml")
     }
 }
 

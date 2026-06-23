@@ -58,6 +58,10 @@ TRUSTED_SERVER__EC__PARTNERS='[{"name":"Integration Test Partner","source_domain
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+echo "==> Generating Viceroy configs..."
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
+VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
+
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
     crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
@@ -71,6 +75,7 @@ docker build \
 echo "==> Running integration tests (target: $TARGET, origin port: $ORIGIN_PORT)..."
 WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm" \
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+VICEROY_CONFIG_PATH="$VICEROY_CONFIG_PATH" \
 RUST_LOG=info \
     cargo test \
         --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
