@@ -108,6 +108,7 @@ export default withMermaid(
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Integration Guide', link: '/guide/integration-guide' },
+            { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
           ],
         },
         {
