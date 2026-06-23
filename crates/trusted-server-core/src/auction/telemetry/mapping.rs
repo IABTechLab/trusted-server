@@ -4,7 +4,11 @@
 //! telemetry builder. It performs no I/O and does not modify the auction.
 
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::auction::telemetry::types::{ProviderCallOutcome, ProviderCallStatus, ProviderRole};
+use crate::auction::telemetry::builder::build_auction_events;
+use crate::auction::telemetry::types::{
+    AuctionEventRow, AuctionObservationContext, ProviderCallOutcome, ProviderCallStatus,
+    ProviderRole, TerminalOutcome, TerminalStatus,
+};
 use crate::auction::types::{AuctionResponse, BidStatus};
 
 /// Build one provider-call outcome per provider response, plus one for the
@@ -66,11 +70,41 @@ fn clamp_u16(value: usize) -> u16 {
     value.min(usize::from(u16::MAX)) as u16
 }
 
+/// Build the terminal outcome for a completed auction. `slot_count` is the
+/// number of requested slots, which the result alone does not carry.
+#[must_use]
+pub fn completed_outcome(result: &OrchestrationResult, slot_count: u16) -> TerminalOutcome {
+    TerminalOutcome {
+        status: TerminalStatus::Completed,
+        reason: None,
+        slot_count: Some(slot_count),
+        total_time_ms: Some(clamp_u32(result.total_time_ms)),
+        winning_bid_count: Some(clamp_u16(result.winning_bids.len())),
+    }
+}
+
+/// Build all telemetry rows for a completed auction. This is the single entry
+/// point a wiring layer calls when `run_auction`/`collect_dispatched_auction`
+/// returns an `OrchestrationResult`.
+#[must_use]
+pub fn build_completed_auction_events(
+    ctx: &AuctionObservationContext,
+    slot_count: u16,
+    result: &OrchestrationResult,
+) -> Vec<AuctionEventRow> {
+    let outcome = completed_outcome(result, slot_count);
+    let provider_calls = provider_calls_from_result(result);
+    build_auction_events(ctx, &outcome, &provider_calls, Some(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auction::orchestrator::OrchestrationResult;
-    use crate::auction::telemetry::types::{ProviderCallStatus, ProviderRole};
+    use crate::auction::telemetry::types::{
+        AuctionObservationContext, AuctionSource, EventKind, ProviderCallStatus, ProviderRole,
+        TerminalStatus,
+    };
     use crate::auction::types::{AuctionResponse, Bid, BidStatus};
     use std::collections::HashMap;
 
@@ -124,6 +158,21 @@ mod tests {
             winning_bids: HashMap::new(),
             total_time_ms: 0,
             metadata: HashMap::new(),
+        }
+    }
+
+    fn ctx() -> AuctionObservationContext {
+        AuctionObservationContext {
+            auction_id: uuid::Uuid::nil(),
+            source: AuctionSource::AuctionApi,
+            publisher_domain: "example.com".to_string(),
+            page_path: "/p".to_string(),
+            country: "US".to_string(),
+            region: None,
+            is_mobile: 1,
+            is_known_browser: 1,
+            gdpr_applies: false,
+            consent_present: true,
         }
     }
 
@@ -234,6 +283,98 @@ mod tests {
         assert_eq!(
             mediator.provider, "mediator",
             "should carry the mediator provider name"
+        );
+    }
+
+    #[test]
+    fn completed_outcome_carries_counts_from_the_result() {
+        let mut res = result(
+            vec![response(
+                "prebid",
+                BidStatus::Success,
+                40,
+                vec![bid("s1", "kargo")],
+                None,
+            )],
+            None,
+        );
+        res.total_time_ms = 88;
+        res.winning_bids
+            .insert("s1".to_string(), bid("s1", "kargo"));
+
+        let outcome = completed_outcome(&res, 2);
+
+        assert_eq!(
+            outcome.status,
+            TerminalStatus::Completed,
+            "should be Completed"
+        );
+        assert!(
+            outcome.reason.is_none(),
+            "completed auctions have no reason"
+        );
+        assert_eq!(
+            outcome.slot_count,
+            Some(2),
+            "should carry the requested slot count"
+        );
+        assert_eq!(outcome.total_time_ms, Some(88), "should carry total time");
+        assert_eq!(
+            outcome.winning_bid_count,
+            Some(1),
+            "should count winning bids"
+        );
+    }
+
+    #[test]
+    fn build_completed_auction_events_emits_summary_provider_and_bid_rows() {
+        let mut res = result(
+            vec![
+                response(
+                    "prebid",
+                    BidStatus::Success,
+                    40,
+                    vec![bid("s1", "kargo")],
+                    None,
+                ),
+                response("aps", BidStatus::NoBid, 30, vec![], None),
+            ],
+            None,
+        );
+        res.winning_bids
+            .insert("s1".to_string(), bid("s1", "kargo"));
+
+        let rows = build_completed_auction_events(&ctx(), 1, &res);
+
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event_kind == EventKind::Summary)
+                .count(),
+            1,
+            "should emit exactly one summary"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event_kind == EventKind::ProviderCall)
+                .count(),
+            2,
+            "should emit one provider-call row per provider"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event_kind == EventKind::Bid)
+                .count(),
+            1,
+            "should emit a bid row for the returned bid"
+        );
+        let summary = rows
+            .iter()
+            .find(|r| r.event_kind == EventKind::Summary)
+            .expect("should have a summary row");
+        assert_eq!(
+            summary.terminal_status,
+            Some(TerminalStatus::Completed),
+            "summary is Completed"
         );
     }
 }

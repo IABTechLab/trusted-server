@@ -9,7 +9,7 @@ pub mod sink;
 pub mod types;
 
 pub use builder::build_auction_events;
-pub use mapping::provider_calls_from_result;
+pub use mapping::{build_completed_auction_events, completed_outcome, provider_calls_from_result};
 pub use sink::{AuctionEventSink, InMemorySink, NoopSink};
 pub use types::{
     to_ndjson, AuctionEventRow, AuctionObservationContext, AuctionSource, EventKind,
