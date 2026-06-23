@@ -522,6 +522,7 @@ pub async fn stream_publisher_body_async<W: Write>(
             .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
             .body(EdgeBody::empty())
             .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
+        let request = dispatched.request().clone();
         let result = orchestrator
             .collect_dispatched_auction(
                 dispatched,
@@ -534,6 +535,13 @@ pub async fn stream_publisher_body_async<W: Write>(
             params.price_granularity,
             &params.ad_bids_state,
             settings.debug.inject_adm_for_testing,
+        );
+        // Emit completed-auction telemetry off the response path.
+        emit_completed_auction_telemetry(
+            services,
+            AuctionSource::InitialNavigation,
+            &request,
+            &result,
         );
         return stream_publisher_body(body, output, params, settings, integration_registry);
     }
@@ -965,6 +973,7 @@ async fn collect_stream_auction(
         .body(EdgeBody::empty())
         .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
     let collect_ctx = make_collect_context(settings, services, &placeholder);
+    let request = dispatched.request().clone();
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
@@ -977,6 +986,13 @@ async fn collect_stream_auction(
         price_granularity,
         ad_bids_state,
         settings.debug.inject_adm_for_testing,
+    );
+    // Emit completed-auction telemetry off the response path.
+    emit_completed_auction_telemetry(
+        services,
+        AuctionSource::InitialNavigation,
+        &request,
+        &result,
     );
 
     if settings.debug.auction_html_comment {
@@ -4501,5 +4517,40 @@ mod tests {
                 rows.len()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn collect_stream_auction_emits_initial_navigation_telemetry() {
+        // A completed SSAT auction (collected at the body-close hold) must emit
+        // one summary row tagged initial_navigation to the injected sink. An
+        // empty dispatched token collects to an empty result, which still emits
+        // a summary.
+        let settings = create_test_settings();
+        let sink = Arc::new(crate::auction::telemetry::InMemorySink::default());
+        let services = noop_services().with_auction_event_sink(sink.clone());
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let dispatched = DispatchedAuction::empty_for_test(test_auction_request(), 500);
+        let ad_bids_state = Arc::new(Mutex::new(None));
+
+        collect_stream_auction(
+            dispatched,
+            PriceGranularity::default(),
+            &ad_bids_state,
+            &orchestrator,
+            &services,
+            &settings,
+        )
+        .await;
+
+        let rows = sink.rows();
+        assert!(
+            rows.iter().any(
+                |r| r.event_kind == crate::auction::telemetry::EventKind::Summary
+                    && r.auction_source
+                        == crate::auction::telemetry::AuctionSource::InitialNavigation
+            ),
+            "should emit an initial_navigation summary, got {} rows",
+            rows.len()
+        );
     }
 }

@@ -29,6 +29,13 @@ pub struct DispatchedAuction {
     request: AuctionRequest,
 }
 
+impl DispatchedAuction {
+    /// The auction request carried by this dispatched auction.
+    pub(crate) fn request(&self) -> &AuctionRequest {
+        &self.request
+    }
+}
+
 #[cfg(test)]
 impl DispatchedAuction {
     pub(crate) fn empty_for_test(request: AuctionRequest, timeout_ms: u32) -> Self {
