@@ -1,8 +1,9 @@
 //! Wiring helper that emits completed-auction telemetry from a handler.
 //!
 //! Reads geo and consent off the `AuctionRequest` (a handler's local copies may
-//! have been moved). Device signals are unknown (`2`) until a later plan threads
-//! them. The sink write is buffered/non-blocking in production.
+//! have been moved). Device signals are derived from the request user agent and
+//! the client TLS/H2 fingerprints via [`DeviceSignals`]. The sink write is
+//! buffered/non-blocking in production.
 
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::auction::telemetry::context::build_observation_context;
