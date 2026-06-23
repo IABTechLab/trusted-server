@@ -57,6 +57,40 @@ jobs:
           TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
+  test-cli:
+    # The native `trusted-server-cli` (`ts dev proxy`) crate is excluded from the
+    # workspace (the workspace default target is wasm32-wasip1), so the workspace
+    # fmt/clippy/test jobs do not cover it. It is a macOS tool (Safari/keychain/
+    # networksetup), so validate it on macOS with an explicit native --target
+    # (the repo's .cargo/config.toml otherwise forces wasm32-wasip1).
+    name: cargo test (dev-proxy CLI, native)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          components: "clippy, rustfmt"
+          cache-shared-key: cargo-cli-${{ runner.os }}
+
+      - name: cargo fmt (check)
+        run: cargo fmt --manifest-path crates/trusted-server-cli/Cargo.toml --check
+
+      - name: cargo clippy
+        run: |
+          cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
+
+      - name: cargo test
+        run: |
+          cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')"
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
