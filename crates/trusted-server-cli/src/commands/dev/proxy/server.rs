@@ -99,9 +99,12 @@ impl RequestHead {
     }
 
     /// Whether this is the local `GET /proxy.pac` route.
+    ///
+    /// Matches **origin-form only** (`target == "/proxy.pac"`); an absolute-form
+    /// `http://host/proxy.pac` is proxy traffic, not the local route, so it
+    /// falls through to blind-forward (spec §8.4).
     fn is_local_pac_route(&self) -> bool {
-        self.method.eq_ignore_ascii_case("GET")
-            && (self.target == "/proxy.pac" || self.target.ends_with("/proxy.pac"))
+        self.method.eq_ignore_ascii_case("GET") && self.target == "/proxy.pac"
     }
 }
 
@@ -327,6 +330,12 @@ async fn mitm(
 
 /// Rewrites one decrypted request and forwards it to the upstream.
 ///
+/// Each request is matched by its inbound `Host` header (falling back to the
+/// CONNECT authority), so a keep-alive tunnel that carries requests for several
+/// hosts routes each one by its own `Host` (spec §8.2). If a request's `Host`
+/// matches no rule, the rule that matched the CONNECT authority is used as a
+/// fallback, keeping an already-MITM'd tunnel usable.
+///
 /// This is infallible at the hyper layer — upstream errors become a `502` so
 /// the keep-alive tunnel survives a single bad request (spec §11).
 async fn forward_request(
@@ -341,8 +350,14 @@ async fn forward_request(
         return Ok(status_response(StatusCode::NOT_IMPLEMENTED));
     }
 
-    let Some(rule) = rules.first_match(connect_host) else {
-        // Should not happen: MITM is only entered on a match.
+    // Match on the inbound Host (before any rewrite), else the CONNECT
+    // authority; fall back to the CONNECT-authority rule when neither matches.
+    let match_host = request_host(&req).unwrap_or_else(|| connect_host.to_string());
+    let Some(rule) = rules
+        .first_match(&match_host)
+        .or_else(|| rules.first_match(connect_host))
+    else {
+        // Should not happen: MITM is only entered on a CONNECT-authority match.
         return Ok(status_response(StatusCode::BAD_GATEWAY));
     };
     let outcome = rewrite_for(rule);
@@ -365,6 +380,23 @@ async fn forward_request(
             Ok(status_response(StatusCode::BAD_GATEWAY))
         }
     }
+}
+
+/// Extracts the inbound request host from the `Host` header (origin-form
+/// requests over a MITM tunnel always carry one), else the URI authority.
+///
+/// Returned verbatim (including any `:port`); [`RuleTable::first_match`] strips
+/// the port when matching.
+fn request_host(req: &Request<Incoming>) -> Option<String> {
+    if let Some(value) = req.headers().get(hyper::header::HOST)
+        && let Ok(text) = value.to_str()
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    req.uri().host().map(str::to_string)
 }
 
 async fn proxy_to_upstream(
@@ -449,6 +481,8 @@ fn rewrite_headers(
     {
         headers.insert(hyper::header::AUTHORIZATION, value);
     }
+    // Drop the hop-by-hop proxy header so it never reaches the upstream (spec §8.3).
+    headers.remove("proxy-connection");
 }
 
 /// Builds a rustls client config: a no-verification verifier when `insecure`,
@@ -530,5 +564,66 @@ mod insecure {
                 .signature_verification_algorithms
                 .supported_schemes()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::dev::proxy::rewrite::RewriteOutcome;
+
+    fn head(method: &str, target: &str) -> RequestHead {
+        RequestHead {
+            method: method.to_string(),
+            target: target.to_string(),
+            raw: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn local_pac_route_is_origin_form_get_only() {
+        assert!(
+            head("GET", "/proxy.pac").is_local_pac_route(),
+            "origin-form GET /proxy.pac is the local route"
+        );
+        assert!(
+            head("get", "/proxy.pac").is_local_pac_route(),
+            "method match is case-insensitive"
+        );
+        assert!(
+            !head("GET", "http://x.example.com/proxy.pac").is_local_pac_route(),
+            "absolute-form /proxy.pac is proxy traffic, not the local route"
+        );
+        assert!(
+            !head("POST", "/proxy.pac").is_local_pac_route(),
+            "non-GET is never the local PAC route"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_strips_proxy_connection() {
+        let outcome = RewriteOutcome {
+            sni: "to.edgecompute.app".to_string(),
+            host_header: "www.example-publisher.com".to_string(),
+            orig_host: "www.example-publisher.com".to_string(),
+            scheme_is_tls: true,
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        rewrite_headers(&mut headers, &outcome, None);
+        assert!(
+            !headers.contains_key("proxy-connection"),
+            "Proxy-Connection is a hop-by-hop header and must be removed"
+        );
+        assert_eq!(
+            headers
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("www.example-publisher.com"),
+            "Host is still rewritten alongside the strip"
+        );
     }
 }

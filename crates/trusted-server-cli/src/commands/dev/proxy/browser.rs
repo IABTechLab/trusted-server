@@ -14,8 +14,11 @@ use crate::output;
 /// Name of the file persisted under `ca_dir` that records the Safari proxy
 /// state that was active before this tool set its own PAC URL.
 ///
-/// Format: two lines, `<service>\n<prior_pac_url>` — or `<service>\n` (empty
-/// second line) when auto-proxy was previously off.
+/// Format: three lines, `<service>\n<prior_pac_url>\n<prior_enabled>`, where
+/// `<prior_pac_url>` is empty when auto-proxy had no URL and `<prior_enabled>`
+/// is `on` or `off`. A missing third line is tolerated when reading (treated as
+/// `on` if a URL is present, else `off`) for forward-compatibility with the
+/// earlier two-line format.
 const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
 
 /// Generates a PAC script that proxies only `https://` requests for matched FROM hosts.
@@ -107,12 +110,17 @@ pub fn launch(
 /// Restores the macOS Safari system auto-proxy to its state before the last
 /// `launch_safari` call, if a pending restore file exists under `ca_dir`.
 ///
-/// Called both at startup (to recover from a previously hard-killed run) and
-/// on clean exit (Ctrl-C).  On non-macOS systems or when no restore file is
-/// present, this is a no-op.  Deletes the restore file even when the
-/// `networksetup` command fails, preventing an infinite restore loop.  Never
-/// panics.
-pub fn restore_system_proxy_if_pending(ca_dir: &Path) {
+/// Called both at startup (to recover from a previously hard-killed run, with
+/// `interactive = false` so it never blocks an unrelated launch on a password
+/// prompt) and on clean Ctrl-C exit (with `interactive = true` so the restore
+/// can prompt for the password the cached sudo credential may have outlived).
+///
+/// On non-macOS systems or when no restore file is present, this is a no-op.
+/// The restore file is **kept** when the restore commands fail so a later run
+/// (or the manual command printed via [`crate::output::warn`]) can still fix the
+/// system proxy; it is deleted only after a successful restore or when the file
+/// is malformed (so a bad file cannot loop forever). Never panics.
+pub fn restore_system_proxy_if_pending(ca_dir: &Path, interactive: bool) {
     #[cfg(target_os = "macos")]
     {
         let restore_path = ca_dir.join(SAFARI_RESTORE_FILE);
@@ -127,42 +135,52 @@ pub fn restore_system_proxy_if_pending(ca_dir: &Path) {
                     "Safari: could not read proxy restore file: {err}; \
                      restore the auto-proxy URL in System Settings → Network manually"
                 ));
-                // Remove the file so we don't retry forever.
+                // Unreadable file: remove it so we don't retry forever.
                 let _ = std::fs::remove_file(&restore_path);
                 return;
             }
         };
 
-        let mut lines = contents.splitn(2, '\n');
+        let mut lines = contents.lines();
         let service = lines.next().unwrap_or("").trim().to_string();
-        let prior_pac = lines.next().unwrap_or("").trim().to_string();
+        let prior_url = lines.next().unwrap_or("").trim().to_string();
+        // Tolerate a missing third line (older two-line format): a saved URL
+        // implies it was enabled; no URL implies auto-proxy was off.
+        let prior_enabled = match lines.next() {
+            Some(line) => line.trim().eq_ignore_ascii_case("on"),
+            None => !prior_url.is_empty(),
+        };
 
         if service.is_empty() {
             output::warn(
                 "Safari: proxy restore file has no service name; \
                  restore the auto-proxy URL in System Settings → Network manually",
             );
+            // Malformed file: remove it so a bad file cannot loop forever.
             let _ = std::fs::remove_file(&restore_path);
             return;
         }
 
-        // Remove the file first so a hard kill during restore doesn't loop.
-        let _ = std::fs::remove_file(&restore_path);
-
-        restore_auto_proxy(
-            &service,
-            if prior_pac.is_empty() {
-                None
-            } else {
-                Some(&prior_pac)
-            },
-        );
+        let prior_url = (!prior_url.is_empty()).then_some(prior_url.as_str());
+        if restore_auto_proxy(&service, prior_url, prior_enabled, interactive) {
+            // Only drop the file once the system proxy is actually restored.
+            let _ = std::fs::remove_file(&restore_path);
+        } else {
+            // Keep the file; print the exact manual recovery steps.
+            let manual = manual_restore_command(&service, prior_url, prior_enabled);
+            output::warn(&format!(
+                "Safari: could not auto-restore the system proxy for '{service}' (needs admin). \
+                 Run: {manual} \
+                 (or in System Settings → Network → {service} → Details → Proxies → \
+                 Automatic Proxy Configuration)"
+            ));
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         // Non-macOS: nothing to restore (Safari/networksetup don't exist).
-        let _ = ca_dir;
+        let _ = (ca_dir, interactive);
     }
 }
 
@@ -276,10 +294,14 @@ fn launch_firefox(cfg: &ResolvedConfig) {
         return;
     }
 
-    // Import CA into NSS DB if certutil is available.
+    // Import CA into the profile's NSS DB via certutil. If certutil is missing
+    // or fails, Firefox would launch with no CA trust, so warn with the exact
+    // manual command instead of silently continuing.
     let cert_path = super::ca::CertAuthority::cert_path(&cfg.ca_dir);
     if cert_path.exists() {
-        let _ = Command::new("certutil")
+        let cert = cert_path.to_string_lossy();
+        let profile = tmpdir.to_string_lossy();
+        let certutil = Command::new("certutil")
             .args([
                 "-A",
                 "-n",
@@ -287,11 +309,18 @@ fn launch_firefox(cfg: &ResolvedConfig) {
                 "-t",
                 "CT,,",
                 "-i",
-                &cert_path.to_string_lossy(),
+                &cert,
                 "-d",
-                &tmpdir.to_string_lossy(),
+                &profile,
             ])
             .status();
+        if !matches!(certutil, Ok(ref s) if s.success()) {
+            output::warn(&format!(
+                "Firefox: could not import the dev CA into the profile (certutil missing or \
+                 failed); HTTPS to proxied hosts will fail until you trust it. Run: \
+                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {cert} -d {profile}"
+            ));
+        }
     }
 
     let mut cmd = firefox_command();
@@ -353,14 +382,15 @@ fn launch_safari(cfg: &ResolvedConfig) {
         return;
     };
 
-    // Read prior state before changing anything.
-    let prior_pac = get_auto_proxy_url(&service);
+    // Read prior state (URL + enabled flag) before changing anything.
+    let (prior_url, prior_enabled) = get_auto_proxy_state(&service);
 
     // Persist the prior state so it can be recovered even after a hard kill.
     let restore_path = cfg.ca_dir.join(SAFARI_RESTORE_FILE);
     let restore_contents = format!(
-        "{service}\n{prior}\n",
-        prior = prior_pac.as_deref().unwrap_or("")
+        "{service}\n{url}\n{enabled}\n",
+        url = prior_url.as_deref().unwrap_or(""),
+        enabled = if prior_enabled { "on" } else { "off" },
     );
     if let Err(err) = std::fs::write(&restore_path, &restore_contents) {
         output::warn(&format!(
@@ -371,8 +401,9 @@ fn launch_safari(cfg: &ResolvedConfig) {
 
     // Changing the system network proxy requires admin, so the `networksetup`
     // call is elevated with `sudo` (only this command — the proxy itself keeps
-    // running as the current user). sudo prompts once in this terminal; the
-    // credential is cached so the restore on exit does not prompt again.
+    // running as the current user). sudo prompts once in this terminal; if the
+    // cached credential outlives a long run, the Ctrl-C restore may prompt again
+    // (and otherwise prints the manual command).
     output::info(
         "Safari: setting the system auto-proxy needs admin — sudo will prompt for your password \
          (only `networksetup` is elevated; the proxy keeps running as you).",
@@ -473,56 +504,110 @@ fn service_for_interface(ns_output: &str, interface: &str) -> Option<String> {
     None
 }
 
-/// Returns the current auto-proxy URL for a network service, if set.
-fn get_auto_proxy_url(service: &str) -> Option<String> {
-    let out = Command::new("networksetup")
-        .args(["-getautoproxyurl", service])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
+/// Parses `networksetup -getautoproxyurl` output into `(url, enabled)`.
+///
+/// The command prints two lines, e.g.:
+///
+/// ```text
+/// URL: http://127.0.0.1:18080/proxy.pac
+/// Enabled: Yes
+/// ```
+///
+/// A `URL:` of `(null)` (or empty) yields `None`; `Enabled:` is `true` only for
+/// a `Yes` (case-insensitive). Pure and unit-testable.
+fn parse_auto_proxy_state(text: &str) -> (Option<String>, bool) {
+    let mut url = None;
+    let mut enabled = false;
     for line in text.lines() {
-        if let Some(url) = line.strip_prefix("URL: ") {
-            let url = url.trim();
-            if !url.is_empty() && url != "(null)" {
-                return Some(url.to_string());
+        if let Some(value) = line.strip_prefix("URL:") {
+            let value = value.trim();
+            if !value.is_empty() && value != "(null)" {
+                url = Some(value.to_string());
             }
+        } else if let Some(value) = line.strip_prefix("Enabled:") {
+            enabled = value.trim().eq_ignore_ascii_case("Yes");
         }
     }
-    None
+    (url, enabled)
 }
 
-/// Restores the prior PAC URL (or disables auto-proxy if there was none).
-/// Restores `service`'s prior auto-proxy state.
+/// Returns the current auto-proxy `(url, enabled)` state for a network service.
 ///
-/// Uses `sudo -n` (non-interactive) so it never blocks on a password prompt: on
-/// a clean Ctrl-C exit the sudo credential is still cached from launch, so the
-/// restore runs silently; when a fresh run recovers a hard-killed session there
-/// is no cached credential, so it prints the manual command instead of stalling
-/// an unrelated startup on a password prompt.
-fn restore_auto_proxy(service: &str, prior_pac: Option<&str>) {
-    let status = match prior_pac {
-        Some(url) => Command::new("sudo")
-            .args(["-n", "networksetup", "-setautoproxyurl", service, url])
-            .status(),
-        None => Command::new("sudo")
-            .args(["-n", "networksetup", "-setautoproxystate", service, "off"])
-            .status(),
+/// A failure to run `networksetup` is reported as `(None, false)`.
+fn get_auto_proxy_state(service: &str) -> (Option<String>, bool) {
+    let Ok(out) = Command::new("networksetup")
+        .args(["-getautoproxyurl", service])
+        .output()
+    else {
+        return (None, false);
+    };
+    parse_auto_proxy_state(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Builds the manual `networksetup` command line that recovers `service`'s prior
+/// auto-proxy state, for printing when the automatic restore fails.
+#[cfg(target_os = "macos")]
+fn manual_restore_command(service: &str, prior_url: Option<&str>, prior_enabled: bool) -> String {
+    match prior_url {
+        Some(url) if prior_enabled => {
+            format!("sudo networksetup -setautoproxyurl \"{service}\" {url}")
+        }
+        Some(url) => format!(
+            "sudo networksetup -setautoproxyurl \"{service}\" {url} && \
+             sudo networksetup -setautoproxystate \"{service}\" off"
+        ),
+        None => format!("sudo networksetup -setautoproxystate \"{service}\" off"),
+    }
+}
+
+/// Restores `service`'s prior auto-proxy state, preserving the enabled/disabled
+/// flag, and returns whether every invoked command succeeded.
+///
+/// `-setautoproxyurl` re-enables auto-proxy, so when the prior state had a URL
+/// that was **disabled** a follow-up `-setautoproxystate off` is issued; when
+/// there was no prior URL the state is simply turned off. When `interactive` is
+/// true the `networksetup` calls run under `sudo` (which may prompt for a
+/// password — used on clean Ctrl-C exit, where the cached credential may have
+/// expired); when false they run under `sudo -n` (never prompts — used during
+/// an unrelated startup recovery so it cannot stall on a password prompt).
+fn restore_auto_proxy(
+    service: &str,
+    prior_url: Option<&str>,
+    prior_enabled: bool,
+    interactive: bool,
+) -> bool {
+    // Run `networksetup <args>` under sudo, honoring the interactive flag.
+    let run = |args: &[&str]| -> bool {
+        let mut cmd = Command::new("sudo");
+        if !interactive {
+            cmd.arg("-n");
+        }
+        cmd.arg("networksetup");
+        cmd.args(args);
+        matches!(cmd.status(), Ok(s) if s.success())
     };
 
-    if matches!(status, Ok(s) if s.success()) {
+    let ok = match prior_url {
+        Some(url) => {
+            // Re-apply the URL (this re-enables auto-proxy)...
+            let set = run(&["-setautoproxyurl", service, url]);
+            // ...then disable it again if it was previously off.
+            if prior_enabled {
+                set
+            } else {
+                let off = run(&["-setautoproxystate", service, "off"]);
+                set && off
+            }
+        }
+        None => run(&["-setautoproxystate", service, "off"]),
+    };
+
+    if ok {
         output::info(&format!(
             "Safari: restored prior auto-proxy setting for '{service}'"
         ));
-    } else {
-        let manual = match prior_pac {
-            Some(url) => format!("sudo networksetup -setautoproxyurl \"{service}\" {url}"),
-            None => format!("sudo networksetup -setautoproxystate \"{service}\" off"),
-        };
-        output::warn(&format!(
-            "Safari: could not auto-restore the system proxy for '{service}' (needs admin). \
-             Run: {manual}"
-        ));
     }
+    ok
 }
 
 #[cfg(test)]
@@ -588,7 +673,7 @@ mod tests {
     fn restore_system_proxy_if_pending_is_noop_when_no_file() {
         let dir = tempfile::tempdir().expect("should create temp dir");
         // No file present — should not panic or error.
-        restore_system_proxy_if_pending(dir.path());
+        restore_system_proxy_if_pending(dir.path(), false);
     }
 
     #[test]
@@ -596,13 +681,45 @@ mod tests {
         let dir = tempfile::tempdir().expect("should create temp dir");
         let restore_path = dir.path().join(SAFARI_RESTORE_FILE);
         // Write a malformed restore file (no service name).
-        std::fs::write(&restore_path, "\nhttp://127.0.0.1:18080/proxy.pac\n")
+        std::fs::write(&restore_path, "\nhttp://127.0.0.1:18080/proxy.pac\noff\n")
             .expect("should write restore file");
-        restore_system_proxy_if_pending(dir.path());
+        restore_system_proxy_if_pending(dir.path(), false);
         // File should be removed even when service name is missing.
         assert!(
             !restore_path.exists(),
             "restore file should be removed after failed parse"
         );
+    }
+
+    #[test]
+    fn parse_auto_proxy_state_reads_url_and_enabled() {
+        let (url, enabled) =
+            parse_auto_proxy_state("URL: http://127.0.0.1:18080/proxy.pac\nEnabled: Yes\n");
+        assert_eq!(
+            url.as_deref(),
+            Some("http://127.0.0.1:18080/proxy.pac"),
+            "should read the URL line"
+        );
+        assert!(enabled, "Enabled: Yes parses as enabled");
+    }
+
+    #[test]
+    fn parse_auto_proxy_state_handles_disabled_with_url() {
+        // A saved-but-disabled PAC URL: URL present, Enabled No.
+        let (url, enabled) =
+            parse_auto_proxy_state("URL: http://example.com/old.pac\nEnabled: No\n");
+        assert_eq!(
+            url.as_deref(),
+            Some("http://example.com/old.pac"),
+            "URL is read even when disabled"
+        );
+        assert!(!enabled, "Enabled: No parses as disabled");
+    }
+
+    #[test]
+    fn parse_auto_proxy_state_treats_null_url_as_none() {
+        let (url, enabled) = parse_auto_proxy_state("URL: (null)\nEnabled: No\n");
+        assert_eq!(url, None, "(null) URL parses as no URL");
+        assert!(!enabled, "disabled with no URL");
     }
 }

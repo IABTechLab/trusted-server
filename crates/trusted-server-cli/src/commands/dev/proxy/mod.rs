@@ -147,16 +147,24 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
         return Ok(());
     }
 
-    let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
+    // Recover a leftover Safari proxy state from a previously hard-killed run
+    // BEFORE resolving rules: a missing/bad rule must not strand the system
+    // proxy. `ca_dir` needs no rule. Non-interactive so an unrelated startup
+    // never blocks on a sudo password prompt.
+    browser::restore_system_proxy_if_pending(&config::ca_dir(&args), false);
 
-    // Recover a leftover Safari proxy state from a previously hard-killed run.
-    browser::restore_system_proxy_if_pending(&cfg.ca_dir);
+    let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
 
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)
             .change_context(ProxyError::CertAuthority)?,
     );
     let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
+
+    // `--insecure` disables all upstream TLS verification — make it loud.
+    if cfg.insecure {
+        output::warn("--insecure: upstream TLS verification is DISABLED for all upstreams");
+    }
 
     let runtime = tokio::runtime::Runtime::new().change_context(ProxyError::Server)?;
     runtime.block_on(async move {
@@ -185,7 +193,9 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
         tokio::select! {
             result = server => result.change_context(ProxyError::Server)?,
             _ = tokio::signal::ctrl_c() => {
-                browser::restore_system_proxy_if_pending(&cfg.ca_dir);
+                // Interactive: the cached sudo credential may have expired during
+                // a long run, so allow `sudo networksetup` to prompt for it.
+                browser::restore_system_proxy_if_pending(&cfg.ca_dir, true);
                 Ok(())
             }
         }
