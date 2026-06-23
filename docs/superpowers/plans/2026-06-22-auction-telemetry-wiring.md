@@ -385,24 +385,96 @@ git commit -m "Add auction event sink to runtime services with no-op default"
 
 - [ ] **Step 1: Write the failing test**
 
-Add to the existing `#[cfg(test)] mod tests` in `endpoints.rs` (it already imports `create_test_settings`, `make_ec_context`, `noop_services`, `AuctionConfig`, `Jurisdiction`, `json`, `Arc`, `StatusCode`, `EdgeBody`, `Request`, `handle_auction`):
+The orchestrator errors on both an empty provider list ("No providers configured") and an all-failed-to-launch auction ("All N configured provider(s) ... failed to launch"). To exercise the **completed** path the test registers a provider that launches successfully through a stubbed HTTP client and parses a no-bid success — the exact harness the orchestrator's own tests use.
+
+This test needs imports the `tests` module does not already have. Add these to the `use` lines at the top of the `#[cfg(test)] mod tests` block:
+
+```rust
+    use crate::platform::test_support::{build_services_with_http_client, StubHttpClient};
+    use crate::platform::PlatformHttpRequest;
+    use error_stack::ResultExt as _;
+```
+
+(The module already imports `create_test_settings`, `make_ec_context`, `AuctionConfig`, `AuctionProvider`, `Jurisdiction`, `json`, `Arc`, `StatusCode`, `EdgeBody`, `Request`, `handle_auction`, `AuctionRequest`, `AuctionResponse`, `PlatformPendingRequest`, `PlatformResponse`, and `error_stack::Report` via the existing test setup.)
+
+First add this provider struct inside the `tests` module (next to the existing `PanicOnBidProvider`). It mirrors `StubAuctionProvider` from the orchestrator tests:
+
+```rust
+    /// Provider that launches through the stub HTTP client and parses a no-bid
+    /// success, so `run_auction` returns a completed `OrchestrationResult`. This
+    /// is the path that must emit telemetry.
+    struct StubLaunchProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for StubLaunchProvider {
+        fn provider_name(&self) -> &'static str {
+            "stub_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            let req = PlatformHttpRequest::new(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(EdgeBody::empty())
+                    .expect("should build stub bid request"),
+                "stub-backend",
+            );
+            context
+                .services
+                .http_client()
+                .send_async(req)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "stub launch failed".to_string(),
+                })
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success("stub_provider", vec![], response_time_ms))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("stub-backend".to_string())
+        }
+    }
+```
+
+Then add the test itself:
 
 ```rust
     #[tokio::test]
     async fn auction_endpoint_emits_completed_telemetry() {
-        // A non-regulated, ungated auction with no providers still completes and
-        // must emit one summary row tagged auction_api to the injected sink.
+        // A non-regulated, ungated auction completes (one provider launches via
+        // the stub HTTP client and parses a no-bid success), so it must emit one
+        // summary row tagged auction_api to the injected sink.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
-            providers: vec![],
+            providers: vec!["stub_provider".to_string()],
             timeout_ms: 2000,
             mediator: None,
             ..Default::default()
         };
-        let orchestrator = AuctionOrchestrator::new(config);
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(StubLaunchProvider));
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response(200, b"{}".to_vec());
         let sink = Arc::new(crate::auction::telemetry::InMemorySink::default());
-        let services = noop_services().with_auction_event_sink(sink.clone());
+        let services =
+            build_services_with_http_client(http_client).with_auction_event_sink(sink.clone());
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
