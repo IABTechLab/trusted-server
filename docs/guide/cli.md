@@ -33,17 +33,29 @@ Create a starter Trusted Server config:
 ts config init
 ```
 
+`config init` accepts `--app-config <path>` and the compatibility alias
+`--config <path>`.
+
 Validate a local config before pushing it to platform storage:
 
 ```bash
 ts config validate
 ```
 
-Push flattened Trusted Server config entries through EdgeZero:
+Push Trusted Server config through EdgeZero:
 
 ```bash
 ts config push --adapter fastly
 ```
+
+`config validate` and `config push` use EdgeZero's typed app-config loader. By
+default that loader applies `TRUSTED_SERVER__...` environment overlays before
+validation and blob creation. Pass `--no-env` for file-only operation.
+
+`config push` publishes a single EdgeZero `BlobEnvelope` containing the validated
+Trusted Server settings JSON. This blob model is intentional because full
+Trusted Server configs can exceed Fastly limits when split into one config-store
+entry per setting.
 
 ## Lifecycle commands
 

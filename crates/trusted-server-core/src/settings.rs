@@ -1809,9 +1809,10 @@ impl Settings {
     /// Creates a new [`Settings`] instance from a TOML string with legacy
     /// test-only `TRUSTED_SERVER__` environment variable overrides.
     ///
-    /// Production loading does not support app-config environment overlays; this
-    /// helper remains available to existing tests that exercise legacy parsing
-    /// behavior.
+    /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
+    /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
+    /// This helper remains available to existing tests that exercise legacy
+    /// parsing behavior.
     ///
     /// # Errors
     ///
@@ -1840,7 +1841,7 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    fn finalize_deserialized(
+    pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {

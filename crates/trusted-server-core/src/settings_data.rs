@@ -159,10 +159,11 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_payload::{build_config_payload, CONFIG_BLOB_KEY};
+    use crate::config_payload::CONFIG_BLOB_KEY;
     use crate::platform::PlatformError;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
+    use edgezero_core::blob_envelope::BlobEnvelope;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -195,13 +196,19 @@ mod tests {
         }
     }
 
+    fn envelope_json(settings: &Settings) -> String {
+        let data = serde_json::to_value(settings).expect("should serialize settings to JSON");
+        let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_string());
+        serde_json::to_string(&envelope).expect("should serialize envelope")
+    }
+
     #[test]
     fn loads_settings_from_config_blob_entry() {
         let settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
-        let payload = build_config_payload(&settings).expect("should build payload");
+        let envelope_json = envelope_json(&settings);
         let store = MemoryConfigStore {
-            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), payload.envelope_json)]),
+            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), envelope_json)]),
         };
 
         let loaded =
@@ -218,18 +225,17 @@ mod tests {
     fn loads_settings_from_fastly_chunk_pointer() {
         let settings =
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
-        let payload = build_config_payload(&settings).expect("should build payload");
-        let midpoint = payload.envelope_json.len() / 2;
-        let first_chunk = payload.envelope_json[..midpoint].to_string();
-        let second_chunk = payload.envelope_json[midpoint..].to_string();
+        let envelope_json = envelope_json(&settings);
+        let midpoint = envelope_json.len() / 2;
+        let first_chunk = envelope_json[..midpoint].to_string();
+        let second_chunk = envelope_json[midpoint..].to_string();
         let first_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
         let second_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.1");
         let pointer = json!({
             "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
             "version": 1,
-            "envelope_sha256": sha256_hex(payload.envelope_json.as_bytes()),
-            "envelope_len": payload.envelope_json.len(),
-            "data_sha256": payload.hash.trim_start_matches("sha256:"),
+            "envelope_sha256": sha256_hex(envelope_json.as_bytes()),
+            "envelope_len": envelope_json.len(),
             "chunks": [
                 {
                     "key": first_key,

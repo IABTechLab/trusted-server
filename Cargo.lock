@@ -4127,18 +4127,10 @@ name = "trusted-server-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "derive_more",
- "edgezero-adapter",
  "edgezero-cli",
- "edgezero-core",
- "error-stack",
  "log",
- "serde",
- "serde_json",
  "tempfile",
- "toml",
  "trusted-server-core",
- "validator",
 ]
 
 [[package]]
