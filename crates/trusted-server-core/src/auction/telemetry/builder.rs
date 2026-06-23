@@ -421,4 +421,89 @@ mod tests {
             "should attribute it to the mediator"
         );
     }
+
+    #[test]
+    fn completed_result_with_mixed_providers_produces_expected_grains() {
+        // Arrange: one successful provider with two bids (one wins), one no-bid
+        // provider, and an explicit provider-call list mirroring those outcomes.
+        let winner = bid("slot-1", "kargo", Some(4.0), Some("c-1"));
+        let mut winning_bids = HashMap::new();
+        winning_bids.insert("slot-1".to_string(), winner);
+        let result = OrchestrationResult {
+            provider_responses: vec![
+                response(
+                    "prebid",
+                    vec![
+                        bid("slot-1", "kargo", Some(4.0), Some("c-1")),
+                        bid("slot-1", "ix", Some(2.0), Some("c-2")),
+                    ],
+                    BidStatus::Success,
+                ),
+                response("aps", vec![], BidStatus::NoBid),
+            ],
+            mediator_response: None,
+            winning_bids,
+            total_time_ms: 88,
+            metadata: HashMap::new(),
+        };
+        let calls = vec![
+            ProviderCallOutcome {
+                provider: "prebid".to_string(),
+                role: ProviderRole::Bidder,
+                status: ProviderCallStatus::Success,
+                response_time_ms: Some(42),
+                bid_count: Some(2),
+            },
+            ProviderCallOutcome {
+                provider: "aps".to_string(),
+                role: ProviderRole::Bidder,
+                status: ProviderCallStatus::NoBid,
+                response_time_ms: Some(40),
+                bid_count: Some(0),
+            },
+        ];
+
+        // Act
+        let rows = build_auction_events(
+            &ctx(AuctionSource::SpaNavigation),
+            &completed_outcome(),
+            &calls,
+            Some(&result),
+        );
+
+        // Assert: exactly one summary, two provider-call rows, two bid rows, and no
+        // invented seats on the no-bid provider.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event_kind == EventKind::Summary)
+                .count(),
+            1,
+            "should emit exactly one summary"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event_kind == EventKind::ProviderCall)
+                .count(),
+            2,
+            "should emit one provider-call row per provider"
+        );
+        let bid_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_kind == EventKind::Bid)
+            .collect();
+        assert_eq!(
+            bid_rows.len(),
+            2,
+            "should emit a bid row only for returned bids"
+        );
+        assert!(
+            bid_rows.iter().all(|r| r.seat.is_some()),
+            "should never emit a bid row without a seat"
+        );
+        assert_eq!(
+            bid_rows.iter().filter(|r| r.is_win == Some(1)).count(),
+            1,
+            "should mark exactly one winning bid"
+        );
+    }
 }
