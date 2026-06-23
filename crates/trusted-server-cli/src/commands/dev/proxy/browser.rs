@@ -157,9 +157,6 @@ pub fn restore_system_proxy_if_pending(ca_dir: &Path) {
                 Some(&prior_pac)
             },
         );
-        output::info(&format!(
-            "Safari: restored prior auto-proxy setting for '{service}'"
-        ));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -372,8 +369,16 @@ fn launch_safari(cfg: &ResolvedConfig) {
         ));
     }
 
-    let set_result = Command::new("networksetup")
-        .args(["-setautoproxyurl", &service, &pac_url])
+    // Changing the system network proxy requires admin, so the `networksetup`
+    // call is elevated with `sudo` (only this command — the proxy itself keeps
+    // running as the current user). sudo prompts once in this terminal; the
+    // credential is cached so the restore on exit does not prompt again.
+    output::info(
+        "Safari: setting the system auto-proxy needs admin — sudo will prompt for your password \
+         (only `networksetup` is elevated; the proxy keeps running as you).",
+    );
+    let set_result = Command::new("sudo")
+        .args(["networksetup", "-setautoproxyurl", &service, &pac_url])
         .status();
 
     match set_result {
@@ -391,8 +396,10 @@ fn launch_safari(cfg: &ResolvedConfig) {
         }
         _ => {
             output::warn(&format!(
-                "Safari: could not set PAC URL automatically; \
-                 set it manually in System Settings → Network → {service}: {pac_url}"
+                "Safari: could not set the system PAC (sudo declined or no terminal). Set it \
+                 manually in System Settings → Network → {service} → Details → Proxies → \
+                 Automatic Proxy Configuration: {pac_url} \
+                 (or run: sudo networksetup -setautoproxyurl \"{service}\" {pac_url})"
             ));
             // Remove the restore file — nothing was applied, nothing to restore.
             let _ = std::fs::remove_file(&restore_path);
@@ -427,23 +434,43 @@ fn detect_network_service() -> Option<String> {
             .output()
             .ok()?;
         let ns_text = String::from_utf8_lossy(&ns_out.stdout);
-
-        let mut last_service: Option<String> = None;
-        for line in ns_text.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('(') && !trimmed.starts_with("(*) An asterisk") {
-                // Service name lines look like: "(1) Wi-Fi"
-                last_service = trimmed
-                    .split_once(')')
-                    .map(|x| x.1)
-                    .map(str::trim)
-                    .map(str::to_string);
-            } else if trimmed.contains(&interface) && last_service.is_some() {
-                return last_service;
-            }
-        }
-        None
+        service_for_interface(&ns_text, &interface)
     }
+}
+
+/// Maps a default-route interface (e.g. `en0`) to its macOS network-service name
+/// (e.g. `Wi-Fi`) given `networksetup -listnetworkserviceorder` output, whose
+/// entries look like:
+///
+/// ```text
+/// (7) Wi-Fi
+/// (Hardware Port: Wi-Fi, Device: en0)
+/// ```
+///
+/// Both lines start with `(`, so the service line (`(N) Name`) is distinguished
+/// from the hardware-port line by the digit after `(`; the device is matched on
+/// the exact `Device: <interface>` marker.
+#[cfg(target_os = "macos")]
+fn service_for_interface(ns_output: &str, interface: &str) -> Option<String> {
+    let device_marker = format!("Device: {interface}");
+    let mut last_service: Option<String> = None;
+    for line in ns_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(&device_marker) {
+            return last_service;
+        }
+        // Service-name line "(N) Name": a '(' immediately followed by a digit
+        // (the "(Hardware Port: …)" line starts with '(' + 'H', so it is skipped).
+        if let Some(rest) = trimmed.strip_prefix('(')
+            && rest.starts_with(|c: char| c.is_ascii_digit())
+        {
+            last_service = trimmed
+                .split_once(')')
+                .map(|(_, name)| name.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    None
 }
 
 /// Returns the current auto-proxy URL for a network service, if set.
@@ -465,18 +492,36 @@ fn get_auto_proxy_url(service: &str) -> Option<String> {
 }
 
 /// Restores the prior PAC URL (or disables auto-proxy if there was none).
+/// Restores `service`'s prior auto-proxy state.
+///
+/// Uses `sudo -n` (non-interactive) so it never blocks on a password prompt: on
+/// a clean Ctrl-C exit the sudo credential is still cached from launch, so the
+/// restore runs silently; when a fresh run recovers a hard-killed session there
+/// is no cached credential, so it prints the manual command instead of stalling
+/// an unrelated startup on a password prompt.
 fn restore_auto_proxy(service: &str, prior_pac: Option<&str>) {
-    match prior_pac {
-        Some(url) => {
-            let _ = Command::new("networksetup")
-                .args(["-setautoproxyurl", service, url])
-                .status();
-        }
-        None => {
-            let _ = Command::new("networksetup")
-                .args(["-setautoproxystate", service, "off"])
-                .status();
-        }
+    let status = match prior_pac {
+        Some(url) => Command::new("sudo")
+            .args(["-n", "networksetup", "-setautoproxyurl", service, url])
+            .status(),
+        None => Command::new("sudo")
+            .args(["-n", "networksetup", "-setautoproxystate", service, "off"])
+            .status(),
+    };
+
+    if matches!(status, Ok(s) if s.success()) {
+        output::info(&format!(
+            "Safari: restored prior auto-proxy setting for '{service}'"
+        ));
+    } else {
+        let manual = match prior_pac {
+            Some(url) => format!("sudo networksetup -setautoproxyurl \"{service}\" {url}"),
+            None => format!("sudo networksetup -setautoproxystate \"{service}\" off"),
+        };
+        output::warn(&format!(
+            "Safari: could not auto-restore the system proxy for '{service}' (needs admin). \
+             Run: {manual}"
+        ));
     }
 }
 
@@ -484,6 +529,33 @@ fn restore_auto_proxy(service: &str, prior_pac: Option<&str>) {
 mod tests {
     use super::*;
     use crate::commands::dev::proxy::rewrite::{Authority, Rule, RuleTable};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_for_interface_maps_device_to_service() {
+        // Real shape of `networksetup -listnetworkserviceorder` output.
+        let ns = "An asterisk (*) denotes that a network service is disabled.\n\
+                  (1) Display Ethernet\n\
+                  (Hardware Port: Display Ethernet, Device: en11)\n\
+                  \n\
+                  (7) Wi-Fi\n\
+                  (Hardware Port: Wi-Fi, Device: en0)\n";
+        assert_eq!(
+            service_for_interface(ns, "en0").as_deref(),
+            Some("Wi-Fi"),
+            "en0 should map to its preceding service name, not the hardware-port line"
+        );
+        assert_eq!(
+            service_for_interface(ns, "en11").as_deref(),
+            Some("Display Ethernet"),
+            "en11 should map to Display Ethernet"
+        );
+        assert_eq!(
+            service_for_interface(ns, "en99"),
+            None,
+            "an unknown interface yields no service"
+        );
+    }
 
     #[test]
     fn pac_proxies_only_https_for_from_hosts() {

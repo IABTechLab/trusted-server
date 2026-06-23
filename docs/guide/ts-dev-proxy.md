@@ -234,9 +234,17 @@ The tool is flags-only; there are no environment variable overrides.
 
 Unlike Chrome/Firefox (which run in a throwaway profile), Safari uses your
 **system** proxy settings, so `--launch safari` sets the macOS auto-proxy on the
-active network service (e.g. Wi-Fi) and then opens Safari at the `FROM` URL. The
-change is system-wide (all apps) but PAC-scoped to the `FROM` hosts, and only
-while the proxy runs. On a clean exit the prior setting is restored. After a hard kill (`SIGKILL`)
+active network service (e.g. Wi-Fi) and then opens Safari at the `FROM` URL.
+
+Changing the system network proxy requires admin, so `--launch safari` runs the
+`networksetup` command under `sudo` — it prompts **once** for your password in
+the terminal (only that command is elevated; the proxy keeps running as you). If
+`sudo` is declined or there is no terminal (e.g. the proxy is backgrounded), it
+prints the exact `networksetup` command and the System Settings path so you can
+set the PAC manually. The change is system-wide (all apps) but PAC-scoped to the
+`FROM` hosts, and only while the proxy runs. On a clean exit the prior setting is
+restored (the restore reuses the cached `sudo` credential, so it does not
+re-prompt). After a hard kill (`SIGKILL`)
 the next `ts dev proxy` run detects and restores the leftover state, or prints
 the manual `networksetup` command.
 

@@ -444,12 +444,20 @@ service. Chrome/`--ignore-certificate-errors` is not used (we rely on the truste
 CA); a developer who prefers not to trust the CA can launch Chrome manually with
 that flag.
 
+Setting the system proxy **requires admin**, so the `networksetup -setautoproxyurl`
+call is run under `sudo` (interactive — it prompts once in the terminal; only
+that command is elevated, the proxy keeps running as the user). If `sudo` is
+declined or there is no TTY, the proxy prints the exact `networksetup` command
+and the System Settings path for a manual one-time setup.
+
 Because `networksetup` changes are **system-wide** (every app, not just Safari),
-the proxy persists the prior auto-proxy state to a file and restores it via an
-exit hook plus signal handlers. A hard kill (`SIGKILL`) skips cleanup, so on the
-next run `ts dev proxy` re-reads that file and restores it (or prints the manual
-`networksetup` command). On multi-service machines it must target the correct
-service, and managed networks may require admin rights.
+the proxy persists the prior auto-proxy state to a file and restores it on exit
+(Ctrl-C) and on the next run after a hard kill (`SIGKILL`). The restore runs
+`sudo -n networksetup` (non-interactive): on a clean exit the credential is still
+cached from launch so it restores silently; a fresh-run recovery has no cached
+credential, so it prints the manual `networksetup` command rather than prompting
+an unrelated startup. On multi-service machines it must target the correct
+service (mapped from the default-route interface above).
 
 If any browser can't be auto-configured, print its manual steps and continue
 with the others.
