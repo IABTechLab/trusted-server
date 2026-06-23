@@ -136,8 +136,7 @@ fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error
 ///
 /// - [`fastly::Error`] if the key cannot be read.
 fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly::Error> {
-    let value = config_store
-        .get(EDGEZERO_ENABLED_KEY)
+    let value = futures::executor::block_on(config_store.get(EDGEZERO_ENABLED_KEY))
         .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
     Ok(value.as_deref().is_some_and(parse_edgezero_flag))
 }

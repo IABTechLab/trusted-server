@@ -32,7 +32,6 @@ pub struct ConfigPushRequest {
     pub dry_run: bool,
     pub runtime_config: Option<PathBuf>,
     pub entries: Vec<(String, String)>,
-    pub settings_entry_count: usize,
     pub config_hash: String,
 }
 
@@ -370,27 +369,21 @@ fn push_config_entries(request: &ConfigPushRequest, out: &mut dyn Write) -> CliR
     if request.dry_run {
         writeln!(
             out,
-            "Config push dry run: {} entries -> {} ({})",
-            request.settings_entry_count, request.store, request.config_hash
+            "Config push dry run: {} blob -> {} ({})",
+            request.entries.len(),
+            request.store,
+            request.config_hash
         )
         .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
     } else {
         writeln!(
             out,
-            "Config pushed: {} entries -> {} ({})",
-            request.settings_entry_count, request.store, request.config_hash
+            "Config pushed: {} blob -> {} ({})",
+            request.entries.len(),
+            request.store,
+            request.config_hash
         )
         .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
-    }
-    for key in request
-        .entries
-        .iter()
-        .map(|(key, _value)| key)
-        .filter(|key| key.as_str() != trusted_server_core::config_payload::CONFIG_KEYS_KEY)
-        .filter(|key| key.as_str() != trusted_server_core::config_payload::CONFIG_HASH_KEY)
-    {
-        writeln!(out, "  {key}")
-            .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
     }
     for line in lines {
         writeln!(out, "{line}")

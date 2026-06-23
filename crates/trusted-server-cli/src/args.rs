@@ -68,7 +68,7 @@ pub enum ConfigCommand {
     Init(ConfigInitArgs),
     /// Validate and hash a local Trusted Server config file.
     Validate(ConfigValidateArgs),
-    /// Push flattened Trusted Server config entries through `EdgeZero`.
+    /// Push the Trusted Server config blob through `EdgeZero`.
     Push(ConfigPushArgs),
 }
 

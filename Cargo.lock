@@ -999,7 +999,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "toml",
 ]
@@ -1007,7 +1007,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1015,7 +1015,7 @@ dependencies = [
  "bytes",
  "ctor",
  "edgezero-adapter",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
  "futures",
  "futures-util",
  "http",
@@ -1035,7 +1035,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1043,7 +1043,7 @@ dependencies = [
  "bytes",
  "ctor",
  "edgezero-adapter",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
  "flate2",
  "futures",
  "futures-util",
@@ -1057,29 +1057,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#7ec2ad1de50477536854c2dc96acb2699b7d0026"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "brotli",
- "bytes",
- "chrono",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?branch=main)",
- "fastly",
- "fern",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "log-fastly",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "edgezero-adapter-fastly"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1089,12 +1067,14 @@ dependencies = [
  "chrono",
  "ctor",
  "edgezero-adapter",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
+ "fastly",
  "fern",
  "flate2",
  "futures",
  "futures-util",
  "log",
+ "log-fastly",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1106,7 +1086,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1114,7 +1094,7 @@ dependencies = [
  "bytes",
  "ctor",
  "edgezero-adapter",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
  "flate2",
  "futures",
  "futures-util",
@@ -1132,16 +1112,16 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "chrono",
  "clap",
  "edgezero-adapter",
  "edgezero-adapter-axum",
  "edgezero-adapter-cloudflare",
- "edgezero-adapter-fastly 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-adapter-fastly",
  "edgezero-adapter-spin",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
  "futures",
  "handlebars",
  "log",
@@ -1157,42 +1137,14 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#7ec2ad1de50477536854c2dc96acb2699b7d0026"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "anyhow",
  "async-compression",
  "async-stream",
  "async-trait",
  "bytes",
- "edgezero-macros 0.1.0 (git+https://github.com/stackpop/edgezero?branch=main)",
- "futures",
- "futures-util",
- "http",
- "http-body",
- "log",
- "matchit 0.9.2",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror 2.0.18",
- "toml",
- "tower-service",
- "tracing",
- "validator",
- "web-time",
-]
-
-[[package]]
-name = "edgezero-core"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
-dependencies = [
- "anyhow",
- "async-compression",
- "async-stream",
- "async-trait",
- "bytes",
- "edgezero-macros 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-macros",
  "futures",
  "futures-util",
  "http",
@@ -1216,21 +1168,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?branch=main#7ec2ad1de50477536854c2dc96acb2699b7d0026"
-dependencies = [
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "syn 2.0.118",
- "toml",
- "validator",
-]
-
-[[package]]
-name = "edgezero-macros"
-version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20#ff921ebe2f66cab83853245c153bf59d3c9dbd20"
+source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
 dependencies = [
  "log",
  "proc-macro2",
@@ -3868,8 +3806,8 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "edgezero-adapter-fastly 0.1.0 (git+https://github.com/stackpop/edgezero?branch=main)",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?branch=main)",
+ "edgezero-adapter-fastly",
+ "edgezero-core",
  "error-stack",
  "fastly",
  "fern",
@@ -3891,7 +3829,7 @@ dependencies = [
  "derive_more",
  "edgezero-adapter",
  "edgezero-cli",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?rev=ff921ebe2f66cab83853245c153bf59d3c9dbd20)",
+ "edgezero-core",
  "error-stack",
  "log",
  "serde",
@@ -3917,7 +3855,7 @@ dependencies = [
  "criterion",
  "derive_more",
  "ed25519-dalek",
- "edgezero-core 0.1.0 (git+https://github.com/stackpop/edgezero?branch=main)",
+ "edgezero-core",
  "error-stack",
  "fastly",
  "flate2",
