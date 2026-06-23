@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::config_store::FastlyConfigStore;
+use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
@@ -10,7 +10,9 @@ use edgezero_core::http::{
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
-use fastly::{Request as FastlyRequest, Response as FastlyResponse};
+use fastly::{
+    ConfigStore as FastlyConfigStore, Request as FastlyRequest, Response as FastlyResponse,
+};
 
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::AuctionOrchestrator;
@@ -123,8 +125,16 @@ fn parse_edgezero_flag(value: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
-fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = FastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
+fn open_trusted_server_config_store() -> Result<FastlyConfigStore, fastly::Error> {
+    FastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
+        fastly::Error::msg(format!(
+            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
+        ))
+    })
+}
+
+fn edgezero_config_store_handle() -> Result<ConfigStoreHandle, fastly::Error> {
+    let store = EdgeZeroFastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
         fastly::Error::msg(format!(
             "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
         ))
@@ -141,8 +151,9 @@ fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error
 /// # Errors
 ///
 /// - [`fastly::Error`] if the key cannot be read.
-fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly::Error> {
-    let value = futures::executor::block_on(config_store.get(EDGEZERO_ENABLED_KEY))
+fn is_edgezero_enabled(config_store: &FastlyConfigStore) -> Result<bool, fastly::Error> {
+    let value = config_store
+        .try_get(EDGEZERO_ENABLED_KEY)
         .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
     Ok(value.as_deref().is_some_and(parse_edgezero_flag))
 }
@@ -198,6 +209,16 @@ fn main() {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
     }) {
+        let edgezero_config_store = match edgezero_config_store_handle() {
+            Ok(config_store) => config_store,
+            Err(e) => {
+                log::warn!(
+                    "failed to open EdgeZero config store handle, falling back to legacy path: {e}"
+                );
+                legacy_main(req);
+                return;
+            }
+        };
         log::debug!("routing request through EdgeZero path");
         edgezero_main(req, edgezero_config_store);
     } else {
