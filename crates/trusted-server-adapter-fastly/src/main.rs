@@ -50,6 +50,7 @@ use trusted_server_core::request_signing::{
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
+mod auction_sink;
 mod error;
 mod logging;
 mod management_api;

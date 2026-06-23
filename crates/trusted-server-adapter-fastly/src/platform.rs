@@ -576,6 +576,9 @@ pub fn build_runtime_services(
             server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
             server_region: std::env::var("FASTLY_REGION").ok(),
         })
+        .auction_event_sink(std::sync::Arc::new(
+            crate::auction_sink::FastlyAuctionEventSink,
+        ))
         .build()
 }
 

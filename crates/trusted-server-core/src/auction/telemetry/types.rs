@@ -265,6 +265,26 @@ pub fn to_ndjson(rows: &[AuctionEventRow]) -> Result<String, serde_json::Error> 
     Ok(out)
 }
 
+/// Serialize one row to a single JSON object string with an injected `event_ts`
+/// field. Core stays clock-free; the caller supplies the timestamp.
+///
+/// # Errors
+///
+/// Returns the underlying `serde_json` error if the row cannot be serialized.
+pub fn to_json_line_with_event_ts(
+    row: &AuctionEventRow,
+    event_ts: &str,
+) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(row)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "event_ts".to_string(),
+            serde_json::Value::String(event_ts.to_string()),
+        );
+    }
+    serde_json::to_string(&value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +362,24 @@ mod tests {
         assert!(row.terminal_status.is_none(), "should null summary fields");
         assert!(row.provider.is_none(), "should null provider fields");
         assert!(row.slot_id.is_none(), "should null bid fields");
+    }
+
+    #[test]
+    fn json_line_injects_event_ts_and_keeps_row_fields() {
+        let row = AuctionEventRow::base(&sample_context(), EventKind::Summary);
+        let line = to_json_line_with_event_ts(&row, "2026-06-22T00:00:00.000Z")
+            .expect("should serialize the row");
+        let value: serde_json::Value =
+            serde_json::from_str(&line).expect("line should be valid JSON");
+        assert_eq!(
+            value.get("event_ts").and_then(serde_json::Value::as_str),
+            Some("2026-06-22T00:00:00.000Z"),
+            "should inject event_ts"
+        );
+        assert!(
+            value.get("event_kind").is_some(),
+            "should retain the row fields"
+        );
     }
 
     #[test]

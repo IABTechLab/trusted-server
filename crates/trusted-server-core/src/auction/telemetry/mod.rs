@@ -14,6 +14,7 @@ pub use context::build_observation_context;
 pub use mapping::{build_completed_auction_events, completed_outcome, provider_calls_from_result};
 pub use sink::{AuctionEventSink, InMemorySink, NoopSink};
 pub use types::{
-    to_ndjson, AuctionEventRow, AuctionObservationContext, AuctionSource, EventKind,
-    ProviderCallOutcome, ProviderCallStatus, ProviderRole, TerminalOutcome, TerminalStatus,
+    to_json_line_with_event_ts, to_ndjson, AuctionEventRow, AuctionObservationContext,
+    AuctionSource, EventKind, ProviderCallOutcome, ProviderCallStatus, ProviderRole,
+    TerminalOutcome, TerminalStatus,
 };
