@@ -21,10 +21,10 @@ Before creating the PR, verify the branch is healthy:
 
 ```
 cargo fmt --all -- --check
-cargo clippy-fastly && cargo clippy-axum
-cargo test-fastly && cargo test-axum
-cd crates/js/lib && npx vitest run
-cd crates/js/lib && npm run format
+cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
+cargo test-fastly && cargo test-axum && cargo test-cloudflare
+cd crates/trusted-server-js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npm run format
 cd docs && npm run format
 ```
 

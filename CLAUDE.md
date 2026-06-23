@@ -17,7 +17,7 @@ crates/
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
   trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
   trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
-  js/            # TypeScript/JS build — per-integration IIFE bundles
+  trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
 
@@ -28,10 +28,12 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 
 | Tool        | Version / Target                         |
 | ----------- | ---------------------------------------- |
-| Rust        | 1.91.1 (pinned in `rust-toolchain.toml`) |
+| Rust        | 1.95.0 (pinned in `rust-toolchain.toml`) |
 | WASM target | `wasm32-wasip1`                          |
-| Node        | LTS (for JS build)                       |
-| Viceroy     | Latest (Fastly local simulator)          |
+| Node        | 24.12.0 (from `.tool-versions`)          |
+| Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
+| Viceroy     | 0.17.0 (from `.tool-versions`)           |
+| Wasmtime    | 44.0.1 (from `.tool-versions`)           |
 
 ---
 
@@ -87,22 +89,22 @@ cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
 cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 
 # JS format
-cd crates/js/lib && npm run format
+cd crates/trusted-server-js/lib && npm run format
 
 # Docs format
 cd docs && npm run format
 
 # JS build
-cd crates/js/lib && node build-all.mjs
+cd crates/trusted-server-js/lib && node build-all.mjs
 ```
 
 ### Install prerequisites
 
 ```bash
-cargo install viceroy          # Fastly local test runtime
+cargo install viceroy --version 0.17.0 --locked --force
 ```
 
 ---
@@ -286,7 +288,7 @@ IntegrationRegistration::builder(ID)
 | --------------------- | ---------------------------------------------------------- |
 | `fastly.toml`         | Fastly service configuration and build settings            |
 | `trusted-server.toml` | Application settings (ad servers, KV stores, ID templates) |
-| `rust-toolchain.toml` | Pins Rust version to 1.91.1                                |
+| `rust-toolchain.toml` | Pins Rust version to 1.95.0                                |
 | `.env.dev`            | Local development environment variables                    |
 
 ---
@@ -296,10 +298,10 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum`
-3. `cargo test-fastly && cargo test-axum`
-4. JS build and test (`cd crates/js/lib && npx vitest run`)
-5. JS format (`cd crates/js/lib && npm run format`)
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare`
+3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare`
+4. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
+5. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 6. Docs format (`cd docs && npm run format`)
 
 ---
@@ -398,8 +400,8 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                   |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management               |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities           |
-| `crates/js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
-| `crates/js/src/bundle.rs`                    | Module map, concatenation, hashing                |
+| `crates/trusted-server-js/build.rs`                         | Discovers dist files, generates `tsjs_modules.rs` |
+| `crates/trusted-server-js/src/bundle.rs`                    | Module map, concatenation, hashing                |
 
 ---
 

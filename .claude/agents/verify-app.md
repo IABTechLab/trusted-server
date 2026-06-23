@@ -31,13 +31,13 @@ cargo test-fastly && cargo test-axum
 ### 4. JS Tests
 
 ```bash
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 ```
 
 ### 5. JS Format
 
 ```bash
-cd crates/js/lib && npm run format
+cd crates/trusted-server-js/lib && npm run format
 ```
 
 ### 6. Docs Format

@@ -3,9 +3,9 @@
 //! This module provides Ed25519-based signing and verification of HTTP requests
 //! using keys stored via platform store primitives.
 
-use base64::{engine::general_purpose, Engine};
-use ed25519_dalek::{Signature, Signer as Ed25519Signer, SigningKey, Verifier, VerifyingKey};
-use error_stack::{Report, ResultExt};
+use base64::{engine::general_purpose, Engine as _};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use error_stack::{Report, ResultExt as _};
 use serde::Serialize;
 
 use crate::error::TrustedServerError;
@@ -37,8 +37,9 @@ pub fn get_current_key_id(
 fn parse_ed25519_signing_key(key_bytes: &[u8]) -> Result<SigningKey, Report<TrustedServerError>> {
     let bytes = general_purpose::STANDARD.decode(key_bytes).map_err(|_| {
         Report::new(TrustedServerError::Configuration {
-            message: "signing key is not valid base64 — corrupt key material in secret store"
-                .into(),
+            message:
+                "signing key is not valid base64 \u{2014} corrupt key material in secret store"
+                    .into(),
         })
     })?;
 
@@ -122,7 +123,7 @@ impl SigningParams {
         };
         serde_json::to_string(&payload).map_err(|e| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Failed to serialize signing payload: {}", e),
+                message: format!("Failed to serialize signing payload: {e}"),
             })
         })
     }
@@ -144,7 +145,7 @@ impl RequestSigner {
             .secret_store()
             .get_bytes(&SIGNING_STORE_NAME, &key_id)
             .change_context(TrustedServerError::Configuration {
-                message: format!("failed to get signing key for kid: {}", key_id),
+                message: format!("failed to get signing key for kid: {key_id}"),
             })?;
 
         let signing_key = parse_ed25519_signing_key(&key_bytes)?;
@@ -198,12 +199,12 @@ pub fn verify_signature(
         .config_store()
         .get(&JWKS_STORE_NAME, kid)
         .change_context(TrustedServerError::Configuration {
-            message: format!("failed to get JWK for kid: {}", kid),
+            message: format!("failed to get JWK for kid: {kid}"),
         })?;
 
     let jwk: serde_json::Value = serde_json::from_str(&jwk_json).map_err(|e| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("Failed to parse JWK: {}", e),
+            message: format!("Failed to parse JWK: {e}"),
         })
     })?;
 
@@ -217,7 +218,7 @@ pub fn verify_signature(
         .decode(x_b64)
         .map_err(|e| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Failed to decode public key: {}", e),
+                message: format!("Failed to decode public key: {e}"),
             })
         })?;
 
@@ -229,7 +230,7 @@ pub fn verify_signature(
 
     let verifying_key = VerifyingKey::from_bytes(&verifying_key_bytes).map_err(|e| {
         Report::new(TrustedServerError::Configuration {
-            message: format!("Failed to create verifying key: {}", e),
+            message: format!("Failed to create verifying key: {e}"),
         })
     })?;
 
@@ -238,7 +239,7 @@ pub fn verify_signature(
         .or_else(|_| general_purpose::STANDARD.decode(signature_b64))
         .map_err(|e| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Failed to decode signature: {}", e),
+                message: format!("Failed to decode signature: {e}"),
             })
         })?;
 
@@ -338,10 +339,10 @@ mod tests {
     #[test]
     fn signing_params_build_payload_serializes_all_fields() {
         let params = SigningParams {
-            request_id: "req-123".to_string(),
-            request_host: "example.com".to_string(),
-            request_scheme: "https".to_string(),
-            timestamp: 1706900000,
+            request_id: "req-123".to_owned(),
+            request_host: "example.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            timestamp: 1_706_900_000,
         };
 
         let payload = params
@@ -355,15 +356,15 @@ mod tests {
         assert_eq!(parsed["host"], "example.com");
         assert_eq!(parsed["scheme"], "https");
         assert_eq!(parsed["id"], "req-123");
-        assert_eq!(parsed["ts"], 1706900000);
+        assert_eq!(parsed["ts"], 1_706_900_000);
     }
 
     #[test]
     fn signing_params_new_creates_recent_timestamp() {
         let params = SigningParams::new(
-            "req-123".to_string(),
-            "example.com".to_string(),
-            "https".to_string(),
+            "req-123".to_owned(),
+            "example.com".to_owned(),
+            "https".to_owned(),
         );
 
         let now_ms = web_time::SystemTime::now()
@@ -387,9 +388,9 @@ mod tests {
         let signer =
             RequestSigner::from_services(&services).expect("should create signer from services");
         let params = SigningParams::new(
-            "auction-123".to_string(),
-            "publisher.com".to_string(),
-            "https".to_string(),
+            "auction-123".to_owned(),
+            "publisher.com".to_owned(),
+            "https".to_owned(),
         );
 
         let signature = signer.sign_request(&params).expect("should sign request");
@@ -410,16 +411,16 @@ mod tests {
             RequestSigner::from_services(&services).expect("should create signer from services");
 
         let params1 = SigningParams {
-            request_id: "req-1".to_string(),
-            request_host: "host1.com".to_string(),
-            request_scheme: "https".to_string(),
-            timestamp: 1706900000,
+            request_id: "req-1".to_owned(),
+            request_host: "host1.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            timestamp: 1_706_900_000,
         };
         let params2 = SigningParams {
-            request_id: "req-1".to_string(),
-            request_host: "host2.com".to_string(),
-            request_scheme: "https".to_string(),
-            timestamp: 1706900000,
+            request_id: "req-1".to_owned(),
+            request_host: "host2.com".to_owned(),
+            request_scheme: "https".to_owned(),
+            timestamp: 1_706_900_000,
         };
 
         let sig1 = signer.sign_request(&params1).expect("should sign params1");

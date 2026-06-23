@@ -50,6 +50,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
 mod backend;
@@ -875,6 +876,10 @@ async fn route_request(
             let outcome = cors_preflight_identify(settings, &req);
             (outcome, false)
         }
+
+        // Tester-cookie endpoints (disabled unless `[tester_cookie].enabled`).
+        (Method::GET, "/_ts/set-tester") => (handle_set_tester(settings), false),
+        (Method::GET, "/_ts/clear-tester") => (handle_clear_tester(settings), false),
 
         // Unified auction endpoint.
         (Method::POST, "/auction") => {

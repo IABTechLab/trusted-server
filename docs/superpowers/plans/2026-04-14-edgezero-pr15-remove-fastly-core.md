@@ -584,7 +584,7 @@ Expected: all tests pass.
 - [ ] **Step 9.3: Run JS tests**
 
 ```bash
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 ```
 
 - [ ] **Step 9.4: Verify the "done when" criteria**

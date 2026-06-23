@@ -148,7 +148,7 @@ Takes over `googletag.cmd` so every queued callback is wrapped before GPT execut
 ## Implementation
 
 - **Rust**: [crates/trusted-server-core/src/integrations/gpt.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/gpt.rs)
-- **TypeScript**: [crates/js/lib/src/integrations/gpt/](https://github.com/IABTechLab/trusted-server/blob/main/crates/js/lib/src/integrations/gpt/)
+- **TypeScript**: [crates/trusted-server-js/lib/src/integrations/gpt/](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-js/lib/src/integrations/gpt/)
 
 ## Next Steps
 

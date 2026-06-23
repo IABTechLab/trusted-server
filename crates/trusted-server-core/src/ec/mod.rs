@@ -56,7 +56,7 @@ pub mod registry;
 #[must_use]
 pub fn log_id(ec_id: &str) -> String {
     let prefix = ec_id.get(..8).unwrap_or(ec_id);
-    format!("{prefix}…")
+    format!("{prefix}\u{2026}")
 }
 
 use cookie::CookieJar;
@@ -274,7 +274,7 @@ impl EcContext {
 
         let client_ip = self.client_ip.as_deref().ok_or_else(|| {
             Report::new(TrustedServerError::EdgeCookie {
-                message: "Client IP required for EC generation but unavailable".to_string(),
+                message: "Client IP required for EC generation but unavailable".to_owned(),
             })
         })?;
 
