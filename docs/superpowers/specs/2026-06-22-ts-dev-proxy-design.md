@@ -120,7 +120,7 @@ ts dev proxy [OPTIONS]
 | `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                 |
 | `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Pairs with `--to`.                                                                                                                                               |
 | `-t, --to`             | `HOST[:PORT]`                    | —                                                                                                           | Shorthand for a single rule's `TO`. Pairs with `--from`. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3).                                                                |
-| `--listen`             | `ADDR`                           | `127.0.0.1:8080`                                                                                            | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                |
+| `--listen`             | `ADDR`                           | `127.0.0.1:18080`                                                                                           | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                |
 | `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11). |
 | `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                       |
 | `--rewrite-host`       | flag                             | false                                                                                                       | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3).                                                                                                                                 |
@@ -164,7 +164,7 @@ ts dev proxy -f www.example-publisher.com -t localhost:3000 \
 
 ```mermaid
 sequenceDiagram
-    participant B as Browser<br/>(proxy = 127.0.0.1:8080)
+    participant B as Browser<br/>(proxy = 127.0.0.1:18080)
     participant P as ts dev proxy
     participant U as Upstream<br/>(Compute / staging)
 
@@ -424,7 +424,7 @@ else `DIRECT`:
 ```javascript
 function FindProxyForURL(url, host) {
   if (url.substring(0, 6) == 'https:' && host == 'www.example-publisher.com')
-    return 'PROXY 127.0.0.1:8080'
+    return 'PROXY 127.0.0.1:18080'
   return 'DIRECT'
 }
 ```
@@ -529,7 +529,7 @@ overrides either. Every setting is a CLI flag (§4).
 
 | Name                      | Value                                                                                                                                 |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Default listen            | `127.0.0.1:8080`                                                                                                                      |
+| Default listen            | `127.0.0.1:18080`                                                                                                                     |
 | Default `--launch`        | _unset_ (proxy only)                                                                                                                  |
 | CA storage dir            | `$XDG_DATA_HOME/trusted-server/dev-proxy/{ca-cert.pem,ca-key.pem}` (macOS: `~/Library/Application Support/…`; dir `0700`, key `0600`) |
 | CA CN                     | `Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION`                                                                       |

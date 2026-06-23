@@ -187,13 +187,13 @@ header but never in the SNI (a bare hostname; a port in SNI is invalid).
 
 ## Non-loopback listen
 
-The proxy binds `127.0.0.1:8080` by default. A non-loopback `--listen` is
+The proxy binds `127.0.0.1:18080` by default. A non-loopback `--listen` is
 rejected unless you also pass `--allow-non-loopback`:
 
 ```bash
 ts dev proxy \
   --map www.example-publisher.com=trusted-server-example.edgecompute.app \
-  --listen 0.0.0.0:8080 \
+  --listen 0.0.0.0:18080 \
   --allow-non-loopback
 ```
 
@@ -210,7 +210,7 @@ Options:
       --map <FROM=TO>           Rewrite rule (repeatable)
   -f, --from <HOST>             Single-rule FROM (pairs with --to)
   -t, --to <HOST[:PORT]>        Single-rule TO (pairs with --from)
-      --listen <ADDR>           Listen address [default: 127.0.0.1:8080]
+      --listen <ADDR>           Listen address [default: 127.0.0.1:18080]
       --allow-non-loopback      Permit non-loopback --listen (disables blind tunnel)
       --launch <LIST>           Browsers to launch (chrome,firefox,safari or all)
       --rewrite-host            Send Host: <TO> instead of the default <FROM>
@@ -245,5 +245,5 @@ the manual `networksetup` command.
 | Upstream returns `401`                         | Upstream is behind Basic auth.                                                                                                                                                              | Pass `--basic-auth user:pass` or `--basic-auth-file ./creds.txt`.                                                                                                                                  |
 | Upstream unreachable (`502` / `503`)           | Upstream service is down or the domain is not provisioned.                                                                                                                                  | Verify the upstream URL and its Fastly service health.                                                                                                                                             |
 | Browser shows an untrusted-certificate warning | The dev CA is not trusted in the browser.                                                                                                                                                   | Run `ts dev proxy ca install` for Chrome and Safari. For Firefox, use `--launch firefox` (auto-imports) or run `certutil` manually (see above). After `ca regenerate`, re-trust with `ca install`. |
-| Listen address already in use                  | Another process holds port 8080.                                                                                                                                                            | Pass `--listen 127.0.0.1:8081` (or another free port).                                                                                                                                             |
+| Listen address already in use                  | Another process holds port 18080.                                                                                                                                                           | Pass `--listen 127.0.0.1:18081` (or another free port).                                                                                                                                            |
 | `--listen` rejected as non-loopback            | A non-loopback address was given without the required flag.                                                                                                                                 | Add `--allow-non-loopback`.                                                                                                                                                                        |

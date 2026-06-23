@@ -276,7 +276,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:18080")]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).
@@ -717,7 +717,7 @@ mod tests {
     fn non_loopback_listen_requires_flag() {
         let mut args = base_args();
         args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.listen = "0.0.0.0:8080".into();
+        args.listen = "0.0.0.0:18080".into();
         assert!(resolve(&args).is_err(), "non-loopback without flag is rejected");
         args.allow_non_loopback = true;
         assert!(resolve(&args).is_ok(), "non-loopback allowed with flag");
@@ -1520,10 +1520,10 @@ mod tests {
             preserve_host: true,
             plaintext: false,
         }]);
-        let pac = generate_pac(&rules, "127.0.0.1:8080".parse().expect("addr"));
+        let pac = generate_pac(&rules, "127.0.0.1:18080".parse().expect("addr"));
         assert!(pac.contains("https:"), "PAC guards on https scheme");
         assert!(pac.contains("www.example-publisher.com"), "PAC lists the FROM host");
-        assert!(pac.contains("PROXY 127.0.0.1:8080"), "PAC points at the listen addr");
+        assert!(pac.contains("PROXY 127.0.0.1:18080"), "PAC points at the listen addr");
         assert!(pac.contains("return \"DIRECT\""), "everything else is direct");
     }
 }

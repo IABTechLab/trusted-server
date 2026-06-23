@@ -274,7 +274,7 @@ mod tests {
     fn non_loopback_listen_requires_flag() {
         let mut args = base_args();
         args.map = vec!["a.example.com=b.edgecompute.app".into()];
-        args.listen = "0.0.0.0:8080".into();
+        args.listen = "0.0.0.0:18080".into();
         assert!(
             resolve(&args).is_err(),
             "non-loopback without flag is rejected"

@@ -486,14 +486,17 @@ mod tests {
             preserve_host: true,
             plaintext: false,
         }]);
-        let pac = generate_pac(&rules, "127.0.0.1:8080".parse().expect("should parse addr"));
+        let pac = generate_pac(
+            &rules,
+            "127.0.0.1:18080".parse().expect("should parse addr"),
+        );
         assert!(pac.contains("https:"), "PAC guards on https scheme");
         assert!(
             pac.contains("www.example-publisher.com"),
             "PAC lists the FROM host"
         );
         assert!(
-            pac.contains("PROXY 127.0.0.1:8080"),
+            pac.contains("PROXY 127.0.0.1:18080"),
             "PAC points at the listen addr"
         );
         assert!(
@@ -514,7 +517,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("should create temp dir");
         let restore_path = dir.path().join(SAFARI_RESTORE_FILE);
         // Write a malformed restore file (no service name).
-        std::fs::write(&restore_path, "\nhttp://127.0.0.1:8080/proxy.pac\n")
+        std::fs::write(&restore_path, "\nhttp://127.0.0.1:18080/proxy.pac\n")
             .expect("should write restore file");
         restore_system_proxy_if_pending(dir.path());
         // File should be removed even when service name is missing.

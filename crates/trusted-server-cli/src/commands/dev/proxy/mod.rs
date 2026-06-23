@@ -45,7 +45,7 @@ pub struct ProxyArgs {
     pub to: Option<String>,
 
     /// Proxy listen address. Non-loopback requires `--allow-non-loopback`.
-    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:18080")]
     pub listen: String,
 
     /// Permit binding a non-loopback `--listen` (disables blind tunnel/forward).
