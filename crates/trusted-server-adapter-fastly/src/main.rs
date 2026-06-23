@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
+use edgezero_adapter_fastly::config_store::FastlyConfigStore;
+use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
@@ -239,7 +240,9 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // metadata here is authoritative. detect_request_scheme in http_util
     // checks this header so scheme-sensitive logic (publisher URL rewriting,
     // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
-    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
+    if req.get_tls_protocol().ok().flatten().is_some()
+        || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+    {
         req.set_header("fastly-ssl", "1");
     }
 
@@ -278,7 +281,18 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                 core_req.extensions_mut().insert(config_store);
                 core_req.extensions_mut().insert(device_signals);
                 core_req.extensions_mut().insert(client_info);
-                futures::executor::block_on(app.router().oneshot(core_req))
+                match futures::executor::block_on(app.router().oneshot(core_req)) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        log::error!("EdgeZero dispatch failed: {e}");
+                        FastlyResponse::from_status(
+                            fastly::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        )
+                        .with_body_text_plain("Internal Server Error")
+                        .send_to_client();
+                        return;
+                    }
+                }
             }
             Err(e) => {
                 log::error!("EdgeZero request conversion failed: {e}");
@@ -636,8 +650,14 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .unwrap_or(FALLBACK_UNAVAILABLE);
     let cipher = req
         .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
         .unwrap_or(FALLBACK_UNAVAILABLE);
-    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req
+        .get_tls_protocol()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
     let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
     let ch_mobile = req
         .get_header_str("sec-ch-ua-mobile")

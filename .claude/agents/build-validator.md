@@ -34,7 +34,7 @@ Validate that the project builds correctly across all targets.
 
 5. **JS build**
    ```bash
-   cd crates/js/lib && node build-all.mjs
+   cd crates/trusted-server-js/lib && node build-all.mjs
    ```
 
 ## Output

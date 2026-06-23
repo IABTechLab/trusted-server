@@ -10,7 +10,7 @@ Viceroy is the local test runtime for Fastly Compute applications. It simulates 
 
 ```bash
 # Install viceroy
-cargo install viceroy
+cargo install viceroy --version 0.17.0 --locked --force
 
 # Run tests (viceroy is invoked automatically)
 cargo test

@@ -136,10 +136,9 @@ impl IntegrationDocumentState {
             .inner
             .lock()
             .expect("should lock integration document state");
-        guard.get(integration_id).and_then(|value| {
-            let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
-            cloned.downcast::<T>().ok()
-        })
+        let value = guard.get(integration_id)?;
+        let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
+        cloned.downcast::<T>().ok()
     }
 
     /// Retrieves or initializes a value for an integration.
@@ -832,19 +831,13 @@ impl IntegrationRegistry {
                 }
                 inner
                     .html_rewriters
-                    .extend(registration.attribute_rewriters.into_iter());
-                inner
-                    .script_rewriters
-                    .extend(registration.script_rewriters.into_iter());
+                    .extend(registration.attribute_rewriters);
+                inner.script_rewriters.extend(registration.script_rewriters);
                 inner
                     .html_post_processors
-                    .extend(registration.html_post_processors.into_iter());
-                inner
-                    .head_injectors
-                    .extend(registration.head_injectors.into_iter());
-                inner
-                    .request_filters
-                    .extend(registration.request_filters.into_iter());
+                    .extend(registration.html_post_processors);
+                inner.head_injectors.extend(registration.head_injectors);
+                inner.request_filters.extend(registration.request_filters);
                 if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
@@ -962,8 +955,7 @@ impl IntegrationRegistry {
                 }
             } else {
                 log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={})",
-                    path,
+                    "EC generation skipped for integration proxy: non-document request (path={path})",
                 );
             }
 
@@ -984,7 +976,7 @@ impl IntegrationRegistry {
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteOutcome {
-        let mut current = attr_value.to_string();
+        let mut current = attr_value.to_owned();
         let mut changed = false;
         for rewriter in &self.inner.html_rewriters {
             if !rewriter.handles_attribute(attr_name) {
@@ -1250,7 +1242,7 @@ impl IntegrationRegistry {
                     path.strip_suffix("/*").expect("path should end with '/*'")
                 )
             } else {
-                path.to_string()
+                path.to_owned()
             };
 
             let router = match method {
@@ -1710,11 +1702,11 @@ mod tests {
             vec![
                 IntegrationEndpoint {
                     method: Method::GET,
-                    path: "/integrations/test/ec".to_string(),
+                    path: "/integrations/test/ec".to_owned(),
                 },
                 IntegrationEndpoint {
                     method: Method::POST,
-                    path: "/integrations/test/ec".to_string(),
+                    path: "/integrations/test/ec".to_owned(),
                 },
             ]
         }
@@ -2081,10 +2073,10 @@ mod tests {
         let all = registry.js_module_ids();
         let mut recombined = registry.js_module_ids_immediate();
         recombined.extend(registry.js_module_ids_deferred());
-        recombined.sort();
+        recombined.sort_unstable();
 
         let mut all_sorted = all;
-        all_sorted.sort();
+        all_sorted.sort_unstable();
 
         assert_eq!(
             recombined, all_sorted,

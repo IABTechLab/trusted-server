@@ -308,7 +308,7 @@ EIDs after auctions and forwards them to Trusted Server when they are available.
 
 User ID submodule inclusion is deterministic for attested builds. The module
 preset is checked in at
-`crates/js/lib/src/integrations/prebid/user_id_modules.json`, and
+`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`, and
 `build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
 that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
 production builds so publisher-specific ID choices do not change the attested JS

@@ -185,9 +185,9 @@ impl HtmlProcessorConfig {
         request_scheme: &str,
     ) -> Self {
         Self {
-            origin_host: origin_host.to_string(),
-            request_host: request_host.to_string(),
-            request_scheme: request_scheme.to_string(),
+            origin_host: origin_host.to_owned(),
+            request_host: request_host.to_owned(),
+            request_scheme: request_scheme.to_owned(),
             integrations: integrations.clone(),
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -272,10 +272,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             if rewritten.starts_with(&self.origin_host) {
                 let suffix = &rewritten[self.origin_host.len()..];
                 let boundary_ok = suffix.is_empty()
-                    || matches!(
-                        suffix.as_bytes().first(),
-                        Some(b'/') | Some(b'?') | Some(b'#')
-                    );
+                    || matches!(suffix.as_bytes().first(), Some(b'/' | b'?' | b'#'));
                 if boundary_ok {
                     rewritten = format!("{}{}", self.request_host, suffix);
                 }
@@ -646,9 +643,9 @@ mod tests {
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
-            origin_host: "origin.example.com".to_string(),
-            request_host: "test.example.com".to_string(),
-            request_scheme: "https".to_string(),
+            origin_host: "origin.example.com".to_owned(),
+            request_host: "test.example.com".to_owned(),
+            request_scheme: "https".to_owned(),
             integrations: IntegrationRegistry::default(),
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -720,11 +717,11 @@ mod tests {
             }
 
             fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![r#"<script>window.__testHeadInjector=true;</script>"#.to_string()]
+                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
             }
         }
 
-        let html = r#"<html><head><title>Test</title></head><body></body></html>"#;
+        let html = "<html><head><title>Test</title></head><body></body></html>";
 
         let mut config = create_test_config();
         config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
@@ -848,14 +845,14 @@ mod tests {
         let protocol_relative_urls = html.matches("//www.test-publisher.com").count();
 
         println!("Test HTML stats:");
-        println!("  Total URLs: {}", original_urls);
-        println!("  HTTPS URLs: {}", https_urls);
-        println!("  Protocol-relative URLs: {}", protocol_relative_urls);
+        println!("  Total URLs: {original_urls}");
+        println!("  HTTPS URLs: {https_urls}");
+        println!("  Protocol-relative URLs: {protocol_relative_urls}");
 
         // Process - replace test-publisher.com with our edge domain
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -878,8 +875,8 @@ mod tests {
         let replaced_urls = result.matches("test-publisher-ts.edgecompute.app").count();
 
         println!("After processing:");
-        println!("  Remaining original URLs: {}", remaining_urls);
-        println!("  Edge domain URLs: {}", replaced_urls);
+        println!("  Remaining original URLs: {remaining_urls}");
+        println!("  Edge domain URLs: {replaced_urls}");
 
         // Expect at least some replacements and fewer originals than before
         assert!(replaced_urls > 0, "Should replace some URLs in attributes");
@@ -921,7 +918,7 @@ mod tests {
         </head><body></body></html>"#;
 
         let mut settings = Settings::default();
-        let shim_src = "https://edge.example.com/static/testlight.js".to_string();
+        let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
         settings
             .integrations
             .insert_config(
@@ -949,7 +946,7 @@ mod tests {
 
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
+        result.unwrap();
 
         let processed = String::from_utf8_lossy(&output);
         assert!(
@@ -967,7 +964,7 @@ mod tests {
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
         use flate2::Compression as GzCompression;
-        use std::io::{Read, Write};
+        use std::io::{Read as _, Write as _};
 
         let html = include_str!("html_processor.test.html");
 
@@ -985,8 +982,8 @@ mod tests {
 
         // Process with compression
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1008,7 +1005,7 @@ mod tests {
         );
 
         // Decompress and verify
-        let mut decoder = GzDecoder::new(&compressed_output[..]);
+        let mut decoder = GzDecoder::new(&*compressed_output);
         let mut decompressed = String::new();
         decoder
             .read_to_string(&mut decompressed)
@@ -1057,10 +1054,10 @@ mod tests {
         // This simulates receiving already-truncated HTML from origin
 
         let truncated_html =
-            r#"<html><head><title>Test</title></head><body><p>This is a test that gets cut o"#;
+            "<html><head><title>Test</title></head><body><p>This is a test that gets cut o";
 
         println!("Testing already-truncated HTML");
-        println!("Input: '{}'", truncated_html);
+        println!("Input: '{truncated_html}'");
 
         let config = create_test_config();
         let processor = create_html_processor(config);
@@ -1080,7 +1077,7 @@ mod tests {
         );
 
         let processed = String::from_utf8_lossy(&output);
-        println!("Output: '{}'", processed);
+        println!("Output: '{processed}'");
 
         // The processor should pass through the truncated HTML
         // It might add some closing tags, but shouldn't truncate further
@@ -1115,8 +1112,8 @@ mod tests {
 
         // Process it through our pipeline
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1166,7 +1163,7 @@ mod tests {
 
     #[test]
     fn post_processors_accumulate_while_streaming_path_passes_through() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
         use lol_html::Settings;
 
         // --- Streaming path: no post-processors → output emitted per chunk ---
@@ -1350,7 +1347,7 @@ mod tests {
 
     #[test]
     fn active_post_processor_receives_full_document_and_mutates_output() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
         use lol_html::Settings;
 
         struct AppendCommentProcessor;

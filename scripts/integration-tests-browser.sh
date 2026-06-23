@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy
+#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #   - Node.js with npx available
 #
@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
-BROWSER_DIR="crates/integration-tests/browser"
+BROWSER_DIR="crates/trusted-server-integration-tests/browser"
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 
 if [ -z "$NODE_VERSION" ]; then
@@ -40,13 +40,13 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 # --- Build Docker images ---
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
-    crates/integration-tests/fixtures/frameworks/wordpress/
+    crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 
 echo "==> Building Next.js test container..."
 docker build \
     --build-arg NODE_VERSION="$NODE_VERSION" \
     -t test-nextjs:latest \
-    crates/integration-tests/fixtures/frameworks/nextjs/
+    crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 
 # --- Install Playwright ---
 echo "==> Installing Playwright dependencies..."
@@ -57,7 +57,7 @@ npx playwright install chromium
 # --- Export env vars for global-setup.ts ---
 export WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm"
 export INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT"
-export VICEROY_CONFIG_PATH="$REPO_ROOT/crates/integration-tests/fixtures/configs/viceroy-template.toml"
+export VICEROY_CONFIG_PATH="$REPO_ROOT/crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml"
 
 # Cleanup trap: stop any leftover containers on failure
 stop_matching_containers() {

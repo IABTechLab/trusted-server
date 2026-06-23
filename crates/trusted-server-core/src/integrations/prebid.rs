@@ -2255,8 +2255,14 @@ server_url = "https://prebid.example"
             .expect("should have cache-control");
         assert!(cache_control.contains("max-age=31536000"));
 
-        let body = String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("should parse script body as utf-8");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("should parse script body as utf-8");
         assert!(body.contains("// Script overridden by Trusted Server"));
     }
 

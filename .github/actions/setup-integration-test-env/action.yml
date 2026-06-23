@@ -50,8 +50,6 @@ runs:
       if: ${{ inputs.install-viceroy == 'true' }}
       shell: bash
       # `.tool-versions` is the single source of truth for the Viceroy pin.
-      # The pin matters because upstream Viceroy > v0.16.4 has bumped MSRV
-      # beyond the rustc pin in `rust-toolchain.toml`.
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
     - name: Set up Rust toolchain
@@ -72,7 +70,7 @@ runs:
     - name: Install Viceroy
       if: ${{ inputs.install-viceroy == 'true' && steps.cache-viceroy.outputs.cache-hit != 'true' }}
       shell: bash
-      run: cargo install --git https://github.com/fastly/Viceroy --tag v${{ steps.viceroy-version.outputs.viceroy-version }} viceroy
+      run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
     - name: Build WASM binary
       if: ${{ inputs.build-wasm == 'true' }}
@@ -91,7 +89,7 @@ runs:
       shell: bash
       run: |
         docker build -t test-wordpress:latest \
-          crates/integration-tests/fixtures/frameworks/wordpress/
+          crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 
     - name: Build Next.js test container
       if: ${{ inputs.build-test-images == 'true' }}
@@ -100,4 +98,4 @@ runs:
         docker build \
           --build-arg NODE_VERSION=${{ steps.node-version.outputs.node-version }} \
           -t test-nextjs:latest \
-          crates/integration-tests/fixtures/frameworks/nextjs/
+          crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/

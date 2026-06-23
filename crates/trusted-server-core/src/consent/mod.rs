@@ -241,13 +241,14 @@ fn decode_or_warn<T, E: core::fmt::Display>(
     label: &str,
     decode: fn(&str) -> Result<T, E>,
 ) -> Option<T> {
-    raw.and_then(|s| match decode(s) {
+    let s = raw?;
+    match decode(s) {
         Ok(value) => Some(value),
         Err(e) => {
             log::warn!("Failed to decode {label}: {e}");
             None
         }
-    })
+    }
 }
 
 /// Builds a [`ConsentContext`] from previously extracted raw signals.
@@ -322,9 +323,10 @@ fn has_eu_tcf_signal(raw_tc_present: bool, gpp_section_ids: Option<&[u16]>) -> b
 /// Returns the effective decoded TCF consent for enforcement decisions.
 #[must_use]
 fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
-    ctx.tcf
-        .as_ref()
-        .or_else(|| ctx.gpp.as_ref().and_then(|g| g.eu_tcf.as_ref()))
+    ctx.tcf.as_ref().or_else(|| {
+        let g = ctx.gpp.as_ref()?;
+        g.eu_tcf.as_ref()
+    })
 }
 
 /// Returns whether a server-side auction may be dispatched for this request.
@@ -638,7 +640,7 @@ fn log_consent_signals(signals: &RawConsentSignals) {
     if signals.is_empty() {
         log::debug!("No consent signals found on request");
     } else {
-        log::info!("Consent signals: {}", signals);
+        log::info!("Consent signals: {signals}");
     }
 }
 
@@ -1201,7 +1203,7 @@ mod tests {
         };
         assert!(
             !allows_ec_creation(&ctx),
-            "US state + no consent signals should block EC (spec §6.1.1: fail-closed)"
+            "US state + no consent signals should block EC (spec \u{a7}6.1.1: fail-closed)"
         );
     }
 

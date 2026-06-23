@@ -4,13 +4,13 @@ OpenRTB 2.6 data model generated from the [IAB Tech Lab protobuf schema](https:/
 
 ## How types are generated
 
-Generated code is checked into `src/generated.rs` so the crate has **no build-time dependency on `protoc`**. To regenerate after proto changes, use the separate `openrtb-codegen` crate:
+Generated code is checked into `src/generated.rs` so the crate has **no build-time dependency on `protoc`**. To regenerate after proto changes, run the wrapper script (it builds and runs the separate `trusted-server-openrtb-codegen` package and writes `src/generated.rs`):
 
 ```sh
-cd crates/openrtb-codegen && ./generate.sh
+./crates/trusted-server-openrtb/generate.sh
 ```
 
-The `generate.sh` / `openrtb-codegen` pipeline has three phases:
+The `generate.sh` / `trusted-server-openrtb-codegen` pipeline has three phases:
 
 1. **Proto compilation** — `prost-build` compiles `proto/openrtb.proto` into Rust structs.
 2. **Strip protobuf concerns** — `prost::Message` derives and `#[prost(...)]` attributes are removed since we only use JSON encoding.

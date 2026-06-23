@@ -15,17 +15,13 @@ pub use trusted_server_openrtb::{
 /// returning `None` if the value exceeds `i32::MAX`.
 #[must_use]
 pub fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
-    match i32::try_from(value) {
-        Ok(converted) => Some(converted),
-        Err(_) => {
-            log::warn!(
-                "openrtb: omitting {}={} for {} because value exceeds i32::MAX",
-                field_name,
-                value,
-                context
-            );
-            None
-        }
+    if let Ok(converted) = i32::try_from(value) {
+        Some(converted)
+    } else {
+        log::warn!(
+            "openrtb: omitting {field_name}={value} for {context} because value exceeds i32::MAX"
+        );
+        None
     }
 }
 
@@ -188,26 +184,26 @@ mod tests {
     #[test]
     fn openrtb_response_round_trips_with_struct_literals() {
         let bid = OpenRtbBid {
-            id: Some("bidder-a-slot-1".to_string()),
-            impid: Some("slot-1".to_string()),
+            id: Some("bidder-a-slot-1".to_owned()),
+            impid: Some("slot-1".to_owned()),
             price: Some(1.25),
-            adm: Some("<div>Test Creative HTML</div>".to_string()),
-            crid: Some("bidder-a-creative".to_string()),
+            adm: Some("<div>Test Creative HTML</div>".to_owned()),
+            crid: Some("bidder-a-creative".to_owned()),
             w: Some(300),
             h: Some(250),
-            adomain: vec!["example.com".to_string()],
+            adomain: vec!["example.com".to_owned()],
             ..Default::default()
         };
 
         let seatbid = SeatBid {
-            seat: Some("bidder-a".to_string()),
+            seat: Some("bidder-a".to_owned()),
             bid: vec![bid],
             ..Default::default()
         };
 
         let ext = ResponseExt {
             orchestrator: OrchestratorExt {
-                strategy: "parallel_only".to_string(),
+                strategy: "parallel_only".to_owned(),
                 providers: 2,
                 total_bids: 3,
                 time_ms: 12,
@@ -217,7 +213,7 @@ mod tests {
         .to_ext();
 
         let response = OpenRtbResponse {
-            id: Some("auction-1".to_string()),
+            id: Some("auction-1".to_owned()),
             seatbid: vec![seatbid],
             ext,
             ..Default::default()
@@ -258,8 +254,8 @@ mod tests {
         // Mirror the production pattern: build ext, then duplicate into top-level.
         let ext = RegsExt {
             gdpr: Some(1),
-            us_privacy: Some("1YNN".to_string()),
-            gpp: Some("DBACNY~CPXxRfA".to_string()),
+            us_privacy: Some("1YNN".to_owned()),
+            gpp: Some("DBACNY~CPXxRfA".to_owned()),
             gpp_sid: Some(vec![2, 6]),
         };
         let regs = Regs {
@@ -334,12 +330,12 @@ mod tests {
     #[test]
     fn user_serializes_dual_placement_consent() {
         let user = User {
-            id: Some("user-1".to_string()),
-            consent: Some("CPXxGfAPXxGfA".to_string()),
+            id: Some("user-1".to_owned()),
+            consent: Some("CPXxGfAPXxGfA".to_owned()),
             ext: UserExt {
-                consent: Some("CPXxGfAPXxGfA".to_string()),
+                consent: Some("CPXxGfAPXxGfA".to_owned()),
                 consented_providers_settings: Some(ConsentedProvidersSettings {
-                    consented_providers: Some("2~2628.2316~dv.".to_string()),
+                    consented_providers: Some("2~2628.2316~dv.".to_owned()),
                 }),
                 eids: None,
             }
@@ -366,7 +362,7 @@ mod tests {
     #[test]
     fn user_omits_consent_when_none() {
         let user = User {
-            id: Some("user-1".to_string()),
+            id: Some("user-1".to_owned()),
             consent: None,
             ext: None,
             ..Default::default()
@@ -382,9 +378,9 @@ mod tests {
     #[test]
     fn eid_serializes_correctly() {
         let eid = Eid {
-            source: "id5-sync.com".to_string(),
+            source: "id5-sync.com".to_owned(),
             uids: vec![Uid {
-                id: "ID5-abc123".to_string(),
+                id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],

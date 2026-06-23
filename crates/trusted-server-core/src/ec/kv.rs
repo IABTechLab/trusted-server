@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::kv_store::{InsertMode, KVStore};
 
 use crate::error::TrustedServerError;
@@ -29,10 +29,10 @@ const MAX_CAS_RETRIES: u32 = 5;
 const CLUSTER_LIST_LIMIT: u32 = 100;
 
 /// TTL for live entries (1 year), matching the EC cookie `Max-Age`.
-const ENTRY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const ENTRY_TTL: Duration = Duration::from_hours(8_760);
 
 /// TTL for withdrawal tombstones (24 hours).
-const TOMBSTONE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const TOMBSTONE_TTL: Duration = Duration::from_hours(24);
 
 /// Outcome of an [`KvIdentityGraph::upsert_partner_id_if_exists`] call.
 ///
@@ -248,9 +248,8 @@ impl KvIdentityGraph {
             }
         };
 
-        let meta_bytes = match response.metadata() {
-            Some(bytes) => bytes,
-            None => return Ok(None),
+        let Some(meta_bytes) = response.metadata() else {
+            return Ok(None);
         };
 
         let meta: KvMetadata =
@@ -345,10 +344,9 @@ impl KvIdentityGraph {
         }
 
         // Key exists — read it to determine if it's live or a tombstone.
-        let (existing, generation) = match self.get(ec_id)? {
-            Some(pair) => pair,
+        let Some((existing, generation)) = self.get(ec_id)? else {
             // Raced with a delete — try create again.
-            None => return self.create(ec_id, entry),
+            return self.create(ec_id, entry);
         };
 
         // Live entry — nothing to do.
@@ -440,23 +438,21 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
 
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match Self::lookup_entry(&store, &self.store_name, ec_id)?
-            {
-                Some(pair) => pair,
-                None => {
-                    log::info!(
-                        "upsert_partner_ids: no entry for '{}', rejecting {} partner updates",
-                        log_id(ec_id),
+            let Some((mut entry, generation)) =
+                Self::lookup_entry(&store, &self.store_name, ec_id)?
+            else {
+                log::info!(
+                    "upsert_partner_ids: no entry for '{}', rejecting {} partner updates",
+                    log_id(ec_id),
+                    updates.len(),
+                );
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!(
+                        "Cannot upsert {} partner IDs for missing key '{ec_id}'",
                         updates.len(),
-                    );
-                    return Err(Report::new(TrustedServerError::KvStore {
-                        store_name: self.store_name.clone(),
-                        message: format!(
-                            "Cannot upsert {} partner IDs for missing key '{ec_id}'",
-                            updates.len(),
-                        ),
-                    }));
-                }
+                    ),
+                }));
             };
 
             // Reject upserts on withdrawn entries — a late sync must not
@@ -546,20 +542,17 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
 
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match self.get(ec_id)? {
-                Some(pair) => pair,
-                None => {
-                    log::info!(
-                        "upsert_partner_id: no entry for '{}', rejecting partner upsert",
-                        log_id(ec_id)
-                    );
-                    return Err(Report::new(TrustedServerError::KvStore {
-                        store_name: self.store_name.clone(),
-                        message: format!(
-                            "Cannot upsert partner '{partner_id}' for missing key '{ec_id}'"
-                        ),
-                    }));
-                }
+            let Some((mut entry, generation)) = self.get(ec_id)? else {
+                log::info!(
+                    "upsert_partner_id: no entry for '{}', rejecting partner upsert",
+                    log_id(ec_id)
+                );
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.store_name.clone(),
+                    message: format!(
+                        "Cannot upsert partner '{partner_id}' for missing key '{ec_id}'"
+                    ),
+                }));
             };
 
             // Reject upserts on withdrawn entries — a late sync must not
@@ -655,9 +648,8 @@ impl KvIdentityGraph {
         let store = self.open_store()?;
 
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut entry, generation) = match self.get(ec_id)? {
-                Some(pair) => pair,
-                None => return Ok(UpsertResult::NotFound),
+            let Some((mut entry, generation)) = self.get(ec_id)? else {
+                return Ok(UpsertResult::NotFound);
             };
 
             if !entry.consent.ok {
@@ -783,7 +775,10 @@ impl KvIdentityGraph {
                 ),
             })?;
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "Fastly list page sizes are bounded well below u32::MAX"
+        )]
         let count = page.keys().len() as u32;
         Ok(count)
     }
@@ -895,8 +890,8 @@ mod tests {
     #[test]
     fn constants_have_expected_values() {
         assert_eq!(MAX_CAS_RETRIES, 5);
-        assert_eq!(ENTRY_TTL, Duration::from_secs(31_536_000));
-        assert_eq!(TOMBSTONE_TTL, Duration::from_secs(86_400));
+        assert_eq!(ENTRY_TTL, Duration::from_hours(8_760));
+        assert_eq!(TOMBSTONE_TTL, Duration::from_hours(24));
         assert_eq!(CLUSTER_LIST_LIMIT, 100);
     }
 

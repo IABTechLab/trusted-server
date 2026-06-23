@@ -3,7 +3,7 @@
 // This is the minimal `window.tsjs.adInit` that runs on first page load
 // before the TSJS bundle has had a chance to install its richer
 // idempotent implementation. The bundle in
-// crates/js/lib/src/integrations/gpt/index.ts overwrites `tsjs.adInit`
+// crates/trusted-server-js/lib/src/integrations/gpt/index.ts overwrites `tsjs.adInit`
 // once it loads.
 //
 // Contract with the bundle:
@@ -157,7 +157,7 @@
         // server-side targeting to GAM. If slim-Prebid has already wrapped
         // refresh(), it must pass this call straight through — not clear the
         // targeting and run a duplicate client-side auction. Mirrors the
-        // bundle's adInit() in crates/js/lib/src/integrations/gpt/index.ts.
+        // bundle's adInit() in crates/trusted-server-js/lib/src/integrations/gpt/index.ts.
         ts.adInitRefreshInProgress = true;
         try {
           googletag.pubads().refresh(slotsNeedingRefresh);

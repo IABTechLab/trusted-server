@@ -462,7 +462,7 @@ mod tests {
     }
 
     fn response_json(response: Response<EdgeBody>) -> JsonValue {
-        serde_json::from_slice(&response.into_body().into_bytes())
+        serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
             .expect("should parse JSON response")
     }
 

@@ -578,7 +578,7 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
     }
 
     // Keep in sync with JS normalization in:
-    // crates/js/lib/src/integrations/sourcepoint/script_guard.ts
+    // crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts
     // (protocol-relative + bare-domain handling + host-validation behavior).
     let normalized = if trimmed.starts_with("//") {
         format!("https:{trimmed}")

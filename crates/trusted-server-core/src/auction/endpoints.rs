@@ -132,7 +132,7 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes();
+    let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -609,7 +609,7 @@ mod tests {
             StatusCode::OK,
             "gated auction should return a 200 no-bid response"
         );
-        let body_bytes = response.into_body().into_bytes();
+        let body_bytes = response.into_body().into_bytes().unwrap_or_default();
         let parsed: JsonValue =
             serde_json::from_slice(&body_bytes).expect("response body should be valid JSON");
         let seatbid_empty = match parsed.get("seatbid").and_then(JsonValue::as_array) {
