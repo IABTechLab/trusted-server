@@ -3,12 +3,20 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::ProxyError;
 use super::ca::CA_COMMON_NAME;
 use super::config::{Browser, ResolvedConfig};
 use super::rewrite::RuleTable;
 use crate::output;
+
+/// Name of the file persisted under `ca_dir` that records the Safari proxy
+/// state that was active before this tool set its own PAC URL.
+///
+/// Format: two lines, `<service>\n<prior_pac_url>` — or `<service>\n` (empty
+/// second line) when auto-proxy was previously off.
+const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
 
 /// Generates a PAC script that proxies only `https://` requests for matched FROM hosts.
 ///
@@ -96,11 +104,75 @@ pub fn launch(
     Ok(())
 }
 
+/// Restores the macOS Safari system auto-proxy to its state before the last
+/// `launch_safari` call, if a pending restore file exists under `ca_dir`.
+///
+/// Called both at startup (to recover from a previously hard-killed run) and
+/// on clean exit (Ctrl-C).  On non-macOS systems or when no restore file is
+/// present, this is a no-op.  Deletes the restore file even when the
+/// `networksetup` command fails, preventing an infinite restore loop.  Never
+/// panics.
+pub fn restore_system_proxy_if_pending(ca_dir: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let restore_path = ca_dir.join(SAFARI_RESTORE_FILE);
+        if !restore_path.exists() {
+            return;
+        }
+
+        let contents = match std::fs::read_to_string(&restore_path) {
+            Ok(s) => s,
+            Err(err) => {
+                output::warn(&format!(
+                    "Safari: could not read proxy restore file: {err}; \
+                     restore the auto-proxy URL in System Settings → Network manually"
+                ));
+                // Remove the file so we don't retry forever.
+                let _ = std::fs::remove_file(&restore_path);
+                return;
+            }
+        };
+
+        let mut lines = contents.splitn(2, '\n');
+        let service = lines.next().unwrap_or("").trim().to_string();
+        let prior_pac = lines.next().unwrap_or("").trim().to_string();
+
+        if service.is_empty() {
+            output::warn(
+                "Safari: proxy restore file has no service name; \
+                 restore the auto-proxy URL in System Settings → Network manually",
+            );
+            let _ = std::fs::remove_file(&restore_path);
+            return;
+        }
+
+        // Remove the file first so a hard kill during restore doesn't loop.
+        let _ = std::fs::remove_file(&restore_path);
+
+        restore_auto_proxy(
+            &service,
+            if prior_pac.is_empty() {
+                None
+            } else {
+                Some(&prior_pac)
+            },
+        );
+        output::info(&format!(
+            "Safari: restored prior auto-proxy setting for '{service}'"
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Non-macOS: nothing to restore (Safari/networksetup don't exist).
+        let _ = ca_dir;
+    }
+}
+
 /// Creates a unique temp directory under the system temp dir.
 ///
 /// Returns `None` and prints a warning with `label` if the directory cannot be created.
 fn make_temp_dir(label: &str) -> Option<PathBuf> {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -262,10 +334,15 @@ fn firefox_command() -> Command {
     }
 }
 
-/// Configures Safari via the system PAC URL, restoring the prior setting on exit.
+/// Configures Safari via the system PAC URL (spec §9).
 ///
-/// Detects the active network service via `route`/`networksetup` and sets a
-/// PAC URL pointing at the running proxy's `/proxy.pac` route (spec §9).
+/// Detects the active network service via `route`/`networksetup`, persists the
+/// prior auto-proxy state to `<ca_dir>/safari-proxy-restore`, then sets the
+/// PAC URL pointing at the running proxy's `/proxy.pac` route.
+///
+/// The restore file is consumed by [`restore_system_proxy_if_pending`] — either
+/// at the next startup (crash recovery) or on clean Ctrl-C exit.  If the
+/// process is SIGKILL'd the file remains and is recovered on the next run.
 fn launch_safari(cfg: &ResolvedConfig) {
     let port = cfg.listen.port();
     let pac_url = format!("http://127.0.0.1:{port}/proxy.pac");
@@ -279,8 +356,21 @@ fn launch_safari(cfg: &ResolvedConfig) {
         return;
     };
 
-    // Save prior PAC URL so we can restore it on exit.
+    // Read prior state before changing anything.
     let prior_pac = get_auto_proxy_url(&service);
+
+    // Persist the prior state so it can be recovered even after a hard kill.
+    let restore_path = cfg.ca_dir.join(SAFARI_RESTORE_FILE);
+    let restore_contents = format!(
+        "{service}\n{prior}\n",
+        prior = prior_pac.as_deref().unwrap_or("")
+    );
+    if let Err(err) = std::fs::write(&restore_path, &restore_contents) {
+        output::warn(&format!(
+            "Safari: could not write proxy restore file: {err}; \
+             PAC URL will not be automatically restored on exit"
+        ));
+    }
 
     let set_result = Command::new("networksetup")
         .args(["-setautoproxyurl", &service, &pac_url])
@@ -297,19 +387,10 @@ fn launch_safari(cfg: &ResolvedConfig) {
                 "Safari: could not set PAC URL automatically; \
                  set it manually in System Settings → Network → {service}: {pac_url}"
             ));
-            return;
+            // Remove the restore file — nothing was applied, nothing to restore.
+            let _ = std::fs::remove_file(&restore_path);
         }
     }
-
-    // Restore PAC on exit.
-    std::thread::spawn(move || {
-        // Wait for Ctrl-C or process exit — the restore runs when this thread
-        // is dropped (i.e., when the process exits).
-        //
-        // A cleaner approach (signal handler) is deferred; this is best-effort.
-        std::thread::park();
-        restore_auto_proxy(&service, prior_pac.as_deref());
-    });
 }
 
 /// Returns the active Wi-Fi/Ethernet network service name, or `None`.
@@ -418,6 +499,28 @@ mod tests {
         assert!(
             pac.contains("return \"DIRECT\""),
             "everything else is direct"
+        );
+    }
+
+    #[test]
+    fn restore_system_proxy_if_pending_is_noop_when_no_file() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        // No file present — should not panic or error.
+        restore_system_proxy_if_pending(dir.path());
+    }
+
+    #[test]
+    fn restore_system_proxy_if_pending_removes_file_with_empty_service() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let restore_path = dir.path().join(SAFARI_RESTORE_FILE);
+        // Write a malformed restore file (no service name).
+        std::fs::write(&restore_path, "\nhttp://127.0.0.1:8080/proxy.pac\n")
+            .expect("should write restore file");
+        restore_system_proxy_if_pending(dir.path());
+        // File should be removed even when service name is missing.
+        assert!(
+            !restore_path.exists(),
+            "restore file should be removed after failed parse"
         );
     }
 }

@@ -148,6 +148,10 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
     }
 
     let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
+
+    // Recover a leftover Safari proxy state from a previously hard-killed run.
+    browser::restore_system_proxy_if_pending(&cfg.ca_dir);
+
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)
             .change_context(ProxyError::CertAuthority)?,
@@ -176,7 +180,14 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
                 .change_context(ProxyError::Browser)??;
         }
 
-        // Keep the runtime alive: serve until the accept loop ends (Ctrl-C / drop).
-        server.await.change_context(ProxyError::Server)?
+        // Race the server against Ctrl-C.  On clean interrupt, restore any
+        // system proxy state that was changed for Safari before exiting.
+        tokio::select! {
+            result = server => result.change_context(ProxyError::Server)?,
+            _ = tokio::signal::ctrl_c() => {
+                browser::restore_system_proxy_if_pending(&cfg.ca_dir);
+                Ok(())
+            }
+        }
     })
 }
