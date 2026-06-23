@@ -161,9 +161,10 @@ work on a freshly cloned machine before the proxy has been run.
 
 `ca regenerate` first removes the previously-installed CA from the macOS keychain
 (revoking its trust) before generating fresh key material, so an exfiltrated old
-key is no longer accepted. If the keychain removal can't be confirmed it warns
-loudly — verify in Keychain Access and remove the old CA manually if needed. Run
-`ca install` afterward to trust the new CA.
+key is no longer accepted. If the keychain removal can't be confirmed it aborts
+without touching the on-disk key, so the stored CA still matches OS trust — remove
+the old CA manually in Keychain Access, then retry. Run `ca install` afterward to
+trust the new CA.
 
 ## Host header behavior
 

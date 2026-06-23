@@ -54,8 +54,9 @@ pub fn ca_install(cert_path: &Path) {
                 output::info("CA added to the login keychain");
             }
             _ => output::warn(&format!(
-                "could not auto-install; run manually: security add-trusted-cert -r trustRoot -k {keychain} {}",
-                cert_path.display()
+                "could not auto-install; run manually: security add-trusted-cert -r trustRoot -k {} {}",
+                shell_quote(&keychain),
+                shell_quote(&cert_path.display().to_string())
             )),
         }
     }
@@ -344,7 +345,9 @@ fn launch_firefox(cfg: &ResolvedConfig) {
             output::warn(&format!(
                 "Firefox: could not import the dev CA into the profile (certutil missing or \
                  failed); HTTPS to proxied hosts will fail until you trust it. Run: \
-                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {cert} -d {profile}"
+                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {} -d {}",
+                shell_quote(&cert),
+                shell_quote(&profile)
             ));
         }
     }
@@ -594,15 +597,15 @@ fn get_auto_proxy_state(service: &str) -> (Option<String>, bool) {
     parse_auto_proxy_state(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Builds the manual `networksetup` command line that recovers `service`'s prior
-/// auto-proxy state, for printing when the automatic restore fails.
-#[cfg(target_os = "macos")]
 /// Single-quotes a value for safe inclusion in a printed POSIX shell command
 /// (handles spaces, `&`, and other metacharacters; embedded `'` are escaped).
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Builds the manual `networksetup` command line that recovers `service`'s prior
+/// auto-proxy state, for printing when the automatic restore fails.
+#[cfg(target_os = "macos")]
 fn manual_restore_command(service: &str, prior_url: Option<&str>, prior_enabled: bool) -> String {
     let svc = shell_quote(service);
     match prior_url {
@@ -631,6 +634,7 @@ fn manual_restore_command(service: &str, prior_url: Option<&str>, prior_enabled:
 /// password — used on clean Ctrl-C exit, where the cached credential may have
 /// expired); when false they run under `sudo -n` (never prompts — used during
 /// an unrelated startup recovery so it cannot stall on a password prompt).
+#[cfg(target_os = "macos")]
 fn restore_auto_proxy(
     service: &str,
     prior_url: Option<&str>,

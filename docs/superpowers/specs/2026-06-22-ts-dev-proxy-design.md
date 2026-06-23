@@ -513,7 +513,9 @@ overrides either. Every setting is a CLI flag (§4).
     `CONNECT` gets `403`, only configured rules are served), so the tool can
     never become a generic open CONNECT/HTTP proxy on the LAN.
   - Leaves are short-lived; the CA is never used by any deployed artifact.
-  - `ca regenerate` rotates the CA (forces re-trust).
+  - `ca regenerate` revokes the old CA from the keychain **before** writing new
+    key material, and **aborts** if that revocation can't be confirmed — so the
+    on-disk key never outlives its OS trust. Forces re-trust afterward.
   - `ca uninstall` removes it from the trust store. Trust is **not** auto-revoked
     on exit, so an OS-trusted 10-year dev CA whose key sits on disk is a standing
     MITM risk if that key is ever exfiltrated by user-level malware: run
@@ -638,5 +640,8 @@ Steps 1–4 already deliver a usable tool; each step is independently shippable.
 - **WebSocket / non-HTTP upgrades** through the MITM tunnel.
 - **Response rewriting / fixture injection** (mock upstreams, latency).
 - **Multiple simultaneous upstreams per host** (A/B / weighted).
-- **Windows/Linux trust + Safari automation** beyond printing instructions.
+- **Windows/Linux support.** v1 is macOS-only — the crate is gated to
+  `target_os = "macos"` (`compile_error!` elsewhere) because CA trust, Safari
+  automation, and browser launching all rely on macOS tooling (login keychain,
+  `networksetup`). Cross-platform trust + Safari automation is future work.
 - **Recording/replay** of proxied traffic.

@@ -3,6 +3,7 @@
 /pkg
 /target
 /crates/trusted-server-integration-tests/target
+/crates/trusted-server-cli/target
 
 # env
 .env*

@@ -18,6 +18,9 @@ pub enum ConfigError {
     /// A `--map`/authority value was malformed.
     #[display("invalid rule value")]
     Rule,
+    /// The FROM host contained characters not valid in a hostname.
+    #[display("invalid FROM host `{value}` (expected a hostname: letters, digits, '-', '.')")]
+    InvalidFrom { value: String },
     /// `--listen` was not a valid socket address.
     #[display("invalid --listen address `{value}`")]
     Listen { value: String },
@@ -145,15 +148,30 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     Ok(RuleTable(rules))
 }
 
+/// Whether `host` is a syntactically valid hostname — ASCII letters, digits,
+/// `-`, and `.` only — so it is safe to embed verbatim in the generated PAC
+/// JavaScript, the browser URL, and the upstream `Host` header.
+fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
 fn make_rule(
     from: &str,
     to: &str,
     preserve_host: bool,
     plaintext: bool,
 ) -> Result<Rule, ConfigError> {
+    let from = from.to_ascii_lowercase();
+    if !is_valid_host(&from) {
+        return Err(ConfigError::InvalidFrom { value: from });
+    }
     let to = Authority::parse(to, plaintext).map_err(|_| ConfigError::Rule)?;
     Ok(Rule {
-        from: from.to_ascii_lowercase(),
+        from,
         to,
         preserve_host,
         plaintext,
@@ -268,6 +286,18 @@ mod tests {
         let mut args = base_args();
         args.map = vec!["not-a-map".into()];
         assert!(resolve(&args).is_err(), "malformed --map errors");
+    }
+
+    #[test]
+    fn invalid_from_host_is_rejected() {
+        // A FROM with characters that would break the PAC JS / Host header.
+        let mut args = base_args();
+        args.map = vec!["bad\"host=to.edgecompute.app".into()];
+        let err = resolve(&args).expect_err("a malformed FROM host should error");
+        assert!(
+            matches!(err.current_context(), ConfigError::InvalidFrom { .. }),
+            "should be InvalidFrom for a hostname with invalid characters"
+        );
     }
 
     #[test]

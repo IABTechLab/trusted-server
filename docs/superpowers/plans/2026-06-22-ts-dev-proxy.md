@@ -239,6 +239,17 @@ pub mod ca;
 pub mod config;
 pub mod rewrite;
 
+// `ts dev proxy` is macOS-only for v1: CA trust (login keychain), Safari
+// automation (`networksetup`), and browser launching all rely on macOS tooling.
+// Fail the build with a clear message elsewhere rather than a confusing
+// missing-symbol error on the platform-specific helpers (spec §16).
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
+     networksetup). Cross-platform support is tracked as future work in the \
+     design spec (§16)."
+);
+
 use crate::output;
 
 /// Errors surfaced by `ts dev proxy`.
@@ -766,6 +777,9 @@ pub enum ConfigError {
     /// A `--map`/authority value was malformed.
     #[display("invalid rule value")]
     Rule,
+    /// A rule `FROM` value was not a bare hostname.
+    #[display("invalid FROM host `{value}` (expected a hostname: letters, digits, '-', '.')")]
+    InvalidFrom { value: String },
     /// `--listen` was not a valid socket address.
     #[display("invalid --listen address `{value}`")]
     Listen { value: String },
@@ -884,7 +898,22 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
 
 fn make_rule(from: &str, to: &str, preserve_host: bool, plaintext: bool) -> Result<Rule, ConfigError> {
     let to = Authority::parse(to, plaintext).map_err(|_| ConfigError::Rule)?;
-    Ok(Rule { from: from.to_ascii_lowercase(), to, preserve_host, plaintext })
+    let from = from.to_ascii_lowercase();
+    // FROM is interpolated into the generated PAC JavaScript and matched against
+    // request authorities — reject anything that isn't a bare hostname so it
+    // cannot inject into the PAC or smuggle path/query characters.
+    if !is_valid_host(&from) {
+        return Err(ConfigError::InvalidFrom { value: from });
+    }
+    Ok(Rule { from, to, preserve_host, plaintext })
+}
+
+/// Returns whether `host` is a plausible bare hostname (letters, digits, `-`,
+/// `.`; non-empty; ≤253 bytes). Used to validate rule `FROM` values.
+fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 /// Resolves arguments into a [`ResolvedConfig`].
@@ -1502,7 +1531,7 @@ Implements spec §9 and §4.2/§7.3.
 - Produces:
   - `fn generate_pac(rules: &RuleTable, listen: SocketAddr) -> String`.
   - `fn launch(browsers: &[Browser], cfg: &ResolvedConfig) -> error_stack::Result<(), ProxyError>`.
-  - `fn ca_install(cert_path: &Path)`, `fn ca_uninstall()`, `fn ca_path(cert_path: &Path)`, `fn ca_regenerate(ca_dir: &Path)` — invoked from `run` for the `ca` subcommand.
+  - `fn ca_install(cert_path: &Path)`, `fn ca_uninstall() -> bool` (returns whether the CA's absence from the keychain was confirmed, so `regenerate` can abort on failed revocation), `fn ca_path(cert_path: &Path)`, `fn ca_regenerate(ca_dir: &Path)` — invoked from `run` for the `ca` subcommand.
 
 - [ ] **Step 1: Write the failing PAC test**
 
@@ -1646,8 +1675,20 @@ pub fn run(args: ProxyArgs) -> error_stack::Result<(), ProxyError> {
                 ca::CertAuthority::load_or_generate(&ca_dir).change_context(ProxyError::CertAuthority)?;
                 browser::ca_install(&cert_path);
             }
-            CaCommand::Uninstall => browser::ca_uninstall(),
+            CaCommand::Uninstall => {
+                browser::ca_uninstall();
+            }
             CaCommand::Regenerate => {
+                // Revoke OS trust for the old key BEFORE writing new key material.
+                // If revocation can't be confirmed, abort so the on-disk key never
+                // outlives its keychain trust (an exfiltrated old key stays usable).
+                if !browser::ca_uninstall() {
+                    return Err(error_stack::Report::new(ProxyError::CertAuthority).attach(
+                        "could not revoke the previously-installed CA from the keychain; \
+                         aborting regenerate so on-disk key material still matches OS trust. \
+                         Remove the old CA manually (Keychain Access), then retry.",
+                    ));
+                }
                 std::fs::remove_file(&cert_path).ok();
                 std::fs::remove_file(ca_dir.join("ca-key.pem")).ok();
                 ca::CertAuthority::load_or_generate(&ca_dir).change_context(ProxyError::CertAuthority)?;

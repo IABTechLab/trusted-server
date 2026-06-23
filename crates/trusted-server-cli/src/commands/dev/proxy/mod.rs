@@ -4,6 +4,18 @@ pub mod config;
 pub mod rewrite;
 pub mod server;
 
+// `ts dev proxy` is macOS-only for v1: certificate trust uses the macOS login
+// keychain, Safari is configured via `networksetup`, and browser launching uses
+// macOS app conventions. Other platforms are scoped as future work (design spec
+// §16). Fail the build with a clear message rather than a confusing
+// missing-symbol error on the platform-specific helpers.
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
+     networksetup). Cross-platform support is tracked as future work in the \
+     design spec (§16)."
+);
+
 use std::sync::Arc;
 
 use error_stack::ResultExt as _;
@@ -142,8 +154,17 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
                 // Revoke OS trust for the OLD CA first. The old and new CA share
                 // CA_COMMON_NAME, so `ca_uninstall` (delete-by-CN, a no-op when
                 // absent) removes the soon-to-be-stale cert from the keychain
-                // before we replace the files on disk.
-                browser::ca_uninstall();
+                // before we replace the files on disk. If revocation cannot be
+                // confirmed, ABORT — rotating the local key while the old CA
+                // stays trusted would contradict the "invalidates prior trust"
+                // promise and leave an exfiltrated old key usable.
+                if !browser::ca_uninstall() {
+                    return Err(error_stack::Report::new(ProxyError::CertAuthority).attach(
+                        "could not revoke the previously-installed CA from the keychain; \
+                         aborting regenerate so on-disk key material still matches OS trust. \
+                         Remove the old CA manually (Keychain Access), then retry.",
+                    ));
+                }
                 std::fs::remove_file(&cert_path).ok();
                 std::fs::remove_file(ca_dir.join("ca-key.pem")).ok();
                 ca::CertAuthority::load_or_generate(&ca_dir)
