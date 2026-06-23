@@ -9,6 +9,9 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
+use crate::auction::telemetry::{
+    build_completed_auction_events, build_observation_context, AuctionSource,
+};
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
@@ -270,6 +273,26 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
+    // Emit completed-auction telemetry. The sink write is buffered and
+    // non-blocking in production and a no-op by default in tests, so this never
+    // affects the response. Device signals are unknown (`2`) until a later plan
+    // threads them through.
+    let observation = build_observation_context(
+        AuctionSource::AuctionApi,
+        &auction_request.publisher.domain,
+        auction_request.publisher.page_url.as_deref(),
+        auction_request
+            .device
+            .as_ref()
+            .and_then(|device| device.geo.as_ref()),
+        auction_request.user.consent.as_ref(),
+        2,
+        2,
+    );
+    let slot_count = u16::try_from(auction_request.slots.len()).unwrap_or(u16::MAX);
+    let telemetry_rows = build_completed_auction_events(&observation, slot_count, &result);
+    services.auction_event_sink().emit(&telemetry_rows);
+
     // Convert to OpenRTB response format with inline creative HTML
     convert_to_openrtb_response(&result, settings, &auction_request, ec_context.ec_allowed())
 }
@@ -490,8 +513,10 @@ mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
-    use crate::platform::test_support::noop_services;
-    use crate::platform::{PlatformPendingRequest, PlatformResponse};
+    use crate::platform::test_support::{
+        build_services_with_http_client, noop_services, StubHttpClient,
+    };
+    use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -540,6 +565,61 @@ mod tests {
 
         fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
             Some("panic-backend".to_string())
+        }
+    }
+
+    /// Provider that launches through the stub HTTP client and parses a no-bid
+    /// success, so `run_auction` returns a completed `OrchestrationResult`. This
+    /// is the path that must emit telemetry.
+    struct StubLaunchProvider;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for StubLaunchProvider {
+        fn provider_name(&self) -> &'static str {
+            "stub_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            _request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            let req = PlatformHttpRequest::new(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://example.com/bid")
+                    .body(EdgeBody::empty())
+                    .expect("should build stub bid request"),
+                "stub-backend",
+            );
+            context
+                .services
+                .http_client()
+                .send_async(req)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "stub launch failed".to_string(),
+                })
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Ok(AuctionResponse::success(
+                "stub_provider",
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some("stub-backend".to_string())
         }
     }
 
@@ -959,6 +1039,69 @@ mod tests {
             merged[0].uids[0].ext,
             Some(json!({ "provider": "server" })),
             "should prefer resolved ext"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_endpoint_emits_completed_telemetry() {
+        // A non-regulated, ungated auction completes (one provider launches via
+        // the stub HTTP client and parses a no-bid success), so it must emit one
+        // summary row tagged auction_api to the injected sink.
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["stub_provider".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(StubLaunchProvider));
+        let http_client = Arc::new(StubHttpClient::new());
+        http_client.push_response(200, b"{}".to_vec());
+        let sink = Arc::new(crate::auction::telemetry::InMemorySink::default());
+        let services =
+            build_services_with_http_client(http_client).with_auction_event_sink(sink.clone());
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let body = json!({
+            "adUnits": [
+                {
+                    "code": "div-gpt-ad-1",
+                    "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("auction should return a valid response");
+
+        assert_eq!(response.status(), StatusCode::OK, "should return 200");
+        let rows = sink.rows();
+        assert!(
+            rows.iter().any(
+                |r| r.event_kind == crate::auction::telemetry::EventKind::Summary
+                    && r.auction_source == crate::auction::telemetry::AuctionSource::AuctionApi
+            ),
+            "should emit a summary row tagged auction_api, got {} rows",
+            rows.len()
         );
     }
 
