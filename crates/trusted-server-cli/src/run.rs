@@ -1,206 +1,169 @@
-use std::io::Write;
-
-use clap::Parser as _;
-
-use crate::args::{Args, AuthCommand, Command, ConfigCommand};
-use crate::config_command::{load_config, run_init, run_validate};
-use crate::edgezero_delegate::{
-    ConfigPushRequest, EdgeZeroDelegate, LifecycleCommand, ProductionEdgeZeroDelegate,
+use clap::{Parser, Subcommand};
+use edgezero_cli::args::{
+    AuthArgs, BuildArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, ProvisionArgs, ServeArgs,
 };
-use crate::error::CliResult;
+use trusted_server_core::config::TrustedServerAppConfig;
 
-/// Run the CLI using process arguments and standard output streams.
+use crate::config_init::{run_config_init, ConfigInitArgs};
+
+#[derive(Debug, Parser)]
+#[command(name = "ts", about = "Trusted Server CLI")]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Sign in / out / status against an EdgeZero adapter.
+    Auth(AuthArgs),
+    /// Build the project for a target adapter.
+    Build(BuildArgs),
+    /// Trusted Server app-config commands.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    /// Deploy the project through a target adapter.
+    Deploy(DeployArgs),
+    /// Provision platform resources through a target adapter.
+    Provision(ProvisionArgs),
+    /// Serve the project locally through a target adapter.
+    Serve(ServeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Initialize a Trusted Server config file from the example template.
+    Init(ConfigInitArgs),
+    /// Push `trusted-server.toml` as a blob envelope through EdgeZero.
+    Push(ConfigPushArgs),
+    /// Validate `edgezero.toml` and the typed Trusted Server config.
+    Validate(ConfigValidateArgs),
+}
+
+/// Run the CLI using process arguments.
 ///
 /// # Errors
 ///
-/// Returns an error when command parsing, config validation, `EdgeZero`
-/// delegation, or output writing fails.
-pub fn run_from_env() -> CliResult<()> {
-    let args = Args::parse();
-    let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
-    let mut delegate = ProductionEdgeZeroDelegate;
-    dispatch(args, &mut delegate, &mut stdout, &mut stderr)
+/// Returns an error when command parsing, config validation, EdgeZero
+/// delegation, or config initialization fails.
+pub fn run_from_env() -> Result<(), String> {
+    dispatch(Args::parse())
 }
 
-/// Run the CLI from explicit arguments and output streams.
-///
-/// # Errors
-///
-/// Returns an error when command parsing, config validation, `EdgeZero`
-/// delegation, or output writing fails.
-pub fn run_with_io<I, T>(args: I, out: &mut dyn Write, err: &mut dyn Write) -> CliResult<()>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString> + Clone,
-{
-    let parsed = Args::try_parse_from(args).map_err(|error| {
-        crate::error::report_error(format!("failed to parse command arguments: {error}"))
-    })?;
-    let mut delegate = ProductionEdgeZeroDelegate;
-    dispatch(parsed, &mut delegate, out, err)
-}
-
-fn dispatch(
-    args: Args,
-    delegate: &mut dyn EdgeZeroDelegate,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> CliResult<()> {
+fn dispatch(args: Args) -> Result<(), String> {
     match args.command {
-        Command::Auth(auth) => match auth.command {
-            AuthCommand::Login(login) => delegate.run_lifecycle(
-                LifecycleCommand::AuthLogin,
-                &login.adapter,
-                &login.edgezero_args,
-            ),
-            AuthCommand::Logout(logout) => delegate.run_lifecycle(
-                LifecycleCommand::AuthLogout,
-                &logout.adapter,
-                &logout.edgezero_args,
-            ),
-            AuthCommand::Status(status) => delegate.run_lifecycle(
-                LifecycleCommand::AuthStatus,
-                &status.adapter,
-                &status.edgezero_args,
-            ),
-        },
-        Command::Build(build) => delegate.run_lifecycle(
-            LifecycleCommand::Build,
-            &build.adapter,
-            &build.edgezero_args,
-        ),
-        Command::Config(ConfigCommand::Init(init)) => run_init(&init, out),
-        Command::Config(ConfigCommand::Validate(validate)) => run_validate(&validate, out, err),
-        Command::Config(ConfigCommand::Push(push)) => {
-            let loaded = load_config(&push.config)?;
-            let config_key =
-                edgezero_core::env_config::EnvConfig::from_env().store_key("config", &push.store);
-            let request = ConfigPushRequest {
-                adapter: push.adapter,
-                manifest: push.manifest,
-                store: push.store.clone(),
-                local: push.local,
-                dry_run: push.dry_run,
-                runtime_config: push.runtime_config,
-                entries: vec![(config_key, loaded.payload.envelope_json)],
-                config_hash: loaded.payload.hash,
-            };
-            delegate.push_config(&request, out)
+        Command::Auth(args) => edgezero_cli::run_auth(&args),
+        Command::Build(args) => edgezero_cli::run_build(&args),
+        Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
+        Command::Config(ConfigCommand::Push(args)) => {
+            edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
         }
-        Command::Deploy(deploy) => delegate.run_lifecycle(
-            LifecycleCommand::Deploy,
-            &deploy.adapter,
-            &deploy.edgezero_args,
-        ),
-        Command::Provision(provision) => delegate.run_lifecycle(
-            LifecycleCommand::Provision,
-            &provision.adapter,
-            &provision.edgezero_args,
-        ),
-        Command::Serve(serve) => delegate.run_lifecycle(
-            LifecycleCommand::Serve,
-            &serve.adapter,
-            &serve.edgezero_args,
-        ),
+        Command::Config(ConfigCommand::Validate(args)) => {
+            edgezero_cli::run_config_validate_typed::<TrustedServerAppConfig>(&args)
+        }
+        Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Command::Provision(args) => edgezero_cli::run_provision(&args),
+        Command::Serve(args) => edgezero_cli::run_serve(&args),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::path::PathBuf;
 
-    use tempfile::TempDir;
+    use clap::Parser as _;
+    use edgezero_cli::args::{AuthSub, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
-    use crate::edgezero_delegate::tests::FakeEdgeZeroDelegate;
-
-    fn valid_config() -> String {
-        r#"
-[publisher]
-domain = "example.com"
-cookie_domain = ".example.com"
-origin_url = "https://origin.example.com"
-proxy_secret = "production-proxy-secret"
-
-[ec]
-passphrase = "production-secret-key-32-bytes-min"
-
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "production-admin-password-32-bytes"
-"#
-        .to_string()
-    }
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
     }
 
     #[test]
-    fn build_delegates_to_edgezero_with_passthrough() {
-        let args = parse(&["ts", "build", "--adapter", "fastly", "--", "--release"]);
-        let mut delegate = FakeEdgeZeroDelegate::default();
-        dispatch(args, &mut delegate, &mut Vec::new(), &mut Vec::new())
-            .expect("should dispatch build");
-
-        assert_eq!(delegate.lifecycle_calls.len(), 1);
-        assert_eq!(delegate.lifecycle_calls[0].0, LifecycleCommand::Build);
-        assert_eq!(delegate.lifecycle_calls[0].1, "fastly");
-        assert_eq!(delegate.lifecycle_calls[0].2, ["--release"]);
-    }
-
-    #[test]
-    fn auth_status_delegates_to_edgezero() {
-        let args = parse(&["ts", "auth", "status", "--adapter", "fastly"]);
-        let mut delegate = FakeEdgeZeroDelegate::default();
-        dispatch(args, &mut delegate, &mut Vec::new(), &mut Vec::new())
-            .expect("should dispatch auth status");
-
-        assert_eq!(delegate.lifecycle_calls.len(), 1);
-        assert_eq!(delegate.lifecycle_calls[0].0, LifecycleCommand::AuthStatus);
-        assert_eq!(delegate.lifecycle_calls[0].1, "fastly");
-    }
-
-    #[test]
-    fn config_push_validates_and_forwards_entries() {
-        let temp = TempDir::new().expect("should create temp dir");
-        let config_path = temp.path().join("trusted-server.toml");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&config_path, valid_config()).expect("should write config");
-        fs::write(&manifest_path, "[app]\nname = \"trusted-server\"\n")
-            .expect("should write manifest placeholder");
-        let args = Args::try_parse_from([
+    fn parses_build_with_adapter_args() {
+        let args = parse(&[
             "ts",
-            "config",
-            "push",
+            "build",
             "--adapter",
             "fastly",
+            "--",
+            "--release",
+            "--flag=value",
+        ]);
+        let Command::Build(build) = args.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(build.adapter, "fastly");
+        assert_eq!(build.adapter_args, ["--release", "--flag=value"]);
+    }
+
+    #[test]
+    fn parses_auth_status() {
+        let args = parse(&["ts", "auth", "status", "--adapter", "fastly"]);
+        let Command::Auth(auth) = args.command else {
+            panic!("expected auth command");
+        };
+        let AuthSub::Status { adapter } = auth.sub else {
+            panic!("expected status command");
+        };
+        assert_eq!(adapter, "fastly");
+    }
+
+    #[test]
+    fn config_init_accepts_legacy_config_alias() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "init",
             "--config",
-            config_path.to_str().expect("path should be UTF-8"),
-            "--manifest",
-            manifest_path.to_str().expect("path should be UTF-8"),
-            "--dry-run",
-        ])
-        .expect("should parse push args");
-        let mut delegate = FakeEdgeZeroDelegate::default();
-        let mut out = Vec::new();
-
-        dispatch(args, &mut delegate, &mut out, &mut Vec::new()).expect("should dispatch push");
-
-        assert_eq!(delegate.push_calls.len(), 1);
-        let call = &delegate.push_calls[0];
-        assert_eq!(call.adapter, "fastly");
-        assert!(call.dry_run, "should forward dry-run");
-        assert_eq!(call.store, "app_config");
-        assert_eq!(call.entries.len(), 1, "should push one logical blob entry");
+            "custom/trusted-server.toml",
+        ]);
+        let Command::Config(ConfigCommand::Init(init)) = args.command else {
+            panic!("expected config init command");
+        };
         assert_eq!(
-            call.entries[0].0, "app_config",
-            "should use the config store id as the blob key"
+            init.app_config,
+            PathBuf::from("custom/trusted-server.toml"),
+            "legacy --config alias should still work"
         );
-        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
-            serde_json::from_str(&call.entries[0].1).expect("should parse blob envelope");
-        envelope.verify().expect("should verify blob envelope");
+    }
+
+    #[test]
+    fn config_push_uses_edgezero_defaults() {
+        let args = parse(&["ts", "config", "push", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Push(push)) = args.command else {
+            panic!("expected config push command");
+        };
+        let default_push = ConfigPushArgs::default();
+        assert_eq!(push.adapter, "fastly");
+        assert_eq!(push.app_config, default_push.app_config);
+        assert_eq!(push.manifest, default_push.manifest);
+        assert_eq!(push.store, default_push.store);
+        assert!(!push.local);
+        assert!(!push.dry_run);
+        assert!(!push.no_env);
+    }
+
+    #[test]
+    fn config_validate_uses_edgezero_app_config_flag() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "validate",
+            "--app-config",
+            "publisher-a.toml",
+            "--no-env",
+            "--strict",
+        ]);
+        let Command::Config(ConfigCommand::Validate(validate)) = args.command else {
+            panic!("expected config validate command");
+        };
+        assert_eq!(validate.app_config, Some(PathBuf::from("publisher-a.toml")));
+        assert!(validate.no_env);
+        assert!(validate.strict);
+
+        let default_validate = ConfigValidateArgs::default();
+        assert_eq!(validate.manifest, default_validate.manifest);
     }
 }

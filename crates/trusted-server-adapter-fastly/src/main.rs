@@ -51,7 +51,6 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::default_config_store_name;
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
@@ -70,6 +69,7 @@ use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
 
+const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
@@ -114,20 +114,20 @@ fn parse_edgezero_flag(value: &str) -> bool {
     v.eq_ignore_ascii_case("true") || v == "1"
 }
 
-/// Opens the configured Fastly Config Store used by both the `EdgeZero` flag
-/// read and `EdgeZero` dispatch metadata.
+/// Opens the existing Fastly Config Store used by the `EdgeZero` rollout flag.
 ///
-/// The store name follows the same `EdgeZero` config-store overlay as runtime
-/// settings loading: `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`, falling back
-/// to the logical `app_config` store id.
+/// This preserves the pre-PR bootstrap behavior: `edgezero_enabled` lives in
+/// `trusted_server_config`, while the Trusted Server app-config blob lives in
+/// the `EdgeZero` `app_config` store.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
 fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store_name = default_config_store_name();
-    let store = FastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
-        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
+    let store = FastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE).map_err(|e| {
+        fastly::Error::msg(format!(
+            "failed to open config store `{TRUSTED_SERVER_CONFIG_STORE}`: {e}"
+        ))
     })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }

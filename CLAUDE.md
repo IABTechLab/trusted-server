@@ -276,7 +276,7 @@ IntegrationRegistration::builder(ID)
 | `edgezero.toml`                 | EdgeZero app/platform manifest and logical stores               |
 | `fastly.toml`                   | Fastly service configuration and build settings                 |
 | `trusted-server.example.toml`   | Source-controlled Trusted Server app-config template            |
-| `trusted-server.toml`           | Operator-owned app config; gitignored and pushed with `ts` CLI  |
+| `trusted-server.toml`           | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
 | `rust-toolchain.toml`           | Pins Rust version to 1.95.0                                     |
 | `.env.dev`                      | Local development environment variables                         |
 
