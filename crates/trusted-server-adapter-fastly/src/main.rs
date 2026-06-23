@@ -50,6 +50,7 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::settings_data::default_config_store_name;
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
@@ -72,7 +73,6 @@ use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER
 use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
-const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
 
@@ -162,15 +162,21 @@ fn routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     bucket < rollout_pct
 }
 
-/// Opens the shared Fastly Config Store used by both the `EdgeZero` flag read and
-/// `EdgeZero` dispatch metadata.
+/// Opens the configured Fastly Config Store used by both the `EdgeZero` flag
+/// read and `EdgeZero` dispatch metadata.
+///
+/// The store name follows the same `EdgeZero` config-store overlay as runtime
+/// settings loading: `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`, falling back
+/// to the logical `app_config` store id.
 ///
 /// # Errors
 ///
 /// Returns [`fastly::Error`] if the config store cannot be opened.
 fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error> {
-    let store = FastlyConfigStore::try_open(TRUSTED_SERVER_CONFIG_STORE)
-        .map_err(|e| fastly::Error::msg(format!("failed to open config store: {e}")))?;
+    let store_name = default_config_store_name();
+    let store = FastlyConfigStore::try_open(store_name.as_ref()).map_err(|e| {
+        fastly::Error::msg(format!("failed to open config store `{store_name}`: {e}"))
+    })?;
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
 
