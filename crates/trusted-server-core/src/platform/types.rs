@@ -7,6 +7,7 @@ use super::{
     PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformHttpClient, PlatformKvStore,
     PlatformSecretStore,
 };
+use crate::auction::telemetry::{AuctionEventSink, NoopSink};
 
 /// Geographic information extracted from a request.
 ///
@@ -160,6 +161,9 @@ pub struct RuntimeServices {
     pub(crate) geo: Arc<dyn PlatformGeo>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
+    /// Sink for auction telemetry rows. Defaults to a no-op; the Fastly adapter
+    /// installs a real implementation.
+    pub(crate) auction_event_sink: Arc<dyn AuctionEventSink>,
 }
 
 impl RuntimeServices {
@@ -229,6 +233,12 @@ impl RuntimeServices {
         &self.client_info
     }
 
+    /// Returns the auction telemetry sink.
+    #[must_use]
+    pub fn auction_event_sink(&self) -> &dyn AuctionEventSink {
+        &*self.auction_event_sink
+    }
+
     /// Wrap the KV store in a [`super::KvHandle`] for ergonomic access to
     /// JSON helpers, pagination, and validation.
     #[must_use]
@@ -245,6 +255,15 @@ impl RuntimeServices {
     pub fn with_kv_store(self, store: Arc<dyn PlatformKvStore>) -> Self {
         Self {
             kv_store: store,
+            ..self
+        }
+    }
+
+    /// Return a clone of these services with a different auction event sink.
+    #[must_use]
+    pub fn with_auction_event_sink(self, sink: Arc<dyn AuctionEventSink>) -> Self {
+        Self {
+            auction_event_sink: sink,
             ..self
         }
     }
@@ -270,6 +289,7 @@ pub struct RuntimeServicesBuilder {
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn PlatformGeo>>,
     client_info: Option<ClientInfo>,
+    auction_event_sink: Option<Arc<dyn AuctionEventSink>>,
 }
 
 impl RuntimeServicesBuilder {
@@ -282,6 +302,7 @@ impl RuntimeServicesBuilder {
             http_client: None,
             geo: None,
             client_info: None,
+            auction_event_sink: None,
         }
     }
 
@@ -334,6 +355,13 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Set the auction telemetry sink. Defaults to a no-op when unset.
+    #[must_use]
+    pub fn auction_event_sink(mut self, sink: Arc<dyn AuctionEventSink>) -> Self {
+        self.auction_event_sink = Some(sink);
+        self
+    }
+
     /// Construct [`RuntimeServices`] from the accumulated configuration.
     ///
     /// # Panics
@@ -363,6 +391,50 @@ impl RuntimeServicesBuilder {
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),
+            auction_event_sink: self
+                .auction_event_sink
+                .unwrap_or_else(|| Arc::new(NoopSink)),
         }
+    }
+}
+
+#[cfg(test)]
+mod auction_sink_tests {
+    use crate::auction::telemetry::types::{AuctionObservationContext, AuctionSource, EventKind};
+    use crate::auction::telemetry::{AuctionEventRow, InMemorySink};
+    use crate::platform::test_support::noop_services;
+
+    fn row() -> AuctionEventRow {
+        let ctx = AuctionObservationContext {
+            auction_id: uuid::Uuid::nil(),
+            source: AuctionSource::AuctionApi,
+            publisher_domain: "example.com".to_string(),
+            page_path: "/p".to_string(),
+            country: "US".to_string(),
+            region: None,
+            is_mobile: 2,
+            is_known_browser: 2,
+            gdpr_applies: false,
+            consent_present: false,
+        };
+        AuctionEventRow::base(&ctx, EventKind::Summary)
+    }
+
+    #[test]
+    fn default_sink_is_noop_and_does_not_panic() {
+        let services = noop_services();
+        services.auction_event_sink().emit(&[row()]);
+    }
+
+    #[test]
+    fn injected_sink_captures_emitted_rows() {
+        let sink = std::sync::Arc::new(InMemorySink::default());
+        let services = noop_services().with_auction_event_sink(sink.clone());
+        services.auction_event_sink().emit(&[row()]);
+        assert_eq!(
+            sink.rows().len(),
+            1,
+            "should route emitted rows to the injected sink"
+        );
     }
 }
