@@ -4,7 +4,7 @@
 
 **Goal:** Build a local TLS-terminating (MITM) dev proxy, shipped as `ts dev proxy`, that serves a production publisher hostname from a dev/staging upstream by swapping the TLS SNI, using a per-machine local CA so Chrome/Firefox/Safari all trust it.
 
-**Architecture:** A native host binary (`crates/trusted-server-cli`, **excluded** from the wasm workspace) built on tokio + hyper + rustls + rcgen. The accept loop handles `CONNECT`: it matches the authority against a rule table *before* replying, blind-tunnels unmatched hosts, and MITM-terminates matched hosts with a leaf minted from a local CA, rewriting SNI→`TO` while preserving `Host: FROM`. Pure logic (rule matching, header outcomes, PAC generation, config resolution) is isolated from I/O so it is unit-testable without sockets.
+**Architecture:** A native host binary (`crates/trusted-server-cli`, **excluded** from the wasm workspace) built on tokio + hyper + rustls + rcgen. The accept loop handles `CONNECT`: it matches the authority against a rule table _before_ replying, blind-tunnels unmatched hosts, and MITM-terminates matched hosts with a leaf minted from a local CA, rewriting SNI→`TO` while preserving `Host: FROM`. Pure logic (rule matching, header outcomes, PAC generation, config resolution) is isolated from I/O so it is unit-testable without sockets.
 
 **Tech Stack:** Rust 2024 edition; `tokio` (`net`, `rt-multi-thread`, `macros`, `io-util`), `hyper` 1 + `hyper-util`, `rustls` 0.23 + `tokio-rustls` 0.26, `rcgen` 0.13 (`Issuer`/leaf minting), `rustls-pemfile` 2, `clap` 4 (derive), `error-stack` 0.6, `derive_more` 2, `log`, `base64` 0.22, `directories` (platform data dir). The spec is the source of truth: [docs/superpowers/specs/2026-06-22-ts-dev-proxy-design.md](../specs/2026-06-22-ts-dev-proxy-design.md).
 
@@ -52,6 +52,7 @@ One responsibility per file. `rewrite.rs`, `config.rs`, `browser.rs` (PAC gen) a
 ## Task 1: Crate skeleton + workspace wiring + CLI surface
 
 **Files:**
+
 - Modify: `Cargo.toml` (workspace root) — add to `[workspace].exclude`
 - Create: `crates/trusted-server-cli/Cargo.toml`
 - Create: `crates/trusted-server-cli/src/lib.rs`
@@ -62,6 +63,7 @@ One responsibility per file. `rewrite.rs`, `config.rs`, `browser.rs` (PAC gen) a
 - Create: `crates/trusted-server-cli/src/commands/dev/proxy/mod.rs`
 
 **Interfaces:**
+
 - Produces: `ProxyArgs` (clap-derived struct, fields below), `CaCommand` enum (`Path`/`Install`/`Uninstall`/`Regenerate`), `run(args: ProxyArgs) -> error_stack::Result<(), ProxyError>` (stub), `output::info(&str)` / `output::warn(&str)`.
 
 - [ ] **Step 1: Add the crate to the workspace exclude list**
@@ -356,10 +358,12 @@ Add empty `ca.rs`, `config.rs`, `rewrite.rs` with a `//!` doc line so the module
 - [ ] **Step 7: Verify it builds and runs on the native target**
 
 Run:
+
 ```bash
 cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
   --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy --help
 ```
+
 Expected: clap prints the `ts dev proxy` help including `--map`, `--rewrite-host`, `--allow-non-loopback`, and the `ca` subcommand. No build errors.
 
 - [ ] **Step 8: Verify the workspace gates still pass (crate stays out of wasm build)**
@@ -381,10 +385,12 @@ git commit -m "Add trusted-server-cli crate skeleton with ts dev proxy CLI surfa
 Pure logic, no I/O. Implements spec §8.1–§8.4. This is the most heavily unit-tested module.
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/rewrite.rs`
 - Test: same file, `#[cfg(test)] mod tests`
 
 **Interfaces:**
+
 - Produces:
   - `struct Authority { host: String, port: u16, default_port: u16 }` with `fn host(&self) -> &str`, `fn is_default_port(&self) -> bool` (port equals the scheme default it was parsed with), `fn host_with_port(&self) -> String` (host, plus `:port` only when non-default), `fn parse(raw: &str, plaintext: bool) -> Result<Authority, RuleError>`.
   - `struct Rule { from: String, to: Authority, preserve_host: bool, plaintext: bool }`.
@@ -650,10 +656,12 @@ git commit -m "Add rewrite core with rule matching and header outcomes"
 Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective settings. Pure logic except project-config inference, which is deferred to Task 7 (here, missing rules produce a clear error). Implements spec §10.1 precedence (flags > inference > defaults). The tool is **flags-only** — there are no `TS_DEV_PROXY_*` environment-variable overrides.
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/config.rs`
 - Test: same file
 
 **Interfaces:**
+
 - Consumes: `ProxyArgs` (Task 1), `Rule`/`RuleTable`/`Authority`/`RuleError` (Task 2).
 - Produces:
   - `struct ResolvedConfig { rules: RuleTable, listen: SocketAddr, allow_non_loopback: bool, launch: Vec<Browser>, insecure: bool, basic_auth: Option<BasicAuth>, ca_dir: PathBuf }`.
@@ -975,10 +983,12 @@ git commit -m "Resolve proxy args and env into a concrete rule table and setting
 Implements spec §7. Testable against a temp `--ca-dir`.
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/ca.rs`
 - Test: same file
 
 **Interfaces:**
+
 - Produces:
   - `struct CertAuthority` with:
     - `fn load_or_generate(ca_dir: &Path) -> error_stack::Result<CertAuthority, CaError>` — reads `ca-cert.pem`/`ca-key.pem` or generates and persists them (dir `0700`, key `0600`); logs a one-time trust hint on generation.
@@ -987,7 +997,7 @@ Implements spec §7. Testable against a temp `--ca-dir`.
   - `const CA_COMMON_NAME: &str = "Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION";`
   - `enum CaError` (`Display` + `Error`).
 
-> **Crate-API note:** rcgen 0.13 exposes `KeyPair`, `CertificateParams`, `Certificate`, and `Issuer`. Method names (`self_signed`, `signed_by`, `serialize_pem`) have shifted across 0.13.x — verify against `cargo doc -p rcgen` for the pinned version and adjust the calls below if needed; the *shape* (generate CA → persist PEM → load issuer → mint leaf with SAN) is stable.
+> **Crate-API note:** rcgen 0.13 exposes `KeyPair`, `CertificateParams`, `Certificate`, and `Issuer`. Method names (`self_signed`, `signed_by`, `serialize_pem`) have shifted across 0.13.x — verify against `cargo doc -p rcgen` for the pinned version and adjust the calls below if needed; the _shape_ (generate CA → persist PEM → load issuer → mint leaf with SAN) is stable.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1225,6 +1235,7 @@ Expected: PASS (3 tests). If rcgen method names differ for the pinned 0.13.x, ad
 - [ ] **Step 5: Lint and commit**
 
 Run clippy (as in Task 3 step 5), then:
+
 ```bash
 git add crates/trusted-server-cli/src/commands/dev/proxy/ca.rs
 git commit -m "Add per-machine local CA with leaf minting and caching"
@@ -1237,17 +1248,20 @@ git commit -m "Add per-machine local CA with leaf minting and caching"
 Implements spec §5. This is the I/O core; it is exercised by a native integration test rather than pure unit tests.
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/server.rs`
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/mod.rs` (call `server::bind`/`serve_on`)
 - Test: `crates/trusted-server-cli/tests/proxy_e2e.rs` (+ `tests/support/mod.rs`)
 
 **Interfaces:**
+
 - Consumes: `ResolvedConfig` (Task 3), `CertAuthority` (Task 4), `RuleTable`/`rewrite_for` (Task 2).
 - Produces (both `pub`, reachable from integration tests via the `trusted_server_cli` lib target):
   - `async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener>` — binds the listen socket so the port is open (connections queue) **before** browsers are launched (Task 6).
   - `async fn serve_on(listener: TcpListener, cfg: Arc<ResolvedConfig>, ca: Arc<CertAuthority>, pac: Arc<str>) -> error_stack::Result<(), ProxyError>` — accept loop; serves until the task is dropped. Splitting bind from serve is what makes the launch ordering in Task 6 safe.
 
 **Behavior contract (from spec §5, §8, §11):**
+
 1. Read the first request line. If it is `CONNECT host:port`: match `host` (authority) against `cfg.rules`.
    - **Match:** reply `200`, select `ca.server_config(host)`, TLS-accept, then loop reading HTTP/1.1 requests; for each apply `rewrite_for`, open the upstream (TLS unless `plaintext`; skip cert verify if `insecure`), forward, stream the response back. Close on `Upgrade:`.
    - **No match, loopback bind:** connect upstream **first**, reply `200` only on success (else `502`), then copy bytes both directions.
@@ -1436,7 +1450,7 @@ async fn handle_connection(
 // Redact Authorization/Cookie in any logging.
 ```
 
-Implement the helper bodies (`read_request_head`, `handle_connect`, `mitm_loop`, `blind_tunnel`, `serve_pac`, `respond_status`, upstream connect with optional `insecure` `ClientConfig`). Use `tokio::io::copy_bidirectional` for the blind tunnel. For the non-loopback path, `handle_connect` must return `403` for unmatched authorities *before* any upstream connect.
+Implement the helper bodies (`read_request_head`, `handle_connect`, `mitm_loop`, `blind_tunnel`, `serve_pac`, `respond_status`, upstream connect with optional `insecure` `ClientConfig`). Use `tokio::io::copy_bidirectional` for the blind tunnel. For the non-loopback path, `handle_connect` must return `403` for unmatched authorities _before_ any upstream connect.
 
 - [ ] **Step 4: Wire `bind` + `serve_on` into `run` (interim — no browsers yet)**
 
@@ -1478,11 +1492,13 @@ git commit -m "Add CONNECT MITM proxy server with blind tunnel and local PAC rou
 Implements spec §9 and §4.2/§7.3.
 
 **Files:**
+
 - Create: `crates/trusted-server-cli/src/commands/dev/proxy/browser.rs`
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/mod.rs` (finalize `run`: `ca` dispatch before resolve + browser launch after bind)
 - Test: `browser.rs` (`#[cfg(test)]`) for PAC generation (pure)
 
 **Interfaces:**
+
 - Consumes: `RuleTable` (Task 2), `Browser` (Task 3), `CertAuthority::cert_path` (Task 4).
 - Produces:
   - `fn generate_pac(rules: &RuleTable, listen: SocketAddr) -> String`.
@@ -1610,8 +1626,9 @@ Expected: PASS.
 - [ ] **Step 5: Finalize `run` — `ca` dispatch before resolution, then bind → spawn → launch → await**
 
 Replace the interim `run` (Task 5 step 4) with the final version. Two ordering fixes are essential:
-- **`ca` subcommands must be handled *before* `config::resolve`** — `resolve` errors when no rewrite rule exists, but `ca path/install/uninstall/regenerate` are standalone (spec §4.2). Use `config::ca_dir(&args)`, which needs no rule.
-- **Bind the listener *before* launching browsers**, and keep the runtime alive by awaiting the server. Launching before the socket is bound would point browsers at a dead port; blocking on `serve_on` before launching would never reach the launch.
+
+- **`ca` subcommands must be handled _before_ `config::resolve`** — `resolve` errors when no rewrite rule exists, but `ca path/install/uninstall/regenerate` are standalone (spec §4.2). Use `config::ca_dir(&args)`, which needs no rule.
+- **Bind the listener _before_ launching browsers**, and keep the runtime alive by awaiting the server. Launching before the socket is bound would point browsers at a dead port; blocking on `serve_on` before launching would never reach the launch.
 
 ```rust
 pub fn run(args: ProxyArgs) -> error_stack::Result<(), ProxyError> {
@@ -1679,10 +1696,12 @@ git commit -m "Add browser orchestration, PAC generation, and ca trust subcomman
 Implements spec §10.2. Lets `ts dev proxy` (and lone `--to`/`--from`) resolve a rule from `trusted-server.toml`.
 
 **Files:**
+
 - Modify: `crates/trusted-server-cli/src/commands/dev/proxy/config.rs`
 - Test: same file
 
 **Interfaces:**
+
 - Produces: `fn infer_from_host() -> Option<String>` (reads `publisher.domain` from `trusted-server.toml` in the CWD), `fn infer_to_host() -> Option<String>` (reads `[dev_proxy].upstream`). `build_rules` is extended so a lone `--to` pairs with the inferred FROM and zero-arg pairs both.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1724,6 +1743,7 @@ git commit -m "Infer dev-proxy rule from trusted-server.toml for zero-arg use"
 Implements spec §15 step 8.
 
 **Files:**
+
 - Create: `docs/guide/ts-dev-proxy.md`
 
 **Interfaces:** none (docs only).
@@ -1747,6 +1767,7 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 ## Self-Review
 
 **Spec coverage:**
+
 - §3 decisions → Tasks 1–6 (crate exclude, default Host=FROM, blind tunnel, non-loopback). ✓
 - §4 CLI surface + §4.2 ca subcommands → Task 1 (args), Task 6 (`ca`). ✓
 - §5 architecture/flow (200-ordering, blind tunnel, keep-alive loop, Upgrade close, local routes) → Task 5. ✓
@@ -1765,7 +1786,7 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 
 **Type consistency:** `Authority::{host,host_with_port,is_default_port}` (now scheme-relative via the stored `default_port`), `RuleTable::first_match`, `rewrite_for → RewriteOutcome{sni,host_header,orig_host,scheme_is_tls}`, `ResolvedConfig`, `config::ca_dir`, `CertAuthority::{load_or_generate,server_config,cert_path}`, `server::{bind,serve_on}`, `Browser::parse_list`, `generate_pac` are used consistently across tasks.
 
-**Review-round fixes (2026-06-22):** (1) crate is a **lib + bin** so integration tests reach internal modules; (2) `ca` subcommands resolve via `config::ca_dir` *before* rule resolution; (3) `run` binds the listener, spawns `serve_on`, launches browsers via `spawn_blocking`, then awaits the server — correct ordering and the runtime stays alive; (4) `Authority` stores its scheme `default_port` so `:80`/`:443` are kept/omitted per scheme.
+**Review-round fixes (2026-06-22):** (1) crate is a **lib + bin** so integration tests reach internal modules; (2) `ca` subcommands resolve via `config::ca_dir` _before_ rule resolution; (3) `run` binds the listener, spawns `serve_on`, launches browsers via `spawn_blocking`, then awaits the server — correct ordering and the runtime stays alive; (4) `Authority` stores its scheme `default_port` so `:80`/`:443` are kept/omitted per scheme.
 
 **Second review round (2026-06-22):** (6) `ca` is a **nested** subcommand (`ProxySub::Ca { action }`) so the path is `ts dev proxy ca <action>`, not `ts dev proxy <action>`; (7) `ca path`/`ca install` call `load_or_generate` first so a fresh machine works before any proxy run; (8) `default_ca_dir` builds `…/trusted-server/dev-proxy` from `XDG_DATA_HOME`/`BaseDirs` (not `ProjectDirs`, which yields a reverse-DNS leaf); (9) CA validity is ~10 years and the leaf ≤ 90 days, both `now`-relative via `time`; (10) the blind-tunnel and basic-auth E2E tests have real assertions, plus a new keep-alive/sequential-request test.
 

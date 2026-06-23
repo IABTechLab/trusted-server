@@ -93,17 +93,17 @@ satisfies **HSTS**, which an "ignored" cert does not.
 
 Resolved during brainstorming and design review (2026-06-22):
 
-| Decision | Choice |
-|---|---|
-| Browser scope | **All three** (Chrome, Firefox, Safari) in v1 via a CA. |
-| CA provenance | **Generated per-machine on first run**, stored in the user data dir (`--ca-dir`), key `0600`; **never committed**. Trust once per machine. |
-| Browser launch | `--launch` takes a **list** and has **no default** — if unset, just run the proxy (no browser). Each listed browser is launched and configured against the proxy. |
-| Safari proxy | Best-effort system PAC via `networksetup`, **restored on exit**; falls back to printed instructions. |
-| Transport | HTTP/1.1 both legs in v1 (h2 deferred). |
-| Bind | Loopback only by default; non-loopback requires `--allow-non-loopback` and disables blind tunnel/forward, so it can't become an open proxy (§11). |
-| Crate wiring | **Excluded** from the workspace (like `integration-tests`), *not* a non-default member — the repo pins the build target to `wasm32-wasip1` and this binary is native (§6). |
-| Default `Host` | `Host = FROM` (preserve the production host) — required because TS core anchors URL rewriting to the inbound `Host`. `--rewrite-host` sends `Host = TO` for upstreams that route/validate on their own host. `X-Orig-Host` is informational (§8.3). |
-| Unmatched hosts | **Blind-tunnel**, decided from the CONNECT authority before terminating TLS; only matched hosts are MITM'd (§5, §11). |
+| Decision        | Choice                                                                                                                                                                                                                                              |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Browser scope   | **All three** (Chrome, Firefox, Safari) in v1 via a CA.                                                                                                                                                                                             |
+| CA provenance   | **Generated per-machine on first run**, stored in the user data dir (`--ca-dir`), key `0600`; **never committed**. Trust once per machine.                                                                                                          |
+| Browser launch  | `--launch` takes a **list** and has **no default** — if unset, just run the proxy (no browser). Each listed browser is launched and configured against the proxy.                                                                                   |
+| Safari proxy    | Best-effort system PAC via `networksetup`, **restored on exit**; falls back to printed instructions.                                                                                                                                                |
+| Transport       | HTTP/1.1 both legs in v1 (h2 deferred).                                                                                                                                                                                                             |
+| Bind            | Loopback only by default; non-loopback requires `--allow-non-loopback` and disables blind tunnel/forward, so it can't become an open proxy (§11).                                                                                                   |
+| Crate wiring    | **Excluded** from the workspace (like `integration-tests`), _not_ a non-default member — the repo pins the build target to `wasm32-wasip1` and this binary is native (§6).                                                                          |
+| Default `Host`  | `Host = FROM` (preserve the production host) — required because TS core anchors URL rewriting to the inbound `Host`. `--rewrite-host` sends `Host = TO` for upstreams that route/validate on their own host. `X-Orig-Host` is informational (§8.3). |
+| Unmatched hosts | **Blind-tunnel**, decided from the CONNECT authority before terminating TLS; only matched hosts are MITM'd (§5, §11).                                                                                                                               |
 
 ---
 
@@ -115,20 +115,20 @@ ts dev proxy [OPTIONS]
 
 ### 4.1 Options
 
-| Flag | Value | Default | Description |
-|---|---|---|---|
-| `--map` | `FROM=TO` (repeatable) | — | Rewrite rule: requests to `FROM` are served from `TO`. |
-| `-f, --from` | `HOST` | — | Shorthand for a single rule's `FROM`. Optional when `FROM` is inferable from config (§10.2). |
-| `-t, --to` | `HOST[:PORT]` | — | Shorthand for a single rule's `TO`. Combines with `--from`, or with the inferred publisher domain when `--from` is omitted. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3). |
-| `--listen` | `ADDR` | `127.0.0.1:8080` | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set. |
-| `--allow-non-loopback` | flag | false | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11). |
-| `--launch` | `chrome,firefox,safari` \| `all` | _unset_ | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser). |
-| `--rewrite-host` | flag | false | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3). |
-| `--basic-auth` | `USER:PASS` | — | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`. |
-| `--basic-auth-file` | `PATH` | — | Read `USER:PASS` from a file (preferred over `--basic-auth`). |
-| `--insecure` | flag | false | Skip **upstream** certificate verification. |
-| `--upstream-plaintext` | flag | false | Connect to upstream over HTTP (e.g. `localhost:3000`). |
-| `--ca-dir` | `PATH` | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run). |
+| Flag                   | Value                            | Default                                                                                                     | Description                                                                                                                                                                                                |
+| ---------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                     |
+| `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Optional when `FROM` is inferable from config (§10.2).                                                                                                               |
+| `-t, --to`             | `HOST[:PORT]`                    | —                                                                                                           | Shorthand for a single rule's `TO`. Combines with `--from`, or with the inferred publisher domain when `--from` is omitted. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3). |
+| `--listen`             | `ADDR`                           | `127.0.0.1:8080`                                                                                            | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                    |
+| `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11).     |
+| `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                           |
+| `--rewrite-host`       | flag                             | false                                                                                                       | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3).                                                                                                                                     |
+| `--basic-auth`         | `USER:PASS`                      | —                                                                                                           | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`.                                                                 |
+| `--basic-auth-file`    | `PATH`                           | —                                                                                                           | Read `USER:PASS` from a file (preferred over `--basic-auth`).                                                                                                                                              |
+| `--insecure`           | flag                             | false                                                                                                       | Skip **upstream** certificate verification.                                                                                                                                                                |
+| `--upstream-plaintext` | flag                             | false                                                                                                       | Connect to upstream over HTTP (e.g. `localhost:3000`).                                                                                                                                                     |
+| `--ca-dir`             | `PATH`                           | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run).                                                                                                                                     |
 
 ### 4.2 Companion subcommands
 
@@ -289,7 +289,7 @@ struct CertAuthority {
 - **Mint** a leaf per **matched** CONNECT host (unmatched hosts are blind-tunneled
   and never get a leaf — §5): `subject_alt_name = [host]`, short validity
   (≤ 90 days), signed by `issuer`; wrap in a `rustls::ServerConfig` (ALPN
-  `http/1.1`); cache keyed by host. Sign *outside* the cache lock and
+  `http/1.1`); cache keyed by host. Sign _outside_ the cache lock and
   double-check before insert so concurrent first-time hosts don't serialize on
   the signing work. (An IP-literal host needs an IP-type SAN, not DNS.)
 - **Acceptor selection:** the CONNECT handler knows the host and selects the
@@ -343,16 +343,16 @@ are instead refused with `403` (§11), never blind-tunneled.
 
 ### 8.3 Header rewriting on match
 
-| Header | Action | Rationale |
-|---|---|---|
-| upstream connection + **SNI** | `rule.to` **host only** (port stripped) | SNI is a bare hostname; a `:port` in SNI is invalid and breaks the handshake |
-| `Host` | `rule.from` (default) or `rule.to` if `--rewrite-host` | TS core anchors URL rewriting to the inbound `Host`; preserving `FROM` keeps rewritten URLs on the production domain (see caveats) |
-| `X-Orig-Host` | `rule.from` | informational record of the real first-party host (see caveat) |
-| `Authorization` | set if `--basic-auth` and not already present | clear `401` gates on staging upstreams |
-| `Proxy-Connection` | removed | hop-by-hop hygiene |
+| Header                        | Action                                                 | Rationale                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| upstream connection + **SNI** | `rule.to` **host only** (port stripped)                | SNI is a bare hostname; a `:port` in SNI is invalid and breaks the handshake                                                       |
+| `Host`                        | `rule.from` (default) or `rule.to` if `--rewrite-host` | TS core anchors URL rewriting to the inbound `Host`; preserving `FROM` keeps rewritten URLs on the production domain (see caveats) |
+| `X-Orig-Host`                 | `rule.from`                                            | informational record of the real first-party host (see caveat)                                                                     |
+| `Authorization`               | set if `--basic-auth` and not already present          | clear `401` gates on staging upstreams                                                                                             |
+| `Proxy-Connection`            | removed                                                | hop-by-hop hygiene                                                                                                                 |
 
 **Why `Host = FROM` is the default (resolved).** The §1 goal — validate cookies,
-`Host`-sensitive logic, CMP/consent, and first-party context at the *real*
+`Host`-sensitive logic, CMP/consent, and first-party context at the _real_
 domain — requires the upstream to see `Host = FROM`. Trusted Server core derives
 `request_host` from the inbound `Host` (`RequestInfo::from_request` in
 `http_util.rs`) and anchors all HTML/RSC URL rewriting to it
@@ -370,7 +370,7 @@ dev service. For those upstreams, pass `--rewrite-host` (sends `Host = TO`) or a
 the domain to the service.
 
 `X-Orig-Host: FROM` is still sent for upstreams that opt to honor it, but it is
-**informational only**: TS core does not read it today and in fact *strips*
+**informational only**: TS core does not read it today and in fact _strips_
 spoofable forwarded host headers (`X-Forwarded-Host`, etc.) as an anti-spoofing
 measure. Reconcile any future trusted-`X-Orig-Host` contract with the existing
 `publisher.origin_host_header_override` knob. **Validation:** an integration test
@@ -397,7 +397,7 @@ applies no rewrite rules. Full absolute-form plain-HTTP rewriting is future work
 
 **Local routes.** Origin-form requests addressed to the proxy's **own** listen
 address — notably `GET /proxy.pac` for Safari (§9) — are served locally and never
-forwarded. The listener dispatches these *before* proxy handling: a request is
+forwarded. The listener dispatches these _before_ proxy handling: a request is
 proxy traffic only if it is `CONNECT` or absolute-form; an origin-form request to
 a local route (`/proxy.pac`, a health check) is answered directly. On a
 non-loopback bind (§11), blind-forwarding is disabled, so only `CONNECT` to
@@ -412,20 +412,20 @@ without launching any browser. When set, each listed browser is launched in a
 throwaway/temporary profile configured against the proxy, opening the first
 rule's `FROM` URL.
 
-| Browser | Launch + configure | Trust |
-|---|---|---|
-| **chrome** | temp `--user-data-dir`, `--proxy-server="https=127.0.0.1:<port>"` (per-scheme — **HTTPS only**, plain HTTP stays direct), `--no-first-run`, open URL | local CA via OS keychain (`ca install`) |
+| Browser     | Launch + configure                                                                                                                                                                                                                 | Trust                                                                                                                                                                                                                                               |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **chrome**  | temp `--user-data-dir`, `--proxy-server="https=127.0.0.1:<port>"` (per-scheme — **HTTPS only**, plain HTTP stays direct), `--no-first-run`, open URL                                                                               | local CA via OS keychain (`ca install`)                                                                                                                                                                                                             |
 | **firefox** | temp profile `user.js` (not `prefs.js`, which Firefox owns and rewrites): `network.proxy.type=1` + **`network.proxy.ssl` host+port only** (leave `network.proxy.http` unset, so plain HTTP stays direct); `firefox -profile <tmp>` | Import the CA into the profile's NSS DB with `certutil -A` (robust, no sudo). `security.enterprise_roots.enabled=true` is unreliable on macOS — it reads the **admin/System** keychain, not the login keychain — so NSS import is the primary path. |
-| **safari** | no per-app proxy: best-effort, **system-wide** `networksetup -setautoproxyurl <service>` on the active service, scoped to `FROM` via the PAC; open URL; **restore prior setting on exit** | local CA via macOS keychain (`ca install`) |
+| **safari**  | no per-app proxy: best-effort, **system-wide** `networksetup -setautoproxyurl <service>` on the active service, scoped to `FROM` via the PAC; open URL; **restore prior setting on exit**                                          | local CA via macOS keychain (`ca install`)                                                                                                                                                                                                          |
 
 PAC (Safari/system scoping) sends only `FROM` hosts to the proxy, everything
 else `DIRECT`:
 
 ```javascript
 function FindProxyForURL(url, host) {
-  if (url.substring(0, 6) == "https:" && host == "www.example-publisher.com")
-    return "PROXY 127.0.0.1:8080";
-  return "DIRECT";
+  if (url.substring(0, 6) == 'https:' && host == 'www.example-publisher.com')
+    return 'PROXY 127.0.0.1:8080'
+  return 'DIRECT'
 }
 ```
 
@@ -526,7 +526,7 @@ overrides. Every setting is a CLI flag (§4); the only file inputs are
 - **Production credentials reach `TO`.** With the default `Host = FROM`, the
   browser attaches the production hostname's cookies and any existing
   `Authorization` for `FROM`, and the proxy forwards them to `TO` — and injected
-  `--basic-auth` is *skipped* when an `Authorization` is already present (§8.3).
+  `--basic-auth` is _skipped_ when an `Authorization` is already present (§8.3).
   Point `TO` only at a dev/staging upstream you control. Launched **temp
   profiles** start with no real cookies, so prefer `--launch` over running the
   proxy against your everyday browser profile; for manual use, treat `TO` as
@@ -542,16 +542,16 @@ overrides. Every setting is a CLI flag (§4); the only file inputs are
 
 ## 12. Constants and Defaults
 
-| Name | Value |
-|---|---|
-| Default listen | `127.0.0.1:8080` |
-| Default `--launch` | _unset_ (proxy only) |
-| CA storage dir | `$XDG_DATA_HOME/trusted-server/dev-proxy/{ca-cert.pem,ca-key.pem}` (macOS: `~/Library/Application Support/…`; dir `0700`, key `0600`) |
-| CA CN | `Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION` |
-| Leaf validity | ≤ 90 days |
-| ALPN (both legs) | `http/1.1` |
-| Injected real-host header | `X-Orig-Host` |
-| Upstream port (default) | `443` (`80` with `--upstream-plaintext`) |
+| Name                      | Value                                                                                                                                 |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Default listen            | `127.0.0.1:8080`                                                                                                                      |
+| Default `--launch`        | _unset_ (proxy only)                                                                                                                  |
+| CA storage dir            | `$XDG_DATA_HOME/trusted-server/dev-proxy/{ca-cert.pem,ca-key.pem}` (macOS: `~/Library/Application Support/…`; dir `0700`, key `0600`) |
+| CA CN                     | `Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION`                                                                       |
+| Leaf validity             | ≤ 90 days                                                                                                                             |
+| ALPN (both legs)          | `http/1.1`                                                                                                                            |
+| Injected real-host header | `X-Orig-Host`                                                                                                                         |
+| Upstream port (default)   | `443` (`80` with `--upstream-plaintext`)                                                                                              |
 
 ---
 
@@ -559,15 +559,15 @@ overrides. Every setting is a CLI flag (§4); the only file inputs are
 
 `error-stack` with actionable messages mapped to the failures we actually hit:
 
-| Condition | Detection | Message guidance |
-|---|---|---|
-| Upstream TLS `unrecognized_name` | rustls alert on connect | "`TO` has no TLS cert for its SNI — verify the domain is provisioned on the upstream Fastly service." |
-| Upstream `401` | response status | "Upstream is gated; pass `--basic-auth user:pass`." |
-| Upstream `503` / connect refused | response/IO | "Upstream unreachable or backend unhealthy; check the service and its origin healthcheck." |
-| CA not trusted (browser warning) | n/a (browser-side) | Surface `ca install` / Firefox-profile note in the run banner. |
-| Listen addr in use | bind error | Suggest `--listen` with another port. |
-| Upstream "unknown domain" | `404` / Fastly error body | "The default `Host = FROM` isn't a domain the `TO` service accepts. Use a TS Compute upstream (routes by SNI), pass `--rewrite-host` to send `Host = TO`, or add the domain to the upstream service." |
-| `Upgrade:` / WebSocket on a matched host | request `Upgrade` header | "Upgrades aren't proxied in v1 (§16); the connection is closed with a logged note." |
+| Condition                                | Detection                 | Message guidance                                                                                                                                                                                      |
+| ---------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Upstream TLS `unrecognized_name`         | rustls alert on connect   | "`TO` has no TLS cert for its SNI — verify the domain is provisioned on the upstream Fastly service."                                                                                                 |
+| Upstream `401`                           | response status           | "Upstream is gated; pass `--basic-auth user:pass`."                                                                                                                                                   |
+| Upstream `503` / connect refused         | response/IO               | "Upstream unreachable or backend unhealthy; check the service and its origin healthcheck."                                                                                                            |
+| CA not trusted (browser warning)         | n/a (browser-side)        | Surface `ca install` / Firefox-profile note in the run banner.                                                                                                                                        |
+| Listen addr in use                       | bind error                | Suggest `--listen` with another port.                                                                                                                                                                 |
+| Upstream "unknown domain"                | `404` / Fastly error body | "The default `Host = FROM` isn't a domain the `TO` service accepts. Use a TS Compute upstream (routes by SNI), pass `--rewrite-host` to send `Host = TO`, or add the domain to the upstream service." |
+| `Upgrade:` / WebSocket on a matched host | request `Upgrade` header  | "Upgrades aren't proxied in v1 (§16); the connection is closed with a logged note."                                                                                                                   |
 
 Per-request errors become a `502` with a short diagnostic body plus a logged
 line; the accept loop continues. The process never panics on a single bad
