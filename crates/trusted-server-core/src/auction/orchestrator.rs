@@ -6,11 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformPendingRequest, RuntimeServices};
+use crate::platform::PlatformPendingRequest;
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
-use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
+use super::types::{
+    AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, ProviderErrorType,
+};
 
 /// In-flight auction requests dispatched to SSP backends.
 ///
@@ -54,11 +56,6 @@ impl DispatchedAuction {
 
 const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 
-const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
-const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
-const ERROR_TYPE_TRANSPORT: &str = "transport";
-const ERROR_TYPE_TIMEOUT: &str = "timeout";
-
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
 // ProviderSummary.metadata["message"]. Providers MUST NOT interpolate
@@ -77,17 +74,17 @@ fn provider_error_message(error: &Report<TrustedServerError>) -> String {
 fn provider_error_response(
     provider_name: &str,
     response_time_ms: u64,
-    error_type: &str,
+    error_type: ProviderErrorType,
     error: &Report<TrustedServerError>,
 ) -> AuctionResponse {
     AuctionResponse::error(provider_name, response_time_ms)
-        .with_metadata("error_type", serde_json::json!(error_type))
+        .with_error_type(error_type)
         .with_metadata("message", serde_json::json!(provider_error_message(error)))
 }
 
 fn provider_launch_failed_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
     AuctionResponse::error(provider_name, response_time_ms)
-        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_LAUNCH_FAILED))
+        .with_error_type(ProviderErrorType::LaunchFailed)
         .with_metadata("message", serde_json::json!("Provider launch failed"))
 }
 
@@ -99,32 +96,35 @@ fn provider_transport_failed_response(
     response_time_ms: u64,
 ) -> AuctionResponse {
     AuctionResponse::error(provider_name, response_time_ms)
-        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
+        .with_error_type(ProviderErrorType::Transport)
         .with_metadata("message", serde_json::json!("Provider request failed"))
 }
 
 fn provider_timeout_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
     AuctionResponse::error(provider_name, response_time_ms)
-        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TIMEOUT))
+        .with_error_type(ProviderErrorType::Timeout)
         .with_metadata("message", serde_json::json!("Provider request timed out"))
 }
 
-fn append_transport_failures_from_dispatched(
+fn append_drained_provider_responses<N, P>(
     responses: &mut Vec<AuctionResponse>,
-    backend_to_provider: &mut HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
-) {
+    backend_to_provider: &mut HashMap<String, (N, Instant, P)>,
+    make_response: fn(&str, u64) -> AuctionResponse,
+) where
+    N: AsRef<str>,
+{
     let mut failures: Vec<(String, u64)> = backend_to_provider
         .drain()
         .map(|(_, (provider_name, start_time, _))| {
-            (provider_name, start_time.elapsed().as_millis() as u64)
+            (
+                provider_name.as_ref().to_string(),
+                start_time.elapsed().as_millis() as u64,
+            )
         })
         .collect();
     failures.sort_by(|left, right| left.0.cmp(&right.0));
     for (provider_name, response_time_ms) in failures {
-        responses.push(provider_transport_failed_response(
-            &provider_name,
-            response_time_ms,
-        ));
+        responses.push(make_response(&provider_name, response_time_ms));
     }
 }
 
@@ -538,19 +538,11 @@ impl AuctionOrchestrator {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("select() failed: {:?}", e);
-                    let mut failures: Vec<(&str, u64)> = backend_to_provider
-                        .drain()
-                        .map(|(_, (provider_name, start_time, _))| {
-                            (provider_name, start_time.elapsed().as_millis() as u64)
-                        })
-                        .collect();
-                    failures.sort_by(|left, right| left.0.cmp(right.0));
-                    for (provider_name, response_time_ms) in failures {
-                        responses.push(provider_transport_failed_response(
-                            provider_name,
-                            response_time_ms,
-                        ));
-                    }
+                    append_drained_provider_responses(
+                        &mut responses,
+                        &mut backend_to_provider,
+                        provider_transport_failed_response,
+                    );
                     break;
                 }
             };
@@ -597,7 +589,7 @@ impl AuctionOrchestrator {
                                 responses.push(provider_error_response(
                                     provider_name,
                                     response_time_ms,
-                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    ProviderErrorType::ParseResponse,
                                     &e,
                                 ));
                             }
@@ -644,16 +636,11 @@ impl AuctionOrchestrator {
                     "Auction timeout reached; dropping {} remaining request(s)",
                     remaining.len()
                 );
-                let mut timeouts: Vec<(&str, u64)> = backend_to_provider
-                    .drain()
-                    .map(|(_, (provider_name, start_time, _))| {
-                        (provider_name, start_time.elapsed().as_millis() as u64)
-                    })
-                    .collect();
-                timeouts.sort_by(|left, right| left.0.cmp(right.0));
-                for (provider_name, response_time_ms) in timeouts {
-                    responses.push(provider_timeout_response(provider_name, response_time_ms));
-                }
+                append_drained_provider_responses(
+                    &mut responses,
+                    &mut backend_to_provider,
+                    provider_timeout_response,
+                );
                 break;
             }
         }
@@ -663,19 +650,11 @@ impl AuctionOrchestrator {
                 "{} provider request(s) were not accounted for after select loop; marking as transport failures",
                 backend_to_provider.len()
             );
-            let mut failures: Vec<(&str, u64)> = backend_to_provider
-                .drain()
-                .map(|(_, (provider_name, start_time, _))| {
-                    (provider_name, start_time.elapsed().as_millis() as u64)
-                })
-                .collect();
-            failures.sort_by(|left, right| left.0.cmp(right.0));
-            for (provider_name, response_time_ms) in failures {
-                responses.push(provider_transport_failed_response(
-                    provider_name,
-                    response_time_ms,
-                ));
-            }
+            append_drained_provider_responses(
+                &mut responses,
+                &mut backend_to_provider,
+                provider_transport_failed_response,
+            );
         }
 
         Ok(responses)
@@ -943,7 +922,6 @@ impl AuctionOrchestrator {
     pub async fn collect_dispatched_auction(
         &self,
         dispatched: DispatchedAuction,
-        services: &RuntimeServices,
         context: &AuctionContext<'_>,
     ) -> OrchestrationResult {
         let DispatchedAuction {
@@ -967,7 +945,8 @@ impl AuctionOrchestrator {
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
-            let select_result = match services
+            let select_result = match context
+                .services
                 .http_client()
                 .select(remaining)
                 .await
@@ -977,9 +956,10 @@ impl AuctionOrchestrator {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("select() failed during auction collection: {:?}", e);
-                    append_transport_failures_from_dispatched(
+                    append_drained_provider_responses(
                         &mut responses,
                         &mut backend_to_provider,
+                        provider_transport_failed_response,
                     );
                     break;
                 }
@@ -1017,7 +997,7 @@ impl AuctionOrchestrator {
                                 responses.push(provider_error_response(
                                     &provider_name,
                                     response_time_ms,
-                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    ProviderErrorType::ParseResponse,
                                     &e,
                                 ));
                             }
@@ -1070,172 +1050,23 @@ impl AuctionOrchestrator {
                 "{} dispatched provider request(s) were not accounted for after collection; marking as transport failures",
                 backend_to_provider.len()
             );
-            append_transport_failures_from_dispatched(&mut responses, &mut backend_to_provider);
+            append_drained_provider_responses(
+                &mut responses,
+                &mut backend_to_provider,
+                provider_transport_failed_response,
+            );
         }
 
-        let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
-            match self.providers.get(mediator_name.as_str()) {
-                Some(mediator) => {
-                    // Cap the mediator at whichever is tighter: its own configured
-                    // timeout or the remaining auction budget (A_deadline).  The old
-                    // comment here claimed origin drain could exhaust the budget before
-                    // collection, but SSP backends are given first_byte_timeout =
-                    // effective_timeout (capped at their provider timeout) at dispatch
-                    // time, so they cannot run past A_deadline independently.  Giving
-                    // the mediator an uncapped timeout lets it run past A_deadline,
-                    // violating the bounded hold invariant.
-                    let remaining = remaining_budget_ms(auction_start, timeout_ms);
-                    if remaining == 0 {
-                        log::warn!(
-                            "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
-                            mediator.provider_name(),
-                            responses.len(),
-                        );
-                        let winning = self.select_winning_bids(&responses, &floor_prices);
-                        let total_time_ms = auction_start.elapsed().as_millis() as u64;
-                        return OrchestrationResult {
-                            provider_responses: responses,
-                            mediator_response: Some(provider_timeout_response(
-                                mediator.provider_name(),
-                                total_time_ms,
-                            )),
-                            winning_bids: winning,
-                            total_time_ms,
-                            metadata: HashMap::new(),
-                        };
-                    }
-                    let mediator_timeout = remaining.min(mediator.timeout_ms());
-                    let mediator_start = Instant::now();
-                    log::info!(
-                        "Running mediator '{}' with {}ms budget (A_deadline remaining: {}ms, configured: {}ms)",
-                        mediator.provider_name(),
-                        mediator_timeout,
-                        remaining,
-                        mediator.timeout_ms(),
-                    );
-                    // The mediator runs on the collect path. See the doc-comment on
-                    // `AuctionContext::request`: the real client request was already
-                    // consumed by `send_async` during dispatch, so we substitute a
-                    // canonical placeholder URL. Any future mediator that needs real
-                    // client headers must snapshot them at dispatch time onto
-                    // `DispatchedAuction` rather than reading `context.request` here.
-                    let placeholder = http::Request::builder()
-                        .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
-                        .body(edgezero_core::body::Body::empty())
-                        .unwrap_or_else(|_| http::Request::new(edgezero_core::body::Body::empty()));
-                    let mediator_context = AuctionContext {
-                        settings: context.settings,
-                        request: &placeholder,
-                        timeout_ms: mediator_timeout,
-                        provider_responses: Some(&responses),
-                        services: context.services,
-                    };
-                    match mediator.request_bids(&request, &mediator_context).await {
-                        Ok(pending) => {
-                            let platform_resp = services.http_client().wait(pending).await;
-                            match platform_resp.change_context(TrustedServerError::Auction {
-                                message: format!(
-                                    "Mediator {} request failed",
-                                    mediator.provider_name()
-                                ),
-                            }) {
-                                Ok(platform_resp) => {
-                                    let response_time_ms =
-                                        mediator_start.elapsed().as_millis() as u64;
-                                    // Mirror run_parallel_mediation: use the
-                                    // context-aware parse so the mediator sees
-                                    // the collected provider responses.
-                                    match mediator
-                                        .parse_response_with_context(
-                                            platform_resp,
-                                            response_time_ms,
-                                            &mediator_context,
-                                        )
-                                        .await
-                                    {
-                                        Ok(mediator_resp) => {
-                                            let winning = mediator_resp
-                                                .bids
-                                                .iter()
-                                                .filter_map(|bid| {
-                                                    if bid.price.is_none() {
-                                                        log::warn!(
-                                                            "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
-                                                            mediator.provider_name(),
-                                                            bid.slot_id
-                                                        );
-                                                        None
-                                                    } else {
-                                                        Some((bid.slot_id.clone(), bid.clone()))
-                                                    }
-                                                })
-                                                .collect();
-                                            let winning =
-                                                self.apply_floor_prices(winning, &floor_prices);
-                                            (Some(mediator_resp), winning)
-                                        }
-                                        Err(e) => {
-                                            log::warn!(
-                                                "Mediator '{}' parse failed: {:?}",
-                                                mediator.provider_name(),
-                                                e
-                                            );
-                                            let response_time_ms =
-                                                mediator_start.elapsed().as_millis() as u64;
-                                            let mediator_response = provider_error_response(
-                                                mediator.provider_name(),
-                                                response_time_ms,
-                                                ERROR_TYPE_PARSE_RESPONSE,
-                                                &e,
-                                            );
-                                            let winning =
-                                                self.select_winning_bids(&responses, &floor_prices);
-                                            (Some(mediator_response), winning)
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let response_time_ms =
-                                        mediator_start.elapsed().as_millis() as u64;
-                                    log::warn!("Mediator request failed: {:?}", e);
-                                    (
-                                        Some(provider_transport_failed_response(
-                                            mediator.provider_name(),
-                                            response_time_ms,
-                                        )),
-                                        self.select_winning_bids(&responses, &floor_prices),
-                                    )
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
-                            log::warn!(
-                                "Mediator '{}' failed to dispatch: {:?}",
-                                mediator.provider_name(),
-                                e
-                            );
-                            (
-                                Some(provider_launch_failed_response(
-                                    mediator.provider_name(),
-                                    response_time_ms,
-                                )),
-                                self.select_winning_bids(&responses, &floor_prices),
-                            )
-                        }
-                    }
-                }
-                None => {
-                    log::warn!("Mediator '{}' not registered", mediator_name);
-                    (
-                        Some(provider_launch_failed_response(mediator_name, 0)),
-                        self.select_winning_bids(&responses, &floor_prices),
-                    )
-                }
-            }
-        } else {
-            (None, self.select_winning_bids(&responses, &floor_prices))
-        };
+        let (mediator_response, winning_bids) = self
+            .run_dispatched_mediator(
+                &responses,
+                &floor_prices,
+                &request,
+                auction_start,
+                timeout_ms,
+                context,
+            )
+            .await;
 
         OrchestrationResult {
             provider_responses: responses,
@@ -1243,6 +1074,165 @@ impl AuctionOrchestrator {
             winning_bids,
             total_time_ms: auction_start.elapsed().as_millis() as u64,
             metadata: HashMap::new(),
+        }
+    }
+
+    async fn run_dispatched_mediator(
+        &self,
+        responses: &[AuctionResponse],
+        floor_prices: &HashMap<String, f64>,
+        request: &AuctionRequest,
+        auction_start: Instant,
+        timeout_ms: u32,
+        context: &AuctionContext<'_>,
+    ) -> (Option<AuctionResponse>, HashMap<String, Bid>) {
+        let Some(mediator_name) = self.config.mediator.as_deref() else {
+            return (None, self.select_winning_bids(responses, floor_prices));
+        };
+
+        let Some(mediator) = self.providers.get(mediator_name) else {
+            log::warn!("Mediator '{}' not registered", mediator_name);
+            return (
+                Some(provider_launch_failed_response(mediator_name, 0)),
+                self.select_winning_bids(responses, floor_prices),
+            );
+        };
+
+        // Cap the mediator at whichever is tighter: its own configured timeout
+        // or the remaining auction budget (A_deadline). SSP backends are given
+        // first_byte_timeout = effective_timeout at dispatch time, so they
+        // cannot run past A_deadline independently; the mediator must also be
+        // capped to preserve the bounded hold invariant.
+        let remaining = remaining_budget_ms(auction_start, timeout_ms);
+        if remaining == 0 {
+            log::warn!(
+                "A_deadline exhausted before mediator '{}' — returning {} SSP bids without mediation",
+                mediator.provider_name(),
+                responses.len(),
+            );
+            return (
+                Some(provider_timeout_response(
+                    mediator.provider_name(),
+                    auction_start.elapsed().as_millis() as u64,
+                )),
+                self.select_winning_bids(responses, floor_prices),
+            );
+        }
+
+        let mediator_timeout = remaining.min(mediator.timeout_ms());
+        let mediator_start = Instant::now();
+        log::info!(
+            "Running mediator '{}' with {}ms budget (A_deadline remaining: {}ms, configured: {}ms)",
+            mediator.provider_name(),
+            mediator_timeout,
+            remaining,
+            mediator.timeout_ms(),
+        );
+
+        // The mediator runs on the collect path. See the doc-comment on
+        // `AuctionContext::request`: the real client request was already
+        // consumed by `send_async` during dispatch, so we substitute a canonical
+        // placeholder URL. Any future mediator that needs real client headers
+        // must snapshot them at dispatch time onto `DispatchedAuction` rather
+        // than reading `context.request` here.
+        let placeholder = http::Request::builder()
+            .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
+            .body(edgezero_core::body::Body::empty())
+            .unwrap_or_else(|_| http::Request::new(edgezero_core::body::Body::empty()));
+        let mediator_context = AuctionContext {
+            settings: context.settings,
+            request: &placeholder,
+            timeout_ms: mediator_timeout,
+            provider_responses: Some(responses),
+            services: context.services,
+        };
+
+        match mediator.request_bids(request, &mediator_context).await {
+            Ok(pending) => match context
+                .services
+                .http_client()
+                .wait(pending)
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: format!("Mediator {} request failed", mediator.provider_name()),
+                }) {
+                Ok(platform_resp) => {
+                    let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                    match mediator
+                        .parse_response_with_context(
+                            platform_resp,
+                            response_time_ms,
+                            &mediator_context,
+                        )
+                        .await
+                    {
+                        Ok(mediator_response) => {
+                            let winning = mediator_response
+                                .bids
+                                .iter()
+                                .filter_map(|bid| {
+                                    if bid.price.is_none() {
+                                        log::warn!(
+                                            "Mediator '{}' returned bid for slot '{}' without decoded price - skipping",
+                                            mediator.provider_name(),
+                                            bid.slot_id
+                                        );
+                                        None
+                                    } else {
+                                        Some((bid.slot_id.clone(), bid.clone()))
+                                    }
+                                })
+                                .collect();
+                            let winning = self.apply_floor_prices(winning, floor_prices);
+                            (Some(mediator_response), winning)
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Mediator '{}' parse failed: {:?}",
+                                mediator.provider_name(),
+                                e
+                            );
+                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                            let mediator_response = provider_error_response(
+                                mediator.provider_name(),
+                                response_time_ms,
+                                ProviderErrorType::ParseResponse,
+                                &e,
+                            );
+                            (
+                                Some(mediator_response),
+                                self.select_winning_bids(responses, floor_prices),
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                    log::warn!("Mediator request failed: {:?}", e);
+                    (
+                        Some(provider_transport_failed_response(
+                            mediator.provider_name(),
+                            response_time_ms,
+                        )),
+                        self.select_winning_bids(responses, floor_prices),
+                    )
+                }
+            },
+            Err(e) => {
+                let response_time_ms = mediator_start.elapsed().as_millis() as u64;
+                log::warn!(
+                    "Mediator '{}' failed to dispatch: {:?}",
+                    mediator.provider_name(),
+                    e
+                );
+                (
+                    Some(provider_launch_failed_response(
+                        mediator.provider_name(),
+                        response_time_ms,
+                    )),
+                    self.select_winning_bids(responses, floor_prices),
+                )
+            }
         }
     }
 
@@ -1710,8 +1700,12 @@ mod tests {
         })
         .attach("internal/source.rs:12:34");
 
-        let response =
-            super::provider_error_response("prebid", 37, super::ERROR_TYPE_PARSE_RESPONSE, &error);
+        let response = super::provider_error_response(
+            "prebid",
+            37,
+            super::ProviderErrorType::ParseResponse,
+            &error,
+        );
 
         assert_eq!(
             response.status,
@@ -2174,7 +2168,7 @@ mod tests {
             .expect("should dispatch at least one provider");
 
         let result = orchestrator
-            .collect_dispatched_auction(dispatched, services, &context)
+            .collect_dispatched_auction(dispatched, &context)
             .await;
 
         let launch = result
@@ -2249,7 +2243,7 @@ mod tests {
             .expect("should dispatch providers");
 
         let result = orchestrator
-            .collect_dispatched_auction(dispatched, services, &context)
+            .collect_dispatched_auction(dispatched, &context)
             .await;
 
         let transport = result

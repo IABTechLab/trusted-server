@@ -9,7 +9,7 @@ use crate::auction::telemetry::types::{
     AuctionEventRow, AuctionObservationContext, ProviderCallOutcome, ProviderCallStatus,
     ProviderRole, TerminalOutcome, TerminalStatus,
 };
-use crate::auction::types::{AuctionResponse, BidStatus};
+use crate::auction::types::{AuctionResponse, BidStatus, ProviderErrorType};
 
 /// Build one provider-call outcome per provider response, plus one for the
 /// mediator when a mediator response is present.
@@ -38,23 +38,19 @@ fn provider_call_outcome(response: &AuctionResponse, role: ProviderRole) -> Prov
 }
 
 /// Classify a response into a provider-call status. For `Error`, read the
-/// orchestrator's `error_type` metadata; an unrecognized or absent value falls
-/// back to `TransportError`.
+/// orchestrator's provider error type metadata; an unrecognized or absent value
+/// falls back to `TransportError`.
 fn provider_call_status(response: &AuctionResponse) -> ProviderCallStatus {
     match response.status {
         BidStatus::Success => ProviderCallStatus::Success,
         BidStatus::NoBid => ProviderCallStatus::NoBid,
         BidStatus::Pending => ProviderCallStatus::Timeout,
-        BidStatus::Error => match response
-            .metadata
-            .get("error_type")
-            .and_then(|value| value.as_str())
-        {
-            Some("launch_failed") => ProviderCallStatus::LaunchError,
-            Some("parse_response") => ProviderCallStatus::ParseError,
-            Some("transport") => ProviderCallStatus::TransportError,
-            Some("timeout") => ProviderCallStatus::Timeout,
-            _ => ProviderCallStatus::TransportError,
+        BidStatus::Error => match response.provider_error_type() {
+            Some(ProviderErrorType::LaunchFailed) => ProviderCallStatus::LaunchError,
+            Some(ProviderErrorType::ParseResponse) => ProviderCallStatus::ParseError,
+            Some(ProviderErrorType::Transport) => ProviderCallStatus::TransportError,
+            Some(ProviderErrorType::Timeout) => ProviderCallStatus::Timeout,
+            None => ProviderCallStatus::TransportError,
         },
     }
 }
@@ -137,7 +133,10 @@ mod tests {
     ) -> AuctionResponse {
         let mut metadata = HashMap::new();
         if let Some(kind) = error_type {
-            metadata.insert("error_type".to_string(), serde_json::json!(kind));
+            metadata.insert(
+                ProviderErrorType::METADATA_KEY.to_string(),
+                serde_json::json!(kind),
+            );
         }
         AuctionResponse {
             provider: provider.to_string(),

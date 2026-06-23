@@ -526,7 +526,6 @@ pub async fn stream_publisher_body_async<W: Write>(
         let result = orchestrator
             .collect_dispatched_auction(
                 dispatched,
-                services,
                 &make_collect_context(settings, services, &placeholder),
             )
             .await;
@@ -975,7 +974,7 @@ async fn collect_stream_auction(
     let collect_ctx = make_collect_context(settings, services, &placeholder);
     let request = dispatched.request().clone();
     let result = orchestrator
-        .collect_dispatched_auction(dispatched, services, &collect_ctx)
+        .collect_dispatched_auction(dispatched, &collect_ctx)
         .await;
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",

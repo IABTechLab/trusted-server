@@ -88,7 +88,7 @@ fn redact_sensitive_path_segments(path: &str) -> String {
         if previous_segment_is_sensitive_parent && !segment.is_empty() {
             redacted.push_str(REDACTED_PATH_SEGMENT);
         } else {
-            redacted.push_str(&redact_path_segment(segment));
+            redacted.push_str(redact_path_segment(segment));
         }
         previous_segment_is_sensitive_parent = is_sensitive_parent_segment(segment);
     }
@@ -99,11 +99,11 @@ fn redact_sensitive_path_segments(path: &str) -> String {
     }
 }
 
-fn redact_path_segment(segment: &str) -> Cow<'_, str> {
+fn redact_path_segment(segment: &str) -> &str {
     if should_redact_path_segment(segment) {
-        Cow::Borrowed(REDACTED_PATH_SEGMENT)
+        REDACTED_PATH_SEGMENT
     } else {
-        Cow::Borrowed(segment)
+        segment
     }
 }
 

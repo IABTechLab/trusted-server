@@ -1,5 +1,7 @@
 //! Pure builder that turns an auction observation into telemetry rows.
 
+use std::collections::HashSet;
+
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::auction::telemetry::types::{
     AuctionEventRow, AuctionObservationContext, EventKind, ProviderCallOutcome, TerminalOutcome,
@@ -62,7 +64,7 @@ fn build_bid_rows(
     let mut rows = Vec::new();
     // Slots whose winning row has already been emitted, so each slot has at
     // most one `is_win = 1` row.
-    let mut claimed_slots: Vec<String> = Vec::new();
+    let mut claimed_slots = HashSet::new();
 
     for response in &result.provider_responses {
         for bid in &response.bids {
@@ -79,7 +81,7 @@ fn build_bid_rows(
                 None
             };
             if is_win {
-                claimed_slots.push(bid.slot_id.clone());
+                claimed_slots.insert(bid.slot_id.clone());
             }
             rows.push(bid_row(
                 ctx,

@@ -273,6 +273,48 @@ pub enum BidStatus {
     Pending,
 }
 
+/// Machine-readable provider error category carried in
+/// `AuctionResponse.metadata["error_type"]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderErrorType {
+    /// Provider request could not be launched.
+    LaunchFailed,
+    /// Provider response could not be parsed.
+    ParseResponse,
+    /// Provider request failed at the transport layer.
+    Transport,
+    /// Provider did not complete before its deadline.
+    Timeout,
+}
+
+impl ProviderErrorType {
+    /// Metadata key used on [`AuctionResponse`].
+    pub(crate) const METADATA_KEY: &'static str = "error_type";
+
+    /// Stable metadata wire value.
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchFailed => "launch_failed",
+            Self::ParseResponse => "parse_response",
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// Parse a metadata wire value.
+    #[must_use]
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "launch_failed" => Some(Self::LaunchFailed),
+            "parse_response" => Some(Self::ParseResponse),
+            "transport" => Some(Self::Transport),
+            "timeout" => Some(Self::Timeout),
+            _ => None,
+        }
+    }
+}
+
 impl AuctionResponse {
     /// Create a new successful auction response.
     pub fn success(provider: impl Into<String>, bids: Vec<Bid>, response_time_ms: u64) -> Self {
@@ -312,6 +354,23 @@ impl AuctionResponse {
         self.metadata.insert(key.into(), value);
         self
     }
+
+    /// Add the machine-readable provider error category metadata.
+    pub(crate) fn with_error_type(self, error_type: ProviderErrorType) -> Self {
+        self.with_metadata(
+            ProviderErrorType::METADATA_KEY,
+            serde_json::json!(error_type.as_str()),
+        )
+    }
+
+    /// Read the machine-readable provider error category metadata.
+    #[must_use]
+    pub(crate) fn provider_error_type(&self) -> Option<ProviderErrorType> {
+        self.metadata
+            .get(ProviderErrorType::METADATA_KEY)
+            .and_then(|value| value.as_str())
+            .and_then(ProviderErrorType::from_str)
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +396,51 @@ mod tests {
             cache_path: None,
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn provider_error_type_round_trips_metadata_wire_values() {
+        let cases = [
+            (ProviderErrorType::LaunchFailed, "launch_failed"),
+            (ProviderErrorType::ParseResponse, "parse_response"),
+            (ProviderErrorType::Transport, "transport"),
+            (ProviderErrorType::Timeout, "timeout"),
+        ];
+
+        for (error_type, wire_value) in cases {
+            assert_eq!(
+                error_type.as_str(),
+                wire_value,
+                "should serialize provider error type to stable metadata value"
+            );
+            assert_eq!(
+                ProviderErrorType::from_str(wire_value),
+                Some(error_type),
+                "should parse provider error type from stable metadata value"
+            );
+        }
+        assert_eq!(
+            ProviderErrorType::from_str("unknown"),
+            None,
+            "unknown provider error types should not parse"
+        );
+    }
+
+    #[test]
+    fn auction_response_reads_and_writes_provider_error_type() {
+        let response =
+            AuctionResponse::error("prebid", 42).with_error_type(ProviderErrorType::Timeout);
+
+        assert_eq!(
+            response.metadata[ProviderErrorType::METADATA_KEY],
+            json!("timeout"),
+            "should store the wire value in metadata"
+        );
+        assert_eq!(
+            response.provider_error_type(),
+            Some(ProviderErrorType::Timeout),
+            "should read provider error type from metadata"
+        );
     }
 
     #[test]
