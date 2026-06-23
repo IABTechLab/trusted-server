@@ -1791,8 +1791,8 @@ impl Settings {
 
     /// Creates a new [`Settings`] instance from a JSON value.
     ///
-    /// Runtime config-store loading uses this after reconstructing the flattened
-    /// `app_config` entries into the same typed settings shape.
+    /// Runtime config-store loading uses this after verifying the `app_config`
+    /// blob envelope and extracting the same typed settings shape.
     ///
     /// # Errors
     ///

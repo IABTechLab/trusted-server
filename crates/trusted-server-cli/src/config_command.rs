@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use trusted_server_core::config_payload::{
-    build_config_payload, settings_from_config_entries, ConfigPayload,
+    build_config_payload, settings_from_config_blob, ConfigPayload,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::integrations::{
@@ -82,7 +82,7 @@ pub fn run_validate(
                 let response = ValidateJson {
                     valid: true,
                     config_path: absolute_display(&loaded.path),
-                    entry_count: Some(loaded.payload.settings_entries.len()),
+                    entry_count: Some(1),
                     config_hash: Some(&loaded.payload.hash),
                     errors: Vec::new(),
                 };
@@ -98,12 +98,7 @@ pub fn run_validate(
                 writeln!(out, "Config valid: {}", absolute_display(&loaded.path)).map_err(
                     |error| report_error(format!("failed to write command output: {error}")),
                 )?;
-                writeln!(
-                    out,
-                    "Config entries: {}",
-                    loaded.payload.settings_entries.len()
-                )
-                .map_err(|error| {
+                writeln!(out, "Config entries: 1").map_err(|error| {
                     report_error(format!("failed to write command output: {error}"))
                 })?;
                 writeln!(out, "Config hash: {}", loaded.payload.hash).map_err(|error| {
@@ -159,9 +154,9 @@ pub fn load_config(path: &Path) -> CliResult<LoadedConfig> {
         .map_err(|error| report_error(format!("invalid app config: {error:?}")))?;
     let payload = build_config_payload(&settings)
         .map_err(|error| report_error(format!("failed to build config payload: {error:?}")))?;
-    let runtime_settings = settings_from_config_entries(&payload.entries).map_err(|error| {
+    let runtime_settings = settings_from_config_blob(&payload.envelope_json).map_err(|error| {
         report_error(format!(
-            "invalid app config: flattened payload failed runtime reconstruction: {error:?}"
+            "invalid app config: blob payload failed runtime reconstruction: {error:?}"
         ))
     })?;
     validate_runtime_startup(&runtime_settings)?;

@@ -74,15 +74,16 @@ fn dispatch(
         Command::Config(ConfigCommand::Validate(validate)) => run_validate(&validate, out, err),
         Command::Config(ConfigCommand::Push(push)) => {
             let loaded = load_config(&push.config)?;
+            let config_key =
+                edgezero_core::env_config::EnvConfig::from_env().store_key("config", &push.store);
             let request = ConfigPushRequest {
                 adapter: push.adapter,
                 manifest: push.manifest,
-                store: push.store,
+                store: push.store.clone(),
                 local: push.local,
                 dry_run: push.dry_run,
                 runtime_config: push.runtime_config,
-                entries: loaded.payload.entries.into_iter().collect(),
-                settings_entry_count: loaded.payload.settings_entries.len(),
+                entries: vec![(config_key, loaded.payload.envelope_json)],
                 config_hash: loaded.payload.hash,
             };
             delegate.push_config(&request, out)
@@ -193,11 +194,13 @@ password = "production-admin-password-32-bytes"
         assert_eq!(call.adapter, "fastly");
         assert!(call.dry_run, "should forward dry-run");
         assert_eq!(call.store, "app_config");
-        assert!(
-            call.entries
-                .iter()
-                .any(|(key, _value)| key == trusted_server_core::config_payload::CONFIG_HASH_KEY),
-            "should include hash metadata"
+        assert_eq!(call.entries.len(), 1, "should push one logical blob entry");
+        assert_eq!(
+            call.entries[0].0, "app_config",
+            "should use the config store id as the blob key"
         );
+        let envelope: edgezero_core::blob_envelope::BlobEnvelope =
+            serde_json::from_str(&call.entries[0].1).expect("should parse blob envelope");
+        envelope.verify().expect("should verify blob envelope");
     }
 }
