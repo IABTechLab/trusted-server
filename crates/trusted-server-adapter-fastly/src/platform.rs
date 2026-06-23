@@ -555,10 +555,14 @@ impl PlatformGeo for FastlyPlatformGeo {
 ///
 /// `kv_store` is an [`Arc<dyn PlatformKvStore>`] opened by the caller for
 /// the primary KV store. Use [`open_kv_store`] to construct it.
+///
+/// `auction_event_log_endpoint` names the Fastly real-time log endpoint used
+/// for auction telemetry.
 #[must_use]
 pub fn build_runtime_services(
     req: &Request,
     kv_store: Arc<dyn PlatformKvStore>,
+    auction_event_log_endpoint: &str,
 ) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
@@ -577,7 +581,7 @@ pub fn build_runtime_services(
             server_region: std::env::var("FASTLY_REGION").ok(),
         })
         .auction_event_sink(std::sync::Arc::new(
-            crate::auction_sink::FastlyAuctionEventSink,
+            crate::auction_sink::FastlyAuctionEventSink::new(auction_event_log_endpoint),
         ))
         .build()
 }
@@ -699,7 +703,7 @@ mod tests {
     #[test]
     fn build_runtime_services_client_info_is_none_without_tls() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(&req, noop_kv_store(), "ts_auction_events");
 
         assert!(
             services.client_info().tls_protocol.is_none(),
@@ -714,7 +718,7 @@ mod tests {
     #[test]
     fn build_runtime_services_returns_cloneable_services() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(&req, noop_kv_store(), "ts_auction_events");
         let cloned = services.clone();
 
         assert_eq!(

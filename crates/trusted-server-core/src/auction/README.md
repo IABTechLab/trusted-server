@@ -445,6 +445,7 @@ enabled = true                      # Enable/disable auction orchestration
 providers = ["prebid", "aps"]        # List of bidder providers
 mediator = "adserver_mock"          # Optional: if set, uses mediation; if omitted, highest bid wins
 timeout_ms = 2000                   # Overall auction timeout
+telemetry_log_endpoint = "ts_auction_events"  # Fastly auction telemetry log endpoint
 ```
 
 **Strategy Auto-Detection:**

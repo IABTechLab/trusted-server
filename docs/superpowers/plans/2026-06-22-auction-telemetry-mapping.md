@@ -21,6 +21,7 @@ Same as the core telemetry plan; every task implicitly includes these:
 **Scope boundary (what this plan deliberately does NOT do):** It does not call these functions from any handler, does not touch `run_auction`/`dispatch_auction`/`collect_dispatched_auction`, does not implement the Fastly sink, does not emit access logs, and does not handle SSAT abandonment. Those are later plans. This plan only adds pure, unit-tested core functions.
 
 **Verified facts this plan relies on (from the current code):**
+
 - `OrchestrationResult` (`crates/trusted-server-core/src/auction/orchestrator.rs`): `provider_responses: Vec<AuctionResponse>`, `mediator_response: Option<AuctionResponse>`, `winning_bids: HashMap<String, Bid>`, `total_time_ms: u64`, `metadata`.
 - `AuctionResponse` (`auction/types.rs`): `provider: String`, `bids: Vec<Bid>`, `status: BidStatus`, `response_time_ms: u64`, `metadata: HashMap<String, serde_json::Value>`.
 - On an `Error` response the orchestrator writes `metadata["error_type"]` to one of `"launch_failed"`, `"parse_response"`, `"transport"`.
@@ -31,11 +32,13 @@ Same as the core telemetry plan; every task implicitly includes these:
 ### Task 1: Map a completed result to provider-call outcomes
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/mapping.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (declare `mapping`, re-export `provider_calls_from_result`)
 - Test: inline `#[cfg(test)]` in `mapping.rs`
 
 **Interfaces:**
+
 - Consumes: `OrchestrationResult` (orchestrator), `AuctionResponse`, `BidStatus`, `Bid` (auction/types), and `ProviderCallOutcome`, `ProviderCallStatus`, `ProviderRole` (telemetry::types).
 - Produces: `pub fn provider_calls_from_result(result: &OrchestrationResult) -> Vec<ProviderCallOutcome>` — one outcome per `provider_responses` entry (role `Bidder`) plus one for `mediator_response` when present (role `Mediator`). Status mapping: `Success -> Success`, `NoBid -> NoBid`, `Pending -> Timeout`, `Error -> {launch_failed: LaunchError, parse_response: ParseError, transport: TransportError, else: TransportError}`.
 
@@ -276,11 +279,13 @@ git commit -m "Map orchestration result to provider-call telemetry outcomes"
 ### Task 2: Build the full completed-auction row set from a result
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mapping.rs` (add two functions + tests)
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (re-export the two new functions)
 - Test: inline `#[cfg(test)]` in `mapping.rs`
 
 **Interfaces:**
+
 - Consumes: `provider_calls_from_result` (Task 1), `build_auction_events`, `AuctionObservationContext`, `AuctionEventRow`, `TerminalOutcome`, `TerminalStatus` (telemetry), `OrchestrationResult`.
 - Produces:
   - `pub fn completed_outcome(result: &OrchestrationResult, slot_count: u16) -> TerminalOutcome` — `status = Completed`, `reason = None`, `slot_count = Some(slot_count)`, `total_time_ms = Some(result.total_time_ms clamped)`, `winning_bid_count = Some(result.winning_bids.len() clamped)`.

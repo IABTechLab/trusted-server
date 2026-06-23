@@ -20,6 +20,7 @@
 **Scope boundary (NOT in this plan):** SSAT non-completed outcomes (abandoned dispatched tokens at the pass-through / buffered-unmodified branches, skipped, dispatch-failed), and access logs. Those are follow-ups.
 
 **Verified facts (current code):**
+
 - `DispatchedAuction` (orchestrator.rs:22) has a private `request: AuctionRequest` field and a `#[cfg(test)] impl` with `empty_for_test(request, timeout_ms)`. There is no non-test getter yet.
 - `collect_dispatched_auction(&self, dispatched: DispatchedAuction, services, context) -> OrchestrationResult` (orchestrator.rs:854) consumes `dispatched` by value.
 - Collect site A, `collect_stream_auction(dispatched: DispatchedAuction, price_granularity: PriceGranularity, ad_bids_state: &Arc<Mutex<Option<String>>>, orchestrator: &AuctionOrchestrator, services: &RuntimeServices, settings: &Settings)` (publisher.rs:954) — used by the HTML close-body hold loop. It calls `collect_dispatched_auction` then `write_bids_to_state`.
@@ -33,11 +34,13 @@
 ### Task 1: Emit completed telemetry from the SSAT collect sites
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/orchestrator.rs` (add a `request()` getter to `DispatchedAuction`)
 - Modify: `crates/trusted-server-core/src/publisher.rs` (emit at both collect sites; add a test)
 - Test: inline `#[cfg(test)]` in `publisher.rs`
 
 **Interfaces:**
+
 - Consumes: `emit_completed_auction_telemetry`, `AuctionSource` (already imported in publisher.rs).
 - Produces: `DispatchedAuction::request(&self) -> &AuctionRequest` (pub(crate)); both SSAT collect sites emit `initial_navigation` rows.
 

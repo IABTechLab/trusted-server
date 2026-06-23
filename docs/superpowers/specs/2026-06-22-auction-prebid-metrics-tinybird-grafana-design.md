@@ -53,7 +53,7 @@ edge (all auction paths)
   -> explicit API: POST /auction -> run_auction
   -> build one summary row plus provider-call and bid rows
   -> sink: buffered non-blocking writes, host flushes async
-  -> Fastly real-time log endpoint "ts_auction_events" (NDJSON, batched delivery)
+  -> configured Fastly real-time log endpoint (default "ts_auction_events", NDJSON, batched delivery)
   -> customer-controlled HTTPS relay "<log-relay-host>"
   -> hosted Tinybird Events API  POST https://<tb-api-host>/v0/events?name=auction_events_raw
   -> landing datasource (append-only, 30-day TTL)
@@ -138,7 +138,7 @@ because other regions use different hosts.
 Implications for this design:
 
 - **Region-specific host.** Ingestion is `POST
-  https://<tb-api-host>/v0/events?name=...`; published pipe endpoints use the
+https://<tb-api-host>/v0/events?name=...`; published pipe endpoints use the
   same regional API base. The token and host must belong to the same region.
 - **Fastly delivery relay.** Fastly's generic HTTPS logging endpoint validates
   control of the destination hostname through
@@ -243,7 +243,8 @@ result so telemetry does not silently undercount errors.
 - **Sink (core abstraction, Fastly implementation).** Core defines a small
   `AuctionEventSink` trait or a method on the existing runtime services object.
   The Fastly adapter writes each serialized row to
-  `fastly::log::Endpoint::from_name("ts_auction_events")` with `writeln!`.
+  `fastly::log::Endpoint::from_name(settings.auction.telemetry_log_endpoint)`
+  with `writeln!`.
   Output is NDJSON with no fern `timestamp LEVEL [module]` prefix. Tests use a
   no-op or in-memory sink so native builds stay clean.
 
@@ -349,7 +350,7 @@ which APS adapter is wired, not on this design:
   per-seat CPM excludes APS, though the mediated **winner** can still carry a
   decoded CPM via `mediator_response`/`winning_bids`.
 - Amazon's newer OpenRTB Prebid Server adapter (`POST
-  https://web.ads.aps.amazon-adsystem.com/e/pb/bid`) returns a standard decoded
+https://web.ads.aps.amazon-adsystem.com/e/pb/bid`) returns a standard decoded
   `seatbid[].bid[].price`. When TS uses that path, APS `price` populates like any
   other bidder and `price_cpm` fills for APS seats with **no schema or pipe
   change**, because both already treat price as nullable.
@@ -371,13 +372,13 @@ not read as total-market CPM.
   endpoints read them with the corresponding `*Merge` combinators.
 - **Materialized view** `auction_overview_mv`: filters `summary` event rows. It
   aggregates per `(minute, publisher_domain, auction_source, terminal_status,
-  terminal_reason)`. Because there is exactly one summary row per auction,
+terminal_reason)`. Because there is exactly one summary row per auction,
   auctions, requested slots, winning bids, completion/abandonment rates, and
   `quantilesState` of `total_time_ms` are not multiplied by the number of
   provider or bid rows.
 - **Materialized view** `auction_provider_stats_mv`: filters `provider_call`
   event rows. It aggregates per `(minute, publisher_domain, auction_source,
-  provider, provider_role)` requests, successes, nobids, errors, timeouts,
+provider, provider_role)` requests, successes, nobids, errors, timeouts,
   abandonments, parsed bids, and `quantilesState` of
   `provider_response_time_ms`.
 - **Materialized view** `auction_bid_stats_mv`: filters `bid` event rows. It
@@ -525,8 +526,9 @@ or reconciled revenue.
   logging challenge and forwards batched NDJSON to the regional Tinybird Events
   API. This prerequisite can be removed only after a direct hosted integration
   is validated.
-- Two Fastly real-time log endpoints on the service: `ts_auction_events` and
-  `ts_access_logs`, each configured with placement `none`, the appropriate relay
+- Two Fastly real-time log endpoints on the service: the configured auction
+  telemetry endpoint (default `ts_auction_events`) and `ts_access_logs`, each
+  configured with placement `none`, the appropriate relay
   URL, `Content-Type: application/json`, the relay authentication header,
   newline-delimited JSON, and blank/raw line framing.
 - Grafana with the Infinity datasource configured for the published endpoint

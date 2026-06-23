@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Default Fastly real-time log endpoint for auction telemetry events.
+pub const DEFAULT_AUCTION_TELEMETRY_LOG_ENDPOINT: &str = "ts_auction_events";
+
 /// Auction orchestration configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AuctionConfig {
@@ -34,6 +37,10 @@ pub struct AuctionConfig {
     /// silently dropped. An empty list blocks all context keys.
     #[serde(default = "default_allowed_context_keys")]
     pub allowed_context_keys: HashSet<String>,
+
+    /// Fastly real-time log endpoint used for auction telemetry rows.
+    #[serde(default = "default_telemetry_log_endpoint")]
+    pub telemetry_log_endpoint: String,
 }
 
 impl Default for AuctionConfig {
@@ -45,6 +52,7 @@ impl Default for AuctionConfig {
             timeout_ms: default_timeout(),
             creative_store: default_creative_store(),
             allowed_context_keys: HashSet::new(),
+            telemetry_log_endpoint: default_telemetry_log_endpoint(),
         }
     }
 }
@@ -61,6 +69,10 @@ fn default_allowed_context_keys() -> HashSet<String> {
     HashSet::new()
 }
 
+fn default_telemetry_log_endpoint() -> String {
+    DEFAULT_AUCTION_TELEMETRY_LOG_ENDPOINT.to_string()
+}
+
 #[allow(dead_code)] // Methods used in runtime but not in build script
 impl AuctionConfig {
     /// Get all provider names.
@@ -73,5 +85,44 @@ impl AuctionConfig {
     #[must_use]
     pub fn has_mediator(&self) -> bool {
         self.mediator.is_some()
+    }
+
+    /// Return the configured auction telemetry log endpoint.
+    #[must_use]
+    pub fn telemetry_log_endpoint(&self) -> &str {
+        let endpoint = self.telemetry_log_endpoint.trim();
+        if endpoint.is_empty() {
+            DEFAULT_AUCTION_TELEMETRY_LOG_ENDPOINT
+        } else {
+            endpoint
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_telemetry_log_endpoint_matches_existing_endpoint() {
+        let config = AuctionConfig::default();
+        assert_eq!(
+            config.telemetry_log_endpoint(),
+            DEFAULT_AUCTION_TELEMETRY_LOG_ENDPOINT,
+            "should preserve the existing Fastly log endpoint by default"
+        );
+    }
+
+    #[test]
+    fn blank_telemetry_log_endpoint_falls_back_to_default() {
+        let config = AuctionConfig {
+            telemetry_log_endpoint: "  ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.telemetry_log_endpoint(),
+            DEFAULT_AUCTION_TELEMETRY_LOG_ENDPOINT,
+            "should not pass an empty endpoint name to Fastly"
+        );
     }
 }

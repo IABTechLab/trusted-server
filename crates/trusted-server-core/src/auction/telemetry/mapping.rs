@@ -39,8 +39,7 @@ fn provider_call_outcome(response: &AuctionResponse, role: ProviderRole) -> Prov
 
 /// Classify a response into a provider-call status. For `Error`, read the
 /// orchestrator's `error_type` metadata; an unrecognized or absent value falls
-/// back to `TransportError` since the orchestrator only emits the three known
-/// error types.
+/// back to `TransportError`.
 fn provider_call_status(response: &AuctionResponse) -> ProviderCallStatus {
     match response.status {
         BidStatus::Success => ProviderCallStatus::Success,
@@ -54,6 +53,7 @@ fn provider_call_status(response: &AuctionResponse) -> ProviderCallStatus {
             Some("launch_failed") => ProviderCallStatus::LaunchError,
             Some("parse_response") => ProviderCallStatus::ParseError,
             Some("transport") => ProviderCallStatus::TransportError,
+            Some("timeout") => ProviderCallStatus::Timeout,
             _ => ProviderCallStatus::TransportError,
         },
     }
@@ -199,6 +199,13 @@ mod tests {
                 response("openx", BidStatus::Error, 60, vec![], Some("transport")),
                 response("smaato", BidStatus::Error, 5, vec![], None),
                 response("teads", BidStatus::Pending, 70, vec![], None),
+                response(
+                    "timeout-bidder",
+                    BidStatus::Error,
+                    80,
+                    vec![],
+                    Some("timeout"),
+                ),
             ],
             None,
         );
@@ -207,7 +214,7 @@ mod tests {
 
         assert_eq!(
             calls.len(),
-            7,
+            8,
             "should emit one outcome per provider response"
         );
         assert_eq!(
@@ -255,6 +262,11 @@ mod tests {
             calls[6].status,
             ProviderCallStatus::Timeout,
             "Pending maps to Timeout"
+        );
+        assert_eq!(
+            calls[7].status,
+            ProviderCallStatus::Timeout,
+            "timeout error metadata maps to Timeout"
         );
     }
 

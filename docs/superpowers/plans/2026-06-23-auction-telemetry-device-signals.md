@@ -17,6 +17,7 @@
 - Run `cargo fmt --all` before committing. Commit only when the focused test, `cargo fmt --all -- --check`, and `cargo clippy -p trusted-server-core --all-targets --all-features -- -D warnings` are all green.
 
 **Verified facts (current code):**
+
 - `crate::ec::device::DeviceSignals::derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> DeviceSignals`; fields `is_mobile: u8` (0=desktop, 1=mobile, 2=unknown via `parse_is_mobile`: iPhone/iPad/Android→1, Macintosh/Windows/Linux→0, else→2) and `known_browser: Option<bool>` (`None` when JA4 or H2 is absent).
 - `RuntimeServices::client_info() -> &ClientInfo`; `ClientInfo { tls_ja4: Option<String>, h2_fingerprint: Option<String>, .. }`.
 - `emit_completed_auction_telemetry(services, source, request, result)` lives in `crates/trusted-server-core/src/auction/telemetry/emit.rs` and currently passes `2, 2` as the device-signal args to `build_observation_context`. The request's UA is at `request.device.as_ref().and_then(|d| d.user_agent.as_deref())`.
@@ -27,10 +28,12 @@
 ### Task 1: Derive device signals in the emission helper
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/emit.rs` (import, replace the `2, 2` args, add a test)
 - Test: inline `#[cfg(test)]` in `emit.rs`
 
 **Interfaces:**
+
 - Consumes: `DeviceSignals::derive`, `ClientInfo` (via `services.client_info()`).
 - Produces: no signature change to `emit_completed_auction_telemetry`; the emitted rows now carry derived `is_mobile`/`is_known_browser`.
 

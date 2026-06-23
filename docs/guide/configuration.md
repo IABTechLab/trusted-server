@@ -1081,13 +1081,14 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 
 ### `[auction]`
 
-| Field            | Type          | Default            | Description                                                 |
-| ---------------- | ------------- | ------------------ | ----------------------------------------------------------- |
-| `enabled`        | Boolean       | `false`            | Enable the auction orchestrator                             |
-| `providers`      | Array[String] | `[]`               | Provider names that participate (e.g., `["prebid", "aps"]`) |
-| `mediator`       | String        | Optional           | Mediator provider name (runs parallel mediation when set)   |
-| `timeout_ms`     | Integer       | `2000`             | Auction timeout in milliseconds                             |
-| `creative_store` | String        | `"creative_store"` | Deprecated; creatives are now delivered inline              |
+| Field                    | Type          | Default               | Description                                                 |
+| ------------------------ | ------------- | --------------------- | ----------------------------------------------------------- |
+| `enabled`                | Boolean       | `false`               | Enable the auction orchestrator                             |
+| `providers`              | Array[String] | `[]`                  | Provider names that participate (e.g., `["prebid", "aps"]`) |
+| `mediator`               | String        | Optional              | Mediator provider name (runs parallel mediation when set)   |
+| `timeout_ms`             | Integer       | `2000`                | Auction timeout in milliseconds                             |
+| `telemetry_log_endpoint` | String        | `"ts_auction_events"` | Fastly real-time log endpoint for auction telemetry rows    |
+| `creative_store`         | String        | `"creative_store"`    | Deprecated; creatives are now delivered inline              |
 
 **Example**:
 
@@ -1096,6 +1097,7 @@ Settings for the auction orchestrator that coordinates multiple bid providers.
 enabled = true
 providers = ["aps", "prebid"]
 timeout_ms = 2000
+telemetry_log_endpoint = "ts_auction_events"
 
 [integrations.aps]
 enabled = true
@@ -1116,6 +1118,7 @@ TRUSTED_SERVER__AUCTION__PROVIDERS__0=aps
 TRUSTED_SERVER__AUCTION__PROVIDERS__1=prebid
 TRUSTED_SERVER__AUCTION__MEDIATOR=adserver_mock
 TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
+TRUSTED_SERVER__AUCTION__TELEMETRY_LOG_ENDPOINT=ts_auction_events
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
 

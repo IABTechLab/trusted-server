@@ -22,6 +22,7 @@ Copied from the project conventions and the prior telemetry plans; every task im
 **Scope boundary (deliberately NOT in this plan):** `handle_page_bids` wiring, the SSAT `dispatch_auction`/`collect_dispatched_auction` path and its abandoned/skipped/dispatch-failed/execution-failed outcomes, real device-signal population (`is_mobile`/`is_known_browser` are passed as `2` = unknown here), access logs, and the Tinybird/relay/Grafana side. Those are later plans. This plan covers only the completed `POST /auction` path.
 
 **Verified facts this plan relies on (current code):**
+
 - `handle_auction(settings, orchestrator, kv, registry, ec_context, services, req)` lives at `crates/trusted-server-core/src/auction/endpoints.rs`; after `run_auction` the `result: OrchestrationResult`, `auction_request: AuctionRequest`, and `services: &RuntimeServices` are all in scope (endpoints.rs:259-274). `geo` and `consent_context` locals are moved into `convert_tsjs_to_auction_request` earlier, so telemetry reads geo/consent back off `auction_request.device`/`auction_request.user.consent`.
 - `AuctionRequest`: `publisher: PublisherInfo { domain: String, page_url: Option<String> }`, `slots: Vec<AdSlot>`, `device: Option<DeviceInfo { geo: Option<GeoInfo>, .. }>`, `user: UserInfo { consent: Option<crate::consent::ConsentContext>, .. }` (auction/types.rs).
 - `GeoInfo { country: String, region: Option<String>, .. }` (`crate::platform::GeoInfo`). `ConsentContext { gdpr_applies: bool, .. }` with `fn is_empty(&self) -> bool` and `Default` (`crate::consent::ConsentContext`).
@@ -34,11 +35,13 @@ Copied from the project conventions and the prior telemetry plans; every task im
 ### Task 1: Observation-context builder
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/context.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (declare `context`, re-export `build_observation_context`)
 - Test: inline `#[cfg(test)]` in `context.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionObservationContext`, `AuctionSource` (telemetry::types); `crate::platform::GeoInfo`; `crate::consent::ConsentContext`.
 - Produces:
   - `pub fn build_observation_context(source: AuctionSource, publisher_domain: &str, page_url: Option<&str>, geo: Option<&GeoInfo>, consent: Option<&ConsentContext>, is_mobile: u8, is_known_browser: u8) -> AuctionObservationContext` — mints a fresh `Uuid::new_v4()`, normalizes `page_url` to a path, derives country/region from geo, and `gdpr_applies`/`consent_present` from consent (both `false` when `consent` is `None`).
@@ -224,10 +227,12 @@ git commit -m "Add auction observation context builder"
 ### Task 2: Auction event sink on RuntimeServices
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/platform/types.rs` (struct field, builder, accessor, `with_` method, imports)
 - Test: inline `#[cfg(test)]` in `platform/types.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionEventSink`, `NoopSink` (telemetry).
 - Produces, on `RuntimeServices`:
   - `pub fn auction_event_sink(&self) -> &dyn AuctionEventSink`
@@ -376,10 +381,12 @@ git commit -m "Add auction event sink to runtime services with no-op default"
 ### Task 3: Emit telemetry from handle_auction
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs` (add `use`, insert emission after `run_auction`, add test)
 - Test: inline `#[cfg(test)]` in `endpoints.rs`
 
 **Interfaces:**
+
 - Consumes: `build_observation_context`, `build_completed_auction_events`, `AuctionSource` (telemetry); `RuntimeServices::auction_event_sink` (Task 2).
 - Produces: no new public API; `POST /auction` now emits to `services.auction_event_sink()`.
 
@@ -575,6 +582,7 @@ git commit -m "Emit completed-auction telemetry from the auction endpoint"
 ### Task 4: Fastly auction event sink
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/types.rs` (add `to_json_line_with_event_ts` + test)
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (re-export it)
 - Create: `crates/trusted-server-adapter-fastly/src/auction_sink.rs`
@@ -583,6 +591,7 @@ git commit -m "Emit completed-auction telemetry from the auction endpoint"
 - Test: inline `#[cfg(test)]` in `types.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionEventRow`, `AuctionEventSink` (telemetry).
 - Produces:
   - core: `pub fn to_json_line_with_event_ts(row: &AuctionEventRow, event_ts: &str) -> Result<String, serde_json::Error>` — the row as a single JSON object with an injected `event_ts` field.

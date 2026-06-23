@@ -3,6 +3,8 @@
 //! This is the only telemetry code that mints the telemetry id and normalizes
 //! the page path. It performs no I/O.
 
+use std::borrow::Cow;
+
 use uuid::Uuid;
 
 use crate::auction::telemetry::types::{AuctionObservationContext, AuctionSource};
@@ -40,6 +42,14 @@ pub fn build_observation_context(
     }
 }
 
+const MAX_PAGE_PATH_CHARS: usize = 512;
+const MAX_PAGE_PATH_INPUT_CHARS: usize = 2048;
+const REDACTED_PATH_SEGMENT: &str = "{redacted}";
+const SENSITIVE_PARENT_SEGMENTS: &[&str] = &[
+    "account", "accounts", "invite", "invites", "member", "members", "order", "orders", "profile",
+    "profiles", "reset", "session", "sessions", "user", "users",
+];
+
 /// Reduce a page URL or path to a bounded path with no scheme, host, query, or
 /// fragment. Empty or path-less inputs normalize to `/`.
 fn normalize_page_path(page_url: &str) -> String {
@@ -56,7 +66,92 @@ fn normalize_page_path(page_url: &str) -> String {
         None => without_query,
     };
     let path = if path.is_empty() { "/" } else { path };
-    path.chars().take(512).collect()
+    let bounded_path: String = path.chars().take(MAX_PAGE_PATH_INPUT_CHARS).collect();
+    let normalized_path = if bounded_path.starts_with('/') {
+        bounded_path
+    } else {
+        format!("/{bounded_path}")
+    };
+    redact_sensitive_path_segments(&normalized_path)
+        .chars()
+        .take(MAX_PAGE_PATH_CHARS)
+        .collect()
+}
+
+fn redact_sensitive_path_segments(path: &str) -> String {
+    let mut redacted = String::with_capacity(path.len().min(MAX_PAGE_PATH_CHARS));
+    let mut previous_segment_is_sensitive_parent = false;
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            redacted.push('/');
+        }
+        if previous_segment_is_sensitive_parent && !segment.is_empty() {
+            redacted.push_str(REDACTED_PATH_SEGMENT);
+        } else {
+            redacted.push_str(&redact_path_segment(segment));
+        }
+        previous_segment_is_sensitive_parent = is_sensitive_parent_segment(segment);
+    }
+    if redacted.is_empty() {
+        "/".to_string()
+    } else {
+        redacted
+    }
+}
+
+fn redact_path_segment(segment: &str) -> Cow<'_, str> {
+    if should_redact_path_segment(segment) {
+        Cow::Borrowed(REDACTED_PATH_SEGMENT)
+    } else {
+        Cow::Borrowed(segment)
+    }
+}
+
+fn should_redact_path_segment(segment: &str) -> bool {
+    let decoded = urlencoding::decode(segment).unwrap_or(Cow::Borrowed(segment));
+    let segment = decoded.trim();
+    if segment.is_empty() {
+        return false;
+    }
+    segment.contains('@')
+        || segment.chars().all(|ch| ch.is_ascii_digit())
+        || uuid::Uuid::parse_str(segment).is_ok()
+        || looks_like_hex_token(segment)
+        || looks_like_high_entropy_token(segment)
+}
+
+fn is_sensitive_parent_segment(segment: &str) -> bool {
+    let decoded = urlencoding::decode(segment).unwrap_or(Cow::Borrowed(segment));
+    let normalized = decoded.trim().to_ascii_lowercase();
+    SENSITIVE_PARENT_SEGMENTS.contains(&normalized.as_str())
+}
+
+fn looks_like_hex_token(segment: &str) -> bool {
+    segment.len() >= 16 && segment.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn looks_like_high_entropy_token(segment: &str) -> bool {
+    if segment.len() < 20 {
+        return false;
+    }
+    let mut has_alpha = false;
+    let mut has_digit = false;
+    let mut token_chars = 0usize;
+    let mut separators = 0usize;
+    for ch in segment.chars() {
+        if ch.is_ascii_alphabetic() {
+            has_alpha = true;
+            token_chars += 1;
+        } else if ch.is_ascii_digit() {
+            has_digit = true;
+            token_chars += 1;
+        } else if matches!(ch, '-' | '_' | '=' | '.') {
+            separators += 1;
+        } else {
+            return false;
+        }
+    }
+    has_alpha && has_digit && token_chars >= 16 && separators <= 4
 }
 
 #[cfg(test)]
@@ -97,6 +192,44 @@ mod tests {
             "a URL with no path normalizes to /"
         );
         assert_eq!(normalize_page_path(""), "/", "empty input normalizes to /");
+    }
+
+    #[test]
+    fn redacts_sensitive_dynamic_path_segments() {
+        assert_eq!(
+            normalize_page_path("https://example.com/account/12345/orders"),
+            "/account/{redacted}/orders",
+            "should redact numeric identifiers"
+        );
+        assert_eq!(
+            normalize_page_path("/reset/550e8400-e29b-41d4-a716-446655440000"),
+            "/reset/{redacted}",
+            "should redact UUID path segments"
+        );
+        assert_eq!(
+            normalize_page_path("/reset/3xY9AbCDef0123456789Z"),
+            "/reset/{redacted}",
+            "should redact high-entropy token path segments"
+        );
+        assert_eq!(
+            normalize_page_path("/users/user%40example.com/profile"),
+            "/users/{redacted}/profile",
+            "should redact percent-encoded email-like path segments"
+        );
+        assert_eq!(
+            normalize_page_path("/users/john-smith/profile"),
+            "/users/{redacted}/profile",
+            "should redact handle-like segments after sensitive route parents"
+        );
+    }
+
+    #[test]
+    fn preserves_ordinary_slug_path_segments() {
+        assert_eq!(
+            normalize_page_path("blog/how-to-build-fast-websites"),
+            "/blog/how-to-build-fast-websites",
+            "should keep ordinary route slugs and add a leading slash"
+        );
     }
 
     #[test]

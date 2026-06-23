@@ -29,12 +29,14 @@ Copied verbatim from the project conventions; every task implicitly includes the
 ### Task 1: Module scaffold and serialized enums
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/mod.rs`
 - Create: `crates/trusted-server-core/src/auction/telemetry/types.rs`
 - Modify: `crates/trusted-server-core/src/auction/mod.rs` (add module declaration + re-exports)
 - Test: inline `#[cfg(test)]` in `types.rs`
 
 **Interfaces:**
+
 - Produces: enums `AuctionSource`, `TerminalStatus`, `ProviderCallStatus`, `ProviderRole`, `EventKind`, each `#[derive(Serialize)]` with the exact wire strings asserted below.
 
 - [ ] **Step 1: Write the failing test**
@@ -203,11 +205,13 @@ git commit -m "Add auction telemetry module scaffold and serialized enums"
 ### Task 2: Observation context and outcome inputs
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/types.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (re-export new types)
 - Test: inline `#[cfg(test)]` in `types.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionSource` (Task 1).
 - Produces: `AuctionObservationContext`, `TerminalOutcome`, `ProviderCallOutcome` structs with the public fields listed below. Later tasks construct these directly.
 
@@ -333,11 +337,13 @@ git commit -m "Add observation context and outcome input types for telemetry"
 ### Task 3: Row struct and NDJSON serialization
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/types.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (re-export `AuctionEventRow`, `to_ndjson`)
 - Test: inline `#[cfg(test)]` in `types.rs`
 
 **Interfaces:**
+
 - Consumes: all enums + `AuctionObservationContext` (Tasks 1-2).
 - Produces:
   - `AuctionEventRow` (all public fields, `#[derive(Serialize)]`).
@@ -560,11 +566,13 @@ git commit -m "Add flat telemetry row struct and NDJSON serialization"
 ### Task 4: Sink abstraction with test implementations
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/sink.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (declare `sink`, re-export)
 - Test: inline `#[cfg(test)]` in `sink.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionEventRow` (Task 3).
 - Produces:
   - `pub trait AuctionEventSink: Send + Sync { fn emit(&self, rows: &[AuctionEventRow]); }`
@@ -706,11 +714,13 @@ git commit -m "Add auction event sink trait and test sinks"
 ### Task 5: Builder for summary and provider-call rows
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/builder.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (declare `builder`, re-export `build_auction_events`)
 - Test: inline `#[cfg(test)]` in `builder.rs`
 
 **Interfaces:**
+
 - Consumes: `AuctionObservationContext`, `TerminalOutcome`, `ProviderCallOutcome`, `AuctionEventRow`, `EventKind` (Tasks 1-3).
 - Produces: `pub fn build_auction_events(ctx: &AuctionObservationContext, outcome: &TerminalOutcome, provider_calls: &[ProviderCallOutcome], result: Option<&OrchestrationResult>) -> Vec<AuctionEventRow>`. This task implements the `result == None` behavior (summary + provider-call rows only); Task 6 adds bid rows when `result` is `Some`.
 
@@ -912,14 +922,17 @@ git commit -m "Add telemetry builder for summary and provider-call rows"
 ### Task 6: Bid rows with win matching and mediator dedup
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/builder.rs` (replace the `build_bid_rows` stub, add helpers)
 - Test: inline `#[cfg(test)]` in `builder.rs`
 
 **Interfaces:**
+
 - Consumes: `OrchestrationResult` (`provider_responses: Vec<AuctionResponse>`, `mediator_response: Option<AuctionResponse>`, `winning_bids: HashMap<String, Bid>`), `Bid`, `AuctionResponse` from `crate::auction::types`.
 - Produces: a real `build_bid_rows` so that `build_auction_events(.., Some(result))` emits bid rows.
 
 Matching rules (from the spec):
+
 - One bid row per returned bid across `provider_responses`. Mediator bids are not re-emitted when matchable to an original provider bid.
 - A bid is the winner for its slot when it matches `winning_bids[slot_id]` on `(slot_id, bidder, ad_id)`, falling back to `(slot_id, bidder)` when `ad_id` is absent. At most one winning row per slot (first match claims it).
 - A matched winning row whose own `price` is `None` takes the winner's decoded `price`.
@@ -1176,10 +1189,12 @@ git commit -m "Build bid rows with win matching and mediator dedup"
 ### Task 7: End-to-end builder test over a mixed result
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/telemetry/builder.rs` (test only)
 - Test: inline `#[cfg(test)]` in `builder.rs`
 
 **Interfaces:**
+
 - Consumes: everything from Tasks 1-6. No production code changes; this task locks the combined behavior with one realistic case and guards against regressions.
 
 - [ ] **Step 1: Write the failing test**
@@ -1287,6 +1302,7 @@ git commit -m "Add end-to-end telemetry builder test over a mixed result"
 ## Self-Review
 
 **Spec coverage (this plan's slice):**
+
 - Three row grains (summary / provider_call / bid) with one summary per auction: Tasks 3, 5, 6, 7.
 - Bid rows only for returned bids; no invented seats on no-bid/error: Tasks 5, 6, 7.
 - Win matching on `(slot_id, bidder, ad_id)` with `(slot_id, bidder)` fallback, one win per slot, decoded-price fill, mediator dedup, unmatched-winner synthesis: Task 6.
@@ -1295,6 +1311,7 @@ git commit -m "Add end-to-end telemetry builder test over a mixed result"
 - Schema column set and wire strings: Tasks 1, 3.
 
 **Deferred to later plans (not gaps in this one):**
+
 - Constructing `AuctionObservationContext` from `EcContext`/geo/`DeviceSignals`, telemetry-UUID independence from `AuctionRequest.id`, and page-path normalization: Plan 2/3 wiring (those inputs are not available to this pure layer).
 - Mapping `BidStatus`/dispatch outcomes to `ProviderCallStatus` and populating `provider_calls`: Plan 2/3.
 - `media_type` population from request slots: later wiring plan.

@@ -187,7 +187,8 @@ fn main() {
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let runtime_services = build_runtime_services(&req, kv_store);
+    let runtime_services =
+        build_runtime_services(&req, kv_store, settings.auction.telemetry_log_endpoint());
     let http_req = compat::from_fastly_request(req);
 
     let route_result = futures::executor::block_on(route_request(

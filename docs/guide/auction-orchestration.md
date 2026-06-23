@@ -608,12 +608,13 @@ price_floor = 0.50
 
 #### `[auction]`
 
-| Field        | Type     | Default | Description                                                     |
-| ------------ | -------- | ------- | --------------------------------------------------------------- |
-| `enabled`    | bool     | `false` | Enable the auction system                                       |
-| `providers`  | string[] | `[]`    | Ordered list of provider names to call                          |
-| `mediator`   | string?  | `null`  | Provider name to use as mediator (enables `parallel_mediation`) |
-| `timeout_ms` | u32      | `2000`  | Overall auction timeout in milliseconds                         |
+| Field                    | Type     | Default               | Description                                                     |
+| ------------------------ | -------- | --------------------- | --------------------------------------------------------------- |
+| `enabled`                | bool     | `false`               | Enable the auction system                                       |
+| `providers`              | string[] | `[]`                  | Ordered list of provider names to call                          |
+| `mediator`               | string?  | `null`                | Provider name to use as mediator (enables `parallel_mediation`) |
+| `timeout_ms`             | u32      | `2000`                | Overall auction timeout in milliseconds                         |
+| `telemetry_log_endpoint` | string   | `"ts_auction_events"` | Fastly real-time log endpoint for auction telemetry rows        |
 
 #### `[integrations.prebid]`
 

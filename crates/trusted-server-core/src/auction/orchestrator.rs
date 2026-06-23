@@ -22,6 +22,7 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
     backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
+    launch_failures: Vec<AuctionResponse>,
     auction_start: Instant,
     timeout_ms: u32,
     floor_prices: HashMap<String, f64>,
@@ -42,6 +43,7 @@ impl DispatchedAuction {
         Self {
             pending_requests: Vec::new(),
             backend_to_provider: HashMap::new(),
+            launch_failures: Vec::new(),
             auction_start: Instant::now(),
             timeout_ms,
             floor_prices: HashMap::new(),
@@ -55,6 +57,7 @@ const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
 const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
 const ERROR_TYPE_TRANSPORT: &str = "transport";
+const ERROR_TYPE_TIMEOUT: &str = "timeout";
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
@@ -98,6 +101,31 @@ fn provider_transport_failed_response(
     AuctionResponse::error(provider_name, response_time_ms)
         .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
         .with_metadata("message", serde_json::json!("Provider request failed"))
+}
+
+fn provider_timeout_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TIMEOUT))
+        .with_metadata("message", serde_json::json!("Provider request timed out"))
+}
+
+fn append_transport_failures_from_dispatched(
+    responses: &mut Vec<AuctionResponse>,
+    backend_to_provider: &mut HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
+) {
+    let mut failures: Vec<(String, u64)> = backend_to_provider
+        .drain()
+        .map(|(_, (provider_name, start_time, _))| {
+            (provider_name, start_time.elapsed().as_millis() as u64)
+        })
+        .collect();
+    failures.sort_by(|left, right| left.0.cmp(&right.0));
+    for (provider_name, response_time_ms) in failures {
+        responses.push(provider_transport_failed_response(
+            &provider_name,
+            response_time_ms,
+        ));
+    }
 }
 
 /// Compute the remaining time budget from a deadline.
@@ -237,10 +265,14 @@ impl AuctionOrchestrator {
 
             if remaining_ms == 0 {
                 log::warn!("Auction timeout exhausted during bidding phase; skipping mediator");
+                let response_time_ms = mediation_start.elapsed().as_millis() as u64;
                 let winning = self.select_winning_bids(&provider_responses, &floor_prices);
                 return Ok(OrchestrationResult {
                     provider_responses,
-                    mediator_response: None,
+                    mediator_response: Some(provider_timeout_response(
+                        mediator.provider_name(),
+                        response_time_ms,
+                    )),
                     winning_bids: winning,
                     total_time_ms: 0,
                     metadata: HashMap::new(),
@@ -506,6 +538,19 @@ impl AuctionOrchestrator {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("select() failed: {:?}", e);
+                    let mut failures: Vec<(&str, u64)> = backend_to_provider
+                        .drain()
+                        .map(|(_, (provider_name, start_time, _))| {
+                            (provider_name, start_time.elapsed().as_millis() as u64)
+                        })
+                        .collect();
+                    failures.sort_by(|left, right| left.0.cmp(right.0));
+                    for (provider_name, response_time_ms) in failures {
+                        responses.push(provider_transport_failed_response(
+                            provider_name,
+                            response_time_ms,
+                        ));
+                    }
                     break;
                 }
             };
@@ -599,7 +644,37 @@ impl AuctionOrchestrator {
                     "Auction timeout reached; dropping {} remaining request(s)",
                     remaining.len()
                 );
+                let mut timeouts: Vec<(&str, u64)> = backend_to_provider
+                    .drain()
+                    .map(|(_, (provider_name, start_time, _))| {
+                        (provider_name, start_time.elapsed().as_millis() as u64)
+                    })
+                    .collect();
+                timeouts.sort_by(|left, right| left.0.cmp(right.0));
+                for (provider_name, response_time_ms) in timeouts {
+                    responses.push(provider_timeout_response(provider_name, response_time_ms));
+                }
                 break;
+            }
+        }
+
+        if !backend_to_provider.is_empty() {
+            log::warn!(
+                "{} provider request(s) were not accounted for after select loop; marking as transport failures",
+                backend_to_provider.len()
+            );
+            let mut failures: Vec<(&str, u64)> = backend_to_provider
+                .drain()
+                .map(|(_, (provider_name, start_time, _))| {
+                    (provider_name, start_time.elapsed().as_millis() as u64)
+                })
+                .collect();
+            failures.sort_by(|left, right| left.0.cmp(right.0));
+            for (provider_name, response_time_ms) in failures {
+                responses.push(provider_transport_failed_response(
+                    provider_name,
+                    response_time_ms,
+                ));
             }
         }
 
@@ -750,6 +825,7 @@ impl AuctionOrchestrator {
         let mut backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)> =
             HashMap::new();
         let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        let mut launch_failures: Vec<AuctionResponse> = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -819,11 +895,16 @@ impl AuctionOrchestrator {
                     pending_requests.push(pending.with_backend_name(backend_name));
                 }
                 Err(e) => {
+                    let response_time_ms = start_time.elapsed().as_millis() as u64;
                     log::warn!(
                         "Provider '{}' failed to dispatch request: {:?}",
                         provider.provider_name(),
                         e
                     );
+                    launch_failures.push(provider_launch_failed_response(
+                        provider.provider_name(),
+                        response_time_ms,
+                    ));
                 }
             }
         }
@@ -841,6 +922,7 @@ impl AuctionOrchestrator {
         Some(DispatchedAuction {
             pending_requests,
             backend_to_provider,
+            launch_failures,
             auction_start,
             timeout_ms: context.timeout_ms,
             floor_prices: self.floor_prices_by_slot(request),
@@ -867,6 +949,7 @@ impl AuctionOrchestrator {
         let DispatchedAuction {
             pending_requests,
             mut backend_to_provider,
+            launch_failures,
             auction_start,
             timeout_ms,
             floor_prices,
@@ -880,7 +963,7 @@ impl AuctionOrchestrator {
             remaining_budget_ms(auction_start, timeout_ms),
         );
 
-        let mut responses: Vec<AuctionResponse> = Vec::new();
+        let mut responses: Vec<AuctionResponse> = launch_failures;
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -894,6 +977,10 @@ impl AuctionOrchestrator {
                 Ok(r) => r,
                 Err(e) => {
                     log::warn!("select() failed during auction collection: {:?}", e);
+                    append_transport_failures_from_dispatched(
+                        &mut responses,
+                        &mut backend_to_provider,
+                    );
                     break;
                 }
             };
@@ -927,8 +1014,12 @@ impl AuctionOrchestrator {
                             }
                             Err(e) => {
                                 log::warn!("Provider '{}' parse failed: {:?}", provider_name, e);
-                                responses
-                                    .push(AuctionResponse::error(&provider_name, response_time_ms));
+                                responses.push(provider_error_response(
+                                    &provider_name,
+                                    response_time_ms,
+                                    ERROR_TYPE_PARSE_RESPONSE,
+                                    &e,
+                                ));
                             }
                         }
                     } else {
@@ -939,7 +1030,30 @@ impl AuctionOrchestrator {
                     }
                 }
                 Err(e) => {
-                    log::warn!("A provider request failed during collection: {:?}", e);
+                    if let Some(ref backend_name) = select_result.failed_backend_name {
+                        if let Some((provider_name, start_time, _)) =
+                            backend_to_provider.remove(backend_name)
+                        {
+                            let response_time_ms = start_time.elapsed().as_millis() as u64;
+                            log::warn!(
+                                "Provider '{}' request failed during collection: {:?}",
+                                provider_name,
+                                e
+                            );
+                            responses.push(provider_transport_failed_response(
+                                &provider_name,
+                                response_time_ms,
+                            ));
+                        } else {
+                            log::warn!(
+                                "A provider request failed during collection (backend '{}' not tracked): {:?}",
+                                backend_name,
+                                e
+                            );
+                        }
+                    } else {
+                        log::warn!("A provider request failed during collection: {:?}", e);
+                    }
                 }
             }
 
@@ -949,6 +1063,14 @@ impl AuctionOrchestrator {
             // elapsed while the origin was slow — dropping them here would
             // discard SSP responses that already arrived. The mediator launch
             // below still observes A_deadline via `remaining_budget_ms`.
+        }
+
+        if !backend_to_provider.is_empty() {
+            log::warn!(
+                "{} dispatched provider request(s) were not accounted for after collection; marking as transport failures",
+                backend_to_provider.len()
+            );
+            append_transport_failures_from_dispatched(&mut responses, &mut backend_to_provider);
         }
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
@@ -970,11 +1092,15 @@ impl AuctionOrchestrator {
                             responses.len(),
                         );
                         let winning = self.select_winning_bids(&responses, &floor_prices);
+                        let total_time_ms = auction_start.elapsed().as_millis() as u64;
                         return OrchestrationResult {
                             provider_responses: responses,
-                            mediator_response: None,
+                            mediator_response: Some(provider_timeout_response(
+                                mediator.provider_name(),
+                                total_time_ms,
+                            )),
                             winning_bids: winning,
-                            total_time_ms: auction_start.elapsed().as_millis() as u64,
+                            total_time_ms,
                             metadata: HashMap::new(),
                         };
                     }
@@ -1054,31 +1180,57 @@ impl AuctionOrchestrator {
                                                 mediator.provider_name(),
                                                 e
                                             );
+                                            let response_time_ms =
+                                                mediator_start.elapsed().as_millis() as u64;
+                                            let mediator_response = provider_error_response(
+                                                mediator.provider_name(),
+                                                response_time_ms,
+                                                ERROR_TYPE_PARSE_RESPONSE,
+                                                &e,
+                                            );
                                             let winning =
                                                 self.select_winning_bids(&responses, &floor_prices);
-                                            (None, winning)
+                                            (Some(mediator_response), winning)
                                         }
                                     }
                                 }
                                 Err(e) => {
+                                    let response_time_ms =
+                                        mediator_start.elapsed().as_millis() as u64;
                                     log::warn!("Mediator request failed: {:?}", e);
-                                    (None, self.select_winning_bids(&responses, &floor_prices))
+                                    (
+                                        Some(provider_transport_failed_response(
+                                            mediator.provider_name(),
+                                            response_time_ms,
+                                        )),
+                                        self.select_winning_bids(&responses, &floor_prices),
+                                    )
                                 }
                             }
                         }
                         Err(e) => {
+                            let response_time_ms = mediator_start.elapsed().as_millis() as u64;
                             log::warn!(
                                 "Mediator '{}' failed to dispatch: {:?}",
                                 mediator.provider_name(),
                                 e
                             );
-                            (None, self.select_winning_bids(&responses, &floor_prices))
+                            (
+                                Some(provider_launch_failed_response(
+                                    mediator.provider_name(),
+                                    response_time_ms,
+                                )),
+                                self.select_winning_bids(&responses, &floor_prices),
+                            )
                         }
                     }
                 }
                 None => {
                     log::warn!("Mediator '{}' not registered", mediator_name);
-                    (None, self.select_winning_bids(&responses, &floor_prices))
+                    (
+                        Some(provider_launch_failed_response(mediator_name, 0)),
+                        self.select_winning_bids(&responses, &floor_prices),
+                    )
                 }
             }
         } else {
@@ -1158,6 +1310,7 @@ mod tests {
     use error_stack::{Report, ResultExt};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use super::AuctionOrchestrator;
 
@@ -1209,6 +1362,99 @@ mod tests {
                 vec![],
                 response_time_ms,
             ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some(self.backend.to_string())
+        }
+    }
+
+    struct SlowParsingProvider {
+        name: &'static str,
+        backend: &'static str,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for SlowParsingProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            StubAuctionProvider {
+                name: self.name,
+                backend: self.backend,
+            }
+            .request_bids(request, context)
+            .await
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            let start = Instant::now();
+            while start.elapsed() < self.delay {
+                core::hint::spin_loop();
+            }
+            Ok(AuctionResponse::success(
+                self.name,
+                vec![],
+                response_time_ms,
+            ))
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            2000
+        }
+
+        fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+            Some(self.backend.to_string())
+        }
+    }
+
+    struct ContextParseFailingProvider {
+        name: &'static str,
+        backend: &'static str,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for ContextParseFailingProvider {
+        fn provider_name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            context: &AuctionContext<'_>,
+        ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+            StubAuctionProvider {
+                name: self.name,
+                backend: self.backend,
+            }
+            .request_bids(request, context)
+            .await
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            Err(Report::new(TrustedServerError::Auction {
+                message: "parse failed in test provider".to_string(),
+            }))
         }
 
         fn timeout_ms(&self) -> u32 {
@@ -1617,21 +1863,10 @@ mod tests {
         );
     }
 
-    // TODO: Re-enable provider integration tests after implementing mock support
-    // for `PlatformHttpClient::send_async()`. Mock providers currently cannot
-    // create realistic pending requests for the select loop without real
-    // platform-backed transport handles.
-    //
-    // Untested timeout enforcement paths (require real backends):
-    // - Deadline check in select() loop (drops remaining requests)
+    // Remaining timeout enforcement paths that still need focused coverage:
     // - Mediator skip when remaining_ms == 0 (bidding exhausts budget)
     // - Provider skip when effective_timeout == 0 (budget exhausted before launch)
     // - Provider context receives reduced timeout_ms per remaining budget
-    //
-    // Follow-up: introduce a thin abstraction over `PlatformHttpClient::select()`
-    // so the deadline/drop logic can be unit-tested with mock futures instead
-    // of requiring real platform backends. An `#[ignore]` integration test
-    // exercising the full path via Viceroy would also catch regressions.
 
     #[tokio::test]
     async fn test_no_providers_configured() {
@@ -1642,6 +1877,7 @@ mod tests {
             timeout_ms: 2000,
             creative_store: "creative_store".to_string(),
             allowed_context_keys: HashSet::from(["permutive_segments".to_string()]),
+            ..Default::default()
         };
 
         let orchestrator = AuctionOrchestrator::new(config);
@@ -1824,6 +2060,210 @@ mod tests {
             provider_b.status,
             BidStatus::Success,
             "provider-b should succeed — error was correctly isolated to provider-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_timeout_records_uncollected_provider_response() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_response(200, b"{}".to_vec());
+        let services = build_services_with_http_client(stub);
+        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["slow".to_string(), "late".to_string()],
+            timeout_ms: 1,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(SlowParsingProvider {
+            name: "slow",
+            backend: "slow-backend",
+            delay: Duration::from_millis(3),
+        }));
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "late",
+            backend: "late-backend",
+        }));
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &req,
+            timeout_ms: 1,
+            provider_responses: None,
+            services,
+        };
+
+        let result = orchestrator
+            .run_auction(&request, &context)
+            .await
+            .expect("should complete with best available responses");
+
+        let late = result
+            .provider_responses
+            .iter()
+            .find(|response| response.provider == "late")
+            .expect("should record the uncollected provider");
+        assert_eq!(
+            late.status,
+            BidStatus::Error,
+            "should expose the uncollected provider as an error response"
+        );
+        assert_eq!(
+            late.metadata
+                .get("error_type")
+                .and_then(serde_json::Value::as_str),
+            Some("timeout"),
+            "should tag the uncollected provider as a timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatched_collect_preserves_launch_and_parse_failures() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_response(200, b"{}".to_vec());
+        let services = build_services_with_http_client(stub);
+        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec![
+                "launch-failing".to_string(),
+                "parse-failing".to_string(),
+                "ok".to_string(),
+            ],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(LaunchFailingProvider));
+        orchestrator.register_provider(Arc::new(ContextParseFailingProvider {
+            name: "parse-failing",
+            backend: "parse-backend",
+        }));
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "ok",
+            backend: "ok-backend",
+        }));
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &req,
+            timeout_ms: 2000,
+            provider_responses: None,
+            services,
+        };
+        let dispatched = orchestrator
+            .dispatch_auction(&request, &context)
+            .await
+            .expect("should dispatch at least one provider");
+
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, services, &context)
+            .await;
+
+        let launch = result
+            .provider_responses
+            .iter()
+            .find(|response| response.provider == "launch-failing")
+            .expect("should retain launch failure from dispatch");
+        assert_eq!(
+            launch
+                .metadata
+                .get("error_type")
+                .and_then(serde_json::Value::as_str),
+            Some("launch_failed"),
+            "should tag launch failures for telemetry mapping"
+        );
+        let parse = result
+            .provider_responses
+            .iter()
+            .find(|response| response.provider == "parse-failing")
+            .expect("should retain parse failure from collect");
+        assert_eq!(
+            parse
+                .metadata
+                .get("error_type")
+                .and_then(serde_json::Value::as_str),
+            Some("parse_response"),
+            "should tag parse failures for telemetry mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatched_collect_preserves_transport_failures() {
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_response(200, b"{}".to_vec());
+        stub.push_select_error();
+        let services = build_services_with_http_client(stub);
+        let services: &'static RuntimeServices = Box::leak(Box::new(services));
+        let config = AuctionConfig {
+            enabled: true,
+            providers: vec!["transport-failing".to_string(), "ok".to_string()],
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "transport-failing",
+            backend: "transport-backend",
+        }));
+        orchestrator.register_provider(Arc::new(StubAuctionProvider {
+            name: "ok",
+            backend: "ok-backend",
+        }));
+        let request = create_test_auction_request();
+        let settings = create_test_settings();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://example.com/test")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let context = AuctionContext {
+            settings: &settings,
+            request: &req,
+            timeout_ms: 2000,
+            provider_responses: None,
+            services,
+        };
+        let dispatched = orchestrator
+            .dispatch_auction(&request, &context)
+            .await
+            .expect("should dispatch providers");
+
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, services, &context)
+            .await;
+
+        let transport = result
+            .provider_responses
+            .iter()
+            .find(|response| response.provider == "transport-failing")
+            .expect("should retain transport failure from collect");
+        assert_eq!(
+            transport
+                .metadata
+                .get("error_type")
+                .and_then(serde_json::Value::as_str),
+            Some("transport"),
+            "should tag transport failures for telemetry mapping"
         );
     }
 

@@ -20,6 +20,7 @@
 **Scope boundary (NOT in this plan):** the SSAT dispatch/collect path and its abandoned/skipped outcomes, real device signals (`is_mobile`/`is_known_browser` stay `2`), access logs.
 
 **Verified facts (current code):**
+
 - `handle_page_bids(settings, services: &RuntimeServices, kv, auction: AuctionDispatch<'_>, ec_context, req)` (publisher.rs:1733). Its `Ok(result)` branch is `Ok(result) => result.winning_bids` (publisher.rs:1878). `auction_request`, `services`, `geo`, `consent_context` are all alive there; `build_auction_request` sets `user.consent = Some(consent_context.clone())` and geo is set on `auction_request.device.geo`, so reading geo/consent off `auction_request` is correct.
 - `handle_auction` (endpoints.rs) currently has an inline emission block added in the previous plan, using `build_observation_context` + `build_completed_auction_events` + `services.auction_event_sink().emit(..)`, and imports `use crate::auction::telemetry::{build_completed_auction_events, build_observation_context, AuctionSource};`.
 - `AuctionDispatch<'a> { orchestrator, slots, registry }` (publisher.rs:1016). `AuctionOrchestrator` rejects empty providers and all-launch-failed auctions; a completing auction needs a provider that launches via `services.http_client().send_async` and parses a no-bid success (the `StubHttpClient` harness).
@@ -31,11 +32,13 @@
 ### Task 1: Shared emission helper
 
 **Files:**
+
 - Create: `crates/trusted-server-core/src/auction/telemetry/emit.rs`
 - Modify: `crates/trusted-server-core/src/auction/telemetry/mod.rs` (declare `emit`, re-export the helper)
 - Test: inline `#[cfg(test)]` in `emit.rs`
 
 **Interfaces:**
+
 - Consumes: `build_observation_context`, `build_completed_auction_events`, `AuctionSource` (telemetry); `AuctionRequest` (auction::types); `OrchestrationResult` (orchestrator); `RuntimeServices` (platform).
 - Produces: `pub fn emit_completed_auction_telemetry(services: &RuntimeServices, source: AuctionSource, request: &AuctionRequest, result: &OrchestrationResult)` — builds rows for a completed auction and emits them; reads geo/consent off `request`; device signals unknown (`2`).
 
@@ -180,10 +183,12 @@ git commit -m "Add shared completed-auction telemetry emission helper"
 ### Task 2: Refactor handle_auction onto the helper
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/auction/endpoints.rs` (replace the inline emission block + its import)
 - Test: the existing `auction_endpoint_emits_completed_telemetry` is the regression gate (no new test).
 
 **Interfaces:**
+
 - Consumes: `emit_completed_auction_telemetry`, `AuctionSource` (Task 1 / telemetry).
 - Produces: no behavior change; `handle_auction` now emits via the shared helper.
 
@@ -239,10 +244,12 @@ git commit -m "Refactor auction endpoint emission onto the shared helper"
 ### Task 3: Emit telemetry from handle_page_bids
 
 **Files:**
+
 - Modify: `crates/trusted-server-core/src/publisher.rs` (import, emit in the `Ok` branch, add a test provider + test)
 - Test: inline `#[cfg(test)]` in `publisher.rs`
 
 **Interfaces:**
+
 - Consumes: `emit_completed_auction_telemetry`, `AuctionSource` (telemetry).
 - Produces: `GET /__ts/page-bids` emits a `spa_navigation` row set on a completed auction.
 
