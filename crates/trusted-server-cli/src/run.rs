@@ -15,7 +15,7 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Sign in / out / status against an EdgeZero adapter.
+    /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
@@ -34,7 +34,7 @@ enum Command {
 enum ConfigCommand {
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
-    /// Push `trusted-server.toml` as a blob envelope through EdgeZero.
+    /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
     Validate(ConfigValidateArgs),
@@ -44,7 +44,7 @@ enum ConfigCommand {
 ///
 /// # Errors
 ///
-/// Returns an error when command parsing, config validation, EdgeZero
+/// Returns an error when command parsing, config validation, `EdgeZero`
 /// delegation, or config initialization fails.
 pub fn run_from_env() -> Result<(), String> {
     dispatch(Args::parse())
