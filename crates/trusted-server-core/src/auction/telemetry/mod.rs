@@ -4,11 +4,13 @@
 //! lives in separate modules; this module performs no I/O.
 
 pub mod builder;
+pub mod context;
 pub mod mapping;
 pub mod sink;
 pub mod types;
 
 pub use builder::build_auction_events;
+pub use context::build_observation_context;
 pub use mapping::{build_completed_auction_events, completed_outcome, provider_calls_from_result};
 pub use sink::{AuctionEventSink, InMemorySink, NoopSink};
 pub use types::{
