@@ -33,6 +33,7 @@ use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
 use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
+use crate::auction::telemetry::{emit_completed_auction_telemetry, AuctionSource};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
@@ -1876,7 +1877,16 @@ pub async fn handle_page_bids(
             .run_auction(&auction_request, &auction_context)
             .await
         {
-            Ok(result) => result.winning_bids,
+            Ok(result) => {
+                // Emit completed-auction telemetry off the response path.
+                emit_completed_auction_telemetry(
+                    services,
+                    AuctionSource::SpaNavigation,
+                    &auction_request,
+                    &result,
+                );
+                result.winning_bids
+            }
             Err(e) => {
                 log::warn!("page-bids auction failed: {e:?}");
                 std::collections::HashMap::new()
@@ -3958,11 +3968,19 @@ mod tests {
 
     mod page_bids_no_match_tests {
         use super::super::*;
+        use crate::auction::config::AuctionConfig;
+        use crate::auction::provider::AuctionProvider;
+        use crate::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
         use crate::auction::AuctionOrchestrator;
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
-        use crate::platform::test_support::noop_services;
+        use crate::platform::test_support::{
+            build_services_with_http_client, noop_services, StubHttpClient,
+        };
+        use crate::platform::{PlatformHttpRequest, PlatformPendingRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use error_stack::Report;
         use http::Method;
+        use std::sync::Arc;
 
         fn settings_with_co() -> Settings {
             let toml = format!(
@@ -4377,6 +4395,110 @@ mod tests {
                     .len(),
                 0,
                 "consent denial must produce no bids"
+            );
+        }
+
+        struct StubLaunchProvider;
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for StubLaunchProvider {
+            fn provider_name(&self) -> &'static str {
+                "stub_provider"
+            }
+
+            async fn request_bids(
+                &self,
+                _request: &AuctionRequest,
+                context: &AuctionContext<'_>,
+            ) -> Result<PlatformPendingRequest, Report<TrustedServerError>> {
+                let req = PlatformHttpRequest::new(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://example.com/bid")
+                        .body(EdgeBody::empty())
+                        .expect("should build stub bid request"),
+                    "stub-backend",
+                );
+                context
+                    .services
+                    .http_client()
+                    .send_async(req)
+                    .await
+                    .change_context(TrustedServerError::Auction {
+                        message: "stub launch failed".to_string(),
+                    })
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                Ok(AuctionResponse::success(
+                    "stub_provider",
+                    vec![],
+                    response_time_ms,
+                ))
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                2000
+            }
+
+            fn backend_name(&self, _timeout_ms: u32) -> Option<String> {
+                Some("stub-backend".to_string())
+            }
+        }
+
+        #[tokio::test]
+        async fn page_bids_emits_spa_navigation_telemetry() {
+            // A consent-allowed page-bids auction that completes (one provider
+            // launches via the stub HTTP client and parses a no-bid success) must
+            // emit one summary row tagged spa_navigation to the injected sink.
+            let settings = settings_with_co();
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["stub_provider".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubLaunchProvider));
+            let slots = article_slot();
+            let http_client = Arc::new(StubHttpClient::new());
+            http_client.push_response(200, b"{}".to_vec());
+            let sink = Arc::new(crate::auction::telemetry::InMemorySink::default());
+            let services =
+                build_services_with_http_client(http_client).with_auction_event_sink(sink.clone());
+            let ec_context = consent_allowing_ec_context();
+            let req = make_page_bids_request("/2024/01/my-article/");
+
+            let response = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: None,
+                },
+                &ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_eq!(response.status(), StatusCode::OK, "should return 200");
+            let rows = sink.rows();
+            assert!(
+                rows.iter().any(
+                    |r| r.event_kind == crate::auction::telemetry::EventKind::Summary
+                        && r.auction_source
+                            == crate::auction::telemetry::AuctionSource::SpaNavigation
+                ),
+                "should emit a summary row tagged spa_navigation, got {} rows",
+                rows.len()
             );
         }
     }
