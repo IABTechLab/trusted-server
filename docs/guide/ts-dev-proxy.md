@@ -242,11 +242,13 @@ the terminal (only that command is elevated; the proxy keeps running as you). If
 `sudo` is declined or there is no terminal (e.g. the proxy is backgrounded), it
 prints the exact `networksetup` command and the System Settings path so you can
 set the PAC manually. The change is system-wide (all apps) but PAC-scoped to the
-`FROM` hosts, and only while the proxy runs. On a clean exit the prior setting is
-restored (the restore reuses the cached `sudo` credential, so it does not
-re-prompt). After a hard kill (`SIGKILL`)
-the next `ts dev proxy` run detects and restores the leftover state, or prints
-the manual `networksetup` command.
+`FROM` hosts, and only while the proxy runs. The prior setting — including
+whether auto-proxy was enabled or disabled — is saved and restored. On a clean
+exit (Ctrl-C) the restore uses `sudo` and may prompt once more if a long run
+outlived the cached credential. After a hard kill (`SIGKILL`) the next
+`ts dev proxy` run restores the leftover state non-interactively (`sudo -n`), or,
+if it can't, keeps the saved state and prints the exact manual `networksetup`
+command.
 
 ## Troubleshooting
 

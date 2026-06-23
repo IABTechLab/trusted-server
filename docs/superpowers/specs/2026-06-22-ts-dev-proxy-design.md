@@ -451,13 +451,22 @@ declined or there is no TTY, the proxy prints the exact `networksetup` command
 and the System Settings path for a manual one-time setup.
 
 Because `networksetup` changes are **system-wide** (every app, not just Safari),
-the proxy persists the prior auto-proxy state to a file and restores it on exit
-(Ctrl-C) and on the next run after a hard kill (`SIGKILL`). The restore runs
-`sudo -n networksetup` (non-interactive): on a clean exit the credential is still
-cached from launch so it restores silently; a fresh-run recovery has no cached
-credential, so it prints the manual `networksetup` command rather than prompting
-an unrelated startup. On multi-service machines it must target the correct
-service (mapped from the default-route interface above).
+the proxy persists the prior auto-proxy state — service, prior PAC URL, **and the
+prior enabled/disabled state** — to a file and restores all of it. The restore
+re-applies the URL and, when the prior state was _disabled_ despite a saved URL,
+issues `-setautoproxystate off` so a previously-disabled PAC is not silently
+re-enabled. Interactivity differs by trigger:
+
+- **Clean exit (Ctrl-C):** interactive `sudo` — a long-running proxy may outlive
+  the cached credential, so the restore is allowed to prompt once.
+- **Startup recovery after a hard kill (`SIGKILL`):** `sudo -n` (non-interactive)
+  so it never blocks an unrelated launch on a password prompt; if it can't
+  restore non-interactively it **keeps** the restore file and prints the exact
+  manual `networksetup` command. The file is deleted only after a successful
+  restore (or if it is malformed).
+
+On multi-service machines it must target the correct service (mapped from the
+default-route interface above).
 
 If any browser can't be auto-configured, print its manual steps and continue
 with the others.
@@ -468,11 +477,15 @@ with the others.
 
 ### 10.1 Precedence
 
-CLI flags > built-in defaults. `--map`/`-f`/`-t` rules are unioned
-(first-match-wins by declared order). A rule is **passed explicitly**: either a
-`--map FROM=TO`, or `-f/--from` **and** `-t/--to` together. If no complete rule
-is given, the tool exits with `no rewrite rule: pass --map FROM=TO …`. There is
-**no** inference from `trusted-server.toml` or any other config file.
+CLI flags > built-in defaults. Rules are unioned **first-match-wins**, in this
+order: all `--map FROM=TO` rules (in the order given), then the single `-f`/`-t`
+shorthand rule. (`clap` does not preserve the interleaved argv order across
+different options, so `--map` rules always precede the shorthand rather than
+following raw command-line position; this only matters if the same `FROM` is
+given by both forms.) A rule is **passed explicitly**: either a `--map FROM=TO`,
+or `-f/--from` **and** `-t/--to` together. If no complete rule is given, the tool
+exits with `no rewrite rule: pass --map FROM=TO …`. There is **no** inference
+from `trusted-server.toml` or any other config file.
 
 ### 10.2 No config-file inference
 
