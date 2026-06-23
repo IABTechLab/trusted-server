@@ -115,20 +115,20 @@ ts dev proxy [OPTIONS]
 
 ### 4.1 Options
 
-| Flag                   | Value                            | Default                                                                                                     | Description                                                                                                                                                                                                |
-| ---------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                     |
-| `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Optional when `FROM` is inferable from config (§10.2).                                                                                                               |
-| `-t, --to`             | `HOST[:PORT]`                    | —                                                                                                           | Shorthand for a single rule's `TO`. Combines with `--from`, or with the inferred publisher domain when `--from` is omitted. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3). |
-| `--listen`             | `ADDR`                           | `127.0.0.1:8080`                                                                                            | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                    |
-| `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11).     |
-| `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                           |
-| `--rewrite-host`       | flag                             | false                                                                                                       | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3).                                                                                                                                     |
-| `--basic-auth`         | `USER:PASS`                      | —                                                                                                           | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`.                                                                 |
-| `--basic-auth-file`    | `PATH`                           | —                                                                                                           | Read `USER:PASS` from a file (preferred over `--basic-auth`).                                                                                                                                              |
-| `--insecure`           | flag                             | false                                                                                                       | Skip **upstream** certificate verification.                                                                                                                                                                |
-| `--upstream-plaintext` | flag                             | false                                                                                                       | Connect to upstream over HTTP (e.g. `localhost:3000`).                                                                                                                                                     |
-| `--ca-dir`             | `PATH`                           | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run).                                                                                                                                     |
+| Flag                   | Value                            | Default                                                                                                     | Description                                                                                                                                                                                            |
+| ---------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                 |
+| `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Pairs with `--to`.                                                                                                                                               |
+| `-t, --to`             | `HOST[:PORT]`                    | —                                                                                                           | Shorthand for a single rule's `TO`. Pairs with `--from`. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3).                                                                |
+| `--listen`             | `ADDR`                           | `127.0.0.1:8080`                                                                                            | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                |
+| `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11). |
+| `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                       |
+| `--rewrite-host`       | flag                             | false                                                                                                       | Send `Host: <TO>` upstream instead of the default `<FROM>` (see §8.3).                                                                                                                                 |
+| `--basic-auth`         | `USER:PASS`                      | —                                                                                                           | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`.                                                             |
+| `--basic-auth-file`    | `PATH`                           | —                                                                                                           | Read `USER:PASS` from a file (preferred over `--basic-auth`).                                                                                                                                          |
+| `--insecure`           | flag                             | false                                                                                                       | Skip **upstream** certificate verification.                                                                                                                                                            |
+| `--upstream-plaintext` | flag                             | false                                                                                                       | Connect to upstream over HTTP (e.g. `localhost:3000`).                                                                                                                                                 |
+| `--ca-dir`             | `PATH`                           | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run).                                                                                                                                 |
 
 ### 4.2 Companion subcommands
 
@@ -142,8 +142,8 @@ ts dev proxy ca regenerate  # regenerate the per-machine CA (invalidates prior t
 ### 4.3 Examples
 
 ```bash
-# Default: infer rule from project config, run proxy only (no browser):
-ts dev proxy
+# Single rule via shorthand, run proxy only (no browser):
+ts dev proxy -f www.example-publisher.com -t trusted-server-example.edgecompute.app
 
 # Explicit map to a Compute service, launch+configure all three browsers:
 ts dev proxy --map www.example-publisher.com=trusted-server-example.edgecompute.app \
@@ -224,7 +224,7 @@ crates/trusted-server-cli/
           ca.rs              # CertAuthority: load-or-generate per-machine CA, mint+cache per-host leaves
           rewrite.rs         # RuleTable, Rule, RewriteOutcome
           browser.rs         # launch+configure Chrome/Firefox/Safari; PAC generation
-          config.rs          # arg + project-config resolution into RuleTable
+          config.rs          # arg resolution into RuleTable
 ```
 
 **Workspace integration.** Add `crates/trusted-server-cli` to the `[workspace]
@@ -460,38 +460,23 @@ with the others.
 
 ### 10.1 Precedence
 
-CLI flags > project-config inference (§10.2) > built-in
-defaults. `--map`/`-f`/`-t` rules are unioned (first-match-wins by declared
-order). `--from` and `--to` may be supplied independently: a lone `--to` pairs
-with the inferred `FROM`, and a lone `--from` pairs with the inferred `TO`
-(§10.2). A rule is complete only when both sides resolve; otherwise the tool
-errors with what it could and couldn't infer.
+CLI flags > built-in defaults. `--map`/`-f`/`-t` rules are unioned
+(first-match-wins by declared order). A rule is **passed explicitly**: either a
+`--map FROM=TO`, or `-f/--from` **and** `-t/--to` together. If no complete rule
+is given, the tool exits with `no rewrite rule: pass --map FROM=TO …`. There is
+**no** inference from `trusted-server.toml` or any other config file.
 
-### 10.2 Project-config inference (zero-arg ergonomics)
+### 10.2 No config-file inference
 
-With no `--map`/`-f`/`-t`, infer a single rule from the Trusted Server project
-config so the common case is argument-free:
-
-- `FROM` ← the publisher first-party domain (`publisher.domain` in
-  `trusted-server.toml` — the public hostname, **not** `publisher.origin_url`'s
-  host, which is the upstream origin).
-- `TO` ← a dev-proxy upstream that **must be added to config**: no existing field
-  carries the Compute/staging hostname (`fastly.toml` has only `service_id`, and
-  `edgecompute.app` appears only in comments). Add an explicit field, honored
-  only when no `--map`/`-f`/`-t`/`--to` is given:
-
-  ```toml
-  [dev_proxy]
-  upstream = "trusted-server-example.edgecompute.app"
-  ```
-
-Until `[dev_proxy].upstream` exists, zero-arg `ts dev proxy` cannot infer `TO`:
-exit with a clear error showing the inferred `FROM` and asking for `--to`/`--map`.
-If `FROM` is ambiguous (multiple publishers), list candidates.
+Rewrite rules are **never** inferred from `trusted-server.toml` (or any other
+file) — the upstream must always be passed on the command line via `--map` or
+`-f`/`-t`. This keeps what the proxy does fully explicit and visible in the
+invocation, with no hidden dependence on the working directory or on a config
+key. The only file input the proxy reads is `--basic-auth-file` (and the
+per-machine CA under `--ca-dir`).
 
 The tool is **flags-only** — there are no `TS_DEV_PROXY_*` environment-variable
-overrides. Every setting is a CLI flag (§4); the only file inputs are
-`trusted-server.toml` (inference, §10.2) and `--basic-auth-file`.
+overrides either. Every setting is a CLI flag (§4).
 
 ---
 
@@ -617,9 +602,7 @@ padlock and the production hostname in the address bar.
 6. **Browser orchestration.** `--launch` list (no default — unset runs proxy
    only): Chrome + Firefox profiles, Safari PAC via `networksetup` with
    restore-on-exit; PAC generation; `ts dev proxy ca {path,install,uninstall,regenerate}`.
-7. **Project-config inference.** Zero-arg resolution from `trusted-server.toml`
-   / `.env.ts.*`.
-8. **Docs.** A `docs/guide/` page: setup, per-browser trust, the §13
+7. **Docs.** A `docs/guide/` page: setup, per-browser trust, the §13
    troubleshooting table, and the per-machine CA security note.
 
 Steps 1–4 already deliver a usable tool; each step is independently shippable.

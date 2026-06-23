@@ -44,27 +44,20 @@ cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
   --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy --help
 ```
 
-### Zero-argument usage
+### Passing the rewrite rule
 
-When `trusted-server.toml` contains a `[dev_proxy]` section, you can start the
-proxy with no arguments from the project root:
-
-```toml
-[publisher]
-domain = "www.example-publisher.com"
-
-[dev_proxy]
-upstream = "trusted-server-example.edgecompute.app"
-```
+The upstream is always passed explicitly — there is no inference from
+`trusted-server.toml` or any config file. Give a single rule with the `-f`/`-t`
+shorthand, or one or more `--map FROM=TO` rules:
 
 ```bash
 cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
-  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy
+  --target "$(rustc -vV | sed -n 's/host: //p')" -- dev proxy \
+  -f www.example-publisher.com -t trusted-server-example.edgecompute.app
 ```
 
-The proxy infers `FROM` from `publisher.domain` and `TO` from
-`[dev_proxy].upstream`. If `[dev_proxy].upstream` is absent, the tool exits
-with a clear error showing the inferred `FROM` and asks for `--to` or `--map`.
+With no `--map`/`-f`/`-t`, the proxy exits with
+`no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)`.
 
 ### Explicit rule and browser launch
 
@@ -215,8 +208,8 @@ ts dev proxy [OPTIONS] [COMMAND]
 
 Options:
       --map <FROM=TO>           Rewrite rule (repeatable)
-  -f, --from <HOST>             Single-rule FROM (optional when inferable from config)
-  -t, --to <HOST[:PORT]>        Single-rule TO
+  -f, --from <HOST>             Single-rule FROM (pairs with --to)
+  -t, --to <HOST[:PORT]>        Single-rule TO (pairs with --from)
       --listen <ADDR>           Listen address [default: 127.0.0.1:8080]
       --allow-non-loopback      Permit non-loopback --listen (disables blind tunnel)
       --launch <LIST>           Browsers to launch (chrome,firefox,safari or all)

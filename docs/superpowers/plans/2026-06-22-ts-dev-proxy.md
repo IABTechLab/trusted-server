@@ -38,7 +38,7 @@ crates/trusted-server-cli/
         proxy/
           mod.rs      # ProxyArgs (clap), CaArgs; orchestration entrypoint
           rewrite.rs  # Rule, RuleTable, Match, RewriteOutcome — pure logic
-          config.rs   # ResolvedConfig: args + env + project-config inference
+          config.rs   # ResolvedConfig: arg resolution into a rule table
           ca.rs       # CertAuthority: load-or-generate, mint+cache leaves
           server.rs   # accept loop, CONNECT dispatch, blind tunnel, MITM, local routes
           browser.rs  # PAC generation; Chrome/Firefox/Safari launch+configure; ca install/uninstall
@@ -267,7 +267,7 @@ pub struct ProxyArgs {
     #[arg(long = "map", value_name = "FROM=TO")]
     pub map: Vec<String>,
 
-    /// Shorthand single-rule FROM (optional when inferable from config).
+    /// Shorthand single-rule FROM (pairs with --to).
     #[arg(short = 'f', long = "from", value_name = "HOST")]
     pub from: Option<String>,
 
@@ -653,7 +653,7 @@ git commit -m "Add rewrite core with rule matching and header outcomes"
 
 ## Task 3: Config resolution (args + rule construction)
 
-Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective settings. Pure logic except project-config inference, which is deferred to Task 7 (here, missing rules produce a clear error). Implements spec §10.1 precedence (flags > inference > defaults). The tool is **flags-only** — there are no `TS_DEV_PROXY_*` environment-variable overrides.
+Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective settings. Pure logic. Rules are passed explicitly (`--map`/`-f`/`-t`); a missing rule produces a clear `NoRule` error. The tool is **flags-only** — no `TS_DEV_PROXY_*` env overrides and no `trusted-server.toml` inference.
 
 **Files:**
 
@@ -760,8 +760,8 @@ use super::rewrite::{Authority, Rule, RuleTable};
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
 pub enum ConfigError {
-    /// No usable rule could be formed and none was inferable.
-    #[display("no rewrite rule: pass --map FROM=TO (or --to with an inferable FROM)")]
+    /// No usable rule was passed.
+    #[display("no rewrite rule: pass --map FROM=TO (or -f/--from with -t/--to)")]
     NoRule,
     /// A `--map`/authority value was malformed.
     #[display("invalid rule value")]
@@ -879,7 +879,6 @@ fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
         rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
     }
-    // NOTE: lone --to / lone --from + project-config inference is added in Task 7.
     Ok(RuleTable(rules))
 }
 
@@ -1691,50 +1690,14 @@ git commit -m "Add browser orchestration, PAC generation, and ca trust subcomman
 
 ---
 
-## Task 7: Project-config inference (zero-arg ergonomics)
+## Task 7: ~~Project-config inference~~ — DROPPED
 
-Implements spec §10.2. Lets `ts dev proxy` (and lone `--to`/`--from`) resolve a rule from `trusted-server.toml`.
-
-**Files:**
-
-- Modify: `crates/trusted-server-cli/src/commands/dev/proxy/config.rs`
-- Test: same file
-
-**Interfaces:**
-
-- Produces: `fn infer_from_host() -> Option<String>` (reads `publisher.domain` from `trusted-server.toml` in the CWD), `fn infer_to_host() -> Option<String>` (reads `[dev_proxy].upstream`). `build_rules` is extended so a lone `--to` pairs with the inferred FROM and zero-arg pairs both.
-
-- [ ] **Step 1: Write the failing tests**
-
-```rust
-#[test]
-fn lone_to_pairs_with_inferred_from(/* uses a temp CWD with trusted-server.toml */) {
-    // Arrange: write trusted-server.toml with [publisher] domain = "www.example-publisher.com"
-    // and run resolve() with only --to set.
-    // Assert: a single rule with from = the inferred publisher domain.
-}
-
-#[test]
-fn zero_arg_requires_dev_proxy_upstream() {
-    // Arrange: trusted-server.toml with publisher.domain but no [dev_proxy].upstream.
-    // Assert: resolve() errors with NoRule and the message names --to/--map.
-}
-```
-
-> Implement these with a helper that writes a `trusted-server.toml` into a `tempfile::tempdir()` and parses from an explicit path (add `fn resolve_in(args, project_dir)` so tests don't depend on the process CWD). Use a minimal hand-rolled TOML read (the two keys) or add a `toml` dev-dependency; keep the parser scoped to `publisher.domain` and `dev_proxy.upstream`.
-
-- [ ] **Step 2: Run to verify they fail.** Run the `config::` tests; expected FAIL.
-
-- [ ] **Step 3: Implement inference** — add `infer_from_host`/`infer_to_host` and extend `build_rules`: if `--map`/`-f`/`-t` produced no rule, try `(--from or inferred FROM, --to or inferred TO)`; if either side is missing, return `ConfigError::NoRule`. List candidates when multiple publishers exist.
-
-- [ ] **Step 4: Run to verify they pass.** Expected PASS.
-
-- [ ] **Step 5: Lint and commit**
-
-```bash
-git add crates/trusted-server-cli/src/commands/dev/proxy/config.rs
-git commit -m "Infer dev-proxy rule from trusted-server.toml for zero-arg use"
-```
+**Status: removed (scope change 2026-06-22).** Rewrite rules must be passed
+explicitly via `--map`/`-f`/`-t`; the proxy does **not** infer them from
+`trusted-server.toml` (or any config file). There is no `infer_from_host` /
+`infer_to_host`, no `[dev_proxy].upstream` field, and no `toml` dependency. With
+no rule, `resolve` returns `ConfigError::NoRule` with a message naming
+`--map`/`-f`/`-t` (see spec §10.2).
 
 ---
 
@@ -1775,14 +1738,14 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 - §7 CA (load-or-generate, 0600/0700, mint+cache, install/uninstall) → Tasks 4, 6. ✓
 - §8 rewrite (Authority/RuleTable/matching/header outcomes/port-vs-SNI) → Task 2. ✓
 - §9 browser orchestration (HTTPS-only Chrome/Firefox, Safari PAC + active-service) → Task 6. ✓
-- §10 config (precedence, inference; flags-only — no env vars) → Tasks 3, 7. ✓
+- §10 config (precedence; explicit rules only — no env vars, no config-file inference) → Task 3. ✓
 - §11 security (non-loopback guard, redaction, credential input, blind-tunnel privacy) → Tasks 3, 5. ✓
 - §12 constants → encoded in Tasks 2/4 (ports, ALPN, validity, CN). ✓
 - §13 error handling → Task 5 status mapping + Task 8 troubleshooting table. ✓
 - §14 testing (rewrite unit, ca unit, native integration incl. blind-tunnel, basic-auth, and keep-alive/sequential-request coverage) → Tasks 2, 4, 5. ✓
 - §16 out-of-scope (HTTP/2, WebSocket, plain-HTTP rewriting) → respected (Upgrade closed; stray HTTP blind-forwarded only). ✓
 
-**Placeholder scan:** I/O-bound helper bodies in Tasks 5–7 (forwarding loops, browser launch, inference TOML read) are described by an explicit behavior contract with signatures rather than full literal bodies, because their exact code depends on the pinned tokio/hyper/rcgen APIs; the pure-logic tasks (2, 3, 6-PAC) carry complete code and tests. Flagged the rcgen API drift explicitly in Task 4. No `TODO`/`TBD` left in committed code.
+**Placeholder scan:** I/O-bound helper bodies in Tasks 5–6 (forwarding loops, browser launch) are described by an explicit behavior contract with signatures rather than full literal bodies, because their exact code depends on the pinned tokio/hyper/rcgen APIs; the pure-logic tasks (2, 3, 6-PAC) carry complete code and tests. Flagged the rcgen API drift explicitly in Task 4. No `TODO`/`TBD` left in committed code.
 
 **Type consistency:** `Authority::{host,host_with_port,is_default_port}` (now scheme-relative via the stored `default_port`), `RuleTable::first_match`, `rewrite_for → RewriteOutcome{sni,host_header,orig_host,scheme_is_tls}`, `ResolvedConfig`, `config::ca_dir`, `CertAuthority::{load_or_generate,server_config,cert_path}`, `server::{bind,serve_on}`, `Browser::parse_list`, `generate_pac` are used consistently across tasks.
 
@@ -1793,6 +1756,8 @@ git commit -m "Document ts dev proxy setup, trust, and troubleshooting"
 **Third review round (2026-06-22):** (11) `mint` builds the SAN explicitly — `SanType::IpAddress` for an IP-literal host, `SanType::DnsName` otherwise (spec §8.3), with a `127.0.0.1` test.
 
 **Scope change (2026-06-22):** environment-variable support (`TS_DEV_PROXY_*`, former spec §10.3) was **dropped** — the tool is flags-only. `ProxyArgs` no longer carries clap `env`, `build_rules` has no `TS_DEV_PROXY_MAP` path, and `warn_unknown_env` is gone (config tests: 6).
+
+**Scope change (2026-06-22):** project-config inference (former Task 7 / spec §10.2) was **dropped** — rules must be passed explicitly via `--map`/`-f`/`-t`. Removed `infer_from_host`/`infer_to_host`, the `resolve_in` plumbing, the `[dev_proxy].upstream` idea, the `toml` dependency, and the inference tests; `resolve` returns `ConfigError::NoRule` when no rule is given.
 
 ---
 
