@@ -95,13 +95,21 @@ path = "src/lib.rs"
 name = "ts"
 path = "src/main.rs"
 
-[dependencies]
+# The proxy (this crate's only command) is macOS-only, so every dependency is
+# scoped to macOS. On other targets — notably the repo-default `wasm32-wasip1`
+# from `.cargo/config.toml` — none of this native TLS/networking stack is built,
+# so the `compile_error!` in `src/lib.rs` is the single, clear failure instead of
+# a cascade of failed `tokio`/`ring`/`aws-lc-sys` builds.
+[target.'cfg(target_os = "macos")'.dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 rustls = "0.23"
 tokio-rustls = "0.26"
-rcgen = "0.13"
+webpki-roots = "0.26"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 rustls-pemfile = "2"
 clap = { version = "4", features = ["derive"] }
@@ -112,9 +120,10 @@ env_logger = "0.11"
 base64 = "0.22"
 directories = "5"
 
-[dev-dependencies]
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.12", features = ["blocking"] }
+x509-parser = "0.16"
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -150,13 +159,30 @@ The crate is a **library + thin bin** so that integration tests (Task 5) can imp
 ```rust
 //! Trusted Server developer CLI library. The `ts` binary is a thin wrapper;
 //! all logic lives here so integration tests can exercise it.
-pub mod commands;
+
+// `ts dev proxy` — the crate's sole command — is macOS-only. The platform gate
+// lives here at the crate root (not inside the proxy module) so that, combined
+// with the macOS-scoped deps in Cargo.toml, unsupported targets compile nothing
+// but this single clear error — no failed native dependency builds (spec §16).
+#[cfg(not(target_os = "macos"))]
+compile_error!(
+    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
+     networksetup). Cross-platform support is tracked as future work in the \
+     design spec (§16)."
+);
+
 pub mod output;
 
+#[cfg(target_os = "macos")]
+pub mod commands;
+
+#[cfg(target_os = "macos")]
 use clap::Parser;
+#[cfg(target_os = "macos")]
 use commands::dev::DevCommand;
 
 /// The `ts` command-line interface.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Parser)]
 #[command(name = "ts", version, about = "Trusted Server developer CLI")]
 pub struct Cli {
@@ -164,6 +190,7 @@ pub struct Cli {
     command: TopCommand,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, clap::Subcommand)]
 enum TopCommand {
     /// Local development tools.
@@ -171,6 +198,7 @@ enum TopCommand {
     Dev(DevCommand),
 }
 
+#[cfg(target_os = "macos")]
 impl Cli {
     /// Runs the parsed CLI, returning a process exit code.
     #[must_use]
@@ -190,13 +218,21 @@ impl Cli {
 - [ ] **Step 5: Write the thin binary `src/main.rs`**
 
 ```rust
+#[cfg(target_os = "macos")]
 use clap::Parser as _;
+#[cfg(target_os = "macos")]
 use trusted_server_cli::Cli;
 
+#[cfg(target_os = "macos")]
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     std::process::exit(Cli::parse().run());
 }
+
+// On unsupported targets the library's `compile_error!` is the real failure;
+// this trivial entry point just keeps the binary target's shape valid.
+#[cfg(not(target_os = "macos"))]
+fn main() {}
 ```
 
 - [ ] **Step 5b: Write `src/commands/mod.rs` and `src/commands/dev/mod.rs`**
@@ -238,17 +274,6 @@ pub fn run(command: DevCommand) -> error_stack::Result<(), ProxyError> {
 pub mod ca;
 pub mod config;
 pub mod rewrite;
-
-// `ts dev proxy` is macOS-only for v1: CA trust (login keychain), Safari
-// automation (`networksetup`), and browser launching all rely on macOS tooling.
-// Fail the build with a clear message elsewhere rather than a confusing
-// missing-symbol error on the platform-specific helpers (spec §16).
-#[cfg(not(target_os = "macos"))]
-compile_error!(
-    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
-     networksetup). Cross-platform support is tracked as future work in the \
-     design spec (§16)."
-);
 
 use crate::output;
 
@@ -1305,6 +1330,10 @@ Create `crates/trusted-server-cli/tests/proxy_e2e.rs`. It starts a local TLS "up
 //! End-to-end proxy test: a matched host is MITM'd, rewritten, and forwarded.
 //! Run with: cargo test --manifest-path crates/trusted-server-cli/Cargo.toml \
 //!   --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_e2e
+
+// The proxy under test is macOS-only (see `lib.rs`); skip this entire test crate
+// on other targets so it does not reference the macOS-scoped dev-dependencies.
+#![cfg(target_os = "macos")]
 
 use std::sync::Arc;
 

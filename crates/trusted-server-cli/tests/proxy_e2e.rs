@@ -5,6 +5,10 @@
 //! Run with: cargo test --manifest-path crates/trusted-server-cli/Cargo.toml \
 //!   --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_e2e
 
+// The proxy under test is macOS-only (see `lib.rs`); skip this entire test crate
+// on other targets so it does not reference the macOS-scoped dev-dependencies.
+#![cfg(target_os = "macos")]
+
 use std::sync::Arc;
 
 use trusted_server_cli::commands::dev::proxy::{ca, config};

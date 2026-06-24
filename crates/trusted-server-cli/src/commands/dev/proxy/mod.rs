@@ -4,18 +4,6 @@ pub mod config;
 pub mod rewrite;
 pub mod server;
 
-// `ts dev proxy` is macOS-only for v1: certificate trust uses the macOS login
-// keychain, Safari is configured via `networksetup`, and browser launching uses
-// macOS app conventions. Other platforms are scoped as future work (design spec
-// §16). Fail the build with a clear message rather than a confusing
-// missing-symbol error on the platform-specific helpers.
-#[cfg(not(target_os = "macos"))]
-compile_error!(
-    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
-     networksetup). Cross-platform support is tracked as future work in the \
-     design spec (§16)."
-);
-
 use std::sync::Arc;
 
 use error_stack::ResultExt as _;

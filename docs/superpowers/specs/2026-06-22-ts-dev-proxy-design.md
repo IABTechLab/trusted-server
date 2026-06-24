@@ -256,6 +256,13 @@ declares its **own** `[lints.clippy]`. Mirror the workspace posture (deny
 user-facing output through a thin helper (with a local
 `#![allow(clippy::print_stdout)]` if that restriction lint is enabled).
 
+Scope every dependency to macOS (`[target.'cfg(target_os = "macos")'.dependencies]`)
+and place the platform `compile_error!` (§16) at the **crate root** (`lib.rs`),
+gating the command modules behind `#[cfg(target_os = "macos")]`. Together these
+ensure an accidental wasm build (the repo default) compiles nothing but the
+single clear "macOS only" error — never a cascade of failed `tokio`/`ring`/
+`aws-lc-sys` builds for a target they don't support.
+
 ---
 
 ## 7. Local Certificate Authority
@@ -640,8 +647,9 @@ Steps 1–4 already deliver a usable tool; each step is independently shippable.
 - **WebSocket / non-HTTP upgrades** through the MITM tunnel.
 - **Response rewriting / fixture injection** (mock upstreams, latency).
 - **Multiple simultaneous upstreams per host** (A/B / weighted).
-- **Windows/Linux support.** v1 is macOS-only — the crate is gated to
-  `target_os = "macos"` (`compile_error!` elsewhere) because CA trust, Safari
-  automation, and browser launching all rely on macOS tooling (login keychain,
-  `networksetup`). Cross-platform trust + Safari automation is future work.
+- **Windows/Linux support.** v1 is macOS-only — deps are scoped to
+  `target_os = "macos"` and the crate root carries a `compile_error!` for other
+  targets (§6), because CA trust, Safari automation, and browser launching all
+  rely on macOS tooling (login keychain, `networksetup`). Cross-platform trust +
+  Safari automation is future work.
 - **Recording/replay** of proxied traffic.
