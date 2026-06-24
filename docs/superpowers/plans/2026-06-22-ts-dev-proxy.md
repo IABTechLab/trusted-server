@@ -15,7 +15,7 @@
 - No `unwrap()`/`panic!`/`println!`/`eprintln!` in non-test code: use `expect("should …")` only where truly infallible, `error-stack` `Report<E>` for fallible paths, `log::*` for instrumentation, and a single binary-scoped output helper (`#![allow(clippy::print_stdout)]` only in that helper module) for user-facing stdout.
 - Errors: concrete enums with `derive_more::Display` + `impl core::error::Error`; `ensure!`/`bail!`; `change_context`/`attach`. Import `Error` from `core::error`.
 - Example/fictional data only in tests/docs (e.g. `www.example-publisher.com`, `*.edgecompute.app`, `example.com`). No real domains/credentials.
-- Default `Host` upstream is **`FROM`** (preserve production host); bare `--rewrite-host` sends `Host = TO`; `--rewrite-host <HOST>` sends `Host = SNI = <HOST>` (so `TO` may be a bare IP). SNI is the `TO` host (or the explicit `<HOST>`), **port stripped**.
+- Default `Host` upstream is **`FROM`** (preserve production host); `--rewrite-host` sends `Host = TO`. SNI is always the `TO` host, **port stripped**. To reach a server by IP, keep `TO` a hostname and pin its connection with `--resolve HOST:IP`.
 - Proxy binds **loopback only** unless `--allow-non-loopback`; off loopback, unmatched `CONNECT` is refused `403` (never blind-tunneled).
 - CA: CN `Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION`; key file `0600`, dir `0700`; never committed; leaf SAN = host, validity ≤ 90 days; ALPN `http/1.1`.
 - Commit after every green step. Commit subjects: sentence case, imperative, no semantic prefixes, no AI bylines.
@@ -302,9 +302,9 @@ pub struct ProxyArgs {
     #[arg(short = 'f', long = "from", value_name = "HOST")]
     pub from: Option<String>,
 
-    /// Shorthand single-rule TO (`HOST[:PORT]` or `IP[:PORT]`; pairs with
-    /// `--from`). When TO is a bare IP, pass `--rewrite-host <HOST>` so the TLS
-    /// SNI and `Host` header target the right vhost.
+    /// Shorthand single-rule TO (`HOST[:PORT]`; pairs with `--from`). Keep it a
+    /// hostname so the TLS SNI/certificate stay valid; pin a connection address
+    /// with `--resolve` to reach a specific server by IP.
     #[arg(short = 't', long = "to", value_name = "HOST[:PORT]")]
     pub to: Option<String>,
 
@@ -320,12 +320,17 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "LIST")]
     pub launch: Option<String>,
 
-    /// Rewrite the upstream `Host` header (and TLS SNI). Omit to keep the
-    /// default `Host: <FROM>`; bare `--rewrite-host` sends `Host: <TO>`;
-    /// `--rewrite-host <HOST>` sends `Host: <HOST>` and uses `<HOST>` for SNI
-    /// (needed when `--to` is a bare IP address).
-    #[arg(long, value_name = "HOST", num_args = 0..=1)]
-    pub rewrite_host: Option<Option<String>>,
+    /// Send `Host: <TO>` upstream instead of the default `<FROM>`. The TLS SNI is
+    /// always the `--to` host; to reach a server by address, pin it with
+    /// `--resolve`.
+    #[arg(long)]
+    pub rewrite_host: bool,
+
+    /// Pin a host's upstream connection to an address instead of DNS (repeatable;
+    /// like curl's `--resolve`). Keeps `--to` a hostname while the socket dials
+    /// the given IP. Format: `HOST:IP`.
+    #[arg(long = "resolve", value_name = "HOST:IP")]
+    pub resolve: Vec<String>,
 
     /// Inject `Authorization: Basic …` (convenience only — visible in `ps`).
     #[arg(long, value_name = "USER:PASS")]
@@ -429,8 +434,7 @@ Pure logic, no I/O. Implements spec §8.1–§8.4. This is the most heavily unit
 
 - Produces:
   - `struct Authority { host: String, port: u16, default_port: u16 }` with `fn host(&self) -> &str`, `fn is_default_port(&self) -> bool` (port equals the scheme default it was parsed with), `fn host_with_port(&self) -> String` (host, plus `:port` only when non-default), `fn parse(raw: &str, plaintext: bool) -> Result<Authority, RuleError>`.
-  - `enum HostMode { PreserveFrom, UseTo, Explicit(String) }` — how a rule derives the upstream `Host` header and TLS SNI.
-  - `struct Rule { from: String, to: Authority, host_mode: HostMode, plaintext: bool }`.
+  - `struct Rule { from: String, to: Authority, rewrite_host: bool, plaintext: bool }` — `rewrite_host` false (default) sends `Host: FROM`, true sends `Host: TO`; SNI is always the `TO` host.
   - `struct RuleTable(Vec<Rule>)` with `fn first_match(&self, host: &str) -> Option<&Rule>`.
   - `struct RewriteOutcome { sni: String, host_header: String, orig_host: String, scheme_is_tls: bool }`.
   - `fn rewrite_for(rule: &Rule) -> RewriteOutcome`.
@@ -443,11 +447,11 @@ Pure logic, no I/O. Implements spec §8.1–§8.4. This is the most heavily unit
 mod tests {
     use super::*;
 
-    fn rule(from: &str, to: &str, host_mode: HostMode, plaintext: bool) -> Rule {
+    fn rule(from: &str, to: &str, rewrite_host: bool, plaintext: bool) -> Rule {
         Rule {
             from: from.to_string(),
             to: Authority::parse(to, plaintext).expect("should parse authority"),
-            host_mode,
+            rewrite_host,
             plaintext,
         }
     }
@@ -491,7 +495,7 @@ mod tests {
 
     #[test]
     fn matching_is_case_insensitive_and_port_stripped() {
-        let table = RuleTable(vec![rule("www.example-publisher.com", "to.edgecompute.app", HostMode::PreserveFrom, false)]);
+        let table = RuleTable(vec![rule("www.example-publisher.com", "to.edgecompute.app", false, false)]);
         let m = table.first_match("WWW.Example-Publisher.COM:443").expect("should match");
         assert_eq!(m.from, "www.example-publisher.com", "match ignores case and port");
         assert!(table.first_match("other.example.com").is_none(), "unmatched host returns None");
@@ -500,15 +504,15 @@ mod tests {
     #[test]
     fn first_match_wins() {
         let table = RuleTable(vec![
-            rule("a.example.com", "first.edgecompute.app", HostMode::PreserveFrom, false),
-            rule("a.example.com", "second.edgecompute.app", HostMode::PreserveFrom, false),
+            rule("a.example.com", "first.edgecompute.app", false, false),
+            rule("a.example.com", "second.edgecompute.app", false, false),
         ]);
         assert_eq!(table.first_match("a.example.com").expect("should match").to.host(), "first.edgecompute.app");
     }
 
     #[test]
     fn rewrite_default_preserves_from_host_and_sets_sni_to_to() {
-        let r = rule("www.example-publisher.com", "to.edgecompute.app:8443", HostMode::PreserveFrom, false);
+        let r = rule("www.example-publisher.com", "to.edgecompute.app:8443", false, false);
         let out = rewrite_for(&r);
         assert_eq!(out.sni, "to.edgecompute.app", "SNI is TO host only, no port");
         assert_eq!(out.host_header, "www.example-publisher.com", "default Host is FROM");
@@ -517,20 +521,10 @@ mod tests {
 
     #[test]
     fn rewrite_host_uses_to_authority_with_port() {
-        let r = rule("www.example-publisher.com", "localhost:3000", HostMode::UseTo, true);
+        let r = rule("www.example-publisher.com", "localhost:3000", true, true);
         let out = rewrite_for(&r);
         assert_eq!(out.sni, "localhost", "SNI never carries a port");
         assert_eq!(out.host_header, "localhost:3000", "rewrite-host sends TO host:port");
-        assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host stays FROM");
-    }
-
-    #[test]
-    fn explicit_rewrite_host_overrides_host_and_sni_for_ip_upstream() {
-        // TO is a bare IP; an explicit --rewrite-host drives both Host and SNI.
-        let r = rule("www.example-publisher.com", "192.0.2.10", HostMode::Explicit("app.edgecompute.app".to_string()), false);
-        let out = rewrite_for(&r);
-        assert_eq!(out.sni, "app.edgecompute.app", "SNI is the explicit host, not the IP");
-        assert_eq!(out.host_header, "app.edgecompute.app", "Host header is the explicit host");
         assert_eq!(out.orig_host, "www.example-publisher.com", "X-Orig-Host stays FROM");
     }
 }
@@ -619,29 +613,17 @@ impl Authority {
     }
 }
 
-/// How a rule derives the upstream `Host` header and TLS SNI (spec §8.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HostMode {
-    /// Default: send `Host: FROM` (preserve the production host); SNI is the
-    /// `TO` host.
-    PreserveFrom,
-    /// Bare `--rewrite-host`: send `Host: TO`; SNI is the `TO` host.
-    UseTo,
-    /// `--rewrite-host <HOST>`: send `Host: <HOST>` and present `<HOST>` as the
-    /// TLS SNI, while still connecting to `TO`. Lets `TO` be a bare IP address
-    /// whose endpoint routes and serves certificates by hostname.
-    Explicit(String),
-}
-
 /// A single rewrite rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
     /// Production hostname to match (stored lowercase, port-stripped).
     pub from: String,
-    /// Upstream connection target (a hostname or a bare IP address).
+    /// Upstream target — kept a hostname so the SNI/certificate stay valid; the
+    /// actual connection address may be pinned via `--resolve`.
     pub to: Authority,
-    /// How the upstream `Host` header and TLS SNI are derived.
-    pub host_mode: HostMode,
+    /// `--rewrite-host`: when true, send `Host: TO`; otherwise (default) send
+    /// `Host: FROM`. The TLS SNI is always the `TO` host either way.
+    pub rewrite_host: bool,
     /// Connect to the upstream over plaintext HTTP.
     pub plaintext: bool,
 }
@@ -666,8 +648,7 @@ impl RuleTable {
 /// The header/SNI decisions for a matched rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteOutcome {
-    /// SNI to present upstream — the `TO` host, or the explicit
-    /// `--rewrite-host` value; never carries a port.
+    /// SNI to present upstream — always the `TO` host; never carries a port.
     pub sni: String,
     /// Value for the upstream `Host` header.
     pub host_header: String,
@@ -680,15 +661,15 @@ pub struct RewriteOutcome {
 /// Computes the rewrite outcome for a matched rule (spec §8.3).
 #[must_use]
 pub fn rewrite_for(rule: &Rule) -> RewriteOutcome {
-    // `Host` and SNI are independent of the connection target (the caller dials
-    // `rule.to`), so an explicit host overrides both while `TO` can stay an IP.
-    let (host_header, sni) = match &rule.host_mode {
-        HostMode::PreserveFrom => (rule.from.clone(), rule.to.host().to_string()),
-        HostMode::UseTo => (rule.to.host_with_port(), rule.to.host().to_string()),
-        HostMode::Explicit(host) => (host.clone(), host.clone()),
+    // SNI is always the TO host (the connection address may be pinned separately
+    // via `--resolve`); only the `Host` header depends on `rewrite_host`.
+    let host_header = if rule.rewrite_host {
+        rule.to.host_with_port()
+    } else {
+        rule.from.clone()
     };
     RewriteOutcome {
-        sni,
+        sni: rule.to.host().to_string(),
         host_header,
         orig_host: rule.from.clone(),
         scheme_is_tls: !rule.plaintext,
@@ -728,7 +709,7 @@ Turns `ProxyArgs` into a `ResolvedConfig` holding a `RuleTable` and effective se
 
 - Consumes: `ProxyArgs` (Task 1), `Rule`/`RuleTable`/`Authority`/`RuleError` (Task 2).
 - Produces:
-  - `struct ResolvedConfig { rules: RuleTable, listen: SocketAddr, allow_non_loopback: bool, launch: Vec<Browser>, insecure: bool, basic_auth: Option<BasicAuth>, ca_dir: PathBuf }`.
+  - `struct ResolvedConfig { rules: RuleTable, listen: SocketAddr, allow_non_loopback: bool, launch: Vec<Browser>, insecure: bool, basic_auth: Option<BasicAuth>, ca_dir: PathBuf, resolve: HashMap<String, IpAddr> }`.
   - `struct BasicAuth { user: String, pass: String }` with `fn header_value(&self) -> String` (returns `Basic base64(user:pass)`).
   - `enum Browser { Chrome, Firefox, Safari }` with `fn parse_list(raw: &str) -> Result<Vec<Browser>, ConfigError>`.
   - `fn resolve(args: &ProxyArgs) -> error_stack::Result<ResolvedConfig, ConfigError>`.
@@ -751,39 +732,38 @@ mod tests {
     }
 
     #[test]
-    fn single_rule_from_to_defaults_to_preserve_host() {
+    fn single_rule_from_to_keeps_from_host_by_default() {
         let mut args = base_args();
         args.from = Some("www.example-publisher.com".into());
         args.to = Some("to.edgecompute.app".into());
         let cfg = resolve(&args).expect("should resolve");
         let rule = cfg.rules.first_match("www.example-publisher.com").expect("rule present");
-        assert_eq!(rule.host_mode, HostMode::PreserveFrom, "default preserves FROM host");
+        assert!(!rule.rewrite_host, "default preserves FROM host");
         assert_eq!(rule.to.host(), "to.edgecompute.app");
     }
 
     #[test]
-    fn bare_rewrite_host_uses_to() {
+    fn rewrite_host_uses_to() {
         let mut args = base_args();
         args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        // Bare `--rewrite-host` (present, no value) parses to `Some(None)`.
-        args.rewrite_host = Some(None);
+        args.rewrite_host = true;
         let cfg = resolve(&args).expect("should resolve");
-        assert_eq!(
-            cfg.rules.first_match("www.example-publisher.com").expect("rule").host_mode,
-            HostMode::UseTo,
-            "bare --rewrite-host sends Host: TO",
+        assert!(
+            cfg.rules.first_match("www.example-publisher.com").expect("rule").rewrite_host,
+            "--rewrite-host sends Host: TO",
         );
     }
 
     #[test]
-    fn rewrite_host_with_value_is_explicit_for_ip_to() {
+    fn resolve_pins_host_to_ip() {
         let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=192.0.2.10".into()];
-        args.rewrite_host = Some(Some("app.edgecompute.app".into()));
+        args.map = vec!["www.example-publisher.com=ts.edgecompute.app".into()];
+        args.resolve = vec!["ts.edgecompute.app:192.0.2.10".into()];
         let cfg = resolve(&args).expect("should resolve");
         assert_eq!(
-            cfg.rules.first_match("www.example-publisher.com").expect("rule").host_mode,
-            HostMode::Explicit("app.edgecompute.app".to_string()),
+            cfg.resolve.get("ts.edgecompute.app"),
+            Some(&"192.0.2.10".parse().expect("ipv4")),
+            "--resolve pins the lowercased host to the address",
         );
     }
 
@@ -829,6 +809,7 @@ Expected: FAIL to compile.
 ```rust
 //! Resolves `ProxyArgs` (+ env, defaults) into a concrete [`ResolvedConfig`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
@@ -836,7 +817,7 @@ use base64::Engine as _;
 use error_stack::{Report, ResultExt as _};
 
 use super::ProxyArgs;
-use super::rewrite::{Authority, HostMode, Rule, RuleTable};
+use super::rewrite::{Authority, Rule, RuleTable};
 
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
@@ -850,9 +831,9 @@ pub enum ConfigError {
     /// A rule `FROM` value was not a bare hostname.
     #[display("invalid FROM host `{value}` (expected a hostname: letters, digits, '-', '.')")]
     InvalidFrom { value: String },
-    /// The `--rewrite-host <HOST>` value was not a valid hostname.
-    #[display("invalid --rewrite-host `{value}` (expected a hostname: letters, digits, '-', '.')")]
-    InvalidRewriteHost { value: String },
+    /// A `--resolve` value was not `HOST:IP` with a valid hostname and IP.
+    #[display("invalid --resolve `{value}` (expected HOST:IP, e.g. ts.example.com:192.0.2.10)")]
+    Resolve { value: String },
     /// `--listen` was not a valid socket address.
     #[display("invalid --listen address `{value}`")]
     Listen { value: String },
@@ -931,6 +912,8 @@ pub struct ResolvedConfig {
     pub insecure: bool,
     pub basic_auth: Option<BasicAuth>,
     pub ca_dir: PathBuf,
+    /// `--resolve` DNS pins: lowercase hostname → connection address.
+    pub resolve: HashMap<String, IpAddr>,
 }
 
 /// Default CA directory (spec §7.1/§12): `$XDG_DATA_HOME/trusted-server/dev-proxy`,
@@ -956,37 +939,40 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
     args.ca_dir.as_ref().map_or_else(default_ca_dir, PathBuf::from)
 }
 
-/// Resolves the `--rewrite-host` flag into a [`HostMode`] applied to every rule:
-/// absent → preserve `FROM`; bare → use `TO`; with a value → that explicit host
-/// (validated, lowercased) for both the `Host` header and the TLS SNI.
-fn host_mode(args: &ProxyArgs) -> Result<HostMode, ConfigError> {
-    match &args.rewrite_host {
-        None => Ok(HostMode::PreserveFrom),
-        Some(None) => Ok(HostMode::UseTo),
-        Some(Some(host)) => {
-            let host = host.to_ascii_lowercase();
-            if !is_valid_host(&host) {
-                return Err(ConfigError::InvalidRewriteHost { value: host });
-            }
-            Ok(HostMode::Explicit(host))
-        }
-    }
-}
-
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
-    let mode = host_mode(args)?;
+    // `--rewrite-host` only chooses the `Host` header; the SNI always follows TO.
     for entry in &args.map {
         let (from, to) = entry.split_once('=').ok_or(ConfigError::Rule)?;
-        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
+        rules.push(make_rule(from, to, args.rewrite_host, args.upstream_plaintext)?);
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
-        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
+        rules.push(make_rule(from, to, args.rewrite_host, args.upstream_plaintext)?);
     }
     Ok(RuleTable(rules))
 }
 
-fn make_rule(from: &str, to: &str, host_mode: HostMode, plaintext: bool) -> Result<Rule, ConfigError> {
+/// Parses `--resolve HOST:IP` entries into a lowercase-host → address map.
+/// Splits on the first `:` so the (possibly IPv6) address keeps its colons.
+fn build_resolve(args: &ProxyArgs) -> Result<HashMap<String, IpAddr>, ConfigError> {
+    let mut map = HashMap::new();
+    for entry in &args.resolve {
+        let (host, ip) = entry.split_once(':').ok_or_else(|| ConfigError::Resolve {
+            value: entry.clone(),
+        })?;
+        let host = host.to_ascii_lowercase();
+        let ip: IpAddr = ip.parse().map_err(|_| ConfigError::Resolve {
+            value: entry.clone(),
+        })?;
+        if !is_valid_host(&host) {
+            return Err(ConfigError::Resolve { value: entry.clone() });
+        }
+        map.insert(host, ip);
+    }
+    Ok(map)
+}
+
+fn make_rule(from: &str, to: &str, rewrite_host: bool, plaintext: bool) -> Result<Rule, ConfigError> {
     let to = Authority::parse(to, plaintext).map_err(|_| ConfigError::Rule)?;
     let from = from.to_ascii_lowercase();
     // FROM is interpolated into the generated PAC JavaScript and matched against
@@ -995,7 +981,7 @@ fn make_rule(from: &str, to: &str, host_mode: HostMode, plaintext: bool) -> Resu
     if !is_valid_host(&from) {
         return Err(ConfigError::InvalidFrom { value: from });
     }
-    Ok(Rule { from, to, host_mode, plaintext })
+    Ok(Rule { from, to, rewrite_host, plaintext })
 }
 
 /// Returns whether `host` is a plausible bare hostname (letters, digits, `-`,
@@ -1036,6 +1022,7 @@ pub fn resolve(args: &ProxyArgs) -> error_stack::Result<ResolvedConfig, ConfigEr
 
     let basic_auth = resolve_basic_auth(args).map_err(Report::from)?;
     let ca_dir = ca_dir(args);
+    let resolve = build_resolve(args).map_err(Report::from)?;
 
     Ok(ResolvedConfig {
         rules,
@@ -1045,6 +1032,7 @@ pub fn resolve(args: &ProxyArgs) -> error_stack::Result<ResolvedConfig, ConfigEr
         insecure: args.insecure,
         basic_auth,
         ca_dir,
+        resolve,
     })
 }
 
@@ -1412,7 +1400,7 @@ async fn matched_host_is_rewritten_and_forwarded() {
     let upstream = start_echo_upstream().await;
 
     // Build a ResolvedConfig mapping FROM=www.example-publisher.com to the
-    // upstream addr, host_mode = PreserveFrom (default), insecure = true.
+    // upstream addr, rewrite_host = false (default), insecure = true.
     let cfg = test_config(&upstream.addr);
     // CA + helpers come from the lib target (Task 1 added `src/lib.rs`):
     // use trusted_server_cli::commands::dev::proxy::{ca, config, server};
@@ -1633,14 +1621,14 @@ Implements spec §9 and §4.2/§7.3.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::dev::proxy::rewrite::{Authority, HostMode, Rule, RuleTable};
+    use crate::commands::dev::proxy::rewrite::{Authority, Rule, RuleTable};
 
     #[test]
     fn pac_proxies_only_https_for_from_hosts() {
         let rules = RuleTable(vec![Rule {
             from: "www.example-publisher.com".into(),
             to: Authority::parse("to.edgecompute.app", false).expect("auth"),
-            host_mode: HostMode::PreserveFrom,
+            rewrite_host: false,
             plaintext: false,
         }]);
         let pac = generate_pac(&rules, "127.0.0.1:18080".parse().expect("addr"));
