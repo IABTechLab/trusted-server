@@ -17,6 +17,7 @@ use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use crate::backend::BackendConfig;
+use trusted_server_core::auction::AuctionTelemetrySink;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
@@ -578,6 +579,7 @@ impl PlatformGeo for FastlyPlatformGeo {
 pub fn build_runtime_services(
     req: &Request,
     kv_store: Arc<dyn PlatformKvStore>,
+    auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
 ) -> RuntimeServices {
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
@@ -586,6 +588,7 @@ pub fn build_runtime_services(
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
+        .auction_telemetry_sink(auction_telemetry_sink)
         .client_info(client_info_from_request(req))
         .build()
 }
@@ -776,7 +779,11 @@ mod tests {
     #[test]
     fn build_runtime_services_client_info_is_none_without_tls() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(
+            &req,
+            noop_kv_store(),
+            Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink),
+        );
 
         assert!(
             services.client_info().tls_protocol.is_none(),
@@ -791,7 +798,11 @@ mod tests {
     #[test]
     fn build_runtime_services_returns_cloneable_services() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(
+            &req,
+            noop_kv_store(),
+            Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink),
+        );
         let cloned = services.clone();
 
         assert_eq!(

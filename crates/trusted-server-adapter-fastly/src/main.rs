@@ -64,6 +64,7 @@ mod middleware;
 mod platform;
 #[cfg(test)]
 mod route_tests;
+mod tinybird;
 
 use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
@@ -470,8 +471,11 @@ fn legacy_main(mut req: FastlyRequest) {
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     let device_signals = derive_device_signals(&req);
-    let runtime_services =
-        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
+    let runtime_services = build_runtime_services(
+        &req,
+        std::sync::Arc::clone(&state.default_kv_store),
+        std::sync::Arc::clone(&state.auction_telemetry_sink),
+    );
     let http_req = compat::from_fastly_request(req);
 
     let route_result = futures::executor::block_on(route_request(

@@ -32,7 +32,13 @@ use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
 use crate::auction::endpoints::{
     merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
 };
-use crate::auction::orchestrator::{AuctionOrchestrator, DispatchedAuction};
+use crate::auction::orchestrator::{
+    AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
+};
+use crate::auction::telemetry::{
+    build_auction_events, emit_auction_events_best_effort, AuctionObservationContext,
+    AuctionSource, AuctionTerminalOutcome,
+};
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
@@ -435,6 +441,10 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: Arc<Mutex<Option<String>>>,
+    /// Observation context for the in-flight auction.
+    pub(crate) auction_observation: Option<AuctionObservationContext>,
+    /// Auction request snapshot used for telemetry after collection.
+    pub(crate) auction_request: Option<AuctionRequest>,
     /// In-flight SSP bids dispatched before `pending_origin.wait()`.
     /// The streaming phase collects these and writes bids to `ad_bids_state`
     /// before processing the last body chunk, so `</body>` injection sees live bids.
@@ -556,6 +566,10 @@ pub async fn stream_publisher_body_async<W: Write>(
         // No auction — use the existing sync pipeline unchanged.
         return stream_publisher_body(body, output, params, settings, integration_registry);
     };
+    let telemetry = AuctionTelemetryCarry {
+        observation: params.auction_observation.take(),
+        auction_request: params.auction_request.take(),
+    };
 
     let is_html = is_html_content_type(&params.content_type);
 
@@ -573,6 +587,19 @@ pub async fn stream_publisher_body_async<W: Write>(
                 &make_collect_context(settings, services, &placeholder),
             )
             .await;
+        if let (Some(observation), Some(auction_request)) =
+            (telemetry.observation, telemetry.auction_request.as_ref())
+        {
+            let telemetry_batch = build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Completed {
+                    request: auction_request,
+                    result: &result,
+                },
+            );
+            emit_auction_events_best_effort(services, telemetry_batch).await;
+        }
+
         write_bids_to_state(
             &result.winning_bids,
             params.price_granularity,
@@ -585,7 +612,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     // HTML: build the processor once and drive it chunk by chunk.
     // One-behind buffer: stream chunk N-1 immediately; hold chunk N until origin
     // EOF, then await auction and process chunk N (which contains </body>).
-    let mut processor = create_html_stream_processor(
+    let mut processor = match create_html_stream_processor(
         &params.origin_host,
         &params.request_host,
         &params.request_scheme,
@@ -593,7 +620,19 @@ pub async fn stream_publisher_body_async<W: Write>(
         integration_registry,
         params.ad_slots_script.as_deref().map(str::to_string),
         params.ad_bids_state.clone(),
-    )?;
+    ) {
+        Ok(processor) => processor,
+        Err(err) => {
+            emit_abandoned_auction(
+                services,
+                telemetry.observation,
+                dispatched,
+                "processor_init_error",
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     let compression = Compression::from_content_encoding(&params.content_encoding);
     stream_html_with_auction_hold(
@@ -603,6 +642,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         compression,
         AuctionCollectCtx {
             dispatched,
+            telemetry,
             price_granularity: params.price_granularity,
             ad_bids_state: &params.ad_bids_state,
             orchestrator,
@@ -749,9 +789,25 @@ pub(crate) fn prepend_auction_debug_comment(
     }
 }
 
+/// Telemetry context carried from dispatch to collect.
+struct AuctionTelemetryCarry {
+    observation: Option<AuctionObservationContext>,
+    auction_request: Option<AuctionRequest>,
+}
+
+impl AuctionTelemetryCarry {
+    fn take(&mut self) -> Self {
+        Self {
+            observation: self.observation.take(),
+            auction_request: self.auction_request.take(),
+        }
+    }
+}
+
 /// Bundles the auction-collection dependencies passed through the streaming helpers.
 struct AuctionCollectCtx<'a> {
     dispatched: DispatchedAuction,
+    telemetry: AuctionTelemetryCarry,
     price_granularity: PriceGranularity,
     ad_bids_state: &'a Arc<Mutex<Option<String>>>,
     orchestrator: &'a AuctionOrchestrator,
@@ -879,6 +935,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
 ) -> Result<(), Report<TrustedServerError>> {
     let AuctionCollectCtx {
         dispatched,
+        mut telemetry,
         price_granularity,
         ad_bids_state,
         orchestrator,
@@ -898,6 +955,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                         .expect("should have dispatched auction to collect");
                     collect_stream_auction(
                         dispatched,
+                        telemetry.take(),
                         price_granularity,
                         ad_bids_state,
                         orchestrator,
@@ -934,14 +992,25 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
             Ok(n) => {
                 if let Some(hold_buffer) = hold.as_mut() {
                     let ready = hold_buffer.push(&buffer[..n]);
-                    write_processed_chunk(
+                    if let Err(err) = write_processed_chunk(
                         writer,
                         processor,
                         &ready,
                         false,
                         "Failed to process chunk",
                         "Failed to write chunk",
-                    )?;
+                    ) {
+                        if let Some(dispatched) = dispatched.take() {
+                            emit_abandoned_auction(
+                                services,
+                                telemetry.observation.take(),
+                                dispatched,
+                                "stream_process_error",
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
 
                     if hold_buffer.found_close() {
                         let dispatched = dispatched
@@ -949,6 +1018,7 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                             .expect("should have dispatched auction to collect");
                         collect_stream_auction(
                             dispatched,
+                            telemetry.take(),
                             price_granularity,
                             ad_bids_state,
                             orchestrator,
@@ -982,6 +1052,15 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
                 }
             }
             Err(e) => {
+                if let Some(dispatched) = dispatched.take() {
+                    emit_abandoned_auction(
+                        services,
+                        telemetry.observation.take(),
+                        dispatched,
+                        "stream_read_error",
+                    )
+                    .await;
+                }
                 return Err(Report::new(TrustedServerError::Proxy {
                     message: format!("Failed to read origin body: {e}"),
                 }));
@@ -995,8 +1074,32 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     Ok(())
 }
 
+async fn emit_abandoned_auction(
+    services: &RuntimeServices,
+    observation: Option<AuctionObservationContext>,
+    dispatched: DispatchedAuction,
+    reason: &'static str,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+    let (request, provider_responses, abandoned_providers, elapsed_ms) = dispatched.abandon();
+    let telemetry_batch = build_auction_events(
+        observation,
+        AuctionTerminalOutcome::Abandoned {
+            request: &request,
+            provider_responses: &provider_responses,
+            abandoned_providers: &abandoned_providers,
+            reason,
+            elapsed_ms,
+        },
+    );
+    emit_auction_events_best_effort(services, telemetry_batch).await;
+}
+
 async fn collect_stream_auction(
     dispatched: DispatchedAuction,
+    telemetry: AuctionTelemetryCarry,
     price_granularity: PriceGranularity,
     ad_bids_state: &Arc<Mutex<Option<String>>>,
     orchestrator: &AuctionOrchestrator,
@@ -1012,6 +1115,18 @@ async fn collect_stream_auction(
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
         .await;
+    if let (Some(observation), Some(auction_request)) =
+        (telemetry.observation, telemetry.auction_request.as_ref())
+    {
+        let telemetry_batch = build_auction_events(
+            observation,
+            AuctionTerminalOutcome::Completed {
+                request: auction_request,
+                result: &result,
+            },
+        );
+        emit_auction_events_best_effort(services, telemetry_batch).await;
+    }
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
         result.winning_bids.len()
@@ -1225,67 +1340,139 @@ pub async fn handle_publisher_request(
     // (User-Agent, x-forwarded-for, cookies, etc.).  The borrow ends when
     // dispatch_auction returns — DispatchedAuction holds no lifetime — so req
     // can be mutated and sent to origin immediately after.
-    let dispatched_auction = if should_run_auction {
-        let slots_ctx = MatchedSlotsContext {
-            matched_slots: &matched_slots,
-            request_path: &request_path,
-        };
-        let mut auction_request = build_auction_request(
-            &slots_ctx,
-            ec_id,
-            &consent_context,
-            &request_info,
-            req.headers()
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok()),
-        );
-        let ts_eids_value = cookie_jar
-            .as_ref()
-            .and_then(|j| j.get(COOKIE_TS_EIDS))
-            .map(|c| c.value().to_owned());
-        let client_eids = if ec_id.is_some() {
-            resolve_client_auction_eids(None, ts_eids_value.as_deref())
-        } else {
-            None
-        };
-        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
-        let merged_eids = merge_auction_eids(client_eids, kv_eids);
-        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-        auction_request.user.eids =
-            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-        if had_eids && auction_request.user.eids.is_none() {
-            log::warn!("Server-side auction EIDs stripped by TCF consent gating");
-        }
-        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
-        if client_ip.is_some() || geo.is_some() {
-            let device = auction_request.device.get_or_insert(DeviceInfo {
-                user_agent: None,
-                ip: None,
-                geo: None,
-            });
-            device.ip = client_ip;
-            device.geo = geo.clone();
-        }
-        let auction_context = AuctionContext {
-            settings,
-            request: &req,
-            timeout_ms: auction_timeout_ms,
-            provider_responses: None,
-            services,
-        };
-        auction
-            .orchestrator
-            .dispatch_auction(&auction_request, &auction_context)
-            .await
-    } else {
+    let mut auction_observation: Option<AuctionObservationContext> = None;
+    let mut auction_request_for_telemetry: Option<AuctionRequest> = None;
+    let mut dispatched_auction = if matched_slots.is_empty() {
         None
+    } else {
+        let observation = AuctionObservationContext::from_parts(
+            AuctionSource::InitialNavigation,
+            request_host,
+            &request_path,
+            matched_slots.len(),
+            ec_context,
+        );
+
+        if should_run_auction {
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &matched_slots,
+                request_path: &request_path,
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                ec_id,
+                &consent_context,
+                &request_info,
+                req.headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let ts_eids_value = cookie_jar
+                .as_ref()
+                .and_then(|j| j.get(COOKIE_TS_EIDS))
+                .map(|c| c.value().to_owned());
+            let client_eids = if ec_id.is_some() {
+                resolve_client_auction_eids(None, ts_eids_value.as_deref())
+            } else {
+                None
+            };
+            let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
+            let merged_eids = merge_auction_eids(client_eids, kv_eids);
+            let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+            auction_request.user.eids =
+                gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+            if had_eids && auction_request.user.eids.is_none() {
+                log::warn!("Server-side auction EIDs stripped by TCF consent gating");
+            }
+            let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
+            if client_ip.is_some() || geo.is_some() {
+                let device = auction_request.device.get_or_insert(DeviceInfo {
+                    user_agent: None,
+                    ip: None,
+                    geo: None,
+                });
+                device.ip = client_ip;
+                device.geo = geo.clone();
+            }
+            let auction_context = AuctionContext {
+                settings,
+                request: &req,
+                timeout_ms: auction_timeout_ms,
+                provider_responses: None,
+                services,
+            };
+            match auction
+                .orchestrator
+                .dispatch_auction(&auction_request, &auction_context)
+                .await
+            {
+                DispatchAuctionOutcome::Dispatched(dispatched) => {
+                    auction_request_for_telemetry = Some(auction_request);
+                    auction_observation = Some(observation);
+                    Some(dispatched)
+                }
+                DispatchAuctionOutcome::DispatchFailed {
+                    request,
+                    provider_responses,
+                    elapsed_ms,
+                } => {
+                    let telemetry_batch = build_auction_events(
+                        observation,
+                        AuctionTerminalOutcome::DispatchFailed {
+                            request: &request,
+                            provider_responses: &provider_responses,
+                            reason: "dispatch_failed",
+                            elapsed_ms,
+                        },
+                    );
+                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    None
+                }
+                DispatchAuctionOutcome::NotStarted => {
+                    let elapsed_ms = observation.elapsed_ms();
+                    let telemetry_batch = build_auction_events(
+                        observation,
+                        AuctionTerminalOutcome::DispatchFailed {
+                            request: &auction_request,
+                            provider_responses: &[],
+                            reason: "no_provider_dispatched",
+                            elapsed_ms,
+                        },
+                    );
+                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    None
+                }
+            }
+        } else {
+            let skip_reason = if !auction.orchestrator.is_enabled() {
+                "auction_disabled"
+            } else if !consent_allows_auction {
+                "consent_denied"
+            } else if is_bot {
+                "bot"
+            } else if is_prefetch {
+                "prefetch"
+            } else {
+                "not_ad_stack_eligible"
+            };
+            let elapsed_ms = observation.elapsed_ms();
+            let telemetry_batch = build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Skipped {
+                    reason: skip_reason,
+                    elapsed_ms,
+                },
+            );
+            emit_auction_events_best_effort(services, telemetry_batch).await;
+            None
+        }
     };
     log::info!(
         "dispatch_auction: {}",
         if dispatched_auction.is_some() {
             "Some — auction running async"
         } else {
-            "None — falling back to sync or skipped"
+            "None — not dispatched or skipped"
         }
     );
 
@@ -1307,14 +1494,27 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let mut response = services
+    let mut response = match services
         .http_client()
         .send(PlatformHttpRequest::new(req, backend_name))
         .await
-        .change_context(TrustedServerError::Proxy {
-            message: "Failed to proxy request to origin".to_string(),
-        })?
-        .response;
+    {
+        Ok(platform_response) => platform_response.response,
+        Err(err) => {
+            if let Some(dispatched) = dispatched_auction.take() {
+                emit_abandoned_auction(
+                    services,
+                    auction_observation.take(),
+                    dispatched,
+                    "origin_proxy_error",
+                )
+                .await;
+            }
+            return Err(err.change_context(TrustedServerError::Proxy {
+                message: "Failed to proxy request to origin".to_string(),
+            }));
+        }
+    };
 
     log::debug!(
         "Publisher origin response received: status={}, header_count={}",
@@ -1388,7 +1588,7 @@ pub async fn handle_publisher_request(
                 content_type,
                 status,
             );
-            if dispatched_auction.is_some() {
+            if let Some(dispatched) = dispatched_auction.take() {
                 // should_run_auction is decided from request signals before the
                 // origin content-type is known. A pass-through (2xx non-HTML)
                 // response has no `</body>` to inject bids into, so the dispatched
@@ -1398,6 +1598,13 @@ pub async fn handle_publisher_request(
                     content_type,
                     status,
                 );
+                emit_abandoned_auction(
+                    services,
+                    auction_observation.take(),
+                    dispatched,
+                    "pass_through_response",
+                )
+                .await;
             }
             let (parts, body) = response.into_parts();
             let response = Response::from_parts(parts, EdgeBody::empty());
@@ -1421,7 +1628,7 @@ pub async fn handle_publisher_request(
                     status,
                 );
             }
-            if dispatched_auction.is_some() {
+            if let Some(dispatched) = dispatched_auction.take() {
                 // Same wasted-dispatch case as the pass-through arm: an
                 // unprocessable/non-2xx response can't carry injected bids, so
                 // the in-flight SSP requests are left uncollected.
@@ -1430,6 +1637,13 @@ pub async fn handle_publisher_request(
                     content_type,
                     status,
                 );
+                emit_abandoned_auction(
+                    services,
+                    auction_observation.take(),
+                    dispatched,
+                    "buffered_unmodified_response",
+                )
+                .await;
             }
             Ok(PublisherResponse::Buffered(response))
         }
@@ -1455,6 +1669,8 @@ pub async fn handle_publisher_request(
                     content_type,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
+                    auction_observation,
+                    auction_request: auction_request_for_telemetry,
                     dispatched_auction,
                     price_granularity,
                 }),
@@ -1866,70 +2082,123 @@ pub async fn handle_page_bids(
     // skip the live auction, matching the existing bot/prefetch behaviour.
     let ad_stack_enabled = auction_enabled && consent_allows_auction;
 
-    let winning_bids = if ad_stack_enabled && !matched_slots.is_empty() && !is_bot && !is_prefetch {
-        let slots_ctx = MatchedSlotsContext {
-            matched_slots: &matched_slots,
-            request_path: &path_param,
-        };
-        let mut auction_request = build_auction_request(
-            &slots_ctx,
-            ec_id,
-            consent_context,
-            &request_info,
-            req.headers()
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok()),
-        );
-        let ts_eids_value = cookie_jar
-            .as_ref()
-            .and_then(|j| j.get(COOKIE_TS_EIDS))
-            .map(|c| c.value().to_owned());
-        let client_eids = if ec_id.is_some() {
-            resolve_client_auction_eids(None, ts_eids_value.as_deref())
-        } else {
-            None
-        };
-        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
-        let merged_eids = merge_auction_eids(client_eids, kv_eids);
-        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-        auction_request.user.eids =
-            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-        if had_eids && auction_request.user.eids.is_none() {
-            log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
-        }
-        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
-        if client_ip.is_some() || geo.is_some() {
-            let device = auction_request.device.get_or_insert(DeviceInfo {
-                user_agent: None,
-                ip: None,
-                geo: None,
-            });
-            device.ip = client_ip;
-            device.geo = geo.clone();
-        }
-        let timeout_ms = co_config
-            .auction_timeout_ms
-            .unwrap_or(settings.auction.timeout_ms);
-        let auction_context = AuctionContext {
-            settings,
-            request: &req,
-            timeout_ms,
-            provider_responses: None,
-            services,
-        };
-        match auction
-            .orchestrator
-            .run_auction(&auction_request, &auction_context)
-            .await
-        {
-            Ok(result) => result.winning_bids,
-            Err(e) => {
-                log::warn!("page-bids auction failed: {e:?}");
-                std::collections::HashMap::new()
-            }
-        }
-    } else {
+    let winning_bids = if matched_slots.is_empty() {
         std::collections::HashMap::new()
+    } else {
+        let observation = AuctionObservationContext::from_parts(
+            AuctionSource::SpaNavigation,
+            &request_info.host,
+            &path_param,
+            matched_slots.len(),
+            ec_context,
+        );
+        if ad_stack_enabled && !is_bot && !is_prefetch {
+            let slots_ctx = MatchedSlotsContext {
+                matched_slots: &matched_slots,
+                request_path: &path_param,
+            };
+            let mut auction_request = build_auction_request(
+                &slots_ctx,
+                ec_id,
+                consent_context,
+                &request_info,
+                req.headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok()),
+            );
+            let ts_eids_value = cookie_jar
+                .as_ref()
+                .and_then(|j| j.get(COOKIE_TS_EIDS))
+                .map(|c| c.value().to_owned());
+            let client_eids = if ec_id.is_some() {
+                resolve_client_auction_eids(None, ts_eids_value.as_deref())
+            } else {
+                None
+            };
+            let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
+            let merged_eids = merge_auction_eids(client_eids, kv_eids);
+            let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+            auction_request.user.eids =
+                gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+            if had_eids && auction_request.user.eids.is_none() {
+                log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
+            }
+            let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
+            if client_ip.is_some() || geo.is_some() {
+                let device = auction_request.device.get_or_insert(DeviceInfo {
+                    user_agent: None,
+                    ip: None,
+                    geo: None,
+                });
+                device.ip = client_ip;
+                device.geo = geo.clone();
+            }
+            let timeout_ms = co_config
+                .auction_timeout_ms
+                .unwrap_or(settings.auction.timeout_ms);
+            let auction_context = AuctionContext {
+                settings,
+                request: &req,
+                timeout_ms,
+                provider_responses: None,
+                services,
+            };
+            match auction
+                .orchestrator
+                .run_auction(&auction_request, &auction_context)
+                .await
+            {
+                Ok(result) => {
+                    let winning_bids = result.winning_bids.clone();
+                    let telemetry_batch = build_auction_events(
+                        observation,
+                        AuctionTerminalOutcome::Completed {
+                            request: &auction_request,
+                            result: &result,
+                        },
+                    );
+                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    winning_bids
+                }
+                Err(e) => {
+                    log::warn!("page-bids auction failed: {e:?}");
+                    let elapsed_ms = observation.elapsed_ms();
+                    let telemetry_batch = build_auction_events(
+                        observation,
+                        AuctionTerminalOutcome::ExecutionFailed {
+                            request: Some(&auction_request),
+                            provider_responses: &[],
+                            reason: "execution_failed",
+                            elapsed_ms,
+                        },
+                    );
+                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    std::collections::HashMap::new()
+                }
+            }
+        } else {
+            let skip_reason = if !auction_enabled {
+                "auction_disabled"
+            } else if !consent_allows_auction {
+                "consent_denied"
+            } else if is_bot {
+                "bot"
+            } else if is_prefetch {
+                "prefetch"
+            } else {
+                "not_ad_stack_eligible"
+            };
+            let elapsed_ms = observation.elapsed_ms();
+            let telemetry_batch = build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Skipped {
+                    reason: skip_reason,
+                    elapsed_ms,
+                },
+            );
+            emit_auction_events_best_effort(services, telemetry_batch).await;
+            std::collections::HashMap::new()
+        }
     };
 
     let bid_map = build_bid_map(
@@ -2100,6 +2369,8 @@ mod tests {
             content_type: "application/json".to_owned(),
             ad_slots_script: None,
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: Default::default(),
         }
@@ -2489,6 +2760,10 @@ mod tests {
         let ad_bids_state = Arc::new(Mutex::new(None));
         let ctx = AuctionCollectCtx {
             dispatched,
+            telemetry: AuctionTelemetryCarry {
+                observation: None,
+                auction_request: None,
+            },
             price_granularity: PriceGranularity::default(),
             ad_bids_state: &ad_bids_state,
             orchestrator: &orchestrator,
@@ -3160,6 +3435,8 @@ mod tests {
             content_type: "text/css".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -3205,6 +3482,8 @@ mod tests {
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -3245,6 +3524,8 @@ mod tests {
                     .to_string(),
             ),
             ad_bids_state: state,
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -3292,6 +3573,8 @@ mod tests {
             content_type: "text/html".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -3398,6 +3681,8 @@ mod tests {
             content_type: "text/html; charset=utf-8".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };
@@ -3452,6 +3737,8 @@ mod tests {
             content_type: "text/html".to_string(),
             ad_slots_script: None,
             ad_bids_state: Arc::new(Mutex::new(None)),
+            auction_observation: None,
+            auction_request: None,
             dispatched_auction: None,
             price_granularity: crate::price_bucket::PriceGranularity::default(),
         };

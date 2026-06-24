@@ -1,0 +1,22 @@
+DESCRIPTION >
+  Per-minute provider-call rollup target.
+
+SCHEMA >
+  `minute` DateTime,
+  `publisher_domain` String,
+  `auction_source` LowCardinality(String),
+  `provider` LowCardinality(String),
+  `provider_role` LowCardinality(String),
+  `requests` AggregateFunction(count),
+  `successes` AggregateFunction(sum, UInt64),
+  `nobids` AggregateFunction(sum, UInt64),
+  `errors` AggregateFunction(sum, UInt64),
+  `timeouts` AggregateFunction(sum, UInt64),
+  `abandonments` AggregateFunction(sum, UInt64),
+  `parsed_bids` AggregateFunction(sum, UInt64),
+  `latency_quantiles` AggregateFunction(quantiles(0.5, 0.95, 0.99), UInt32),
+  `event_date` Date DEFAULT toDate(minute)
+
+ENGINE "AggregatingMergeTree"
+ENGINE_SORTING_KEY "event_date, minute, publisher_domain, auction_source, provider, provider_role"
+TTL "event_date + INTERVAL 13 MONTH"
