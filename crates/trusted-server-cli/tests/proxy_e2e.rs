@@ -34,6 +34,34 @@ async fn matched_host_is_rewritten_and_forwarded() {
         support::FROM_HOST,
         "X-Orig-Host is FROM"
     );
+    assert_eq!(
+        response.seen_forwarded_host,
+        support::FROM_HOST,
+        "X-Forwarded-Host is FROM"
+    );
+}
+
+#[tokio::test]
+async fn rewrite_host_keeps_forwarded_host_on_from() {
+    let upstream = support::start_echo_upstream().await;
+    let cfg = support::test_config_rewrite_host(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let response = support::drive_request_through_proxy(cfg, ca).await;
+
+    assert_eq!(response.status, 200, "response streamed back");
+    assert_eq!(
+        response.seen_host,
+        upstream.addr.to_string(),
+        "--rewrite-host sends Host: TO"
+    );
+    // The point: TS anchors URL rewriting to X-Forwarded-Host, so it stays FROM
+    // even though Host is TO — keeping emitted first-party URLs on the prod host.
+    assert_eq!(
+        response.seen_forwarded_host,
+        support::FROM_HOST,
+        "X-Forwarded-Host stays FROM even with --rewrite-host"
+    );
 }
 
 #[tokio::test]

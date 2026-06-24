@@ -168,13 +168,14 @@ trust the new CA.
 
 ## Host header behavior
 
-By default the proxy sends `Host: <FROM>` (the production hostname) to the
-upstream. This is required for Trusted Server core to rewrite first-party URLs
-correctly: it anchors all HTML/URL rewriting to the inbound `Host`, so keeping
-`Host = FROM` ensures rewritten links stay on the production domain.
+The proxy always sends `X-Forwarded-Host: <FROM>` (the production hostname) — the
+standard "original host" header for a forward proxy. Trusted Server core anchors
+all HTML/URL rewriting to it (it prefers `X-Forwarded-Host`, then `Host`), so
+**first-party URLs always stay on the production domain regardless of the `Host`
+header**. That decouples routing (`Host`) from the first-party host.
 
-This works well against a Trusted Server Compute upstream because Fastly routes
-by SNI (`= TO`) and passes `Host` through to the application unchanged.
+By default `Host: <FROM>` too, which works against a Trusted Server Compute
+upstream because Fastly routes by SNI (`= TO`) and passes `Host` through unchanged.
 
 **Targeting a specific server by IP.** To point at a particular server or load
 balancer — for example when the `TO` hostname isn't in DNS yet — keep `--to` a
@@ -189,29 +190,28 @@ ts dev proxy \
   --launch chrome
 ```
 
-The proxy dials `192.0.2.10` while the SNI and `Host` stay
-`ts.example-publisher.com` (SNI) and `www.example-publisher.com` (`Host = FROM`,
-the default) — so TS still rewrites first-party URLs onto the production domain.
-This keeps the tool self-contained — no `/etc/hosts` edit. (Pointing `--to` at a
-bare IP instead would make the SNI an IP, which sends no SNI extension at all, so
-a host-routed endpoint serves its default vhost.) Add `--insecure` if the
-endpoint serves a certificate that doesn't match the hostname.
+The proxy dials `192.0.2.10` while the SNI stays `ts.example-publisher.com` and
+`X-Forwarded-Host` stays `www.example-publisher.com` — so TS rewrites first-party
+URLs onto the production domain. This keeps the tool self-contained — no
+`/etc/hosts` edit. (Pointing `--to` at a bare IP instead would make the SNI an IP,
+which sends no SNI extension at all, so a host-routed endpoint serves its default
+vhost.) Add `--insecure` if the endpoint serves a certificate that doesn't match
+the hostname.
 
-**Sending `Host: TO` instead.** Only if your upstream is **not** a Trusted Server
-and routes/validates on its _own_ hostname, pass `--rewrite-host` to send
-`Host: <TO>`. Avoid it for TS upstreams: TS anchors first-party URL rewriting to
-the inbound `Host`, so `Host = TO` rewrites links onto the `TO` host. The TLS SNI
-is always the `TO` host either way:
+**Sending `Host: TO`.** If your upstream routes or validates on its _own_
+hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pass
+`--rewrite-host` to send `Host: <TO>`. First-party URLs **still stay on `FROM`**
+because `X-Forwarded-Host` anchors them — so this is safe with Trusted Server
+upstreams too. The TLS SNI is always the `TO` host either way:
 
-| Form             | `Host` header | TLS SNI   |
-| ---------------- | ------------- | --------- |
-| _(omitted)_      | `FROM`        | `TO` host |
-| `--rewrite-host` | `TO` host     | `TO` host |
+| Form             | `Host` header | `X-Forwarded-Host` | TLS SNI   |
+| ---------------- | ------------- | ------------------ | --------- |
+| _(omitted)_      | `FROM`        | `FROM`             | `TO` host |
+| `--rewrite-host` | `TO` host     | `FROM`             | `TO` host |
 
-An `X-Orig-Host: <FROM>` header is always sent informally. **Port handling:** with
-`--rewrite-host` and a non-default `TO` port (e.g. `localhost:3000`), the port is
-included in the `Host` header but never in the SNI (a bare hostname; a port in SNI
-is invalid).
+**Port handling:** with `--rewrite-host` and a non-default `TO` port (e.g.
+`localhost:3000`), the port is included in the `Host` header but never in the SNI
+(a bare hostname; a port in SNI is invalid).
 
 ## Non-loopback listen
 

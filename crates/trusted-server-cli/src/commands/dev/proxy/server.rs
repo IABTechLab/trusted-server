@@ -30,6 +30,7 @@ use super::config::ResolvedConfig;
 use super::rewrite::rewrite_for;
 
 const X_ORIG_HOST: &str = "x-orig-host";
+const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 /// Binds the listen socket. Separate from [`serve_on`] so the caller can open
 /// the port (queueing connections) before launching browsers (spec §9, Task 6).
@@ -498,9 +499,9 @@ where
         .change_context(ProxyError::Server)
 }
 
-/// Applies the rewrite outcome: upstream `Host`, `X-Orig-Host`, and (only when
-/// absent) the injected `Authorization`. The request URI is left origin-form,
-/// which is what an HTTP/1.1 upstream expects.
+/// Applies the rewrite outcome: upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host`
+/// (both `FROM`), and (only when absent) the injected `Authorization`. The request
+/// URI is left origin-form, which is what an HTTP/1.1 upstream expects.
 fn rewrite_headers(
     headers: &mut hyper::HeaderMap,
     outcome: &super::rewrite::RewriteOutcome,
@@ -509,7 +510,12 @@ fn rewrite_headers(
     if let Ok(value) = HeaderValue::from_str(&outcome.host_header) {
         headers.insert(hyper::header::HOST, value);
     }
+    // Tell the upstream the original first-party host (always `FROM`). Trusted
+    // Server anchors its URL rewriting to `X-Forwarded-Host` (then `Host`), so
+    // this keeps emitted first-party URLs on the production host even when
+    // `--rewrite-host` sends `Host: TO` for routing/validation (spec §8.3).
     if let Ok(value) = HeaderValue::from_str(&outcome.orig_host) {
+        headers.insert(HeaderName::from_static(X_FORWARDED_HOST), value.clone());
         headers.insert(HeaderName::from_static(X_ORIG_HOST), value);
     }
     if let Some(auth) = basic_auth

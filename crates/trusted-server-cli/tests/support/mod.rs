@@ -22,6 +22,7 @@ pub struct ProxiedResponse {
     pub status: u16,
     pub seen_host: String,
     pub seen_orig_host: String,
+    pub seen_forwarded_host: String,
     pub path: String,
 }
 
@@ -52,6 +53,21 @@ pub fn dev_ca() -> ca::CertAuthority {
 pub fn test_config(addr: &SocketAddr) -> config::ResolvedConfig {
     let map = format!("{FROM_HOST}={}", addr);
     resolve(&["ts", "--map", &map, "--listen", "127.0.0.1:0", "--insecure"])
+}
+
+/// Like [`test_config`] but with `--rewrite-host`, so the upstream sees
+/// `Host: <TO>` while `X-Forwarded-Host` stays `FROM`.
+pub fn test_config_rewrite_host(addr: &SocketAddr) -> config::ResolvedConfig {
+    let map = format!("{FROM_HOST}={}", addr);
+    resolve(&[
+        "ts",
+        "--map",
+        &map,
+        "--rewrite-host",
+        "--listen",
+        "127.0.0.1:0",
+        "--insecure",
+    ])
 }
 
 /// Builds a config whose TO host is a **non-resolvable** name (`pinned.invalid`)
@@ -199,12 +215,13 @@ where
             .to_string();
         let host = header_value(&head, "host").unwrap_or_default();
         let orig_host = header_value(&head, "x-orig-host").unwrap_or_default();
+        let fwd_host = header_value(&head, "x-forwarded-host").unwrap_or_default();
         let has_auth = header_value(&head, "authorization").is_some();
 
         let (status_line, body) = if gated && !has_auth {
             ("HTTP/1.1 401 Unauthorized", String::new())
         } else {
-            let body = format!("host={host};orig={orig_host};path={path}");
+            let body = format!("host={host};orig={orig_host};fwd={fwd_host};path={path}");
             ("HTTP/1.1 200 OK", body)
         };
         let response = format!(
@@ -497,30 +514,34 @@ where
         body.extend_from_slice(&chunk[..n]);
     }
     let body = String::from_utf8_lossy(&body[..content_length.min(body.len())]).to_string();
-    let (seen_host, seen_orig_host, path) = parse_echo(&body);
+    let (seen_host, seen_orig_host, seen_forwarded_host, path) = parse_echo(&body);
     ProxiedResponse {
         status,
         seen_host,
         seen_orig_host,
+        seen_forwarded_host,
         path,
     }
 }
 
-/// Parses `host=..;orig=..;path=..` echoed by the upstream.
-fn parse_echo(body: &str) -> (String, String, String) {
+/// Parses `host=..;orig=..;fwd=..;path=..` echoed by the upstream.
+fn parse_echo(body: &str) -> (String, String, String, String) {
     let mut host = String::new();
     let mut orig = String::new();
+    let mut fwd = String::new();
     let mut path = String::new();
     for field in body.split(';') {
         if let Some(v) = field.strip_prefix("host=") {
             host = v.to_string();
         } else if let Some(v) = field.strip_prefix("orig=") {
             orig = v.to_string();
+        } else if let Some(v) = field.strip_prefix("fwd=") {
+            fwd = v.to_string();
         } else if let Some(v) = field.strip_prefix("path=") {
             path = v.to_string();
         }
     }
-    (host, orig, path)
+    (host, orig, fwd, path)
 }
 
 /// CONNECTs through the proxy to an UNMATCHED authority, completes the TLS
