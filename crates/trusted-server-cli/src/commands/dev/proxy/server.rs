@@ -57,6 +57,9 @@ pub async fn serve_on(
 ) -> Result<(), Report<ProxyError>> {
     let is_loopback = is_loopback(cfg.listen.ip());
     log::info!("listening on {}", cfg.listen);
+    for (host, ip) in &cfg.resolve {
+        log::info!("--resolve pin: {host} -> {ip}");
+    }
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -161,7 +164,7 @@ async fn handle_connection(
     }
     // Stray absolute-form plain HTTP.
     if is_loopback {
-        blind_forward_http(client, &head).await
+        blind_forward_http(client, &head, &cfg.resolve).await
     } else {
         respond_status_line(&mut client, StatusCode::FORBIDDEN).await
     }
@@ -196,7 +199,26 @@ async fn handle_connect(
     }
 
     // No match on loopback: connect upstream FIRST, then reply 200 (else 502).
-    blind_tunnel(client, &host, port).await
+    blind_tunnel(client, &host, port, &cfg.resolve).await
+}
+
+/// Opens an upstream TCP connection, honoring a `--resolve` pin for `host`.
+///
+/// When `host` (matched case-insensitively) has a pin, the socket dials that IP
+/// instead of resolving the name via DNS. The TLS SNI / `Host` set by the caller
+/// are unaffected, so the certificate still validates against the hostname.
+async fn connect_upstream(
+    host: &str,
+    port: u16,
+    resolve: &HashMap<String, IpAddr>,
+) -> std::io::Result<TcpStream> {
+    if !resolve.is_empty()
+        && let Some(ip) = resolve.get(&host.to_ascii_lowercase())
+    {
+        log::debug!("--resolve {host}:{port} -> {ip}:{port}");
+        return TcpStream::connect((*ip, port)).await;
+    }
+    TcpStream::connect((host, port)).await
 }
 
 /// Connects to the upstream first; on success replies `200` then pipes bytes
@@ -205,8 +227,9 @@ async fn blind_tunnel(
     mut client: TcpStream,
     host: &str,
     port: u16,
+    resolve: &HashMap<String, IpAddr>,
 ) -> Result<(), Report<ProxyError>> {
-    let mut upstream = match TcpStream::connect((host, port)).await {
+    let mut upstream = match connect_upstream(host, port, resolve).await {
         Ok(stream) => stream,
         Err(err) => {
             log::warn!("blind tunnel to {host}:{port} failed: {err}");
@@ -267,6 +290,7 @@ async fn serve_pac(client: &mut TcpStream, pac: &str) -> Result<(), Report<Proxy
 async fn blind_forward_http(
     mut client: TcpStream,
     head: &RequestHead,
+    resolve: &HashMap<String, IpAddr>,
 ) -> Result<(), Report<ProxyError>> {
     let Ok(uri) = head.target.parse::<Uri>() else {
         return respond_status_line(&mut client, StatusCode::BAD_REQUEST).await;
@@ -275,7 +299,7 @@ async fn blind_forward_http(
         return respond_status_line(&mut client, StatusCode::BAD_REQUEST).await;
     };
     let port = uri.port_u16().unwrap_or(80);
-    let mut upstream = match TcpStream::connect((host, port)).await {
+    let mut upstream = match connect_upstream(host, port, resolve).await {
         Ok(stream) => stream,
         Err(err) => {
             log::warn!("plain-HTTP forward to {host}:{port} failed: {err}");
@@ -432,14 +456,9 @@ async fn proxy_to_upstream(
 
     // Dial the `--resolve` pin when the upstream host has one; the SNI/`Host`
     // (set above) stay the hostname, so the certificate still validates.
-    let tcp = match resolve.get(upstream_host) {
-        Some(ip) => {
-            log::debug!("--resolve {upstream_host} -> {ip}");
-            TcpStream::connect((*ip, upstream_port)).await
-        }
-        None => TcpStream::connect((upstream_host, upstream_port)).await,
-    }
-    .change_context(ProxyError::Server)?;
+    let tcp = connect_upstream(upstream_host, upstream_port, resolve)
+        .await
+        .change_context(ProxyError::Server)?;
 
     let response = if outcome.scheme_is_tls {
         let connector = TlsConnector::from(client_config(insecure));
