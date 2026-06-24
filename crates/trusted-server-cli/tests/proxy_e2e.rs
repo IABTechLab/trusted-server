@@ -37,6 +37,27 @@ async fn matched_host_is_rewritten_and_forwarded() {
 }
 
 #[tokio::test]
+async fn resolve_pins_connection_to_address() {
+    let upstream = support::start_echo_upstream().await;
+    // The TO host is `pinned.invalid` (never DNS-resolvable); `--resolve` sends
+    // the connection to the real upstream, so a 200 proves the pin is honored.
+    let cfg = support::test_config_with_resolve(&upstream.addr);
+    let ca = Arc::new(support::dev_ca());
+
+    let response = support::drive_request_through_proxy(cfg, ca).await;
+
+    assert_eq!(
+        response.status, 200,
+        "a non-resolvable TO host still reaches the upstream via --resolve"
+    );
+    assert_eq!(
+        response.seen_host,
+        support::FROM_HOST,
+        "Host stays FROM (no --rewrite-host)"
+    );
+}
+
+#[tokio::test]
 async fn unmatched_host_is_blind_tunneled_on_loopback() {
     let upstream = support::start_echo_upstream().await;
     let cfg = support::test_config_without_rules();

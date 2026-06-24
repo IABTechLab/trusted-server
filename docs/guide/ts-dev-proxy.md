@@ -176,49 +176,42 @@ correctly: it anchors all HTML/URL rewriting to the inbound `Host`, so keeping
 This works well against a Trusted Server Compute upstream because Fastly routes
 by SNI (`= TO`) and passes `Host` through to the application unchanged.
 
-If your upstream validates or routes on its own hostname, pass bare
-`--rewrite-host`:
-
-```bash
-ts dev proxy \
-  --map www.example-publisher.com=staging.example.net \
-  --rewrite-host \
-  --launch chrome
-```
-
-With bare `--rewrite-host`, the proxy sends `Host: staging.example.net` (the
-`TO` host). An `X-Orig-Host: www.example-publisher.com` header is always sent
-informally.
-
-`--rewrite-host` controls both the upstream `Host` header **and** the TLS SNI:
-
-| Form                    | `Host` header | TLS SNI   |
-| ----------------------- | ------------- | --------- |
-| _(omitted)_             | `FROM`        | `TO` host |
-| `--rewrite-host`        | `TO` host     | `TO` host |
-| `--rewrite-host <HOST>` | `<HOST>`      | `<HOST>`  |
-
-**Targeting an IP upstream.** To reach a specific server or load balancer by
-address, set `--to` to a bare IP and pass `--rewrite-host <HOST>` with the
-hostname that endpoint expects. The proxy dials the IP but presents `<HOST>` for
-both SNI and `Host`:
+**Targeting a specific server by IP.** To point at a particular server or load
+balancer — for example when the `TO` hostname isn't in DNS yet — keep `--to` a
+hostname (so the TLS SNI and certificate stay valid) and pin its connection
+address with `--resolve HOST:IP` (like curl's `--resolve`, repeatable):
 
 ```bash
 ts dev proxy \
   --from www.example-publisher.com \
-  --to 192.0.2.10 \
-  --rewrite-host app.edgecompute.app \
+  --to ts.example-publisher.com \
+  --resolve ts.example-publisher.com:192.0.2.10 \
   --launch chrome
 ```
 
-Without the explicit `<HOST>`, the SNI would be the IP itself — which sends no
-SNI extension at all, so a host-routed endpoint serves its default vhost. Add
-`--insecure` if the IP serves a certificate that doesn't match `<HOST>`.
+The proxy dials `192.0.2.10` while the SNI and `Host` stay
+`ts.example-publisher.com` (SNI) and `www.example-publisher.com` (`Host = FROM`,
+the default) — so TS still rewrites first-party URLs onto the production domain.
+This keeps the tool self-contained — no `/etc/hosts` edit. (Pointing `--to` at a
+bare IP instead would make the SNI an IP, which sends no SNI extension at all, so
+a host-routed endpoint serves its default vhost.) Add `--insecure` if the
+endpoint serves a certificate that doesn't match the hostname.
 
-**Port handling.** With bare `--rewrite-host` and a non-default `TO` port (e.g.
-`localhost:3000`), the port is included in the `Host` header but never in the
-SNI (a bare hostname; a port in SNI is invalid). An explicit
-`--rewrite-host <HOST>` is a bare hostname (no port).
+**Sending `Host: TO` instead.** Only if your upstream is **not** a Trusted Server
+and routes/validates on its _own_ hostname, pass `--rewrite-host` to send
+`Host: <TO>`. Avoid it for TS upstreams: TS anchors first-party URL rewriting to
+the inbound `Host`, so `Host = TO` rewrites links onto the `TO` host. The TLS SNI
+is always the `TO` host either way:
+
+| Form             | `Host` header | TLS SNI   |
+| ---------------- | ------------- | --------- |
+| _(omitted)_      | `FROM`        | `TO` host |
+| `--rewrite-host` | `TO` host     | `TO` host |
+
+An `X-Orig-Host: <FROM>` header is always sent informally. **Port handling:** with
+`--rewrite-host` and a non-default `TO` port (e.g. `localhost:3000`), the port is
+included in the `Host` header but never in the SNI (a bare hostname; a port in SNI
+is invalid).
 
 ## Non-loopback listen
 
@@ -244,12 +237,12 @@ ts dev proxy [OPTIONS] [COMMAND]
 Options:
       --map <FROM=TO>           Rewrite rule (repeatable)
   -f, --from <HOST>             Single-rule FROM (pairs with --to)
-  -t, --to <HOST[:PORT]>        Single-rule TO (host or IP; pairs with --from)
+  -t, --to <HOST[:PORT]>        Single-rule TO (hostname; pairs with --from)
+      --resolve <HOST:IP>       Pin HOST's connection to IP (curl-style, repeatable)
       --listen <ADDR>           Listen address [default: 127.0.0.1:18080]
       --allow-non-loopback      Permit non-loopback --listen (disables blind tunnel)
       --launch <LIST>           Browsers to launch (chrome,firefox,safari or all)
-      --rewrite-host [<HOST>]   Rewrite upstream Host + SNI: bare = TO, <HOST> = explicit
-                                (omit to keep the default Host: <FROM>)
+      --rewrite-host            Send Host: <TO> instead of the default <FROM>
       --basic-auth <USER:PASS>  Inject Basic auth (visible in ps — prefer --basic-auth-file)
       --basic-auth-file <PATH>  Read USER:PASS from a file
       --insecure                Skip upstream TLS certificate verification

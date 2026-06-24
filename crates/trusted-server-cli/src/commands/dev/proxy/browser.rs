@@ -678,7 +678,7 @@ fn restore_auto_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::dev::proxy::rewrite::{Authority, HostMode, Rule, RuleTable};
+    use crate::commands::dev::proxy::rewrite::{Authority, Rule, RuleTable};
 
     #[test]
     fn shell_quote_wraps_and_escapes() {
@@ -739,7 +739,7 @@ mod tests {
         let rules = RuleTable(vec![Rule {
             from: "www.example-publisher.com".into(),
             to: Authority::parse("to.edgecompute.app", false).expect("should parse authority"),
-            host_mode: HostMode::PreserveFrom,
+            rewrite_host: false,
             plaintext: false,
         }]);
         let pac = generate_pac(

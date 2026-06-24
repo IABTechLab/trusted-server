@@ -40,9 +40,9 @@ pub struct ProxyArgs {
     #[arg(short = 'f', long = "from", value_name = "HOST")]
     pub from: Option<String>,
 
-    /// Shorthand single-rule TO (`HOST[:PORT]` or `IP[:PORT]`; pairs with
-    /// `--from`). When TO is a bare IP, pass `--rewrite-host <HOST>` so the TLS
-    /// SNI and `Host` header target the right vhost.
+    /// Shorthand single-rule TO (`HOST[:PORT]`; pairs with `--from`). Keep this a
+    /// hostname so the TLS SNI and certificate stay valid; to reach a specific
+    /// server by address, pin it with `--resolve` instead of using a bare IP.
     #[arg(short = 't', long = "to", value_name = "HOST[:PORT]")]
     pub to: Option<String>,
 
@@ -58,12 +58,18 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "LIST")]
     pub launch: Option<String>,
 
-    /// Rewrite the upstream `Host` header (and TLS SNI). Omit to keep the
-    /// default `Host: <FROM>`; bare `--rewrite-host` sends `Host: <TO>`;
-    /// `--rewrite-host <HOST>` sends `Host: <HOST>` and uses `<HOST>` for SNI
-    /// (needed when `--to` is a bare IP address).
-    #[arg(long, value_name = "HOST", num_args = 0..=1)]
-    pub rewrite_host: Option<Option<String>>,
+    /// Send `Host: <TO>` upstream instead of the default `<FROM>`. The TLS SNI is
+    /// always the `--to` host; to reach a specific server by address, pin it with
+    /// `--resolve` rather than changing the host here.
+    #[arg(long)]
+    pub rewrite_host: bool,
+
+    /// Pin a host's upstream connection to an address instead of using DNS
+    /// (repeatable; like curl's `--resolve`). Keeps `--to` a hostname — so SNI
+    /// and the certificate stay valid — while the socket dials the given IP.
+    /// Format: `HOST:IP` (e.g. `ts.example.com:192.0.2.10`).
+    #[arg(long = "resolve", value_name = "HOST:IP")]
+    pub resolve: Vec<String>,
 
     /// Inject `Authorization: Basic …` (convenience only — visible in `ps`).
     #[arg(long, value_name = "USER:PASS")]

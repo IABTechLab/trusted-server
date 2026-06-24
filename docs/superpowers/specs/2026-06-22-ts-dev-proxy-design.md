@@ -93,17 +93,17 @@ satisfies **HSTS**, which an "ignored" cert does not.
 
 Resolved during brainstorming and design review (2026-06-22):
 
-| Decision        | Choice                                                                                                                                                                                                                                                                                 |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Browser scope   | **All three** (Chrome, Firefox, Safari) in v1 via a CA.                                                                                                                                                                                                                                |
-| CA provenance   | **Generated per-machine on first run**, stored in the user data dir (`--ca-dir`), key `0600`; **never committed**. Trust once per machine.                                                                                                                                             |
-| Browser launch  | `--launch` takes a **list** and has **no default** — if unset, just run the proxy (no browser). Each listed browser is launched and configured against the proxy.                                                                                                                      |
-| Safari proxy    | Best-effort system PAC via `networksetup`, **restored on exit**; falls back to printed instructions.                                                                                                                                                                                   |
-| Transport       | HTTP/1.1 both legs in v1 (h2 deferred).                                                                                                                                                                                                                                                |
-| Bind            | Loopback only by default; non-loopback requires `--allow-non-loopback` and disables blind tunnel/forward, so it can't become an open proxy (§11).                                                                                                                                      |
-| Crate wiring    | **Excluded** from the workspace (like `integration-tests`), _not_ a non-default member — the repo pins the build target to `wasm32-wasip1` and this binary is native (§6).                                                                                                             |
-| Default `Host`  | `Host = FROM` (preserve the production host) — required because TS core anchors URL rewriting to the inbound `Host`. `--rewrite-host` sends `Host = TO`, or `--rewrite-host <HOST>` sends (and SNIs) an explicit host so `TO` can be a bare IP. `X-Orig-Host` is informational (§8.3). |
-| Unmatched hosts | **Blind-tunnel**, decided from the CONNECT authority before terminating TLS; only matched hosts are MITM'd (§5, §11).                                                                                                                                                                  |
+| Decision        | Choice                                                                                                                                                                                                                                                                                                      |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Browser scope   | **All three** (Chrome, Firefox, Safari) in v1 via a CA.                                                                                                                                                                                                                                                     |
+| CA provenance   | **Generated per-machine on first run**, stored in the user data dir (`--ca-dir`), key `0600`; **never committed**. Trust once per machine.                                                                                                                                                                  |
+| Browser launch  | `--launch` takes a **list** and has **no default** — if unset, just run the proxy (no browser). Each listed browser is launched and configured against the proxy.                                                                                                                                           |
+| Safari proxy    | Best-effort system PAC via `networksetup`, **restored on exit**; falls back to printed instructions.                                                                                                                                                                                                        |
+| Transport       | HTTP/1.1 both legs in v1 (h2 deferred).                                                                                                                                                                                                                                                                     |
+| Bind            | Loopback only by default; non-loopback requires `--allow-non-loopback` and disables blind tunnel/forward, so it can't become an open proxy (§11).                                                                                                                                                           |
+| Crate wiring    | **Excluded** from the workspace (like `integration-tests`), _not_ a non-default member — the repo pins the build target to `wasm32-wasip1` and this binary is native (§6).                                                                                                                                  |
+| Default `Host`  | `Host = FROM` (preserve the production host) — required because TS core anchors URL rewriting to the inbound `Host`. `--rewrite-host` sends `Host = TO`. The SNI is always the `TO` host; to reach a server by IP, keep `TO` a hostname and pin it with `--resolve`. `X-Orig-Host` is informational (§8.3). |
+| Unmatched hosts | **Blind-tunnel**, decided from the CONNECT authority before terminating TLS; only matched hosts are MITM'd (§5, §11).                                                                                                                                                                                       |
 
 ---
 
@@ -115,20 +115,21 @@ ts dev proxy [OPTIONS]
 
 ### 4.1 Options
 
-| Flag                   | Value                            | Default                                                                                                     | Description                                                                                                                                                                                            |
-| ---------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                 |
-| `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Pairs with `--to`.                                                                                                                                               |
-| `-t, --to`             | `HOST[:PORT]` or `IP[:PORT]`     | —                                                                                                           | Shorthand for a single rule's `TO`. Pairs with `--from`. May be a bare IP (then pass `--rewrite-host <HOST>`). A non-default port is kept in the upstream `Host` but never in the SNI (§8.3).          |
-| `--listen`             | `ADDR`                           | `127.0.0.1:18080`                                                                                           | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                |
-| `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11). |
-| `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                       |
-| `--rewrite-host`       | _(none)_ \| `HOST`               | _unset_ (Host = `FROM`)                                                                                     | Rewrite the upstream `Host` header **and** TLS SNI. Bare → `Host = TO`; with a value → `Host = SNI = <HOST>` (needed when `--to` is a bare IP). Omit to keep `Host = FROM` (see §8.3).                 |
-| `--basic-auth`         | `USER:PASS`                      | —                                                                                                           | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`.                                                             |
-| `--basic-auth-file`    | `PATH`                           | —                                                                                                           | Read `USER:PASS` from a file (preferred over `--basic-auth`).                                                                                                                                          |
-| `--insecure`           | flag                             | false                                                                                                       | Skip **upstream** certificate verification.                                                                                                                                                            |
-| `--upstream-plaintext` | flag                             | false                                                                                                       | Connect to upstream over HTTP (e.g. `localhost:3000`).                                                                                                                                                 |
-| `--ca-dir`             | `PATH`                           | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run).                                                                                                                                 |
+| Flag                   | Value                            | Default                                                                                                     | Description                                                                                                                                                                                                                       |
+| ---------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--map`                | `FROM=TO` (repeatable)           | —                                                                                                           | Rewrite rule: requests to `FROM` are served from `TO`.                                                                                                                                                                            |
+| `-f, --from`           | `HOST`                           | —                                                                                                           | Shorthand for a single rule's `FROM`. Pairs with `--to`.                                                                                                                                                                          |
+| `-t, --to`             | `HOST[:PORT]`                    | —                                                                                                           | Shorthand for a single rule's `TO`. Pairs with `--from`. Keep it a hostname so the SNI/cert stay valid; pin a connection address with `--resolve`. A non-default port is kept in the upstream `Host` but never in the SNI (§8.3). |
+| `--listen`             | `ADDR`                           | `127.0.0.1:18080`                                                                                           | Proxy listen address. A non-loopback address is **rejected** unless `--allow-non-loopback` is also set.                                                                                                                           |
+| `--allow-non-loopback` | flag                             | false                                                                                                       | Permit binding a non-loopback `--listen`. Even then, blind tunnel/forward of **unmatched** hosts is disabled (only configured rules are served), so the proxy can't act as a generic open proxy (§11).                            |
+| `--launch`             | `chrome,firefox,safari` \| `all` | _unset_                                                                                                     | Comma list of browsers to launch + configure (`all` = `chrome,firefox,safari`); **if omitted, just run the proxy** (no browser).                                                                                                  |
+| `--rewrite-host`       | flag                             | false (Host = `FROM`)                                                                                       | Send `Host = TO` instead of the default `Host = FROM`. The TLS SNI is always the `TO` host (see §8.3).                                                                                                                            |
+| `--resolve`            | `HOST:IP` (repeatable)           | —                                                                                                           | Pin `HOST`'s upstream connection to `IP` (curl-style), so `TO` stays a hostname (valid SNI/cert) while the socket dials a chosen server. Keeps the tool self-contained — no `/etc/hosts` (see §8.3).                              |
+| `--basic-auth`         | `USER:PASS`                      | —                                                                                                           | Inject `Authorization: Basic …` toward gated upstreams. **Convenience only** — visible via `ps`/shell history; prefer `--basic-auth-file`.                                                                                        |
+| `--basic-auth-file`    | `PATH`                           | —                                                                                                           | Read `USER:PASS` from a file (preferred over `--basic-auth`).                                                                                                                                                                     |
+| `--insecure`           | flag                             | false                                                                                                       | Skip **upstream** certificate verification.                                                                                                                                                                                       |
+| `--upstream-plaintext` | flag                             | false                                                                                                       | Connect to upstream over HTTP (e.g. `localhost:3000`).                                                                                                                                                                            |
+| `--ca-dir`             | `PATH`                           | `$XDG_DATA_HOME/trusted-server/dev-proxy` (macOS: `~/Library/Application Support/trusted-server/dev-proxy`) | Where the per-machine CA cert/key are stored (generated on first run).                                                                                                                                                            |
 
 ### 4.2 Companion subcommands
 
@@ -327,28 +328,24 @@ struct CertAuthority {
 ```rust
 struct Rule {
     from: String,      // matched case-insensitively, port-stripped
-    to: Authority,     // host OR bare IP + optional port (default 443; 80 with --upstream-plaintext)
-    host_mode: HostMode,
+    to: Authority,     // hostname + optional port (default 443; 80 with --upstream-plaintext)
+    rewrite_host: bool,// false (default): Host = FROM;  true (--rewrite-host): Host = TO
     plaintext: bool,
-}
-enum HostMode {        // how the upstream `Host` header AND the TLS SNI are derived
-    PreserveFrom,      // default:               Host = FROM;   SNI = TO host
-    UseTo,             // bare --rewrite-host:    Host = TO;     SNI = TO host
-    Explicit(String),  // --rewrite-host <HOST>:  Host = <HOST>; SNI = <HOST>  (TO may be a bare IP)
 }
 struct RuleTable(Vec<Rule>);   // first match wins; unmatched => pass-through
 ```
 
-In v1, `host_mode` (default **`PreserveFrom`**) and `plaintext` are set on every
-rule from the global flags — `--rewrite-host` selects `UseTo` (bare) or
-`Explicit(<HOST>)` (with a value), and `--upstream-plaintext` sets `plaintext`;
-the per-rule fields exist so a future per-`--map` override can be added without a
-struct change. `-f/--from` + `-t/--to` is sugar for a single `--map FROM=TO`.
+In v1, `rewrite_host` (default **false**) and `plaintext` are set on every rule
+from the global flags (`--rewrite-host`, `--upstream-plaintext`); the per-rule
+fields exist so a future per-`--map` override can be added without a struct
+change. `-f/--from` + `-t/--to` is sugar for a single `--map FROM=TO`.
 
-The connection target is always `rule.to` (so `TO` may be a bare IP). Because the
-SNI is derived independently, `Explicit(<HOST>)` lets a request reach an IP
-upstream while still presenting a real hostname for TLS and routing — the only
-way to drive a host-routed endpoint (Fastly, a load balancer) by IP.
+The TLS **SNI is always the `TO` host** (port-stripped), independent of
+`rewrite_host` — so `TO` should stay a hostname for the certificate to validate.
+The **connection address** is decoupled from the SNI: `--resolve HOST:IP` pins
+where `TO`'s socket connects (curl-style), letting a request reach a specific
+server/load balancer by IP while still presenting the real hostname for TLS and
+routing. See §8.3 / §8.5.
 
 ### 8.2 Matching
 
@@ -362,14 +359,14 @@ are instead refused with `403` (§11), never blind-tunneled.
 
 ### 8.3 Header rewriting on match
 
-| Header                  | Action                                                                                                       | Rationale                                                                                                                          |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| upstream **connection** | `rule.to` host/IP + port                                                                                     | dialed verbatim; may be a bare IP                                                                                                  |
-| **SNI**                 | `rule.to` host (default/bare), or the `--rewrite-host <HOST>` value; **port stripped**                       | SNI is a bare hostname; a `:port` (or a bare IP) in SNI is invalid/unroutable, so an IP `TO` needs an explicit `--rewrite-host`    |
-| `Host`                  | `rule.from` (default); `rule.to` with bare `--rewrite-host`; the `<HOST>` value with `--rewrite-host <HOST>` | TS core anchors URL rewriting to the inbound `Host`; preserving `FROM` keeps rewritten URLs on the production domain (see caveats) |
-| `X-Orig-Host`           | `rule.from`                                                                                                  | informational record of the real first-party host (see caveat)                                                                     |
-| `Authorization`         | set if `--basic-auth` and not already present                                                                | clear `401` gates on staging upstreams                                                                                             |
-| `Proxy-Connection`      | removed                                                                                                      | hop-by-hop hygiene                                                                                                                 |
+| Header                  | Action                                                                                           | Rationale                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| upstream **connection** | the `--resolve` pin for `rule.to` host if present, else `rule.to` host via DNS; + `rule.to` port | lets `TO` stay a hostname (valid SNI/cert) while the socket targets a chosen IP                                                    |
+| **SNI**                 | `rule.to` host; **port stripped**                                                                | always the `TO` hostname; a `:port` or bare IP in SNI is invalid/unroutable, so keep `TO` a hostname                               |
+| `Host`                  | `rule.from` (default); `rule.to` with `--rewrite-host`                                           | TS core anchors URL rewriting to the inbound `Host`; preserving `FROM` keeps rewritten URLs on the production domain (see caveats) |
+| `X-Orig-Host`           | `rule.from`                                                                                      | informational record of the real first-party host (see caveat)                                                                     |
+| `Authorization`         | set if `--basic-auth` and not already present                                                    | clear `401` gates on staging upstreams                                                                                             |
+| `Proxy-Connection`      | removed                                                                                          | hop-by-hop hygiene                                                                                                                 |
 
 **Why `Host = FROM` is the default (resolved).** The §1 goal — validate cookies,
 `Host`-sensitive logic, CMP/consent, and first-party context at the _real_
@@ -389,13 +386,13 @@ only one service (§2 ¶3), you cannot add the live production domain to a separ
 dev service. For those upstreams, pass `--rewrite-host` (sends `Host = TO`) or add
 the domain to the service.
 
-**Targeting an IP upstream.** To reach a specific server/load balancer by address,
-set `TO` to a bare IP (`--to 192.0.2.10`) and pass `--rewrite-host <HOST>` with the
-logical hostname the endpoint expects. The proxy then dials the IP while presenting
-`<HOST>` as both the TLS SNI and the `Host` header — without it, SNI would be the IP
-(rustls sends no SNI extension for IP literals, so the endpoint gets its default
-vhost). Cert verification still applies; add `--insecure` if the IP serves a cert
-that doesn't match `<HOST>`.
+**Targeting a specific server by IP.** Keep `TO` a hostname (so the SNI and
+certificate stay valid) and pin its connection address with `--resolve HOST:IP`
+(curl-style, repeatable). The proxy dials the IP while the SNI and `Host` stay the
+hostname — avoiding a bare-IP SNI (rustls sends no SNI extension for IP literals,
+so a host-routed endpoint would serve its default vhost). Cert verification still
+applies; add `--insecure` if the endpoint serves a cert that doesn't match. This
+keeps the tool self-contained — no `/etc/hosts` edit.
 
 `X-Orig-Host: FROM` is still sent for upstreams that opt to honor it, but it is
 **informational only**: TS core does not read it today and in fact _strips_
@@ -404,12 +401,11 @@ measure. Reconcile any future trusted-`X-Orig-Host` contract with the existing
 `publisher.origin_host_header_override` knob. **Validation:** an integration test
 must assert that, by default, rewritten HTML/RSC output stays on `FROM` (not `TO`).
 
-**Port handling.** With bare `--rewrite-host` (`Host = TO`) and a non-default `TO`
+**Port handling.** With `--rewrite-host` (`Host = TO`) and a non-default `TO`
 port (e.g. `localhost:3000`, `staging.example.com:8443`), the port **is** included
 in the `Host` header but **never** in the SNI (a bare hostname). This mirrors the
 existing split in `publisher.rs` (`origin_host_without_port` vs
-`origin_host_header`). An explicit `--rewrite-host <HOST>` is a bare hostname (no
-port) used verbatim for both `Host` and SNI.
+`origin_host_header`).
 
 ### 8.4 URI normalization
 

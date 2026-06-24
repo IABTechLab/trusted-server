@@ -1,5 +1,6 @@
 //! Resolves `ProxyArgs` (+ defaults) into a concrete [`ResolvedConfig`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
@@ -7,7 +8,7 @@ use base64::Engine as _;
 use error_stack::{Report, ResultExt as _};
 
 use super::ProxyArgs;
-use super::rewrite::{Authority, HostMode, Rule, RuleTable};
+use super::rewrite::{Authority, Rule, RuleTable};
 
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
@@ -21,9 +22,9 @@ pub enum ConfigError {
     /// The FROM host contained characters not valid in a hostname.
     #[display("invalid FROM host `{value}` (expected a hostname: letters, digits, '-', '.')")]
     InvalidFrom { value: String },
-    /// The `--rewrite-host <HOST>` value was not a valid hostname.
-    #[display("invalid --rewrite-host `{value}` (expected a hostname: letters, digits, '-', '.')")]
-    InvalidRewriteHost { value: String },
+    /// A `--resolve` value was not `HOST:IP` with a valid hostname and IP.
+    #[display("invalid --resolve `{value}` (expected HOST:IP, e.g. ts.example.com:192.0.2.10)")]
+    Resolve { value: String },
     /// `--listen` was not a valid socket address.
     #[display("invalid --listen address `{value}`")]
     Listen { value: String },
@@ -111,6 +112,10 @@ pub struct ResolvedConfig {
     pub insecure: bool,
     pub basic_auth: Option<BasicAuth>,
     pub ca_dir: PathBuf,
+    /// DNS pins from `--resolve`: lowercase hostname → connection address. When
+    /// an upstream host is present here, the proxy dials this IP instead of
+    /// resolving the name, leaving the SNI/`Host` untouched.
+    pub resolve: HashMap<String, IpAddr>,
 }
 
 /// Default CA directory (spec §7.1/§12): `$XDG_DATA_HOME/trusted-server/dev-proxy`,
@@ -138,34 +143,52 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
         .map_or_else(default_ca_dir, PathBuf::from)
 }
 
-/// Resolves the `--rewrite-host` flag into a [`HostMode`] applied to every rule:
-/// absent → preserve `FROM`; bare → use `TO`; with a value → that explicit host
-/// (validated, lowercased) for both the `Host` header and the TLS SNI.
-fn host_mode(args: &ProxyArgs) -> Result<HostMode, ConfigError> {
-    match &args.rewrite_host {
-        None => Ok(HostMode::PreserveFrom),
-        Some(None) => Ok(HostMode::UseTo),
-        Some(Some(host)) => {
-            let host = host.to_ascii_lowercase();
-            if !is_valid_host(&host) {
-                return Err(ConfigError::InvalidRewriteHost { value: host });
-            }
-            Ok(HostMode::Explicit(host))
-        }
-    }
-}
-
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
-    let mode = host_mode(args)?;
+    // `--rewrite-host` only chooses the `Host` header; the SNI always follows TO.
     for entry in &args.map {
         let (from, to) = entry.split_once('=').ok_or(ConfigError::Rule)?;
-        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
+        rules.push(make_rule(
+            from,
+            to,
+            args.rewrite_host,
+            args.upstream_plaintext,
+        )?);
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
-        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
+        rules.push(make_rule(
+            from,
+            to,
+            args.rewrite_host,
+            args.upstream_plaintext,
+        )?);
     }
     Ok(RuleTable(rules))
+}
+
+/// Parses `--resolve HOST:IP` entries into a lowercase-host → address map.
+///
+/// Splits on the first `:` so the IP (including IPv6, which contains `:`) is the
+/// remainder. The host is validated as a hostname and the address as an
+/// [`IpAddr`].
+fn build_resolve(args: &ProxyArgs) -> Result<HashMap<String, IpAddr>, ConfigError> {
+    let mut map = HashMap::new();
+    for entry in &args.resolve {
+        let (host, ip) = entry.split_once(':').ok_or_else(|| ConfigError::Resolve {
+            value: entry.clone(),
+        })?;
+        let host = host.to_ascii_lowercase();
+        let ip: IpAddr = ip.parse().map_err(|_| ConfigError::Resolve {
+            value: entry.clone(),
+        })?;
+        if !is_valid_host(&host) {
+            return Err(ConfigError::Resolve {
+                value: entry.clone(),
+            });
+        }
+        map.insert(host, ip);
+    }
+    Ok(map)
 }
 
 /// Whether `host` is a syntactically valid hostname — ASCII letters, digits,
@@ -182,7 +205,7 @@ fn is_valid_host(host: &str) -> bool {
 fn make_rule(
     from: &str,
     to: &str,
-    host_mode: HostMode,
+    rewrite_host: bool,
     plaintext: bool,
 ) -> Result<Rule, ConfigError> {
     let from = from.to_ascii_lowercase();
@@ -193,7 +216,7 @@ fn make_rule(
     Ok(Rule {
         from,
         to,
-        host_mode,
+        rewrite_host,
         plaintext,
     })
 }
@@ -202,8 +225,9 @@ fn make_rule(
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError`] on malformed rules, an invalid/forbidden listen
-/// address, malformed credentials, or an unknown browser.
+/// Returns [`ConfigError`] on malformed rules, a malformed `--resolve` entry, an
+/// invalid/forbidden listen address, malformed credentials, or an unknown
+/// browser.
 pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> {
     let rules = build_rules(args).map_err(Report::from)?;
     if rules.0.is_empty() {
@@ -233,6 +257,7 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
 
     let basic_auth = resolve_basic_auth(args).map_err(Report::from)?;
     let ca_dir = ca_dir(args);
+    let resolve = build_resolve(args).map_err(Report::from)?;
 
     Ok(ResolvedConfig {
         rules,
@@ -242,6 +267,7 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         insecure: args.insecure,
         basic_auth,
         ca_dir,
+        resolve,
     })
 }
 
@@ -284,26 +310,19 @@ mod tests {
     }
 
     #[test]
-    fn clap_parses_the_three_rewrite_host_forms() {
-        assert_eq!(
-            parse_args(&["ts"]).rewrite_host,
-            None,
-            "absent --rewrite-host parses to None"
+    fn clap_parses_rewrite_host_as_a_bool() {
+        assert!(
+            !parse_args(&["ts"]).rewrite_host,
+            "absent --rewrite-host is false"
         );
-        assert_eq!(
+        assert!(
             parse_args(&["ts", "--rewrite-host"]).rewrite_host,
-            Some(None),
-            "bare --rewrite-host parses to Some(None)"
-        );
-        assert_eq!(
-            parse_args(&["ts", "--rewrite-host", "app.example.com"]).rewrite_host,
-            Some(Some("app.example.com".to_string())),
-            "--rewrite-host <HOST> parses to Some(Some(host))"
+            "present --rewrite-host is true"
         );
     }
 
     #[test]
-    fn single_rule_from_to_defaults_to_preserve_host() {
+    fn single_rule_from_to_keeps_from_host_by_default() {
         let mut args = base_args();
         args.from = Some("www.example-publisher.com".into());
         args.to = Some("to.edgecompute.app".into());
@@ -312,60 +331,62 @@ mod tests {
             .rules
             .first_match("www.example-publisher.com")
             .expect("rule present");
-        assert_eq!(
-            rule.host_mode,
-            HostMode::PreserveFrom,
-            "default preserves FROM host"
-        );
+        assert!(!rule.rewrite_host, "default preserves FROM host");
         assert_eq!(rule.to.host(), "to.edgecompute.app");
     }
 
     #[test]
-    fn bare_rewrite_host_uses_to() {
+    fn rewrite_host_uses_to() {
         let mut args = base_args();
         args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        // Bare `--rewrite-host` (present, no value) parses to `Some(None)`.
-        args.rewrite_host = Some(None);
+        args.rewrite_host = true;
         let cfg = resolve(&args).expect("should resolve");
-        assert_eq!(
-            cfg.rules
-                .first_match("www.example-publisher.com")
-                .expect("rule")
-                .host_mode,
-            HostMode::UseTo,
-            "bare --rewrite-host sends Host: TO"
-        );
-    }
-
-    #[test]
-    fn rewrite_host_with_value_is_explicit_for_ip_to() {
-        let mut args = base_args();
-        // TO is a bare IP; the explicit value supplies the Host header and SNI.
-        args.map = vec!["www.example-publisher.com=192.0.2.10".into()];
-        args.rewrite_host = Some(Some("App.EdgeCompute.app".into()));
-        let cfg = resolve(&args).expect("should resolve");
-        assert_eq!(
-            cfg.rules
-                .first_match("www.example-publisher.com")
-                .expect("rule")
-                .host_mode,
-            HostMode::Explicit("app.edgecompute.app".to_string()),
-            "explicit --rewrite-host is lowercased and stored verbatim"
-        );
-    }
-
-    #[test]
-    fn rewrite_host_with_invalid_value_is_rejected() {
-        let mut args = base_args();
-        args.map = vec!["www.example-publisher.com=192.0.2.10".into()];
-        args.rewrite_host = Some(Some("bad/host".into()));
-        let err = resolve(&args).expect_err("an invalid --rewrite-host should error");
         assert!(
-            matches!(
-                err.current_context(),
-                ConfigError::InvalidRewriteHost { .. }
-            ),
-            "should be InvalidRewriteHost for a non-hostname value"
+            cfg.rules
+                .first_match("www.example-publisher.com")
+                .expect("rule")
+                .rewrite_host,
+            "--rewrite-host sends Host: TO"
+        );
+    }
+
+    #[test]
+    fn resolve_pins_host_to_ip() {
+        let mut args = base_args();
+        args.map = vec!["www.example-publisher.com=ts.edgecompute.app".into()];
+        // Mixed case to confirm the host key is lowercased.
+        args.resolve = vec!["TS.EdgeCompute.app:192.0.2.10".into()];
+        let cfg = resolve(&args).expect("should resolve");
+        assert_eq!(
+            cfg.resolve.get("ts.edgecompute.app"),
+            Some(&"192.0.2.10".parse().expect("should parse ipv4")),
+            "--resolve pins the lowercased host to the address"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_ipv6_target() {
+        let mut args = base_args();
+        args.map = vec!["a.example.com=b.edgecompute.app".into()];
+        // Split-on-first-colon must keep the colon-bearing IPv6 address intact.
+        args.resolve = vec!["b.edgecompute.app:::1".into()];
+        let cfg = resolve(&args).expect("should resolve");
+        assert_eq!(
+            cfg.resolve.get("b.edgecompute.app"),
+            Some(&"::1".parse().expect("should parse ipv6")),
+            "IPv6 --resolve target is parsed whole"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_value() {
+        let mut args = base_args();
+        args.map = vec!["a.example.com=b.edgecompute.app".into()];
+        args.resolve = vec!["b.edgecompute.app:not-an-ip".into()];
+        let err = resolve(&args).expect_err("a non-IP --resolve target should error");
+        assert!(
+            matches!(err.current_context(), ConfigError::Resolve { .. }),
+            "should be a Resolve error for a non-IP target"
         );
     }
 

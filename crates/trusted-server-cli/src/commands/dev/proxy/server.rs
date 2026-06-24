@@ -7,6 +7,7 @@
 //! or refused (`403`) off loopback. An origin-form `GET /proxy.pac` is served
 //! locally.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -315,7 +316,8 @@ async fn mitm(
         let rules = cfg.rules.clone();
         let basic_auth = cfg.basic_auth.clone();
         let insecure = cfg.insecure;
-        async move { forward_request(req, &host, &rules, basic_auth.as_ref(), insecure).await }
+        let resolve = cfg.resolve.clone();
+        async move { forward_request(req, &host, &rules, basic_auth.as_ref(), insecure, &resolve).await }
     });
 
     // serve_connection drives keep-alive: many sequential requests per tunnel.
@@ -346,6 +348,7 @@ async fn forward_request(
     rules: &super::rewrite::RuleTable,
     basic_auth: Option<&super::config::BasicAuth>,
     insecure: bool,
+    resolve: &HashMap<String, IpAddr>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
     if req.headers().contains_key(hyper::header::UPGRADE) {
         log::info!("closing tunnel for {connect_host}: Upgrade (WebSocket) is out of scope");
@@ -377,6 +380,7 @@ async fn forward_request(
         insecure,
         &upstream_host,
         upstream_port,
+        resolve,
     )
     .await
     {
@@ -412,6 +416,7 @@ async fn proxy_to_upstream(
     insecure: bool,
     upstream_host: &str,
     upstream_port: u16,
+    resolve: &HashMap<String, IpAddr>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Report<ProxyError>> {
     log::debug!(
         "{} {} -> {}:{} (Host={}, X-Orig-Host={})",
@@ -425,9 +430,16 @@ async fn proxy_to_upstream(
 
     rewrite_headers(req.headers_mut(), outcome, basic_auth);
 
-    let tcp = TcpStream::connect((upstream_host, upstream_port))
-        .await
-        .change_context(ProxyError::Server)?;
+    // Dial the `--resolve` pin when the upstream host has one; the SNI/`Host`
+    // (set above) stay the hostname, so the certificate still validates.
+    let tcp = match resolve.get(upstream_host) {
+        Some(ip) => {
+            log::debug!("--resolve {upstream_host} -> {ip}");
+            TcpStream::connect((*ip, upstream_port)).await
+        }
+        None => TcpStream::connect((upstream_host, upstream_port)).await,
+    }
+    .change_context(ProxyError::Server)?;
 
     let response = if outcome.scheme_is_tls {
         let connector = TlsConnector::from(client_config(insecure));

@@ -54,6 +54,24 @@ pub fn test_config(addr: &SocketAddr) -> config::ResolvedConfig {
     resolve(&["ts", "--map", &map, "--listen", "127.0.0.1:0", "--insecure"])
 }
 
+/// Builds a config whose TO host is a **non-resolvable** name (`pinned.invalid`)
+/// pinned to the upstream `addr` via `--resolve`. The request only reaches the
+/// upstream if the pin is honored — DNS for `.invalid` never resolves.
+pub fn test_config_with_resolve(addr: &SocketAddr) -> config::ResolvedConfig {
+    let map = format!("{FROM_HOST}=pinned.invalid:{}", addr.port());
+    let pin = format!("pinned.invalid:{}", addr.ip());
+    resolve(&[
+        "ts",
+        "--map",
+        &map,
+        "--resolve",
+        &pin,
+        "--listen",
+        "127.0.0.1:0",
+        "--insecure",
+    ])
+}
+
 /// A config with no rewrite rules (every CONNECT is unmatched), on loopback.
 pub fn test_config_without_rules() -> config::ResolvedConfig {
     // resolve() rejects an empty rule table, so map an unrelated host the tests
