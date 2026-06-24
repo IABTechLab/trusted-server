@@ -803,7 +803,7 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         // Check if this is a DataDome script URL
         let is_datadome =
@@ -814,10 +814,8 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
         }
 
         let path = Self::extract_datadome_path(attr_value);
-        let new_url = format!(
-            "{}://{}/integrations/datadome{}",
-            ctx.request_scheme, ctx.request_host, path
-        );
+        // Root-relative so the browser resolves it against the page host.
+        let new_url = format!("/integrations/datadome{path}");
 
         log::info!(
             "[datadome] Rewriting script src from {} to {}",
@@ -1328,10 +1326,7 @@ mod tests {
         let action = integration.rewrite("src", "https://js.datadome.co/tags.js", &ctx);
         match action {
             AttributeRewriteAction::Replace(new_url) => {
-                assert_eq!(
-                    new_url,
-                    "https://publisher.com/integrations/datadome/tags.js"
-                );
+                assert_eq!(new_url, "/integrations/datadome/tags.js");
             }
             _ => panic!("Expected Replace action"),
         }
@@ -1340,10 +1335,7 @@ mod tests {
         let action = integration.rewrite("href", "https://js.datadome.co/tags.js", &ctx);
         match action {
             AttributeRewriteAction::Replace(new_url) => {
-                assert_eq!(
-                    new_url,
-                    "https://publisher.com/integrations/datadome/tags.js"
-                );
+                assert_eq!(new_url, "/integrations/datadome/tags.js");
             }
             _ => panic!("Expected Replace action for href"),
         }
@@ -1368,10 +1360,7 @@ mod tests {
         let action = integration.rewrite("src", "https://js.datadome.co/js/check", &ctx);
         match action {
             AttributeRewriteAction::Replace(new_url) => {
-                assert_eq!(
-                    new_url,
-                    "https://publisher.com/integrations/datadome/js/check"
-                );
+                assert_eq!(new_url, "/integrations/datadome/js/check");
             }
             _ => panic!("Expected Replace action"),
         }
@@ -1380,10 +1369,7 @@ mod tests {
         let action = integration.rewrite("href", "//js.datadome.co/js/signal", &ctx);
         match action {
             AttributeRewriteAction::Replace(new_url) => {
-                assert_eq!(
-                    new_url,
-                    "https://publisher.com/integrations/datadome/js/signal"
-                );
+                assert_eq!(new_url, "/integrations/datadome/js/signal");
             }
             _ => panic!("Expected Replace action for protocol-relative URL"),
         }
@@ -1392,10 +1378,7 @@ mod tests {
         let action = integration.rewrite("src", "https://js.datadome.co", &ctx);
         match action {
             AttributeRewriteAction::Replace(new_url) => {
-                assert_eq!(
-                    new_url,
-                    "https://publisher.com/integrations/datadome/tags.js"
-                );
+                assert_eq!(new_url, "/integrations/datadome/tags.js");
             }
             _ => panic!("Expected Replace action for bare domain"),
         }

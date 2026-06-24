@@ -285,11 +285,7 @@ impl SourcepointIntegration {
         Ok(target.to_string())
     }
 
-    fn build_first_party_url(
-        &self,
-        source_url: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
+    fn build_first_party_url(&self, source_url: &str) -> Option<String> {
         let parsed = parse_sourcepoint_url(source_url)?;
         if parsed.host_str()? != SOURCEPOINT_CDN_HOST {
             return None;
@@ -301,10 +297,8 @@ impl SourcepointIntegration {
             .map(|value| format!("?{value}"))
             .unwrap_or_default();
 
-        Some(format!(
-            "{}://{}{}{}{}",
-            ctx.request_scheme, ctx.request_host, SOURCEPOINT_CDN_PREFIX, path, query
-        ))
+        // Root-relative so the browser resolves it against the page host.
+        Some(format!("{SOURCEPOINT_CDN_PREFIX}{path}{query}"))
     }
 
     fn copy_headers(
@@ -851,11 +845,11 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         // `handles_attribute()` already gates on `rewrite_sdk`, so this
         // method is only called when rewriting is enabled.
-        if let Some(rewritten) = self.build_first_party_url(attr_value, ctx) {
+        if let Some(rewritten) = self.build_first_party_url(attr_value) {
             return AttributeRewriteAction::replace(rewritten);
         }
 
@@ -986,7 +980,7 @@ mod tests {
         assert_eq!(
             rewritten,
             AttributeRewriteAction::replace(
-                "https://edge.example.com/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=821",
+                "/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=821",
             )
         );
     }

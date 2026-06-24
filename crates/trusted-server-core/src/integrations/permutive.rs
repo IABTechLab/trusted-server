@@ -425,18 +425,16 @@ impl IntegrationAttributeRewriter for PermutiveIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_sdk {
             return AttributeRewriteAction::keep();
         }
 
         if self.is_permutive_sdk_url(attr_value) {
-            // Rewrite to first-party SDK endpoint
-            AttributeRewriteAction::replace(format!(
-                "{}://{}/integrations/permutive/sdk",
-                ctx.request_scheme, ctx.request_host
-            ))
+            // Rewrite to first-party SDK endpoint.
+            // Root-relative so the browser resolves it against the page host.
+            AttributeRewriteAction::replace("/integrations/permutive/sdk".to_string())
         } else {
             AttributeRewriteAction::keep()
         }
@@ -547,7 +545,7 @@ mod tests {
 
         assert!(matches!(rewritten, AttributeRewriteAction::Replace(_)));
         if let AttributeRewriteAction::Replace(url) = rewritten {
-            assert_eq!(url, "https://edge.example.com/integrations/permutive/sdk");
+            assert_eq!(url, "/integrations/permutive/sdk");
         }
     }
 
