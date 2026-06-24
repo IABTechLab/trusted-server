@@ -120,12 +120,24 @@ fn publisher_fallback_methods() -> [Method; 7] {
 // registry and rate limiter) that the portability adapters do not yet wire.
 // On Spin these paths fall through to the publisher/integration fallback,
 // identical to the other non-Fastly adapters.
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 9] {
+const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
+
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
         ("/_ts/admin/keys/rotate", &[Method::POST]),
         ("/_ts/admin/keys/deactivate", &[Method::POST]),
+        ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
+        ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
@@ -208,22 +220,27 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
         .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(parse_client_addr);
-    let existing_full_url = SpinRequestContext::get(req).and_then(|c| c.full_url.clone());
+    let trusted_full_url = req
+        .headers()
+        .get_all("spin-full-url")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     SpinRequestContext::insert(
         req,
         SpinRequestContext {
             client_addr: trusted_client_addr,
-            full_url: existing_full_url,
+            full_url: trusted_full_url.clone(),
         },
     );
 
     // Spin's WASI HTTP bridge copies synthetic `spin-client-addr` and
     // `spin-full-url` headers onto the core request. They are runtime metadata,
     // not client- or application-supplied headers. The trusted `spin-client-addr`
-    // value is captured into `SpinRequestContext` above; remove every copy here so
-    // the shared publisher/integration handlers neither forward them to publisher
-    // origins nor mistake them for client-controlled input. `spin-full-url` is
-    // consumed below to derive the trusted scheme/host.
+    // values are captured into `SpinRequestContext` above; remove every copy here
+    // so the shared publisher/integration handlers neither forward them to
+    // publisher origins nor mistake them for client-controlled input.
     req.headers_mut().remove("spin-client-addr");
 
     // Spin's WASI HTTP bridge appends its synthetic `spin-full-url` *after* the
@@ -234,13 +251,6 @@ pub(crate) fn normalize_spin_request(req: &mut Request) {
     // by publisher HTML rewriting, integration URL rewriting, and request
     // signing. Select the last occurrence as the trusted authority, then strip
     // every copy so none reach publisher origins or the shared handlers.
-    let trusted_full_url = req
-        .headers()
-        .get_all("spin-full-url")
-        .iter()
-        .next_back()
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     req.headers_mut().remove("spin-full-url");
     let Some((scheme, host)) = trusted_full_url
         .as_deref()
@@ -311,6 +321,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the Spin adapter.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback, which would forward the caller's `Authorization` header
+/// and key-management payload to the origin.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -589,6 +616,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             let s = Arc::clone(&s);
             dispatch(s, ctx)
         };
+        let legacy_admin_deny =
+            |_ctx: RequestContext| async { Ok::<Response, EdgeError>(legacy_admin_alias_denied()) };
 
         let mut builder = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
@@ -610,11 +639,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
             //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are deliberately not
-            // registered: the production handler regex `^/_ts/admin` does not match
-            // them, so registering them as admin routes would expose the key
-            // handlers to unauthenticated callers. Unrouted, they fall through to
-            // the publisher fallback like any other unknown path.
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered below
+            // to a local 404 for every publisher-fallback method: the production
+            // handler regex `^/_ts/admin` does not match them, and letting them
+            // fall through to the publisher fallback would forward admin
+            // credentials and key-management payloads to the origin.
             .post("/_ts/admin/keys/rotate", rotate_handler)
             .post("/_ts/admin/keys/deactivate", deactivate_handler)
             .post("/auction", auction_handler)
@@ -623,6 +652,11 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/first-party/sign", fp_sign_handler)
             .post("/first-party/sign", fp_sign_post_handler)
             .post("/first-party/proxy-rebuild", fp_rebuild_handler);
+
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            builder = builder.route("/admin/keys/rotate", method.clone(), legacy_admin_deny);
+            builder = builder.route("/admin/keys/deactivate", method.clone(), legacy_admin_deny);
+        }
 
         // Mirror the Fastly/Axum publisher fallback: every supported method that is
         // not a named route's primary method falls through to the publisher origin
@@ -802,6 +836,13 @@ mod tests {
         let mut req = builder
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
+        SpinRequestContext::insert(
+            &mut req,
+            SpinRequestContext {
+                client_addr: None,
+                full_url: Some("https://evil.example/attacker/path".to_string()),
+            },
+        );
 
         normalize_spin_request(&mut req);
 
@@ -822,6 +863,11 @@ mod tests {
             req.uri().to_string(),
             "https://www.publisher.example/first-party/proxy",
             "should rebuild the absolute URI from the trusted authority, not evil.example"
+        );
+        assert_eq!(
+            SpinRequestContext::get(&req).and_then(|c| c.full_url.clone()),
+            Some("https://www.publisher.example/cars/".to_string()),
+            "should update SpinRequestContext::full_url from the trusted last spin-full-url"
         );
         assert_ne!(
             req.uri().host(),

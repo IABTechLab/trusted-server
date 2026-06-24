@@ -18,9 +18,11 @@ use trusted_server_core::platform::UnavailableHttpClient;
 use error_stack::ResultExt as _;
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use std::io::Read as _;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use trusted_server_core::platform::PlatformHttpRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use trusted_server_core::platform::{
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
+    PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
 // 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
@@ -297,7 +299,32 @@ fn content_encoding(headers: &HeaderPairs) -> Option<String> {
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn reject_unsupported_request_contracts(
+    request: &PlatformHttpRequest,
+) -> Result<(), Report<PlatformError>> {
+    if request.image_optimizer.is_some() {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("Spin outbound HTTP does not support Image Optimizer metadata"));
+    }
+    if request.stream_response {
+        return Err(Report::new(PlatformError::HttpClient)
+            .attach("Spin outbound HTTP does not support streaming responses"));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn response_must_not_have_body(method: &edgezero_core::http::Method, status: u16) -> bool {
+    method == edgezero_core::http::Method::HEAD
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn apply_spin_response_policy(
+    method: &edgezero_core::http::Method,
+    status: u16,
     headers: HeaderPairs,
     body: Vec<u8>,
 ) -> Result<BufferedResponseParts, Report<PlatformError>> {
@@ -310,6 +337,10 @@ fn apply_spin_response_policy(
     // For gzip/br this also rejects an overlarge compressed body before
     // decompression; `decompress_body` separately bounds the expanded size.
     enforce_response_size(body.len())?;
+
+    if response_must_not_have_body(method, status) {
+        return Ok((headers, body));
+    }
 
     let Some(encoding) = content_encoding(&headers) else {
         return Ok((headers, body));
@@ -438,12 +469,13 @@ impl SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        reject_unsupported_request_contracts(&request)?;
+
+        let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
 
         let mut builder = spin_sdk::http::Request::builder();
-        builder
-            .method(into_spin_method(request.request.method()))
-            .uri(uri.clone());
+        builder.method(into_spin_method(&method)).uri(uri.clone());
 
         for (name, value) in request.request.headers() {
             // WASI HTTP forbids these headers on outbound requests:
@@ -491,7 +523,7 @@ impl SpinPlatformHttpClient {
             .collect();
         let body = spin_response.into_body();
 
-        let (headers, body) = apply_spin_response_policy(headers, body)?;
+        let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in headers {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
@@ -781,6 +813,22 @@ mod tests {
         compressed
     }
 
+    fn platform_request() -> PlatformHttpRequest {
+        let req = request_builder()
+            .method("GET")
+            .uri("https://origin.example/asset.png")
+            .body(Body::empty())
+            .expect("should build platform HTTP request");
+        PlatformHttpRequest::new(req, "origin")
+    }
+
+    fn apply_get_response_policy(
+        headers: HeaderPairs,
+        body: Vec<u8>,
+    ) -> Result<BufferedResponseParts, Report<PlatformError>> {
+        apply_spin_response_policy(&edgezero_core::http::Method::GET, 200, headers, body)
+    }
+
     #[test]
     fn extract_client_ip_reads_spin_request_context() {
         let mut req = request_builder()
@@ -958,8 +1006,35 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_request_contracts_reject_image_optimizer_metadata() {
+        use trusted_server_core::platform::{
+            PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
+        };
+
+        let request = platform_request().with_image_optimizer(PlatformImageOptimizerOptions::new(
+            "us_west",
+            PlatformImageOptimizerParams::default(),
+        ));
+
+        assert!(
+            reject_unsupported_request_contracts(&request).is_err(),
+            "Spin must reject Image Optimizer metadata instead of silently dropping it"
+        );
+    }
+
+    #[test]
+    fn unsupported_request_contracts_reject_stream_response() {
+        let request = platform_request().with_stream_response();
+
+        assert!(
+            reject_unsupported_request_contracts(&request).is_err(),
+            "Spin must reject streaming-response requests instead of buffering silently"
+        );
+    }
+
+    #[test]
     fn response_policy_strips_transfer_encoding() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_get_response_policy(
             vec![
                 ("transfer-encoding".to_string(), b"chunked".to_vec()),
                 ("x-preserve".to_string(), b"yes".to_vec()),
@@ -981,7 +1056,7 @@ mod tests {
 
     #[test]
     fn response_policy_strips_headers_named_by_connection() {
-        let (headers, _) = apply_spin_response_policy(
+        let (headers, _) = apply_get_response_policy(
             vec![
                 ("connection".to_string(), b"keep-alive, x-remove".to_vec()),
                 ("x-remove".to_string(), b"drop".to_vec()),
@@ -1007,7 +1082,7 @@ mod tests {
 
     #[test]
     fn response_policy_decodes_gzip_and_strips_encoding_headers() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_get_response_policy(
             vec![
                 ("content-encoding".to_string(), b"gzip".to_vec()),
                 ("content-length".to_string(), b"999".to_vec()),
@@ -1035,7 +1110,7 @@ mod tests {
 
     #[test]
     fn response_policy_decodes_brotli_and_strips_encoding_headers() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_get_response_policy(
             vec![
                 ("content-encoding".to_string(), b"br".to_vec()),
                 ("content-length".to_string(), b"999".to_vec()),
@@ -1056,7 +1131,7 @@ mod tests {
 
     #[test]
     fn response_policy_preserves_unsupported_encoding() {
-        let (headers, body) = apply_spin_response_policy(
+        let (headers, body) = apply_get_response_policy(
             vec![("content-encoding".to_string(), b"zstd".to_vec())],
             b"raw body".to_vec(),
         )
@@ -1072,8 +1147,83 @@ mod tests {
     }
 
     #[test]
+    fn response_policy_skips_decoding_for_head_responses() {
+        let (headers, body) = apply_spin_response_policy(
+            &edgezero_core::http::Method::HEAD,
+            200,
+            vec![
+                ("content-encoding".to_string(), b"gzip".to_vec()),
+                ("content-length".to_string(), b"999".to_vec()),
+                ("transfer-encoding".to_string(), b"chunked".to_vec()),
+            ],
+            Vec::new(),
+        )
+        .expect("should apply HEAD response policy without decoding");
+
+        assert!(body.is_empty(), "should preserve the empty HEAD body");
+        assert!(
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-encoding") && value.as_slice() == b"gzip"
+            }),
+            "should preserve content-encoding on HEAD responses"
+        );
+        assert!(
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length") && value.as_slice() == b"999"
+            }),
+            "should preserve content-length on HEAD responses"
+        );
+        assert!(
+            headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("transfer-encoding")),
+            "should still strip hop-by-hop headers on HEAD responses"
+        );
+    }
+
+    #[test]
+    fn response_policy_skips_decoding_for_no_body_statuses() {
+        for status in [100, 101, 204, 304] {
+            let (headers, body) = apply_spin_response_policy(
+                &edgezero_core::http::Method::GET,
+                status,
+                vec![
+                    ("content-encoding".to_string(), b"gzip".to_vec()),
+                    ("content-length".to_string(), b"999".to_vec()),
+                    ("connection".to_string(), b"close".to_vec()),
+                ],
+                Vec::new(),
+            )
+            .expect("should apply no-body response policy without decoding");
+
+            assert!(
+                body.is_empty(),
+                "status {status} should preserve the empty body"
+            );
+            assert!(
+                headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-encoding") && value.as_slice() == b"gzip"
+                }),
+                "status {status} should preserve content-encoding"
+            );
+            assert!(
+                headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length") && value.as_slice() == b"999"
+                }),
+                "status {status} should preserve content-length"
+            );
+            assert!(
+                headers
+                    .iter()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("connection")),
+                "status {status} should still strip hop-by-hop headers"
+            );
+        }
+    }
+
+    #[test]
     fn response_policy_reports_gzip_decode_failure() {
-        let result = apply_spin_response_policy(
+        let result = apply_get_response_policy(
             vec![("content-encoding".to_string(), b"gzip".to_vec())],
             b"not gzip".to_vec(),
         );
@@ -1084,7 +1234,7 @@ mod tests {
     #[test]
     fn response_policy_rejects_oversized_identity_body() {
         let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
-        let result = apply_spin_response_policy(Vec::new(), oversized);
+        let result = apply_get_response_policy(Vec::new(), oversized);
 
         assert!(
             result.is_err(),
@@ -1095,7 +1245,7 @@ mod tests {
     #[test]
     fn response_policy_rejects_oversized_unsupported_encoding_body() {
         let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1];
-        let result = apply_spin_response_policy(
+        let result = apply_get_response_policy(
             vec![("content-encoding".to_string(), b"zstd".to_vec())],
             oversized,
         );
@@ -1109,7 +1259,7 @@ mod tests {
     #[test]
     fn response_policy_allows_body_at_size_ceiling() {
         let at_limit = vec![0u8; MAX_DECOMPRESSED_SIZE];
-        let (_, body) = apply_spin_response_policy(Vec::new(), at_limit)
+        let (_, body) = apply_get_response_policy(Vec::new(), at_limit)
             .expect("should accept an identity body exactly at the ceiling");
 
         assert_eq!(
