@@ -1,7 +1,14 @@
 // Build script includes source modules (`error`, `auction_config_types`, etc.)
 // for compile-time config validation. Not all items from those modules are used
 // in the build context, so `dead_code` is expected.
-#![allow(clippy::unwrap_used, clippy::panic, dead_code)]
+#![allow(
+    dead_code,
+    clippy::expect_used,
+    clippy::pedantic,
+    clippy::panic,
+    clippy::restriction,
+    reason = "build script validates checked-in configuration and should fail Cargo on invalid input"
+)]
 
 #[path = "src/error.rs"]
 mod error;
@@ -43,8 +50,9 @@ fn main() {
 
     // Read init config
     let init_config_path = Path::new(TRUSTED_SERVER_INIT_CONFIG_PATH);
-    let toml_content = fs::read_to_string(init_config_path)
-        .unwrap_or_else(|_| panic!("Failed to read {init_config_path:?}"));
+    let toml_content = fs::read_to_string(init_config_path).unwrap_or_else(|err| {
+        panic!("Failed to read {}: {err}", init_config_path.display());
+    });
 
     // Merge base TOML with environment variable overrides and write output.
     // Panics if admin endpoints are not covered by a handler.
@@ -61,7 +69,8 @@ fn main() {
     }
     let current = fs::read_to_string(dest_path).unwrap_or_default();
     if current != merged_toml {
-        fs::write(dest_path, merged_toml)
-            .unwrap_or_else(|_| panic!("Failed to write {dest_path:?}"));
+        fs::write(dest_path, merged_toml).unwrap_or_else(|err| {
+            panic!("Failed to write {}: {err}", dest_path.display());
+        });
     }
 }

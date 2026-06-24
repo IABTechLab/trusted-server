@@ -5,14 +5,17 @@ members = [
     "crates/trusted-server-adapter-fastly",
     "crates/trusted-server-adapter-axum",
     "crates/trusted-server-adapter-cloudflare",
-    "crates/js",
-    "crates/openrtb",
+    "crates/trusted-server-js",
+    "crates/trusted-server-openrtb",
 ]
+# trusted-server-integration-tests is intentionally excluded from workspace members because it
+# requires a native target (testcontainers, reqwest) while the workspace default
+# is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
 # Crates excluded from workspace — must be built/tested outside the workspace:
 #   cargo test-cloudflare → trusted-server-adapter-cloudflare (wasm32-unknown-unknown)
 exclude = [
-    "crates/integration-tests",
-    "crates/openrtb-codegen",
+    "crates/trusted-server-integration-tests",
+    "crates/trusted-server-openrtb-codegen",
 ]
 
 # Viceroy (cargo test-fastly runner) calls `cargo run --bin trusted-server-adapter-fastly`
@@ -23,28 +26,6 @@ exclude = [
 default-members = [
     "crates/trusted-server-adapter-fastly",
 ]
-
-[workspace.lints.clippy]
-# Correctness - Force explicit error handling in production code
-unwrap_used = "deny"
-expect_used = "allow"  # Allow expect with context message
-panic = "deny"
-
-# Style
-module_name_repetitions = "allow"
-must_use_candidate = "warn"
-
-# Pedantic (selective)
-doc_markdown = "warn"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-needless_pass_by_value = "warn"  # Encourage borrowing over ownership
-redundant_closure_for_method_calls = "warn"
-
-# Restriction (selective)
-print_stdout = "warn"
-print_stderr = "warn"
-dbg_macro = "warn"
 
 [profile.release]
 debug = 1
@@ -102,3 +83,25 @@ validator = { version = "0.20", features = ["derive"] }
 web-time = "1"
 which = "8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[workspace.lints.clippy]
+# Correctness - Force explicit error handling in production code
+unwrap_used = "deny"
+expect_used = "allow"  # Allow expect with context message
+panic = "deny"
+
+# Style
+module_name_repetitions = "allow"
+must_use_candidate = "warn"
+
+# Pedantic (selective)
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+needless_pass_by_value = "warn"  # Encourage borrowing over ownership
+redundant_closure_for_method_calls = "warn"
+
+# Restriction (selective)
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"

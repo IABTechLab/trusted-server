@@ -249,7 +249,7 @@ Add the module to `crates/trusted-server-core/src/integrations/mod.rs`'s builder
 
 ### 7. Provide Static Assets (If Needed)
 
-Place any integration-specific JavaScript entrypoint under `crates/js/lib/src/integrations/` (for example, `crates/js/lib/src/integrations/testlight.ts`). The shared `npm run build` script automatically discovers every file in that directory and produces a bundle named `tsjs-<entry>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<entry>.min.js`.
+Place any integration-specific JavaScript entrypoint under `crates/trusted-server-js/lib/src/integrations/<integration-id>/index.ts` (for example, `crates/trusted-server-js/lib/src/integrations/testlight/index.ts`). The shared `npm run build` script automatically discovers every integration directory with an `index.ts` file and produces a bundle named `tsjs-<integration-id>.js`, which the Rust crate embeds as `/static/tsjs=tsjs-<integration-id>.min.js`.
 
 Integrations that ship additional JS (such as Testlight) typically expose a `shim_src` config and rewrite publisher tags to point at that URL. Others (like Prebid) drop the publisher tag because the server injects its own deferred bundle automatically.
 
@@ -284,7 +284,7 @@ Integrations are loaded in one of two ways:
 **Key files**:
 
 - `crates/trusted-server-core/src/integrations/testlight.rs` - Rust implementation
-- `crates/js/lib/src/integrations/testlight.ts` - TypeScript shim
+- `crates/trusted-server-js/lib/src/integrations/testlight/index.ts` - TypeScript shim
 
 ### Prebid
 
@@ -295,7 +295,7 @@ Integrations are loaded in one of two ways:
 **Key files**:
 
 - `crates/trusted-server-core/src/integrations/prebid.rs` - Rust implementation
-- `crates/js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
+- `crates/trusted-server-js/lib/src/integrations/prebid/index.ts` - TypeScript NPM integration
 
 #### Prebid Integration Details
 
@@ -326,7 +326,7 @@ When the integration is enabled, the `IntegrationAttributeRewriter` removes any 
 
 **4. TSJS Assets & Testing**
 
-The NPM integration lives in `crates/js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
+The NPM integration lives in `crates/trusted-server-js/lib/src/integrations/prebid/index.ts`. Tests typically assert that publisher references disappear and the deferred `tsjs-prebid.min.js` tag is present.
 
 **5. Hybrid EID forwarding**
 

@@ -442,11 +442,7 @@ impl KvGeo {
     pub fn from_geo_info(geo: Option<&GeoInfo>) -> Self {
         match geo {
             Some(info) => {
-                let dma = if info.metro_code > 0 {
-                    Some(info.metro_code)
-                } else {
-                    None
-                };
+                let dma = (info.metro_code > 0).then_some(info.metro_code);
                 Self {
                     country: info.country.clone(),
                     region: info.region.clone(),
@@ -493,7 +489,7 @@ mod tests {
     fn entry_serialization_roundtrip() {
         let geo = sample_geo_info();
         let consent = sample_consent_context();
-        let mut entry = KvEntry::new(&consent, Some(&geo), 1741824000, "example.com");
+        let mut entry = KvEntry::new(&consent, Some(&geo), 1_741_824_000, "example.com");
         entry.ids.insert(
             "liveramp".to_owned(),
             KvPartnerId {
@@ -506,7 +502,7 @@ mod tests {
             serde_json::from_str(&json).expect("should deserialize KvEntry");
 
         assert_eq!(deserialized.v, SCHEMA_VERSION);
-        assert_eq!(deserialized.created, 1741824000);
+        assert_eq!(deserialized.created, 1_741_824_000);
         assert_eq!(
             deserialized.consent.tcf.as_deref(),
             Some("CP_test_tc_string")
@@ -846,7 +842,7 @@ mod tests {
 
     #[test]
     fn minimal_entry_has_partner_id_and_placeholder_geo() {
-        let entry = KvEntry::minimal("ssp_x", "abc123", 1741824000);
+        let entry = KvEntry::minimal("ssp_x", "abc123", 1_741_824_000);
 
         assert_eq!(entry.v, SCHEMA_VERSION);
         assert!(entry.consent.ok, "should be a live entry");
@@ -862,13 +858,13 @@ mod tests {
 
     #[test]
     fn tombstone_entry_has_correct_shape() {
-        let entry = KvEntry::tombstone(1741910400);
+        let entry = KvEntry::tombstone(1_741_910_400);
 
         assert_eq!(entry.v, SCHEMA_VERSION);
         assert!(!entry.consent.ok, "should be a tombstone");
         assert!(entry.ids.is_empty(), "tombstone should have no partner IDs");
         assert_eq!(entry.geo.country, "ZZ");
-        assert_eq!(entry.consent.updated, 1741910400);
+        assert_eq!(entry.consent.updated, 1_741_910_400);
         assert!(
             entry.pub_properties.is_none(),
             "tombstone should have no pub_properties"

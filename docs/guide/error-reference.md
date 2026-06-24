@@ -584,7 +584,7 @@ ERROR: npm run build:custom failed
 1. Install Node.js dependencies:
 
 ```bash
-cd crates/js/lib
+cd crates/trusted-server-js/lib
 npm ci
 ```
 
@@ -621,7 +621,7 @@ Warning: viceroy version mismatch
 **Solution:**
 
 ```bash
-cargo install viceroy --force
+cargo install viceroy --version 0.17.0 --locked --force
 ```
 
 ---

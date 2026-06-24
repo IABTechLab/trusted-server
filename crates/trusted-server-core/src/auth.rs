@@ -34,9 +34,8 @@ pub fn enforce_basic_auth(
         return Ok(None);
     };
 
-    let (username, password) = match extract_credentials(req) {
-        Some(credentials) => credentials,
-        None => return Ok(Some(unauthorized_response())),
+    let Some((username, password)) = extract_credentials(req) else {
+        return Ok(Some(unauthorized_response()));
     };
 
     // Hash before comparing to normalise lengths — `ct_eq` on raw byte slices
@@ -80,8 +79,8 @@ fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
     let credentials = String::from_utf8(decoded).ok()?;
 
     let mut credentials_parts = credentials.splitn(2, ':');
-    let username = credentials_parts.next()?.to_string();
-    let password = credentials_parts.next()?.to_string();
+    let username = credentials_parts.next()?.to_owned();
+    let password = credentials_parts.next()?.to_owned();
 
     Some((username, password))
 }

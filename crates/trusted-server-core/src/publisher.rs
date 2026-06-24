@@ -479,9 +479,9 @@ fn response_carries_body(method: &Method, status: StatusCode) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Since headers are already
-/// committed, the caller should log the error and drop the `StreamingBody`
-/// (client sees a truncated response).
+/// Returns an error if processing fails mid-stream. Since headers are
+/// already committed, the caller should log the error and drop the
+/// `StreamingBody` (client sees a truncated response).
 pub fn stream_publisher_body<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -1732,6 +1732,46 @@ mod tests {
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case("fastly-ssl")),
                 "internal fastly-ssl signal must not be forwarded to the origin, got: {outbound:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn publisher_request_sends_configured_host_header_override() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let _ = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+
+            let recorded_headers = stub.recorded_request_headers();
+            let outbound_headers = recorded_headers
+                .first()
+                .expect("should record one outbound request");
+            let outbound_host = outbound_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.as_str());
+
+            assert_eq!(
+                outbound_host,
+                Some("www.example.com"),
+                "should send configured host override to outbound request"
             );
         });
     }

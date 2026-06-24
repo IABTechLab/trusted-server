@@ -6,13 +6,13 @@
 //! [`startup_error_router`] returns a bare router without middleware.
 //! Builds the [`AppState`] once per Wasm instance.
 //!
-//! TLS protocol and cipher metadata is captured from the raw [`fastly::Request`]
-//! in `main.rs` before the request is consumed by `dispatch_with_config_handle`,
-//! then injected as trusted internal headers (`x-ts-tls-protocol`,
-//! `x-ts-tls-cipher`) after stripping client-spoofable forwarded headers.
-//! [`build_per_request_services`] reads those internal headers to populate
-//! [`ClientInfo`] so that [`crate::http_util::RequestInfo::from_request`] detects
-//! HTTPS correctly on the `EdgeZero` path.
+//! `EdgeZero`'s current Fastly request context exposes client IP but not TLS
+//! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
+//! header after stripping client-spoofable headers, so [`detect_request_scheme`]
+//! in `http_util` can still derive the correct scheme for HTTPS traffic.
+//! It also captures the full [`ClientInfo`] (TLS, JA4, H2 fingerprint, server
+//! metadata) into the request extensions, which [`build_per_request_services`]
+//! reads back so integration bot protection sees the authoritative signals.
 //!
 //! # Route inventory
 //!
@@ -24,6 +24,8 @@
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
+//! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
+//! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
@@ -120,6 +122,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -204,26 +207,25 @@ pub(crate) fn runtime_services_for_consent_route(
 
 /// Construct per-request [`RuntimeServices`] from the `EdgeZero` request context.
 ///
-/// Extracts the client IP from the [`FastlyRequestContext`] extension inserted by
-/// `edgezero_adapter_fastly::dispatch`. TLS protocol and cipher are read from the
-/// trusted internal headers `x-ts-tls-protocol` and `x-ts-tls-cipher` injected by
-/// `edgezero_main` in `main.rs` after stripping client-spoofable forwarded headers.
+/// Prefers the full [`ClientInfo`] captured by `edgezero_main` from the original
+/// `FastlyRequest` (TLS protocol/cipher, JA4, H2 fingerprint, and server
+/// hostname/region) and stored in the request extensions — the metadata
+/// integration bot protection (e.g. `DataDome`) serializes, which the
+/// reconstructed `EdgeZero` request cannot expose. Falls back to the client IP
+/// from the dispatch-inserted [`FastlyRequestContext`] when the extension is
+/// absent (e.g. tests that dispatch without the entry point). Scheme detection
+/// continues to rely on the trusted `fastly-ssl` header injected by
+/// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
-    let client_ip = FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip);
-
-    let tls_protocol = ctx
+    let client_info = ctx
         .request()
-        .headers()
-        .get("x-ts-tls-protocol")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    let tls_cipher = ctx
-        .request()
-        .headers()
-        .get("x-ts-tls-cipher")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .extensions()
+        .get::<ClientInfo>()
+        .cloned()
+        .unwrap_or_else(|| ClientInfo {
+            client_ip: FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+            ..ClientInfo::default()
+        });
 
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
@@ -232,12 +234,7 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
-        .client_info(ClientInfo {
-            client_ip,
-            tls_protocol,
-            tls_cipher,
-            ..ClientInfo::default()
-        })
+        .client_info(client_info)
         .build()
 }
 
@@ -563,6 +560,8 @@ async fn run_named_route(
                 )
             }
         }
+        NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
+        NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -939,6 +938,8 @@ enum NamedRouteHandler {
     LegacyAdminDenied,
     BatchSync,
     Identify,
+    SetTester,
+    ClearTester,
     Auction,
     FirstPartyProxy,
     FirstPartyClick,
@@ -997,6 +998,16 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/_ts/api/v1/identify",
         primary_methods: &[Method::GET, Method::OPTIONS],
         handler: NamedRouteHandler::Identify,
+    },
+    NamedRoute {
+        path: "/_ts/set-tester",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::SetTester,
+    },
+    NamedRoute {
+        path: "/_ts/clear-tester",
+        primary_methods: &[Method::GET],
+        handler: NamedRouteHandler::ClearTester,
     },
     NamedRoute {
         path: "/auction",
@@ -1113,19 +1124,19 @@ impl Hooks for TrustedServerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::{
-        build_per_request_services, build_state_from_settings, startup_error_router, AppState,
-        NamedRouteHandler, TrustedServerApp, NAMED_ROUTES,
+        build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
+        TrustedServerApp, NAMED_ROUTES,
     };
 
     use edgezero_core::body::Body;
-    use edgezero_core::context::RequestContext;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
-    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Mutex;
+
     use error_stack::Report;
     use futures::executor::block_on;
     use serde_json::json;
@@ -1136,6 +1147,7 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
+    use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1192,113 +1204,6 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
-    }
-
-    fn minimal_state() -> Arc<AppState> {
-        // Build from explicit test settings: the settings baked into the
-        // binary contain placeholder secrets that `get_settings()` rejects
-        // by design.
-        app_state_for_settings(settings_with_missing_consent_store())
-    }
-
-    // ---------------------------------------------------------------------------
-    // build_per_request_services TLS header tests
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn build_per_request_services_reads_tls_protocol_from_internal_header() {
-        let state = minimal_state();
-        let req = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .header("x-ts-tls-protocol", "TLSv1.3")
-            .body(Body::empty())
-            .expect("should build request with TLS header");
-        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
-
-        let services = build_per_request_services(&state, &ctx);
-
-        assert_eq!(
-            services.client_info().tls_protocol.as_deref(),
-            Some("TLSv1.3"),
-            "should read TLS protocol from x-ts-tls-protocol header"
-        );
-    }
-
-    #[test]
-    fn build_per_request_services_reads_tls_cipher_from_internal_header() {
-        let state = minimal_state();
-        let req = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .header("x-ts-tls-cipher", "ECDHE-RSA-AES256-GCM-SHA384")
-            .body(Body::empty())
-            .expect("should build request with TLS cipher header");
-        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
-
-        let services = build_per_request_services(&state, &ctx);
-
-        assert_eq!(
-            services.client_info().tls_cipher.as_deref(),
-            Some("ECDHE-RSA-AES256-GCM-SHA384"),
-            "should read TLS cipher from x-ts-tls-cipher header"
-        );
-    }
-
-    #[test]
-    fn build_per_request_services_tls_none_when_headers_absent() {
-        let state = minimal_state();
-        let req = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .body(Body::empty())
-            .expect("should build request without TLS headers");
-        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
-
-        let services = build_per_request_services(&state, &ctx);
-
-        assert!(
-            services.client_info().tls_protocol.is_none(),
-            "tls_protocol should be None when x-ts-tls-protocol header is absent"
-        );
-        assert!(
-            services.client_info().tls_cipher.is_none(),
-            "tls_cipher should be None when x-ts-tls-cipher header is absent"
-        );
-    }
-
-    #[test]
-    fn build_per_request_services_does_not_trust_client_supplied_tls_headers() {
-        // Regression: edgezero_main must strip x-ts-tls-* before dispatch so a
-        // plain-HTTP client cannot spoof HTTPS scheme detection by injecting these
-        // headers. After the strip+set logic runs, build_per_request_services
-        // should see no TLS data on a request where the Fastly SDK returned None.
-        //
-        // This test validates the contract at the build_per_request_services
-        // boundary: if the header is absent (because edgezero_main stripped it),
-        // tls_protocol is None.
-        let state = minimal_state();
-        // Simulate a request that arrived with NO internal header
-        // (edgezero_main already stripped and did not re-inject because
-        // req.get_tls_protocol() returned None on a plain-HTTP connection).
-        let req = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .body(Body::empty())
-            .expect("should build plain-HTTP request");
-        let ctx = RequestContext::new(req, PathParams::new(HashMap::new()));
-
-        let services = build_per_request_services(&state, &ctx);
-
-        assert!(
-            services.client_info().tls_protocol.is_none(),
-            "tls_protocol must be None after edgezero_main strips client-supplied header \
-             on a plain-HTTP connection — spoofed HTTPS would affect scheme detection"
-        );
-        assert!(
-            services.client_info().tls_cipher.is_none(),
-            "tls_cipher must be None for the same reason"
-        );
     }
 
     fn test_settings() -> Settings {
@@ -1410,6 +1315,30 @@ mod tests {
                     response_headers: vec![HeaderMutation::set("x-challenge", "1")],
                 },
             })
+        }
+    }
+
+    /// Records the [`ClientInfo`] a request filter observes via its
+    /// [`RequestFilterInput`], so a test can assert the entry-point-captured
+    /// bot-protection metadata reaches integration filters like `DataDome`.
+    struct ClientInfoCapturingFilter(Arc<Mutex<Option<ClientInfo>>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for ClientInfoCapturingFilter {
+        fn integration_id(&self) -> &'static str {
+            "client-info-capture"
+        }
+
+        async fn filter_request(
+            &self,
+            input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            *self.0.lock().expect("should lock captured client info") =
+                Some(input.services.client_info().clone());
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: Vec::new(),
+                response_headers: Vec::new(),
+            }))
         }
     }
 
@@ -1675,6 +1604,89 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_set_tester_is_disabled_by_default() {
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "disabled tester-cookie route should return 404"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "disabled tester-cookie route should not set a cookie"
+        );
+    }
+
+    #[test]
+    fn dispatch_set_tester_sets_cookie_on_configured_domain() {
+        let mut settings = test_settings();
+        settings.tester_cookie.enabled = true;
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "enabled tester-cookie route should return no content"
+        );
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should set tester cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert_eq!(
+            set_cookie, "ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax",
+            "tester cookie should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_clear_tester_is_disabled_by_default() {
+        let router = test_router();
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "disabled clear tester-cookie route should return 404"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "disabled clear tester-cookie route should not set a cookie"
+        );
+    }
+
+    #[test]
+    fn dispatch_clear_tester_clears_cookie_on_configured_domain() {
+        let mut settings = test_settings();
+        settings.tester_cookie.enabled = true;
+        let state = app_state_for_settings(settings);
+        let router = TrustedServerApp::routes_for_state(&state);
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "enabled clear tester-cookie route should return no content"
+        );
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("should clear tester cookie")
+            .to_str()
+            .expect("should render set-cookie as utf-8");
+        assert_eq!(
+            set_cookie,
+            "ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0",
+            "tester cookie clear should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
     fn dispatch_fallback_attaches_ec_finalize_state() {
         // The publisher fallback must thread EC finalize state to the entry
         // point via response extensions — even on error responses — so that
@@ -1733,6 +1745,69 @@ mod tests {
         assert!(
             !finalize.is_real_browser,
             "a request without captured device signals should not be classified as a real browser"
+        );
+    }
+
+    #[test]
+    fn entry_point_client_info_reaches_request_filters() {
+        // Regression guard for the EdgeZero bot-protection metadata loss:
+        // `edgezero_main` captures the full ClientInfo (TLS protocol/cipher, JA4,
+        // H2 fingerprint, server hostname/region) from the original FastlyRequest
+        // and stores it in the request extensions. It must survive dispatch so
+        // integration request filters (e.g. DataDome) serialize the same signals
+        // the legacy path provides, not an empty payload.
+        let captured = Arc::new(Mutex::new(None));
+        let filter = Arc::new(ClientInfoCapturingFilter(Arc::clone(&captured)))
+            as Arc<dyn IntegrationRequestFilter>;
+        let router = router_with_request_filters(vec![filter]);
+
+        let mut req = empty_request(Method::GET, "/some-page");
+        req.extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            tls_protocol: Some("TLSv1.3".to_string()),
+            tls_cipher: Some("TLS_AES_128_GCM_SHA256".to_string()),
+            tls_ja4: Some("t13d1516h2_8daaf6152771_b186095e22b6".to_string()),
+            h2_fingerprint: Some("1:65536;2:0;4:6291456;6:262144".to_string()),
+            server_hostname: Some("edge-test.example.net".to_string()),
+            server_region: Some("US-East".to_string()),
+        });
+
+        let _ = block_on(router.oneshot(req));
+
+        let observed = captured
+            .lock()
+            .expect("should lock captured client info")
+            .clone()
+            .expect("request filter should have observed the entry-point ClientInfo");
+        assert_eq!(
+            observed.tls_protocol.as_deref(),
+            Some("TLSv1.3"),
+            "filter should see the captured TLS protocol"
+        );
+        assert_eq!(
+            observed.tls_cipher.as_deref(),
+            Some("TLS_AES_128_GCM_SHA256"),
+            "filter should see the captured TLS cipher"
+        );
+        assert_eq!(
+            observed.tls_ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_b186095e22b6"),
+            "filter should see the captured JA4 fingerprint"
+        );
+        assert_eq!(
+            observed.h2_fingerprint.as_deref(),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+            "filter should see the captured H2 fingerprint"
+        );
+        assert_eq!(
+            observed.server_hostname.as_deref(),
+            Some("edge-test.example.net"),
+            "filter should see the captured server hostname"
+        );
+        assert_eq!(
+            observed.server_region.as_deref(),
+            Some("US-East"),
+            "filter should see the captured server region"
         );
     }
 

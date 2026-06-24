@@ -3,7 +3,7 @@
 //! Provides source-domain normalization for EC partner configuration and
 //! API key hashing. The partner registry is in [`super::registry`].
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 
 /// Maximum allowed length for partner source domains.
 const MAX_SOURCE_DOMAIN_LENGTH: usize = 255;
