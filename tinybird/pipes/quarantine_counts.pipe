@@ -1,0 +1,13 @@
+DESCRIPTION >
+  Quarantine panel contract for Grafana. Tinybird quarantine metadata is workspace-specific;
+  deployments should replace this compatibility endpoint with the workspace quarantine source.
+
+NODE endpoint
+SQL >
+  SELECT
+    'auction_events_raw' AS datasource,
+    CAST(NULL, 'Nullable(UInt64)') AS quarantined_rows,
+    now() AS checked_at,
+    'unconfigured' AS status
+
+TYPE endpoint

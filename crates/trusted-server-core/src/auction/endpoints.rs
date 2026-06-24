@@ -24,6 +24,10 @@ use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
+use super::telemetry::{
+    build_auction_events, emit_auction_events_best_effort, AuctionObservationContext,
+    AuctionSource, AuctionTerminalOutcome,
+};
 use super::types::AuctionContext;
 use super::AuctionOrchestrator;
 
@@ -188,6 +192,20 @@ pub async fn handle_auction(
             ec_id,
             None,
         )?;
+        let observation = AuctionObservationContext::from_auction_request(
+            AuctionSource::AuctionApi,
+            &auction_request,
+            ec_context,
+        );
+        let telemetry_batch = build_auction_events(
+            observation,
+            AuctionTerminalOutcome::Skipped {
+                reason: "consent_denied",
+                elapsed_ms: 0,
+            },
+        );
+        emit_auction_events_best_effort(services, telemetry_batch).await;
+
         let empty_result = OrchestrationResult {
             provider_responses: Vec::new(),
             mediator_response: None,
@@ -268,13 +286,41 @@ pub async fn handle_auction(
         services,
     };
 
+    let observation = AuctionObservationContext::from_auction_request(
+        AuctionSource::AuctionApi,
+        &auction_request,
+        ec_context,
+    );
+
     // Run the auction
-    let result = orchestrator
-        .run_auction(&auction_request, &context)
-        .await
-        .change_context(TrustedServerError::Auction {
-            message: "Auction orchestration failed".to_string(),
-        })?;
+    let result = match orchestrator.run_auction(&auction_request, &context).await {
+        Ok(result) => result,
+        Err(err) => {
+            let elapsed_ms = observation.elapsed_ms();
+            let telemetry_batch = build_auction_events(
+                observation,
+                AuctionTerminalOutcome::ExecutionFailed {
+                    request: Some(&auction_request),
+                    provider_responses: &[],
+                    reason: "execution_failed",
+                    elapsed_ms,
+                },
+            );
+            emit_auction_events_best_effort(services, telemetry_batch).await;
+            return Err(err.change_context(TrustedServerError::Auction {
+                message: "Auction orchestration failed".to_string(),
+            }));
+        }
+    };
+
+    let telemetry_batch = build_auction_events(
+        observation,
+        AuctionTerminalOutcome::Completed {
+            request: &auction_request,
+            result: &result,
+        },
+    );
+    emit_auction_events_best_effort(services, telemetry_batch).await;
 
     log::info!(
         "Auction completed: {} providers, {} winning bids, {}ms total",
@@ -499,17 +545,54 @@ mod tests {
     use super::*;
     use crate::auction::config::AuctionConfig;
     use crate::auction::provider::AuctionProvider;
+    use crate::auction::telemetry::{AuctionEventBatch, AuctionTelemetrySink};
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
     use crate::openrtb::Uid;
-    use crate::platform::test_support::noop_services;
-    use crate::platform::{PlatformPendingRequest, PlatformResponse};
+    use crate::platform::test_support::{
+        noop_services, NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore,
+    };
+    use crate::platform::{ClientInfo, PlatformPendingRequest, PlatformResponse};
     use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingTelemetrySink {
+        batches: Mutex<Vec<AuctionEventBatch>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionTelemetrySink for RecordingTelemetrySink {
+        async fn emit_auction_events(
+            &self,
+            _services: &RuntimeServices,
+            batch: AuctionEventBatch,
+        ) -> Result<(), Report<TrustedServerError>> {
+            self.batches
+                .lock()
+                .expect("should lock telemetry batches")
+                .push(batch);
+            Ok(())
+        }
+    }
+
+    fn services_with_telemetry(sink: Arc<RecordingTelemetrySink>) -> RuntimeServices {
+        let telemetry_sink: Arc<dyn AuctionTelemetrySink> = sink;
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .auction_telemetry_sink(telemetry_sink)
+            .client_info(ClientInfo::default())
+            .build()
+    }
 
     fn make_ec_context(jurisdiction: Jurisdiction, ec_value: Option<&str>) -> EcContext {
         EcContext::new_for_test(
@@ -572,7 +655,8 @@ mod tests {
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
         orchestrator.register_provider(Arc::new(PanicOnBidProvider));
-        let services = noop_services();
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
@@ -619,6 +703,24 @@ mod tests {
         assert!(
             seatbid_empty,
             "gated auction must return no bids, got: {parsed}"
+        );
+
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
+        let rows = batches[0].rows();
+        assert_eq!(rows.len(), 1, "skipped auction should emit one summary row");
+        assert_eq!(rows[0].event_kind, "summary");
+        assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
+        assert_eq!(rows[0].terminal_reason.as_deref(), Some("consent_denied"));
+        let ndjson = batches[0]
+            .to_ndjson(16 * 1024)
+            .expect("should serialize telemetry");
+        assert!(
+            !ndjson.contains(&ec_id),
+            "telemetry must not serialize EC identifiers"
         );
     }
 
