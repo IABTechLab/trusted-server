@@ -93,6 +93,7 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
                 message: "invalid Tinybird authorization header".to_owned(),
             },
         )?;
+        let body_len = body.len();
         let request = request_builder()
             .method(Method::POST)
             .uri(uri)
@@ -102,6 +103,15 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
             .change_context(TrustedServerError::Proxy {
                 message: "failed to build Tinybird Events API request".to_owned(),
             })?;
+
+        log::info!(
+            "sending auction telemetry to Tinybird dataset={} rows={} bytes={} host={} backend={}",
+            self.config.auction_dataset,
+            batch.row_count(),
+            body_len,
+            self.config.api_host,
+            backend_name
+        );
 
         let pending = services
             .http_client()
