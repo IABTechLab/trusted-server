@@ -71,7 +71,9 @@ impl EcTestClient {
             let Ok(cookie_str) = value.to_str() else {
                 continue;
             };
-            let Some((name, raw_value)) = cookie_str.split(';').next().and_then(|s| s.split_once('=')) else {
+            let Some((name, raw_value)) =
+                cookie_str.split(';').next().and_then(|s| s.split_once('='))
+            else {
                 continue;
             };
 
@@ -270,14 +272,14 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 /// Asserts the response has a specific HTTP status code.
-/// Asserts the running Viceroy instance is serving the EdgeZero entry point.
+/// Asserts the running Viceroy instance is serving the `EdgeZero` entry point.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
-/// This canary distinguishes them: the EdgeZero router returns a router-level
+/// This canary distinguishes them: the `EdgeZero` router returns a router-level
 /// `405` for methods outside its registered set (e.g. `TRACE`), whereas the
 /// legacy path proxied every method through to the publisher origin. Without it,
-/// a fixture/env/config-store regression could green the EdgeZero CI job while
+/// a fixture/env/config-store regression could green the `EdgeZero` CI job while
 /// it actually exercises legacy.
 pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
     let client = Client::builder()

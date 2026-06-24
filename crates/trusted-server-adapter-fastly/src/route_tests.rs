@@ -1040,26 +1040,33 @@ fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     let partner_registry = test_partner_registry(&settings);
 
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let alias_req = Request::post(format!("https://test.com{path}"))
-            .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .with_body("{\"key_id\":\"leak-me\"}");
-        let services = test_runtime_services(&alias_req);
-        let resp = futures::executor::block_on(route_request(
-            &settings,
-            &orchestrator,
-            &integration_registry,
-            &partner_registry,
-            &services,
-            compat::from_fastly_request(alias_req),
-            DeviceSignals::derive("", None, None),
-        ))
-        .expect("should route legacy admin alias request");
+        for method in [Method::POST, Method::GET] {
+            let alias_req = if method == Method::POST {
+                Request::post(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .with_body("{\"key_id\":\"leak-me\"}")
+            } else {
+                Request::get(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            };
+            let services = test_runtime_services(&alias_req);
+            let resp = futures::executor::block_on(route_request(
+                &settings,
+                &orchestrator,
+                &integration_registry,
+                &partner_registry,
+                &services,
+                compat::from_fastly_request(alias_req),
+                DeviceSignals::derive("", None, None),
+            ))
+            .expect("should route legacy admin alias request");
 
-        assert_eq!(
-            resp.outcome.status(),
-            StatusCode::NOT_FOUND,
-            "POST {path} with Authorization must be denied locally (404), not proxied to publisher"
-        );
+            assert_eq!(
+                resp.outcome.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
     }
 }
 

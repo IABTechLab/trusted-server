@@ -10,6 +10,9 @@ use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::settings::Settings;
 
+const LEGACY_ADMIN_DENY_METHODS: &[&str] =
+    &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+
 /// Build the full application router from explicit test settings.
 ///
 /// The settings baked into the binary contain placeholder secrets that
@@ -150,27 +153,30 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
 async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     // Regression for the credential-leak finding: the production basic-auth regex
     // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
-    // auth-gated. A POST carrying an `Authorization` header must be denied locally
-    // with 404, never proxied to the publisher origin (which would leak the admin
-    // credentials and key body). A publisher-fallback proxy without a backend
-    // would surface as a 5xx, so 404 proves the local deny ran.
+    // auth-gated. Any publisher-fallback method carrying an `Authorization`
+    // header must be denied locally with 404, never proxied to the publisher
+    // origin (which would leak the admin credentials and key body). A
+    // publisher-fallback proxy without a backend would surface as a 5xx, so 404
+    // proves the local deny ran.
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let router = test_router();
-        let req = request_builder()
-            .method("POST")
-            .uri(path)
-            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header("content-type", "application/json")
-            .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
-            .expect("should build authorized legacy-alias request");
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            let router = test_router();
+            let req = request_builder()
+                .method(*method)
+                .uri(path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .header("content-type", "application/json")
+                .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
+                .expect("should build authorized legacy-alias request");
 
-        let resp = router.oneshot(req).await;
+            let resp = router.oneshot(req).await;
 
-        assert_eq!(
-            resp.status().as_u16(),
-            404,
-            "legacy {path} with Authorization must be denied locally (404), not proxied to publisher"
-        );
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
     }
 }
 
@@ -205,8 +211,6 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
-        ("POST", "/admin/keys/rotate"),
-        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
@@ -217,6 +221,12 @@ fn all_explicit_routes_are_registered() {
 
     for (method, path) in expected {
         assert_route_registered(method, path);
+    }
+
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            assert_route_registered(method, path);
+        }
     }
 }
 
@@ -366,11 +376,9 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
 }
 
 #[tokio::test]
-async fn admin_rotate_key_returns_501() {
-    // Cloudflare's config/secret stores reject writes, so the admin key routes
-    // are wired to a fixed 501 responder rather than the real handlers (which
-    // would surface an opaque 500 on the first store write). A 500 here means
-    // the fixed-501 wiring regressed.
+async fn legacy_admin_rotate_alias_returns_404() {
+    // The legacy non-`/_ts` alias is denied locally rather than routed to the
+    // admin handler or publisher fallback.
     let router = make_router();
 
     let req = request_builder()
@@ -384,13 +392,13 @@ async fn admin_rotate_key_returns_501() {
 
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "admin key rotation must return 501 Not Implemented on Cloudflare"
+        404,
+        "legacy admin key rotation alias must return local 404"
     );
 }
 
 #[tokio::test]
-async fn admin_deactivate_key_returns_501() {
+async fn legacy_admin_deactivate_alias_returns_404() {
     let router = make_router();
 
     let req = request_builder()
@@ -404,8 +412,8 @@ async fn admin_deactivate_key_returns_501() {
 
     assert_eq!(
         resp.status().as_u16(),
-        501,
-        "admin key deactivation must return 501 Not Implemented on Cloudflare"
+        404,
+        "legacy admin key deactivation alias must return local 404"
     );
 }
 

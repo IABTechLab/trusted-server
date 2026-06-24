@@ -58,7 +58,7 @@ Native Axum dev/test adapter (native binary):
 | KV store                                   | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
 | Geo lookup                                 | Always returns `None`                                                                                                                        |
 | Config/secret-store writes                 | Return an error (read-only via env vars)                                                                                                     |
-| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. The legacy `/admin/keys/*` aliases are no longer registered and fall through to the publisher fallback          |
+| Admin key management (`/_ts/admin/keys/*`) | Returns 501 Not Implemented. Legacy `/admin/keys/*` aliases are denied locally with 404 and are not proxied to the publisher fallback        |
 | Auction fan-out ordering                   | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
 
 ## Design Patterns

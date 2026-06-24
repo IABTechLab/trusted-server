@@ -129,8 +129,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          components: clippy
+          components: clippy, rustfmt
           cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Format check (parity test crate)
+        run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
 
       - name: Run cross-adapter parity tests
         run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity

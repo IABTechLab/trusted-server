@@ -953,6 +953,16 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
+const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
+
 const NAMED_ROUTES: &[NamedRoute] = &[
     NamedRoute {
         path: "/.well-known/trusted-server.json",
@@ -977,16 +987,17 @@ const NAMED_ROUTES: &[NamedRoute] = &[
     // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
     // 404 instead of executing key operations: the production basic-auth handler
     // regex `^/_ts/admin` does not match them, and letting them fall through to
-    // the publisher fallback would forward the caller's `Authorization` header
-    // and key-management payload to the origin, leaking admin credentials.
+    // publisher fallback for any fallback method would forward the caller's
+    // `Authorization` header and key-management payload to the origin, leaking
+    // admin credentials.
     NamedRoute {
         path: "/admin/keys/rotate",
-        primary_methods: &[Method::POST],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
         path: "/admin/keys/deactivate",
-        primary_methods: &[Method::POST],
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
         handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
@@ -1473,6 +1484,13 @@ mod tests {
                 .find(|route| route.path == path)
                 .map(|route| route.handler)
         };
+        let methods_for = |path: &str| {
+            NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .map(|route| route.primary_methods)
+                .unwrap_or(&[])
+        };
 
         assert!(
             matches!(
@@ -1502,17 +1520,27 @@ mod tests {
             ),
             "legacy /admin/keys/deactivate must map to the local deny handler, not the key handler"
         );
+
+        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+            for method in super::publisher_fallback_methods() {
+                assert!(
+                    methods_for(path).contains(&method),
+                    "legacy {method} {path} must route to the local deny handler, not publisher fallback"
+                );
+            }
+        }
     }
 
     #[test]
     fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
         // Regression for the credential-leak finding: with a production-shaped
         // config (only `^/_ts/admin` is auth-gated, so `/admin/keys/*` is NOT
-        // matched by any handler), a POST to a legacy alias carrying an
-        // `Authorization` header must be denied locally with 404 — never proxied
-        // to the publisher origin (which would leak the admin credentials and the
-        // key-management body). A publisher-fallback proxy without a backend would
-        // surface as a 5xx, so a 404 proves the deny route ran instead.
+        // matched by any handler), any publisher-fallback method to a legacy
+        // alias carrying an `Authorization` header must be denied locally with
+        // 404 — never proxied to the publisher origin (which would leak the
+        // admin credentials and the key-management body). A publisher-fallback
+        // proxy without a backend would surface as a 5xx, so a 404 proves the
+        // deny route ran instead.
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
@@ -1535,20 +1563,22 @@ mod tests {
         let router = TrustedServerApp::routes_for_state(&state);
 
         for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-            let req = request_builder()
-                .method(Method::POST)
-                .uri(format!("https://test-publisher.com{path}"))
-                .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
-                .body(Body::from("{\"key_id\":\"leak-me\"}"))
-                .expect("should build authorized legacy-alias request");
+            for method in super::publisher_fallback_methods() {
+                let req = request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("{\"key_id\":\"leak-me\"}"))
+                    .expect("should build authorized legacy-alias request");
 
-            let response = block_on(router.oneshot(req));
+                let response = block_on(router.oneshot(req));
 
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "POST {path} with Authorization must be denied locally (404), not proxied to publisher"
-            );
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                );
+            }
         }
     }
 

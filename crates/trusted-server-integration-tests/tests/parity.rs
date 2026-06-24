@@ -146,6 +146,40 @@ async fn cf_post_headers(uri: &str, body: &str) -> (u16, HeaderMap) {
     (s, h)
 }
 
+/// Send an authorized JSON request to the Axum adapter and return (status, headers).
+async fn axum_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
+    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let req = AxumRequest::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .header("content-type", "application/json")
+        .body(AxumBody::from(body.to_owned()))
+        .expect("should build authorized JSON request");
+    let resp = svc
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
+/// Send an authorized JSON request to the Cloudflare adapter and return (status, headers).
+async fn cf_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
+    let router = cf_router();
+    let req = request_builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from(body.to_owned()))
+        .expect("should build authorized JSON request");
+    let resp = router.oneshot(req).await.expect("should respond");
+    (resp.status().as_u16(), resp.headers().clone())
+}
+
 // ---------------------------------------------------------------------------
 // Route parity: same route → same status on both adapters
 // ---------------------------------------------------------------------------
@@ -396,7 +430,10 @@ async fn auction_not_challenged_by_auth_parity() {
     assert_ne!(axum_status, 401, "Axum /auction must not 401");
     assert_ne!(cf_status, 401, "Cloudflare /auction must not 401");
     assert_ne!(axum_status, 404, "Axum /auction must be routed (not 404)");
-    assert_ne!(cf_status, 404, "Cloudflare /auction must be routed (not 404)");
+    assert_ne!(
+        cf_status, 404,
+        "Cloudflare /auction must be routed (not 404)"
+    );
     assert_eq!(
         axum_status, cf_status,
         "/auction must return the same status across adapters: \
@@ -413,11 +450,10 @@ async fn publisher_proxy_fallback_parity() {
     let (axum_status, axum_headers) = axum_get("/").await;
     let (cf_status, cf_headers) = cf_get("/").await;
 
-    // Both adapters must agree: either both proxy to the origin or both fail.
+    // Both adapters must agree on the exact fallback outcome.
     assert_eq!(
-        axum_status >= 500,
-        cf_status >= 500,
-        "publisher fallback 5xx behaviour must match: axum={axum_status} cf={cf_status}"
+        axum_status, cf_status,
+        "publisher fallback status must match exactly: axum={axum_status} cf={cf_status}"
     );
 
     let axum_has_cookie = axum_headers.contains_key("set-cookie");
@@ -440,7 +476,7 @@ async fn unknown_route_returns_same_status_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cf_legacy_admin_aliases_are_denied_locally_not_proxied() {
+async fn legacy_admin_aliases_are_denied_locally_not_proxied() {
     // The production handler regex `^/_ts/admin` only matches the canonical
     // `/_ts/admin/keys/*` paths, so the legacy `/admin/keys/*` aliases are not
     // auth-gated. They must be denied locally with 404 — never routed to the key
@@ -449,9 +485,9 @@ async fn cf_legacy_admin_aliases_are_denied_locally_not_proxied() {
     // (including any `Authorization` header and key-management body) to the origin
     // and leaks admin credentials.
     //
-    // Primary guard: assert the route table directly. The legacy aliases must be
-    // registered (to the local deny) so they can never reach the publisher
-    // fallback as an unrouted path.
+    // Primary guard: assert the Cloudflare route table directly. The legacy
+    // aliases must be registered (to the local deny) so they can never reach
+    // the publisher fallback as an unrouted path.
     let registered: Vec<(String, String)> = cf_router()
         .routes()
         .iter()
@@ -460,16 +496,19 @@ async fn cf_legacy_admin_aliases_are_denied_locally_not_proxied() {
     let is_registered =
         |method: &str, path: &str| registered.iter().any(|(m, p)| m == method && p == path);
 
-    for path in [
-        "/_ts/admin/keys/rotate",
-        "/_ts/admin/keys/deactivate",
-        "/admin/keys/rotate",
-        "/admin/keys/deactivate",
-    ] {
+    for path in ["/_ts/admin/keys/rotate", "/_ts/admin/keys/deactivate"] {
         assert!(
             is_registered("POST", path),
             "POST {path} must be a registered route"
         );
+    }
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            assert!(
+                is_registered(method, path),
+                "{method} {path} must be a registered route"
+            );
+        }
     }
 
     // Secondary guard: confirm runtime behavior. Canonical paths challenge
@@ -484,14 +523,31 @@ async fn cf_legacy_admin_aliases_are_denied_locally_not_proxied() {
             "canonical /_ts{alias} must challenge unauthenticated callers"
         );
 
-        let (alias_status, alias_headers) = cf_post_headers(alias, "{}").await;
-        assert_eq!(
-            alias_status, 404,
-            "legacy {alias} must be denied locally with 404, not proxied or key-handled"
-        );
-        assert!(
-            !alias_headers.contains_key("www-authenticate"),
-            "legacy {alias} must not issue an admin auth challenge"
-        );
+        for method in ["POST", "GET"] {
+            let (axum_status, axum_headers) =
+                axum_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
+            let (cf_status, cf_headers) =
+                cf_authorized_json(method, alias, r#"{"key_id":"leak-me"}"#).await;
+            assert_eq!(
+                axum_status, 404,
+                "Axum legacy {method} {alias} must be denied locally with 404"
+            );
+            assert_eq!(
+                cf_status, 404,
+                "Cloudflare legacy {method} {alias} must be denied locally with 404"
+            );
+            assert_eq!(
+                axum_status, cf_status,
+                "legacy {method} {alias} status must match across adapters"
+            );
+            assert!(
+                !axum_headers.contains_key("www-authenticate"),
+                "Axum legacy {method} {alias} must not issue an admin auth challenge"
+            );
+            assert!(
+                !cf_headers.contains_key("www-authenticate"),
+                "Cloudflare legacy {method} {alias} must not issue an admin auth challenge"
+            );
+        }
     }
 }

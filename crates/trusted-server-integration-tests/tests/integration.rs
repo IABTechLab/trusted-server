@@ -196,7 +196,10 @@ fn test_ec_lifecycle_fastly() {
         .spawn(&wasm_path)
         .expect("should spawn Viceroy for EC tests");
 
-    log::info!("EC lifecycle tests: Viceroy running at {}", process.base_url);
+    log::info!(
+        "EC lifecycle tests: Viceroy running at {}",
+        process.base_url
+    );
 
     // EdgeZero entry-point canary. This same test runs in two CI jobs: the
     // legacy `integration-tests` job (default Viceroy config, legacy_main) and
@@ -214,6 +217,9 @@ fn test_ec_lifecycle_fastly() {
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
         let result = scenario.run(&process.base_url);
-        assert!(result.is_ok(), "EC scenario {scenario:?} should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "EC scenario {scenario:?} should succeed: {result:?}"
+        );
     }
 }

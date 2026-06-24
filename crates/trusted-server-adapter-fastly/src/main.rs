@@ -863,9 +863,16 @@ async fn route_request(
         // The legacy `/admin/keys/*` aliases are denied locally below so stale
         // clients do not leak admin Basic credentials or key-management payloads
         // to the publisher origin via the organic fallback.
-        (Method::POST, "/admin/keys/rotate" | "/admin/keys/deactivate") => {
-            (Ok(legacy_admin_alias_denied()), false)
-        }
+        (
+            Method::GET
+            | Method::POST
+            | Method::HEAD
+            | Method::OPTIONS
+            | Method::PUT
+            | Method::PATCH
+            | Method::DELETE,
+            "/admin/keys/rotate" | "/admin/keys/deactivate",
+        ) => (Ok(legacy_admin_alias_denied()), false),
         (Method::POST, "/_ts/admin/keys/rotate") => {
             (handle_rotate_key(settings, runtime_services, req), false)
         }

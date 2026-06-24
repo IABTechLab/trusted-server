@@ -1,9 +1,9 @@
 use crate::common::assertions;
 use crate::common::ec::{
-    assert_json_response, assert_status, batch_sync, batch_sync_no_auth, identify,
-    identify_with_headers, is_ec_cookie_expired, normalize_ec_id, BatchMapping, EcTestClient,
+    BatchMapping, EcTestClient, assert_json_response, assert_status, batch_sync,
+    batch_sync_no_auth, identify, identify_with_headers, is_ec_cookie_expired, normalize_ec_id,
 };
-use crate::common::runtime::{origin_port, TestError, TestResult};
+use crate::common::runtime::{TestError, TestResult, origin_port};
 use error_stack::Report;
 use error_stack::ResultExt as _;
 
