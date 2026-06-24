@@ -176,7 +176,8 @@ correctly: it anchors all HTML/URL rewriting to the inbound `Host`, so keeping
 This works well against a Trusted Server Compute upstream because Fastly routes
 by SNI (`= TO`) and passes `Host` through to the application unchanged.
 
-If your upstream validates or routes on its own hostname, pass `--rewrite-host`:
+If your upstream validates or routes on its own hostname, pass bare
+`--rewrite-host`:
 
 ```bash
 ts dev proxy \
@@ -185,12 +186,39 @@ ts dev proxy \
   --launch chrome
 ```
 
-With `--rewrite-host`, the proxy sends `Host: staging.example.net`. An
-`X-Orig-Host: www.example-publisher.com` header is always sent informally.
+With bare `--rewrite-host`, the proxy sends `Host: staging.example.net` (the
+`TO` host). An `X-Orig-Host: www.example-publisher.com` header is always sent
+informally.
 
-**Port handling.** When `--rewrite-host` is active and `TO` carries a
-non-default port (e.g. `localhost:3000`), the port is included in the `Host`
-header but never in the SNI (a bare hostname; a port in SNI is invalid).
+`--rewrite-host` controls both the upstream `Host` header **and** the TLS SNI:
+
+| Form                    | `Host` header | TLS SNI   |
+| ----------------------- | ------------- | --------- |
+| _(omitted)_             | `FROM`        | `TO` host |
+| `--rewrite-host`        | `TO` host     | `TO` host |
+| `--rewrite-host <HOST>` | `<HOST>`      | `<HOST>`  |
+
+**Targeting an IP upstream.** To reach a specific server or load balancer by
+address, set `--to` to a bare IP and pass `--rewrite-host <HOST>` with the
+hostname that endpoint expects. The proxy dials the IP but presents `<HOST>` for
+both SNI and `Host`:
+
+```bash
+ts dev proxy \
+  --from www.example-publisher.com \
+  --to 192.0.2.10 \
+  --rewrite-host app.edgecompute.app \
+  --launch chrome
+```
+
+Without the explicit `<HOST>`, the SNI would be the IP itself — which sends no
+SNI extension at all, so a host-routed endpoint serves its default vhost. Add
+`--insecure` if the IP serves a certificate that doesn't match `<HOST>`.
+
+**Port handling.** With bare `--rewrite-host` and a non-default `TO` port (e.g.
+`localhost:3000`), the port is included in the `Host` header but never in the
+SNI (a bare hostname; a port in SNI is invalid). An explicit
+`--rewrite-host <HOST>` is a bare hostname (no port).
 
 ## Non-loopback listen
 
@@ -216,11 +244,12 @@ ts dev proxy [OPTIONS] [COMMAND]
 Options:
       --map <FROM=TO>           Rewrite rule (repeatable)
   -f, --from <HOST>             Single-rule FROM (pairs with --to)
-  -t, --to <HOST[:PORT]>        Single-rule TO (pairs with --from)
+  -t, --to <HOST[:PORT]>        Single-rule TO (host or IP; pairs with --from)
       --listen <ADDR>           Listen address [default: 127.0.0.1:18080]
       --allow-non-loopback      Permit non-loopback --listen (disables blind tunnel)
       --launch <LIST>           Browsers to launch (chrome,firefox,safari or all)
-      --rewrite-host            Send Host: <TO> instead of the default <FROM>
+      --rewrite-host [<HOST>]   Rewrite upstream Host + SNI: bare = TO, <HOST> = explicit
+                                (omit to keep the default Host: <FROM>)
       --basic-auth <USER:PASS>  Inject Basic auth (visible in ps — prefer --basic-auth-file)
       --basic-auth-file <PATH>  Read USER:PASS from a file
       --insecure                Skip upstream TLS certificate verification

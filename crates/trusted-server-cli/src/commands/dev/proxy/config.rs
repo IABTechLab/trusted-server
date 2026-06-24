@@ -7,7 +7,7 @@ use base64::Engine as _;
 use error_stack::{Report, ResultExt as _};
 
 use super::ProxyArgs;
-use super::rewrite::{Authority, Rule, RuleTable};
+use super::rewrite::{Authority, HostMode, Rule, RuleTable};
 
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
@@ -21,6 +21,9 @@ pub enum ConfigError {
     /// The FROM host contained characters not valid in a hostname.
     #[display("invalid FROM host `{value}` (expected a hostname: letters, digits, '-', '.')")]
     InvalidFrom { value: String },
+    /// The `--rewrite-host <HOST>` value was not a valid hostname.
+    #[display("invalid --rewrite-host `{value}` (expected a hostname: letters, digits, '-', '.')")]
+    InvalidRewriteHost { value: String },
     /// `--listen` was not a valid socket address.
     #[display("invalid --listen address `{value}`")]
     Listen { value: String },
@@ -135,15 +138,32 @@ pub fn ca_dir(args: &ProxyArgs) -> PathBuf {
         .map_or_else(default_ca_dir, PathBuf::from)
 }
 
+/// Resolves the `--rewrite-host` flag into a [`HostMode`] applied to every rule:
+/// absent → preserve `FROM`; bare → use `TO`; with a value → that explicit host
+/// (validated, lowercased) for both the `Host` header and the TLS SNI.
+fn host_mode(args: &ProxyArgs) -> Result<HostMode, ConfigError> {
+    match &args.rewrite_host {
+        None => Ok(HostMode::PreserveFrom),
+        Some(None) => Ok(HostMode::UseTo),
+        Some(Some(host)) => {
+            let host = host.to_ascii_lowercase();
+            if !is_valid_host(&host) {
+                return Err(ConfigError::InvalidRewriteHost { value: host });
+            }
+            Ok(HostMode::Explicit(host))
+        }
+    }
+}
+
 fn build_rules(args: &ProxyArgs) -> Result<RuleTable, ConfigError> {
     let mut rules = Vec::new();
-    let preserve_host = !args.rewrite_host;
+    let mode = host_mode(args)?;
     for entry in &args.map {
         let (from, to) = entry.split_once('=').ok_or(ConfigError::Rule)?;
-        rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
+        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
     }
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
-        rules.push(make_rule(from, to, preserve_host, args.upstream_plaintext)?);
+        rules.push(make_rule(from, to, mode.clone(), args.upstream_plaintext)?);
     }
     Ok(RuleTable(rules))
 }
@@ -162,7 +182,7 @@ fn is_valid_host(host: &str) -> bool {
 fn make_rule(
     from: &str,
     to: &str,
-    preserve_host: bool,
+    host_mode: HostMode,
     plaintext: bool,
 ) -> Result<Rule, ConfigError> {
     let from = from.to_ascii_lowercase();
@@ -173,7 +193,7 @@ fn make_rule(
     Ok(Rule {
         from,
         to,
-        preserve_host,
+        host_mode,
         plaintext,
     })
 }
@@ -253,6 +273,35 @@ mod tests {
         W::parse_from(["ts"]).a
     }
 
+    fn parse_args(argv: &[&str]) -> crate::commands::dev::proxy::ProxyArgs {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct W {
+            #[command(flatten)]
+            a: crate::commands::dev::proxy::ProxyArgs,
+        }
+        W::parse_from(argv).a
+    }
+
+    #[test]
+    fn clap_parses_the_three_rewrite_host_forms() {
+        assert_eq!(
+            parse_args(&["ts"]).rewrite_host,
+            None,
+            "absent --rewrite-host parses to None"
+        );
+        assert_eq!(x
+            parse_args(&["ts", "--rewrite-host"]).rewrite_host,
+            Some(None),
+            "bare --rewrite-host parses to Some(None)"
+        );
+        assert_eq!(
+            parse_args(&["ts", "--rewrite-host", "app.example.com"]).rewrite_host,
+            Some(Some("app.example.com".to_string())),
+            "--rewrite-host <HOST> parses to Some(Some(host))"
+        );
+    }
+
     #[test]
     fn single_rule_from_to_defaults_to_preserve_host() {
         let mut args = base_args();
@@ -263,21 +312,60 @@ mod tests {
             .rules
             .first_match("www.example-publisher.com")
             .expect("rule present");
-        assert!(rule.preserve_host, "default preserves FROM host");
+        assert_eq!(
+            rule.host_mode,
+            HostMode::PreserveFrom,
+            "default preserves FROM host"
+        );
         assert_eq!(rule.to.host(), "to.edgecompute.app");
     }
 
     #[test]
-    fn rewrite_host_flag_clears_preserve_host() {
+    fn bare_rewrite_host_uses_to() {
         let mut args = base_args();
         args.map = vec!["www.example-publisher.com=to.edgecompute.app".into()];
-        args.rewrite_host = true;
+        // Bare `--rewrite-host` (present, no value) parses to `Some(None)`.
+        args.rewrite_host = Some(None);
         let cfg = resolve(&args).expect("should resolve");
-        assert!(
-            !cfg.rules
+        assert_eq!(
+            cfg.rules
                 .first_match("www.example-publisher.com")
                 .expect("rule")
-                .preserve_host
+                .host_mode,
+            HostMode::UseTo,
+            "bare --rewrite-host sends Host: TO"
+        );
+    }
+
+    #[test]
+    fn rewrite_host_with_value_is_explicit_for_ip_to() {
+        let mut args = base_args();
+        // TO is a bare IP; the explicit value supplies the Host header and SNI.
+        args.map = vec!["www.example-publisher.com=192.0.2.10".into()];
+        args.rewrite_host = Some(Some("App.EdgeCompute.app".into()));
+        let cfg = resolve(&args).expect("should resolve");
+        assert_eq!(
+            cfg.rules
+                .first_match("www.example-publisher.com")
+                .expect("rule")
+                .host_mode,
+            HostMode::Explicit("app.edgecompute.app".to_string()),
+            "explicit --rewrite-host is lowercased and stored verbatim"
+        );
+    }
+
+    #[test]
+    fn rewrite_host_with_invalid_value_is_rejected() {
+        let mut args = base_args();
+        args.map = vec!["www.example-publisher.com=192.0.2.10".into()];
+        args.rewrite_host = Some(Some("bad/host".into()));
+        let err = resolve(&args).expect_err("an invalid --rewrite-host should error");
+        assert!(
+            matches!(
+                err.current_context(),
+                ConfigError::InvalidRewriteHost { .. }
+            ),
+            "should be InvalidRewriteHost for a non-hostname value"
         );
     }
 

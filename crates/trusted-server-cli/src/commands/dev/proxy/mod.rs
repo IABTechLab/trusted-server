@@ -40,7 +40,9 @@ pub struct ProxyArgs {
     #[arg(short = 'f', long = "from", value_name = "HOST")]
     pub from: Option<String>,
 
-    /// Shorthand single-rule TO (`HOST[:PORT]`; pairs with `--from`).
+    /// Shorthand single-rule TO (`HOST[:PORT]` or `IP[:PORT]`; pairs with
+    /// `--from`). When TO is a bare IP, pass `--rewrite-host <HOST>` so the TLS
+    /// SNI and `Host` header target the right vhost.
     #[arg(short = 't', long = "to", value_name = "HOST[:PORT]")]
     pub to: Option<String>,
 
@@ -56,9 +58,12 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "LIST")]
     pub launch: Option<String>,
 
-    /// Send `Host: <TO>` upstream instead of the default `<FROM>`.
-    #[arg(long)]
-    pub rewrite_host: bool,
+    /// Rewrite the upstream `Host` header (and TLS SNI). Omit to keep the
+    /// default `Host: <FROM>`; bare `--rewrite-host` sends `Host: <TO>`;
+    /// `--rewrite-host <HOST>` sends `Host: <HOST>` and uses `<HOST>` for SNI
+    /// (needed when `--to` is a bare IP address).
+    #[arg(long, value_name = "HOST", num_args = 0..=1)]
+    pub rewrite_host: Option<Option<String>>,
 
     /// Inject `Authorization: Basic …` (convenience only — visible in `ps`).
     #[arg(long, value_name = "USER:PASS")]

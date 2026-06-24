@@ -85,15 +85,29 @@ impl Authority {
     }
 }
 
+/// How a rule derives the upstream `Host` header and TLS SNI (spec §8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostMode {
+    /// Default: send `Host: FROM` (preserve the production host); SNI is the
+    /// `TO` host.
+    PreserveFrom,
+    /// Bare `--rewrite-host`: send `Host: TO`; SNI is the `TO` host.
+    UseTo,
+    /// `--rewrite-host <HOST>`: send `Host: <HOST>` and present `<HOST>` as the
+    /// TLS SNI, while still connecting to `TO`. Lets `TO` be a bare IP address
+    /// whose endpoint routes and serves certificates by hostname.
+    Explicit(String),
+}
+
 /// A single rewrite rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
     /// Production hostname to match (stored lowercase, port-stripped).
     pub from: String,
-    /// Upstream target.
+    /// Upstream connection target (a hostname or a bare IP address).
     pub to: Authority,
-    /// When true (default), send `Host: FROM`; when false, send `Host: TO`.
-    pub preserve_host: bool,
+    /// How the upstream `Host` header and TLS SNI are derived.
+    pub host_mode: HostMode,
     /// Connect to the upstream over plaintext HTTP.
     pub plaintext: bool,
 }
@@ -120,7 +134,8 @@ impl RuleTable {
 /// The header/SNI decisions for a matched rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewriteOutcome {
-    /// SNI to present upstream (TO host only, no port).
+    /// SNI to present upstream — the `TO` host, or the explicit
+    /// `--rewrite-host` value; never carries a port.
     pub sni: String,
     /// Value for the upstream `Host` header.
     pub host_header: String,
@@ -133,13 +148,15 @@ pub struct RewriteOutcome {
 /// Computes the rewrite outcome for a matched rule (spec §8.3).
 #[must_use]
 pub fn rewrite_for(rule: &Rule) -> RewriteOutcome {
-    let host_header = if rule.preserve_host {
-        rule.from.clone()
-    } else {
-        rule.to.host_with_port()
+    // `Host` and SNI are independent of the connection target (the caller dials
+    // `rule.to`), so an explicit host overrides both while `TO` can stay an IP.
+    let (host_header, sni) = match &rule.host_mode {
+        HostMode::PreserveFrom => (rule.from.clone(), rule.to.host().to_string()),
+        HostMode::UseTo => (rule.to.host_with_port(), rule.to.host().to_string()),
+        HostMode::Explicit(host) => (host.clone(), host.clone()),
     };
     RewriteOutcome {
-        sni: rule.to.host().to_string(),
+        sni,
         host_header,
         orig_host: rule.from.clone(),
         scheme_is_tls: !rule.plaintext,
@@ -150,11 +167,11 @@ pub fn rewrite_for(rule: &Rule) -> RewriteOutcome {
 mod tests {
     use super::*;
 
-    fn rule(from: &str, to: &str, preserve_host: bool, plaintext: bool) -> Rule {
+    fn rule(from: &str, to: &str, host_mode: HostMode, plaintext: bool) -> Rule {
         Rule {
             from: from.to_string(),
             to: Authority::parse(to, plaintext).expect("should parse authority"),
-            preserve_host,
+            host_mode,
             plaintext,
         }
     }
@@ -220,7 +237,7 @@ mod tests {
         let table = RuleTable(vec![rule(
             "www.example-publisher.com",
             "to.edgecompute.app",
-            true,
+            HostMode::PreserveFrom,
             false,
         )]);
         let m = table
@@ -239,8 +256,18 @@ mod tests {
     #[test]
     fn first_match_wins() {
         let table = RuleTable(vec![
-            rule("a.example.com", "first.edgecompute.app", true, false),
-            rule("a.example.com", "second.edgecompute.app", true, false),
+            rule(
+                "a.example.com",
+                "first.edgecompute.app",
+                HostMode::PreserveFrom,
+                false,
+            ),
+            rule(
+                "a.example.com",
+                "second.edgecompute.app",
+                HostMode::PreserveFrom,
+                false,
+            ),
         ]);
         assert_eq!(
             table
@@ -257,7 +284,7 @@ mod tests {
         let r = rule(
             "www.example-publisher.com",
             "to.edgecompute.app:8443",
-            true,
+            HostMode::PreserveFrom,
             false,
         );
         let out = rewrite_for(&r);
@@ -278,7 +305,12 @@ mod tests {
 
     #[test]
     fn rewrite_host_uses_to_authority_with_port() {
-        let r = rule("www.example-publisher.com", "localhost:3000", false, true);
+        let r = rule(
+            "www.example-publisher.com",
+            "localhost:3000",
+            HostMode::UseTo,
+            true,
+        );
         let out = rewrite_for(&r);
         assert_eq!(out.sni, "localhost", "SNI never carries a port");
         assert_eq!(
@@ -293,6 +325,32 @@ mod tests {
             !out.scheme_is_tls,
             "plaintext rule yields a non-TLS outcome"
         );
+    }
+
+    #[test]
+    fn explicit_rewrite_host_overrides_host_and_sni_for_ip_upstream() {
+        // TO is a bare IP; an explicit --rewrite-host drives both the Host header
+        // and the SNI so the IP endpoint can route and present the right cert.
+        let r = rule(
+            "www.example-publisher.com",
+            "192.0.2.10",
+            HostMode::Explicit("app.edgecompute.app".to_string()),
+            false,
+        );
+        let out = rewrite_for(&r);
+        assert_eq!(
+            out.sni, "app.edgecompute.app",
+            "SNI is the explicit host, not the IP"
+        );
+        assert_eq!(
+            out.host_header, "app.edgecompute.app",
+            "Host header is the explicit host"
+        );
+        assert_eq!(
+            out.orig_host, "www.example-publisher.com",
+            "X-Orig-Host stays FROM"
+        );
+        assert!(out.scheme_is_tls, "TLS rule yields a TLS outcome");
     }
 
     #[test]
