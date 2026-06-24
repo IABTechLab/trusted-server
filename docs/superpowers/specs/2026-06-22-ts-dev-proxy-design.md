@@ -257,11 +257,13 @@ user-facing output through a thin helper (with a local
 `#![allow(clippy::print_stdout)]` if that restriction lint is enabled).
 
 Scope every dependency to macOS (`[target.'cfg(target_os = "macos")'.dependencies]`)
-and place the platform `compile_error!` (§16) at the **crate root** (`lib.rs`),
-gating the command modules behind `#[cfg(target_os = "macos")]`. Together these
-ensure an accidental wasm build (the repo default) compiles nothing but the
-single clear "macOS only" error — never a cascade of failed `tokio`/`ring`/
-`aws-lc-sys` builds for a target they don't support.
+and gate the command modules behind `#[cfg(target_os = "macos")]`. On any other
+target (notably the repo-default `wasm32-wasip1`) the crate builds as an empty
+shell rather than dragging `tokio`/`ring`/`aws-lc-sys` through a build for a
+target they don't support. Build the tool natively with an explicit `--target`
+(e.g. `aarch64-apple-darwin`); a plain `cargo build` uses the wasm default and
+produces only the empty shell. (Making a no-`--target` build resolve to the host
+is target-config work tracked separately, aligned with edgezero conventions.)
 
 ---
 
@@ -667,9 +669,9 @@ Steps 1–4 already deliver a usable tool; each step is independently shippable.
 - **WebSocket / non-HTTP upgrades** through the MITM tunnel.
 - **Response rewriting / fixture injection** (mock upstreams, latency).
 - **Multiple simultaneous upstreams per host** (A/B / weighted).
-- **Windows/Linux support.** v1 is macOS-only — deps are scoped to
-  `target_os = "macos"` and the crate root carries a `compile_error!` for other
-  targets (§6), because CA trust, Safari automation, and browser launching all
-  rely on macOS tooling (login keychain, `networksetup`). Cross-platform trust +
-  Safari automation is future work.
+- **Windows/Linux support.** v1 is macOS-only — deps and command modules are
+  scoped to `target_os = "macos"` (the crate is an empty shell elsewhere; §6),
+  because CA trust, Safari automation, and browser launching all rely on macOS
+  tooling (login keychain, `networksetup`). Cross-platform trust + Safari
+  automation is future work.
 - **Recording/replay** of proxied traffic.

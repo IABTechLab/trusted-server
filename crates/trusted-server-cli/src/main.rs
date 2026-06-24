@@ -9,7 +9,8 @@ fn main() {
     std::process::exit(Cli::parse().run());
 }
 
-// On unsupported targets the library's `compile_error!` is the real failure;
-// this trivial entry point just keeps the binary target's shape valid.
+// `ts dev proxy` is macOS-only (its deps are macOS-scoped in `Cargo.toml`), so
+// on other targets the crate is an empty shell; this trivial entry point just
+// keeps the binary target's shape valid.
 #[cfg(not(target_os = "macos"))]
 fn main() {}

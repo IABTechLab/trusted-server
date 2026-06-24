@@ -1,21 +1,13 @@
 //! Trusted Server developer CLI library. The `ts` binary is a thin wrapper;
 //! all logic lives here so integration tests can exercise it.
 
-// `ts dev proxy` — the crate's sole command — is macOS-only: CA trust uses the
-// login keychain, Safari is driven via `networksetup`, and browser launching
-// uses macOS app conventions. The native networking/TLS dependencies are scoped
-// to macOS in `Cargo.toml`, so on other targets (notably the repo-default
-// `wasm32-wasip1`) this is the single, clear build error instead of a cascade of
-// failed dependency builds. Cross-platform support is future work (design spec §16).
-#[cfg(not(target_os = "macos"))]
-compile_error!(
-    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
-     networksetup). Cross-platform support is tracked as future work in the \
-     design spec (§16)."
-);
-
 pub mod output;
 
+// `ts dev proxy` — the crate's sole command — is macOS-only (CA trust via the
+// login keychain, Safari automation via `networksetup`, a native TLS/networking
+// stack). Its dependencies are scoped to macOS in `Cargo.toml`, so the command
+// module only exists there; on other targets the crate builds as an empty shell.
+// Cross-platform support is future work (design spec §16).
 #[cfg(target_os = "macos")]
 pub mod commands;
 

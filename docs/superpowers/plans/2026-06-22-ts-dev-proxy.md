@@ -97,9 +97,10 @@ path = "src/main.rs"
 
 # The proxy (this crate's only command) is macOS-only, so every dependency is
 # scoped to macOS. On other targets — notably the repo-default `wasm32-wasip1`
-# from `.cargo/config.toml` — none of this native TLS/networking stack is built,
-# so the `compile_error!` in `src/lib.rs` is the single, clear failure instead of
-# a cascade of failed `tokio`/`ring`/`aws-lc-sys` builds.
+# from `.cargo/config.toml` — none of this native TLS/networking stack is built
+# and the crate is an empty shell, instead of a cascade of failed
+# `tokio`/`ring`/`aws-lc-sys` builds. Build natively with an explicit `--target`
+# (e.g. `aarch64-apple-darwin`).
 [target.'cfg(target_os = "macos")'.dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
@@ -160,19 +161,12 @@ The crate is a **library + thin bin** so that integration tests (Task 5) can imp
 //! Trusted Server developer CLI library. The `ts` binary is a thin wrapper;
 //! all logic lives here so integration tests can exercise it.
 
-// `ts dev proxy` — the crate's sole command — is macOS-only. The platform gate
-// lives here at the crate root (not inside the proxy module) so that, combined
-// with the macOS-scoped deps in Cargo.toml, unsupported targets compile nothing
-// but this single clear error — no failed native dependency builds (spec §16).
-#[cfg(not(target_os = "macos"))]
-compile_error!(
-    "`ts dev proxy` currently supports macOS only (keychain trust, Safari, \
-     networksetup). Cross-platform support is tracked as future work in the \
-     design spec (§16)."
-);
-
 pub mod output;
 
+// `ts dev proxy` — the crate's sole command — is macOS-only (CA trust via the
+// login keychain, Safari automation via `networksetup`, a native TLS/networking
+// stack). Its deps are macOS-scoped in Cargo.toml, so the command module only
+// exists there; on other targets the crate builds as an empty shell (spec §16).
 #[cfg(target_os = "macos")]
 pub mod commands;
 
@@ -229,8 +223,9 @@ fn main() {
     std::process::exit(Cli::parse().run());
 }
 
-// On unsupported targets the library's `compile_error!` is the real failure;
-// this trivial entry point just keeps the binary target's shape valid.
+// `ts dev proxy` is macOS-only (its deps are macOS-scoped in Cargo.toml), so on
+// other targets the crate is an empty shell; this trivial entry point just keeps
+// the binary target's shape valid.
 #[cfg(not(target_os = "macos"))]
 fn main() {}
 ```

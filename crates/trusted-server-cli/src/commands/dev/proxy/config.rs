@@ -290,7 +290,7 @@ mod tests {
             None,
             "absent --rewrite-host parses to None"
         );
-        assert_eq!(x
+        assert_eq!(
             parse_args(&["ts", "--rewrite-host"]).rewrite_host,
             Some(None),
             "bare --rewrite-host parses to Some(None)"
