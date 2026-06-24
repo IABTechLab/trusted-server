@@ -10,6 +10,9 @@ use edgezero_core::router::RouterService;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp;
 use trusted_server_core::settings::Settings;
 
+const LEGACY_ADMIN_DENY_METHODS: &[&str] =
+    &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+
 /// Build the full application router from explicit test settings.
 ///
 /// The settings baked into the binary contain placeholder secrets that
@@ -57,6 +60,34 @@ fn assert_route_registered(method: &str, path: &str) {
         routes.iter().any(|(m, p)| m == method && p == path),
         "{method} {path} must be explicitly registered; registered routes: {routes:?}"
     );
+}
+
+/// Build a router from explicit test settings so routes resolve to their real
+/// handlers instead of the `startup_error_router` fallback. The settings baked
+/// into the binary carry placeholder secrets that `get_settings()` rejects,
+/// which would otherwise turn every route into a startup error page.
+fn make_router() -> RouterService {
+    let settings = trusted_server_core::settings::Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "integration-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+        "#,
+    )
+    .expect("should parse route test settings");
+
+    TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router from test settings")
 }
 
 #[test]
@@ -122,27 +153,30 @@ async fn auth_middleware_runs_in_chain_for_protected_routes() {
 async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     // Regression for the credential-leak finding: the production basic-auth regex
     // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
-    // auth-gated. A POST carrying an `Authorization` header must be denied locally
-    // with 404, never proxied to the publisher origin (which would leak the admin
-    // credentials and key body). A publisher-fallback proxy without a backend
-    // would surface as a 5xx, so 404 proves the local deny ran.
+    // auth-gated. Any publisher-fallback method carrying an `Authorization`
+    // header must be denied locally with 404, never proxied to the publisher
+    // origin (which would leak the admin credentials and key body). A
+    // publisher-fallback proxy without a backend would surface as a 5xx, so 404
+    // proves the local deny ran.
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let router = test_router();
-        let req = request_builder()
-            .method("POST")
-            .uri(path)
-            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header("content-type", "application/json")
-            .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
-            .expect("should build authorized legacy-alias request");
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            let router = test_router();
+            let req = request_builder()
+                .method(*method)
+                .uri(path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .header("content-type", "application/json")
+                .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
+                .expect("should build authorized legacy-alias request");
 
-        let resp = router.oneshot(req).await;
+            let resp = router.oneshot(req).await;
 
-        assert_eq!(
-            resp.status().as_u16(),
-            404,
-            "legacy {path} with Authorization must be denied locally (404), not proxied to publisher"
-        );
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
     }
 }
 
@@ -177,8 +211,6 @@ fn all_explicit_routes_are_registered() {
         ("POST", "/verify-signature"),
         ("POST", "/_ts/admin/keys/rotate"),
         ("POST", "/_ts/admin/keys/deactivate"),
-        ("POST", "/admin/keys/rotate"),
-        ("POST", "/admin/keys/deactivate"),
         ("POST", "/auction"),
         ("GET", "/first-party/proxy"),
         ("GET", "/first-party/click"),
@@ -189,6 +221,12 @@ fn all_explicit_routes_are_registered() {
 
     for (method, path) in expected {
         assert_route_registered(method, path);
+    }
+
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            assert_route_registered(method, path);
+        }
     }
 }
 
@@ -334,5 +372,69 @@ async fn admin_deactivate_key_auth_fail_returns_401() {
         resp.status().as_u16(),
         401,
         "admin/keys/deactivate without credentials must return 401"
+    );
+}
+
+#[tokio::test]
+async fn legacy_admin_rotate_alias_returns_404() {
+    // The legacy non-`/_ts` alias is denied locally rather than routed to the
+    // admin handler or publisher fallback.
+    let router = make_router();
+
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/rotate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+
+    let resp = router.oneshot(req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "legacy admin key rotation alias must return local 404"
+    );
+}
+
+#[tokio::test]
+async fn legacy_admin_deactivate_alias_returns_404() {
+    let router = make_router();
+
+    let req = request_builder()
+        .method("POST")
+        .uri("/admin/keys/deactivate")
+        .header("content-type", "application/json")
+        .body(edgezero_core::body::Body::from("{}"))
+        .expect("should build request");
+
+    let resp = router.oneshot(req).await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "legacy admin key deactivation alias must return local 404"
+    );
+}
+
+#[tokio::test]
+async fn tsjs_route_prefix_is_handled_not_5xx() {
+    // `/static/tsjs=` is a GET catch-all path. The handler returns 404 for an
+    // unknown hash, which is correct application behavior (not a routing 404).
+    // This verifies the handler is reached without a 5xx/panic.
+    let router = make_router();
+
+    let req = request_builder()
+        .method("GET")
+        .uri("/static/tsjs=0000000000000000")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build request");
+
+    let resp = router.oneshot(req).await;
+    let status = resp.status().as_u16();
+
+    assert!(
+        status < 500,
+        "tsjs catch-all handler must not return 5xx: got {status}"
     );
 }

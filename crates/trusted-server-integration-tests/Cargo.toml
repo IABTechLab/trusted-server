@@ -1,0 +1,59 @@
+[package]
+name = "trusted-server-integration-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = true
+
+[[test]]
+name = "parity"
+path = "tests/parity.rs"
+harness = true
+
+[dev-dependencies]
+trusted-server-core = { path = "../trusted-server-core" }
+testcontainers = { version = "0.25", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "cookies", "json"] }
+scraper = "0.21"
+log = "0.4.29"
+serde_json = "1.0.149"
+error-stack = "0.6"
+derive_more = { version = "2.0", features = ["display"] }
+env_logger = "0.11"
+libc = "0.2"
+urlencoding = "2.1"
+trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
+trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
+trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
+# This crate is excluded from the workspace, so the edgezero git rev below
+# cannot come from [workspace.dependencies] and duplicates the pin in the
+# root Cargo.toml. Any edgezero rev bump must be applied in BOTH places, or
+# this crate compiles edgezero-core at a different rev than the adapters
+# under test and fails with a type mismatch.
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", features = ["axum"] }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e" }
+axum = "0.8.9"
+tower = { version = "0.4", features = ["util"] }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] } # exact pin — keep in sync with workspace-resolved tokio version
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "allow"
+panic = "deny"
+module_name_repetitions = "allow"
+must_use_candidate = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"

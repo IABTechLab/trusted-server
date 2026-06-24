@@ -333,11 +333,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // and the production basic-auth handler regex (`^/_ts/admin`), so they
             // are auth-gated under a production-shaped config.
             //
-            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally
-            // with a 404: the production handler regex `^/_ts/admin` does not match
-            // them, and letting them fall through to the publisher fallback would
-            // forward the caller's `Authorization` header and key-management payload
-            // to the origin, leaking admin credentials.
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered
+            // below to a local 404 for every publisher-fallback method: the
+            // production handler regex `^/_ts/admin` does not match them, and
+            // letting them fall through would forward the caller's
+            // `Authorization` header and key-management payload to the origin,
+            // leaking admin credentials.
             .post(
                 "/_ts/admin/keys/rotate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
@@ -348,18 +349,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 "/_ts/admin/keys/deactivate",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
                     handle_deactivate_key(&s.settings, &services, req)
-                }),
-            )
-            .post(
-                "/admin/keys/rotate",
-                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                    Ok(legacy_admin_alias_denied())
-                }),
-            )
-            .post(
-                "/admin/keys/deactivate",
-                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                    Ok(legacy_admin_alias_denied())
                 }),
             )
             .post(
@@ -408,6 +397,19 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     handle_first_party_proxy_rebuild(&s.settings, &services, req).await
                 }),
             );
+
+        let legacy_admin_deny =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(legacy_admin_alias_denied())
+            });
+        for method in publisher_fallback_methods() {
+            router = router.route(
+                "/admin/keys/rotate",
+                method.clone(),
+                legacy_admin_deny.clone(),
+            );
+            router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
+        }
 
         for method in publisher_fallback_methods() {
             router = router.route("/", method.clone(), fallback.clone());

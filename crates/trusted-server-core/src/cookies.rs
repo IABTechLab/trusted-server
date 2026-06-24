@@ -5,7 +5,7 @@
 
 use cookie::{Cookie, CookieJar};
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use http::header;
 use http::Request;
 
@@ -51,21 +51,18 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
 pub fn handle_request_cookies(
     req: &Request<EdgeBody>,
 ) -> Result<Option<CookieJar>, Report<TrustedServerError>> {
-    match req.headers().get(header::COOKIE) {
-        Some(header_value) => {
-            let header_value_str =
-                header_value
-                    .to_str()
-                    .change_context(TrustedServerError::InvalidHeaderValue {
-                        message: "Cookie header contains invalid UTF-8".to_string(),
-                    })?;
-            let jar = parse_cookies_to_jar(header_value_str);
-            Ok(Some(jar))
-        }
-        None => {
-            log::debug!("No cookie header found in request");
-            Ok(None)
-        }
+    if let Some(header_value) = req.headers().get(header::COOKIE) {
+        let header_value_str =
+            header_value
+                .to_str()
+                .change_context(TrustedServerError::InvalidHeaderValue {
+                    message: "Cookie header contains invalid UTF-8".to_owned(),
+                })?;
+        let jar = parse_cookies_to_jar(header_value_str);
+        Ok(Some(jar))
+    } else {
+        log::debug!("No cookie header found in request");
+        Ok(None)
     }
 }
 

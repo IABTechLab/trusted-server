@@ -10,6 +10,9 @@ use edgezero_adapter_axum::EdgeZeroAxumService;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
+const LEGACY_ADMIN_DENY_METHODS: &[&str] =
+    &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
+
 /// Build the full application router from explicit test settings.
 ///
 /// The settings baked into the binary contain placeholder secrets that
@@ -100,12 +103,12 @@ fn all_explicit_routes_are_registered() {
 fn legacy_admin_aliases_are_registered_to_local_deny() {
     let routes = registered_routes();
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        assert!(
-            routes
-                .iter()
-                .any(|(method, p)| method == "POST" && p == path),
-            "legacy {path} must be registered (to the local deny) so it never reaches the publisher fallback; registered routes: {routes:?}"
-        );
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            assert!(
+                routes.iter().any(|(m, p)| m == method && p == path),
+                "legacy {method} {path} must be registered (to the local deny) so it never reaches the publisher fallback; registered routes: {routes:?}"
+            );
+        }
     }
 }
 
@@ -257,31 +260,34 @@ async fn admin_route_without_credentials_returns_401() {
 async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
     // Regression for the credential-leak finding: the production basic-auth regex
     // `^/_ts/admin` does not match `/admin/keys/*`, so those aliases are not
-    // auth-gated. A POST carrying an `Authorization` header must be denied locally
-    // with 404, never proxied to the publisher origin (which would leak the admin
-    // credentials and key body). A publisher-fallback proxy without a backend
-    // would surface as a 5xx, so 404 proves the local deny ran.
+    // auth-gated. Any publisher-fallback method carrying an `Authorization`
+    // header must be denied locally with 404, never proxied to the publisher
+    // origin (which would leak the admin credentials and key body). A
+    // publisher-fallback proxy without a backend would surface as a 5xx, so 404
+    // proves the local deny ran.
     for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-        let mut svc = make_service();
-        let req = Request::builder()
-            .method("POST")
-            .uri(path)
-            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
-            .header("content-type", "application/json")
-            .body(AxumBody::from("{\"key_id\":\"leak-me\"}"))
-            .expect("should build authorized legacy-alias request");
-        let resp = svc
-            .ready()
-            .await
-            .expect("should be ready")
-            .call(req)
-            .await
-            .expect("should respond");
-        assert_eq!(
-            resp.status().as_u16(),
-            404,
-            "legacy {path} with Authorization must be denied locally (404), not proxied to publisher"
-        );
+        for method in LEGACY_ADMIN_DENY_METHODS {
+            let mut svc = make_service();
+            let req = Request::builder()
+                .method(*method)
+                .uri(path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .header("content-type", "application/json")
+                .body(AxumBody::from("{\"key_id\":\"leak-me\"}"))
+                .expect("should build authorized legacy-alias request");
+            let resp = svc
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(req)
+                .await
+                .expect("should respond");
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
     }
 }
 

@@ -2,6 +2,15 @@
 /bin
 /pkg
 /target
+**/target/
+
+# Node.js dependencies and build output (any crate, e.g. crates/trusted-server-js)
+**/node_modules/
+**/dist/
+**/.npm
+**/.eslintcache
+# Auto-generated JS module index
+**/src/generated-modules.ts
 
 # local Spin CLI downloads
 /spin
@@ -9,7 +18,6 @@
 
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
-/crates/integration-tests/target
 
 # env
 .env*
@@ -39,7 +47,7 @@ src/*.html
 /benchmark-results/**
 
 # Playwright browser tests
-/crates/integration-tests/browser/node_modules/
-/crates/integration-tests/browser/test-results/
-/crates/integration-tests/browser/playwright-report/
-/crates/integration-tests/browser/.browser-test-state.json
+/crates/trusted-server-integration-tests/browser/node_modules/
+/crates/trusted-server-integration-tests/browser/test-results/
+/crates/trusted-server-integration-tests/browser/playwright-report/
+/crates/trusted-server-integration-tests/browser/.browser-test-state.json

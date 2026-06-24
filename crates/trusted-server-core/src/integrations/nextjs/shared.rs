@@ -71,10 +71,7 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
         return Some(suffix);
     }
 
-    if matches!(
-        suffix.as_bytes().first(),
-        Some(b'/') | Some(b'?') | Some(b'#')
-    ) {
+    if matches!(suffix.as_bytes().first(), Some(b'/' | b'?' | b'#')) {
         return Some(suffix);
     }
 
@@ -85,16 +82,8 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
     }
 
     let rest = &port_and_rest[port_len..];
-    if rest.is_empty()
-        || matches!(
-            rest.as_bytes().first(),
-            Some(b'/') | Some(b'?') | Some(b'#')
-        )
-    {
-        Some(suffix)
-    } else {
-        None
-    }
+    (rest.is_empty() || matches!(rest.as_bytes().first(), Some(b'/' | b'?' | b'#')))
+        .then_some(suffix)
 }
 
 // =============================================================================
@@ -111,7 +100,7 @@ pub(crate) fn strip_origin_host_with_optional_port<'a>(
 fn build_origin_url_pattern(origin_host: &str) -> Result<Regex, regex::Error> {
     let escaped = regex::escape(origin_host);
     Regex::new(&format!(
-        r#"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>{escaped}(?::\d+)?)"#
+        r"(https?)?(:)?(\\\\\\\\\\\\\\\\//|\\\\\\\\//|\\/\\/|//)(?P<host>{escaped}(?::\d+)?)"
     ))
 }
 
@@ -174,7 +163,7 @@ impl RscUrlRewriter {
             Ok(pattern) => {
                 let result =
                     Self::apply_rewrite(input, &pattern, origin_host, request_host, request_scheme);
-                *self.cached_pattern.borrow_mut() = Some((origin_host.to_string(), pattern));
+                *self.cached_pattern.borrow_mut() = Some((origin_host.to_owned(), pattern));
                 result
             }
             Err(e) => {
@@ -199,7 +188,7 @@ impl RscUrlRewriter {
                     .get(0)
                     .expect("should capture the matched RSC URL")
                     .as_str()
-                    .to_string();
+                    .to_owned();
             };
 
             let slashes = caps.get(3).map_or("//", |m| m.as_str());
@@ -252,7 +241,7 @@ mod tests {
 
     #[test]
     fn finds_single_quoted_payload() {
-        let script = r#"self.__next_f.push([1,'hello world'])"#;
+        let script = "self.__next_f.push([1,'hello world'])";
         let (start, end) = find_rsc_push_payload_range(script).expect("should find payload");
         assert_eq!(&script[start..end], "hello world");
     }

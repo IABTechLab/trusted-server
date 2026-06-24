@@ -61,6 +61,7 @@ openssl rand -base64 32
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
 | `[ec]`              | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`   | Optional tester-cookie endpoint              |
 | `[proxy]`           | Proxy SSRF allowlist and asset routes        |
 | `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
@@ -321,6 +322,52 @@ a zero-byte cap fails every non-empty buffered response.
 
 ```bash
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+```
+
+## Tester Cookie Configuration
+
+Settings for the optional tester-cookie endpoints. This feature is disabled by
+default and should only be enabled for intentional QA or troubleshooting flows.
+
+### `[tester_cookie]`
+
+| Field     | Type    | Required | Description                                        |
+| --------- | ------- | -------- | -------------------------------------------------- |
+| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+
+When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
+
+```http
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Cache-Control: no-store, private
+```
+
+`GET /_ts/clear-tester` returns `204 No Content` and clears the cookie:
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+When disabled, both routes return `404 Not Found` and do not set a cookie.
+
+::: warning
+The cookie is scoped with `[publisher].cookie_domain`, not the EC-specific
+computed domain. Keep `cookie_domain` aligned with the browser scope where your
+QA tooling expects to read `ts-tester`.
+:::
+
+**Example**:
+
+```toml
+[tester_cookie]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
 ```
 
 ## EC Configuration
@@ -933,7 +980,7 @@ See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and I
 
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Permutive, Testlight). For other
+Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
 integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
 
 ### Common Fields
@@ -1055,6 +1102,29 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__ENABLED=true
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
+
+### Osano Integration
+
+**Section**: `[integrations.osano]`
+
+| Field     | Type    | Default | Description                             |
+| --------- | ------- | ------- | --------------------------------------- |
+| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+
+**Example**:
+
+```toml
+[integrations.osano]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+```
+
+The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
 
 ### Permutive Integration
 

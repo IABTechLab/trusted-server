@@ -118,7 +118,10 @@ export default withMermaid(
               text: 'Proxy Signing',
               link: '/guide/proxy-signing',
             },
-            { text: 'Collective Sync', link: '/guide/collective-sync' },
+            {
+              text: 'Edge Cookie External Sync',
+              link: '/guide/collective-sync',
+            },
           ],
         },
         {
@@ -137,7 +140,10 @@ export default withMermaid(
             },
             {
               text: 'CMP',
-              items: [{ text: 'Didomi', link: '/guide/integrations/didomi' }],
+              items: [
+                { text: 'Didomi', link: '/guide/integrations/didomi' },
+                { text: 'Osano', link: '/guide/integrations/osano' },
+              ],
             },
             {
               text: 'Data',

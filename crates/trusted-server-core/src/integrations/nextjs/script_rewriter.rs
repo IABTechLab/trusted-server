@@ -143,13 +143,11 @@ impl UrlRewriter {
                 .collect::<Vec<_>>()
                 .join("|");
             let pattern = format!(
-                r#"(?P<prefix>(?:\\*")?(?:{attrs})(?:\\*")?\s*:\s*\\*")(?P<value>[^"\\]*)(?P<quote>\\*")"#,
-                attrs = attr_alternation,
+                r#"(?P<prefix>(?:\\*")?(?:{attr_alternation})(?:\\*")?\s*:\s*\\*")(?P<value>[^"\\]*)(?P<quote>\\*")"#,
             );
             Some(Regex::new(&pattern).map_err(|err| {
                 super::configuration_error(format!(
-                    "failed to compile __NEXT_DATA__ URL rewrite regex for attributes {:?}: {err}",
-                    attributes
+                    "failed to compile __NEXT_DATA__ URL rewrite regex for attributes {attributes:?}: {err}"
                 ))
             })?)
         };
@@ -177,7 +175,7 @@ impl UrlRewriter {
                 return Some(format!("//{request_host}{path}"));
             }
         } else if url == origin_host {
-            return Some(request_host.to_string());
+            return Some(request_host.to_owned());
         } else if let Some(path) = strip_origin_host_with_optional_port(url, origin_host) {
             return Some(format!("{request_host}{path}"));
         }
@@ -210,7 +208,7 @@ impl UrlRewriter {
                 caps.get(0)
                     .expect("should capture matched attribute value")
                     .as_str()
-                    .to_string()
+                    .to_owned()
             }
         });
 

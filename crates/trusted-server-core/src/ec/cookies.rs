@@ -90,8 +90,7 @@ fn is_safe_cookie_value(value: &str) -> bool {
 /// attributes (e.g. adding `Partitioned`) only need updating in one place.
 fn format_set_cookie(domain: &str, value: &str, max_age: i32) -> String {
     format!(
-        "{}={}; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={}; HttpOnly",
-        COOKIE_TS_EC, value, domain, max_age,
+        "{COOKIE_TS_EC}={value}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
     )
 }
 
@@ -231,7 +230,7 @@ mod tests {
         let settings = create_test_settings();
         let result = create_ec_cookie(&settings, "evil;injected\r\nfoo=bar\0baz");
         let value = result
-            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
+            .strip_prefix(&format!("{COOKIE_TS_EC}="))
             .and_then(|s| s.split_once(';').map(|(v, _)| v))
             .expect("should have cookie value portion");
 
@@ -247,7 +246,7 @@ mod tests {
         let id = "abc123def0123456789abcdef0123456789abcdef0123456789abcdef01234567.xk92ab";
         let result = create_ec_cookie(&settings, id);
         let value = result
-            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
+            .strip_prefix(&format!("{COOKIE_TS_EC}="))
             .and_then(|s| s.split_once(';').map(|(v, _)| v))
             .expect("should have cookie value portion");
 
@@ -306,7 +305,7 @@ mod tests {
     #[test]
     fn is_safe_cookie_value_rejects_non_ascii() {
         assert!(
-            !is_safe_cookie_value("valüe"),
+            !is_safe_cookie_value("val\u{fc}e"),
             "should reject non-ASCII UTF-8 characters"
         );
     }
@@ -348,7 +347,7 @@ mod tests {
             "should set Max-Age=0 to expire cookie"
         );
         assert!(
-            cookie_str.starts_with(&format!("{}=;", COOKIE_TS_EC)),
+            cookie_str.starts_with(&format!("{COOKIE_TS_EC}=;")),
             "should clear cookie value"
         );
         assert!(
