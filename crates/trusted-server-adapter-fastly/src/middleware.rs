@@ -30,6 +30,9 @@ use trusted_server_core::platform::PlatformGeo;
 use trusted_server_core::settings::Settings;
 
 pub(crate) const HEADER_X_TS_FINALIZED: &str = "x-ts-finalized";
+pub(crate) const PRIVATE_CACHE_CONTROL_VALUE: &str = "private, max-age=0";
+pub(crate) const SURROGATE_CONTROL_HEADER: &str = "surrogate-control";
+pub(crate) const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
 
 // ---------------------------------------------------------------------------
 // FinalizeResponseMiddleware
@@ -237,15 +240,10 @@ pub(crate) fn apply_finalize_headers(
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+        .is_some_and(cache_control_is_uncacheable);
 
     for (key, value) in &settings.response_headers {
-        if response_is_uncacheable
-            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || key.eq_ignore_ascii_case("surrogate-control")
-                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
-        {
+        if response_is_uncacheable && is_protected_cache_header(key) {
             continue;
         }
         let header_name = HeaderName::from_bytes(key.as_bytes())
@@ -277,22 +275,40 @@ pub(crate) fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    response.headers_mut().remove("surrogate-control");
-    response.headers_mut().remove("fastly-surrogate-control");
-    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
-    // against a lowercased copy — `No-Store` / `Private` must count.
+    response.headers_mut().remove(SURROGATE_CONTROL_HEADER);
+    response
+        .headers_mut()
+        .remove(FASTLY_SURROGATE_CONTROL_HEADER);
     let already_uncacheable = response
         .headers()
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+        .is_some_and(cache_control_is_uncacheable);
     if !already_uncacheable {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
+            HeaderValue::from_static(PRIVATE_CACHE_CONTROL_VALUE),
         );
     }
+}
+
+/// Returns whether a `Cache-Control` value already disables shared cache reuse.
+pub(crate) fn cache_control_is_uncacheable(value: &str) -> bool {
+    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
+    // against a lowercased copy — `No-Store` / `Private` must count.
+    let value = value.to_ascii_lowercase();
+    value.contains("private") || value.contains("no-store")
+}
+
+/// Returns whether a response header can re-enable shared cacheability.
+pub(crate) fn is_protected_cache_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str()) || is_surrogate_cache_header(name)
+}
+
+/// Returns whether a response header controls Fastly surrogate cacheability.
+pub(crate) fn is_surrogate_cache_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(SURROGATE_CONTROL_HEADER)
+        || name.eq_ignore_ascii_case(FASTLY_SURROGATE_CONTROL_HEADER)
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +436,30 @@ mod tests {
             );
         }
         response
+    }
+
+    #[test]
+    fn cache_policy_helpers_match_case_insensitive_directives_and_headers() {
+        assert!(
+            cache_control_is_uncacheable("No-Store"),
+            "should match mixed-case no-store"
+        );
+        assert!(
+            cache_control_is_uncacheable("max-age=0, Private"),
+            "should match mixed-case private"
+        );
+        assert!(
+            is_protected_cache_header("Fastly-Surrogate-Control"),
+            "should match protected surrogate cache header"
+        );
+        assert!(
+            is_protected_cache_header("Cache-Control"),
+            "should match protected cache-control header"
+        );
+        assert!(
+            !is_protected_cache_header("x-operator"),
+            "should not protect unrelated operator headers"
+        );
     }
 
     #[test]
