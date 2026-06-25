@@ -1,7 +1,6 @@
 //! Middleware implementations for the `EdgeZero` entry point.
 //!
-//! Provides two middleware types that mirror the finalization and auth logic
-//! used in the legacy entry point:
+//! Provides two middleware types used by the `EdgeZero` entry point:
 //!
 //! - [`FinalizeResponseMiddleware`] — geo lookup and standard TS header injection
 //! - [`AuthMiddleware`] — basic-auth enforcement via [`enforce_basic_auth`]
@@ -154,11 +153,12 @@ impl Middleware for AuthMiddleware {
 ///
 /// # Parity note
 ///
-/// The legacy path skips geo only for its own `HandlerOutcome::AuthChallenge`
-/// responses; origin-forwarded 401s still receive geo headers there. The `EdgeZero`
-/// path skips geo for **all** 401s by status. This is intentionally more
-/// conservative: geo data is not sent to any unauthenticated caller regardless of
-/// whether the 401 originated from this server or the upstream origin.
+/// Before legacy cleanup, the Fastly-native path skipped geo only for this
+/// server's own auth challenges; origin-forwarded 401s still received geo
+/// headers there. The `EdgeZero` path skips geo for **all** 401s by status. This
+/// is intentionally more conservative: geo data is not sent to any
+/// unauthenticated caller regardless of whether the 401 originated from this
+/// server or the upstream origin.
 pub(crate) fn resolve_geo_for_response<F>(
     response: &Response,
     client_ip: Option<IpAddr>,

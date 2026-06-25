@@ -272,15 +272,12 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 /// Asserts the response has a specific HTTP status code.
-/// Asserts the running Viceroy instance is serving the `EdgeZero` entry point.
+/// Asserts the running Viceroy instance is serving the post-cutover `EdgeZero`
+/// entry point.
 ///
-/// `main()` silently falls back to the legacy entry point when the config store
-/// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
-/// This canary distinguishes them: the `EdgeZero` router returns a router-level
-/// `405` for methods outside its registered set (e.g. `TRACE`), whereas the
-/// legacy path proxied every method through to the publisher origin. Without it,
-/// a fixture/env/config-store regression could green the `EdgeZero` CI job while
-/// it actually exercises legacy.
+/// The `EdgeZero` router returns a router-level `405` for methods outside its
+/// registered set (e.g. `TRACE`). This canary catches stale binaries or broken
+/// fixtures that fail before reaching the router.
 pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -292,8 +289,7 @@ pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
         .change_context(TestError::HttpRequest)
         .attach("TRACE / (EdgeZero entry-point canary)")?;
     assert_status(&response, 405).attach(
-        "EdgeZero canary: TRACE should return a router-level 405; a non-405 status \
-         means main() fell back to the legacy entry point",
+        "EdgeZero canary: TRACE should return a router-level 405",
     )
 }
 

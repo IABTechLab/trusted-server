@@ -1,12 +1,9 @@
-# Viceroy local server configuration template for integration tests —
-# EdgeZero entry-point variant.
+# Viceroy local server configuration template for the focused Fastly EC
+# lifecycle integration job.
 #
-# Identical to `viceroy-template.toml` but adds the `trusted_server_config`
-# config store with `edgezero_enabled = "true"`, so the same WASM binary routes
-# requests through the EdgeZero entry point instead of the legacy path. Used by
-# the `integration-tests-edgezero` CI job (via `VICEROY_CONFIG_PATH`) to exercise
-# Fastly request conversion, config-store dispatch, and end-to-end EC wiring on
-# the EdgeZero path. Keep the shared stores in sync with `viceroy-template.toml`.
+# Post-cutover, the Fastly binary always uses the EdgeZero entry point. This
+# fixture is retained for the focused CI job selected via `VICEROY_CONFIG_PATH`;
+# keep shared stores in sync with `viceroy-template.toml`.
 #
 # This configures the Viceroy runtime itself (backends, KV stores, etc.),
 # separate from the application config (trusted-server.toml).
@@ -76,13 +73,11 @@
             data = "test-api-key"
 
     [local_server.config_stores]
-        # Routes requests through the EdgeZero entry point. `is_edgezero_enabled`
-        # in the Fastly adapter reads this key at runtime; `"true"` (or `"1"`)
-        # enables EdgeZero, anything else falls back to the legacy path.
+        # Required by the post-cutover Fastly entry point. No canary keys are
+        # read after legacy cleanup; the store only needs to exist.
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]
-            edgezero_enabled = "true"
 
         [local_server.config_stores.jwks_store]
             format = "inline-toml"

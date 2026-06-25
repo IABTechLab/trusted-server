@@ -19,7 +19,7 @@ build = """
 
 [local_server]
     address = "127.0.0.1:7676"
-    
+
     [local_server.backends]
 
     [local_server.kv_stores]

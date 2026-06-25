@@ -18,6 +18,20 @@ fn init_logger() {
     let _ = env_logger::try_init();
 }
 
+#[test]
+fn default_fastly_viceroy_template_defines_trusted_server_config_store() {
+    let template = include_str!("../fixtures/configs/viceroy-template.toml");
+
+    assert!(
+        template.contains("[local_server.config_stores.trusted_server_config]"),
+        "default Fastly Viceroy template should define trusted_server_config"
+    );
+    assert!(
+        template.contains("[local_server.config_stores.trusted_server_config.contents]"),
+        "default Fastly Viceroy template should define trusted_server_config contents"
+    );
+}
+
 /// Test all combinations: frameworks x runtimes (matrix testing).
 ///
 /// Iterates every registered runtime and framework, running all standard
@@ -201,14 +215,9 @@ fn test_ec_lifecycle_fastly() {
         process.base_url
     );
 
-    // EdgeZero entry-point canary. This same test runs in two CI jobs: the
-    // legacy `integration-tests` job (default Viceroy config, legacy_main) and
-    // the `integration-tests-edgezero` job (EdgeZero config store, edgezero_main).
-    // Only assert the canary when the job opted into the EdgeZero path via
-    // EXPECT_EDGEZERO_ENTRY_POINT; on the legacy path TRACE is proxied (not 405ed)
-    // and the scenarios still validate legacy behavior. The canary guards against
-    // the EdgeZero job silently greening on legacy if the config store cannot be
-    // read (main() falls back to legacy_main).
+    // EdgeZero entry-point canary. The focused CI job opts into this assertion
+    // via EXPECT_EDGEZERO_ENTRY_POINT so the EC lifecycle run verifies it reached
+    // the post-cutover router before executing route-level scenarios.
     if std::env::var("EXPECT_EDGEZERO_ENTRY_POINT").as_deref() == Ok("true") {
         common::ec::assert_edgezero_entry_point(&process.base_url)
             .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
