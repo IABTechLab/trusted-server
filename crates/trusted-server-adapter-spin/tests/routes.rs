@@ -250,6 +250,38 @@ async fn admin_deactivate_key_is_routed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+    // The production basic-auth regex `^/_ts/admin` does not match
+    // `/admin/keys/*`, so those aliases are not auth-gated. Any
+    // publisher-fallback method carrying an `Authorization` header must be
+    // denied locally with 404, never proxied to the publisher origin.
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in ["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"] {
+            let router = test_router();
+            let req = request_builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                .header("content-type", "application/json")
+                .body(edgezero_core::body::Body::from("{\"key_id\":\"leak-me\"}"))
+                .expect("should build authorized legacy-alias request");
+
+            let resp = router.oneshot(req).await;
+
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "legacy {method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+            assert!(
+                !resp.headers().contains_key("www-authenticate"),
+                "legacy {method} {path} must not issue an admin auth challenge"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auction_is_routed() {
     let router = test_router();
     let req = request_builder()

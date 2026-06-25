@@ -105,7 +105,7 @@ This separation allows:
 | ---------------------------- | -------------------------------------------------------------------------------------------- |
 | **Request Signing**          | Ed25519 signatures on OpenRTB request IDs (`crates/common/src/request_signing/signing.rs`)   |
 | **Key Management**           | JWKS at `/.well-known/trusted-server.json`, key rotation via admin endpoints                 |
-| **Build Process**            | Cargo → WASM (`wasm32-wasip1`), TS/JS bundled via Vite (`crates/js/build.rs`)                |
+| **Build Process**            | Cargo → WASM (`wasm32-wasip1`), TS/JS bundled via Vite (`crates/trusted-server-js/build.rs`) |
 | **Integration Registration** | Runtime trait-based discovery from `Settings` (`crates/common/src/integrations/registry.rs`) |
 | **Configuration**            | TOML-based, **embedded at build time**, no runtime validation of config authenticity         |
 

@@ -2214,7 +2214,7 @@ KV behavior is tested with Viceroy (local Fastly Compute simulator) using real K
 
 ### 18.3 JS tests (if applicable)
 
-If any JS changes are made for EC (e.g., publisher-side `/_ts/api/v1/identify` fetch helper in `crates/js/`), use Vitest with `vi.hoisted()` for mocks.
+If any JS changes are made for EC (e.g., publisher-side `/_ts/api/v1/identify` fetch helper in `crates/trusted-server-js/`), use Vitest with `vi.hoisted()` for mocks.
 
 ---
 

@@ -4,7 +4,7 @@
 //! Ed25519 keypairs in JWK format for request signing.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use jose_jwk::{
     jose_jwa::{Algorithm, Signing},
     Jwk, Key, Okp, OkpCurves, Parameters,
@@ -77,18 +77,18 @@ pub fn get_active_jwks(services: &RuntimeServices) -> Result<String, Report<Trus
             .config_store()
             .get(&JWKS_STORE_NAME, &kid)
             .change_context(TrustedServerError::Configuration {
-                message: format!("failed to get JWK for kid: {}", kid),
+                message: format!("failed to get JWK for kid: {kid}"),
             })?;
         jwks.push(jwk);
     }
 
     let keys_json = jwks.join(",");
-    Ok(format!(r#"{{"keys":[{}]}}"#, keys_json))
+    Ok(format!(r#"{{"keys":[{keys_json}]}}"#))
 }
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::{Signer, Verifier};
+    use ed25519_dalek::{Signer as _, Verifier as _};
     use error_stack::Report;
     use jose_jwk::Key;
 
@@ -167,11 +167,11 @@ mod tests {
 
     #[test]
     fn get_jwk_produces_correct_structure() {
-        let jwk = Keypair::generate().get_jwk("test-kid".to_string());
+        let jwk = Keypair::generate().get_jwk("test-kid".to_owned());
 
         assert_eq!(
             jwk.prm.kid,
-            Some("test-kid".to_string()),
+            Some("test-kid".to_owned()),
             "should set kid parameter"
         );
         assert_eq!(

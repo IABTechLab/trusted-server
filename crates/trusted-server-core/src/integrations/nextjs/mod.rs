@@ -18,7 +18,10 @@ mod shared;
 
 // Re-export deprecated legacy functions for backward compatibility.
 // Production code should use the placeholder-based approach via NextJsHtmlPostProcessor.
-#[allow(deprecated)]
+#[allow(
+    deprecated,
+    reason = "legacy HTML post-processing functions remain re-exported for compatibility"
+)]
 pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
 pub use rsc::rewrite_rsc_scripts_combined;
 
@@ -51,7 +54,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_rewrite_attributes() -> Vec<String> {
-    vec!["href".to_string(), "link".to_string(), "url".to_string()]
+    vec!["href".to_owned(), "link".to_owned(), "url".to_owned()]
 }
 
 fn default_max_combined_payload_bytes() -> usize {
@@ -76,20 +79,17 @@ pub(super) fn configuration_error(message: impl Into<String>) -> Report<TrustedS
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    let config = match build(settings)? {
-        Some(config) => {
-            log::info!(
-                "NextJS integration registered: enabled={}, rewrite_attributes={:?}, max_combined_payload_bytes={}",
-                config.enabled,
-                config.rewrite_attributes,
-                config.max_combined_payload_bytes
-            );
-            config
-        }
-        None => {
-            log::info!("NextJS integration not registered (disabled or missing config)");
-            return Ok(None);
-        }
+    let config = if let Some(config) = build(settings)? {
+        log::info!(
+            "NextJS integration registered: enabled={}, rewrite_attributes={:?}, max_combined_payload_bytes={}",
+            config.enabled,
+            config.rewrite_attributes,
+            config.max_combined_payload_bytes
+        );
+        config
+    } else {
+        log::info!("NextJS integration not registered (disabled or missing config)");
+        return Ok(None);
     };
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
     let structured = Arc::new(NextJsNextDataRewriter::new(config.clone())?);
@@ -336,13 +336,11 @@ mod tests {
         // RSC payloads should be rewritten via end-of-document post-processing
         assert!(
             final_html.contains("test.example.com"),
-            "RSC stream payloads should be rewritten to proxy host via post-processing. Output: {}",
-            final_html
+            "RSC stream payloads should be rewritten to proxy host via post-processing. Output: {final_html}"
         );
         assert!(
             !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
-            "RSC placeholder markers should not appear in final HTML. Output: {}",
-            final_html
+            "RSC placeholder markers should not appear in final HTML. Output: {final_html}"
         );
     }
 
@@ -384,13 +382,11 @@ mod tests {
         // RSC payloads should be rewritten via end-of-document post-processing
         assert!(
             final_html.contains("test.example.com"),
-            "RSC stream payloads should be rewritten to proxy host with chunked input. Output: {}",
-            final_html
+            "RSC stream payloads should be rewritten to proxy host with chunked input. Output: {final_html}"
         );
         assert!(
             !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
-            "RSC placeholder markers should not appear in final HTML. Output: {}",
-            final_html
+            "RSC placeholder markers should not appear in final HTML. Output: {final_html}"
         );
     }
 
@@ -434,18 +430,15 @@ mod tests {
 
         assert!(
             final_html.contains("https://origin.example.com/page"),
-            "Origin URL should remain when rewrite is skipped due to size limit. Output: {}",
-            final_html
+            "Origin URL should remain when rewrite is skipped due to size limit. Output: {final_html}"
         );
         assert!(
             !final_html.contains("test.example.com"),
-            "Proxy host should not be introduced when rewrite is skipped. Output: {}",
-            final_html
+            "Proxy host should not be introduced when rewrite is skipped. Output: {final_html}"
         );
         assert!(
             !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
-            "RSC placeholder markers should not appear in final HTML. Output: {}",
-            final_html
+            "RSC placeholder markers should not appear in final HTML. Output: {final_html}"
         );
     }
 
@@ -500,8 +493,7 @@ mod tests {
         // RSC payloads should be rewritten via post-processing
         assert!(
             final_html.contains("test.example.com"),
-            "RSC payload URLs should be rewritten to proxy host. Output: {}",
-            final_html
+            "RSC payload URLs should be rewritten to proxy host. Output: {final_html}"
         );
 
         // Verify the RSC payload structure is preserved
@@ -520,14 +512,12 @@ mod tests {
 
         // Verify \n separators are preserved (crucial for RSC parsing)
         assert!(
-            final_html.contains(r#"\n442:"#),
-            "RSC record separator \\n should be preserved. Output: {}",
-            final_html
+            final_html.contains(r"\n442:"),
+            "RSC record separator \\n should be preserved. Output: {final_html}"
         );
         assert!(
             !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
-            "RSC placeholder markers should not appear in final HTML. Output: {}",
-            final_html
+            "RSC placeholder markers should not appear in final HTML. Output: {final_html}"
         );
     }
 
@@ -573,30 +563,25 @@ mod tests {
         // Non-RSC scripts should be preserved
         assert!(
             final_html.contains(r#"console.log("hello world");"#),
-            "First non-RSC script should be preserved intact. Output: {}",
-            final_html
+            "First non-RSC script should be preserved intact. Output: {final_html}"
         );
         assert!(
             final_html.contains("window.analytics"),
-            "Third non-RSC script should be preserved. Output: {}",
-            final_html
+            "Third non-RSC script should be preserved. Output: {final_html}"
         );
         assert!(
             final_html.contains("track: function(e)"),
-            "Third non-RSC script content should be intact. Output: {}",
-            final_html
+            "Third non-RSC script content should be intact. Output: {final_html}"
         );
 
         // RSC scripts should be rewritten
         assert!(
             final_html.contains("test.example.com"),
-            "RSC URL should be rewritten. Output: {}",
-            final_html
+            "RSC URL should be rewritten. Output: {final_html}"
         );
         assert!(
             !final_html.contains(RSC_PAYLOAD_PLACEHOLDER_PREFIX),
-            "No placeholders should remain. Output: {}",
-            final_html
+            "No placeholders should remain. Output: {final_html}"
         );
     }
 
@@ -720,7 +705,7 @@ mod tests {
         );
         assert!(
             processed.contains(r#""])</script>"#),
-            "push call must close properly — `\"])` followed by </script>. Got: {processed}"
+            "push call must close properly \u{2014} `\"])` followed by </script>. Got: {processed}"
         );
     }
 }

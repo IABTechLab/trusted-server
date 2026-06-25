@@ -744,7 +744,7 @@ IntegrationRegistration::builder("my_integration")
 
 ### Bundle Types
 
-Each integration is built as a separate IIFE at compile time (`crates/js/lib/dist/`):
+Each integration is built as a separate IIFE at compile time (`crates/trusted-server-js/dist/`):
 
 - `tsjs-core.js` — Core API (always included)
 - `tsjs-creative.js` — Creative click-guard and tracking

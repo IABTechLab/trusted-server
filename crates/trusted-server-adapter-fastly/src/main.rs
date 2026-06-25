@@ -51,6 +51,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
 mod backend;
@@ -69,7 +70,7 @@ use crate::app::{build_state, TrustedServerApp};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
-use crate::platform::{build_runtime_services, FastlyPlatformGeo};
+use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -397,6 +398,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         req.set_header("x-ts-tls-cipher", cipher);
     }
 
+    // Capture the full ClientInfo (TLS protocol/cipher, JA4, H2 fingerprint, and
+    // server hostname/region) from the original FastlyRequest before conversion.
+    // These accessors only return real values on the client request; the
+    // reconstructed EdgeZero request cannot expose them. Stored in the request
+    // extensions so `build_per_request_services` reads the authoritative metadata
+    // that integration bot protection (e.g. DataDome) serializes, instead of
+    // defaulting those fields to empty as the EdgeZero context alone would.
+    let client_info = client_info_from_request(&req);
+
     // Derive device signals from the original FastlyRequest before conversion.
     // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
     // return real values on the client request; a synthetic request rebuilt from
@@ -419,6 +429,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             Ok(mut core_req) => {
                 core_req.extensions_mut().insert(config_store);
                 core_req.extensions_mut().insert(device_signals);
+                core_req.extensions_mut().insert(client_info);
                 futures::executor::block_on(app.router().oneshot(core_req))
             }
             Err(e) => {
@@ -1011,9 +1022,16 @@ async fn route_request(
         // The legacy `/admin/keys/*` aliases are denied locally below so stale
         // clients do not leak admin Basic credentials or key-management payloads
         // to the publisher origin via the organic fallback.
-        (Method::POST, "/admin/keys/rotate" | "/admin/keys/deactivate") => {
-            (Ok(legacy_admin_alias_denied()), false)
-        }
+        (
+            Method::GET
+            | Method::POST
+            | Method::HEAD
+            | Method::OPTIONS
+            | Method::PUT
+            | Method::PATCH
+            | Method::DELETE,
+            "/admin/keys/rotate" | "/admin/keys/deactivate",
+        ) => (Ok(legacy_admin_alias_denied()), false),
         (Method::POST, "/_ts/admin/keys/rotate") => {
             (handle_rotate_key(settings, runtime_services, req), false)
         }
@@ -1030,6 +1048,10 @@ async fn route_request(
             let outcome = cors_preflight_identify(settings, &req);
             (outcome, false)
         }
+
+        // Tester-cookie endpoints (disabled unless `[tester_cookie].enabled`).
+        (Method::GET, "/_ts/set-tester") => (handle_set_tester(settings), false),
+        (Method::GET, "/_ts/clear-tester") => (handle_clear_tester(settings), false),
 
         // Unified auction endpoint.
         (Method::POST, "/auction") => {

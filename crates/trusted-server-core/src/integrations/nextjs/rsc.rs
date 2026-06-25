@@ -9,7 +9,7 @@ use super::shared::RscUrlRewriter;
 /// This is a static code-defined literal rather than a config-derived pattern,
 /// so it intentionally stays outside startup preparation.
 static TCHUNK_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
+    LazyLock::new(|| Regex::new("([0-9a-fA-F]+):T([0-9a-fA-F]+),").expect("valid T-chunk regex"));
 
 /// Marker used to track script boundaries when combining RSC content.
 pub(crate) const RSC_MARKER: &str = "\x00SPLIT\x00";
@@ -141,7 +141,7 @@ impl Iterator for EscapeSequenceIter<'_> {
                             }
                         }
 
-                        let c = char::from_u32(code_unit as u32).unwrap_or('\u{FFFD}');
+                        let c = char::from_u32(u32::from(code_unit)).unwrap_or('\u{FFFD}');
                         self.pos += 6;
                         return Some(EscapeElement {
                             byte_count: c.len_utf8(),
@@ -206,11 +206,7 @@ struct TChunkInfo {
 fn find_tchunks_impl(content: &str, skip_markers: bool) -> Option<Vec<TChunkInfo>> {
     let mut chunks = Vec::new();
     let mut search_pos = 0;
-    let marker = if skip_markers {
-        Some(RSC_MARKER.as_bytes())
-    } else {
-        None
-    };
+    let marker = skip_markers.then(|| RSC_MARKER.as_bytes());
 
     while search_pos < content.len() {
         if let Some(cap) = TCHUNK_PATTERN.captures(&content[search_pos..]) {
@@ -289,7 +285,7 @@ pub(crate) fn rewrite_rsc_tchunks_with_rewriter(
         log::warn!(
             "RSC payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
         );
-        return content.to_string();
+        return content.to_owned();
     };
 
     if chunks.is_empty() {
@@ -406,7 +402,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
 
     // Early exit if no payload contains the origin host - avoids regex compilation
     if !payloads.iter().any(|p| p.contains(origin_host)) {
-        return payloads.iter().map(|p| (*p).to_string()).collect();
+        return payloads.iter().map(|p| (*p).to_owned()).collect();
     }
 
     if payloads.len() == 1 {
@@ -434,9 +430,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
         // per-script rewriting is unsafe because it may rewrite T-chunk content without updating
         // the original header, breaking React hydration.
         log::warn!(
-            "RSC combined payload size {} exceeds limit {}, skipping cross-script combining",
-            total_size,
-            max_combined_payload_bytes
+            "RSC combined payload size {total_size} exceeds limit {max_combined_payload_bytes}, skipping cross-script combining"
         );
 
         if payloads
@@ -446,7 +440,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
             log::warn!(
                 "RSC payloads contain cross-script T-chunks; skipping RSC URL rewriting to avoid breaking hydration (consider increasing integrations.nextjs.max_combined_payload_bytes)"
             );
-            return payloads.iter().map(|p| (*p).to_string()).collect();
+            return payloads.iter().map(|p| (*p).to_owned()).collect();
         }
 
         return payloads
@@ -474,7 +468,7 @@ pub(crate) fn rewrite_rsc_scripts_combined_with_limit(
         log::warn!(
             "RSC combined payload contains invalid or incomplete T-chunks; skipping rewriting to avoid breaking hydration"
         );
-        return payloads.iter().map(|p| (*p).to_string()).collect();
+        return payloads.iter().map(|p| (*p).to_owned()).collect();
     };
     if chunks.is_empty() {
         return payloads
@@ -542,8 +536,7 @@ mod tests {
         );
         assert!(
             result.starts_with("1a:T27,"),
-            "T-chunk length should be updated from 29 (41) to 27 (39). Got: {}",
-            result
+            "T-chunk length should be updated from 29 (41) to 27 (39). Got: {result}"
         );
     }
 
@@ -565,21 +558,20 @@ mod tests {
         );
         assert!(
             result.starts_with("1a:T24,"),
-            "T-chunk length should be updated from 1c (28) to 24 (36). Got: {}",
-            result
+            "T-chunk length should be updated from 1c (28) to 24 (36). Got: {result}"
         );
     }
 
     #[test]
     fn calculate_unescaped_byte_length_handles_common_escapes() {
         assert_eq!(calculate_unescaped_byte_length("hello"), 5);
-        assert_eq!(calculate_unescaped_byte_length(r#"\n"#), 1);
-        assert_eq!(calculate_unescaped_byte_length(r#"\r\n"#), 2);
+        assert_eq!(calculate_unescaped_byte_length(r"\n"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\r\n"), 2);
         assert_eq!(calculate_unescaped_byte_length(r#"\""#), 1);
-        assert_eq!(calculate_unescaped_byte_length(r#"\\"#), 1);
-        assert_eq!(calculate_unescaped_byte_length(r#"\x41"#), 1);
-        assert_eq!(calculate_unescaped_byte_length(r#"\u0041"#), 1);
-        assert_eq!(calculate_unescaped_byte_length(r#"\u00e9"#), 2);
+        assert_eq!(calculate_unescaped_byte_length(r"\\"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\x41"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\u0041"), 1);
+        assert_eq!(calculate_unescaped_byte_length(r"\u00e9"), 2);
     }
 
     #[test]
@@ -604,15 +596,12 @@ mod tests {
 
     #[test]
     fn cross_script_tchunk_rewriting() {
-        let script0 = r#"other:data\n1a:T3e,partial content"#;
-        let script1 = r#" with https://origin.example.com/page goes here"#;
+        let script0 = r"other:data\n1a:T3e,partial content";
+        let script1 = " with https://origin.example.com/page goes here";
 
         let combined_content = "partial content with https://origin.example.com/page goes here";
         let combined_len = calculate_unescaped_byte_length(combined_content);
-        println!(
-            "Combined T-chunk content length: {} bytes = 0x{:x}",
-            combined_len, combined_len
-        );
+        println!("Combined T-chunk content length: {combined_len} bytes = 0x{combined_len:x}");
 
         let payloads: Vec<&str> = vec![script0, script1];
         let results = rewrite_rsc_scripts_combined(
@@ -631,7 +620,7 @@ mod tests {
 
         let rewritten_content = "partial content with https://test.example.com/page goes here";
         let rewritten_len = calculate_unescaped_byte_length(rewritten_content);
-        let expected_header = format!(":T{:x},", rewritten_len);
+        let expected_header = format!(":T{rewritten_len:x},");
         assert!(
             results[0].contains(&expected_header),
             "T-chunk length in script 0 should be updated to {}. Got: {}",
@@ -643,7 +632,7 @@ mod tests {
     #[test]
     fn cross_script_preserves_non_tchunk_content() {
         let script0 = r#"{"url":"https://origin.example.com/first"}\n1a:T38,partial"#;
-        let script1 = r#" content with https://origin.example.com/page end"#;
+        let script1 = " content with https://origin.example.com/page end";
 
         let payloads: Vec<&str> = vec![script0, script1];
         let results = rewrite_rsc_scripts_combined(
@@ -799,8 +788,8 @@ mod tests {
 
     #[test]
     fn size_limit_skips_rewrite_when_cross_script_tchunk_detected() {
-        let script0 = r#"other:data\n1a:T40,partial content"#;
-        let script1 = r#" with https://origin.example.com/page goes here"#;
+        let script0 = r"other:data\n1a:T40,partial content";
+        let script1 = " with https://origin.example.com/page goes here";
 
         let payloads: Vec<&str> = vec![script0, script1];
         let results = rewrite_rsc_scripts_combined_with_limit(

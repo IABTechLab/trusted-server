@@ -1,4 +1,5 @@
-fastly 13.3.0
-rust 1.91.1
+fastly 15.1.0
+rust 1.95.0
 nodejs 24.12.0
-viceroy 0.16.5
+viceroy 0.17.0
+wasmtime 44.0.1

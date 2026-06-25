@@ -209,6 +209,16 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
+const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
+
 fn named_routes() -> [NamedRoute; 11] {
     [
         NamedRoute {
@@ -237,17 +247,17 @@ fn named_routes() -> [NamedRoute; 11] {
         // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
         // a 404, matching the Fastly and Cloudflare adapters: the production
         // basic-auth handler regex `^/_ts/admin` does not match them, and letting
-        // them fall through to the publisher fallback would forward the caller's
-        // `Authorization` header and key-management payload to the origin, leaking
-        // admin credentials.
+        // any publisher-fallback method fall through would forward the caller's
+        // `Authorization` header and key-management payload to the origin,
+        // leaking admin credentials.
         NamedRoute {
             path: "/admin/keys/rotate",
-            primary_methods: &[Method::POST],
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
             path: "/admin/keys/deactivate",
-            primary_methods: &[Method::POST],
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
             handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {

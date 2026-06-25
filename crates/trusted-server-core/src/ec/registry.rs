@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
@@ -82,10 +82,7 @@ impl PartnerRegistry {
 
             if by_source_domain.contains_key(&normalized_source) {
                 return Err(Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "ec.partners: duplicate source_domain '{}'",
-                        normalized_source
-                    ),
+                    message: format!("ec.partners: duplicate source_domain '{normalized_source}'"),
                 }));
             }
 
@@ -96,9 +93,8 @@ impl PartnerRegistry {
             if by_api_key_hash.contains_key(&api_key_hash) {
                 return Err(Report::new(TrustedServerError::Configuration {
                     message: format!(
-                        "ec.partners: source_domain '{}' has an API token that collides \
-                         with another partner's token hash",
-                        normalized_source
+                        "ec.partners: source_domain '{normalized_source}' has an API token that collides \
+                         with another partner's token hash"
                     ),
                 }));
             }
@@ -150,9 +146,8 @@ impl PartnerRegistry {
     /// Looks up a partner by the SHA-256 hex hash of their API token.
     #[must_use]
     pub fn find_by_api_key_hash(&self, hash: &str) -> Option<&PartnerConfig> {
-        self.by_api_key_hash
-            .get(hash)
-            .and_then(|source_domain| self.by_source_domain.get(source_domain))
+        let source_domain = self.by_api_key_hash.get(hash)?;
+        self.by_source_domain.get(source_domain)
     }
 
     /// Looks up a partner by their `source_domain`.
@@ -262,8 +257,7 @@ fn validate_pull_sync(config: &PartnerConfig) -> Result<(), Report<TrustedServer
     if config
         .ts_pull_token
         .as_ref()
-        .map(|token| token.expose().trim().is_empty())
-        .unwrap_or(true)
+        .is_none_or(|token| token.expose().trim().is_empty())
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: "ts_pull_token is required when pull_sync_enabled is true".to_owned(),

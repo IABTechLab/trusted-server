@@ -308,7 +308,16 @@ fn edge_request_to_fastly(
     let (parts, body) = request.into_parts();
     let mut fastly_req = fastly::Request::new(parts.method, parts.uri.to_string());
     for (name, value) in parts.headers.iter() {
-        fastly_req.append_header(name.as_str(), value.as_bytes());
+        // `fastly::Request::new` derives a Host header from the request URI, so
+        // appending the edge request's own Host would leave a duplicate. Replace
+        // it instead to keep the in-memory request well-formed. The Host actually
+        // sent on the wire is still governed by the backend's `override_host`
+        // (see `BackendConfig::ensure`), which forces the value regardless.
+        if name == edgezero_core::http::header::HOST {
+            fastly_req.set_header(name.as_str(), value.as_bytes());
+        } else {
+            fastly_req.append_header(name.as_str(), value.as_bytes());
+        }
     }
     match body {
         edgezero_core::body::Body::Once(bytes) => {
@@ -577,20 +586,34 @@ pub fn build_runtime_services(
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
         .geo(Arc::new(FastlyPlatformGeo))
-        .client_info(ClientInfo {
-            client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
-            tls_cipher: req
-                .get_tls_cipher_openssl_name()
-                .ok()
-                .flatten()
-                .map(str::to_string),
-            tls_ja4: req.get_tls_ja4().map(str::to_string),
-            h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
-            server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
-            server_region: std::env::var("FASTLY_REGION").ok(),
-        })
+        .client_info(client_info_from_request(req))
         .build()
+}
+
+/// Extract [`ClientInfo`] from the original Fastly request.
+///
+/// Fastly's TLS, JA4, and HTTP/2 fingerprint accessors only return real values
+/// on the client request before it is converted to platform HTTP types. This
+/// must therefore be called at the adapter entry point, while the original
+/// [`fastly::Request`] is still available. Used by both [`build_runtime_services`]
+/// (legacy path) and the `EdgeZero` entry point, which stores the result in the
+/// request extensions so `build_per_request_services` can read back the same
+/// bot-protection metadata the reconstructed request cannot expose.
+#[must_use]
+pub fn client_info_from_request(req: &Request) -> ClientInfo {
+    ClientInfo {
+        client_ip: req.get_client_ip_addr(),
+        tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
+        tls_cipher: req
+            .get_tls_cipher_openssl_name()
+            .ok()
+            .flatten()
+            .map(str::to_string),
+        tls_ja4: req.get_tls_ja4().map(str::to_string),
+        h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
+        server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
+        server_region: std::env::var("FASTLY_REGION").ok(),
+    }
 }
 
 /// Open a named KV store as a [`PlatformKvStore`] implementation.
@@ -623,6 +646,24 @@ mod tests {
         Arc::new(NoopKvStore)
     }
 
+    #[test]
+    fn edge_request_to_fastly_replaces_url_derived_host_header() {
+        let request = request_builder()
+            .method("GET")
+            .uri("https://origin.example.com/")
+            .header(edgezero_core::http::header::HOST, "www.example.com")
+            .body(Body::empty())
+            .expect("should build request");
+
+        let fastly_req = edge_request_to_fastly(request).expect("should convert request");
+
+        assert_eq!(
+            fastly_req.get_header_str(fastly::http::header::HOST),
+            Some("www.example.com"),
+            "should replace the URL-derived Host instead of appending a duplicate"
+        );
+    }
+
     // --- FastlyPlatformBackend::predict_name --------------------------------
 
     #[test]
@@ -644,6 +685,28 @@ mod tests {
         assert_eq!(
             name, "backend_https_origin_example_com_443_t15000",
             "should match BackendConfig naming convention"
+        );
+    }
+
+    #[test]
+    fn predict_name_includes_host_header_override_suffix() {
+        let backend = FastlyPlatformBackend;
+        let spec = PlatformBackendSpec {
+            scheme: "https".to_string(),
+            host: "origin.example.com".to_string(),
+            port: None,
+            host_header_override: Some("www.example.com".to_string()),
+            certificate_check: true,
+            first_byte_timeout: Duration::from_secs(15),
+        };
+
+        let name = backend
+            .predict_name(&spec)
+            .expect("should compute backend name for host header override");
+
+        assert_eq!(
+            name, "backend_https_origin_example_com_443_oh_www_example_com_t15000",
+            "should match BackendConfig naming convention with host header override"
         );
     }
 

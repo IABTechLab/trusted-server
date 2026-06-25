@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - Docker running
-#   - Viceroy installed: cargo install viceroy
+#   - Viceroy installed: cargo install viceroy --version 0.17.0 --locked --force
 #   - wasm32-wasip1 target: rustup target add wasm32-wasip1
 #
 set -euo pipefail
@@ -67,13 +67,13 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
-    crates/integration-tests/fixtures/frameworks/wordpress/
+    crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/
 
 echo "==> Building Next.js test container..."
 docker build \
     --build-arg NODE_VERSION="$NODE_VERSION" \
     -t test-nextjs:latest \
-    crates/integration-tests/fixtures/frameworks/nextjs/
+    crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 
 echo "==> Running integration tests (target: $TARGET, origin port: $ORIGIN_PORT)..."
 WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm" \
@@ -81,6 +81,6 @@ AXUM_BINARY_PATH="$REPO_ROOT/target/debug/trusted-server-axum" \
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
 RUST_LOG=info \
     cargo test \
-        --manifest-path crates/integration-tests/Cargo.toml \
+        --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
         --target "$TARGET" \
         -- --include-ignored --test-threads=1 "${TEST_ARGS[@]}"

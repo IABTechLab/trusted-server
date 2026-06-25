@@ -199,13 +199,79 @@ struct CloudflarePendingResponse {
 #[cfg(target_arch = "wasm32")]
 pub struct CloudflareHttpClient;
 
+/// Maximum buffered upstream response body, mirroring the Fastly adapter's cap.
+///
+/// Cloudflare Workers isolates have a bounded memory budget (~128 MB), so a
+/// large or hostile upstream could OOM the isolate. `execute` buffers the whole
+/// body via `resp.bytes()`, so it caps both the declared Content-Length and the
+/// materialized byte count at this limit.
+#[cfg(target_arch = "wasm32")]
+const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Collect the lowercased tokens listed in the upstream `Connection:` header(s).
+///
+/// Every header named here is hop-by-hop (RFC 7230 §6.1) and must not be
+/// forwarded downstream.
+#[cfg(target_arch = "wasm32")]
+fn response_connection_tokens(resp: &worker::Response) -> Vec<String> {
+    resp.headers()
+        .entries()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| {
+            value
+                .split(',')
+                .map(|token| token.trim().to_ascii_lowercase())
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Returns `true` for hop-by-hop response headers that must not be forwarded
+/// downstream (RFC 7230 §6.1), including any header named in the upstream
+/// `Connection:` token list. Mirrors the Axum adapter's
+/// `is_hop_by_hop_response_header`. `transfer-encoding` is stripped separately
+/// at the call site alongside the other auto-decoded framing headers.
+#[cfg(target_arch = "wasm32")]
+fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bool {
+    const HOP_BY_HOP: [&str; 6] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "upgrade",
+    ];
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.iter().any(|header| *header == lower)
+        || connection_tokens.iter().any(|token| *token == lower)
+}
+
 #[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{Fetch, Headers, Method, Request, RequestInit};
+        use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+
+        // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
+        // metadata, and it always buffers the response body (see below). The
+        // `PlatformHttpRequest` contract requires adapters that cannot honor
+        // these to reject rather than silently drop the behavior, so surface a
+        // typed error instead of returning an untransformed or fully-buffered
+        // response. These fields are only set by asset routes, which are not
+        // routed to the Cloudflare adapter today; the guard keeps the contract
+        // honest if that changes.
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("Image Optimizer is not supported on the Cloudflare Workers runtime"));
+        }
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient).attach(
+                "streaming response bodies are not supported on the Cloudflare Workers runtime",
+            ));
+        }
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -236,7 +302,16 @@ impl CloudflareHttpClient {
         };
 
         let mut init = RequestInit::new();
-        init.with_method(method).with_headers(headers);
+        // Force manual redirect handling: the Workers runtime otherwise defaults
+        // to `RequestRedirect::Follow` and transparently chases 3xx responses to
+        // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
+        // own per-hop redirect handling and validates each next hop against
+        // `allowed_domains`; auto-following here would bypass that allowlist
+        // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
+        // matching the Axum adapter's `redirect::Policy::none()`.
+        init.with_method(method)
+            .with_headers(headers)
+            .with_redirect(RequestRedirect::Manual);
         if !body_bytes.is_empty() {
             let uint8 = js_sys::Uint8Array::from(body_bytes.as_slice());
             init.with_body(Some(uint8.into()));
@@ -252,6 +327,28 @@ impl CloudflareHttpClient {
             .attach_with(|| format!("outbound request to {uri} failed"))?;
 
         let status = resp.status_code();
+
+        // Pre-flight: reject oversized responses before copying bytes into the
+        // isolate heap. Content-Length is advisory (and absent on chunked
+        // responses), so the post-buffer check below is the real guard; this
+        // just rejects honestly-declared large bodies cheaply. Mirrors the
+        // Fastly adapter's two-stage cap.
+        if let Some(claimed_len) = resp
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+                return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "origin Content-Length {claimed_len} exceeds \
+                     {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+                )));
+            }
+        }
+
+        let connection_tokens = response_connection_tokens(&resp);
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in resp.headers().entries() {
             // The Workers runtime auto-decompresses gzip/br/deflate and handles
@@ -267,12 +364,27 @@ impl CloudflareHttpClient {
             {
                 continue;
             }
+            // Strip hop-by-hop headers (and any header named in the upstream
+            // `Connection:` token list) so they are not forwarded downstream,
+            // matching the Axum adapter's `is_hop_by_hop_response_header`.
+            if is_hop_by_hop_response_header(&name, &connection_tokens) {
+                continue;
+            }
             edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
         }
         let body_bytes = resp
             .bytes()
             .await
             .change_context(PlatformError::HttpClient)?;
+
+        // Belt-and-suspenders: catches chunked responses with no Content-Length.
+        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin response body {} bytes exceeds \
+                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
+                body_bytes.len()
+            )));
+        }
         edge_builder = edge_builder.header(
             edgezero_core::http::header::CONTENT_LENGTH,
             body_bytes.len(),

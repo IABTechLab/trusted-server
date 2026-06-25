@@ -202,8 +202,9 @@ fn normalize_offset(value: Option<&str>, config: &ImageOptimizerCropOffsetsConfi
         return config.default;
     };
     for window in config.buckets.windows(2) {
-        let current = window[0];
-        let next = window[1];
+        let &[current, next] = window else {
+            continue;
+        };
         let midpoint = current + (next.saturating_sub(current) / 2);
         if parsed < midpoint {
             return current;

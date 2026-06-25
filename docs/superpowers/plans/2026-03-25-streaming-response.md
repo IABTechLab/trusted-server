@@ -644,7 +644,7 @@ Expected: All tests pass.
 
 - [ ] **Step 2: Run JS tests**
 
-Run: `cd crates/js/lib && npx vitest run`
+Run: `cd crates/trusted-server-js/lib && npx vitest run`
 
 Expected: All tests pass.
 
@@ -965,7 +965,7 @@ Expected: All tests pass.
 ```bash
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-cd crates/js/lib && npx vitest run
+cd crates/trusted-server-js/lib && npx vitest run
 ```
 
 Expected: All clean.

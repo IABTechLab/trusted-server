@@ -98,7 +98,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             .payloads
             .push(content[payload_start..payload_end].to_string());
 
-        let mut rewritten = content.to_string();
+        let mut rewritten = content.to_owned();
         rewritten.replace_range(payload_start..payload_end, &placeholder);
         ScriptRewriteAction::replace(rewritten)
     }
@@ -109,10 +109,10 @@ mod tests {
     use super::*;
     use crate::integrations::IntegrationDocumentState;
 
-    fn ctx<'a>(
+    fn ctx(
         is_last_in_text_node: bool,
-        document_state: &'a IntegrationDocumentState,
-    ) -> IntegrationScriptContext<'a> {
+        document_state: &IntegrationDocumentState,
+    ) -> IntegrationScriptContext<'_> {
         IntegrationScriptContext {
             selector: "script",
             request_host: "proxy.example.com",

@@ -154,9 +154,8 @@ fn validate_port(port: &str) -> Result<(), &'static str> {
     }
 
     match port.parse::<u16>() {
-        Ok(0) => Err("port must be between 1 and 65535"),
+        Ok(0) | Err(_) => Err("port must be between 1 and 65535"),
         Ok(_) => Ok(()),
-        Err(_) => Err("port must be between 1 and 65535"),
     }
 }
 

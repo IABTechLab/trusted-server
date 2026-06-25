@@ -72,13 +72,13 @@ These decisions are finalized and reflected in this plan:
 
 Follow the EdgeZero convention (`{app}-core`, `{app}-adapter-{platform}`):
 
-| Current                                   | New                                                                              | Purpose                          |
-| ----------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------- |
-| `crates/common` (`trusted-server-common`) | `crates/trusted-server-core` (`trusted-server-core`)                             | Platform-agnostic business logic |
-| `crates/fastly` (`trusted-server-fastly`) | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)         | Fastly Compute entry point       |
-| —                                         | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)             | Native Axum dev server           |
-| —                                         | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`) | Cloudflare Workers entry point   |
-| `crates/js` (`trusted-server-js`)         | `crates/js` (`trusted-server-js`)                                                | JS build (unchanged)             |
+| Current                                          | New                                                                              | Purpose                          |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- | -------------------------------- |
+| `crates/common` (`trusted-server-common`)        | `crates/trusted-server-core` (`trusted-server-core`)                             | Platform-agnostic business logic |
+| `crates/fastly` (`trusted-server-fastly`)        | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)         | Fastly Compute entry point       |
+| —                                                | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)             | Native Axum dev server           |
+| —                                                | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`) | Cloudflare Workers entry point   |
+| `crates/trusted-server-js` (`trusted-server-js`) | `crates/trusted-server-js` (`trusted-server-js`)                                 | JS build (unchanged)             |
 
 The rename from `common` → `trusted-server-core` and `fastly` →
 `trusted-server-adapter-fastly` happens in **PR 1** (foundation) to avoid

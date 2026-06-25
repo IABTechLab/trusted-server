@@ -49,8 +49,7 @@ pub fn extract_consent_signals(
         .headers()
         .get(HEADER_SEC_GPC)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+        .is_some_and(|v| v.trim() == "1");
 
     RawConsentSignals {
         raw_tc_string,
