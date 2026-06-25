@@ -23,6 +23,8 @@
 - Browser-navigation requests to kitchen-sink HTML participate in EC generation
   and response finalization where practical.
 - The site copy no longer refers to Cloudflare Pages as the intended runtime.
+- Runtime-facing pages are reduced to a minimal v1 fixture: home, auction,
+  Prebid, and identity.
 - Unit/adapter tests cover config, asset embedding, handler behavior, HTML
   processing, disabled behavior, and dispatch precedence.
 - Required Rust formatting, test, clippy, and wasm build checks pass.
@@ -153,7 +155,6 @@
    - `/assets/app.js` -> `assets/app.js`
    - `/auction.html` -> `auction.html`
    - `/prebid.html` -> `prebid.html`
-   - `/creative-proxy.html` -> `creative-proxy.html`
    - `/identity.html` -> `identity.html`
    - `/prebid.js` -> `prebid.js`
    - brand/home link `/` -> `./` or `index.html`
@@ -168,14 +169,16 @@
    - describe the site as available at `/_ts/kitchen-sink/` when enabled;
    - keep examples fictional and avoid real customer/domain/secret values.
 
-6. Preserve the current page set for v1:
+6. Preserve only the minimal page set for v1:
    - `index.html`
    - `auction.html`
    - `prebid.html`
-   - `creative-proxy.html`
    - `identity.html`
    - `prebid.js`
    - `assets/*`
+
+7. Defer the old creative-proxy page until there are explicit assertions for
+   first-party creative URL rewriting.
 
 ## Stage 5 — Add core handler
 

@@ -8,10 +8,9 @@
 Trusted Server currently has a separate static kitchen-sink site deployed as a
 Cloudflare Pages project from
 `/Users/christian/Projects/stackpop/trusted-server-coolify/static-site`. The
-site is useful for exercising auction, Prebid, creative proxy, identity, and
-browser diagnostic flows, but it depends on external Cloudflare Pages hosting
-and must be configured as the publisher origin to test the full Trusted Server
-path.
+site is useful for exercising auction, Prebid, identity, and basic browser
+fixture flows, but it depends on external Cloudflare Pages hosting and must be
+configured as the publisher origin to test the full Trusted Server path.
 
 We want the same diagnostic fixture to be available directly inside Trusted
 Server, with no Cloudflare Pages dependency, and enabled by operator
@@ -56,8 +55,8 @@ publisher pages.
    `trusted-server-kitchen-sink`.
 4. **Handler location:** put request handling and HTML processing integration in
    `trusted-server-core`; the Fastly adapter only wires dispatch.
-5. **Static bundle:** migrate the current site mostly as-is, with required path
-   and copy updates for embedded use.
+5. **Static bundle:** migrate the current site into a smaller v1 fixture, with
+   only the pages needed for auction, Prebid, and identity checks.
 6. **Path style:** make site-local navigation and asset references relative so
    the site works below `/_ts/kitchen-sink/`. Keep real Trusted Server endpoint
    probes absolute, such as `/auction` and `/_ts/set-tester`.
@@ -132,7 +131,6 @@ crates/trusted-server-kitchen-sink/
     index.html
     auction.html
     prebid.html
-    creative-proxy.html
     identity.html
     prebid.js
     assets/...
@@ -206,6 +204,7 @@ directory and update it for embedded use:
 - convert site-local absolute references to relative references;
 - keep actual Trusted Server endpoint probes absolute;
 - update text that references Cloudflare Pages deployment;
+- keep page content minimal and focused on one primary action per page;
 - keep the tiny `prebid.js` placeholder as a site-local relative asset;
 - avoid introducing customer-specific domains, credentials, or real production
   values in examples.
