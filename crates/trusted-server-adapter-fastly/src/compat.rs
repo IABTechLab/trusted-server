@@ -1,45 +1,7 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
-//!
-//! Contains only the functions used by the legacy `main()` entry point.
-//! Relocated from `trusted-server-core` as part of removing all `fastly` crate
-//! imports from the core library.
 
-use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{Request as HttpRequest, RequestBuilder, Response as HttpResponse, Uri};
+use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
-
-fn build_http_request(req: &fastly::Request, body: EdgeBody) -> HttpRequest {
-    // Does not panic in practice: a URL that Fastly accepts but `http::Uri`
-    // rejects degrades to "/" instead of aborting the Wasm instance.
-    let uri: Uri = req.get_url_str().parse().unwrap_or_else(|_| {
-        log::warn!(
-            "failed to parse fastly request URL '{}'; falling back to '/'",
-            req.get_url_str()
-        );
-        Uri::from_static("/")
-    });
-
-    let mut builder: RequestBuilder = edgezero_core::http::request_builder()
-        .method(req.get_method().clone())
-        .uri(uri);
-
-    for (name, value) in req.get_headers() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-
-    builder
-        .body(body)
-        .expect("should build http request from fastly request")
-}
-
-/// Convert an owned `fastly::Request` into an [`HttpRequest`].
-///
-/// URLs that Fastly accepts but `http::Uri` rejects fall back to `/` with a
-/// warning instead of panicking, preserving availability on the legacy path.
-pub(crate) fn from_fastly_request(mut req: fastly::Request) -> HttpRequest {
-    let body = EdgeBody::from(req.take_body_bytes());
-    build_http_request(&req, body)
-}
 
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
@@ -50,40 +12,16 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     }
 
     match body {
-        EdgeBody::Once(bytes) => {
+        edgezero_core::body::Body::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_resp.set_body(bytes.to_vec());
             }
         }
-        EdgeBody::Stream(_) => {
-            // Streaming bodies cannot cross the compat boundary. Both audited call sites
-            // (legacy_main buffered arm and edgezero_main after EdgeZero collapses bodies
-            // to Once) only pass Once bodies — a Stream here is a caller error.
-            // The assert is suppressed in test builds where the behavior-documentation
-            // test deliberately exercises this path.
-            #[cfg(not(test))]
-            debug_assert!(
-                false,
-                "to_fastly_response: streaming body will be silently dropped; \
-                 use to_fastly_response_skeleton + stream_to_client for streaming responses"
-            );
+        edgezero_core::body::Body::Stream(_) => {
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }
 
-    fastly_resp
-}
-
-/// Convert an [`HttpResponse`] into a `fastly::Response` without a body.
-///
-/// Use this when the caller will stream the body separately through
-/// [`fastly::Response::stream_to_client`].
-pub(crate) fn to_fastly_response_skeleton(resp: HttpResponse) -> fastly::Response {
-    let (parts, _body) = resp.into_parts();
-    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
-    for (name, value) in &parts.headers {
-        fastly_resp.append_header(name.as_str(), value.as_bytes());
-    }
     fastly_resp
 }
 
@@ -135,28 +73,11 @@ mod tests {
     }
 
     #[test]
-    fn from_fastly_request_falls_back_to_root_on_unparseable_url() {
-        // `url::Url` (used by fastly) has no length limit, but `http::Uri`
-        // rejects URIs longer than 65534 bytes — an accepted-by-Fastly,
-        // rejected-by-Uri divergence the fallback guards against.
-        let long_url = format!("https://example.com/{}", "a".repeat(70_000));
-        let req = fastly::Request::get(long_url);
-
-        let http_req = from_fastly_request(req);
-
-        assert_eq!(
-            http_req.uri(),
-            &Uri::from_static("/"),
-            "should fall back to '/' when the fastly URL cannot be parsed as an http::Uri"
-        );
-    }
-
-    #[test]
     fn to_fastly_response_with_streaming_body_produces_empty_body() {
         use edgezero_core::http::StatusCode;
 
         let stream = futures::stream::empty::<bytes::Bytes>();
-        let stream_body = EdgeBody::stream(stream);
+        let stream_body = edgezero_core::body::Body::stream(stream);
 
         let http_resp = edgezero_core::http::response_builder()
             .status(StatusCode::OK)

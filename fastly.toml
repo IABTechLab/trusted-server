@@ -23,28 +23,13 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
-        [[local_server.kv_stores.counter_store]]
-            key = "placeholder"
-            data = "placeholder"
-
-        [[local_server.kv_stores.opid_store]]
-            key = "placeholder"
-            data = "placeholder"
-
         [[local_server.kv_stores.creative_store]]
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.ec_identity_store]]
+        [[local_server.kv_stores.consent_store]]
             key = "placeholder"
             data = "placeholder"
-
-        # Pre-seeded test EC entry for local script testing (test-prebid-eids.sh).
-        # Matches the TEST_EC_ID used in that script.
-        [[local_server.kv_stores.ec_identity_store]]
-            key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01"
-            data = '{"v":1,"created":1700000000,"last_seen":1700000000,"consent":{"ok":true,"updated":1700000000},"geo":{"country":"US"}}'
-
     [local_server.secret_stores]
         [[local_server.secret_stores.signing_keys]]
             key = "ts-2025-10-A"
@@ -58,19 +43,6 @@ build = """
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]
-            # "true" / "1" (case-insensitive) enable the EdgeZero path. Missing,
-            # unreadable, or any other value falls back to the legacy entry point.
-            # Keep "false" until EdgeZero parity is verified end to end (issue #495).
-            # EC API routes and the EC identity lifecycle are ported; the remaining
-            # intentional deviations are documented in adapter-fastly/src/app.rs.
-            edgezero_enabled = "false"
-            # Integer 0-100. Effective only when edgezero_enabled = "true".
-            #   0    -> all traffic to legacy (instant rollback — no deploy needed)
-            #   1-99 -> canary: clients whose fnv1a_bucket(client_ip) < this value go EdgeZero
-            #   100  -> all traffic to EdgeZero (full cutover)
-            # Absent, invalid, or unreadable all fail safe to legacy (0), so deleting
-            # the key can never trigger a cutover. Set an explicit percentage to roll out.
-            edgezero_rollout_pct = "0"
 
         [local_server.config_stores.jwks_store]
             format = "inline-toml"

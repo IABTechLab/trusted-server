@@ -133,13 +133,12 @@ jobs:
           name: integration-test-artifacts
           path: ${{ env.ARTIFACTS_DIR }}
 
-      # Exercises the EdgeZero entry point against the same WASM binary by
-      # pointing Viceroy at a config store with `edgezero_enabled = "true"`.
-      # Scoped to the container-free EC lifecycle suite (minimal TCP origin), a
-      # focused parity subset covering Fastly request conversion, config-store
-      # dispatch, publisher fallback proxying, and end-to-end EC/API wiring on
-      # the EdgeZero path. The legacy `integration-tests` job above still covers
-      # the full framework matrix.
+      # Exercises the post-cutover EdgeZero entry point against the same WASM
+      # binary. Scoped to the container-free EC lifecycle suite (minimal TCP
+      # origin), a focused parity subset covering Fastly request conversion,
+      # config-store dispatch, publisher fallback proxying, and end-to-end
+      # EC/API wiring. The integration-tests job above still covers the full
+      # framework matrix.
       - name: Run EdgeZero EC lifecycle tests
         run: >-
           cargo test
@@ -152,8 +151,8 @@ jobs:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ github.workspace }}/crates/trusted-server-integration-tests/fixtures/configs/viceroy-template-edgezero.toml
           # Opt into the EdgeZero entry-point canary in test_ec_lifecycle_fastly.
-          # Only set here, so the legacy integration-tests job runs the same
-          # scenarios through legacy_main without asserting the EdgeZero-only 405.
+          # The full matrix job keeps this unset so framework tests stay focused
+          # on their route-level scenarios.
           EXPECT_EDGEZERO_ENTRY_POINT: "true"
           RUST_LOG: info
 

@@ -1,6 +1,6 @@
 //! Full `EdgeZero` application wiring for Trusted Server.
 //!
-//! Registers all routes from the legacy [`crate::route_request`] into a
+//! Registers all routes for the Trusted Server into a
 //! [`RouterService`]. On successful startup, attaches [`FinalizeResponseMiddleware`]
 //! (outermost) and [`AuthMiddleware`] (inner). When startup fails,
 //! [`startup_error_router`] returns a bare router without middleware.
@@ -174,11 +174,9 @@ pub(crate) fn build_state_from_settings(
 /// Resolves per-request consent KV store services for routes that read consent data.
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
-/// intentional hardening over the legacy `route_request` path, which builds
-/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
-/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
-/// routes unavailable rather than proceeding without consent.
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
+/// ensures a misconfigured consent store makes consent-dependent routes unavailable
+/// rather than proceeding without consent (fail-closed).
 ///
 /// # Errors
 ///
@@ -854,11 +852,7 @@ async fn buffer_asset_body(
 // Error helper
 // ---------------------------------------------------------------------------
 
-/// Convert a [`Report<TrustedServerError>`] into an HTTP [`Response`],
-/// mirroring [`crate::http_error_response`] exactly.
-///
-/// The near-identical function in `main.rs` is intentional: the legacy path
-/// uses fastly HTTP types while this path uses `edgezero_core` types.
+/// Converts a [`Report<TrustedServerError>`] into an HTTP [`Response`].
 pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let root_error = report.current_context();
     log::error!("Error occurred: {:?}", report);
@@ -1863,9 +1857,9 @@ mod tests {
     #[test]
     fn dispatch_head_on_named_get_route_falls_through_to_publisher_fallback() {
         // Regression guard: HEAD /first-party/proxy must reach the publisher
-        // fallback, not return a router-level 405. Legacy route_request proxies
-        // every (method, path) combination not matched by a specific arm through
-        // to the publisher origin.
+        // fallback, not return a router-level 405. The EdgeZero dispatch path
+        // proxies every (method, path) combination not matched by a specific
+        // arm through to the publisher origin.
         //
         // Without a live backend the publisher proxy errors (502/503), but the
         // important invariant is that the status is NOT 405.

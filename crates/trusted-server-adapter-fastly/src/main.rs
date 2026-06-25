@@ -1,170 +1,47 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
 use edgezero_core::app::Hooks as _;
-use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::http::{
-    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
-};
+use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
-use trusted_server_core::auction::endpoints::handle_auction;
-use trusted_server_core::auction::AuctionOrchestrator;
-use trusted_server_core::auth::enforce_basic_auth;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
-use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
-use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
 use trusted_server_core::ec::registry::PartnerRegistry;
-use trusted_server_core::ec::EcContext;
-use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
-use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::http_util::is_navigation_request;
-use trusted_server_core::integrations::{
-    IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
-    RequestFilterRegistryOutcome,
-};
+use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
-use trusted_server_core::proxy::{
-    handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
-    AssetProxyCachePolicy,
-};
-use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
-    OwnedProcessResponseParams, PublisherResponse,
-};
-use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
-};
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
-use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 mod app;
 mod backend;
 mod compat;
 mod ec_kv;
-mod error;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
-#[cfg(test)]
-mod route_tests;
 
-use crate::app::{build_state, TrustedServerApp};
+use crate::app::TrustedServerApp;
 use crate::ec_kv::FastlyEcKvStore;
-use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
-use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
+use crate::platform::{client_info_from_request, FastlyPlatformGeo};
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
-const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
-const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
 
-/// Result of routing a request, distinguishing buffered from streaming publisher responses.
-///
-/// The streaming arm keeps the publisher body out of WASM heap until it is written directly
-/// to the client via [`fastly::Response::stream_to_client`]. All other legacy routes are buffered.
-///
-/// [`AuthChallenge`](HandlerOutcome::AuthChallenge) marks responses produced by this server's
-/// own `enforce_basic_auth` so the geo-lookup gate can distinguish them from origin-forwarded
-/// 401s, which should still carry geo headers.
-enum HandlerOutcome {
-    Buffered(HttpResponse),
-    AuthChallenge(HttpResponse),
-    Streaming {
-        response: HttpResponse,
-        body: EdgeBody,
-        params: OwnedProcessResponseParams,
-    },
-    AssetStreaming {
-        response: HttpResponse,
-        body: EdgeBody,
-    },
-}
-
-impl HandlerOutcome {
-    #[cfg(test)]
-    fn status(&self) -> edgezero_core::http::StatusCode {
-        match self {
-            HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
-            HandlerOutcome::Streaming { response, .. }
-            | HandlerOutcome::AssetStreaming { response, .. } => response.status(),
-        }
-    }
-}
-
-/// Returns `true` if the raw config-store value represents an enabled flag.
-///
-/// Accepted values (after whitespace trimming): `"1"` or `"true"` in any ASCII case.
-/// All other values, including the empty string, are treated as disabled.
-fn parse_edgezero_flag(value: &str) -> bool {
-    let v = value.trim();
-    v.eq_ignore_ascii_case("true") || v == "1"
-}
-
-/// Parses a rollout percentage string into a value in `0..=100`.
-///
-/// Accepts only integer strings in the range 0–100 (inclusive) after whitespace
-/// trimming. Returns `None` for anything else: non-integer, out-of-range,
-/// empty string.
-fn parse_rollout_pct(value: &str) -> Option<u8> {
-    let n: u16 = value.trim().parse().ok()?;
-    if n > 100 {
-        return None;
-    }
-    Some(n as u8)
-}
-
-/// Maps an arbitrary string to a deterministic bucket in `0..100`.
-///
-/// Uses FNV-1a (32-bit variant) to produce a uniform-enough distribution for
-/// canary traffic splitting without pulling in any hash crates. The same input
-/// always produces the same output across Rust versions because the algorithm
-/// is defined here, not delegated to `DefaultHasher`.
-fn fnv1a_bucket(key: &str) -> u8 {
-    const FNV_OFFSET: u32 = 2_166_136_261;
-    const FNV_PRIME: u32 = 16_777_619;
-    let mut hash = FNV_OFFSET;
-    for byte in key.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    (hash % 100) as u8
-}
-
-/// Returns `true` if the given bucket should be routed to the `EdgeZero` path.
-///
-/// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
-/// When `rollout_pct = 0` no bucket ever routes to `EdgeZero` (instant rollback).
-/// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
-fn routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
-    debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
-    debug_assert!(
-        rollout_pct <= 100,
-        "should be a value produced by read_rollout_pct"
-    );
-    bucket < rollout_pct
-}
-
-/// Opens the shared Fastly Config Store used by both the `EdgeZero` flag read and
-/// `EdgeZero` dispatch metadata.
+/// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
 ///
@@ -175,117 +52,6 @@ fn open_trusted_server_config_store() -> Result<ConfigStoreHandle, fastly::Error
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
 
-/// Reads the `edgezero_enabled` key from the prepared Fastly Config Store
-/// handle.
-///
-/// Returns `Err` on any key-read failure, so callers should use the legacy path
-/// as the safe default.
-///
-/// # Errors
-///
-/// - [`fastly::Error`] if the key cannot be read.
-fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly::Error> {
-    let value = config_store
-        .get(EDGEZERO_ENABLED_KEY)
-        .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
-    Ok(value.as_deref().is_some_and(parse_edgezero_flag))
-}
-
-/// Reads `edgezero_rollout_pct` from the config store.
-///
-/// | Config store state              | Return value | Effect                     |
-/// |---------------------------------|--------------|----------------------------|
-/// | Key absent                      | `0`          | All legacy (safe default)  |
-/// | Key present, valid 0–100        | parsed value | Partial or full rollout    |
-/// | Key present, invalid            | `0`          | All legacy (safe default)  |
-/// | Key read error                  | `0`          | All legacy (safe default)  |
-fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
-    match config_store.get(EDGEZERO_ROLLOUT_PCT_KEY) {
-        Ok(Some(value)) => match parse_rollout_pct(&value) {
-            Some(pct) => pct,
-            None => {
-                log::warn!("invalid edgezero_rollout_pct value, defaulting to 0 (legacy path)");
-                0
-            }
-        },
-        Ok(None) => {
-            // Absent key fails safe to legacy, matching every other failure branch
-            // (unreadable flag, invalid value, read error all resolve to legacy).
-            // Deleting the key can never trigger a full cutover. Fires per-request
-            // when the key is absent and edgezero_enabled=true, so emit at debug to
-            // avoid a per-request log flood at production QPS.
-            log::debug!(
-                "edgezero_rollout_pct key absent, defaulting to 0 (legacy path — fail safe)"
-            );
-            0
-        }
-        Err(e) => {
-            log::warn!("failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)");
-            0
-        }
-    }
-}
-
-/// Decides whether a request routes to the `EdgeZero` path for the given rollout state.
-///
-/// `rollout_pct` must be in `0..=100` (as produced by [`read_rollout_pct`]).
-///
-/// The degenerate rollout values short-circuit the per-request routing-key
-/// allocation and FNV hash, which together cover most of the canary's lifetime:
-/// `0` always routes to legacy (full rollback) and `100` always routes to
-/// `EdgeZero` (full cutover). Only the partial-rollout path hashes the client IP
-/// (or the empty string when absent) into a `0..100` bucket via [`fnv1a_bucket`]
-/// and compares it against `rollout_pct` with [`routes_to_edgezero`].
-fn should_route_to_edgezero(rollout_pct: u8, client_ip: Option<IpAddr>) -> bool {
-    match rollout_pct {
-        0 => {
-            log::debug!("routing request through legacy path (rollout_pct=0)");
-            false
-        }
-        100 => {
-            log::debug!("routing request through EdgeZero path (rollout_pct=100)");
-            true
-        }
-        pct => {
-            let routing_key = match client_ip {
-                Some(ip) => ip.to_string(),
-                None => {
-                    log::debug!(
-                        "no client IP available, using empty routing key (deterministic bucket 61)"
-                    );
-                    String::new()
-                }
-            };
-            let bucket = fnv1a_bucket(&routing_key);
-            let routed = routes_to_edgezero(bucket, pct);
-            log::debug!(
-                "routing request through {} path (bucket={bucket}, rollout_pct={pct})",
-                if routed { "EdgeZero" } else { "legacy" }
-            );
-            routed
-        }
-    }
-}
-
-/// Selects the Fastly entry point for an already-opened config store and request.
-///
-/// `edgezero_enabled=false` always routes to legacy and must not require callers
-/// to read `edgezero_rollout_pct`. When enabled, `rollout_pct` is interpreted
-/// exactly as [`read_rollout_pct`] returns it: `0` is full rollback, `100` is full
-/// cutover, and intermediate values are sticky by client-IP bucket.
-fn select_edgezero_entrypoint(
-    edgezero_enabled: bool,
-    rollout_pct: u8,
-    client_ip: Option<IpAddr>,
-) -> bool {
-    if !edgezero_enabled {
-        log::debug!("routing request through legacy path (edgezero_enabled=false)");
-        return false;
-    }
-
-    should_route_to_edgezero(rollout_pct, client_ip)
-}
-
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
         return Some(FastlyResponse::from_status(200).with_body_text_plain("ok"));
@@ -294,24 +60,10 @@ fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     None
 }
 
-/// Combined result from `route_request`, bundling the handler outcome with the
-/// EC context and cookies needed for post-send finalization and pull sync.
-struct RouteResult {
-    outcome: HandlerOutcome,
-    ec_context: EcContext,
-    finalize_kv_graph: Option<KvIdentityGraph>,
-    eids_cookie: Option<String>,
-    sharedid_cookie: Option<String>,
-    is_real_browser: bool,
-    should_finalize_ec: bool,
-    asset_cache_policy: AssetProxyCachePolicy,
-    request_filter_effects: RequestFilterEffects,
-}
-
 /// Entry point for the Fastly Compute program.
 ///
 /// Uses an undecorated `main()` with `FastlyRequest::from_client()` instead of
-/// `#[fastly::main]` so the legacy streaming publisher path can call
+/// `#[fastly::main]` so the `EdgeZero` streaming publisher path can call
 /// [`fastly::Response::stream_to_client`] explicitly.
 fn main() {
     let req = FastlyRequest::from_client();
@@ -323,39 +75,14 @@ fn main() {
     }
 
     logging::init_logger();
-
-    let edgezero_config_store = match open_trusted_server_config_store() {
-        Ok(config_store) => config_store,
-        Err(e) => {
-            log::warn!("failed to open EdgeZero config store, falling back to legacy path: {e}");
-            legacy_main(req);
-            return;
-        }
-    };
-
-    let edgezero_enabled = is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
-        log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
-        false
-    });
-    let route_to_edgezero = if edgezero_enabled {
-        let rollout_pct = read_rollout_pct(&edgezero_config_store);
-        select_edgezero_entrypoint(edgezero_enabled, rollout_pct, req.get_client_ip_addr())
-    } else {
-        select_edgezero_entrypoint(edgezero_enabled, 0, req.get_client_ip_addr())
-    };
-
-    if route_to_edgezero {
-        edgezero_main(req, edgezero_config_store);
-    } else {
-        legacy_main(req);
-    }
+    edgezero_main(req);
 }
 
 /// Handles a request through the `EdgeZero` router path.
-fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
-    // Short-circuit the JA4 debug probe before app construction, mirroring
-    // legacy_main. Must run here because TLS/JA4 accessors are only available
-    // on FastlyRequest before conversion to edgezero types.
+fn edgezero_main(mut req: FastlyRequest) {
+    // Short-circuit the JA4 debug probe before app construction. Must run here
+    // because TLS/JA4 accessors are only available on FastlyRequest before
+    // conversion to edgezero types.
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
         match get_settings() {
             Ok(settings) if settings.debug.ja4_endpoint_enabled => {
@@ -374,17 +101,26 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         return;
     }
 
+    let config_store = match open_trusted_server_config_store() {
+        Ok(cs) => cs,
+        Err(e) => {
+            log::error!("failed to open config store: {e}");
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body_text_plain("Internal Server Error")
+                .send_to_client();
+            return;
+        }
+    };
+
     let app = TrustedServerApp::build_app();
 
-    // Strip client-spoofable forwarded headers before handing off to the
-    // EdgeZero dispatcher, mirroring the sanitization done in legacy_main.
+    // Strip client-spoofable forwarded headers before dispatch.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     // Re-inject a trusted TLS scheme signal after sanitization has stripped any
     // client-sent fastly-ssl header. Setting it from Fastly's native TLS
-    // metadata here is authoritative. detect_request_scheme in http_util
-    // checks this header so scheme-sensitive logic (publisher URL rewriting,
-    // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
+    // metadata here is authoritative. detect_request_scheme in http_util checks
+    // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
     if req.get_tls_protocol().ok().flatten().is_some()
         || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
     {
@@ -394,11 +130,8 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
-    // Strip any client-supplied x-ts-tls-* headers before injecting the
-    // trusted values from the Fastly SDK. Without this, a plain-HTTP request
-    // carrying X-TS-TLS-Protocol: TLSv1.3 would sail through and cause
-    // detect_request_scheme to return "https", spoofing cookie Secure and
-    // URL rewriting. Must run after sanitize_fastly_forwarded_headers.
+    // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
+    // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
     req.remove_header("x-ts-tls-protocol");
     req.remove_header("x-ts-tls-cipher");
     if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
@@ -413,77 +146,39 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         req.set_header("x-ts-tls-cipher", cipher);
     }
 
-    // Capture the full ClientInfo (TLS protocol/cipher, JA4, H2 fingerprint, and
-    // server hostname/region) from the original FastlyRequest before conversion.
-    // These accessors only return real values on the client request; the
-    // reconstructed EdgeZero request cannot expose them. Stored in the request
-    // extensions so `build_per_request_services` reads the authoritative metadata
-    // that integration bot protection (e.g. DataDome) serializes, instead of
-    // defaulting those fields to empty as the EdgeZero context alone would.
+    // Capture metadata from the original FastlyRequest before conversion. These
+    // accessors only return real values on the client request, so store them in
+    // request extensions for build_per_request_services and EC bot classification.
     let client_info = client_info_from_request(&req);
-
-    // Derive device signals from the original FastlyRequest before conversion.
-    // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
-    // return real values on the client request; a synthetic request rebuilt from
-    // EdgeZero HTTP types cannot expose them, which would strip the JA4/H2 class
-    // the EC bot gate needs and misclassify real browsers as bots. Stored in the
-    // request extensions so `build_ec_request_state` reads the authoritative
-    // signals instead of re-deriving from the reconstructed request.
     let device_signals = derive_device_signals(&req);
 
     // Dispatch directly through the EdgeZero router without an intermediate
-    // fastly::Response conversion. The standard dispatch helpers
-    // (dispatch_with_config_handle, etc.) convert through fastly::Response using
-    // set_header, which drops duplicate header values — silently losing multiple
-    // Set-Cookie headers from publisher/origin responses.
-    //
-    // Bypassing to app.router().oneshot() preserves every header value in the
-    // http::HeaderMap and skips the logger-reinit that prevents using run_app_*.
-    let mut response = {
-        match into_core_request(req) {
-            Ok(mut core_req) => {
-                core_req.extensions_mut().insert(config_store);
-                core_req.extensions_mut().insert(device_signals);
-                core_req.extensions_mut().insert(client_info);
-                futures::executor::block_on(app.router().oneshot(core_req))
-            }
-            Err(e) => {
-                log::error!("EdgeZero request conversion failed: {e}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-                return;
-            }
+    // fastly::Response conversion. That preserves duplicate header values such
+    // as multiple Set-Cookie headers.
+    let mut response = match into_core_request(req) {
+        Ok(mut core_req) => {
+            core_req.extensions_mut().insert(config_store);
+            core_req.extensions_mut().insert(device_signals);
+            core_req.extensions_mut().insert(client_info);
+            futures::executor::block_on(app.router().oneshot(core_req))
+        }
+        Err(e) => {
+            log::error!("EdgeZero request conversion failed: {e}");
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body_text_plain("Internal Server Error")
+                .send_to_client();
+            return;
         }
     };
 
-    // Pop the EC finalize state that route handlers thread out via response
-    // extensions. Must happen before the fastly conversion, which drops
-    // extensions.
+    // Pop response extensions before the Fastly conversion, which drops them.
     let ec_state = response
         .extensions_mut()
         .remove::<crate::app::EcFinalizeState>();
-
-    // Pop the asset cache policy threaded out by the asset-route fallback. Must
-    // happen before the fastly conversion, which drops extensions. Reapplied
-    // after finalization below so protected directives (e.g. no-store on asset
-    // errors) survive operator `response_headers`, mirroring legacy_main's
-    // asset_cache_policy.apply_after_route_finalization.
     let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
-
-    // Pop the integration request-filter response effects (e.g. DataDome
-    // challenge/allow headers) threaded out by the dispatch path. Applied to the
-    // response after EC finalization and before send, mirroring legacy_main's
-    // `request_filter_effects` application. Must happen before the fastly
-    // conversion, which drops extensions.
     let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
 
     if !take_finalize_sentinel(&mut response) {
-        // Apply finalize headers at the entry point so that router-level
-        // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
-        // verbs) carry TS/geo headers. Middleware-finalized responses are
-        // skipped here to avoid a second settings read and geo lookup on the
-        // normal registered-route path.
         match get_settings() {
             Ok(settings) => {
                 let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
@@ -500,24 +195,14 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         }
     }
 
-    // Reapply protected asset cache directives after finalization, mirroring
-    // legacy_main. A no-op for OriginControlled responses.
     if let Some(policy) = asset_cache_policy {
         policy.apply_after_route_finalization(&mut response);
     }
 
-    // EC response lifecycle, mirroring legacy_main: finalize EC cookies and
-    // request headers on the response, send it, then run pull sync for
-    // recognized browsers. When settings or the partner registry cannot be
-    // loaded the response is sent without EC finalization rather than
-    // dropped.
     if let Some(ec_state) = ec_state {
         match get_settings() {
             Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
                 Ok(partner_registry) => {
-                    // KvIdentityGraph cannot ride in response extensions
-                    // (non-Sync dyn EcKvStore), so rebuild it from settings
-                    // when the handler enabled the KV write path.
                     let finalize_kv_graph = if ec_state.use_finalize_kv {
                         maybe_identity_graph(&settings)
                     } else {
@@ -574,213 +259,6 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
         .is_some()
 }
 
-/// Handles a request using the original Fastly-native entry point.
-///
-/// Preserves identical semantics to the pre-PR14 `main()`, with one
-/// relocation: `GET /health` is short-circuited in [`main`] before the flag
-/// dispatch, so it never reaches this function. The pre-PR14 entry point
-/// answered `/health` with the same `200 ok` before settings loading and
-/// routing; the only difference is that the probe now also skips logger
-/// initialization. Called whenever
-/// the `EdgeZero` flag is disabled or cannot be read/parsed as enabled — that
-/// includes config-store open failures, key-read errors, missing keys, and
-/// any value other than the accepted `"true"` / `"1"` forms.
-///
-/// The thin fastly↔http conversion layer (via `compat::from_fastly_request` /
-/// `compat::to_fastly_response`) lives here in the adapter crate.
-// TODO: delete after Phase 5 EdgeZero cutover — see issue #495
-fn legacy_main(mut req: FastlyRequest) {
-    let state = match build_state() {
-        Ok(state) => state,
-        Err(e) => {
-            log::error!("Failed to build application state: {:?}", e);
-            to_error_response(&e).send_to_client();
-            return;
-        }
-    };
-    // lgtm[rust/cleartext-logging]
-    // `Settings` uses `Redacted<T>` for secrets, so this debug dump is redacted.
-    log::debug!("Settings {:?}", state.settings);
-
-    // Short-circuit the ja4 debug probe before finalize_response so that
-    // Cache-Control: no-store, private cannot be replaced by operator [response_headers].
-    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
-        if state.settings.debug.ja4_endpoint_enabled {
-            build_ja4_debug_response(&req).send_to_client();
-        } else {
-            FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
-        }
-        return;
-    }
-
-    let partner_registry = match PartnerRegistry::from_config(&state.settings.ec.partners) {
-        Ok(registry) => registry,
-        Err(e) => {
-            log::error!("Failed to build partner registry: {:?}", e);
-            to_error_response(&e).send_to_client();
-            return;
-        }
-    };
-
-    // Strip client-spoofable forwarded headers at the edge before building
-    // any request-derived context or converting to the core HTTP types.
-    compat::sanitize_fastly_forwarded_headers(&mut req);
-
-    let device_signals = derive_device_signals(&req);
-    let runtime_services =
-        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
-    let http_req = compat::from_fastly_request(req);
-
-    let route_result = futures::executor::block_on(route_request(
-        &state.settings,
-        &state.orchestrator,
-        &state.registry,
-        &partner_registry,
-        &runtime_services,
-        http_req,
-        device_signals,
-    ))
-    .unwrap_or_else(|e| RouteResult {
-        outcome: HandlerOutcome::Buffered(http_error_response(&e)),
-        ec_context: EcContext::default(),
-        finalize_kv_graph: None,
-        eids_cookie: None,
-        sharedid_cookie: None,
-        is_real_browser: false,
-        should_finalize_ec: true,
-        asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-        request_filter_effects: RequestFilterEffects::default(),
-    });
-
-    let RouteResult {
-        outcome,
-        ec_context,
-        finalize_kv_graph,
-        eids_cookie,
-        sharedid_cookie,
-        is_real_browser,
-        should_finalize_ec,
-        asset_cache_policy,
-        request_filter_effects,
-    } = route_result;
-
-    // Skip geo lookup for our own auth challenges: avoids exposing geo headers to
-    // unauthenticated callers.  Origin-forwarded 401s are not AuthChallenge and
-    // do receive geo headers — the client already reached the origin anyway.
-    let geo_info = if matches!(outcome, HandlerOutcome::AuthChallenge(_)) {
-        None
-    } else {
-        runtime_services
-            .geo()
-            .lookup(runtime_services.client_info().client_ip)
-            .unwrap_or_else(|e| {
-                log::warn!("geo lookup failed: {e}");
-                None
-            })
-    };
-
-    match outcome {
-        HandlerOutcome::Buffered(mut response) | HandlerOutcome::AuthChallenge(mut response) => {
-            finalize_response(&state.settings, geo_info.as_ref(), &mut response);
-            asset_cache_policy.apply_after_route_finalization(&mut response);
-            if should_finalize_ec {
-                ec_finalize_response(
-                    &state.settings,
-                    &ec_context,
-                    finalize_kv_graph.as_ref(),
-                    &partner_registry,
-                    eids_cookie.as_deref(),
-                    sharedid_cookie.as_deref(),
-                    &mut response,
-                );
-            }
-            request_filter_effects.apply_to_response(&mut response);
-            compat::to_fastly_response(response).send_to_client();
-
-            if is_real_browser {
-                if let Some(context) = build_pull_sync_context(&ec_context) {
-                    run_pull_sync_after_send(
-                        &state.settings,
-                        &partner_registry,
-                        &context,
-                        &runtime_services,
-                    );
-                }
-            }
-        }
-        HandlerOutcome::Streaming {
-            mut response,
-            body,
-            params,
-        } => {
-            finalize_response(&state.settings, geo_info.as_ref(), &mut response);
-            asset_cache_policy.apply_after_route_finalization(&mut response);
-            if should_finalize_ec {
-                ec_finalize_response(
-                    &state.settings,
-                    &ec_context,
-                    finalize_kv_graph.as_ref(),
-                    &partner_registry,
-                    eids_cookie.as_deref(),
-                    sharedid_cookie.as_deref(),
-                    &mut response,
-                );
-            }
-            request_filter_effects.apply_to_response(&mut response);
-            let fastly_resp = compat::to_fastly_response_skeleton(response);
-            let mut streaming_body = fastly_resp.stream_to_client();
-            let mut stream_succeeded = false;
-            match stream_publisher_body(
-                body,
-                &mut streaming_body,
-                &params,
-                &state.settings,
-                &state.registry,
-            ) {
-                Ok(()) => {
-                    if let Err(e) = streaming_body.finish() {
-                        log::error!("failed to finish streaming body: {e}");
-                    } else {
-                        stream_succeeded = true;
-                    }
-                }
-                Err(e) => {
-                    log::error!("streaming processing failed: {e:?}");
-                    // Headers already committed. Drop the body so the client sees a
-                    // truncated response (EOF mid-stream) — standard proxy behavior.
-                    drop(streaming_body);
-                }
-            }
-
-            if is_real_browser && stream_succeeded {
-                if let Some(context) = build_pull_sync_context(&ec_context) {
-                    run_pull_sync_after_send(
-                        &state.settings,
-                        &partner_registry,
-                        &context,
-                        &runtime_services,
-                    );
-                }
-            }
-        }
-        HandlerOutcome::AssetStreaming { mut response, body } => {
-            finalize_response(&state.settings, geo_info.as_ref(), &mut response);
-            asset_cache_policy.apply_after_route_finalization(&mut response);
-            request_filter_effects.apply_to_response(&mut response);
-            let fastly_resp = compat::to_fastly_response_skeleton(response);
-            let mut streaming_body = fastly_resp.stream_to_client();
-            if let Err(e) =
-                futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
-            {
-                log::error!("asset streaming failed: {e:?}");
-                drop(streaming_body);
-            } else if let Err(e) = streaming_body.finish() {
-                log::error!("failed to finish asset streaming body: {e}");
-            }
-        }
-    }
-}
-
 const FALLBACK_UNAVAILABLE: &str = "unavailable";
 const FALLBACK_NOT_SENT: &str = "not sent";
 const FALLBACK_NONE: &str = "none";
@@ -829,418 +307,6 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
-async fn route_request(
-    settings: &Settings,
-    orchestrator: &AuctionOrchestrator,
-    integration_registry: &IntegrationRegistry,
-    partner_registry: &PartnerRegistry,
-    runtime_services: &RuntimeServices,
-    mut req: HttpRequest,
-    device_signals: DeviceSignals,
-) -> Result<RouteResult, Report<TrustedServerError>> {
-    let is_real_browser = device_signals.looks_like_browser();
-
-    if !is_real_browser {
-        log::info!(
-            "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
-            device_signals.ja4_class,
-            device_signals.platform_class,
-            device_signals.is_mobile,
-        );
-    }
-
-    // Extract the Prebid EIDs and SharedID cookies before routing.
-    let eids_cookie = extract_cookie_value(&req, COOKIE_TS_EIDS);
-    let sharedid_cookie = extract_cookie_value(&req, COOKIE_SHAREDID);
-
-    // Extract geo info.
-    let geo_info = runtime_services
-        .geo()
-        .lookup(runtime_services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed during routing: {e}");
-            None
-        });
-
-    // S2S batch sync — uses Bearer auth (not EC cookies), so skip EC
-    // context creation and the EC finalize middleware entirely.
-    if req.method() == Method::POST && req.uri().path() == "/_ts/api/v1/batch-sync" {
-        match enforce_basic_auth(settings, &req) {
-            Ok(Some(response)) => {
-                return Ok(RouteResult {
-                    outcome: HandlerOutcome::AuthChallenge(response),
-                    ec_context: EcContext::default(),
-                    finalize_kv_graph: None,
-                    eids_cookie,
-                    sharedid_cookie,
-                    is_real_browser,
-                    should_finalize_ec: true,
-                    asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                    request_filter_effects: RequestFilterEffects::default(),
-                });
-            }
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
-        let result = require_identity_graph(settings).and_then(|kv| {
-            let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-            handle_batch_sync(&kv, partner_registry, &limiter, req)
-        });
-        let outcome = match result {
-            Ok(resp) => HandlerOutcome::Buffered(resp),
-            Err(e) => HandlerOutcome::Buffered(http_error_response(&e)),
-        };
-        return Ok(RouteResult {
-            outcome,
-            ec_context: EcContext::default(),
-            finalize_kv_graph: None,
-            eids_cookie,
-            sharedid_cookie,
-            is_real_browser,
-            should_finalize_ec: true,
-            asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-            request_filter_effects: RequestFilterEffects::default(),
-        });
-    }
-
-    // Build EC context using the fastly request reference (headers/method/URI).
-    let mut ec_context = match EcContext::read_from_request_with_geo(
-        settings,
-        &req,
-        runtime_services,
-        geo_info.as_ref(),
-    ) {
-        Ok(context) => context,
-        Err(err) => {
-            return Ok(RouteResult {
-                outcome: HandlerOutcome::Buffered(http_error_response(&err)),
-                ec_context: EcContext::default(),
-                finalize_kv_graph: None,
-                eids_cookie,
-                sharedid_cookie,
-                is_real_browser,
-                should_finalize_ec: true,
-                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                request_filter_effects: RequestFilterEffects::default(),
-            });
-        }
-    };
-
-    // Pass device signals to EcContext so they are stored on new entries.
-    ec_context.set_device_signals(device_signals);
-
-    // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations need the KV graph so tombstones remain
-    // authoritative even for privacy-extension-heavy clients that do not look
-    // like known browsers.
-    // Build the KV identity graph once. The write-path (finalize_kv_graph) is
-    // also given to bots when they signal consent withdrawal so tombstones are
-    // authoritative even for privacy-extension-heavy clients.
-    let kv_graph = maybe_identity_graph(settings);
-    let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
-        kv_graph.clone()
-    } else {
-        None
-    };
-    let kv_graph = if is_real_browser { kv_graph } else { None };
-
-    // `get_settings()` should already have rejected invalid handler regexes.
-    // Keep this fallback so manually-constructed or otherwise unprepared
-    // settings still become an error response instead of panicking.
-    match enforce_basic_auth(settings, &req) {
-        Ok(Some(response)) => {
-            return Ok(RouteResult {
-                outcome: HandlerOutcome::AuthChallenge(response),
-                ec_context,
-                finalize_kv_graph,
-                eids_cookie,
-                sharedid_cookie,
-                is_real_browser,
-                should_finalize_ec: true,
-                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                request_filter_effects: RequestFilterEffects::default(),
-            });
-        }
-        Ok(None) => {}
-        Err(e) => return Err(e),
-    }
-
-    let request_filter_effects = match integration_registry
-        .filter_request(RequestFilterRegistryInput {
-            settings,
-            services: runtime_services,
-            req: &mut req,
-            geo_info: geo_info.as_ref(),
-        })
-        .await
-    {
-        Ok(RequestFilterRegistryOutcome::Continue(effects)) => effects,
-        Ok(RequestFilterRegistryOutcome::Respond { response, effects }) => {
-            return Ok(RouteResult {
-                outcome: HandlerOutcome::Buffered(*response),
-                ec_context,
-                finalize_kv_graph,
-                eids_cookie,
-                sharedid_cookie,
-                is_real_browser,
-                should_finalize_ec: true,
-                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                request_filter_effects: effects,
-            });
-        }
-        Err(e) => {
-            log::error!("Failed to run integration request filters: {:?}", e);
-            return Ok(RouteResult {
-                outcome: HandlerOutcome::Buffered(http_error_response(&e)),
-                ec_context,
-                finalize_kv_graph,
-                eids_cookie,
-                sharedid_cookie,
-                is_real_browser,
-                should_finalize_ec: true,
-                asset_cache_policy: AssetProxyCachePolicy::OriginControlled,
-                request_filter_effects: RequestFilterEffects::default(),
-            });
-        }
-    };
-
-    // Get path and method for routing
-    let path = req.uri().path().to_string();
-    let method = req.method().clone();
-
-    let mut asset_cache_policy = AssetProxyCachePolicy::OriginControlled;
-    let mut should_finalize_ec = true;
-
-    // Match known routes and handle them
-    let (result, organic_route) = match (method, path.as_str()) {
-        // Serve the tsjs library
-        (Method::GET, path) if path.starts_with("/static/tsjs=") => {
-            (handle_tsjs_dynamic(&req, integration_registry), false)
-        }
-
-        // Discovery endpoint for trusted-server capabilities and JWKS
-        (Method::GET, "/.well-known/trusted-server.json") => (
-            handle_trusted_server_discovery(settings, runtime_services, req),
-            false,
-        ),
-
-        // Signature verification endpoint
-        (Method::POST, "/verify-signature") => (
-            handle_verify_signature(settings, runtime_services, req),
-            false,
-        ),
-
-        // Admin endpoints
-        // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        //
-        // Only the canonical `/_ts/admin/keys/*` paths execute key operations.
-        // The legacy `/admin/keys/*` aliases are denied locally below so stale
-        // clients do not leak admin Basic credentials or key-management payloads
-        // to the publisher origin via the organic fallback.
-        (
-            Method::GET
-            | Method::POST
-            | Method::HEAD
-            | Method::OPTIONS
-            | Method::PUT
-            | Method::PATCH
-            | Method::DELETE,
-            "/admin/keys/rotate" | "/admin/keys/deactivate",
-        ) => (Ok(legacy_admin_alias_denied()), false),
-        (Method::POST, "/_ts/admin/keys/rotate") => {
-            (handle_rotate_key(settings, runtime_services, req), false)
-        }
-        (Method::POST, "/_ts/admin/keys/deactivate") => (
-            handle_deactivate_key(settings, runtime_services, req),
-            false,
-        ),
-        (Method::GET, "/_ts/api/v1/identify") => {
-            let outcome = require_identity_graph(settings)
-                .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context));
-            (outcome, false)
-        }
-        (Method::OPTIONS, "/_ts/api/v1/identify") => {
-            let outcome = cors_preflight_identify(settings, &req);
-            (outcome, false)
-        }
-
-        // Tester-cookie endpoints (disabled unless `[tester_cookie].enabled`).
-        (Method::GET, "/_ts/set-tester") => (handle_set_tester(settings), false),
-        (Method::GET, "/_ts/clear-tester") => (handle_clear_tester(settings), false),
-
-        // Unified auction endpoint.
-        (Method::POST, "/auction") => {
-            let registry_ref = if partner_registry.is_empty() {
-                None
-            } else {
-                Some(partner_registry)
-            };
-            (
-                handle_auction(
-                    settings,
-                    orchestrator,
-                    kv_graph.as_ref(),
-                    registry_ref,
-                    &ec_context,
-                    runtime_services,
-                    req,
-                )
-                .await,
-                false,
-            )
-        }
-
-        // First-party proxy/click/sign/rebuild endpoints
-        (Method::GET, "/first-party/proxy") => (
-            handle_first_party_proxy(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::GET, "/first-party/click") => (
-            handle_first_party_click(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::GET, "/first-party/sign") | (Method::POST, "/first-party/sign") => (
-            handle_first_party_proxy_sign(settings, runtime_services, req).await,
-            false,
-        ),
-        (Method::POST, "/first-party/proxy-rebuild") => (
-            handle_first_party_proxy_rebuild(settings, runtime_services, req).await,
-            false,
-        ),
-        (m, path) if integration_registry.has_route(&m, path) => {
-            let result = integration_registry
-                .handle_proxy(ProxyDispatchInput {
-                    method: &m,
-                    path,
-                    settings,
-                    kv: kv_graph.as_ref(),
-                    ec_context: &mut ec_context,
-                    services: runtime_services,
-                    req,
-                })
-                .await
-                .unwrap_or_else(|| {
-                    Err(Report::new(TrustedServerError::BadRequest {
-                        message: format!("Unknown integration route: {path}"),
-                    }))
-                });
-            (result, true)
-        }
-
-        // No known route matched, proxy to an asset origin or publisher origin as fallback
-        (method, _) => {
-            let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
-                .then(|| settings.asset_route_for_path(&path))
-                .flatten();
-
-            if let Some(asset_route) = matched_asset_route {
-                should_finalize_ec = false;
-                log::info!("No explicit route matched; proxying via configured asset route");
-                let result =
-                    match handle_asset_proxy_request(settings, runtime_services, req, asset_route)
-                        .await
-                    {
-                        Ok(asset_response) => {
-                            asset_cache_policy = asset_response.cache_policy();
-                            let (response, stream_body) = asset_response.into_response_and_body();
-                            if let Some(body) = stream_body {
-                                return Ok(RouteResult {
-                                    outcome: HandlerOutcome::AssetStreaming { response, body },
-                                    ec_context,
-                                    finalize_kv_graph,
-                                    eids_cookie,
-                                    sharedid_cookie,
-                                    is_real_browser,
-                                    should_finalize_ec,
-                                    asset_cache_policy,
-                                    request_filter_effects,
-                                });
-                            }
-                            Ok(response)
-                        }
-                        Err(e) => {
-                            asset_cache_policy = AssetProxyCachePolicy::NoStorePrivate;
-                            Err(e)
-                        }
-                    };
-                (result, false)
-            } else {
-                log::info!(
-                    "No known route matched for path: {}, proxying to publisher origin",
-                    path
-                );
-
-                // Generate EC ID if needed — mirrors the integration proxy path in registry.rs.
-                // Only for document navigations by recognised browsers; subresource requests
-                // may lack consent signals such as Sec-GPC.
-                if is_real_browser && is_navigation_request(&req) {
-                    if let Err(err) = ec_context.generate_if_needed(settings, kv_graph.as_ref()) {
-                        log::warn!("EC generation failed for publisher proxy: {err:?}");
-                    }
-                }
-
-                match handle_publisher_request(
-                    settings,
-                    integration_registry,
-                    runtime_services,
-                    req,
-                )
-                .await
-                {
-                    Ok(PublisherResponse::Stream {
-                        response,
-                        body,
-                        params,
-                    }) => {
-                        return Ok(RouteResult {
-                            outcome: HandlerOutcome::Streaming {
-                                response,
-                                body,
-                                params,
-                            },
-                            ec_context,
-                            finalize_kv_graph,
-                            eids_cookie,
-                            sharedid_cookie,
-                            is_real_browser,
-                            should_finalize_ec,
-                            asset_cache_policy,
-                            request_filter_effects,
-                        });
-                    }
-                    Ok(PublisherResponse::PassThrough { mut response, body }) => {
-                        *response.body_mut() = body;
-                        (Ok(response), true)
-                    }
-                    Ok(PublisherResponse::Buffered(response)) => (Ok(response), true),
-                    Err(e) => {
-                        log::error!("Failed to proxy to publisher origin: {:?}", e);
-                        (Err(e), true)
-                    }
-                }
-            }
-        }
-    };
-
-    let _ = organic_route;
-
-    let outcome = result
-        .map(HandlerOutcome::Buffered)
-        .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
-
-    Ok(RouteResult {
-        outcome,
-        ec_context,
-        finalize_kv_graph,
-        eids_cookie,
-        sharedid_cookie,
-        is_real_browser,
-        should_finalize_ec,
-        asset_cache_policy,
-        request_filter_effects,
-    })
-}
-
 pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
     settings
         .ec
@@ -1265,49 +331,6 @@ fn run_pull_sync_after_send(
 
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context, services);
-}
-
-/// Applies all standard response headers: geo, version, staging, and configured headers.
-///
-/// Called from every response path (including auth early-returns) so that all
-/// outgoing responses carry a consistent set of Trusted Server headers.
-///
-/// Header precedence (last write wins): geo headers are set first, then
-/// version/staging, then operator-configured `settings.response_headers`.
-/// This means operators can intentionally override any managed header.
-fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
-    apply_finalize_headers(settings, geo_info, response);
-}
-
-/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
-/// aliases.
-///
-/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
-/// handler, so they must fail closed locally rather than fall through to the
-/// publisher fallback — which would forward the client's `Authorization` header
-/// and key-management payload to the origin, leaking admin credentials.
-fn legacy_admin_alias_denied() -> HttpResponse {
-    let mut response = HttpResponse::new(EdgeBody::from("Not found\n"));
-    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {
-    let root_error = report.current_context();
-    log::error!("Error occurred: {:?}", report);
-
-    let mut response =
-        HttpResponse::new(EdgeBody::from(format!("{}\n", root_error.user_message())));
-    *response.status_mut() = root_error.status_code();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
 }
 
 /// Constructs a `KvIdentityGraph` from settings, or returns an error if the
@@ -1353,7 +376,9 @@ pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder;
+    use edgezero_core::http::HeaderValue;
     use fastly::mime;
 
     fn test_settings() -> Settings {
@@ -1380,353 +405,6 @@ mod tests {
             "#,
         )
         .expect("should parse test settings")
-    }
-
-    #[test]
-    fn parses_true_flag_values() {
-        assert!(parse_edgezero_flag("true"), "should parse 'true'");
-        assert!(parse_edgezero_flag("1"), "should parse '1'");
-        assert!(parse_edgezero_flag("  true  "), "should trim whitespace");
-        assert!(
-            parse_edgezero_flag("  1  "),
-            "should trim whitespace around '1'"
-        );
-        assert!(parse_edgezero_flag("TRUE"), "should parse uppercase 'TRUE'");
-        assert!(
-            parse_edgezero_flag("True"),
-            "should parse mixed-case 'True'"
-        );
-    }
-
-    #[test]
-    fn rejects_non_true_flag_values() {
-        assert!(!parse_edgezero_flag("false"), "should not parse 'false'");
-        assert!(!parse_edgezero_flag(""), "should not parse empty string");
-        assert!(
-            !parse_edgezero_flag("  "),
-            "should not parse whitespace-only"
-        );
-        assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
-    }
-
-    // ---------------------------------------------------------------------------
-    // parse_rollout_pct
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn parses_valid_rollout_percentages() {
-        assert_eq!(parse_rollout_pct("0"), Some(0), "should parse '0'");
-        assert_eq!(parse_rollout_pct("1"), Some(1), "should parse '1'");
-        assert_eq!(parse_rollout_pct("50"), Some(50), "should parse '50'");
-        assert_eq!(parse_rollout_pct("100"), Some(100), "should parse '100'");
-        assert_eq!(
-            parse_rollout_pct("  50  "),
-            Some(50),
-            "should trim whitespace"
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_rollout_percentages() {
-        assert_eq!(
-            parse_rollout_pct("101"),
-            None,
-            "should reject values above 100"
-        );
-        assert_eq!(parse_rollout_pct(""), None, "should reject empty string");
-        assert_eq!(parse_rollout_pct("abc"), None, "should reject non-integer");
-        assert_eq!(
-            parse_rollout_pct("-1"),
-            None,
-            "should reject negative value"
-        );
-        assert_eq!(
-            parse_rollout_pct("1.5"),
-            None,
-            "should reject decimal value"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // fnv1a_bucket
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn bucket_is_in_range_0_to_99() {
-        for key in &["1.2.3.4", "255.255.255.255", "::1", "", "unknown"] {
-            let b = fnv1a_bucket(key);
-            assert!(b < 100, "bucket must be 0..100 for key {key:?}, got {b}");
-        }
-    }
-
-    #[test]
-    fn bucket_is_deterministic() {
-        let key = "192.168.1.1";
-        assert_eq!(
-            fnv1a_bucket(key),
-            fnv1a_bucket(key),
-            "same key must produce the same bucket"
-        );
-    }
-
-    #[test]
-    fn bucket_matches_known_fnv1a_vector() {
-        // FNV-1a 32-bit: XOR-then-multiply. Verified against reference implementation.
-        assert_eq!(
-            fnv1a_bucket("1.2.3.4"),
-            85,
-            "should match pinned FNV-1a vector"
-        );
-        assert_eq!(
-            fnv1a_bucket(""),
-            61,
-            "should match pinned FNV-1a vector for empty key"
-        );
-    }
-
-    #[test]
-    fn bucket_distributes_across_range() {
-        // Smoke-test that fnv1a_bucket produces a spread of values (not a constant).
-        // 256 distinct IP-like keys must produce at least 50 unique buckets.
-        let buckets: std::collections::HashSet<u8> = (0u16..=255)
-            .map(|i| fnv1a_bucket(&format!("10.0.0.{i}")))
-            .collect();
-        assert!(
-            buckets.len() > 50,
-            "fnv1a_bucket should distribute across buckets; got only {} unique values in 256 keys",
-            buckets.len()
-        );
-    }
-
-    #[test]
-    fn empty_key_bucket_is_valid() {
-        let b = fnv1a_bucket("");
-        assert!(
-            b < 100,
-            "empty key must still produce a valid bucket, got {b}"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // routes_to_edgezero
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn rollout_zero_routes_all_to_legacy() {
-        for bucket in 0u8..100 {
-            assert!(
-                !routes_to_edgezero(bucket, 0),
-                "pct=0 should route all to legacy, bucket={bucket}"
-            );
-        }
-    }
-
-    #[test]
-    fn rollout_hundred_routes_all_to_edgezero() {
-        for bucket in 0u8..100 {
-            assert!(
-                routes_to_edgezero(bucket, 100),
-                "pct=100 should route all to EdgeZero, bucket={bucket}"
-            );
-        }
-    }
-
-    #[test]
-    fn rollout_fifty_routes_exactly_half_of_bucket_space() {
-        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 50)).count();
-        assert_eq!(
-            edgezero_count, 50,
-            "pct=50 should route exactly 50 out of 100 buckets to EdgeZero"
-        );
-    }
-
-    #[test]
-    fn rollout_one_routes_exactly_one_bucket() {
-        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 1)).count();
-        assert_eq!(
-            edgezero_count, 1,
-            "pct=1 should route exactly 1 out of 100 buckets to EdgeZero"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // should_route_to_edgezero — entry-point dispatch matrix
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn should_route_zero_pct_always_routes_to_legacy() {
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-        assert!(
-            !should_route_to_edgezero(0, Some(ip)),
-            "rollout_pct=0 should route to legacy regardless of client IP"
-        );
-        assert!(
-            !should_route_to_edgezero(0, None),
-            "rollout_pct=0 should route to legacy when client IP is absent"
-        );
-    }
-
-    #[test]
-    fn should_route_hundred_pct_always_routes_to_edgezero() {
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-        assert!(
-            should_route_to_edgezero(100, Some(ip)),
-            "rollout_pct=100 should route to EdgeZero regardless of client IP"
-        );
-        assert!(
-            should_route_to_edgezero(100, None),
-            "rollout_pct=100 should route to EdgeZero when client IP is absent"
-        );
-    }
-
-    #[test]
-    fn should_route_partial_buckets_client_ip() {
-        // "1.2.3.4" hashes to bucket 85 (pinned FNV-1a vector).
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-        assert!(
-            should_route_to_edgezero(86, Some(ip)),
-            "bucket 85 < 86 should route to EdgeZero (hit)"
-        );
-        assert!(
-            !should_route_to_edgezero(85, Some(ip)),
-            "bucket 85 is not < 85 should route to legacy (miss)"
-        );
-    }
-
-    #[test]
-    fn should_route_partial_absent_ip_uses_empty_key_bucket() {
-        // The empty routing key hashes to bucket 61 (pinned FNV-1a vector).
-        assert!(
-            should_route_to_edgezero(62, None),
-            "bucket 61 < 62 should route to EdgeZero (hit)"
-        );
-        assert!(
-            !should_route_to_edgezero(61, None),
-            "bucket 61 is not < 61 should route to legacy (miss)"
-        );
-    }
-
-    #[test]
-    fn entrypoint_selector_requires_enabled_flag_before_rollout() {
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-
-        assert!(
-            !select_edgezero_entrypoint(false, 100, Some(ip)),
-            "disabled EdgeZero flag should force the legacy entry point even at 100% rollout"
-        );
-    }
-
-    #[test]
-    fn entrypoint_selector_routes_rollout_edges() {
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-
-        assert!(
-            !select_edgezero_entrypoint(true, 0, Some(ip)),
-            "enabled EdgeZero with 0% rollout should route to legacy"
-        );
-        assert!(
-            select_edgezero_entrypoint(true, 100, Some(ip)),
-            "enabled EdgeZero with 100% rollout should route to EdgeZero"
-        );
-    }
-
-    #[test]
-    fn entrypoint_selector_routes_partial_hit_and_miss() {
-        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
-
-        assert!(
-            select_edgezero_entrypoint(true, 86, Some(ip)),
-            "enabled EdgeZero should route a bucket hit to EdgeZero"
-        );
-        assert!(
-            !select_edgezero_entrypoint(true, 85, Some(ip)),
-            "enabled EdgeZero should route a bucket miss to legacy"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // read_rollout_pct — safety-critical config-store branches
-    // ---------------------------------------------------------------------------
-
-    // Canned config-store response so the safety-critical defaults can be pinned
-    // without a live Fastly Config Store. `ConfigStoreError` is not `Clone`, so the
-    // error case is built fresh inside `get` rather than stored.
-    enum StubResponse {
-        Value(String),
-        Absent,
-        Unavailable,
-    }
-
-    struct TestConfigStore {
-        response: StubResponse,
-    }
-
-    impl edgezero_core::config_store::ConfigStore for TestConfigStore {
-        fn get(
-            &self,
-            key: &str,
-        ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
-            assert_eq!(
-                key, EDGEZERO_ROLLOUT_PCT_KEY,
-                "stub should pin the rollout config key"
-            );
-            match &self.response {
-                StubResponse::Value(v) => Ok(Some(v.clone())),
-                StubResponse::Absent => Ok(None),
-                StubResponse::Unavailable => Err(
-                    edgezero_core::config_store::ConfigStoreError::unavailable("boom"),
-                ),
-            }
-        }
-    }
-
-    fn rollout_handle(response: StubResponse) -> ConfigStoreHandle {
-        ConfigStoreHandle::new(Arc::new(TestConfigStore { response }))
-    }
-
-    #[test]
-    fn read_rollout_pct_absent_defaults_to_legacy() {
-        assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Absent)),
-            0,
-            "absent key should fail safe to 0 (legacy), like every other failure branch"
-        );
-    }
-
-    #[test]
-    fn read_rollout_pct_valid_value_is_parsed() {
-        assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("42".into()))),
-            42,
-            "a valid in-range value should be returned verbatim"
-        );
-    }
-
-    #[test]
-    fn read_rollout_pct_invalid_value_defaults_to_zero() {
-        assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("abc".into()))),
-            0,
-            "an unparseable value should fail safe to 0 (legacy)"
-        );
-    }
-
-    #[test]
-    fn read_rollout_pct_out_of_range_defaults_to_zero() {
-        assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("101".into()))),
-            0,
-            "an out-of-range value should fail safe to 0 (legacy)"
-        );
-    }
-
-    #[test]
-    fn read_rollout_pct_read_error_defaults_to_zero() {
-        assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Unavailable)),
-            0,
-            "a config-store read error should fail safe to 0 (legacy)"
-        );
     }
 
     #[test]

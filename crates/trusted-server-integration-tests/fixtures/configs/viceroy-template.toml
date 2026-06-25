@@ -67,6 +67,12 @@
             data = "test-api-key"
 
     [local_server.config_stores]
+        # Required by the post-cutover Fastly entry point. No canary keys are
+        # read after legacy cleanup; the store only needs to exist.
+        [local_server.config_stores.trusted_server_config]
+            format = "inline-toml"
+        [local_server.config_stores.trusted_server_config.contents]
+
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]
