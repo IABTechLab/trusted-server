@@ -109,13 +109,10 @@ impl RuleTable {
     /// ignoring any `:port`.
     #[must_use]
     pub fn first_match(&self, host: &str) -> Option<&Rule> {
-        let needle = host
-            .rsplit_once(':')
-            .map_or(host, |(h, _)| h)
-            .to_ascii_lowercase();
-        self.0
-            .iter()
-            .find(|r| r.from.to_ascii_lowercase() == needle)
+        // `from` is stored lowercase (see `Rule::from`); compare
+        // case-insensitively against the port-stripped host without allocating.
+        let needle = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        self.0.iter().find(|r| r.from.eq_ignore_ascii_case(needle))
     }
 }
 

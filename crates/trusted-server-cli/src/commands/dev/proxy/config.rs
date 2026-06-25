@@ -194,6 +194,10 @@ fn build_resolve(args: &ProxyArgs) -> Result<HashMap<String, IpAddr>, ConfigErro
 /// Whether `host` is a syntactically valid hostname — ASCII letters, digits,
 /// `-`, and `.` only — so it is safe to embed verbatim in the generated PAC
 /// JavaScript, the browser URL, and the upstream `Host` header.
+///
+/// Underscores are intentionally rejected: they are not valid in DNS hostnames
+/// and excluding them keeps the allowed set strictly safe for the contexts
+/// above. A publisher host that needs `_` is out of scope for this dev tool.
 fn is_valid_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
@@ -258,6 +262,17 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
     let basic_auth = resolve_basic_auth(args).map_err(Report::from)?;
     let ca_dir = ca_dir(args);
     let resolve = build_resolve(args).map_err(Report::from)?;
+
+    // A `--resolve HOST:IP` whose HOST matches no rule's TO host is almost
+    // certainly a typo: the pin would silently never apply. Warn rather than
+    // error, so a deliberate pin for a host reached indirectly still works.
+    for host in resolve.keys() {
+        if !rules.0.iter().any(|rule| rule.to.host() == host) {
+            log::warn!(
+                "--resolve {host}:… does not match any rule's TO host; the pin will not be used"
+            );
+        }
+    }
 
     Ok(ResolvedConfig {
         rules,
@@ -375,6 +390,20 @@ mod tests {
             cfg.resolve.get("b.edgecompute.app"),
             Some(&"::1".parse().expect("should parse ipv6")),
             "IPv6 --resolve target is parsed whole"
+        );
+    }
+
+    #[test]
+    fn resolve_host_not_matching_any_rule_warns_but_succeeds() {
+        let mut args = base_args();
+        args.map = vec!["a.example.com=b.edgecompute.app".into()];
+        // A pin for a host that is no rule's TO is a likely typo: it should warn
+        // (not error) and still be recorded.
+        args.resolve = vec!["typo.edgecompute.app:192.0.2.10".into()];
+        let cfg = resolve(&args).expect("an unmatched --resolve host should warn, not error");
+        assert!(
+            cfg.resolve.contains_key("typo.edgecompute.app"),
+            "the pin is recorded even when it matches no rule's TO host"
         );
     }
 

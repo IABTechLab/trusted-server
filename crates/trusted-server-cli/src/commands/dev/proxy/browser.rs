@@ -282,7 +282,7 @@ fn chrome_command() -> Command {
     }
     #[cfg(target_os = "linux")]
     {
-        // Try google-chrome first, then chromium-browser, then chromium.
+        // Linux: the `google-chrome` launcher (unreached on the macOS-only build).
         Command::new("google-chrome")
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
