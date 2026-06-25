@@ -1,6 +1,9 @@
+use std::process;
+
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, ProvisionArgs, ServeArgs,
+    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
+    ProvisionArgs, ServeArgs,
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
@@ -34,6 +37,8 @@ enum Command {
 enum ConfigCommand {
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
+    /// Diff `trusted-server.toml` against the live `EdgeZero` config.
+    Diff(ConfigDiffArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
@@ -55,6 +60,13 @@ fn dispatch(args: Args) -> Result<(), String> {
         Command::Auth(args) => edgezero_cli::run_auth(&args),
         Command::Build(args) => edgezero_cli::run_build(&args),
         Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
+        Command::Config(ConfigCommand::Diff(args)) => {
+            match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
+                Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(()),
+                Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
+                Err(err) => Err(err),
+            }
+        }
         Command::Config(ConfigCommand::Push(args)) => {
             edgezero_cli::run_config_push_typed::<TrustedServerAppConfig>(&args)
         }
@@ -72,7 +84,7 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser as _;
-    use edgezero_cli::args::{AuthSub, ConfigPushArgs, ConfigValidateArgs};
+    use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
 
@@ -143,6 +155,22 @@ mod tests {
         assert!(!push.local);
         assert!(!push.dry_run);
         assert!(!push.no_env);
+    }
+
+    #[test]
+    fn config_diff_uses_edgezero_defaults() {
+        let args = parse(&["ts", "config", "diff", "--adapter", "fastly"]);
+        let Command::Config(ConfigCommand::Diff(diff)) = args.command else {
+            panic!("expected config diff command");
+        };
+        let default_diff = ConfigDiffArgs::default();
+        assert_eq!(diff.adapter, "fastly");
+        assert_eq!(diff.app_config, default_diff.app_config);
+        assert_eq!(diff.manifest, default_diff.manifest);
+        assert_eq!(diff.store, default_diff.store);
+        assert!(!diff.local);
+        assert!(!diff.exit_code);
+        assert!(!diff.no_env);
     }
 
     #[test]
