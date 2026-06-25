@@ -2,5 +2,6 @@ target/
 build/
 .edgezero/
 .wrangler/
+.worker-build/
 .env.cloudflare.dev
 .dev.vars

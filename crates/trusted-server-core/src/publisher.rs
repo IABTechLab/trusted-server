@@ -1,9 +1,21 @@
+//! Publisher response handler.
+//!
+//! Publisher fallback has three delivery modes that must remain explicit at
+//! the API boundary:
+//! - pass-through for non-processable `2xx` content
+//! - streamed processing for stream-safe processable responses
+//! - buffered responses for unsupported encodings, `204/205`, or HTML routes
+//!   that require full-document post-processing
+//!
+//! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
+//! streaming processor treats unknown encodings as identity, so publisher code
+//! must gate them out before the body enters the rewrite pipeline.
 use std::io::Write;
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
+use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
@@ -205,12 +217,11 @@ fn process_response_streaming<W: Write>(
     let is_html = params.content_type.contains("text/html");
     let is_rsc_flight = params.content_type.contains("text/x-component");
     log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}, origin_host={}",
+        "process_response_streaming: content_type={}, content_encoding={}, is_html={}, is_rsc_flight={}",
         params.content_type,
         params.content_encoding,
         is_html,
-        is_rsc_flight,
-        params.origin_host
+        is_rsc_flight
     );
 
     let compression = Compression::from_content_encoding(params.content_encoding);
@@ -394,15 +405,77 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
+/// Buffer a [`PublisherResponse`] into a single [`Response`].
+///
+/// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
+/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
+/// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
+///
+/// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
+/// (16 MiB by default), so processable origin responses cannot grow the
+/// buffer without bound and exhaust the Wasm heap.
+///
+/// `method` is used to preserve metadata for bodiless responses: `HEAD` and
+/// bodiless statuses (204, 304) carry no body but may advertise the `GET`
+/// representation's length. `handle_publisher_request` already strips the origin
+/// `Content-Length` for processable [`PublisherResponse::Stream`] responses, so
+/// rewriting it here to the buffered byte count (`0`) would replace it with a
+/// misleading length. Those responses skip the buffer, the length rewrite, and
+/// the body replacement, mirroring the asset path's bodiless guard.
+///
+/// # Errors
+///
+/// Returns an error if the streaming pipeline fails to process the response
+/// body, or if the processed body exceeds the configured buffer cap.
+pub fn buffer_publisher_response(
+    publisher_response: PublisherResponse,
+    method: &Method,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            if !response_carries_body(method, response.status()) {
+                return Ok(response);
+            }
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = output.into_inner();
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(bytes.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(bytes);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+/// Returns `true` when a buffered publisher response should carry a body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) carry no body; rewriting
+/// their `Content-Length` to the (empty) buffered length would mislead clients
+/// and caches, so the origin metadata is preserved instead.
+fn response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
 /// Stream the publisher response body through the processing pipeline.
 ///
-/// Called by the adapter after `stream_to_client()` has committed the
-/// response headers. Writes processed chunks directly to `output`.
-///
-/// This is `async` because it uses `services.http_client().send(...).await` rather
-/// than the synchronous Fastly SDK `req.send()`. The only caller wraps the entire
-/// route handler in `block_on`, so behavior is equivalent — the change reflects the
-/// migration to the platform-agnostic HTTP client.
+/// Called by the adapter after `stream_to_client()` has committed the response
+/// headers. Writes processed chunks directly to `output`.
 ///
 /// # Errors
 ///
@@ -427,6 +500,51 @@ pub fn stream_publisher_body<W: Write>(
         integration_registry,
     };
     process_response_streaming(body, output, &borrowed)
+}
+
+/// A [`Write`] sink that buffers into a `Vec<u8>` but fails once the configured
+/// byte limit would be exceeded.
+///
+/// Used to bound in-WASM-heap buffering of decoded/re-written publisher bodies.
+/// A highly-compressible origin response can sit under the platform raw-body cap
+/// yet expand past a safe heap size after decode and post-processing; this writer
+/// turns that into a recoverable error instead of an out-of-memory abort.
+pub struct BoundedWriter {
+    inner: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedWriter {
+    /// Creates a writer that accepts at most `limit` bytes before erroring.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            inner: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Consumes the writer and returns the buffered bytes.
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl Write for BoundedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.inner.len() + buf.len() > self.limit {
+            return Err(std::io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Proxies requests to the publisher's origin server.
@@ -531,6 +649,7 @@ pub async fn handle_publisher_request(
             scheme: origin_scheme.clone(),
             host: origin_host_without_port.to_string(),
             port: parsed_origin.port(),
+            host_header_override: settings.publisher.origin_host_header_override.clone(),
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT,
         })
@@ -538,6 +657,7 @@ pub async fn handle_publisher_request(
             message: "backend registration failed".to_string(),
         })?;
     let origin_host = settings.publisher.origin_host();
+    let origin_host_header = settings.publisher.origin_host_header();
     let origin_path_and_query = req
         .uri()
         .path_and_query()
@@ -549,17 +669,20 @@ pub async fn handle_publisher_request(
             message: "invalid publisher origin uri".to_string(),
         })?;
 
-    log::debug!(
-        "Proxying to dynamic backend: {} (from {})",
-        backend_name,
-        settings.publisher.origin_url
-    );
+    log::debug!("Proxying request to configured publisher backend");
     // Only advertise encodings the rewrite pipeline can decode and re-encode.
     restrict_accept_encoding(&mut req);
+    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
+    // origin. On the EdgeZero path the entry point re-injects this header from
+    // trusted Fastly TLS metadata so in-process scheme detection
+    // (`RequestInfo::from_request`, computed above) works; the legacy path never
+    // sets it. Either way it is an internal edge signal that must not leak to
+    // publisher backends, matching legacy outbound-header behavior.
+    req.headers_mut().remove("fastly-ssl");
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
-        HeaderValue::from_str(&origin_host).change_context(TrustedServerError::Proxy {
+        HeaderValue::from_str(&origin_host_header).change_context(TrustedServerError::Proxy {
             message: "invalid publisher origin host header".to_string(),
         })?,
     );
@@ -573,10 +696,11 @@ pub async fn handle_publisher_request(
         })?
         .response;
 
-    log::debug!("Response headers:");
-    for (name, value) in response.headers() {
-        log::debug!("  {}: {:?}", name, value);
-    }
+    log::debug!(
+        "Publisher origin response received: status={}, header_count={}",
+        response.status(),
+        response.headers().len()
+    );
 
     // Set EC ID / cookie headers BEFORE body processing.
     // These are body-independent (computed from request cookies + consent).
@@ -636,15 +760,11 @@ pub async fn handle_publisher_request(
                     status,
                 );
             } else if !is_supported_content_encoding(&content_encoding) {
-                log::warn!(
-                    "Unsupported Content-Encoding '{}' - returning response unmodified",
-                    content_encoding,
-                );
+                log::warn!("Unsupported Content-Encoding; returning response unmodified");
             } else {
                 log::debug!(
-                    "Skipping response processing - Content-Type: '{}', request_host: '{}', status: {}",
+                    "Skipping response processing - Content-Type: '{}', status: {}",
                     content_type,
-                    request_host,
                     status,
                 );
             }
@@ -689,8 +809,9 @@ pub async fn handle_publisher_request(
                 content_type: &content_type,
                 integration_registry,
             };
-            let mut output = Vec::new();
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
             process_response_streaming(body, &mut output, &params)?;
+            let output = output.into_inner();
 
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
@@ -753,14 +874,14 @@ fn apply_ec_headers(
         }
         // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
         // characters. The header is still emitted when consent allows it.
-        crate::cookies::set_ec_cookie(settings, response, ec_id);
+        crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
         log::info!(
             "EC revoked for '{}': consent withdrawn (jurisdiction={})",
             cookie_ec_id,
             consent_context.jurisdiction,
         );
-        crate::cookies::expire_ec_cookie(settings, response);
+        crate::ec::cookies::expire_ec_cookie(settings, response);
         if settings.consent.consent_store.is_some() {
             crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
         }
@@ -791,6 +912,30 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build test request")
+    }
+
+    #[test]
+    fn response_carries_body_preserves_bodiless_metadata() {
+        // A processable GET 200 buffers a body and recomputes Content-Length.
+        assert!(
+            super::response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 publisher response should carry a buffered body"
+        );
+        // HEAD carries no body; recomputing Content-Length to 0 would mislead
+        // clients/caches about the GET representation length.
+        assert!(
+            !super::response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD publisher responses must not get a recomputed Content-Length"
+        );
+        // Bodiless statuses keep their metadata regardless of method.
+        assert!(
+            !super::response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must not get a recomputed Content-Length"
+        );
+        assert!(
+            !super::response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must not get a recomputed Content-Length"
+        );
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -1512,42 +1657,123 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn publisher_request_uses_platform_http_client_with_http_types() {
-        let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
-        let stub = Arc::new(StubHttpClient::new());
-        stub.push_response(200, b"origin response".to_vec());
-        let services = build_services_with_http_client(
-            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
-        );
-        let req = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://publisher.example/page")
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
+    #[test]
+    fn publisher_request_uses_platform_http_client_with_http_types() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
 
-        let pub_response = handle_publisher_request(&settings, &registry, &services, req)
-            .await
-            .expect("should proxy publisher request");
-        let response = match pub_response {
-            PublisherResponse::Buffered(r) => r,
-            PublisherResponse::PassThrough { mut response, body } => {
-                *response.body_mut() = body;
-                response
-            }
-            PublisherResponse::Stream { response, .. } => response,
-        };
+            let pub_response = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+            let response = match pub_response {
+                PublisherResponse::Buffered(r) => r,
+                PublisherResponse::PassThrough { mut response, body } => {
+                    *response.body_mut() = body;
+                    response
+                }
+                PublisherResponse::Stream { response, .. } => response,
+            };
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body_string(response), "origin response");
-        assert_eq!(
-            stub.recorded_backend_names(),
-            vec!["stub-backend".to_string()],
-            "should proxy through the platform http client"
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response), "origin response");
+            assert_eq!(
+                stub.recorded_backend_names(),
+                vec!["stub-backend".to_string()],
+                "should proxy through the platform http client"
+            );
+        });
+    }
+
+    #[test]
+    fn publisher_request_strips_fastly_ssl_before_forwarding() {
+        futures::executor::block_on(async {
+            // The EdgeZero entry point re-injects `fastly-ssl` from trusted TLS
+            // metadata so in-process scheme detection works. It must not leak to the
+            // origin: the legacy path never forwarded it.
+            let settings = create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .header("fastly-ssl", "1")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+
+            let recorded = stub.recorded_request_headers();
+            let outbound = recorded
+                .first()
+                .expect("should record one outbound request");
+            assert!(
+                !outbound
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("fastly-ssl")),
+                "internal fastly-ssl signal must not be forwarded to the origin, got: {outbound:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn publisher_request_sends_configured_host_header_override() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"origin response".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let _ = handle_publisher_request(&settings, &registry, &services, req)
+                .await
+                .expect("should proxy publisher request");
+
+            let recorded_headers = stub.recorded_request_headers();
+            let outbound_headers = recorded_headers
+                .first()
+                .expect("should record one outbound request");
+            let outbound_host = outbound_headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                .map(|(_, value)| value.as_str());
+
+            assert_eq!(
+                outbound_host,
+                Some("www.example.com"),
+                "should send configured host override to outbound request"
+            );
+        });
     }
 
     #[test]
@@ -1780,6 +2006,63 @@ mod tests {
         );
     }
 
+    /// `BufferedProcessed` must enforce `publisher.max_buffered_body_bytes` so a
+    /// post-processed HTML body whose decoded output exceeds the cap fails instead
+    /// of allocating past the limit. Regression for the `EdgeZero` buffering gap
+    /// where only the streaming-conversion path applied the cap.
+    #[test]
+    fn buffered_processed_enforces_max_buffered_body_bytes() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            // Register an HTML post-processor so the response routes to BufferedProcessed.
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should update nextjs config");
+            // Tiny cap so a modest HTML document exceeds it after processing.
+            settings.publisher.max_buffered_body_bytes = 64;
+
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            assert!(
+                registry.has_html_post_processors(),
+                "nextjs integration must register an HTML post-processor"
+            );
+
+            // Identity-encoded HTML well above the 64-byte cap once buffered.
+            let filler = "<p>padding</p>".repeat(64);
+            let html = format!("<html><body>{filler}</body></html>");
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                html.into_bytes(),
+                vec![("content-type", "text/html; charset=utf-8")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let result = handle_publisher_request(&settings, &registry, &services, req).await;
+
+            assert!(
+            result.is_err(),
+            "buffered-processed body exceeding max_buffered_body_bytes must error, not allocate past the cap"
+        );
+        });
+    }
+
     /// Document-state survives from the streaming pass into the post-processor.
     /// `NextJsRscPlaceholderRewriter` writes into `IntegrationDocumentState`
     /// during streaming; `NextJsHtmlPostProcessor` reads it and substitutes.
@@ -1834,6 +2117,41 @@ mod tests {
         assert!(
             !processed.contains("origin.example.com"),
             "origin host must not leak. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_accepts_writes_within_limit() {
+        let mut writer = BoundedWriter::new(10);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        writer
+            .write_all(b"67890")
+            .expect("should accept write up to exact limit");
+
+        assert_eq!(
+            writer.into_inner(),
+            b"1234567890",
+            "should preserve all written bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_writes_exceeding_limit() {
+        let mut writer = BoundedWriter::new(8);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        let err = writer
+            .write_all(b"6789")
+            .expect_err("should reject write that exceeds the limit");
+
+        assert!(
+            err.to_string().contains("maximum buffered size"),
+            "should report the buffer cap in the error message"
         );
     }
 }

@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
 use url::Url;
 
 use trusted_server_core::error::TrustedServerError;
+use trusted_server_core::host_header::validate_host_header_override_value;
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]
@@ -26,11 +27,24 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
 /// would generate URLs without the port when the Host header didn't include it.
 #[inline]
 fn compute_host_header(scheme: &str, host: &str, port: u16) -> String {
-    if port != default_port_for_scheme(scheme) {
-        format!("{}:{}", host, port)
+    if port == default_port_for_scheme(scheme) {
+        host.to_owned()
     } else {
-        host.to_string()
+        format!("{host}:{port}")
     }
+}
+
+fn sanitize_backend_name_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Default first-byte timeout for backends (15 seconds).
@@ -46,6 +60,7 @@ pub struct BackendConfig<'a> {
     port: Option<u16>,
     certificate_check: bool,
     first_byte_timeout: Duration,
+    host_header_override: Option<&'a str>,
 }
 
 impl<'a> BackendConfig<'a> {
@@ -61,6 +76,7 @@ impl<'a> BackendConfig<'a> {
             port: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            host_header_override: None,
         }
     }
 
@@ -90,6 +106,13 @@ impl<'a> BackendConfig<'a> {
         self
     }
 
+    /// Set the outbound Host header sent to the backend origin.
+    #[must_use]
+    pub fn host_header_override(mut self, host: Option<&'a str>) -> Self {
+        self.host_header_override = host;
+        self
+    }
+
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
     ///
@@ -101,18 +124,25 @@ impl<'a> BackendConfig<'a> {
     fn compute_name(&self) -> Result<(String, u16), Report<TrustedServerError>> {
         if self.host.is_empty() {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "missing host".to_string(),
+                message: "missing host".to_owned(),
             }));
         }
         if self.host.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "host contains control characters".to_string(),
+                message: "host contains control characters".to_owned(),
             }));
         }
         if self.scheme.chars().any(char::is_control) {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "scheme contains control characters".to_string(),
+                message: "scheme contains control characters".to_owned(),
             }));
+        }
+        if let Some(host_header_override) = self.host_header_override {
+            validate_host_header_override_value(host_header_override).map_err(|reason| {
+                Report::new(TrustedServerError::Proxy {
+                    message: format!("host header override {reason}"),
+                })
+            })?;
         }
 
         let target_port = self
@@ -120,6 +150,10 @@ impl<'a> BackendConfig<'a> {
             .unwrap_or_else(|| default_port_for_scheme(self.scheme));
 
         let name_base = format!("{}_{}_{}", self.scheme, self.host, target_port);
+        let host_override_suffix = self
+            .host_header_override
+            .map(|host| format!("_oh_{}", sanitize_backend_name_component(host)))
+            .unwrap_or_default();
         let cert_suffix = if self.certificate_check {
             ""
         } else {
@@ -127,8 +161,9 @@ impl<'a> BackendConfig<'a> {
         };
         let timeout_ms = self.first_byte_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}_t{}",
-            name_base.replace(['.', ':'], "_"),
+            "backend_{}{}{}_t{}",
+            sanitize_backend_name_component(&name_base),
+            host_override_suffix,
             cert_suffix,
             timeout_ms
         );
@@ -138,7 +173,7 @@ impl<'a> BackendConfig<'a> {
 
     /// Return the deterministic backend name without registering anything.
     ///
-    /// Convenience wrapper over [`Self::compute_name`] that discards the
+    /// Convenience wrapper over `Self::compute_name` that discards the
     /// resolved port, used by [`crate::platform::PlatformBackend`]
     /// implementations that only need the name for correlation.
     ///
@@ -165,7 +200,10 @@ impl<'a> BackendConfig<'a> {
 
         let host_with_port = format!("{}:{}", self.host, target_port);
 
-        let host_header = compute_host_header(self.scheme, self.host, target_port);
+        let host_header = self.host_header_override.map_or_else(
+            || compute_host_header(self.scheme, self.host, target_port),
+            str::to_owned,
+        );
 
         // Target base is host[:port]; SSL is enabled only for https scheme
         let mut builder = Backend::builder(&backend_name, &host_with_port)
@@ -176,38 +214,27 @@ impl<'a> BackendConfig<'a> {
         if self.scheme.eq_ignore_ascii_case("https") {
             builder = builder.enable_ssl().sni_hostname(self.host);
             if self.certificate_check {
-                builder = builder
-                    .enable_ssl()
-                    .sni_hostname(self.host)
-                    .check_certificate(self.host);
+                builder = builder.check_certificate(self.host);
             } else {
-                log::warn!(
-                    "INSECURE: certificate check disabled for backend: {}",
-                    backend_name
-                );
+                log::warn!("INSECURE: certificate check disabled for backend: {backend_name}");
             }
-            log::info!("enable ssl for backend: {}", backend_name);
+            log::info!("enable ssl for backend: {backend_name}");
         }
 
         match builder.finish() {
             Ok(_) => {
-                log::info!(
-                    "created dynamic backend: {} -> {}",
-                    backend_name,
-                    host_with_port
-                );
+                log::info!("created dynamic backend: {backend_name} -> {host_with_port}");
                 Ok(backend_name)
             }
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("NameInUse") || msg.contains("already in use") {
-                    log::info!("reusing existing dynamic backend: {}", backend_name);
+                    log::info!("reusing existing dynamic backend: {backend_name}");
                     Ok(backend_name)
                 } else {
                     Err(Report::new(TrustedServerError::Proxy {
                         message: format!(
-                            "dynamic backend creation failed ({} -> {}): {}",
-                            backend_name, host_with_port, msg
+                            "dynamic backend creation failed ({backend_name} -> {host_with_port}): {msg}"
                         ),
                     }))
                 }
@@ -224,7 +251,7 @@ impl<'a> BackendConfig<'a> {
         origin_url: &str,
     ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
         let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {}", origin_url),
+            message: format!("Invalid origin_url: {origin_url}"),
         })?;
 
         let scheme = parsed_url.scheme().to_owned();
@@ -232,7 +259,7 @@ impl<'a> BackendConfig<'a> {
             .host_str()
             .ok_or_else(|| {
                 Report::new(TrustedServerError::Proxy {
-                    message: "Missing host in origin_url".to_string(),
+                    message: "Missing host in origin_url".to_owned(),
                 })
             })?
             .to_owned();
@@ -278,12 +305,27 @@ impl<'a> BackendConfig<'a> {
         certificate_check: bool,
         first_byte_timeout: Duration,
     ) -> Result<String, Report<TrustedServerError>> {
+        Self::from_url_with_first_byte_timeout_and_host_header_override(
+            origin_url,
+            certificate_check,
+            first_byte_timeout,
+            None,
+        )
+    }
+
+    fn from_url_with_first_byte_timeout_and_host_header_override(
+        origin_url: &str,
+        certificate_check: bool,
+        first_byte_timeout: Duration,
+        host_header_override: Option<&str>,
+    ) -> Result<String, Report<TrustedServerError>> {
         let (scheme, host, port) = Self::parse_origin(origin_url)?;
 
         BackendConfig::new(&scheme, &host)
             .port(port)
             .certificate_check(certificate_check)
             .first_byte_timeout(first_byte_timeout)
+            .host_header_override(host_header_override)
             .ensure()
     }
 }
@@ -406,11 +448,70 @@ mod tests {
     }
 
     #[test]
+    fn host_header_overrides_produce_different_names() {
+        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("www.example.com"))
+            .compute_name()
+            .expect("should compute name with host header override");
+        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("m.example.com"))
+            .compute_name()
+            .expect("should compute name with different host header override");
+
+        assert_ne!(
+            name_a, name_b,
+            "backends with different host header overrides should have different names"
+        );
+        assert_eq!(
+            name_a,
+            "backend_https_origin_example_com_443_oh_www_example_com_t15000"
+        );
+        assert_eq!(
+            name_b,
+            "backend_https_origin_example_com_443_oh_m_example_com_t15000"
+        );
+    }
+
+    #[test]
+    fn host_header_override_rejects_control_characters() {
+        let err = BackendConfig::new("https", "origin.example.com")
+            .host_header_override(Some("www\n.example.com"))
+            .predict_name()
+            .expect_err("should reject host header override containing newline");
+
+        assert!(
+            err.to_string().contains("control characters"),
+            "should report control characters in error message"
+        );
+    }
+
+    #[test]
+    fn host_header_override_rejects_invalid_values() {
+        for host_header_override in [
+            "https://www.example.com",
+            "www.example.com/path",
+            "www.example.com:",
+            "example..com",
+            "-",
+        ] {
+            let err = BackendConfig::new("https", "origin.example.com")
+                .host_header_override(Some(host_header_override))
+                .predict_name()
+                .expect_err("should reject invalid host header override");
+
+            assert!(
+                err.to_string().contains("host header override"),
+                "should report host header override error for {host_header_override:?}"
+            );
+        }
+    }
+
+    #[test]
     fn different_timeouts_produce_different_names() {
         use std::time::Duration;
 
         let (name_a, _) = BackendConfig::new("https", "origin.example.com")
-            .first_byte_timeout(Duration::from_millis(2000))
+            .first_byte_timeout(Duration::from_secs(2))
             .compute_name()
             .expect("should compute name with 2000ms timeout");
         let (name_b, _) = BackendConfig::new("https", "origin.example.com")

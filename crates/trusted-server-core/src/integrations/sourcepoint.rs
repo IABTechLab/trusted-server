@@ -33,10 +33,10 @@ use validator::{Validate, ValidationError};
 
 use crate::error::TrustedServerError;
 use crate::integrations::{
-    collect_body_bounded, ensure_integration_backend, AttributeRewriteAction,
-    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration,
-    INTEGRATION_MAX_BODY_BYTES,
+    collect_body_bounded, collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationProxy,
+    IntegrationRegistration, INTEGRATION_MAX_BODY_BYTES,
 };
 use crate::platform::{PlatformHttpRequest, RuntimeServices};
 use crate::settings::{IntegrationConfig, Settings};
@@ -578,7 +578,7 @@ fn parse_sourcepoint_url(url: &str) -> Option<Url> {
     }
 
     // Keep in sync with JS normalization in:
-    // crates/js/lib/src/integrations/sourcepoint/script_guard.ts
+    // crates/trusted-server-js/lib/src/integrations/sourcepoint/script_guard.ts
     // (protocol-relative + bare-domain handling + host-validation behavior).
     let normalized = if trimmed.starts_with("//") {
         format!("https:{trimmed}")
@@ -729,6 +729,7 @@ impl IntegrationProxy for SourcepointIntegration {
             services,
             &self.config.cdn_origin,
             SOURCEPOINT_INTEGRATION_ID,
+            None,
         )?;
 
         let mut response = services
@@ -805,15 +806,12 @@ impl IntegrationProxy for SourcepointIntegration {
             }
 
             let (resp_parts, resp_body) = response.into_parts();
-            let body_bytes = match resp_body {
-                EdgeBody::Once(b) => b.to_vec(),
-                EdgeBody::Stream(_) => {
-                    log::warn!("Sourcepoint: streaming response body, skipping rewrite");
-                    let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
-                    self.apply_cache_headers(&mut response, forwarded_cookies);
-                    return Ok(response);
-                }
-            };
+            let body_bytes = collect_response_bounded(
+                resp_body,
+                MAX_REWRITE_BODY_SIZE as usize,
+                SOURCEPOINT_INTEGRATION_ID,
+            )
+            .await?;
             let mut response = http::Response::from_parts(resp_parts, EdgeBody::empty());
 
             let body = match String::from_utf8(body_bytes) {
@@ -1140,9 +1138,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(config(true)));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.prospecta.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.prospecta.com",
             document_state: &document_state,
         };
 
@@ -1203,9 +1201,9 @@ mod tests {
         let integration = SourcepointIntegration::new(Arc::new(cfg));
         let document_state = IntegrationDocumentState::default();
         let ctx = IntegrationHtmlContext {
-            request_host: "ts.autoblog.com",
+            request_host: "ts.prospecta.com",
             request_scheme: "https",
-            origin_host: "origin.autoblog.com",
+            origin_host: "origin.prospecta.com",
             document_state: &document_state,
         };
 

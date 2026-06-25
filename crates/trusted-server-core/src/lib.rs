@@ -12,13 +12,12 @@
 //! - [`consent`]: Consent signal extraction and logging
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`models`]: Data models for ad serving and callbacks
-//! - [`prebid`]: Prebid integration and real-time bidding support
-//! - [`privacy`]: Privacy utilities and helpers
+//! - [`integrations::prebid`]: Prebid integration and real-time bidding support
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses
-//! - [`edge_cookie`]: Edge Cookie (EC) ID generation using HMAC
+//! - [`ec`]: Edge Cookie (EC) identity subsystem — ID generation, consent gating, lifecycle
 //! - [`test_support`]: Testing utilities and mocks
-//! - [`why`]: Debugging and introspection utilities
+//! - [`tester_cookie`]: Optional tester-cookie endpoint helpers
 
 #![cfg_attr(
     test,
@@ -28,9 +27,11 @@
         clippy::panic,
         clippy::dbg_macro,
         clippy::unwrap_used,
+        reason = "tests use direct diagnostics and panic-on-failure helpers"
     )
 )]
 
+pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
@@ -39,9 +40,11 @@ pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
-pub mod edge_cookie;
+pub mod ec;
+pub(crate) mod edge_cookie;
 pub mod error;
 pub mod geo;
+pub mod host_header;
 pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
@@ -54,12 +57,14 @@ pub mod publisher;
 pub mod redacted;
 pub mod request_signing;
 pub mod rsc_flight;
+pub(crate) mod s3_sigv4;
 pub mod settings;
 pub mod settings_data;
 pub mod storage;
 pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
+pub mod tester_cookie;
 pub mod tsjs;
 
 #[cfg(test)]

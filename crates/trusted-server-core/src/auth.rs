@@ -34,9 +34,8 @@ pub fn enforce_basic_auth(
         return Ok(None);
     };
 
-    let (username, password) = match extract_credentials(req) {
-        Some(credentials) => credentials,
-        None => return Ok(Some(unauthorized_response())),
+    let Some((username, password)) = extract_credentials(req) else {
+        return Ok(Some(unauthorized_response()));
     };
 
     // Hash before comparing to normalise lengths — `ct_eq` on raw byte slices
@@ -80,8 +79,8 @@ fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String)> {
     let credentials = String::from_utf8(decoded).ok()?;
 
     let mut credentials_parts = credentials.splitn(2, ':');
-    let username = credentials_parts.next()?.to_string();
-    let password = credentials_parts.next()?.to_string();
+    let username = credentials_parts.next()?.to_owned();
+    let password = credentials_parts.next()?.to_owned();
 
     Some((username, password))
 }
@@ -230,7 +229,7 @@ mod tests {
     #[test]
     fn allow_admin_path_with_valid_credentials() {
         let settings = create_test_settings();
-        let mut req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = build_request(Method::POST, "https://example.com/_ts/admin/keys/rotate");
         let token = STANDARD.encode("admin:admin-pass");
         set_authorization(&mut req, &format!("Basic {token}"));
 
@@ -245,7 +244,7 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_wrong_credentials() {
         let settings = create_test_settings();
-        let mut req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
+        let mut req = build_request(Method::POST, "https://example.com/_ts/admin/keys/rotate");
         let token = STANDARD.encode("admin:wrong");
         set_authorization(&mut req, &format!("Basic {token}"));
 
@@ -258,7 +257,7 @@ mod tests {
     #[test]
     fn challenge_admin_path_with_missing_credentials() {
         let settings = create_test_settings();
-        let req = build_request(Method::POST, "https://example.com/admin/keys/rotate");
+        let req = build_request(Method::POST, "https://example.com/_ts/admin/keys/rotate");
 
         let response = enforce_basic_auth(&settings, &req)
             .expect("should evaluate auth")

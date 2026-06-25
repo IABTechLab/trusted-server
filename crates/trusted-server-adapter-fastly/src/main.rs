@@ -1,34 +1,43 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::FastlyConfigStore;
+use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
 use edgezero_core::app::Hooks as _;
-use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::http::{header, HeaderValue, Response as HttpResponse};
+use edgezero_core::http::{Request as HttpRequest, Response as HttpResponse};
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::kv::KvIdentityGraph;
+use trusted_server_core::ec::pull_sync::{
+    build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
+};
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::integrations::IntegrationRegistry;
+use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
-use trusted_server_core::publisher::{stream_publisher_body, PublisherResponse};
+use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::proxy::AssetProxyCachePolicy;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
 
 mod app;
 mod backend;
 mod compat;
+mod ec_kv;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+mod rate_limiter;
 
 use crate::app::TrustedServerApp;
-use crate::middleware::{apply_finalize_headers, HEADER_X_TS_FINALIZED};
-use crate::platform::FastlyPlatformGeo;
+use crate::ec_kv::FastlyEcKvStore;
+use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
+use crate::platform::{client_info_from_request, FastlyPlatformGeo};
+use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 
@@ -71,6 +80,27 @@ fn main() {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest) {
+    // Short-circuit the JA4 debug probe before app construction. Must run here
+    // because TLS/JA4 accessors are only available on FastlyRequest before
+    // conversion to edgezero types.
+    if req.get_method() == FastlyMethod::GET && req.get_path() == "/_ts/debug/ja4" {
+        match get_settings() {
+            Ok(settings) if settings.debug.ja4_endpoint_enabled => {
+                build_ja4_debug_response(&req).send_to_client();
+            }
+            Ok(_) => {
+                FastlyResponse::from_status(fastly::http::StatusCode::NOT_FOUND).send_to_client();
+            }
+            Err(e) => {
+                log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
+                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_body_text_plain("Internal Server Error")
+                    .send_to_client();
+            }
+        }
+        return;
+    }
+
     let config_store = match open_trusted_server_config_store() {
         Ok(cs) => cs,
         Err(e) => {
@@ -87,32 +117,77 @@ fn edgezero_main(mut req: FastlyRequest) {
     // Strip client-spoofable forwarded headers before dispatch.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
+    // Re-inject a trusted TLS scheme signal after sanitization has stripped any
+    // client-sent fastly-ssl header. Setting it from Fastly's native TLS
+    // metadata here is authoritative. detect_request_scheme in http_util checks
+    // this header so scheme-sensitive logic produces https URLs on HTTPS traffic.
+    if req.get_tls_protocol().ok().flatten().is_some()
+        || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+    {
+        req.set_header("fastly-ssl", "1");
+    }
+
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
 
-    // `dispatch_with_config_handle` skips logger initialisation and injects
-    // the config store directly (init_logger already called in main()).
-    let mut response =
-        match edgezero_adapter_fastly::dispatch_with_config_handle(&app, req, config_store) {
-            Ok(response) => compat::from_fastly_response(response),
-            Err(e) => {
-                log::error!("EdgeZero dispatch failed: {e}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
-                return;
-            }
-        };
+    // Strip any client-supplied x-ts-tls-* headers before injecting the trusted
+    // values from the Fastly SDK. Must run after sanitize_fastly_forwarded_headers.
+    req.remove_header("x-ts-tls-protocol");
+    req.remove_header("x-ts-tls-cipher");
+    if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
+        req.set_header("x-ts-tls-protocol", proto);
+    }
+    if let Some(cipher) = req
+        .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
+        .map(str::to_owned)
+    {
+        req.set_header("x-ts-tls-cipher", cipher);
+    }
 
-    if !response_was_finalized_by_middleware(&mut response) {
+    // Capture metadata from the original FastlyRequest before conversion. These
+    // accessors only return real values on the client request, so store them in
+    // request extensions for build_per_request_services and EC bot classification.
+    let client_info = client_info_from_request(&req);
+    let device_signals = derive_device_signals(&req);
+
+    // Dispatch directly through the EdgeZero router without an intermediate
+    // fastly::Response conversion. That preserves duplicate header values such
+    // as multiple Set-Cookie headers.
+    let mut response = match into_core_request(req) {
+        Ok(mut core_req) => {
+            core_req.extensions_mut().insert(config_store);
+            core_req.extensions_mut().insert(device_signals);
+            core_req.extensions_mut().insert(client_info);
+            futures::executor::block_on(app.router().oneshot(core_req))
+        }
+        Err(e) => {
+            log::error!("EdgeZero request conversion failed: {e}");
+            FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_body_text_plain("Internal Server Error")
+                .send_to_client();
+            return;
+        }
+    };
+
+    // Pop response extensions before the Fastly conversion, which drops them.
+    let ec_state = response
+        .extensions_mut()
+        .remove::<crate::app::EcFinalizeState>();
+    let asset_cache_policy = response.extensions_mut().remove::<AssetProxyCachePolicy>();
+    let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
+
+    if !take_finalize_sentinel(&mut response) {
         match get_settings() {
             Ok(settings) => {
-                apply_entry_point_finalize(&settings, client_ip, &mut response, |client_ip| {
+                let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
                     FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
                         log::warn!("entry-point geo lookup failed: {e}");
                         None
                     })
-                })
+                });
+                apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
             }
             Err(e) => {
                 log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
@@ -120,64 +195,217 @@ fn edgezero_main(mut req: FastlyRequest) {
         }
     }
 
+    if let Some(policy) = asset_cache_policy {
+        policy.apply_after_route_finalization(&mut response);
+    }
+
+    if let Some(ec_state) = ec_state {
+        match get_settings() {
+            Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
+                Ok(partner_registry) => {
+                    let finalize_kv_graph = if ec_state.use_finalize_kv {
+                        maybe_identity_graph(&settings)
+                    } else {
+                        None
+                    };
+                    ec_finalize_response(
+                        &settings,
+                        &ec_state.ec_context,
+                        finalize_kv_graph.as_ref(),
+                        &partner_registry,
+                        ec_state.eids_cookie.as_deref(),
+                        ec_state.sharedid_cookie.as_deref(),
+                        &mut response,
+                    );
+                    if let Some(effects) = &request_filter_effects {
+                        effects.apply_to_response(&mut response);
+                    }
+                    compat::to_fastly_response(response).send_to_client();
+
+                    if ec_state.is_real_browser {
+                        if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
+                            run_pull_sync_after_send(
+                                &settings,
+                                &partner_registry,
+                                &context,
+                                &ec_state.services,
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(e) => {
+                    log::error!(
+                        "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
+                    );
+                }
+            },
+            Err(e) => {
+                log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
+            }
+        }
+    }
+
+    if let Some(effects) = &request_filter_effects {
+        effects.apply_to_response(&mut response);
+    }
     compat::to_fastly_response(response).send_to_client();
 }
 
-fn response_was_finalized_by_middleware(response: &mut HttpResponse) -> bool {
+fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
     response
         .headers_mut()
         .remove(HEADER_X_TS_FINALIZED)
         .is_some()
 }
 
-fn apply_entry_point_finalize<F>(
-    settings: &Settings,
-    client_ip: Option<IpAddr>,
-    response: &mut HttpResponse,
-    lookup_geo: F,
-) where
-    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
-{
-    let geo_info = if response.status() == edgezero_core::http::StatusCode::UNAUTHORIZED {
-        None
-    } else {
-        lookup_geo(client_ip)
-    };
-    apply_finalize_headers(settings, geo_info.as_ref(), response);
+const FALLBACK_UNAVAILABLE: &str = "unavailable";
+const FALLBACK_NOT_SENT: &str = "not sent";
+const FALLBACK_NONE: &str = "none";
+
+// TODO: remove after JA4 evaluation completes - see #645
+fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
+    let ja4 = req.get_tls_ja4().unwrap_or(FALLBACK_UNAVAILABLE);
+    let h2 = req
+        .get_client_h2_fingerprint()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let cipher = req
+        .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req
+        .get_tls_protocol()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
+    let ch_mobile = req
+        .get_header_str("sec-ch-ua-mobile")
+        .unwrap_or(FALLBACK_NOT_SENT);
+    let ch_platform = req
+        .get_header_str("sec-ch-ua-platform")
+        .unwrap_or(FALLBACK_NOT_SENT);
+
+    let body = format!(
+        "ja4:         {ja4}\n\
+         h2_fp:       {h2}\n\
+         cipher:      {cipher}\n\
+         tls_version: {tls_version}\n\
+         user-agent:  {ua}\n\
+         ch-mobile:   {ch_mobile}\n\
+         ch-platform: {ch_platform}\n"
+    );
+
+    FastlyResponse::from_status(fastly::http::StatusCode::OK)
+        .with_header(fastly::http::header::CACHE_CONTROL, "no-store, private")
+        .with_header(
+            fastly::http::header::VARY,
+            "User-Agent, Sec-CH-UA-Mobile, Sec-CH-UA-Platform",
+        )
+        .with_content_type(fastly::mime::TEXT_PLAIN_UTF_8)
+        .with_body(body)
 }
 
-pub(crate) fn resolve_publisher_response_buffered(
-    publisher_response: PublisherResponse,
+pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
+    settings
+        .ec
+        .ec_store
+        .as_ref()
+        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+}
+
+fn run_pull_sync_after_send(
     settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            let mut output = Vec::new();
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(output.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(output);
-            Ok(response)
+    partner_registry: &PartnerRegistry,
+    context: &PullSyncContext,
+    services: &RuntimeServices,
+) {
+    let kv = match require_identity_graph(settings) {
+        Ok(kv) => kv,
+        Err(err) => {
+            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
+            return;
         }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
+    };
+
+    let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
+    dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context, services);
+}
+
+/// Constructs a `KvIdentityGraph` from settings, or returns an error if the
+/// `ec_store` config is not set.
+pub(crate) fn require_identity_graph(
+    settings: &Settings,
+) -> Result<KvIdentityGraph, Report<TrustedServerError>> {
+    let store_name = settings.ec.ec_store.as_deref().ok_or_else(|| {
+        Report::new(TrustedServerError::KvStore {
+            store_name: "ec.ec_store".to_owned(),
+            message: "ec.ec_store is not configured".to_owned(),
+        })
+    })?;
+    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
+}
+
+/// Extracts a named cookie value from the request's `Cookie` header.
+pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<String> {
+    let cookie_header = req.headers().get("cookie").and_then(|v| v.to_str().ok())?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some((key, value)) = pair.split_once('=') {
+            if key.trim() == name {
+                return Some(value.trim().to_owned());
+            }
         }
     }
+    None
+}
+
+/// Derives device signals from TLS, H2, and UA request data.
+///
+/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
+/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
+pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
+    let ua = req.get_header_str("user-agent").unwrap_or("");
+    let ja4 = req.get_tls_ja4();
+    let h2_fp = req.get_client_h2_fingerprint();
+
+    DeviceSignals::derive(ua, ja4, h2_fp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder;
+    use edgezero_core::http::HeaderValue;
+    use fastly::mime;
+
+    fn test_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse test settings")
+    }
 
     #[test]
     fn health_response_short_circuits_get_health() {
@@ -208,14 +436,14 @@ mod tests {
     }
 
     #[test]
-    fn response_was_finalized_by_middleware_strips_sentinel() {
+    fn take_finalize_sentinel_strips_sentinel() {
         let mut response = HttpResponse::new(EdgeBody::empty());
         response
             .headers_mut()
             .insert("x-ts-finalized", HeaderValue::from_static("1"));
 
         assert!(
-            response_was_finalized_by_middleware(&mut response),
+            take_finalize_sentinel(&mut response),
             "should detect middleware-finalized responses"
         );
         assert!(
@@ -227,15 +455,16 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn entry_point_finalize_skips_geo_lookup_for_401() {
-        let settings = get_settings().expect("should load settings");
+        let settings = test_settings();
         let mut response = response_builder()
             .status(edgezero_core::http::StatusCode::UNAUTHORIZED)
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        apply_entry_point_finalize(&settings, None, &mut response, |_| {
+        let geo_info = resolve_geo_for_response(&response, None, |_| {
             panic!("should skip entry-point geo lookup for 401 responses");
         });
+        apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
 
         assert_eq!(
             response
@@ -244,6 +473,60 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("false"),
             "401 responses should still carry geo-unavailable headers"
+        );
+    }
+
+    #[test]
+    fn ja4_debug_response_uses_plain_text_and_fallback_values() {
+        let req = FastlyRequest::get("https://example.com/_ts/debug/ja4");
+
+        let mut response = build_ja4_debug_response(&req);
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::OK,
+            "should return 200 OK"
+        );
+        assert_eq!(
+            response.get_content_type(),
+            Some(mime::TEXT_PLAIN_UTF_8),
+            "should return plain text content"
+        );
+        assert_eq!(
+            response.get_header_str(fastly::http::header::CACHE_CONTROL),
+            Some("no-store, private"),
+            "should disable caching for the debug response"
+        );
+
+        let body = response.take_body_str();
+
+        assert!(
+            body.contains("ja4:         unavailable"),
+            "should include JA4 fallback"
+        );
+        assert!(
+            body.contains("h2_fp:       unavailable"),
+            "should include H2 fingerprint fallback"
+        );
+        assert!(
+            body.contains("cipher:      unavailable"),
+            "should include cipher fallback"
+        );
+        assert!(
+            body.contains("tls_version: unavailable"),
+            "should include TLS version fallback"
+        );
+        assert!(
+            body.contains("user-agent:  none"),
+            "should include user-agent fallback"
+        );
+        assert!(
+            body.contains("ch-mobile:   not sent"),
+            "should include sec-ch-ua-mobile fallback"
+        );
+        assert!(
+            body.contains("ch-platform: not sent"),
+            "should include sec-ch-ua-platform fallback"
         );
     }
 }

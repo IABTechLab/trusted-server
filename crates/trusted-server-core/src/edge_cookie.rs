@@ -3,70 +3,29 @@
 //! This module provides functionality for generating privacy-preserving EC IDs
 //! based on the client IP address and a secret key.
 
-use std::net::IpAddr;
-
 use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt};
-use hmac::{Hmac, Mac};
+use error_stack::Report;
 use http::Request;
-use rand::Rng;
-use sha2::Sha256;
 
 use crate::constants::{COOKIE_TS_EC, HEADER_X_TS_EC};
-use crate::cookies::{ec_id_has_only_allowed_chars, handle_request_cookies};
+use crate::cookies::handle_request_cookies;
+use crate::ec::cookies::ec_id_has_only_allowed_chars;
+use crate::ec::generation::{generate_ec_id as generate_canonical_ec_id, normalize_ip};
 use crate::error::TrustedServerError;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
-type HmacSha256 = Hmac<Sha256>;
-
-const ALPHANUMERIC_CHARSET: &[u8] =
-    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-/// Normalizes an IP address for stable EC ID generation.
-///
-/// For IPv6 addresses, masks to /64 prefix to handle Privacy Extensions
-/// where devices rotate their interface identifier (lower 64 bits).
-/// IPv4 addresses are returned unchanged.
-fn normalize_ip(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(ipv4) => ipv4.to_string(),
-        IpAddr::V6(ipv6) => {
-            let segments = ipv6.segments();
-            // Keep only the first 4 segments (64 bits) for /64 prefix
-            format!(
-                "{:x}:{:x}:{:x}:{:x}::",
-                segments[0], segments[1], segments[2], segments[3]
-            )
-        }
-    }
-}
-
-/// Generates a random alphanumeric string of the specified length.
-fn generate_random_suffix(length: usize) -> String {
-    let mut rng = rand::thread_rng();
-    (0..length)
-        .map(|_| {
-            let idx = rng.gen_range(0..ALPHANUMERIC_CHARSET.len());
-            ALPHANUMERIC_CHARSET[idx] as char
-        })
-        .collect()
-}
-
 /// Generates a fresh EC ID based on client IP address.
 ///
-/// Uses only the client IP (not user-agent or other headers) intentionally:
-/// EC IDs are meant to be simple, privacy-preserving identifiers — not
-/// high-entropy fingerprints. The random suffix provides per-cookie
-/// uniqueness for users behind the same NAT/proxy.
-///
-/// Creates an HMAC-SHA256-based ID using the configured secret key and
-/// the client IP address, then appends a random suffix for additional
-/// uniqueness. The resulting format is `{64hex}.{6alnum}`.
+/// Delegates to the canonical generator in [`crate::ec::generation`] so a
+/// single normalization + HMAC path produces EC IDs. The canonical
+/// `normalize_ip` format is a stable contract — EC hashes stored in KV
+/// depend on it, and a divergent normalization would mint non-correlating
+/// identities for the same client.
 ///
 /// # Errors
 ///
-/// - [`TrustedServerError::Ec`] if HMAC generation fails
+/// - [`TrustedServerError::EdgeCookie`] if HMAC generation fails
 pub fn generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
@@ -79,22 +38,9 @@ pub fn generate_ec_id(
         .map(normalize_ip)
         .unwrap_or_else(|| "unknown".to_string());
 
-    log::trace!("Input for fresh EC ID: client_ip={}", client_ip);
+    log::trace!("Generating fresh EC ID from normalized client context");
 
-    let mut mac = HmacSha256::new_from_slice(settings.edge_cookie.secret_key.expose().as_bytes())
-        .change_context(TrustedServerError::Ec {
-        message: "Failed to create HMAC instance".to_string(),
-    })?;
-    mac.update(client_ip.as_bytes());
-    let hmac_hash = hex::encode(mac.finalize().into_bytes());
-
-    // Append random 6-character alphanumeric suffix for additional uniqueness
-    let random_suffix = generate_random_suffix(6);
-    let ec_id = format!("{hmac_hash}.{random_suffix}");
-
-    log::trace!("Generated fresh EC ID: {}", ec_id);
-
-    Ok(ec_id)
+    generate_canonical_ec_id(settings, &client_ip)
 }
 
 /// Gets an existing EC ID from the request.
@@ -115,7 +61,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
         .and_then(|h| h.to_str().ok())
     {
         if ec_id_has_only_allowed_chars(ec_id) {
-            log::trace!("Using existing EC ID from header: {}", ec_id);
+            log::trace!("Using existing EC ID from header");
             return Ok(Some(ec_id.to_string()));
         }
         log::warn!("Rejected EC ID from x-ts-ec header with disallowed characters");
@@ -126,7 +72,7 @@ pub fn get_ec_id(req: &Request<EdgeBody>) -> Result<Option<String>, Report<Trust
             if let Some(cookie) = jar.get(COOKIE_TS_EC) {
                 let value = cookie.value();
                 if ec_id_has_only_allowed_chars(value) {
-                    log::trace!("Using existing EC ID from cookie: {}", value);
+                    log::trace!("Using existing EC ID from cookie");
                     return Ok(Some(value.to_string()));
                 }
                 log::warn!("Rejected EC ID from cookie with disallowed characters");
@@ -162,7 +108,7 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
 
     // If no existing EC ID found, generate a fresh one
     let ec_id = generate_ec_id(settings, services)?;
-    log::trace!("No existing EC ID, generated: {}", ec_id);
+    log::trace!("No existing EC ID found; generated a fresh EC ID");
     Ok(ec_id)
 }
 
@@ -171,6 +117,7 @@ pub(crate) fn get_or_generate_ec_id_from_http_request(
 /// # Errors
 ///
 /// Returns an error if ID generation fails.
+#[cfg(test)]
 pub fn get_or_generate_ec_id(
     settings: &Settings,
     services: &RuntimeServices,
@@ -184,39 +131,32 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body as EdgeBody;
     use http::{header, HeaderName};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::platform::test_support::{noop_services, noop_services_with_client_ip};
     use crate::test_support::tests::create_test_settings;
 
     #[test]
-    fn test_normalize_ip_ipv4_unchanged() {
-        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
-        assert_eq!(normalize_ip(ipv4), "192.168.1.100");
-    }
-
-    #[test]
-    fn test_normalize_ip_ipv6_masks_to_64() {
-        // Full IPv6 address with interface identifier
-        let ipv6 = IpAddr::V6(Ipv6Addr::new(
+    fn test_generate_ec_id_matches_canonical_generator_for_ipv6() {
+        // Regression guard: this module must hash the same normalized IP as
+        // the canonical generator in ec::generation. A divergent IPv6 /64
+        // normalization would mint non-correlating identity prefixes for the
+        // same client depending on which path generated the ID.
+        let settings = create_test_settings();
+        let ip = IpAddr::V6(Ipv6Addr::new(
             0x2001, 0x0db8, 0x85a3, 0x0000, 0x8a2e, 0x0370, 0x7334, 0x1234,
         ));
-        assert_eq!(normalize_ip(ipv6), "2001:db8:85a3:0::");
-    }
 
-    #[test]
-    fn test_normalize_ip_ipv6_different_suffix_same_prefix() {
-        // Two IPv6 addresses with same /64 prefix but different interface identifiers
-        // (simulating Privacy Extensions rotation)
-        let ipv6_a = IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0db8, 0xabcd, 0x0001, 0x1111, 0x2222, 0x3333, 0x4444,
-        ));
-        let ipv6_b = IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0db8, 0xabcd, 0x0001, 0xaaaa, 0xbbbb, 0xcccc, 0xdddd,
-        ));
-        // Both should normalize to the same /64 prefix
-        assert_eq!(normalize_ip(ipv6_a), normalize_ip(ipv6_b));
-        assert_eq!(normalize_ip(ipv6_a), "2001:db8:abcd:1::");
+        let id_here = generate_ec_id(&settings, &noop_services_with_client_ip(ip))
+            .expect("should generate EC ID via edge_cookie");
+        let id_canonical = generate_canonical_ec_id(&settings, &normalize_ip(ip))
+            .expect("should generate EC ID via canonical generator");
+
+        assert_eq!(
+            crate::ec::ec_hash(&id_here),
+            crate::ec::ec_hash(&id_canonical),
+            "should produce the same identity hash prefix as the canonical generator"
+        );
     }
 
     fn create_test_request(headers: &[(HeaderName, &str)]) -> Request<EdgeBody> {

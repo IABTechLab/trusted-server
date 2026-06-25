@@ -25,8 +25,6 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        # The pin matters because upstream Viceroy v0.17+ has bumped MSRV
-        # beyond the rustc pin in `rust-toolchain.toml`.
         run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
@@ -46,7 +44,7 @@ jobs:
 
       - name: Install Viceroy
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/fastly/Viceroy --tag v${{ steps.viceroy-version.outputs.viceroy-version }} viceroy
+        run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
       - name: Run tests
         run: cargo test-fastly
@@ -66,6 +64,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          # wasm32-wasip1 is required by the "Verify Fastly WASM release
+          # build" step below; the axum build and tests are native.
+          target: wasm32-wasip1
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Build Axum adapter
@@ -77,6 +78,14 @@ jobs:
       - name: Run HTML processor benchmarks (smoke)
         # -- --test runs each benchmark as a regular test (no timing harness) so CI stays fast
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
+
+      - name: Verify Fastly WASM release build
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
+          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+        run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
@@ -106,7 +115,7 @@ jobs:
         run: cargo test-cloudflare
 
   test-spin:
-    name: cargo check/build (spin native + wasm32-wasip1)
+    name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,6 +139,15 @@ jobs:
         run: cargo check-spin
 
       - name: Build Spin adapter release WASM
+        # Mirror the Fastly release-build overrides so the artifact embeds usable
+        # settings instead of the trusted-server.toml placeholders, which startup
+        # rejects (falling back to the generic 503 router). This proves the
+        # documented Spin artifact can boot, not just compile.
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
+          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
+          TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -150,21 +168,24 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          components: clippy
+          components: clippy, rustfmt
           cache-shared-key: cargo-${{ runner.os }}
 
+      - name: Format check (parity test crate)
+        run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
+
       - name: Run cross-adapter parity tests
-        run: cargo test --manifest-path crates/integration-tests/Cargo.toml --test parity
+        run: cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
 
       - name: Clippy (parity test crate)
-        run: cargo clippy --manifest-path crates/integration-tests/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
 
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/js/lib
+        working-directory: crates/trusted-server-js/lib
     steps:
       - uses: actions/checkout@v4
 
@@ -179,7 +200,7 @@ jobs:
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: crates/js/lib/package.json
+          cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
         run: npm ci

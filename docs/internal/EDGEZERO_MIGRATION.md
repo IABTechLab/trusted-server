@@ -10,48 +10,53 @@ epic [#480](https://github.com/IABTechLab/trusted-server/issues/480)).
 
 Config store name: **`trusted_server_config`** (Fastly service config store)
 
-| Key                    | Type                 | Effect                                                                                                                            |
-| ---------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                      |
-| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"100"`. |
+| Key                    | Type                 | Effect                                                                                                                                                |
+| ---------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                                          |
+| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"0"` (fail safe to legacy). |
 
 **Routing logic:** `fnv1a_bucket(client_ip) < edgezero_rollout_pct` → EdgeZero, else legacy.
-Same client IP always gets the same bucket — routing is sticky per user.
+Same client IP always gets the same bucket — routing is sticky per client IP (not per
+user; a user whose IP changes, e.g. mobile roaming or ISP reassignment, may re-bucket and
+switch paths, and could observe inconsistent identity if the two paths differ in EC handling).
 
 ### Safe defaults / failure modes
 
-| Condition                                           | Effective behaviour   |
-| --------------------------------------------------- | --------------------- |
-| Config store unreachable                            | All legacy            |
-| `edgezero_enabled` unreadable                       | All legacy            |
-| `edgezero_rollout_pct` absent (but enabled=true)    | All EdgeZero (100%)   |
-| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy            |
-| `edgezero_rollout_pct = "0"`                        | All legacy (rollback) |
+| Condition                                           | Effective behaviour    |
+| --------------------------------------------------- | ---------------------- |
+| Config store unreachable                            | All legacy             |
+| `edgezero_enabled` unreadable                       | All legacy             |
+| `edgezero_rollout_pct` absent (but enabled=true)    | All legacy (fail safe) |
+| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy             |
+| `edgezero_rollout_pct = "0"`                        | All legacy (rollback)  |
 
-> ⚠️ **Do NOT delete `edgezero_rollout_pct` while `edgezero_enabled = "true"`.** An absent key
-> is treated as 100 (full rollout) for backward compatibility. If you want to pause or roll back,
-> **set the value to `"0"`** — do not delete it.
+> **Note:** Every non-explicit state fails safe to legacy — an absent, invalid, or unreadable
+> `edgezero_rollout_pct` all route 100% to the legacy path, so deleting the key can never trigger
+> a cutover. To roll out, set an explicit percentage; to pause or roll back, set `"0"`.
 
 ---
 
 ## Canary progression
 
 > **Pre-condition:** All Phase 5 verification gates (PR18) passed.
->
-> **Production key setup order (important):** Set `edgezero_rollout_pct = "0"` in the
-> production config store **before** setting `edgezero_enabled = "true"`. If you set
-> `edgezero_enabled` first and `edgezero_rollout_pct` is absent, the absent-key default
-> (100) kicks in immediately, routing all traffic to EdgeZero without a staged canary.
 
 ### Pre-flight activation
 
 Before advancing any stage, activate the canary switch:
 
-1. Confirm `edgezero_rollout_pct = "0"` is already set in the production config store
-   (set it now if not — the pre-condition above explains why this must come first).
+1. Confirm `edgezero_rollout_pct = "0"` (or absent — both fail safe to legacy) in the
+   production config store. Setting it explicitly to `"0"` documents intent.
 2. Set `edgezero_enabled = "true"` in the production config store.
-3. Verify via log tailing that `routing request through legacy path (bucket=N, rollout_pct=0)`
-   appears — this confirms the flag is live and all traffic is still on the legacy path.
+3. Confirm the flag is live and all traffic is still on the legacy path.
+   `rollout_pct = "0"` deterministically short-circuits every request to the
+   legacy path (`should_route_to_edgezero` in the Fastly entry point), so all-legacy
+   is guaranteed by the config value rather than observed per request: confirm the
+   config-store values are applied and that error rate, p95 latency, and timeout
+   rate hold at baseline. There is no production per-branch route signal to tail
+   (see [Monitoring](#monitoring)); the `routing request through legacy path
+(rollout_pct=0)` line is emitted at `debug!`, so it surfaces only in local
+   Viceroy runs, where the logger auto-raises to `debug` via
+   `FASTLY_HOSTNAME=localhost` (production stays at `Info`, which suppresses it).
 
 ### Stage 1 — 1%
 
@@ -120,16 +125,39 @@ Rollback is **immediate, no deploy required**.
 
 ## Monitoring
 
-Fastly real-time stats dashboard. Key signals at each canary stage:
+> **There is no production signal that splits traffic by EdgeZero-vs-legacy
+> branch yet.** The per-request route decision is emitted only at `log::debug!`
+> (`should_route_to_edgezero` in the Fastly entry point), and the Fastly logger
+> defaults to `Info` (`logging::init_logger`), so these lines do not reach the
+> production log endpoint. The logger auto-raises to `debug` only under Viceroy,
+> detected via the guest-visible `FASTLY_HOSTNAME=localhost` signal, so the route
+> decision is visible only in local runs and never in production. No
+> `x-edgezero-path` response-path marker exists (deferred
+> follow-up), and no Fastly real-time-stats traffic split is configured for this
+> decision. Until a production-safe per-branch signal is added, canary
+> verification relies on aggregate service metrics moving as expected when
+> `rollout_pct` is stepped — not on per-request branch attribution.
+
+Fastly real-time stats dashboard — aggregate service signals (not split by
+branch). Watch each as `rollout_pct` is increased stage by stage; a regression
+that appears and tracks the rollout steps implicates the EdgeZero branch:
 
 - **Error rate:** `5xx / total_requests` by edge PoP
-- **Latency p95:** use log search for `routing request through EdgeZero path` to identify EdgeZero traffic (`x-edgezero-path` instrumentation header does not exist yet — follow-up task)
+- **Latency p95:** service-wide
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> Log lines in Viceroy / Fastly log tailing:
-> `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
-> `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
+> For local pre-production validation under Viceroy, start the simulator normally
+> (`fastly compute serve`). Viceroy exposes `FASTLY_HOSTNAME=localhost` to guest
+> code, and the Fastly logger raises the route-decision level to `debug` in that
+> local environment while production stays at `Info`. The route-decision log lines
+> are then:
+>
+> - `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — partial-stage canary traffic.
+> - `routing request through legacy path (bucket=N, rollout_pct=M)` — partial-stage legacy traffic.
+> - At the degenerate values the bucket is not computed:
+>   `routing request through legacy path (rollout_pct=0)` (full rollback) and
+>   `routing request through EdgeZero path (rollout_pct=100)` (full cutover).
 
 ---
 

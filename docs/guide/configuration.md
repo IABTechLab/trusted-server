@@ -23,8 +23,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "your-secure-secret-here"
 
-[edge_cookie]
-secret_key = "your-hmac-secret"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
 ```
 
 ### Environment Variable Overrides
@@ -37,7 +37,7 @@ at runtime.
 # Format: TRUSTED_SERVER__SECTION__FIELD
 export TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
-export TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
+export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 ```
 
 ### Generate Secure Secrets
@@ -60,8 +60,10 @@ openssl rand -base64 32
 | Section             | Purpose                                      |
 | ------------------- | -------------------------------------------- |
 | `[publisher]`       | Domain, origin, proxy settings               |
-| `[edge_cookie]`     | Edge Cookie (EC) ID generation               |
-| `[proxy]`           | Proxy SSRF allowlist                         |
+| `[ec]`              | Edge Cookie (EC) ID generation               |
+| `[tester_cookie]`   | Optional tester-cookie endpoint              |
+| `[proxy]`           | Proxy SSRF allowlist and asset routes        |
+| `[image_optimizer]` | Reusable Image Optimizer profile sets        |
 | `[request_signing]` | Ed25519 request signing                      |
 | `[auction]`         | Auction orchestration                        |
 | `[integrations.*]`  | Partner integrations (Prebid, Next.js, etc.) |
@@ -75,8 +77,8 @@ cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
 proxy_secret = "change-me-to-secure-value"
 
-[edge_cookie]
-secret_key = "your-hmac-secret-key"
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
 
 [request_signing]
 enabled = true
@@ -153,20 +155,27 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field           | Type   | Required | Description                                             |
-| --------------- | ------ | -------- | ------------------------------------------------------- |
-| `domain`        | String | Yes      | Publisher's domain name                                 |
-| `cookie_domain` | String | Yes      | Domain for setting cookies (typically with leading dot) |
-| `origin_url`    | String | Yes      | Full URL of publisher origin server                     |
-| `proxy_secret`  | String | Yes      | Secret key for encrypting/signing proxy URLs            |
+| Field                         | Type    | Required | Description                                                                             |
+| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------------------- |
+| `domain`                      | String  | Yes      | Publisher's apex domain name                                                            |
+| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                                  |
+| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                                     |
+| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`                           |
+| `proxy_secret`                | String  | Yes      | Secret key for encrypting/signing proxy URLs                                            |
+| `max_buffered_body_bytes`     | Integer | No       | Max bytes buffered when a publisher response is post-processed in full (default 16 MiB) |
+
+> **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
+> do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
 
 **Example**:
 
 ```toml
 [publisher]
 domain = "publisher.com"
-cookie_domain = ".publisher.com"  # Includes subdomains
+cookie_domain = ".publisher.com"
 origin_url = "https://origin.publisher.com"
+# Optional: connect to origin_url but send this outbound Host header.
+# origin_host_header_override = "www.publisher.com"
 proxy_secret = "change-me-to-secure-random-value"
 ```
 
@@ -176,7 +185,9 @@ proxy_secret = "change-me-to-secure-random-value"
 TRUSTED_SERVER__PUBLISHER__DOMAIN=publisher.com
 TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
+TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
+TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 ```
 
 ### Field Details
@@ -199,12 +210,12 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 
 #### `cookie_domain`
 
-**Purpose**: Domain scope for EC cookies.
+**Purpose**: Domain scope for non-EC cookies.
 
 **Usage**:
 
-- Set on `ts-ec` cookie
-- Controls cookie sharing across subdomains
+- Used by non-EC cookie helpers for domain scoping
+- EC cookies (`ts-ec`) use a separate computed domain derived from `domain`
 
 **Format**: Domain with optional leading dot
 
@@ -231,6 +242,26 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=your-secret-here
 - ❌ `origin.publisher.com` (missing protocol)
 
 **Port Handling**: Includes port if non-standard (not 80/443).
+
+#### `origin_host_header_override`
+
+**Purpose**: Optional Host header to send to the publisher origin while still
+connecting to the host in `origin_url`.
+
+**Usage**:
+
+- Connects, uses SNI, and checks certificates against `origin_url`
+- Sends the configured value as the outbound HTTP `Host` header
+- Useful when the origin endpoint expects a canonical publisher hostname
+
+**Format**: Hostname with optional port, without protocol, path, query, or fragment
+
+- ✅ `www.publisher.com`
+- ✅ `www.publisher.com:8443`
+- ❌ `https://www.publisher.com`
+- ❌ `www.publisher.com/path`
+
+**Default**: When omitted, Trusted Server sends the host from `origin_url`.
 
 #### `proxy_secret`
 
@@ -261,34 +292,129 @@ openssl rand -base64 32
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
-## EC Configuration
+#### `max_buffered_body_bytes`
 
-Settings for generating privacy-preserving Edge Cookie identifiers.
+**Purpose**: Upper bound on the in-memory buffer used when a publisher origin
+response must be processed in full (HTML rewriting and integration injection)
+instead of streamed.
 
-### `[edge_cookie]`
+**Usage**:
 
-| Field        | Type   | Required | Description                   |
-| ------------ | ------ | -------- | ----------------------------- |
-| `secret_key` | String | Yes      | HMAC secret for ID generation |
+- Caps the _decoded, post-rewrite_ output buffer for any buffered publisher
+  response on both the legacy and EdgeZero paths.
+- Exceeding the cap fails the response (mapped to a 5xx proxy error) rather than
+  allocating past the limit, preventing Wasm-heap exhaustion on highly
+  compressible documents.
+
+**Default**: `16777216` (16 MiB).
+
+**Effective Fastly limit**: On Fastly the practical ceiling for a publisher page
+is lower. The platform HTTP client rejects any origin response whose raw (still
+compressed) body exceeds **10 MiB** before this buffer is filled, so raising the
+value only helps highly compressible pages whose decoded size exceeds 16 MiB
+while their compressed origin body stays under 10 MiB. Raising it above ~10 MiB
+does not lift the platform cap for uncompressed pages.
+
+**Minimum**: Must be at least `1`. A value of `0` is rejected at startup because
+a zero-byte cap fails every non-empty buffered response.
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+```
+
+## Tester Cookie Configuration
+
+Settings for the optional tester-cookie endpoints. This feature is disabled by
+default and should only be enabled for intentional QA or troubleshooting flows.
+
+### `[tester_cookie]`
+
+| Field     | Type    | Required | Description                                        |
+| --------- | ------- | -------- | -------------------------------------------------- |
+| `enabled` | Boolean | No       | Enables routes to set and clear `ts-tester` cookie |
+
+When enabled, `GET /_ts/set-tester` returns `204 No Content` and sets:
+
+```http
+Set-Cookie: ts-tester=true; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax
+Cache-Control: no-store, private
+```
+
+`GET /_ts/clear-tester` returns `204 No Content` and clears the cookie:
+
+```http
+Set-Cookie: ts-tester=; Domain=<publisher.cookie_domain>; Path=/; Secure; SameSite=Lax; Max-Age=0
+Cache-Control: no-store, private
+```
+
+When disabled, both routes return `404 Not Found` and do not set a cookie.
+
+::: warning
+The cookie is scoped with `[publisher].cookie_domain`, not the EC-specific
+computed domain. Keep `cookie_domain` aligned with the browser scope where your
+QA tooling expects to read `ts-tester`.
+:::
 
 **Example**:
 
 ```toml
-[edge_cookie]
-secret_key = "your-secure-hmac-secret"
+[tester_cookie]
+enabled = true
 ```
 
 **Environment Override**:
 
 ```bash
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=your-secret
+TRUSTED_SERVER__TESTER_COOKIE__ENABLED=true
+```
+
+## EC Configuration
+
+Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Consent configuration controls request-local interpretation and forwarding, not separate KV persistence.
+
+### `[ec]`
+
+| Field                     | Type           | Required | Description                                                             |
+| ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
+| `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
+| `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
+| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
+| `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `partners`                | Array          | No       | Static partner registry entries                                         |
+
+::: tip Partner keying
+`source_domain` is the canonical partner key. It matches incoming OpenRTB EID `source` values and is also used as the EC KV `ids` map key.
+:::
+
+**Example**:
+
+```toml
+[ec]
+passphrase = "replace-with-32-plus-byte-random-secret"
+ec_store = "ec_identity_store"
+
+[[ec.partners]]
+name = "Mocktioneer SSP"
+source_domain = "mocktioneer.example"
+api_token = "partner-api-token-32-bytes-minimum"
+bidstream_enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__EC__PASSPHRASE=your-secret
+TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
 ```
 
 ### Field Details
 
-#### `secret_key`
+#### `passphrase`
 
-**Purpose**: HMAC secret for EC ID base generation.
+**Purpose**: Publisher passphrase used as HMAC key for EC ID generation.
 
 **Security**:
 
@@ -436,7 +562,7 @@ Path-based HTTP Basic Authentication.
 ```toml
 # Single handler
 [[handlers]]
-path = "^/admin"
+path = "^/_ts/admin"
 username = "admin"
 password = "secure-password"
 
@@ -456,7 +582,7 @@ password = "api-pass"
 
 ```bash
 # Handler 0
-TRUSTED_SERVER__HANDLERS__0__PATH="^/admin"
+TRUSTED_SERVER__HANDLERS__0__PATH="^/_ts/admin"
 TRUSTED_SERVER__HANDLERS__0__USERNAME="admin"
 TRUSTED_SERVER__HANDLERS__0__PASSWORD="secure-password"
 
@@ -474,10 +600,10 @@ TRUSTED_SERVER__HANDLERS__1__PASSWORD="api-pass"
 
 ```toml
 # Exact path
-path = "^/admin$"  # Only /admin
+path = "^/_ts/admin$"  # Only /_ts/admin
 
 # Prefix match
-path = "^/admin"   # /admin, /admin/users, /admin/settings
+path = "^/_ts/admin"   # /_ts/admin, /_ts/admin/users, /_ts/admin/settings
 
 # Multiple paths
 path = "^/(admin|secure|private)"
@@ -608,13 +734,15 @@ See [Creative Processing](/guide/creative-processing#exclude-domains) for detail
 
 ## Proxy Configuration
 
-Controls first-party proxy security settings.
+Controls first-party proxy security settings and path-based asset routes.
 
 ### `[proxy]`
 
-| Field             | Type          | Required           | Description                                            |
-| ----------------- | ------------- | ------------------ | ------------------------------------------------------ |
-| `allowed_domains` | Array[String] | No (default: `[]`) | Redirect destinations the proxy is permitted to follow |
+| Field               | Type          | Required             | Description                                            |
+| ------------------- | ------------- | -------------------- | ------------------------------------------------------ |
+| `allowed_domains`   | Array[String] | No (default: `[]`)   | Redirect destinations the proxy is permitted to follow |
+| `certificate_check` | Boolean       | No (default: `true`) | Verify TLS certificates when proxying HTTPS origins    |
+| `asset_routes`      | Array[Table]  | No (default: `[]`)   | Path prefixes proxied directly to configured origins   |
 
 **Example**:
 
@@ -679,9 +807,180 @@ allowed_domains = [
 
 See [First-Party Proxy](/guide/first-party-proxy#proxy-allowlist) for usage details.
 
+#### `certificate_check`
+
+**Purpose**: Control TLS certificate verification for HTTPS proxy and asset-route origins.
+
+**Default**: `true`
+
+Set this to `false` only for local development with self-signed certificates.
+
+### `[[proxy.asset_routes]]`
+
+Asset routes proxy selected first-party paths to an alternate asset origin without requiring signed `/first-party/proxy` URLs.
+
+| Field             | Type   | Required | Description                                     |
+| ----------------- | ------ | -------- | ----------------------------------------------- |
+| `prefix`          | String | Yes      | Request path prefix to match                    |
+| `origin_url`      | String | Yes      | Absolute `http` or `https` origin URL           |
+| `path_pattern`    | String | No       | Regex matched against the incoming request path |
+| `target_path`     | String | No       | Replacement path used with `path_pattern`       |
+| `auth`            | Table  | No       | Optional origin authentication                  |
+| `image_optimizer` | Table  | No       | Optional route-level Image Optimizer settings   |
+
+**Example**:
+
+```toml
+[[proxy.asset_routes]]
+prefix = "/assets/"
+origin_url = "https://assets.example.com"
+```
+
+**Path rewrite example**:
+
+```toml
+[[proxy.asset_routes]]
+prefix = "/.image/"
+origin_url = "https://assets-cdn.example.com"
+path_pattern = "^/\\.image/(.*)/[^/]+\\.([^/.]+)$"
+target_path = "/image/upload/$1.$2"
+```
+
+**Behavior**:
+
+- Only `GET` and `HEAD` requests use asset routes.
+- Built-in and integration routes take precedence.
+- The longest matching asset-route prefix wins.
+- `path_pattern` and `target_path` must be configured together.
+- `origin_url` must not include userinfo, a path, a query string, or a fragment.
+- Unsafe origin response headers such as `Set-Cookie` are stripped before the response reaches the browser.
+
+### `[proxy.asset_routes.auth]`
+
+The first supported origin auth type is `s3_sigv4`.
+
+| Field               | Type   | Required | Default             | Description                                     |
+| ------------------- | ------ | -------- | ------------------- | ----------------------------------------------- |
+| `type`              | String | Yes      | none                | Must be `s3_sigv4`                              |
+| `region`            | String | Yes      | none                | AWS region used in the SigV4 credential scope   |
+| `secret_store`      | String | No       | `s3-auth`           | Runtime secret store containing AWS credentials |
+| `access_key_id`     | String | No       | `access_key_id`     | Secret key containing the AWS access key ID     |
+| `secret_access_key` | String | No       | `secret_access_key` | Secret key containing the AWS secret access key |
+| `session_token`     | String | No       | unset               | Optional secret key containing a session token  |
+| `origin_query`      | String | No       | route default       | `preserve` or `strip`                           |
+
+**Example**:
+
+```toml
+[[proxy.asset_routes]]
+prefix = "/.image/"
+origin_url = "https://bucket.s3.us-east-1.amazonaws.com"
+
+[proxy.asset_routes.auth]
+type = "s3_sigv4"
+region = "us-east-1"
+origin_query = "strip"
+secret_store = "s3-auth"
+access_key_id = "access_key_id"
+secret_access_key = "secret_access_key"
+# session_token = "session_token"
+```
+
+S3 auth uses header-based AWS SigV4 with `UNSIGNED-PAYLOAD`. It is scoped to read-only asset requests and expects `origin_url` to use the S3 host that AWS validates. Credentials are cached per process by configured secret names after the first successful read.
+
+Effective `origin_query` precedence is auth-level `origin_query`, then enabled Image Optimizer `origin_query`, then the route default.
+
+### `[proxy.asset_routes.image_optimizer]`
+
+Route-level Image Optimizer configuration selects a reusable profile set.
+
+| Field          | Type    | Required         | Default              | Description                                                                 |
+| -------------- | ------- | ---------------- | -------------------- | --------------------------------------------------------------------------- |
+| `enabled`      | Boolean | No               | `true`               | Enable Image Optimizer for the route                                        |
+| `region`       | String  | Yes when enabled | none                 | Fastly IO processing region, such as `us_east`                              |
+| `profile_set`  | String  | Yes when enabled | none                 | Name under `[image_optimizer.profile_sets.*]`                               |
+| `origin_query` | String  | No               | `strip` when enabled | `preserve` or `strip`; effective `preserve` is rejected while IO is enabled |
+
+**Example**:
+
+```toml
+[proxy.asset_routes.image_optimizer]
+enabled = true
+region = "us_east"
+profile_set = "default_images"
+```
+
+### `[image_optimizer.profile_sets.<name>]`
+
+Profile sets convert small request query controls into a closed set of Image Optimizer parameters.
+
+| Field                | Type   | Required | Default       | Description                                      |
+| -------------------- | ------ | -------- | ------------- | ------------------------------------------------ |
+| `base_params`        | String | No       | `""`          | Params applied before profile-specific params    |
+| `default_profile`    | String | No       | `default`     | Profile used when no profile is requested        |
+| `unknown_profile`    | String | No       | `use_default` | `use_default` or `reject`                        |
+| `profile_param`      | String | No       | `profile`     | Query parameter containing the profile name      |
+| `aspect_ratio_param` | String | No       | `ar`          | Query parameter containing aspect ratio          |
+| `debug_param`        | String | No       | `_io_debug`   | Query parameter that disables IO when set to `1` |
+
+Profile values live under `[image_optimizer.profile_sets.<name>.profiles]` and use query-string syntax.
+
+```toml
+[image_optimizer.profile_sets.default_images]
+base_params = "quality=70&resize-filter=bicubic"
+default_profile = "default"
+unknown_profile = "use_default"
+profile_param = "profile"
+aspect_ratio_param = "ar"
+debug_param = "_io_debug"
+
+[image_optimizer.profile_sets.default_images.profiles]
+default = "width=1920"
+medium = "format=auto&width=828"
+thumbnail = "width=150&crop=1:1,smart"
+```
+
+Supported profile parameters are `quality`, `resize-filter`, `format`, `width`, `height`, and `crop`. Unknown profile parameters fail configuration validation.
+
+### `[image_optimizer.profile_sets.<name>.aspect_ratios]`
+
+| Field      | Type          | Required | Description                                         |
+| ---------- | ------------- | -------- | --------------------------------------------------- |
+| `allowed`  | Array[String] | No       | Allowed query values such as `1-1` or `16-9`        |
+| `profiles` | Array[String] | No       | Defined profiles that accept aspect-ratio overrides |
+
+```toml
+[image_optimizer.profile_sets.default_images.aspect_ratios]
+allowed = ["1-1", "16-9", "4-3"]
+profiles = ["medium", "thumbnail"]
+```
+
+### `[image_optimizer.profile_sets.<name>.crop_offsets]`
+
+| Field          | Type           | Required | Default                | Description                                  |
+| -------------- | -------------- | -------- | ---------------------- | -------------------------------------------- |
+| `enabled`      | Boolean        | No       | `true`                 | Enable offset bucketing                      |
+| `x_param`      | String         | No       | `x`                    | Query parameter for x-axis offset            |
+| `y_param`      | String         | No       | `y`                    | Query parameter for y-axis offset            |
+| `buckets`      | Array[Integer] | No       | `[10, 30, 50, 70, 90]` | Offset buckets in `0..=100`                  |
+| `default`      | Integer        | No       | `50`                   | Offset used when input is missing or invalid |
+| `when_missing` | String         | No       | `smart`                | `smart` or `none` when neither offset exists |
+
+```toml
+[image_optimizer.profile_sets.default_images.crop_offsets]
+enabled = true
+x_param = "x"
+y_param = "y"
+buckets = [10, 30, 50, 70, 90]
+default = 50
+when_missing = "smart"
+```
+
+See [Asset Routes](/guide/asset-routes) for request flow, S3 auth details, and Image Optimizer behavior.
+
 ## Integration Configurations
 
-Settings for built-in integrations (Prebid, Next.js, Permutive, Testlight). For other
+Settings for built-in integrations (Prebid, Next.js, Osano, Permutive, Testlight). For other
 integrations (APS, Didomi, Lockr, GAM, etc.), see the relevant integration guides.
 
 ### Common Fields
@@ -804,6 +1103,29 @@ TRUSTED_SERVER__INTEGRATIONS__NEXTJS__REWRITE_ATTRIBUTES=href,link,url,src
 TRUSTED_SERVER__INTEGRATIONS__NEXTJS__MAX_COMBINED_PAYLOAD_BYTES=10485760
 ```
 
+### Osano Integration
+
+**Section**: `[integrations.osano]`
+
+| Field     | Type    | Default | Description                             |
+| --------- | ------- | ------- | --------------------------------------- |
+| `enabled` | Boolean | `false` | Enable the Osano browser consent mirror |
+
+**Example**:
+
+```toml
+[integrations.osano]
+enabled = true
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__INTEGRATIONS__OSANO__ENABLED=true
+```
+
+The Osano mirror runs in the browser, so consent cookies it writes are available to Trusted Server on requests after the page where Osano consent APIs become ready. See [Osano Integration](/guide/integrations/osano) for details.
+
 ### Permutive Integration
 
 **Section**: `[integrations.permutive]`
@@ -899,6 +1221,67 @@ TRUSTED_SERVER__AUCTION__TIMEOUT_MS=2000
 TRUSTED_SERVER__AUCTION__CREATIVE_STORE=creative_store
 ```
 
+## Runtime Feature Flags
+
+Unlike the TOML/environment settings above (which are baked into the Wasm binary
+at build time), the EdgeZero entry point is toggled at **runtime** through a
+Fastly Config Store. This lets operators switch request handling without
+rebuilding or redeploying the binary.
+
+### EdgeZero Canary Routing
+
+**Purpose**: Routes incoming requests through the EdgeZero entry point instead of
+the legacy entry point, with an optional percentage rollout.
+
+**Source**: Fastly Config Store, not `trusted-server.toml` or an environment
+variable.
+
+| Key                    | Value                                              | Behavior                                                                                 |
+| ---------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `true` or `1` (whitespace-trimmed, any ASCII case) | Master switch. Any other value, missing key, or read error routes all traffic to legacy. |
+| `edgezero_rollout_pct` | Integer string `0` through `100`                   | Percentage of enabled traffic routed to EdgeZero by deterministic client-IP bucket.      |
+
+**Fallback behavior** (fail-safe to the legacy path):
+
+- If the `trusted_server_config` store cannot be opened, requests use the legacy
+  path.
+- If the `edgezero_enabled` key is missing or cannot be read, requests use the
+  legacy path.
+- Any value other than `true`/`1` keeps the legacy path.
+- If `edgezero_enabled=true` but `edgezero_rollout_pct` is missing, invalid, or
+  cannot be read, rollout defaults to `0` and requests use the legacy path.
+
+**Local development** (`fastly.toml`):
+
+```toml
+[local_server.config_stores]
+  [local_server.config_stores.trusted_server_config]
+    format = "inline-toml"
+    [local_server.config_stores.trusted_server_config.contents]
+      edgezero_enabled = "true"
+      edgezero_rollout_pct = "0"
+```
+
+**Production setup** (Fastly CLI):
+
+```bash
+# Create the store (once) and attach it to the service, then set the keys.
+fastly config-store create --name trusted_server_config
+fastly config-store-entry create \
+  --store-id <STORE_ID> --key edgezero_enabled --value true
+fastly config-store-entry create \
+  --store-id <STORE_ID> --key edgezero_rollout_pct --value 0
+```
+
+**Rollout**: With `edgezero_enabled=true`, increase `edgezero_rollout_pct`
+through staged values such as `1`, `10`, `50`, and `100`. Routing is sticky per
+client IP at a given percentage.
+
+**Rollback**: Set `edgezero_rollout_pct` to `0` to return enabled traffic to the
+legacy path immediately. Set `edgezero_enabled` to `false` (or delete the key) to
+disable the EdgeZero entry point entirely. Neither rollback requires a rebuild or
+redeploy.
+
 ## Validation
 
 ### Automatic Validation
@@ -912,8 +1295,8 @@ Configuration is validated at startup:
 
 **EC Validation**:
 
-- `secret_key` ≥ 1 character
-- `secret_key` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
+- `passphrase` ≥ 1 character
+- `passphrase` ≠ known placeholders (`"secret-key"`, `"secret_key"`, `"trusted-server"` — case-insensitive)
 
 **Handler Validation**:
 
@@ -970,7 +1353,7 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret_staging)
 ```bash
 # All secrets from environment
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=$(cat /run/secrets/proxy_secret)
-TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY=$(cat /run/secrets/ec_secret)
+TRUSTED_SERVER__EC__PASSPHRASE=$(cat /run/secrets/ec_secret)
 TRUSTED_SERVER__HANDLERS__0__PASSWORD=$(cat /run/secrets/admin_password)
 ```
 
@@ -1024,7 +1407,7 @@ trusted-server.dev.toml      # Development overrides
 
 **"Configuration field '...' is set to a known placeholder value"**:
 
-- `edge_cookie.secret_key` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
+- `ec.passphrase` cannot be `"secret-key"`, `"secret_key"`, or `"trusted-server"` (case-insensitive)
 - `publisher.proxy_secret` cannot be `"change-me-proxy-secret"` (case-insensitive)
 - Must be non-empty
 - Change to a secure random value (see generation commands above)
@@ -1032,7 +1415,7 @@ trusted-server.dev.toml      # Development overrides
 **"Invalid regex"**:
 
 - Handler `path` must be valid regex
-- Test pattern: `echo "^/admin" | grep -E "^/admin"`
+- Test pattern: `echo "^/_ts/admin" | grep -E "^/_ts/admin"`
 - Escape special characters: `\.`, `\$`, etc.
 
 **"Integration configuration could not be parsed"**:

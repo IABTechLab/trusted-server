@@ -19,6 +19,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderName, HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
+use std::net::IpAddr;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{
     ENV_FASTLY_IS_STAGING, ENV_FASTLY_SERVICE_VERSION, HEADER_X_GEO_INFO_AVAILABLE,
@@ -77,15 +78,12 @@ impl Middleware for FinalizeResponseMiddleware {
             }
         };
 
-        // Skip geo lookup for authentication rejections — the lookup is unnecessary for 401s.
-        let geo_info = if response.status() != StatusCode::UNAUTHORIZED {
-            self.geo.lookup(client_ip).unwrap_or_else(|e| {
+        let geo_info = resolve_geo_for_response(&response, client_ip, |ip| {
+            self.geo.lookup(ip).unwrap_or_else(|e| {
                 log::warn!("geo lookup failed: {e}");
                 None
             })
-        } else {
-            None
-        };
+        });
 
         apply_finalize_headers(&self.settings, geo_info.as_ref(), &mut response);
         response
@@ -142,6 +140,41 @@ impl Middleware for AuthMiddleware {
 }
 
 // ---------------------------------------------------------------------------
+// Shared geo resolution helper
+// ---------------------------------------------------------------------------
+
+/// Resolves geo for a response, skipping the lookup for 401 responses.
+///
+/// Returns `None` for authentication rejections (401) without calling `lookup_geo`
+/// to avoid unnecessary work and exposing geo data to unauthenticated callers.
+/// All other responses call `lookup_geo` and return its result.
+///
+/// Used by both [`FinalizeResponseMiddleware`] and the entry-point finalization
+/// in `main.rs` so the 401-skip rule is defined in one place.
+///
+/// # Parity note
+///
+/// The legacy path skips geo only for its own `HandlerOutcome::AuthChallenge`
+/// responses; origin-forwarded 401s still receive geo headers there. The `EdgeZero`
+/// path skips geo for **all** 401s by status. This is intentionally more
+/// conservative: geo data is not sent to any unauthenticated caller regardless of
+/// whether the 401 originated from this server or the upstream origin.
+pub(crate) fn resolve_geo_for_response<F>(
+    response: &Response,
+    client_ip: Option<IpAddr>,
+    lookup_geo: F,
+) -> Option<GeoInfo>
+where
+    F: FnOnce(Option<IpAddr>) -> Option<GeoInfo>,
+{
+    if response.status() == StatusCode::UNAUTHORIZED {
+        None
+    } else {
+        lookup_geo(client_ip)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // apply_finalize_headers — extracted for unit testing
 // ---------------------------------------------------------------------------
 
@@ -184,9 +217,10 @@ pub(crate) fn apply_finalize_headers(
 
     for (key, value) in &settings.response_headers {
         let header_name = HeaderName::from_bytes(key.as_bytes())
-            .expect("settings.response_headers validated at load time");
-        let header_value =
-            HeaderValue::from_str(value).expect("settings.response_headers validated at load time");
+            .expect("should be a valid header name: response_headers validated in prepare_runtime");
+        let header_value = HeaderValue::from_str(value).expect(
+            "should be a valid header value: response_headers validated in prepare_runtime",
+        );
         response.headers_mut().insert(header_name, header_value);
     }
 }
@@ -236,9 +270,34 @@ mod tests {
         }
     }
 
+    fn test_settings() -> Settings {
+        Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+            "#,
+        )
+        .expect("should parse test settings")
+    }
+
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        let mut s =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        let mut s = test_settings();
         s.response_headers = headers
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -395,9 +454,36 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
+    fn finalize_handle_preserves_duplicate_set_cookie_headers() {
+        // Regression guard: FinalizeResponseMiddleware must not drop duplicate
+        // Set-Cookie headers. The old dispatch_with_config_handle path silently
+        // collapsed them because fastly::Response uses set_header (last-wins).
+        // This test verifies the EdgeZero middleware chain is header-transparent.
+        let settings = settings_with_response_headers(vec![]);
+        let middleware =
+            FinalizeResponseMiddleware::new(Arc::new(settings), Arc::new(FixedGeo(None)));
+        let handler = Arc::new(|_ctx: RequestContext| async move {
+            let resp = response_builder()
+                .header("set-cookie", "session=abc; Path=/; HttpOnly")
+                .header("set-cookie", "tracker=xyz; Path=/; SameSite=Lax")
+                .body(Body::empty())
+                .expect("should build response with two Set-Cookie headers");
+            Ok::<Response, EdgeError>(resp)
+        });
+
+        let response = block_on(middleware.handle(empty_ctx(), Next::new(&[], &*handler)))
+            .expect("should succeed");
+
+        let cookie_count = response.headers().get_all("set-cookie").iter().count();
+        assert_eq!(
+            cookie_count, 2,
+            "FinalizeResponseMiddleware must not drop duplicate Set-Cookie headers"
+        );
+    }
+
+    #[test]
     fn auth_handle_passes_through_when_auth_not_configured() {
-        let settings =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        let settings = test_settings();
         let middleware = AuthMiddleware::new(Arc::new(settings));
         let handler =
             Arc::new(

@@ -28,6 +28,10 @@ pub struct GeoInfo {
     pub metro_code: i64,
     /// Region code.
     pub region: Option<String>,
+    /// Autonomous System Number (e.g. `7922` = Comcast).
+    /// Used to distinguish home ISP vs. corporate VPN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
 }
 
 impl GeoInfo {
@@ -45,7 +49,7 @@ impl GeoInfo {
 }
 
 /// Per-request client metadata extracted once at the adapter entry point.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClientInfo {
     /// Client IP address, if available.
     pub client_ip: Option<IpAddr>,
@@ -53,6 +57,14 @@ pub struct ClientInfo {
     pub tls_protocol: Option<String>,
     /// OpenSSL cipher name, if the connection used TLS.
     pub tls_cipher: Option<String>,
+    /// TLS JA4 fingerprint, if the platform exposes it.
+    pub tls_ja4: Option<String>,
+    /// HTTP/2 client fingerprint, if the platform exposes it.
+    pub h2_fingerprint: Option<String>,
+    /// Edge server hostname, if available.
+    pub server_hostname: Option<String>,
+    /// Edge server region, if available.
+    pub server_region: Option<String>,
 }
 
 /// Edge-visible name used to open a config or secret store at runtime.
@@ -72,7 +84,7 @@ impl From<String> for StoreName {
 
 impl From<&str> for StoreName {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 
@@ -99,7 +111,7 @@ impl From<String> for StoreId {
 
 impl From<&str> for StoreId {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self(s.to_owned())
     }
 }
 
@@ -121,6 +133,8 @@ pub struct PlatformBackendSpec {
     pub host: String,
     /// Explicit port, or `None` to use the scheme default.
     pub port: Option<u16>,
+    /// Optional outbound `Host` header override for backend registration.
+    pub host_header_override: Option<String>,
     /// Whether to verify the TLS certificate.
     pub certificate_check: bool,
     /// Maximum time to wait for the first response byte.

@@ -2,8 +2,6 @@
 //!
 //! This module provides functionality for replacing patterns in content
 //! in streaming fashion, handling content that may be split across multiple chunks.
-//!
-//! See [`crate::platform`] module doc for platform notes.
 
 // Note: std::io::{Read, Write} were previously used by stream_process function
 // which has been removed in favor of StreamingPipeline
@@ -54,8 +52,8 @@ impl StreamingReplacer {
     #[must_use]
     pub fn new_single(find: &str, replace_with: &str) -> Self {
         Self::new(vec![Replacement {
-            find: find.to_string(),
-            replace_with: replace_with.to_string(),
+            find: find.to_owned(),
+            replace_with: replace_with.to_owned(),
         }])
     }
 
@@ -119,7 +117,7 @@ impl StreamingReplacer {
             // Check if this is a valid UTF-8 boundary
             if let Ok(s) = std::str::from_utf8(&combined[..adjusted_end_bytes]) {
                 // Valid UTF-8 up to this point, process it
-                let mut processed = s.to_string();
+                let mut processed = s.to_owned();
 
                 // Apply all replacements
                 for replacement in &self.replacements {
@@ -127,10 +125,10 @@ impl StreamingReplacer {
                 }
 
                 // Save the overlap for the next chunk
-                if !is_last_chunk {
-                    self.overlap_buffer = combined[adjusted_end_bytes..].to_vec();
-                } else {
+                if is_last_chunk {
                     self.overlap_buffer.clear();
+                } else {
+                    self.overlap_buffer = combined[adjusted_end_bytes..].to_vec();
                 }
 
                 return processed.into_bytes();
@@ -161,12 +159,12 @@ pub fn create_url_replacer(
     request_host: &str,
     request_scheme: &str,
 ) -> StreamingReplacer {
-    let request_url = format!("{}://{}", request_scheme, request_host);
+    let request_url = format!("{request_scheme}://{request_host}");
 
     let mut replacements = vec![
         // Replace full URLs first (more specific)
         Replacement {
-            find: origin_url.to_string(),
+            find: origin_url.to_owned(),
             replace_with: request_url.clone(),
         },
     ];
@@ -182,14 +180,14 @@ pub fn create_url_replacer(
 
     // Replace protocol-relative URLs
     replacements.push(Replacement {
-        find: format!("//{}", origin_host),
-        replace_with: format!("//{}", request_host),
+        find: format!("//{origin_host}"),
+        replace_with: format!("//{request_host}"),
     });
 
     // Replace host in various contexts
     replacements.push(Replacement {
-        find: origin_host.to_string(),
-        replace_with: request_host.to_string(),
+        find: origin_host.to_owned(),
+        replace_with: request_host.to_owned(),
     });
 
     StreamingReplacer::new(replacements)
@@ -221,7 +219,7 @@ mod tests {
         split_points: &[usize],
     ) -> String {
         let mut result = Vec::new();
-        let mut start = 0usize;
+        let mut start = 0_usize;
 
         for (index, end) in split_points.iter().copied().enumerate() {
             let is_last_chunk = index == split_points.len() - 1;
@@ -268,12 +266,12 @@ mod tests {
     fn test_streaming_replacer_multiple_patterns() {
         let replacements = vec![
             Replacement {
-                find: "https://origin.example.com".to_string(),
-                replace_with: "https://test.example.com".to_string(),
+                find: "https://origin.example.com".to_owned(),
+                replace_with: "https://test.example.com".to_owned(),
             },
             Replacement {
-                find: "//origin.example.com".to_string(),
-                replace_with: "//test.example.com".to_string(),
+                find: "//origin.example.com".to_owned(),
+                replace_with: "//test.example.com".to_owned(),
             },
         ];
 
@@ -422,20 +420,20 @@ mod tests {
                     "test.com",
                     "https",
                 ),
-                content: "https://origin.com/test 思怙ᕏ测试 https://origin.com/more",
+                content: "https://origin.com/test \u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5} https://origin.com/more",
                 chunk_size: 20,
                 expected_fragments: &[
                     "https://test.com/test",
                     "https://test.com/more",
-                    "思怙ᕏ测试",
+                    "\u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5}",
                 ],
             },
             Utf8BoundaryCase {
                 name: "small chunks preserve utf8 without replacements",
                 replacer: create_url_replacer("test.com", "https://test.com", "new.com", "https"),
-                content: "Some text 思怙ᕏ测试 more text with 🎉 emoji",
+                content: "Some text \u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5} more text with \u{1f389} emoji",
                 chunk_size: 8,
-                expected_fragments: &["Some text", "思怙ᕏ测试", "🎉 emoji"],
+                expected_fragments: &["Some text", "\u{601d}\u{6019}\u{154f}\u{6d4b}\u{8bd5}", "\u{1f389} emoji"],
             },
         ];
 
@@ -460,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_process_chunk_boundary_in_multibyte_char() {
-        let content = "https://example.com/før/bår/test".as_bytes();
+        let content = "https://example.com/f\u{f8}r/b\u{e5}r/test".as_bytes();
 
         let result = process_with_explicit_splits(
             create_url_replacer("example.com", "https://example.com", "new.com", "https"),
@@ -468,12 +466,12 @@ mod tests {
             &[22, content.len()],
         );
 
-        assert!(result.contains("https://new.com/før/bår/test"));
+        assert!(result.contains("https://new.com/f\u{f8}r/b\u{e5}r/test"));
     }
 
     #[test]
     fn test_process_chunk_boundary_in_emoji() {
-        let content = "🎉🎊🎋 https://emoji.com/more".as_bytes();
+        let content = "\u{1f389}\u{1f38a}\u{1f38b} https://emoji.com/more".as_bytes();
 
         let result = process_with_explicit_splits(
             create_url_replacer("emoji.com", "https://emoji.com", "test.com", "https"),
@@ -481,7 +479,7 @@ mod tests {
             &[2, content.len()],
         );
 
-        assert!(result.contains("🎉🎊🎋"));
+        assert!(result.contains("\u{1f389}\u{1f38a}\u{1f38b}"));
         assert!(result.contains("https://test.com/more"));
     }
 
@@ -514,12 +512,12 @@ mod tests {
         // Test replacing arbitrary strings
         let replacements = vec![
             Replacement {
-                find: "color".to_string(),
-                replace_with: "colour".to_string(),
+                find: "color".to_owned(),
+                replace_with: "colour".to_owned(),
             },
             Replacement {
-                find: "gray".to_string(),
-                replace_with: "grey".to_string(),
+                find: "gray".to_owned(),
+                replace_with: "grey".to_owned(),
             },
         ];
 
@@ -537,12 +535,12 @@ mod tests {
         // Test that longer patterns are replaced first (order matters)
         let replacements = vec![
             Replacement {
-                find: "hello world".to_string(),
-                replace_with: "greetings universe".to_string(),
+                find: "hello world".to_owned(),
+                replace_with: "greetings universe".to_owned(),
             },
             Replacement {
-                find: "hello".to_string(),
-                replace_with: "hi".to_string(),
+                find: "hello".to_owned(),
+                replace_with: "hi".to_owned(),
             },
         ];
 
@@ -561,12 +559,12 @@ mod tests {
         // Test handling of overlapping patterns
         let replacements = vec![
             Replacement {
-                find: "abc".to_string(),
-                replace_with: "xyz".to_string(),
+                find: "abc".to_owned(),
+                replace_with: "xyz".to_owned(),
             },
             Replacement {
-                find: "bcd".to_string(),
-                replace_with: "123".to_string(),
+                find: "bcd".to_owned(),
+                replace_with: "123".to_owned(),
             },
         ];
 
@@ -609,12 +607,12 @@ mod tests {
         // Test replacing patterns with special regex characters
         let replacements = vec![
             Replacement {
-                find: "cost: $10.99".to_string(),
-                replace_with: "price: €9.99".to_string(),
+                find: "cost: $10.99".to_owned(),
+                replace_with: "price: \u{20ac}9.99".to_owned(),
             },
             Replacement {
-                find: "[TAG]".to_string(),
-                replace_with: "<LABEL>".to_string(),
+                find: "[TAG]".to_owned(),
+                replace_with: "<LABEL>".to_owned(),
             },
         ];
 
@@ -624,7 +622,7 @@ mod tests {
         let processed = replacer.process_chunk(input, true);
         let result = String::from_utf8(processed).expect("output should be valid UTF-8");
 
-        assert_eq!(result, "The price: €9.99 <LABEL> is final");
+        assert_eq!(result, "The price: \u{20ac}9.99 <LABEL> is final");
     }
 
     #[test]
@@ -634,12 +632,12 @@ mod tests {
 
         let replacements = vec![
             Replacement {
-                find: "foo".to_string(),
-                replace_with: "bar".to_string(),
+                find: "foo".to_owned(),
+                replace_with: "bar".to_owned(),
             },
             Replacement {
-                find: "hello".to_string(),
-                replace_with: "hi".to_string(),
+                find: "hello".to_owned(),
+                replace_with: "hi".to_owned(),
             },
         ];
 

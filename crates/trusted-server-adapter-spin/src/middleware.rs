@@ -82,6 +82,41 @@ impl Middleware for AuthMiddleware {
 }
 
 // ---------------------------------------------------------------------------
+// NormalizeMiddleware
+// ---------------------------------------------------------------------------
+
+/// Request-normalization chokepoint.
+///
+/// Runs [`crate::app::normalize_spin_request`] on every routed request before
+/// the handler executes, so the de-spoofing invariant — strip client-spoofable
+/// `Forwarded` / `X-Forwarded-*` headers, derive the trusted Host, scheme, and
+/// client IP from Spin's synthetic runtime headers — holds for *every* route
+/// structurally rather than by per-handler convention. A future route, or a
+/// signing handler that begins deriving an issuer/audience from `RequestInfo`,
+/// cannot silently trust spoofable input by forgetting to opt in.
+///
+/// Registered after [`AuthMiddleware`] (innermost) so the basic-auth gate still
+/// evaluates the original request, preserving prior behaviour.
+#[derive(Default)]
+pub struct NormalizeMiddleware;
+
+impl NormalizeMiddleware {
+    /// Creates a new [`NormalizeMiddleware`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait(?Send)]
+impl Middleware for NormalizeMiddleware {
+    async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        crate::app::normalize_spin_request(ctx.request_mut());
+        next.run(ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // apply_finalize_headers — extracted for unit testing
 // ---------------------------------------------------------------------------
 
@@ -133,8 +168,27 @@ mod tests {
     }
 
     fn settings_with_response_headers(headers: Vec<(&str, &str)>) -> Settings {
-        let mut s =
-            trusted_server_core::settings_data::get_settings().expect("should load test settings");
+        // Build from explicit test settings: the settings baked into the
+        // binary contain placeholder secrets that `get_settings()` rejects
+        // by design.
+        let mut s = Settings::from_toml(
+            r#"
+                [[handlers]]
+                path = "^/_ts/admin"
+                username = "admin"
+                password = "admin-pass"
+
+                [publisher]
+                domain = "test-publisher.example.com"
+                cookie_domain = ".test-publisher.example.com"
+                origin_url = "https://origin.test-publisher.example.com"
+                proxy_secret = "unit-test-proxy-secret"
+
+                [ec]
+                passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should load test settings");
         s.response_headers = headers
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auction::types::OrchestratorExt;
@@ -15,17 +15,13 @@ pub use trusted_server_openrtb::{
 /// returning `None` if the value exceeds `i32::MAX`.
 #[must_use]
 pub fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
-    match i32::try_from(value) {
-        Ok(converted) => Some(converted),
-        Err(_) => {
-            log::warn!(
-                "openrtb: omitting {}={} for {} because value exceeds i32::MAX",
-                field_name,
-                value,
-                context
-            );
-            None
-        }
+    if let Ok(converted) = i32::try_from(value) {
+        Some(converted)
+    } else {
+        log::warn!(
+            "openrtb: omitting {field_name}={value} for {context} because value exceeds i32::MAX"
+        );
+        None
     }
 }
 
@@ -49,12 +45,6 @@ pub struct UserExt {
     /// Gated by TCF Purpose 1 (storage) and Purpose 4 (personalized ads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eids: Option<Vec<Eid>>,
-    /// Whether this EC ID was freshly generated for this request.
-    ///
-    /// **Breaking change:** this wire field was previously named `synthetic_fresh`.
-    /// Downstream PBS modules or analytics reading the old name must be updated.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ec_fresh: Option<String>,
 }
 
 impl ToExt for UserExt {}
@@ -75,7 +65,7 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
@@ -84,7 +74,7 @@ pub struct Eid {
 }
 
 /// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Uid {
     /// The identifier value.
     pub id: String,
@@ -182,26 +172,26 @@ mod tests {
     #[test]
     fn openrtb_response_round_trips_with_struct_literals() {
         let bid = OpenRtbBid {
-            id: Some("bidder-a-slot-1".to_string()),
-            impid: Some("slot-1".to_string()),
+            id: Some("bidder-a-slot-1".to_owned()),
+            impid: Some("slot-1".to_owned()),
             price: Some(1.25),
-            adm: Some("<div>Test Creative HTML</div>".to_string()),
-            crid: Some("bidder-a-creative".to_string()),
+            adm: Some("<div>Test Creative HTML</div>".to_owned()),
+            crid: Some("bidder-a-creative".to_owned()),
             w: Some(300),
             h: Some(250),
-            adomain: vec!["example.com".to_string()],
+            adomain: vec!["example.com".to_owned()],
             ..Default::default()
         };
 
         let seatbid = SeatBid {
-            seat: Some("bidder-a".to_string()),
+            seat: Some("bidder-a".to_owned()),
             bid: vec![bid],
             ..Default::default()
         };
 
         let ext = ResponseExt {
             orchestrator: OrchestratorExt {
-                strategy: "parallel_only".to_string(),
+                strategy: "parallel_only".to_owned(),
                 providers: 2,
                 total_bids: 3,
                 time_ms: 12,
@@ -211,7 +201,7 @@ mod tests {
         .to_ext();
 
         let response = OpenRtbResponse {
-            id: Some("auction-1".to_string()),
+            id: Some("auction-1".to_owned()),
             seatbid: vec![seatbid],
             ext,
             ..Default::default()
@@ -252,8 +242,8 @@ mod tests {
         // Mirror the production pattern: build ext, then duplicate into top-level.
         let ext = RegsExt {
             gdpr: Some(1),
-            us_privacy: Some("1YNN".to_string()),
-            gpp: Some("DBACNY~CPXxRfA".to_string()),
+            us_privacy: Some("1YNN".to_owned()),
+            gpp: Some("DBACNY~CPXxRfA".to_owned()),
             gpp_sid: Some(vec![2, 6]),
         };
         let regs = Regs {
@@ -328,15 +318,14 @@ mod tests {
     #[test]
     fn user_serializes_dual_placement_consent() {
         let user = User {
-            id: Some("user-1".to_string()),
-            consent: Some("CPXxGfAPXxGfA".to_string()),
+            id: Some("user-1".to_owned()),
+            consent: Some("CPXxGfAPXxGfA".to_owned()),
             ext: UserExt {
-                consent: Some("CPXxGfAPXxGfA".to_string()),
+                consent: Some("CPXxGfAPXxGfA".to_owned()),
                 consented_providers_settings: Some(ConsentedProvidersSettings {
-                    consented_providers: Some("2~2628.2316~dv.".to_string()),
+                    consented_providers: Some("2~2628.2316~dv.".to_owned()),
                 }),
                 eids: None,
-                ec_fresh: None,
             }
             .to_ext(),
             ..Default::default()
@@ -361,7 +350,7 @@ mod tests {
     #[test]
     fn user_omits_consent_when_none() {
         let user = User {
-            id: Some("user-1".to_string()),
+            id: Some("user-1".to_owned()),
             consent: None,
             ext: None,
             ..Default::default()
@@ -377,9 +366,9 @@ mod tests {
     #[test]
     fn eid_serializes_correctly() {
         let eid = Eid {
-            source: "id5-sync.com".to_string(),
+            source: "id5-sync.com".to_owned(),
             uids: vec![Uid {
-                id: "ID5-abc123".to_string(),
+                id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
@@ -395,26 +384,6 @@ mod tests {
         assert!(
             serialized["uids"][0].get("ext").is_none(),
             "ext should be omitted when None"
-        );
-    }
-
-    #[test]
-    fn user_ext_serializes_ec_fresh_not_synthetic_fresh() {
-        let ext = UserExt {
-            consent: None,
-            consented_providers_settings: None,
-            eids: None,
-            ec_fresh: Some("true".to_string()),
-        };
-
-        let serialized = serde_json::to_value(&ext).expect("should serialize UserExt");
-        assert_eq!(
-            serialized["ec_fresh"], "true",
-            "ec_fresh should be present in serialized output"
-        );
-        assert!(
-            serialized.get("synthetic_fresh").is_none(),
-            "synthetic_fresh should not appear — field was renamed to ec_fresh"
         );
     }
 }

@@ -186,11 +186,12 @@ struct CloudflarePendingResponse {
 ///
 /// # Multi-provider auction limitation
 ///
-/// `send_async` eagerly awaits each request before returning. Multi-provider
-/// auctions (more than one DSP) are therefore not supported: `select` will
-/// return `PlatformError::HttpClient` when called with more than one pending
-/// request. Configure a single auction provider for Cloudflare Workers, or
-/// use the Fastly adapter for parallel DSP fan-out.
+/// `send_async` eagerly awaits each request before returning, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
+/// auction orchestrator rejects multi-provider configurations before any
+/// request launches. `select` keeps a defense-in-depth rejection for more
+/// than one pending request. Configure a single auction provider for
+/// Cloudflare Workers, or use the Fastly adapter for parallel DSP fan-out.
 ///
 /// Per-provider timeouts baked into the backend name are not enforced at the
 /// fetch layer; the Workers runtime's global CPU budget (~30 s on paid plans)
@@ -198,21 +199,96 @@ struct CloudflarePendingResponse {
 #[cfg(target_arch = "wasm32")]
 pub struct CloudflareHttpClient;
 
+/// Maximum buffered upstream response body, mirroring the Fastly adapter's cap.
+///
+/// Cloudflare Workers isolates have a bounded memory budget (~128 MB), so a
+/// large or hostile upstream could OOM the isolate. `execute` buffers the whole
+/// body via `resp.bytes()`, so it caps both the declared Content-Length and the
+/// materialized byte count at this limit.
+#[cfg(target_arch = "wasm32")]
+const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+/// Collect the lowercased tokens listed in the upstream `Connection:` header(s).
+///
+/// Every header named here is hop-by-hop (RFC 7230 §6.1) and must not be
+/// forwarded downstream.
+#[cfg(target_arch = "wasm32")]
+fn response_connection_tokens(resp: &worker::Response) -> Vec<String> {
+    resp.headers()
+        .entries()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| {
+            value
+                .split(',')
+                .map(|token| token.trim().to_ascii_lowercase())
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Returns `true` for hop-by-hop response headers that must not be forwarded
+/// downstream (RFC 7230 §6.1), including any header named in the upstream
+/// `Connection:` token list. Mirrors the Axum adapter's
+/// `is_hop_by_hop_response_header`. `transfer-encoding` is stripped separately
+/// at the call site alongside the other auto-decoded framing headers.
+#[cfg(target_arch = "wasm32")]
+fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bool {
+    const HOP_BY_HOP: [&str; 6] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "upgrade",
+    ];
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.iter().any(|header| *header == lower)
+        || connection_tokens.iter().any(|token| *token == lower)
+}
+
 #[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        use worker::{Fetch, Headers, Method, Request, RequestInit};
+        use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+
+        // The Cloudflare fetch path cannot honor Fastly-style Image Optimizer
+        // metadata, and it always buffers the response body (see below). The
+        // `PlatformHttpRequest` contract requires adapters that cannot honor
+        // these to reject rather than silently drop the behavior, so surface a
+        // typed error instead of returning an untransformed or fully-buffered
+        // response. These fields are only set by asset routes, which are not
+        // routed to the Cloudflare adapter today; the guard keeps the contract
+        // honest if that changes.
+        if request.image_optimizer.is_some() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("Image Optimizer is not supported on the Cloudflare Workers runtime"));
+        }
+        if request.stream_response {
+            return Err(Report::new(PlatformError::HttpClient).attach(
+                "streaming response bodies are not supported on the Cloudflare Workers runtime",
+            ));
+        }
 
         let uri = request.request.uri().to_string();
-        let method = Method::from(request.request.method().as_str().to_ascii_uppercase());
+        // http::Method always stores uppercase; worker 0.7 implements From<String> only.
+        let method = Method::from(request.request.method().to_string());
 
         let headers = Headers::new();
         for (name, value) in request.request.headers() {
+            let value_str = std::str::from_utf8(value.as_bytes())
+                .change_context(PlatformError::HttpClient)
+                .attach_with(|| {
+                    format!("non-UTF-8 bytes in outbound header `{name}` — value dropped")
+                })?;
+            // `append` rather than `set`: a request carrying the same header
+            // name more than once must forward every value, matching the
+            // response path which appends via `edge_builder.header(...)`.
             headers
-                .set(name.as_str(), &String::from_utf8_lossy(value.as_bytes()))
+                .append(name.as_str(), value_str)
                 .change_context(PlatformError::HttpClient)?;
         }
 
@@ -226,7 +302,16 @@ impl CloudflareHttpClient {
         };
 
         let mut init = RequestInit::new();
-        init.with_method(method).with_headers(headers);
+        // Force manual redirect handling: the Workers runtime otherwise defaults
+        // to `RequestRedirect::Follow` and transparently chases 3xx responses to
+        // any host inside `Fetch::send()`. Core's `proxy_with_redirects` does its
+        // own per-hop redirect handling and validates each next hop against
+        // `allowed_domains`; auto-following here would bypass that allowlist
+        // (SSRF). `Manual` surfaces the 3xx + Location back to core unfollowed,
+        // matching the Axum adapter's `redirect::Policy::none()`.
+        init.with_method(method)
+            .with_headers(headers)
+            .with_redirect(RequestRedirect::Manual);
         if !body_bytes.is_empty() {
             let uint8 = js_sys::Uint8Array::from(body_bytes.as_slice());
             init.with_body(Some(uint8.into()));
@@ -242,15 +327,47 @@ impl CloudflareHttpClient {
             .attach_with(|| format!("outbound request to {uri} failed"))?;
 
         let status = resp.status_code();
+
+        // Pre-flight: reject oversized responses before copying bytes into the
+        // isolate heap. Content-Length is advisory (and absent on chunked
+        // responses), so the post-buffer check below is the real guard; this
+        // just rejects honestly-declared large bodies cheaply. Mirrors the
+        // Fastly adapter's two-stage cap.
+        if let Some(claimed_len) = resp
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+                return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                    "origin Content-Length {claimed_len} exceeds \
+                     {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+                )));
+            }
+        }
+
+        let connection_tokens = response_connection_tokens(&resp);
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
         for (name, value) in resp.headers().entries() {
             // The Workers runtime auto-decompresses gzip/br/deflate and handles
             // chunked transfer — strip these headers so the proxy layer does not
             // attempt a second decompression pass on the already-decoded body.
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "content-encoding" | "transfer-encoding"
-            ) {
+            // Content-Length is stripped too: the origin value describes the
+            // compressed payload, not the decoded bytes returned by `bytes()`,
+            // and forwarding it stale would truncate pass-through responses.
+            // The accurate length is set from the decoded body below.
+            if name.eq_ignore_ascii_case("content-encoding")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("content-length")
+            {
+                continue;
+            }
+            // Strip hop-by-hop headers (and any header named in the upstream
+            // `Connection:` token list) so they are not forwarded downstream,
+            // matching the Axum adapter's `is_hop_by_hop_response_header`.
+            if is_hop_by_hop_response_header(&name, &connection_tokens) {
                 continue;
             }
             edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
@@ -259,6 +376,19 @@ impl CloudflareHttpClient {
             .bytes()
             .await
             .change_context(PlatformError::HttpClient)?;
+
+        // Belt-and-suspenders: catches chunked responses with no Content-Length.
+        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin response body {} bytes exceeds \
+                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
+                body_bytes.len()
+            )));
+        }
+        edge_builder = edge_builder.header(
+            edgezero_core::http::header::CONTENT_LENGTH,
+            body_bytes.len(),
+        );
         let edge_resp = edge_builder
             .body(edgezero_core::body::Body::from(body_bytes))
             .change_context(PlatformError::HttpClient)?;
@@ -277,6 +407,13 @@ impl PlatformHttpClient for CloudflareHttpClient {
         self.execute(request).await
     }
 
+    fn supports_concurrent_fanout(&self) -> bool {
+        // `send_async` executes each request eagerly, so multiple pending
+        // requests run sequentially. The auction orchestrator checks this
+        // before launching more than one provider request.
+        false
+    }
+
     async fn send_async(
         &self,
         request: PlatformHttpRequest,
@@ -293,10 +430,14 @@ impl PlatformHttpClient for CloudflareHttpClient {
             .collect();
         let body_bytes = match response.response.into_body() {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            // execute() always buffers via resp.bytes().await → Body::Once, so
-            // this branch is unreachable in practice.
+            // execute() always buffers via resp.bytes().await → Body::Once.
+            // Return a typed error rather than panicking in the request path
+            // in case that edgezero implementation detail ever changes.
             edgezero_core::body::Body::Stream(_) => {
-                unreachable!("CloudflareHttpClient::execute always returns Body::Once")
+                return Err(Report::new(PlatformError::HttpClient).attach(
+                    "unexpected streaming body from CloudflareHttpClient::execute \
+                     — expected a buffered Body::Once",
+                ));
             }
         };
 
@@ -318,20 +459,7 @@ impl PlatformHttpClient for CloudflareHttpClient {
                 .attach("select called with an empty pending_requests list"));
         }
 
-        // Cloudflare Workers does not support concurrent fetch calls through the
-        // ?Send PlatformHttpClient interface. send_async() executes each request
-        // eagerly, so multi-provider auctions accrue sum(DSP_i) latency instead
-        // of max(DSP_i) and per-provider timeouts baked into the backend name are
-        // not enforced. Reject multi-provider fan-out loudly rather than silently
-        // degrading the auction budget.
-        if pending_requests.len() >= 2 {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "CloudflareHttpClient: multi-provider fan-out is not supported \
-                 ({} providers submitted). Configure a single auction provider \
-                 or use the Fastly adapter for parallel DSP fan-out.",
-                pending_requests.len()
-            )));
-        }
+        reject_multi_provider_fanout(pending_requests.len())?;
 
         let ready_platform = pending_requests.remove(0);
         let pending = ready_platform
@@ -353,6 +481,7 @@ impl PlatformHttpClient for CloudflareHttpClient {
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
+            failed_backend_name: None,
         })
     }
 }
@@ -381,6 +510,10 @@ impl PlatformSecretStore for CloudflareSecretStoreAdapter {
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         match self.env.secret(key) {
+            // worker 0.7: Secret implements Display via JsValue::as_string() which
+            // returns the raw JS string value with no wrapping or debug formatting.
+            // Verified in worker-rs src/env.rs: `impl Display for Secret { fn fmt ->
+            // write!(f, "{}", self.inner.as_string().unwrap_or_default()) }`.
             Ok(secret) => Ok(secret.to_string().into_bytes()),
             Err(err) => Err(Report::new(PlatformError::SecretStore)
                 .attach(format!("secret lookup failed for key `{key}`: {err}"))),
@@ -464,6 +597,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             client_ip,
             tls_protocol: None,
             tls_cipher: None,
+            ..ClientInfo::default()
         })
         .build()
 }
@@ -499,6 +633,7 @@ impl PlatformGeo for CloudflareGeo {
             longitude: self.longitude,
             metro_code: 0,
             region: None,
+            asn: None,
         }))
     }
 }
@@ -548,6 +683,32 @@ fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpA
         .and_then(|s| s.parse().ok())
 }
 
+/// Reject multi-provider auction fan-out at the Cloudflare adapter level.
+///
+/// Cloudflare Workers executes `send_async` eagerly (no true concurrency), so
+/// N simultaneous DSP requests run sequentially and accrue `sum(latencies)`
+/// instead of `max(latencies)`.
+///
+/// The primary guard lives in the auction orchestrator, which checks
+/// `supports_concurrent_fanout()` and rejects multi-provider configurations
+/// before any request launches. This `select`-time rejection is
+/// defense-in-depth for callers that bypass that check.
+///
+/// Extracted as a free function so the critical control-flow is testable on
+/// native targets where the `#[cfg(target_arch = "wasm32")]` `select` impl
+/// is excluded from the test binary.
+#[cfg(any(target_arch = "wasm32", test))]
+fn reject_multi_provider_fanout(len: usize) -> Result<(), Report<PlatformError>> {
+    if len >= 2 {
+        return Err(Report::new(PlatformError::HttpClient).attach(format!(
+            "CloudflareHttpClient: multi-provider fan-out is not supported \
+             ({len} providers submitted). Configure a single auction provider \
+             or use the Fastly adapter for parallel DSP fan-out."
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,9 +720,12 @@ mod tests {
         let req = request_builder()
             .method("GET")
             .uri("https://example.com/")
-            .header(name, HeaderValue::from_str(value).unwrap())
+            .header(
+                name,
+                HeaderValue::from_str(value).expect("should parse test header value"),
+            )
             .body(edgezero_core::body::Body::empty())
-            .unwrap();
+            .expect("should build test request");
         RequestContext::new(req, PathParams::default())
     }
 
@@ -570,7 +734,7 @@ mod tests {
             .method("GET")
             .uri("https://example.com/")
             .body(edgezero_core::body::Body::empty())
-            .unwrap();
+            .expect("should build test request");
         RequestContext::new(req, PathParams::default())
     }
 
@@ -580,7 +744,7 @@ mod tests {
         let ip = extract_client_ip(&ctx);
         assert_eq!(
             ip,
-            Some("203.0.113.42".parse().unwrap()),
+            Some("203.0.113.42".parse().expect("should parse test IP")),
             "should parse cf-connecting-ip header"
         );
     }
@@ -622,7 +786,9 @@ mod tests {
         let ctx = make_ctx_without_header();
         let geo = build_geo(&ctx);
         assert!(
-            geo.lookup(None).unwrap().is_none(),
+            geo.lookup(None)
+                .expect("should perform geo lookup")
+                .is_none(),
             "should return None when no country header"
         );
     }
@@ -638,12 +804,12 @@ mod tests {
             .header("cf-iplatitude", HeaderValue::from_static("40.71"))
             .header("cf-iplongitude", HeaderValue::from_static("-74.01"))
             .body(edgezero_core::body::Body::empty())
-            .unwrap();
+            .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
         let geo = build_geo(&ctx);
         let info = geo
             .lookup(None)
-            .unwrap()
+            .expect("should perform geo lookup")
             .expect("should return GeoInfo when country is set");
         assert_eq!(info.country, "US", "should populate country");
         assert_eq!(info.city, "New York", "should populate city");
@@ -655,6 +821,44 @@ mod tests {
         assert!(
             (info.longitude - (-74.01)).abs() < 0.01,
             "should populate longitude"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // reject_multi_provider_fanout tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn reject_multi_provider_fanout_passes_empty() {
+        assert!(
+            reject_multi_provider_fanout(0).is_ok(),
+            "len=0 should pass (empty list caught separately in select)"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_passes_single_provider() {
+        assert!(
+            reject_multi_provider_fanout(1).is_ok(),
+            "single provider should be allowed"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_rejects_two_providers() {
+        assert!(
+            reject_multi_provider_fanout(2).is_err(),
+            "len=2 should be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_multi_provider_fanout_rejects_five_providers() {
+        let err = reject_multi_provider_fanout(5).expect_err("should reject five providers");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("5"),
+            "error message should include provider count"
         );
     }
 }

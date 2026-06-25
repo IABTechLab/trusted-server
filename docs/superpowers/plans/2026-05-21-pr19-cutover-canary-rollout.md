@@ -17,11 +17,11 @@
 
 ## File map
 
-| Action | Path                                               | What changes                                                                                                                            |
-| ------ | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Modify | `crates/trusted-server-adapter-fastly/src/main.rs` | Add `EDGEZERO_ROLLOUT_PCT_KEY`, `parse_rollout_pct`, `fnv1a_bucket`, `canary_routes_to_edgezero`, `read_rollout_pct`; refactor `main()` |
-| Modify | `fastly.toml`                                      | Add `edgezero_rollout_pct = "0"` to local config store with comment                                                                     |
-| Create | `docs/internal/EDGEZERO_MIGRATION.md`              | Ops runbook: config keys, canary progression, hold points, thresholds, rollback                                                         |
+| Action | Path                                               | What changes                                                                                                                                                                                              |
+| ------ | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Modify | `crates/trusted-server-adapter-fastly/src/main.rs` | Add `EDGEZERO_ROLLOUT_PCT_KEY`, `parse_rollout_pct`, `fnv1a_bucket`, `routes_to_edgezero`, `read_rollout_pct`; refactor `main()` and unit-test config-store defaults with an in-memory `ConfigStore` stub |
+| Modify | `fastly.toml`                                      | Add `edgezero_rollout_pct = "0"` to local config store with comment                                                                                                                                       |
+| Create | `docs/internal/EDGEZERO_MIGRATION.md`              | Ops runbook: config keys, canary progression, hold points, thresholds, rollback                                                                                                                           |
 
 ---
 
@@ -35,22 +35,28 @@ Current `main()` flow (lines 129–159):
 2. Check `edgezero_enabled` flag — if false/err → `legacy_main`
 3. If true → `edgezero_main`
 
-**No** `edgezero_rollout_pct` key exists anywhere yet. After this PR the flow becomes:
+At the start of this PR, no `edgezero_rollout_pct` key existed. The final flow is:
 
 1. Open config store — on error → `legacy_main`
 2. Check `edgezero_enabled` — if false/err → `legacy_main`
-3. Read `rollout_pct` from `read_rollout_pct()` (absent key = 100, invalid = 0-safe)
+3. Read `rollout_pct` from `read_rollout_pct()` (absent / invalid / unreadable all = 0, fail safe to legacy)
 4. Compute `bucket = fnv1a_bucket(client_ip_string)`
 5. If `bucket < rollout_pct` → `edgezero_main`, else → `legacy_main`
 
-`ConfigStoreHandle` comes from `edgezero_core::config_store` and cannot be constructed in unit tests (needs Fastly runtime). Test only pure functions.
+`ConfigStoreHandle` can be constructed in unit tests from an in-memory
+`edgezero_core::config_store::ConfigStore` implementation. The final PR uses
+that stub to cover `read_rollout_pct` branches for absent, valid, invalid,
+out-of-range, and read-error config-store states, and pins the exact
+`edgezero_rollout_pct` key.
 
 Run tests with: `cargo test-fastly` (compiles to wasm32-wasip1 and runs under Viceroy).
 
-> **Note on routing key:** The spec (§Cutover plan) says "hash of request ID." This plan uses
-> client IP instead, which gives sticky per-user routing — the same user always gets the same
-> path during the canary, preventing split-session bugs. Request ID changes per-request and
-> would route a single user's session across both paths simultaneously.
+> **Note on routing key:** Earlier spec drafts mentioned hashing a request ID.
+> The final implementation hashes client IP instead, which gives sticky
+> per-client-IP routing — the same IP always gets the same path during the
+> canary, preventing split-session bugs (though a user whose IP changes may
+> re-bucket). Request ID changes per-request and would route a single user's
+> session across both paths simultaneously.
 
 ---
 
@@ -66,7 +72,7 @@ git checkout -b feature/edgezero-pr19-cutover-canary
 
 ---
 
-## Task 1: Pure routing helpers — `parse_rollout_pct`, `fnv1a_bucket`, `canary_routes_to_edgezero`
+## Task 1: Pure routing helpers — `parse_rollout_pct`, `fnv1a_bucket`, `routes_to_edgezero`
 
 **Files:**
 
@@ -170,14 +176,14 @@ fn empty_key_bucket_is_valid() {
 }
 
 // ---------------------------------------------------------------------------
-// canary_routes_to_edgezero
+// routes_to_edgezero
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rollout_zero_routes_all_to_legacy() {
     for bucket in 0u8..100 {
         assert!(
-            !canary_routes_to_edgezero(bucket, 0),
+            !routes_to_edgezero(bucket, 0),
             "pct=0 should route all to legacy, bucket={bucket}"
         );
     }
@@ -187,7 +193,7 @@ fn rollout_zero_routes_all_to_legacy() {
 fn rollout_hundred_routes_all_to_edgezero() {
     for bucket in 0u8..100 {
         assert!(
-            canary_routes_to_edgezero(bucket, 100),
+            routes_to_edgezero(bucket, 100),
             "pct=100 should route all to EdgeZero, bucket={bucket}"
         );
     }
@@ -196,7 +202,7 @@ fn rollout_hundred_routes_all_to_edgezero() {
 #[test]
 fn rollout_fifty_routes_exactly_half_of_bucket_space() {
     let edgezero_count = (0u8..100)
-        .filter(|&b| canary_routes_to_edgezero(b, 50))
+        .filter(|&b| routes_to_edgezero(b, 50))
         .count();
     assert_eq!(
         edgezero_count, 50,
@@ -207,7 +213,7 @@ fn rollout_fifty_routes_exactly_half_of_bucket_space() {
 #[test]
 fn rollout_one_routes_exactly_one_bucket() {
     let edgezero_count = (0u8..100)
-        .filter(|&b| canary_routes_to_edgezero(b, 1))
+        .filter(|&b| routes_to_edgezero(b, 1))
         .count();
     assert_eq!(
         edgezero_count, 1,
@@ -219,10 +225,10 @@ fn rollout_one_routes_exactly_one_bucket() {
 - [ ] **Step 2: Run tests — verify they FAIL**
 
 ```bash
-cargo test-fastly 2>&1 | head -40
+cargo test-fastly
 ```
 
-Expected: compile errors for `parse_rollout_pct`, `fnv1a_bucket`, `canary_routes_to_edgezero` not found.
+Expected: compile errors for `parse_rollout_pct`, `fnv1a_bucket`, `routes_to_edgezero` not found.
 
 - [ ] **Step 3: Implement the three pure functions**
 
@@ -264,7 +270,7 @@ fn fnv1a_bucket(key: &str) -> u8 {
 /// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
 /// When `rollout_pct = 0` no bucket ever routes to EdgeZero (instant rollback).
 /// When `rollout_pct = 100` every bucket routes to EdgeZero (full cutover).
-fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
+fn routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
     bucket < rollout_pct
 }
 ```
@@ -272,7 +278,7 @@ fn canary_routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
 - [ ] **Step 4: Run tests — verify they PASS**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: `test result: ok. N passed; 0 failed`
@@ -281,7 +287,7 @@ Expected: `test result: ok. N passed; 0 failed`
 
 ```bash
 git add crates/trusted-server-adapter-fastly/src/main.rs
-git commit -m "Add canary routing helpers: parse_rollout_pct, fnv1a_bucket, canary_routes_to_edgezero"
+git commit -m "Add canary routing helpers: parse_rollout_pct, fnv1a_bucket, routes_to_edgezero"
 ```
 
 ---
@@ -292,7 +298,11 @@ git commit -m "Add canary routing helpers: parse_rollout_pct, fnv1a_bucket, cana
 
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs`
 
-`read_rollout_pct` wraps `ConfigStoreHandle` which requires the Fastly runtime, so no unit test for it — we rely on the `parse_rollout_pct` tests above covering its parse logic. The `main()` refactor is exercised by the full `cargo test-fastly` run.
+`read_rollout_pct` wraps `ConfigStoreHandle`, but it can still be unit-tested by
+constructing the handle from an in-memory `ConfigStore` stub. Cover absent,
+valid, invalid, out-of-range, and read-error states directly, and assert the stub
+is queried with `EDGEZERO_ROLLOUT_PCT_KEY`. The `main()` refactor is exercised by
+the full `cargo test-fastly` run.
 
 - [ ] **Step 1: Add the `EDGEZERO_ROLLOUT_PCT_KEY` constant**
 
@@ -311,7 +321,7 @@ Add after the `is_edgezero_enabled` function (after line 114):
 ///
 /// | Config store state              | Return value | Effect                     |
 /// |---------------------------------|--------------|----------------------------|
-/// | Key absent                      | `100`        | Full rollout (backward compat) |
+/// | Key absent                      | `0`          | All legacy (safe default)  |
 /// | Key present, valid 0–100        | parsed value | Partial or full rollout    |
 /// | Key present, invalid            | `0`          | All legacy (safe default)  |
 /// | Key read error                  | `0`          | All legacy (safe default)  |
@@ -322,13 +332,22 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
             Some(pct) => pct,
             None => {
                 log::warn!(
-                    "invalid edgezero_rollout_pct value {:?}, defaulting to 0 (legacy path)",
-                    value
+                    "invalid edgezero_rollout_pct value, defaulting to 0 (legacy path)"
                 );
                 0
             }
         },
-        Ok(None) => 100,
+        Ok(None) => {
+            // Absent key fails safe to legacy, matching every other failure branch
+            // (unreadable flag, invalid value, read error all resolve to legacy).
+            // Deleting the key can never trigger a full cutover. Fires per-request
+            // when the key is absent and edgezero_enabled=true, so emit at debug to
+            // avoid a per-request log flood at production QPS.
+            log::debug!(
+                "edgezero_rollout_pct key absent, defaulting to 0 (legacy path — fail safe)"
+            );
+            0
+        }
         Err(e) => {
             log::warn!(
                 "failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)"
@@ -382,7 +401,7 @@ fn main() {
         .unwrap_or_default();
     let bucket = fnv1a_bucket(&routing_key);
 
-    if canary_routes_to_edgezero(bucket, rollout_pct) {
+    if routes_to_edgezero(bucket, rollout_pct) {
         log::debug!(
             "routing request through EdgeZero path (bucket={bucket}, rollout_pct={rollout_pct})"
         );
@@ -399,19 +418,19 @@ fn main() {
 - [ ] **Step 4: Run tests, fmt, and clippy**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: all tests pass.
 
 ```bash
-cargo fmt --all -- --check 2>&1 | tail -10
+cargo fmt --all -- --check
 ```
 
 Expected: no diff. If there is output, run `cargo fmt --all` to fix, then re-check.
 
 ```bash
-cargo clippy -p trusted-server-adapter-fastly --all-targets --all-features -- -D warnings 2>&1 | tail -20
+cargo clippy-fastly
 ```
 
 Expected: no warnings. (`--all-targets` covers the test binary so the new test code is also linted.)
@@ -425,11 +444,11 @@ git commit -m "Add edgezero_rollout_pct canary routing to Fastly entry point
 When edgezero_enabled=true, reads edgezero_rollout_pct (0-100) from the
 trusted_server_config store. Routes each request to EdgeZero if
 fnv1a_bucket(client_ip) < rollout_pct, giving the ops team sticky
-per-user canary control without a deploy.
+per-client-IP canary control without a deploy.
 
-Absent key defaults to 100 (full rollout, backward compatible with
-edgezero_enabled=true deployments that predate this PR). Invalid values
-and read errors default to 0 (all legacy, fail-safe)."
+Absent, invalid, and unreadable values all default to 0 (all legacy,
+fail-safe), matching every other failure branch — deleting the key can
+never trigger a cutover."
 ```
 
 ---
@@ -454,15 +473,15 @@ In `fastly.toml`, within `[local_server.config_stores.trusted_server_config.cont
             #   0    -> all traffic to legacy (instant rollback — no deploy needed)
             #   1-99 -> canary: clients whose fnv1a_bucket(client_ip) < this value go EdgeZero
             #   100  -> all traffic to EdgeZero (full cutover)
-            # Key absent when edgezero_enabled = "true" is treated as 100 (full rollout).
-            # IMPORTANT: Set this to "0" in production BEFORE setting edgezero_enabled = "true".
+            # Absent, invalid, or unreadable all fail safe to legacy (0), so deleting
+            # the key can never trigger a cutover. Set an explicit percentage to roll out.
             edgezero_rollout_pct = "0"
 ```
 
 - [ ] **Step 2: Verify local Viceroy still starts without errors**
 
 ```bash
-cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 2>&1 | tail -5
+cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1
 ```
 
 Expected: `Finished release profile [optimized] target(s)`
@@ -508,38 +527,37 @@ epic [#480](https://github.com/IABTechLab/trusted-server/issues/480)).
 
 Config store name: **`trusted_server_config`** (Fastly service config store)
 
-| Key                    | Type                 | Effect                                                                                                                            |
-| ---------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                      |
-| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"100"`. |
+| Key                    | Type                 | Effect                                                                                                                                                |
+| ---------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `"true"` / `"false"` | Master on/off switch. Set `"false"` to disable EdgeZero entirely, regardless of rollout_pct.                                                          |
+| `edgezero_rollout_pct` | `"0"` – `"100"`      | Percentage of traffic (by client IP bucket) routed to EdgeZero. Only read when `edgezero_enabled = "true"`. Key absent = `"0"` (fail safe to legacy). |
 
 **Routing logic:** `fnv1a_bucket(client_ip) < edgezero_rollout_pct` → EdgeZero, else legacy.
-Same client IP always gets the same bucket — routing is sticky per user.
+Same client IP always gets the same bucket — routing is sticky per client IP (not per
+user; a user whose IP changes may re-bucket and switch paths).
+
+> The canonical operational runbook is `docs/internal/EDGEZERO_MIGRATION.md`; this embedded
+> copy is a planning snapshot. Defer to that file if the two ever diverge.
 
 ### Safe defaults / failure modes
 
-| Condition                                           | Effective behaviour   |
-| --------------------------------------------------- | --------------------- |
-| Config store unreachable                            | All legacy            |
-| `edgezero_enabled` unreadable                       | All legacy            |
-| `edgezero_rollout_pct` absent (but enabled=true)    | All EdgeZero (100%)   |
-| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy            |
-| `edgezero_rollout_pct = "0"`                        | All legacy (rollback) |
+| Condition                                           | Effective behaviour    |
+| --------------------------------------------------- | ---------------------- |
+| Config store unreachable                            | All legacy             |
+| `edgezero_enabled` unreadable                       | All legacy             |
+| `edgezero_rollout_pct` absent (but enabled=true)    | All legacy (fail safe) |
+| `edgezero_rollout_pct` invalid (non-integer, > 100) | All legacy             |
+| `edgezero_rollout_pct = "0"`                        | All legacy (rollback)  |
 
-> ⚠️ **Do NOT delete `edgezero_rollout_pct` while `edgezero_enabled = "true"`.** An absent key
-> is treated as 100 (full rollout) for backward compatibility. If you want to pause or roll back,
-> **set the value to `"0"`** — do not delete it.
+> **Note:** Every non-explicit state fails safe to legacy — an absent, invalid, or unreadable
+> `edgezero_rollout_pct` all route 100% to the legacy path, so deleting the key can never trigger
+> a cutover. To roll out, set an explicit percentage; to pause or roll back, set `"0"`.
 
 ---
 
 ## Canary progression
 
 > **Pre-condition:** All Phase 5 verification gates (PR18) passed.
->
-> **Production key setup order (important):** Set `edgezero_rollout_pct = "0"` in the
-> production config store **before** setting `edgezero_enabled = "true"`. If you set
-> `edgezero_enabled` first and `edgezero_rollout_pct` is absent, the absent-key default
-> (100) kicks in immediately, routing all traffic to EdgeZero without a staged canary.
 
 ### Stage 1 — 1%
 
@@ -607,14 +625,23 @@ Rollback is **immediate, no deploy required**.
 
 ## Monitoring
 
-Fastly real-time stats dashboard. Key signals at each canary stage:
+Fastly real-time stats dashboard, **aggregate service metrics only**. There is no
+production per-branch (EdgeZero vs legacy) route attribution: route-decision logs are
+emitted at `debug!`, and production Compute keeps the logger at `Info`, so they
+appear only in local Viceroy runs. No `x-edgezero-path` / real-time-stats branch split
+exists yet (tracked as a follow-up). Verify each stage by watching aggregate metrics move
+as `rollout_pct` is stepped, not by per-request branch tagging.
+
+Key signals at each canary stage:
 
 - **Error rate:** `5xx / total_requests` by edge PoP
-- **Latency p95:** use log search for `routing request through EdgeZero path` to identify EdgeZero traffic (`x-edgezero-path` instrumentation header does not exist yet — follow-up task)
+- **Latency p95:** aggregate service latency; correlate shifts with the active `rollout_pct` stage
 - **Auction win-rate:** downstream SSP reporting, compare same-day prior week
 - **Timeout rate:** `504 / total_requests`
 
-> Log lines in Viceroy / Fastly log tailing:
+> Route-decision log lines are **local Viceroy only** (the logger auto-raises to
+> `debug` under Viceroy via `FASTLY_HOSTNAME=localhost`; production stays at `Info`
+> and suppresses them):
 > `routing request through EdgeZero path (bucket=N, rollout_pct=M)` — confirms canary traffic.
 > `routing request through legacy path (bucket=N, rollout_pct=M)` — confirms legacy traffic.
 
@@ -638,7 +665,7 @@ cd docs && cat package.json | grep -A3 '"format"'
 If the glob is `"*.md"` (flat), update it to `"**/*.md"` before proceeding. Then:
 
 ```bash
-cd docs && npm run format -- --check 2>&1 | tail -10
+cd docs && npm run format -- --check
 ```
 
 Expected: `All matched files use Prettier code style!` (or no diff output)
@@ -663,7 +690,7 @@ instant rollback procedure."
 - [ ] **Run full test suite**
 
 ```bash
-cargo test-fastly 2>&1 | tail -20
+cargo test-fastly
 ```
 
 Expected: all tests pass, including the 10 new canary routing tests.
@@ -671,8 +698,8 @@ Expected: all tests pass, including the 10 new canary routing tests.
 - [ ] **Run fmt and clippy**
 
 ```bash
-cargo fmt --all -- --check 2>&1 | tail -10
-cargo clippy -p trusted-server-adapter-fastly --all-targets --all-features -- -D warnings 2>&1 | tail -10
+cargo fmt --all -- --check
+cargo clippy-fastly
 ```
 
 Expected: both clean.
@@ -707,7 +734,6 @@ Open PR:
 ## Invariants to preserve
 
 - **No new dependencies** — FNV-1a is inlined, not a crate import.
-- **Backward compatible** — `edgezero_rollout_pct` absent + `edgezero_enabled=true` still means 100% EdgeZero, matching pre-PR19 behavior.
-- **Fail-safe** — any error reading `edgezero_rollout_pct` produces 0 (all legacy), never 100. Avoids a misconfigured key accidentally routing all traffic to EdgeZero.
+- **Fail-safe** — absent, invalid, or unreadable `edgezero_rollout_pct` all produce 0 (all legacy), never 100. A missing or misconfigured key can never accidentally route traffic to EdgeZero; rollout requires an explicit percentage.
 - **No handler or core changes** — all changes are confined to `main.rs` entry-point logic and `fastly.toml`.
-- **Sticky routing** — client IP hash is deterministic; the same user always gets the same path at a given `rollout_pct`, preventing split-session bugs.
+- **Sticky routing** — client IP hash is deterministic; the same client IP gets the same path at a given `rollout_pct`, but NAT sharing and IP changes can re-bucket users.

@@ -1,7 +1,7 @@
 // NOTE: This file is also included in build.rs via #[path].
 // It must remain self-contained (no `crate::` imports).
 
-//! A wrapper type that redacts sensitive values in [`Debug`] and [`Display`] output.
+//! A wrapper type that redacts sensitive values in [`Debug`] and [`fmt::Display`] output.
 //!
 //! Use [`Redacted`] for secrets, passwords, API keys, and other sensitive values
 //! that must never appear in logs or error messages.
@@ -10,7 +10,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Wraps a value so that [`Debug`] and [`Display`] print `[REDACTED]`
+/// Wraps a value so that [`Debug`] and [`fmt::Display`] print `[REDACTED]`
 /// instead of the inner contents.
 ///
 /// Access the real value via [`expose`](Redacted::expose). Callers must
@@ -31,7 +31,10 @@ pub struct Redacted<T>(T);
 
 impl<T> Redacted<T> {
     /// Creates a new [`Redacted`] value.
-    #[allow(dead_code)] // Used by the library crate but not by build.rs which includes this file via #[path]
+    #[allow(
+        dead_code,
+        reason = "used by the library crate but not by build.rs path inclusion"
+    )]
     pub fn new(value: T) -> Self {
         Self(value)
     }
@@ -74,9 +77,9 @@ mod tests {
 
     #[test]
     fn debug_output_is_redacted() {
-        let secret = Redacted::new("super-secret".to_string());
+        let secret = Redacted::new("super-secret".to_owned());
         assert_eq!(
-            format!("{:?}", secret),
+            format!("{secret:?}"),
             "[REDACTED]",
             "should print [REDACTED] in debug output"
         );
@@ -84,9 +87,9 @@ mod tests {
 
     #[test]
     fn display_output_is_redacted() {
-        let secret = Redacted::new("super-secret".to_string());
+        let secret = Redacted::new("super-secret".to_owned());
         assert_eq!(
-            format!("{}", secret),
+            format!("{secret}"),
             "[REDACTED]",
             "should print [REDACTED] in display output"
         );
@@ -94,7 +97,7 @@ mod tests {
 
     #[test]
     fn expose_returns_inner_value() {
-        let secret = Redacted::new("super-secret".to_string());
+        let secret = Redacted::new("super-secret".to_owned());
         assert_eq!(
             secret.expose(),
             "super-secret",
@@ -110,13 +113,13 @@ mod tests {
 
     #[test]
     fn from_string_creates_redacted() {
-        let secret = Redacted::from("my-key".to_string());
+        let secret = Redacted::from("my-key".to_owned());
         assert_eq!(secret.expose(), "my-key", "should create from String");
     }
 
     #[test]
     fn clone_preserves_inner_value() {
-        let secret = Redacted::new("cloneable".to_string());
+        let secret = Redacted::new("cloneable".to_owned());
         let cloned = secret.clone();
         assert_eq!(
             cloned.expose(),
@@ -127,7 +130,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let secret = Redacted::new("serialize-me".to_string());
+        let secret = Redacted::new("serialize-me".to_owned());
         let json = serde_json::to_string(&secret).expect("should serialize");
         assert_eq!(json, "\"serialize-me\"", "should serialize transparently");
 
@@ -143,18 +146,21 @@ mod tests {
     #[test]
     fn struct_with_redacted_field_debug() {
         #[derive(Debug)]
-        #[allow(dead_code)]
+        #[allow(
+            dead_code,
+            reason = "test fixture fields are read only through derived Debug output"
+        )]
         struct Config {
             name: String,
             api_key: Redacted<String>,
         }
 
         let config = Config {
-            name: "test".to_string(),
-            api_key: Redacted::new("secret-key-123".to_string()),
+            name: "test".to_owned(),
+            api_key: Redacted::new("secret-key-123".to_owned()),
         };
 
-        let debug = format!("{:?}", config);
+        let debug = format!("{config:?}");
         assert!(
             debug.contains("[REDACTED]"),
             "should contain [REDACTED] for the api_key field"

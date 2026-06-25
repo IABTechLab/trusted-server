@@ -5,13 +5,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::{HeaderValue, Method, Request, Response};
+use http::{Method, Request, Response};
 use matchit::Router;
 
 use crate::constants::HEADER_X_TS_EC;
-use crate::cookies::set_ec_cookie;
-use crate::edge_cookie::get_or_generate_ec_id;
+use crate::ec::kv::KvIdentityGraph;
+use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::geo::GeoInfo;
+use crate::http_util::is_navigation_request;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -134,10 +136,9 @@ impl IntegrationDocumentState {
             .inner
             .lock()
             .expect("should lock integration document state");
-        guard.get(integration_id).and_then(|value| {
-            let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
-            cloned.downcast::<T>().ok()
-        })
+        let value = guard.get(integration_id)?;
+        let cloned: Arc<dyn Any + Send + Sync> = Arc::clone(value);
+        cloned.downcast::<T>().ok()
     }
 
     /// Retrieves or initializes a value for an integration.
@@ -248,8 +249,8 @@ impl IntegrationEndpoint {
 /// `Send + Sync` bounds are required so trait objects can be stored in
 /// `Arc<dyn IntegrationProxy>` and shared across the single-threaded WASM
 /// request context. The `?Send` on the async methods is intentional — see the
-/// `!Send` design rationale on [`PlatformPendingRequest`] for the full
-/// explanation. On wasm32 these bounds are compatible because the runtime is
+/// `!Send` design rationale on [`crate::platform::PlatformPendingRequest`] for
+/// the full explanation. On wasm32 these bounds are compatible because the runtime is
 /// single-threaded.
 #[async_trait(?Send)]
 pub trait IntegrationProxy: Send + Sync {
@@ -257,8 +258,24 @@ pub trait IntegrationProxy: Send + Sync {
     /// Use this with the `namespaced_*` helper methods to automatically prefix routes.
     fn integration_name(&self) -> &'static str;
 
+    /// Returns the URL path prefix for this integration's proxy routes.
+    ///
+    /// Override this to provide a custom, customer-specific proxy path that is
+    /// harder for ad blockers to target. When not overridden, defaults to
+    /// `/integrations/{integration_name()}`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn proxy_prefix(&self) -> String {
+    ///     "/my-custom-path".to_string()  // instead of /integrations/didomi
+    /// }
+    /// ```
+    fn proxy_prefix(&self) -> String {
+        format!("/integrations/{}", self.integration_name())
+    }
+
     /// Routes handled by this integration.
-    /// to automatically namespace routes under `/integrations/{integration_name()}/`,
+    /// to automatically namespace routes under the proxy prefix,
     /// or define routes manually for backwards compatibility.
     fn routes(&self) -> Vec<IntegrationEndpoint>;
 
@@ -271,63 +288,227 @@ pub trait IntegrationProxy: Send + Sync {
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>>;
 
     /// Helper to create a namespaced GET endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.namespaced_get("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn get(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::get(full_path)
     }
 
     /// Helper to create a namespaced POST endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.post("/auction")  // becomes /integrations/my_integration/auction
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn post(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::post(full_path)
     }
 
     /// Helper to create a namespaced PUT endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.put("/users")  // becomes /integrations/my_integration/users
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn put(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::put(full_path)
     }
 
     /// Helper to create a namespaced DELETE endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.delete("/users/123")  // becomes /integrations/my_integration/users/123
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn delete(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::delete(full_path)
     }
 
     /// Helper to create a namespaced PATCH endpoint.
-    /// Automatically prefixes the path with `/integrations/{integration_name()}`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// self.patch("/settings")  // becomes /integrations/my_integration/settings
-    /// ```
+    /// Automatically prefixes the path with the integration's `proxy_prefix()`.
     fn patch(&self, path: &str) -> IntegrationEndpoint {
-        let full_path = format!("/integrations/{}{}", self.integration_name(), path);
+        let full_path = format!("{}{}", self.proxy_prefix(), path);
         IntegrationEndpoint::patch(full_path)
+    }
+}
+
+/// Input passed to integration request filters.
+pub struct RequestFilterInput<'a> {
+    pub settings: &'a Settings,
+    pub services: &'a RuntimeServices,
+    pub request: &'a Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
+    /// Whether the request matches a registered integration proxy route.
+    pub is_integration_route: bool,
+}
+
+/// How a header mutation should be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderMutationMode {
+    Set,
+    Append,
+}
+
+/// Header mutation requested by an integration filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderMutation {
+    pub name: String,
+    pub value: String,
+    pub mode: HeaderMutationMode,
+}
+
+impl HeaderMutation {
+    #[must_use]
+    pub fn set(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            mode: HeaderMutationMode::Set,
+        }
+    }
+
+    #[must_use]
+    pub fn append(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            mode: HeaderMutationMode::Append,
+        }
+    }
+}
+
+/// Request and response effects returned by request filters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFilterEffects {
+    pub request_headers: Vec<HeaderMutation>,
+    pub response_headers: Vec<HeaderMutation>,
+}
+
+impl RequestFilterEffects {
+    fn extend(&mut self, next: Self) {
+        self.request_headers.extend(next.request_headers);
+        self.response_headers.extend(next.response_headers);
+    }
+
+    fn apply_to_request(&self, req: &mut Request<EdgeBody>) {
+        for mutation in &self.request_headers {
+            apply_header_mutation_to_request(req, mutation);
+        }
+    }
+
+    pub fn apply_to_response(&self, response: &mut Response<EdgeBody>) {
+        for mutation in &self.response_headers {
+            apply_header_mutation_to_response(response, mutation);
+        }
+    }
+}
+
+/// Decision returned by an integration request filter.
+pub enum RequestFilterDecision {
+    Continue(RequestFilterEffects),
+    Respond {
+        response: Box<Response<EdgeBody>>,
+        effects: RequestFilterEffects,
+    },
+}
+
+/// Input passed to [`IntegrationRegistry::filter_request`].
+pub struct RequestFilterRegistryInput<'a> {
+    pub settings: &'a Settings,
+    pub services: &'a RuntimeServices,
+    pub req: &'a mut Request<EdgeBody>,
+    pub geo_info: Option<&'a GeoInfo>,
+}
+
+/// Outcome returned by [`IntegrationRegistry::filter_request`].
+pub enum RequestFilterRegistryOutcome {
+    Continue(RequestFilterEffects),
+    Respond {
+        response: Box<Response<EdgeBody>>,
+        effects: RequestFilterEffects,
+    },
+}
+
+/// Trait for integration-provided pre-routing request filters.
+#[async_trait(?Send)]
+pub trait IntegrationRequestFilter: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+
+    /// Filter an incoming request before normal route matching.
+    async fn filter_request(
+        &self,
+        input: RequestFilterInput<'_>,
+    ) -> Result<RequestFilterDecision, Report<TrustedServerError>>;
+}
+
+fn is_forbidden_filter_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "host"
+    ) || lower.starts_with("x-ts-")
+}
+
+fn apply_header_mutation_to_request(req: &mut Request<EdgeBody>, mutation: &HeaderMutation) {
+    if is_forbidden_filter_header(&mutation.name) {
+        log::warn!(
+            "Skipping forbidden request-filter header: {}",
+            mutation.name
+        );
+        return;
+    }
+
+    let Ok(name) = http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
+        log::warn!("Skipping invalid request-filter header: {}", mutation.name);
+        return;
+    };
+    let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
+        log::warn!(
+            "Skipping invalid request-filter header value: {}",
+            mutation.name
+        );
+        return;
+    };
+
+    match mutation.mode {
+        HeaderMutationMode::Set => {
+            req.headers_mut().insert(name, value);
+        }
+        HeaderMutationMode::Append => {
+            req.headers_mut().append(name, value);
+        }
+    }
+}
+
+fn apply_header_mutation_to_response(response: &mut Response<EdgeBody>, mutation: &HeaderMutation) {
+    if is_forbidden_filter_header(&mutation.name) {
+        log::warn!(
+            "Skipping forbidden response-filter header: {}",
+            mutation.name
+        );
+        return;
+    }
+
+    let Ok(name) = http::HeaderName::from_bytes(mutation.name.as_bytes()) else {
+        log::warn!("Skipping invalid response-filter header: {}", mutation.name);
+        return;
+    };
+    let Ok(value) = http::HeaderValue::from_str(&mutation.value) else {
+        log::warn!(
+            "Skipping invalid response-filter header value: {}",
+            mutation.name
+        );
+        return;
+    };
+
+    match mutation.mode {
+        HeaderMutationMode::Set => {
+            response.headers_mut().insert(name, value);
+        }
+        HeaderMutationMode::Append => {
+            response.headers_mut().append(name, value);
+        }
     }
 }
 
@@ -405,6 +586,7 @@ pub struct IntegrationRegistration {
     pub script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
 
 impl IntegrationRegistration {
@@ -429,6 +611,7 @@ impl IntegrationRegistrationBuilder {
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
             },
         }
     }
@@ -469,6 +652,12 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_request_filter(mut self, filter: Arc<dyn IntegrationRequestFilter>) -> Self {
+        self.registration.request_filters.push(filter);
+        self
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -497,11 +686,13 @@ struct IntegrationRegistryInner {
 
     // Metadata for introspection
     routes: Vec<(IntegrationEndpoint, &'static str)>,
+    enabled_integration_ids: Vec<&'static str>,
     deferred_js_ids: Vec<&'static str>,
     html_rewriters: Vec<Arc<dyn IntegrationAttributeRewriter>>,
     script_rewriters: Vec<Arc<dyn IntegrationScriptRewriter>>,
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
+    request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -515,10 +706,12 @@ impl Default for IntegrationRegistryInner {
             head_router: Router::new(),
             options_router: Router::new(),
             routes: Vec::new(),
+            enabled_integration_ids: Vec::new(),
             html_rewriters: Vec::new(),
             script_rewriters: Vec::new(),
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
+            request_filters: Vec::new(),
             deferred_js_ids: Vec::new(),
         }
     }
@@ -532,6 +725,7 @@ pub struct IntegrationMetadata {
     pub attribute_rewriters: usize,
     pub script_selectors: Vec<&'static str>,
     pub head_injectors: usize,
+    pub request_filters: usize,
 }
 
 impl IntegrationMetadata {
@@ -542,8 +736,24 @@ impl IntegrationMetadata {
             attribute_rewriters: 0,
             script_selectors: Vec::new(),
             head_injectors: 0,
+            request_filters: 0,
         }
     }
+}
+
+/// Inputs to [`IntegrationRegistry::handle_proxy`].
+///
+/// Bundled into a struct so the dispatch surface stays within the project's
+/// 7-argument cap; `ec_context` and `req` participate in the borrow so the
+/// whole thing shares one lifetime.
+pub struct ProxyDispatchInput<'a> {
+    pub method: &'a Method,
+    pub path: &'a str,
+    pub settings: &'a Settings,
+    pub kv: Option<&'a KvIdentityGraph>,
+    pub ec_context: &'a mut EcContext,
+    pub services: &'a RuntimeServices,
+    pub req: Request<EdgeBody>,
 }
 
 /// In-memory registry of integrations discovered from settings.
@@ -567,6 +777,10 @@ impl IntegrationRegistry {
 
         for builder in crate::integrations::builders() {
             if let Some(registration) = builder(settings)? {
+                inner
+                    .enabled_integration_ids
+                    .push(registration.integration_id);
+
                 for proxy in registration.proxies {
                     for route in proxy.routes() {
                         let value = (proxy.clone(), registration.integration_id);
@@ -617,16 +831,13 @@ impl IntegrationRegistry {
                 }
                 inner
                     .html_rewriters
-                    .extend(registration.attribute_rewriters.into_iter());
-                inner
-                    .script_rewriters
-                    .extend(registration.script_rewriters.into_iter());
+                    .extend(registration.attribute_rewriters);
+                inner.script_rewriters.extend(registration.script_rewriters);
                 inner
                     .html_post_processors
-                    .extend(registration.html_post_processors.into_iter());
-                inner
-                    .head_injectors
-                    .extend(registration.head_injectors.into_iter());
+                    .extend(registration.html_post_processors);
+                inner.head_injectors.extend(registration.head_injectors);
+                inner.request_filters.extend(registration.request_filters);
                 if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
@@ -659,64 +870,99 @@ impl IntegrationRegistry {
         self.find_route(method, path).is_some()
     }
 
+    /// Run pre-routing request filters.
+    ///
+    /// Request header mutations are applied immediately so later filters and
+    /// route handlers observe enriched headers. Response mutations are returned
+    /// to the adapter so it can apply them after normal response finalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an integration request filter returns an error.
+    pub async fn filter_request(
+        &self,
+        input: RequestFilterRegistryInput<'_>,
+    ) -> Result<RequestFilterRegistryOutcome, Report<TrustedServerError>> {
+        let RequestFilterRegistryInput {
+            settings,
+            services,
+            req,
+            geo_info,
+        } = input;
+        let mut accumulated = RequestFilterEffects::default();
+        let is_integration_route = self.has_route(req.method(), req.uri().path());
+
+        for filter in &self.inner.request_filters {
+            let decision = filter
+                .filter_request(RequestFilterInput {
+                    settings,
+                    services,
+                    request: req,
+                    geo_info,
+                    is_integration_route,
+                })
+                .await?;
+
+            match decision {
+                RequestFilterDecision::Continue(effects) => {
+                    effects.apply_to_request(req);
+                    accumulated.extend(RequestFilterEffects {
+                        request_headers: Vec::new(),
+                        response_headers: effects.response_headers,
+                    });
+                }
+                RequestFilterDecision::Respond { response, effects } => {
+                    accumulated.extend(RequestFilterEffects {
+                        request_headers: Vec::new(),
+                        response_headers: effects.response_headers,
+                    });
+                    return Ok(RequestFilterRegistryOutcome::Respond {
+                        response,
+                        effects: accumulated,
+                    });
+                }
+            }
+        }
+
+        Ok(RequestFilterRegistryOutcome::Continue(accumulated))
+    }
+
     /// Dispatch a proxy request when an integration handles the path.
     ///
-    /// This method automatically sets the `x-ts-ec` header and
-    /// `ts-ec` cookie on successful responses.
+    /// This method removes any caller-supplied `x-ts-ec` before proxying.
+    /// Response-side cookie mutation is centralized in EC finalize.
     #[must_use]
     pub async fn handle_proxy(
         &self,
-        method: &Method,
-        path: &str,
-        settings: &Settings,
-        services: &RuntimeServices,
-        mut req: Request<EdgeBody>,
+        input: ProxyDispatchInput<'_>,
     ) -> Option<Result<Response<EdgeBody>, Report<TrustedServerError>>> {
+        let ProxyDispatchInput {
+            method,
+            path,
+            settings,
+            kv,
+            ec_context,
+            services,
+            mut req,
+        } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
-            let ec_id_result = get_or_generate_ec_id(settings, services, &req);
-
-            // Set EC ID header on the request so integrations can read it.
-            // Header injection: HeaderValue::from_str rejects values containing \r, \n, or \0,
-            // so a crafted EC ID cannot inject additional request headers.
-            if let Ok(ref ec_id) = ec_id_result {
-                match HeaderValue::from_str(ec_id) {
-                    Ok(header_value) => {
-                        req.headers_mut()
-                            .insert(HEADER_X_TS_EC.clone(), header_value);
-                    }
-                    Err(error) => {
-                        log::warn!("Failed to build x-ts-ec request header value: {}", error);
-                    }
+            // Organic proxy handler: generate if needed (best effort).
+            // Only generate for document navigations — subresource requests
+            // may lack consent signals such as the Sec-GPC header.
+            if is_navigation_request(&req) {
+                if let Err(err) = ec_context.generate_if_needed(settings, kv) {
+                    log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
+            } else {
+                log::debug!(
+                    "EC generation skipped for integration proxy: non-document request (path={path})",
+                );
             }
 
-            let mut result = proxy.handle(settings, services, req).await;
+            // Remove any caller-supplied EC header rather than forwarding it.
+            req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            // Set EC ID header on successful responses
-            if let Ok(ref mut response) = result {
-                match ec_id_result {
-                    Ok(ref ec_id) => {
-                        match HeaderValue::from_str(ec_id) {
-                            Ok(header_value) => {
-                                response
-                                    .headers_mut()
-                                    .insert(HEADER_X_TS_EC.clone(), header_value);
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "Failed to build x-ts-ec response header value: {}",
-                                    error
-                                );
-                            }
-                        }
-                        set_ec_cookie(settings, response, ec_id);
-                    }
-                    Err(ref err) => {
-                        log::warn!("Failed to generate EC ID for integration response: {err:?}");
-                    }
-                }
-            }
-            Some(result)
+            Some(proxy.handle(settings, services, req).await)
         } else {
             None
         }
@@ -730,7 +976,7 @@ impl IntegrationRegistry {
         attr_value: &str,
         ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteOutcome {
-        let mut current = attr_value.to_string();
+        let mut current = attr_value.to_owned();
         let mut changed = false;
         for rewriter in &self.inner.html_rewriters {
             if !rewriter.handles_attribute(attr_name) {
@@ -794,6 +1040,11 @@ impl IntegrationRegistry {
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
         let mut map: BTreeMap<&'static str, IntegrationMetadata> = BTreeMap::new();
 
+        for integration_id in &self.inner.enabled_integration_ids {
+            map.entry(*integration_id)
+                .or_insert_with(|| IntegrationMetadata::new(integration_id));
+        }
+
         for (route, integration_id) in &self.inner.routes {
             let entry = map
                 .entry(*integration_id)
@@ -825,25 +1076,31 @@ impl IntegrationRegistry {
             entry.head_injectors += 1;
         }
 
+        for filter in &self.inner.request_filters {
+            let entry = map
+                .entry(filter.integration_id())
+                .or_insert_with(|| IntegrationMetadata::new(filter.integration_id()));
+            entry.request_filters += 1;
+        }
+
         map.into_values().collect()
     }
 
     /// Return JS module IDs that should be included in the tsjs bundle.
     ///
-    /// Always includes "creative" (JS-only, no Rust-side registration).
-    /// Excludes integrations that have no JS module (e.g., "nextjs").
+    /// Always includes JS-only modules with no Rust-side registration.
+    /// Includes enabled integrations only when the generated TSJS registry has a
+    /// corresponding browser module.
     #[must_use]
     pub fn js_module_ids(&self) -> Vec<&'static str> {
-        // Rust-only integrations with no corresponding JS module
-        const JS_EXCLUDED: &[&str] = &["nextjs", "aps", "adserver_mock"];
-        // JS-only modules always included (no Rust-side registration)
+        // Core JS-only modules that do not have a Rust-side registration.
         const JS_ALWAYS: &[&str] = &["creative"];
 
         let mut ids: Vec<&'static str> = JS_ALWAYS.to_vec();
 
-        for meta in self.registered_integrations() {
-            if !JS_EXCLUDED.contains(&meta.id) && !ids.contains(&meta.id) {
-                ids.push(meta.id);
+        for id in &self.inner.enabled_integration_ids {
+            if trusted_server_js::module_bundle(id).is_some() && !ids.contains(id) {
+                ids.push(*id);
             }
         }
 
@@ -890,10 +1147,12 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -916,10 +1175,36 @@ impl IntegrationRegistry {
                 head_router: Router::new(),
                 options_router: Router::new(),
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: attribute_rewriters,
                 script_rewriters,
                 html_post_processors: Vec::new(),
                 head_injectors,
+                request_filters: Vec::new(),
+                deferred_js_ids: Vec::new(),
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn from_request_filters(request_filters: Vec<Arc<dyn IntegrationRequestFilter>>) -> Self {
+        Self {
+            inner: Arc::new(IntegrationRegistryInner {
+                get_router: Router::new(),
+                post_router: Router::new(),
+                put_router: Router::new(),
+                delete_router: Router::new(),
+                patch_router: Router::new(),
+                head_router: Router::new(),
+                options_router: Router::new(),
+                routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
+                html_rewriters: Vec::new(),
+                script_rewriters: Vec::new(),
+                html_post_processors: Vec::new(),
+                head_injectors: Vec::new(),
+                request_filters,
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -949,7 +1234,7 @@ impl IntegrationRegistry {
                     path.strip_suffix("/*").expect("path should end with '/*'")
                 )
             } else {
-                path.to_string()
+                path.to_owned()
             };
 
             let router = match method {
@@ -978,10 +1263,12 @@ impl IntegrationRegistry {
                 head_router,
                 options_router,
                 routes: Vec::new(),
+                enabled_integration_ids: Vec::new(),
                 html_rewriters: Vec::new(),
                 script_rewriters: Vec::new(),
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
+                request_filters: Vec::new(),
                 deferred_js_ids: Vec::new(),
             }),
         }
@@ -991,8 +1278,9 @@ impl IntegrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
-    use http::{header, StatusCode};
+    use http::{header, HeaderValue, StatusCode};
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -1014,6 +1302,25 @@ mod tests {
             _req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             Ok(Response::new(EdgeBody::empty()))
+        }
+    }
+
+    struct EnrichingRequestFilter;
+
+    #[async_trait(?Send)]
+    impl IntegrationRequestFilter for EnrichingRequestFilter {
+        fn integration_id(&self) -> &'static str {
+            "enriching"
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            Ok(RequestFilterDecision::Continue(RequestFilterEffects {
+                request_headers: vec![HeaderMutation::set("x-datadome-isbot", "1")],
+                response_headers: vec![HeaderMutation::set("x-dd-b", "allowed")],
+            }))
         }
     }
 
@@ -1087,13 +1394,17 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = futures::executor::block_on(registry.handle_proxy(
-            &http::Method::GET,
-            "/integrations/test/echo",
-            &settings,
-            &noop_services(),
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &http::Method::GET,
+            path: "/integrations/test/echo",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &noop_services(),
             req,
-        ))
+        }))
         .expect("should match route")
         .expect("proxy should succeed");
 
@@ -1107,6 +1418,46 @@ mod tests {
             "/integrations/test/echo",
             "should expose the HTTP request path to the proxy"
         );
+    }
+
+    #[test]
+    fn filter_request_applies_request_headers_and_returns_response_headers() {
+        let registry =
+            IntegrationRegistry::from_request_filters(vec![Arc::new(EnrichingRequestFilter)]);
+        let settings = crate::test_support::tests::create_test_settings();
+        let services = crate::platform::test_support::noop_services();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/page")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let outcome =
+            futures::executor::block_on(registry.filter_request(RequestFilterRegistryInput {
+                settings: &settings,
+                services: &services,
+                req: &mut req,
+                geo_info: None,
+            }))
+            .expect("should run request filter");
+
+        assert_eq!(
+            req.headers()
+                .get("x-datadome-isbot")
+                .and_then(|value| value.to_str().ok()),
+            Some("1"),
+            "should apply DataDome-style request enrichment before routing"
+        );
+        match outcome {
+            RequestFilterRegistryOutcome::Continue(effects) => {
+                assert_eq!(
+                    effects.response_headers,
+                    vec![HeaderMutation::set("x-dd-b", "allowed")],
+                    "should return downstream response header effects for finalization"
+                );
+            }
+            RequestFilterRegistryOutcome::Respond { .. } => panic!("should continue routing"),
+        }
     }
 
     #[test]
@@ -1328,7 +1679,6 @@ mod tests {
     }
 
     // Tests for EC ID header on proxy responses
-    use crate::constants::COOKIE_TS_EC;
     use crate::test_support::tests::create_test_settings;
 
     /// Mock proxy that returns a simple 200 OK response
@@ -1344,11 +1694,11 @@ mod tests {
             vec![
                 IntegrationEndpoint {
                     method: Method::GET,
-                    path: "/integrations/test/ec".to_string(),
+                    path: "/integrations/test/ec".to_owned(),
                 },
                 IntegrationEndpoint {
                     method: Method::POST,
-                    path: "/integrations/test/ec".to_string(),
+                    path: "/integrations/test/ec".to_owned(),
                 },
             ]
         }
@@ -1357,72 +1707,23 @@ mod tests {
             &self,
             _settings: &Settings,
             _services: &RuntimeServices,
-            _req: Request<EdgeBody>,
+            req: Request<EdgeBody>,
         ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-            Ok(Response::builder()
+            let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .body(EdgeBody::from("test response"))
-                .expect("should build test response"))
+                .expect("should build test response");
+            if let Some(ec) = req.headers().get(HEADER_X_TS_EC.clone()) {
+                response
+                    .headers_mut()
+                    .insert(http::HeaderName::from_static("x-echo-ts-ec"), ec.clone());
+            }
+            Ok(response)
         }
     }
 
     #[test]
-    fn handle_proxy_sets_ec_id_header_on_response() {
-        let settings = create_test_settings();
-        let routes = vec![(
-            Method::GET,
-            "/integrations/test/ec",
-            (
-                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
-                "ec_test",
-            ),
-        )];
-        let registry = IntegrationRegistry::from_routes(routes);
-
-        // Create a request without a synthetic ID cookie
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("https://test-publisher.com/integrations/test/synthetic")
-            .body(EdgeBody::empty())
-            .expect("should build request");
-
-        // Call handle_proxy (uses futures executor in test environment)
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            &noop_services(),
-            req,
-        ));
-
-        // Should have matched and returned a response
-        assert!(result.is_some(), "Should find route and handle request");
-        let response = result.unwrap();
-        assert!(response.is_ok(), "Handler should succeed");
-
-        let response = response.unwrap();
-
-        assert!(
-            response.headers().get(&HEADER_X_TS_EC).is_some(),
-            "Response should have x-ts-ec header"
-        );
-
-        let set_cookie = response.headers().get(header::SET_COOKIE);
-        assert!(
-            set_cookie.is_some(),
-            "Response should have Set-Cookie header for ts-ec"
-        );
-
-        let cookie_value = set_cookie.unwrap().to_str().unwrap();
-        assert!(
-            cookie_value.contains(COOKIE_TS_EC),
-            "Set-Cookie should contain ts-ec cookie, got: {}",
-            cookie_value
-        );
-    }
-
-    #[test]
-    fn handle_proxy_replaces_invalid_ec_request_header_with_matching_response_cookie() {
+    fn handle_proxy_removes_ec_id_header_on_request() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1436,54 +1737,89 @@ mod tests {
 
         let mut req = Request::builder()
             .method(Method::GET)
-            .uri("https://test-publisher.com/integrations/test/synthetic")
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        req.headers_mut().insert(
+            HEADER_X_TS_EC.clone(),
+            HeaderValue::from_static("some-ec-value"),
+        );
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services = noop_services();
+
+        // Call handle_proxy (uses futures executor in test environment)
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+        }));
+
+        // Should have matched and returned a response
+        assert!(result.is_some(), "should find route and handle request");
+        let response = result.unwrap();
+        assert!(response.is_ok(), "handler should succeed");
+
+        let response = response.unwrap();
+
+        assert!(
+            response.headers().get("x-echo-ts-ec").is_none(),
+            "should not have x-ts-ec header on integration request"
+        );
+    }
+
+    #[test]
+    fn handle_proxy_rejects_invalid_ec_request_header() {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
             .body(EdgeBody::empty())
             .expect("should build request");
         req.headers_mut().insert(
             HEADER_X_TS_EC.clone(),
             HeaderValue::from_static("evil;injected"),
         );
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            &noop_services(),
+        let services = crate::platform::test_support::noop_services();
+
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
             req,
-        ))
+        }))
         .expect("should handle proxy request");
 
         let response = result.expect("handler should succeed");
-        let response_header = response
-            .headers()
-            .get(&HEADER_X_TS_EC)
-            .expect("response should have x-ts-ec header")
-            .to_str()
-            .expect("header should be valid UTF-8")
-            .to_string();
-        let cookie_header = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("response should have Set-Cookie header")
-            .to_str()
-            .expect("header should be valid UTF-8");
-        let cookie_value = cookie_header
-            .strip_prefix(&format!("{}=", COOKIE_TS_EC))
-            .and_then(|s| s.split_once(';').map(|(value, _)| value))
-            .expect("should contain the ts-ec cookie value");
 
-        assert_ne!(
-            response_header, "evil;injected",
-            "should not reflect the tampered request header"
-        );
-        assert_eq!(
-            response_header, cookie_value,
-            "response header and cookie should carry the same effective EC ID"
+        assert!(
+            response.headers().get("x-echo-ts-ec").is_none(),
+            "should not reflect the tampered request header to the integration"
         );
     }
 
     #[test]
-    fn handle_proxy_always_sets_cookie() {
+    fn handle_proxy_removes_request_ec_header_even_when_consent_denied() {
         let settings = create_test_settings();
         let routes = vec![(
             Method::GET,
@@ -1495,7 +1831,7 @@ mod tests {
 
         let mut req = Request::builder()
             .method(Method::GET)
-            .uri("https://test.example.com/integrations/test/synthetic")
+            .uri("https://test.example.com/integrations/test/ec")
             .body(EdgeBody::empty())
             .expect("should build request");
         req.headers_mut().insert(
@@ -1507,38 +1843,28 @@ mod tests {
             ))
             .expect("should build Cookie header"),
         );
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::GET,
-            "/integrations/test/ec",
-            &settings,
-            &noop_services(),
+        let services = crate::platform::test_support::noop_services();
+
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
             req,
-        ))
+        }))
         .expect("should handle proxy request");
 
         let response = result.expect("proxy handle should succeed");
 
         assert!(
-            response.headers().get(&HEADER_X_TS_EC).is_some(),
-            "Response should still have x-ts-ec header"
+            response.headers().get("x-echo-ts-ec").is_none(),
+            "should not set x-ts-ec on integration request"
         );
-
-        let set_cookie = response.headers().get(header::SET_COOKIE);
-
-        assert!(
-            set_cookie.is_some(),
-            "Should set Set-Cookie header even if cookie is present"
-        );
-
-        if let Some(cookie) = set_cookie {
-            let cookie_str = cookie.to_str().unwrap_or("");
-            assert!(
-                cookie_str.contains(COOKIE_TS_EC),
-                "Should contain ts-ec cookie, got: {}",
-                cookie_str
-            );
-        }
     }
 
     #[test]
@@ -1554,19 +1880,29 @@ mod tests {
         )];
         let registry = IntegrationRegistry::from_routes(routes);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::POST)
-            .uri("https://test-publisher.com/integrations/test/synthetic")
+            .uri("https://test-publisher.com/integrations/test/ec")
             .body(EdgeBody::from("test body"))
             .expect("should build POST request");
+        req.headers_mut().insert(
+            HEADER_X_TS_EC.clone(),
+            HeaderValue::from_static("some-ec-value"),
+        );
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
 
-        let result = futures::executor::block_on(registry.handle_proxy(
-            &Method::POST,
-            "/integrations/test/ec",
-            &settings,
-            &noop_services(),
+        let services = crate::platform::test_support::noop_services();
+
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
             req,
-        ));
+        }));
 
         assert!(result.is_some(), "Should find POST route");
         let response = result.unwrap();
@@ -1574,13 +1910,13 @@ mod tests {
 
         let response = response.unwrap();
         assert!(
-            response.headers().get(&HEADER_X_TS_EC).is_some(),
-            "POST response should have x-ts-ec header"
+            response.headers().get("x-echo-ts-ec").is_none(),
+            "POST integration request should not include x-ts-ec"
         );
     }
 
     #[test]
-    fn js_module_ids_immediate_excludes_prebid() {
+    fn js_module_ids_immediate_excludes_prebid_and_includes_core_js_only_modules() {
         let settings = crate::test_support::tests::create_test_settings();
         let mut settings_with_prebid = settings;
         settings_with_prebid
@@ -1609,12 +1945,76 @@ mod tests {
             "should include prebid in full list"
         );
         assert!(
+            immediate.contains(&"creative"),
+            "should include creative in immediate IDs"
+        );
+        assert!(
+            !immediate.contains(&"sourcepoint"),
+            "should not include Sourcepoint unless explicitly enabled"
+        );
+        assert!(
             !immediate.contains(&"prebid"),
             "should not include prebid in immediate IDs"
         );
         assert!(
             deferred.contains(&"prebid"),
             "should include prebid in deferred IDs"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_skip_enabled_integrations_without_generated_js_module() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("nextjs", &serde_json::json!({ "enabled": true }))
+            .expect("should insert nextjs config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let all = registry.js_module_ids();
+
+        assert!(
+            !all.contains(&"nextjs"),
+            "should not include enabled integrations without generated JS modules"
+        );
+
+        let metadata = registry.registered_integrations();
+        assert!(
+            metadata
+                .iter()
+                .any(|integration| integration.id == "nextjs"),
+            "should still register enabled Rust-only integrations"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings
+            .integrations
+            .insert_config("sourcepoint", &serde_json::json!({ "enabled": true }))
+            .expect("should insert sourcepoint config");
+        settings
+            .integrations
+            .insert_config("osano", &serde_json::json!({ "enabled": true }))
+            .expect("should insert osano config");
+
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+        let immediate = registry.js_module_ids_immediate();
+
+        assert!(
+            immediate.contains(&"sourcepoint"),
+            "should include Sourcepoint when explicitly enabled"
+        );
+        assert!(
+            immediate.contains(&"osano"),
+            "should include Osano when explicitly enabled"
+        );
+
+        let metadata = registry.registered_integrations();
+        assert!(
+            metadata.iter().any(|integration| integration.id == "osano"),
+            "should include JS-only Osano registration in metadata"
         );
     }
 
@@ -1665,10 +2065,10 @@ mod tests {
         let all = registry.js_module_ids();
         let mut recombined = registry.js_module_ids_immediate();
         recombined.extend(registry.js_module_ids_deferred());
-        recombined.sort();
+        recombined.sort_unstable();
 
         let mut all_sorted = all;
-        all_sorted.sort();
+        all_sorted.sort_unstable();
 
         assert_eq!(
             recombined, all_sorted,

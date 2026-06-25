@@ -1,20 +1,7 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
 
-use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
-
-/// Convert a `fastly::Response` into an [`HttpResponse`].
-pub(crate) fn from_fastly_response(mut resp: fastly::Response) -> HttpResponse {
-    let status = resp.get_status();
-    let mut builder = edgezero_core::http::response_builder().status(status);
-    for (name, value) in resp.get_headers() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-    builder
-        .body(EdgeBody::from(resp.take_body_bytes()))
-        .expect("should build http response from fastly response")
-}
 
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
@@ -25,12 +12,12 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     }
 
     match body {
-        EdgeBody::Once(bytes) => {
+        edgezero_core::body::Body::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_resp.set_body(bytes.to_vec());
             }
         }
-        EdgeBody::Stream(_) => {
+        edgezero_core::body::Body::Stream(_) => {
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }
@@ -90,7 +77,7 @@ mod tests {
         use edgezero_core::http::StatusCode;
 
         let stream = futures::stream::empty::<bytes::Bytes>();
-        let stream_body = EdgeBody::stream(stream);
+        let stream_body = edgezero_core::body::Body::stream(stream);
 
         let http_resp = edgezero_core::http::response_builder()
             .status(StatusCode::OK)

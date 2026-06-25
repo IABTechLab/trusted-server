@@ -54,14 +54,17 @@ fn default_timeout() -> u32 {
 }
 
 fn default_creative_store() -> String {
-    "creative_store".to_string()
+    "creative_store".to_owned()
 }
 
 fn default_allowed_context_keys() -> HashSet<String> {
     HashSet::new()
 }
 
-#[allow(dead_code)] // Methods used in runtime but not in build script
+#[allow(
+    dead_code,
+    reason = "methods are used by the runtime crate but not by build.rs path inclusion"
+)]
 impl AuctionConfig {
     /// Get all provider names.
     #[must_use]

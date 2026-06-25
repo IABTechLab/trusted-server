@@ -4,14 +4,15 @@ Get up and running with Trusted Server quickly.
 
 ## Prerequisites
 
-Before you begin, ensure you have:
+Before you begin, ensure you have the following installed (versions are pinned in `.tool-versions`):
 
-- Rust 1.91.1 (see `.tool-versions`)
+- Rust {{RUST_VERSION}} (see `.tool-versions`)
+- NodeJS {{NODEJS_VERSION}}
 - Basic familiarity with Rust and WebAssembly
 
 **For Fastly deployment** (optional for local dev):
 
-- Fastly CLI installed
+- Fastly {{FASTLY_VERSION}} CLI installed
 - A Fastly account and API key
 
 ## Installation
@@ -34,7 +35,7 @@ Simulates the full Fastly production environment locally.
 Install and configure the Fastly CLI using the [Fastly setup guide](/guide/fastly), then install Viceroy:
 
 ```bash
-cargo install viceroy
+cargo install viceroy --version 0.17.0 --locked --force
 ```
 
 Start the local Fastly simulator:
@@ -64,7 +65,8 @@ set -a && source .env && set +a
 cargo run -p trusted-server-adapter-axum
 ```
 
-The server will be available at `http://localhost:8787`.
+The server will be available at `http://localhost:8787`. Set `PORT=<port>` before
+`cargo run` to bind the dev server to a different local port.
 
 **Environment variable conventions used by the Axum adapter:**
 
@@ -82,7 +84,11 @@ Store names and key names are uppercased with hyphens and dots replaced by under
 ### Build the Project
 
 ```bash
-cargo build
+# Axum dev server (native)
+cargo build -p trusted-server-adapter-axum
+
+# Fastly adapter (WASM)
+cargo build -p trusted-server-adapter-fastly --target wasm32-wasip1
 ```
 
 ### Run Tests
@@ -115,5 +121,6 @@ fastly compute publish
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)
+- Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - Understand [GDPR Compliance](/guide/gdpr-compliance)
 - Configure [Ad Serving](/guide/ad-serving)

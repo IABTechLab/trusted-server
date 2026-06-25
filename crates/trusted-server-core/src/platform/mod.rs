@@ -25,8 +25,7 @@
 //!   `streaming_replacer`, and `rsc_flight` modules use only standard Rust
 //!   (`std::io::Read`/`Write`, `lol_html`, `flate2`, `brotli`). The pipeline
 //!   is accessed via [`StreamingPipeline::process`](crate::streaming_processor::StreamingPipeline::process) which
-//!   accepts any reader, including `fastly::Body` (which implements
-//!   `std::io::Read`).
+//!   accepts any reader that implements `std::io::Read`.
 //!
 //!   No `PlatformContentRewriter` trait exists or is needed.
 //!
@@ -35,6 +34,7 @@ use std::time::Duration;
 
 mod error;
 mod http;
+mod image_optimizer;
 mod kv;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -46,6 +46,10 @@ pub use error::PlatformError;
 pub use http::{
     PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     PlatformSelectResult, UnavailableHttpClient,
+};
+pub use image_optimizer::{
+    PlatformImageOptimizerCrop, PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions,
+    PlatformImageOptimizerParams, PlatformImageOptimizerRegion,
 };
 pub use kv::UnavailableKvStore;
 pub use traits::{PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore};
@@ -76,7 +80,7 @@ mod tests {
     impl PlatformKvStore for MarkerKvStore {
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
             if key == "marker" {
-                Ok(Some(Bytes::from(self.0.to_string())))
+                Ok(Some(Bytes::from(self.0.to_owned())))
             } else {
                 Ok(None)
             }
@@ -199,13 +203,14 @@ mod tests {
     #[test]
     fn geo_info_coordinates_string_formats_correctly() {
         let geo = GeoInfo {
-            city: "New York".to_string(),
-            country: "US".to_string(),
-            continent: "NorthAmerica".to_string(),
+            city: "New York".to_owned(),
+            country: "US".to_owned(),
+            continent: "NorthAmerica".to_owned(),
             latitude: 40.7128,
             longitude: -74.0060,
             metro_code: 501,
-            region: Some("NY".to_string()),
+            region: Some("NY".to_owned()),
+            asn: None,
         };
 
         assert_eq!(
@@ -225,6 +230,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 807,
             region: None,
+            asn: None,
         };
         assert!(
             geo.has_metro_code(),
@@ -242,6 +248,7 @@ mod tests {
             longitude: 0.0,
             metro_code: 0,
             region: None,
+            asn: None,
         };
         assert!(
             !geo.has_metro_code(),

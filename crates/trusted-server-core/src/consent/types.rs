@@ -7,7 +7,6 @@
 //! - [`UsPrivacy`] / [`PrivacyFlag`] — decoded US Privacy (CCPA) 4-char string
 //! - [`TcfConsent`] — decoded TCF v2 core consent data
 //! - [`GppConsent`] — decoded GPP consent data
-//! - [`Jurisdiction`] — the privacy regime applicable to the request
 //! - [`ConsentSource`] — how consent was sourced (cookie, KV store, etc.)
 
 use core::fmt;
@@ -80,13 +79,13 @@ impl fmt::Display for RawConsentSignals {
 
         write!(f, ", __gpp_sid=")?;
         match &self.raw_gpp_sid {
-            Some(s) => write!(f, "\"{}\"", s)?,
+            Some(s) => write!(f, "\"{s}\"")?,
             None => write!(f, "absent")?,
         }
 
         write!(f, ", us_privacy=")?;
         match &self.raw_us_privacy {
-            Some(s) => write!(f, "\"{}\"", s)?,
+            Some(s) => write!(f, "\"{s}\"")?,
             None => write!(f, "absent")?,
         }
 
@@ -302,6 +301,13 @@ pub struct GppConsent {
     pub section_ids: Vec<u16>,
     /// Decoded EU TCF v2.2 section (if present in GPP, section ID 2).
     pub eu_tcf: Option<TcfConsent>,
+    /// Whether the user opted out of sale of personal information via a US GPP
+    /// section (IDs 7–23).
+    ///
+    /// - `Some(true)` — a US section is present and `sale_opt_out == OptedOut`
+    /// - `Some(false)` — a US section is present and user did not opt out
+    /// - `None` — no US section exists in the GPP string
+    pub us_sale_opt_out: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

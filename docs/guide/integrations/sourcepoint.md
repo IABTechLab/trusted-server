@@ -26,6 +26,10 @@ cdn_origin = "https://cdn.privacy-mgmt.com"
 cache_ttl_seconds = 3600
 ```
 
+::: warning Migration note
+The Sourcepoint browser module is now opt-in through `[integrations.sourcepoint].enabled = true`. Existing deployments that relied on unconditional Sourcepoint JavaScript inclusion should enable this integration explicitly before upgrading.
+:::
+
 ### Configuration Options
 
 | Option              | Type             | Default                        | Description                                                                                                                                                                |

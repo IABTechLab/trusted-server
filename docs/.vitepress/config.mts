@@ -78,6 +78,7 @@ export default withMermaid(
           text: 'Core Concepts',
           items: [
             { text: 'Edge Cookies', link: '/guide/edge-cookies' },
+            { text: 'EC Setup Guide', link: '/guide/ec-setup-guide' },
             { text: 'GDPR Compliance', link: '/guide/gdpr-compliance' },
             { text: 'Ad Serving', link: '/guide/ad-serving' },
             {
@@ -85,6 +86,7 @@ export default withMermaid(
               link: '/guide/auction-orchestration',
             },
             { text: 'First-Party Proxy', link: '/guide/first-party-proxy' },
+            { text: 'Asset Routes', link: '/guide/asset-routes' },
             { text: 'Creative Processing', link: '/guide/creative-processing' },
             {
               text: 'Integrations Overview',
@@ -116,7 +118,10 @@ export default withMermaid(
               text: 'Proxy Signing',
               link: '/guide/proxy-signing',
             },
-            { text: 'Collective Sync', link: '/guide/collective-sync' },
+            {
+              text: 'Edge Cookie External Sync',
+              link: '/guide/collective-sync',
+            },
           ],
         },
         {
@@ -135,7 +140,10 @@ export default withMermaid(
             },
             {
               text: 'CMP',
-              items: [{ text: 'Didomi', link: '/guide/integrations/didomi' }],
+              items: [
+                { text: 'Didomi', link: '/guide/integrations/didomi' },
+                { text: 'Osano', link: '/guide/integrations/osano' },
+              ],
             },
             {
               text: 'Data',

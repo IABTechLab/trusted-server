@@ -298,6 +298,111 @@ The build script (`build-all.mjs`) validates that each adapter exists in `prebid
 Adding a new client-side bidder requires both a config change (`client_side_bidders`) **and** a rebuild with the adapter included in `TSJS_PREBID_ADAPTERS`. Without the adapter in the bundle, the bidder is silently dropped from both server-side and client-side auctions.
 :::
 
+## User ID Modules
+
+Prebid.js can expose publisher-configured User ID Module output via
+`pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
+EIDs after auctions and forwards them to Trusted Server when they are available.
+
+User ID submodule inclusion is deterministic for attested builds. The module
+preset is checked in at
+`crates/trusted-server-js/lib/src/integrations/prebid/user_id_modules.json`, and
+`build-all.mjs` generates `src/integrations/prebid/_user_ids.generated.ts` from
+that preset. `TSJS_PREBID_USER_ID_MODULES` is intentionally ignored for
+production builds so publisher-specific ID choices do not change the attested JS
+artifact.
+
+This is deliberate: Trusted Server replaces the publisher's Prebid.js bundle so
+we can install the `trustedServer` adapter and route auctions through `/auction`,
+but publishers often have custom or opaque Prebid builds. It is difficult to
+know every User ID submodule needed for a publisher before runtime, and making
+that list an environment-driven build input would produce different JS bytes per
+publisher. Those publisher-specific bundles would undermine deployment
+attestation because the trusted artifact hash would vary based on integration
+configuration rather than code changes. Keeping a broad, reviewed preset in
+source control makes the auction flow predictable while keeping the generated
+bundle stable across publishers.
+
+The current preset includes common ID modules such as Yahoo ConnectID, Criteo,
+LiveIntent, SharedID, UID2, ID5, LiveRamp IdentityLink, PubProvidedID, and
+Unified ID / TDID. LiveIntent is imported through a local ESM shim because the
+public Prebid wrapper contains a CommonJS `require(...)` mode switch that is not
+safe for the TSJS IIFE bundle.
+
+Example EID source mapping:
+
+| EID source                                                        | Included module        |
+| ----------------------------------------------------------------- | ---------------------- |
+| `yahoo.com`                                                       | `connectIdSystem`      |
+| `criteo.com`                                                      | `criteoIdSystem`       |
+| `liveintent.com`, `bidswitch.net`, `openx.net`, `pubmatic.com`, … | `liveIntentIdSystem`   |
+| `pubcid.org`                                                      | `sharedIdSystem`       |
+| `adserver.org` with `rtiPartner = TDID`                           | `unifiedIdSystem`      |
+| `uidapi.com`                                                      | `uid2IdSystem`         |
+| `id5-sync.com`                                                    | `id5IdSystem`          |
+| `liveramp.com`                                                    | `identityLinkIdSystem` |
+
+For local experiments only, `TSJS_PREBID_USER_ID_MODULES_DEV_OVERRIDE` can
+replace the preset. Do not use that override for trusted deployments because it
+changes the bundle hash.
+
+This is separate from `TSJS_PREBID_ADAPTERS`, which continues to control
+client-side bidder adapter modules.
+
+## Identity Forwarding
+
+Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
+
+1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
+2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
+3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
+4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
+5. The `ts-eids` cookie is still ingested after the response so later requests can reuse the IDs even when the current auction does not provide them again.
+
+This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
+
+### Identity flow
+
+```mermaid
+sequenceDiagram
+    participant B as Browser / Prebid.js
+    participant T as Trusted Server /auction
+    participant K as EC + KV identity graph
+    participant P as Prebid Server
+
+    B->>B: User ID modules resolve EIDs
+    B->>T: POST /auction\n(adUnits + current-request eids)
+    T->>K: Resolve EC-backed source-domain IDs
+    K-->>T: KV-derived EIDs
+    T->>T: Merge + dedupe client + KV EIDs
+    T->>T: Apply consent gating
+    T->>P: OpenRTB request\nuser.ext.eids = merged set
+    P-->>T: OpenRTB bid response
+    T-->>B: Auction response
+    T->>K: Ingest ts-eids cookie for future requests
+```
+
+### Merge and deduplication rules
+
+- Client-request EIDs and KV-resolved EIDs are merged by `source`
+- UIDs are deduplicated by `source + id`
+- If the same UID appears in both places, it is sent only once downstream
+- Distinct UIDs under the same source are preserved
+- Consent gating is applied to the **merged** set before forwarding
+
+### What reaches Prebid Server
+
+The downstream Prebid Server request includes:
+
+- `user.id` when EC forwarding is allowed
+- `user.ext.eids` containing the merged, deduplicated EID set
+- forwarded browser cookies (subject to consent-forwarding mode)
+
+In practice, this gives operators both:
+
+- **same-request identity transparency** for Prebid User ID Module output, and
+- **future-request continuity** through cookie ingestion and KV-backed partner resolution.
+
 ## Endpoints
 
 ### GET /first-party/ad
@@ -365,6 +470,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, page URL, `site.ref` from the Referer header, and `site.publisher` from the domain
 - Injects EC ID in the user object
+- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields

@@ -9,6 +9,7 @@ use http::{header, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IntoHttpResponse, TrustedServerError};
+use crate::http_util::enforce_max_body_size;
 use crate::platform::RuntimeServices;
 use crate::request_signing::discovery::TrustedServerDiscovery;
 use crate::request_signing::rotation::KeyRotationManager;
@@ -100,15 +101,7 @@ pub fn handle_verify_signature(
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let body = req.into_body().into_bytes();
-    if body.len() > VERIFY_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "verify-signature payload {} exceeds limit of {}",
-                body.len(),
-                VERIFY_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, VERIFY_MAX_BODY_BYTES, "verify-signature")?;
     let verify_req: VerifySignatureRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -207,17 +200,13 @@ fn signing_store_ids(
         })
 }
 
-fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+/// Validates the structural constraints every kid must satisfy regardless of
+/// operation: non-empty, length-bounded, and limited to a safe charset so a kid
+/// cannot smuggle a CSV separator or other control characters into storage.
+fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
     if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: format!("kid must be 1..={MAX_KID_LENGTH} characters"),
-        }));
-    }
-
-    if kid.starts_with(|c: char| c.is_ascii_digit()) {
-        return Err(Report::new(TrustedServerError::BadRequest {
-            message: "kid must start with an ASCII letter or allowed punctuation, not a digit"
-                .into(),
         }));
     }
 
@@ -231,6 +220,50 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     }
 
     Ok(())
+}
+
+/// Validates a kid for creation/rotation.
+///
+/// Enforces the **portable-KID contract**: a kid created through any adapter must
+/// be storable by every platform's key-name encoder, so create/rotate validates
+/// against the strictest common denominator. Concretely the kid must start with a
+/// lowercase ASCII letter, on top of the structural [`validate_kid_format`]
+/// charset checks.
+///
+/// That floor is currently set by the Fermyon Spin variable encoder
+/// (`spin_variable_name` in the Spin adapter's `platform.rs`), which requires a
+/// lowercase ASCII leading character: it would otherwise alias digit-leading keys
+/// (`1foo` and `n1foo` both map to `v_n1foo`) or reject uppercase/punctuation
+/// leading keys (`KidA`, `_kid`, `-kid`, `.kid`, `:kid`) at storage time.
+/// Enforcing the floor here turns those into a client-correctable 400 on every
+/// adapter instead of a runtime 5xx on Spin. [`kid_is_creatable`] exposes this
+/// predicate so adapter crates can pin the contract with a test — core must never
+/// accept a kid its encoder rejects. System-generated KIDs (`ts-YYYY-MM-DD`)
+/// start with `t` and are unaffected.
+///
+/// Deactivation/deletion deliberately uses the looser [`validate_kid_format`] so
+/// legacy KIDs created under earlier validation rules remain removable.
+fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+    validate_kid_format(kid)?;
+
+    if !kid.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must start with a lowercase ASCII letter".into(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// Returns whether `kid` satisfies the create/rotate portable-KID contract
+/// enforced by [`validate_kid`].
+///
+/// Exposed so platform adapter crates can assert their key-name encoder accepts
+/// every kid this validation admits, pinning the cross-adapter contract against
+/// silent drift between this validation floor and an adapter's storage encoder.
+#[must_use]
+pub fn kid_is_creatable(kid: &str) -> bool {
+    validate_kid(kid).is_ok()
 }
 
 /// Rotates the current active kid by generating and saving a new one.
@@ -258,15 +291,7 @@ pub fn handle_rotate_key(
     } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
-    if body.len() > ADMIN_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "rotate-key payload {} exceeds limit of {}",
-                body.len(),
-                ADMIN_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "rotate-key")?;
     let rotate_req: RotateKeyRequest = if body.is_empty() {
         RotateKeyRequest { kid: None }
     } else {
@@ -385,15 +410,7 @@ pub fn handle_deactivate_key(
     } = signing_store_ids(settings)?;
 
     let body = req.into_body().into_bytes();
-    if body.len() > ADMIN_MAX_BODY_BYTES {
-        return Err(Report::new(TrustedServerError::RequestTooLarge {
-            message: format!(
-                "deactivate-key payload {} exceeds limit of {}",
-                body.len(),
-                ADMIN_MAX_BODY_BYTES,
-            ),
-        }));
-    }
+    enforce_max_body_size(&body, ADMIN_MAX_BODY_BYTES, "deactivate-key")?;
     let deactivate_req: DeactivateKeyRequest =
         serde_json::from_slice(&body).change_context(TrustedServerError::Configuration {
             message: "invalid JSON request body".into(),
@@ -401,7 +418,11 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    let result = validate_kid(&deactivate_req.kid).and_then(|()| {
+    // Use the looser format validation here so legacy KIDs created under earlier
+    // validation rules (e.g. digit- or uppercase-leading) can still be
+    // deactivated or deleted. The stricter validate_kid only gates new key
+    // creation/rotation.
+    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
         if deactivate_req.delete {
             manager.delete_key(services, &deactivate_req.kid)
         } else {
@@ -1011,9 +1032,70 @@ mod tests {
 
     #[test]
     fn validate_kid_rejects_digit_leading_ids() {
-        let result = validate_kid("2026-key");
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject digit-leading kid value: {kid}"
+            );
+        }
+    }
 
-        assert!(result.is_err(), "should reject digit-leading kid values");
+    #[test]
+    fn validate_kid_rejects_non_lowercase_leading_ids() {
+        // The Spin variable encoder requires a lowercase ASCII leading character,
+        // so uppercase- and punctuation-leading KIDs that pass validate_kid_format
+        // must be rejected on the create/rotate path to avoid a runtime 5xx on Spin.
+        for kid in &["KidA", "_kid", "-kid", ".kid", ":kid"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject non-lowercase-leading kid value: {kid}"
+            );
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should still accept {kid}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_kid_format_allows_digit_leading_for_legacy_removal() {
+        // Deactivation/deletion uses validate_kid_format so digit-leading KIDs
+        // created under earlier rules stay removable, while the stricter
+        // validate_kid still blocks them on the create/rotate path.
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should accept legacy kid {kid}: {e:?}"));
+            assert!(
+                validate_kid(kid).is_err(),
+                "create/rotate validation must still reject digit-leading kid: {kid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deactivate_allows_legacy_digit_leading_kid_past_validation() {
+        // A digit-leading legacy kid must pass validation and reach storage
+        // (which fails with the noop test stores -> 500) rather than being
+        // rejected up front as a 400 bad request.
+        let settings = crate::test_support::tests::create_test_settings();
+        let req_body = DeactivateKeyRequest {
+            kid: "1legacy-key".to_string(),
+            delete: true,
+        };
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
+
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response for a legacy digit-leading kid");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "legacy digit-leading kid must not be rejected as a bad request on deactivation"
+        );
     }
 
     #[test]

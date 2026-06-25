@@ -46,7 +46,7 @@ These decisions are finalized and reflected in this plan:
 2. **Migrate all integrations** including GPT and Google Tag Manager as
    first-class scope.
 3. **Admin key routes must be supported on all adapters** —
-   `/admin/keys/rotate` and `/admin/keys/deactivate` are required on Fastly,
+   `/_ts/admin/keys/rotate` and `/_ts/admin/keys/deactivate` are required on Fastly,
    Axum, and Cloudflare (no disabled-route mode).
 4. **Temporary Fastly compatibility adapter is required** — `compat.rs` lives in
    trusted-server during migration (created in PR 11, deleted in PR 15),
@@ -72,13 +72,13 @@ These decisions are finalized and reflected in this plan:
 
 Follow the EdgeZero convention (`{app}-core`, `{app}-adapter-{platform}`):
 
-| Current                                   | New                                                                              | Purpose                          |
-| ----------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------- |
-| `crates/common` (`trusted-server-common`) | `crates/trusted-server-core` (`trusted-server-core`)                             | Platform-agnostic business logic |
-| `crates/fastly` (`trusted-server-fastly`) | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)         | Fastly Compute entry point       |
-| —                                         | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)             | Native Axum dev server           |
-| —                                         | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`) | Cloudflare Workers entry point   |
-| `crates/js` (`trusted-server-js`)         | `crates/js` (`trusted-server-js`)                                                | JS build (unchanged)             |
+| Current                                          | New                                                                              | Purpose                          |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- | -------------------------------- |
+| `crates/common` (`trusted-server-common`)        | `crates/trusted-server-core` (`trusted-server-core`)                             | Platform-agnostic business logic |
+| `crates/fastly` (`trusted-server-fastly`)        | `crates/trusted-server-adapter-fastly` (`trusted-server-adapter-fastly`)         | Fastly Compute entry point       |
+| —                                                | `crates/trusted-server-adapter-axum` (`trusted-server-adapter-axum`)             | Native Axum dev server           |
+| —                                                | `crates/trusted-server-adapter-cloudflare` (`trusted-server-adapter-cloudflare`) | Cloudflare Workers entry point   |
+| `crates/trusted-server-js` (`trusted-server-js`) | `crates/trusted-server-js` (`trusted-server-js`)                                 | JS build (unchanged)             |
 
 The rename from `common` → `trusted-server-core` and `fastly` →
 `trusted-server-adapter-fastly` happens in **PR 1** (foundation) to avoid
@@ -1366,7 +1366,7 @@ Changes:
 - Local development without Viceroy
 - Mock stores for local KV/config/secret
 - Implement required admin key routes
-  (`/admin/keys/rotate`, `/admin/keys/deactivate`) — core signing logic
+  (`/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`) — core signing logic
   composes the Axum store primitives (local config/secret providers)
 - Add `.env.dev` or local config file for Axum-specific **non-secret**
   settings only (listen address, mock store paths, log level).
@@ -1395,7 +1395,7 @@ Changes:
 - Construct `RuntimeServices` with Cloudflare-backed trait implementations
 - Wrangler configuration
 - Implement required admin key routes
-  (`/admin/keys/rotate`, `/admin/keys/deactivate`) — core signing logic
+  (`/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`) — core signing logic
   composes the Cloudflare store primitives (Workers API bindings)
 - Add `wrangler.toml` with bindings for KV, secrets, and config
 - Add integration tests: route smoke tests, admin key route tests,
@@ -1466,7 +1466,7 @@ Changes:
 
 - Route parity validation for all routes currently in `crates/trusted-server-adapter-fastly/src/main.rs`
   (`/static/tsjs=*`, `/.well-known/trusted-server.json`,
-  `/verify-signature`, `/admin/keys/rotate`, `/admin/keys/deactivate`,
+  `/verify-signature`, `/_ts/admin/keys/rotate`, `/_ts/admin/keys/deactivate`,
   `/auction`, `/first-party/*`, integration routes, and publisher fallback)
 - Cross-adapter behavior parity tests (Fastly vs Axum vs Cloudflare vs Spin) for:
   response status/body, required headers, cookie behavior, and request-signing
@@ -1510,10 +1510,11 @@ specifics. Summary of what each PR adds:
   config flag (PR 14). Traffic splitting at percentage levels is controlled
   via **edge dictionary percentage check**: a config store key
   `edgezero_rollout_pct` (integer 0-100) compared against a hash of the
-  request ID. This runs inside the entry point, after flag check but before
-  path dispatch. The ops team owns the config store value and advances it
-  through the canary stages. Rollback = set `edgezero_rollout_pct` to `0`
-  (immediate, no deploy required)
+  client IP. This runs inside the entry point, after flag check but before
+  path dispatch, and keeps routing sticky per client IP at each rollout
+  percentage. The ops team owns the config store value and advances it through
+  the canary stages. Rollback = set `edgezero_rollout_pct` to `0` (immediate,
+  no deploy required)
 - Run canary traffic progression with hold points:
   - **1%** — hold **30 min**, verify no error-rate increase
   - **10%** — hold **2 hours**, verify p95 latency within **±10%** of baseline

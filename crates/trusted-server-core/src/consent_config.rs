@@ -72,9 +72,6 @@ pub struct ConsentConfig {
     /// but disagree on consent status.
     #[serde(default)]
     pub conflict_resolution: ConflictResolutionConfig,
-
-    /// Name of the KV Store used for consent persistence.
-    ///
     /// When set, consent data is persisted per Edge Cookie (EC) ID so that
     /// returning users without consent cookies can still have their
     /// consent preferences applied. Set to `None` to disable.
@@ -105,7 +102,7 @@ impl ConsentConfig {
         let clamped = self.max_consent_age_days.clamp(1, 3650);
         if clamped != self.max_consent_age_days {
             log::warn!(
-                "max_consent_age_days={} is outside the valid range 1–3650; clamped to {clamped}",
+                "max_consent_age_days={} is outside the valid range 1\u{2013}3650; clamped to {clamped}",
                 self.max_consent_age_days
             );
             self.max_consent_age_days = clamped;

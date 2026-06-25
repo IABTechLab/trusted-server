@@ -1,22 +1,6 @@
-//! Simplified HTML processor that combines URL replacement and integration injection.
+//! Simplified HTML processor that combines URL replacement and integration injection
 //!
-//! This module provides a [`StreamProcessor`] implementation for HTML content.
-//! It handles `<script>` tag injection at `<head>`, attribute URL rewriting
-//! (`href`, `src`, `action`, `srcset`, `imagesrcset`), and post-processing
-//! hooks for enabled integrations.
-//!
-//! # Platform notes
-//!
-//! This module is **platform-agnostic** (verified 2026-03-31; see
-//! `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`). It has zero
-//! `fastly` imports and depends only on `lol_html`, `std`, and crate-internal
-//! types. [`create_html_processor`] returns an impl [`StreamProcessor`]
-//! whose `process_chunk` method operates on `&[u8]` slices with no
-//! platform body type involved.
-//!
-//! Future adapters (Cloudflare Workers, Axum, Spin) do not need to implement any content-rewriting
-//! interface. See `crate::platform` module doc for the authoritative note.
-
+//! This module provides a `StreamProcessor` implementation for HTML content.
 use std::cell::Cell;
 use std::io;
 use std::rc::Rc;
@@ -49,6 +33,16 @@ struct HtmlWithPostProcessing {
     /// Buffer that accumulates all intermediate output when post-processors
     /// need the full document. Left empty on the streaming-only path.
     accumulated_output: Vec<u8>,
+    /// Cumulative decoded input length seen on the post-processing path. Bounded
+    /// independently of `accumulated_output` so a rewriter that stashes the
+    /// original payload in `document_state` and emits a small placeholder (e.g.
+    /// the Next.js RSC rewriter) cannot grow the Wasm heap past the cap behind
+    /// the output check. Unused on the streaming-only path.
+    decoded_input_len: usize,
+    /// Upper bound on `accumulated_output` (and the post-processed result) to
+    /// prevent the buffered post-processing path from growing the Wasm heap
+    /// without limit on highly-compressible documents.
+    max_buffered_body_bytes: usize,
     origin_host: String,
     request_host: String,
     request_scheme: String,
@@ -57,14 +51,36 @@ struct HtmlWithPostProcessing {
 
 impl StreamProcessor for HtmlWithPostProcessing {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
-        let output = self.inner.process_chunk(chunk, is_last)?;
-
-        // Streaming-optimized path: no post-processors, pass through immediately.
+        // Streaming-optimized path: no post-processors, pass through immediately
+        // with no buffering cap (legacy parity: the streaming path is unbounded).
         if self.post_processors.is_empty() {
-            return Ok(output);
+            return self.inner.process_chunk(chunk, is_last);
         }
 
-        // Post-processors need the full document. Accumulate until the last chunk.
+        // On the buffered post-processing path, bound the cumulative decoded
+        // input before the rewriter runs. The rewriter (and the post-processors
+        // it feeds) may stash the original payload in `document_state` and emit
+        // only a small placeholder, so the `accumulated_output` check below
+        // cannot observe that growth. Capping decoded input first closes that
+        // hole. Matches the `BoundedWriter` error path (mapped to a 5xx proxy
+        // error downstream).
+        self.decoded_input_len = self.decoded_input_len.saturating_add(chunk.len());
+        if self.decoded_input_len > self.max_buffered_body_bytes {
+            return Err(io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
+
+        let output = self.inner.process_chunk(chunk, is_last)?;
+
+        // Post-processors need the full document. Accumulate until the last chunk,
+        // but enforce the buffering cap before growing the heap so a highly
+        // compressible document cannot OOM the accumulator.
+        if self.accumulated_output.len() + output.len() > self.max_buffered_body_bytes {
+            return Err(io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
+        }
         self.accumulated_output.extend_from_slice(&output);
         if !is_last {
             return Ok(Vec::new());
@@ -110,11 +126,16 @@ impl StreamProcessor for HtmlWithPostProcessing {
         }
 
         if changed {
-            log::debug!(
-                "HTML post-processing complete: origin_host={}, output_len={}",
-                self.origin_host,
-                html.len()
-            );
+            log::debug!("HTML post-processing complete: output_len={}", html.len());
+        }
+
+        // Post-processors may append content (e.g. injected scripts); enforce the
+        // same cap on the final document so growth during post-processing cannot
+        // push the buffer past the limit either.
+        if html.len() > self.max_buffered_body_bytes {
+            return Err(io::Error::other(
+                "publisher body exceeded maximum buffered size",
+            ));
         }
 
         Ok(html.into_bytes())
@@ -134,23 +155,29 @@ pub struct HtmlProcessorConfig {
     pub request_host: String,
     pub request_scheme: String,
     pub integrations: IntegrationRegistry,
+    /// Maximum bytes the post-processing accumulator may buffer before the
+    /// processor aborts. Mirrors `publisher.max_buffered_body_bytes` so the
+    /// full-document buffering done for post-processors is bounded by the same
+    /// cap as the final [`crate::publisher::BoundedWriter`] sink.
+    pub max_buffered_body_bytes: usize,
 }
 
 impl HtmlProcessorConfig {
     /// Create from settings and request parameters
     #[must_use]
     pub fn from_settings(
-        _settings: &Settings,
+        settings: &Settings,
         integrations: &IntegrationRegistry,
         origin_host: &str,
         request_host: &str,
         request_scheme: &str,
     ) -> Self {
         Self {
-            origin_host: origin_host.to_string(),
-            request_host: request_host.to_string(),
-            request_scheme: request_scheme.to_string(),
+            origin_host: origin_host.to_owned(),
+            request_host: request_host.to_owned(),
+            request_scheme: request_scheme.to_owned(),
             integrations: integrations.clone(),
+            max_buffered_body_bytes: settings.publisher.max_buffered_body_bytes,
         }
     }
 }
@@ -208,10 +235,7 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
             if rewritten.starts_with(&self.origin_host) {
                 let suffix = &rewritten[self.origin_host.len()..];
                 let boundary_ok = suffix.is_empty()
-                    || matches!(
-                        suffix.as_bytes().first(),
-                        Some(b'/') | Some(b'?') | Some(b'#')
-                    );
+                    || matches!(suffix.as_bytes().first(), Some(b'/' | b'?' | b'#'));
                 if boundary_ok {
                     rewritten = format!("{}{}", self.request_host, suffix);
                 }
@@ -514,6 +538,8 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
         inner,
         post_processors,
         accumulated_output: Vec::new(),
+        decoded_input_len: 0,
+        max_buffered_body_bytes: config.max_buffered_body_bytes,
         origin_host: config.origin_host,
         request_host: config.request_host,
         request_scheme: config.request_scheme,
@@ -534,15 +560,18 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    // 2× accounts for the injected tsjs script tag plus URL attribute rewrites.
-    const MAX_GROWTH_FACTOR: f64 = 2.0;
+    // 1.1× accounts for the injected tsjs script tag plus URL attribute rewrites.
+    // Observed growth on the test fixture is ≤1.01×; 1.1× gives headroom while
+    // catching real regressions (e.g., double-injection or buffer leak).
+    const MAX_GROWTH_FACTOR: f64 = 1.1;
 
     fn create_test_config() -> HtmlProcessorConfig {
         HtmlProcessorConfig {
-            origin_host: "origin.example.com".to_string(),
-            request_host: "test.example.com".to_string(),
-            request_scheme: "https".to_string(),
+            origin_host: "origin.example.com".to_owned(),
+            request_host: "test.example.com".to_owned(),
+            request_scheme: "https".to_owned(),
             integrations: IntegrationRegistry::default(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         }
     }
 
@@ -610,11 +639,11 @@ mod tests {
             }
 
             fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-                vec![r#"<script>window.__testHeadInjector=true;</script>"#.to_string()]
+                vec!["<script>window.__testHeadInjector=true;</script>".to_owned()]
             }
         }
 
-        let html = r#"<html><head><title>Test</title></head><body></body></html>"#;
+        let html = "<html><head><title>Test</title></head><body></body></html>";
 
         let mut config = create_test_config();
         config.integrations = IntegrationRegistry::from_rewriters_with_head_injectors(
@@ -738,14 +767,14 @@ mod tests {
         let protocol_relative_urls = html.matches("//www.test-publisher.com").count();
 
         println!("Test HTML stats:");
-        println!("  Total URLs: {}", original_urls);
-        println!("  HTTPS URLs: {}", https_urls);
-        println!("  Protocol-relative URLs: {}", protocol_relative_urls);
+        println!("  Total URLs: {original_urls}");
+        println!("  HTTPS URLs: {https_urls}");
+        println!("  Protocol-relative URLs: {protocol_relative_urls}");
 
         // Process - replace test-publisher.com with our edge domain
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -768,8 +797,8 @@ mod tests {
         let replaced_urls = result.matches("test-publisher-ts.edgecompute.app").count();
 
         println!("After processing:");
-        println!("  Remaining original URLs: {}", remaining_urls);
-        println!("  Edge domain URLs: {}", replaced_urls);
+        println!("  Remaining original URLs: {remaining_urls}");
+        println!("  Edge domain URLs: {replaced_urls}");
 
         // Expect at least some replacements and fewer originals than before
         assert!(replaced_urls > 0, "Should replace some URLs in attributes");
@@ -779,8 +808,14 @@ mod tests {
         );
 
         // Verify HTML structure
-        assert_eq!(&result[0..15], "<!DOCTYPE html>");
-        assert_eq!(&result[result.len() - 7..], "</html>");
+        assert!(
+            result.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            result.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(
@@ -805,7 +840,7 @@ mod tests {
         </head><body></body></html>"#;
 
         let mut settings = Settings::default();
-        let shim_src = "https://edge.example.com/static/testlight.js".to_string();
+        let shim_src = "https://edge.example.com/static/testlight.js".to_owned();
         settings
             .integrations
             .insert_config(
@@ -833,7 +868,7 @@ mod tests {
 
         let mut output = Vec::new();
         let result = pipeline.process(Cursor::new(html.as_bytes()), &mut output);
-        assert!(result.is_ok());
+        result.unwrap();
 
         let processed = String::from_utf8_lossy(&output);
         assert!(
@@ -851,7 +886,7 @@ mod tests {
         use flate2::read::GzDecoder;
         use flate2::write::GzEncoder;
         use flate2::Compression as GzCompression;
-        use std::io::{Read, Write};
+        use std::io::{Read as _, Write as _};
 
         let html = include_str!("html_processor.test.html");
 
@@ -869,8 +904,8 @@ mod tests {
 
         // Process with compression
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -892,7 +927,7 @@ mod tests {
         );
 
         // Decompress and verify
-        let mut decoder = GzDecoder::new(&compressed_output[..]);
+        let mut decoder = GzDecoder::new(&*compressed_output);
         let mut decompressed = String::new();
         decoder
             .read_to_string(&mut decompressed)
@@ -910,8 +945,14 @@ mod tests {
         );
 
         // Verify structure
-        assert_eq!(&decompressed[0..15], "<!DOCTYPE html>");
-        assert_eq!(&decompressed[decompressed.len() - 7..], "</html>");
+        assert!(
+            decompressed.starts_with("<!DOCTYPE html>"),
+            "Should preserve doctype"
+        );
+        assert!(
+            decompressed.trim_end().ends_with("</html>"),
+            "Should preserve closing html tag"
+        );
 
         // Verify content preservation
         assert!(
@@ -935,10 +976,10 @@ mod tests {
         // This simulates receiving already-truncated HTML from origin
 
         let truncated_html =
-            r#"<html><head><title>Test</title></head><body><p>This is a test that gets cut o"#;
+            "<html><head><title>Test</title></head><body><p>This is a test that gets cut o";
 
         println!("Testing already-truncated HTML");
-        println!("Input: '{}'", truncated_html);
+        println!("Input: '{truncated_html}'");
 
         let config = create_test_config();
         let processor = create_html_processor(config);
@@ -958,7 +999,7 @@ mod tests {
         );
 
         let processed = String::from_utf8_lossy(&output);
-        println!("Output: '{}'", processed);
+        println!("Output: '{processed}'");
 
         // The processor should pass through the truncated HTML
         // It might add some closing tags, but shouldn't truncate further
@@ -993,8 +1034,8 @@ mod tests {
 
         // Process it through our pipeline
         let mut config = create_test_config();
-        config.origin_host = "www.test-publisher.com".to_string(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_string();
+        config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
+        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1044,7 +1085,7 @@ mod tests {
 
     #[test]
     fn post_processors_accumulate_while_streaming_path_passes_through() {
-        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
         use lol_html::Settings;
 
         // --- Streaming path: no post-processors → output emitted per chunk ---
@@ -1052,6 +1093,8 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: Vec::new(),
             accumulated_output: Vec::new(),
+            decoded_input_len: 0,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
@@ -1092,6 +1135,8 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: vec![Arc::new(NoopPostProcessor)],
             accumulated_output: Vec::new(),
+            decoded_input_len: 0,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
@@ -1128,8 +1173,103 @@ mod tests {
     }
 
     #[test]
-    fn active_post_processor_receives_full_document_and_mutates_output() {
+    fn post_processing_accumulator_rejects_growth_past_cap() {
         use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        struct NoopPostProcessor;
+        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-noop"
+            }
+            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                false
+            }
+        }
+
+        // Tiny cap so a single non-final chunk overflows the accumulator.
+        let mut processor = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(NoopPostProcessor)],
+            accumulated_output: Vec::new(),
+            decoded_input_len: 0,
+            max_buffered_body_bytes: 16,
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        // A complete element well past the cap. The error must fire on this
+        // non-final chunk — proving the accumulator itself is bounded, not just
+        // the final write after the whole document was already buffered.
+        let oversized = format!("<p>{}</p>", "a".repeat(100));
+        let err = processor
+            .process_chunk(oversized.as_bytes(), false)
+            .expect_err("accumulator growth past the cap must error mid-stream");
+        assert!(
+            err.to_string().contains("exceeded maximum buffered size"),
+            "should report the buffering cap violation, got: {err}"
+        );
+
+        // The accumulator must never retain more than the configured cap.
+        assert!(
+            processor.accumulated_output.len() <= 16,
+            "accumulator must not grow past the cap, held {} bytes",
+            processor.accumulated_output.len()
+        );
+    }
+
+    #[test]
+    fn decoded_input_cap_rejects_oversized_input_with_small_output() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
+        use lol_html::Settings;
+
+        struct NoopPostProcessor;
+        impl IntegrationHtmlPostProcessor for NoopPostProcessor {
+            fn integration_id(&self) -> &'static str {
+                "test-noop"
+            }
+            fn post_process(&self, _html: &mut String, _ctx: &IntegrationHtmlContext<'_>) -> bool {
+                false
+            }
+        }
+
+        // Tiny cap so a single oversized chunk overflows the decoded-input bound.
+        let mut processor = HtmlWithPostProcessing {
+            inner: HtmlRewriterAdapter::new(Settings::default()),
+            post_processors: vec![Arc::new(NoopPostProcessor)],
+            accumulated_output: Vec::new(),
+            decoded_input_len: 0,
+            max_buffered_body_bytes: 16,
+            origin_host: String::new(),
+            request_host: String::new(),
+            request_scheme: String::new(),
+            document_state: IntegrationDocumentState::default(),
+        };
+
+        // An unclosed tag far larger than the cap. lol_html buffers it internally
+        // and emits little or no output, so the output accumulator stays small —
+        // the same shape as a rewriter stashing the payload in `document_state`
+        // behind a small placeholder. The decoded-input bound must still reject
+        // it, which the output-only check could not.
+        let oversized = format!("<div data-x=\"{}\"", "a".repeat(100));
+        let err = processor
+            .process_chunk(oversized.as_bytes(), false)
+            .expect_err("oversized decoded input must error even when output is small");
+        assert!(
+            err.to_string().contains("exceeded maximum buffered size"),
+            "should report the buffering cap violation, got: {err}"
+        );
+        assert!(
+            processor.accumulated_output.is_empty(),
+            "the decoded-input bound must catch the overflow before the output accumulator grows"
+        );
+    }
+
+    #[test]
+    fn active_post_processor_receives_full_document_and_mutates_output() {
+        use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor as _};
         use lol_html::Settings;
 
         struct AppendCommentProcessor;
@@ -1150,6 +1290,8 @@ mod tests {
             inner: HtmlRewriterAdapter::new(Settings::default()),
             post_processors: vec![Arc::new(AppendCommentProcessor)],
             accumulated_output: Vec::new(),
+            decoded_input_len: 0,
+            max_buffered_body_bytes: 16 * 1024 * 1024,
             origin_host: String::new(),
             request_host: String::new(),
             request_scheme: String::new(),
@@ -1228,7 +1370,7 @@ mod tests {
     #[test]
     fn golden_url_rewriting_replaces_origin_in_href() {
         // href attributes pointing at origin domain must be rewritten to proxy host.
-        let origin = "https://origin.test-publisher.com";
+        let origin = "https://origin.test-publisher.example.com";
         let html = format!(
             r#"<!DOCTYPE html><html><head></head><body>
         <a href="{origin}/page">Link</a>
@@ -1236,12 +1378,13 @@ mod tests {
         </body></html>"#
         );
 
-        let request_host = "proxy.test-publisher.com";
+        let request_host = "proxy.test-publisher.example.com";
         let config = HtmlProcessorConfig {
-            origin_host: "origin.test-publisher.com".to_string(),
+            origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
             request_scheme: "https".to_string(),
             integrations: IntegrationRegistry::default(),
+            max_buffered_body_bytes: 16 * 1024 * 1024,
         };
         let mut processor = create_html_processor(config);
         let output = processor
@@ -1250,7 +1393,7 @@ mod tests {
         let output_str = std::str::from_utf8(&output).expect("should be valid UTF-8");
 
         assert!(
-            !output_str.contains("origin.test-publisher.com"),
+            !output_str.contains("origin.test-publisher.example.com"),
             "origin host must not appear in rewritten HTML"
         );
         assert!(
@@ -1281,9 +1424,9 @@ mod tests {
 
     #[test]
     fn response_size_does_not_grow_disproportionately() {
-        // Processing must not expand HTML by more than 2× (accounts for injected
-        // script tag + URL rewrites). Disproportionate growth indicates a bug
-        // (e.g., double-processing, buffer leak).
+        // Processing must not expand HTML by more than 1.1× (accounts for the
+        // injected script tag + URL rewrites). Disproportionate growth indicates
+        // a bug (e.g., double-processing, buffer leak).
         let html = include_str!("html_processor.test.html");
         let input_size = html.len();
 

@@ -19,6 +19,7 @@ pub mod google_tag_manager;
 pub mod gpt;
 pub mod lockr;
 pub mod nextjs;
+pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
@@ -26,11 +27,14 @@ pub mod sourcepoint;
 pub mod testlight;
 
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationDocumentState, IntegrationEndpoint,
-    IntegrationHeadInjector, IntegrationHtmlContext, IntegrationHtmlPostProcessor,
-    IntegrationMetadata, IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder,
-    IntegrationRegistry, IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
+    AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,
+    IntegrationAttributeContext, IntegrationAttributeRewriter, IntegrationDocumentState,
+    IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
+    IntegrationHtmlPostProcessor, IntegrationMetadata, IntegrationProxy, IntegrationRegistration,
+    IntegrationRegistrationBuilder, IntegrationRegistry, IntegrationRequestFilter,
+    IntegrationScriptContext, IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision,
+    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -47,6 +51,7 @@ pub(crate) fn ensure_integration_backend(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
+    first_byte_timeout: Option<Duration>,
 ) -> Result<String, Report<TrustedServerError>> {
     services
         .backend()
@@ -54,7 +59,7 @@ pub(crate) fn ensure_integration_backend(
             url,
             integration,
             true,
-            DEFAULT_FIRST_BYTE_TIMEOUT,
+            first_byte_timeout.unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
         )?)
         .change_context(TrustedServerError::Integration {
             integration: integration.to_string(),
@@ -106,7 +111,6 @@ pub(crate) fn predict_integration_backend_name(
     services: &RuntimeServices,
     url: &str,
     integration: &'static str,
-    certificate_check: bool,
     first_byte_timeout: Duration,
 ) -> Result<String, Report<TrustedServerError>> {
     services
@@ -114,7 +118,7 @@ pub(crate) fn predict_integration_backend_name(
         .predict_name(&integration_backend_spec(
             url,
             integration,
-            certificate_check,
+            true,
             first_byte_timeout,
         )?)
         .change_context(TrustedServerError::Integration {
@@ -145,6 +149,7 @@ fn integration_backend_spec(
             })?
             .to_string(),
         port: parsed.port(),
+        host_header_override: None,
         certificate_check,
         first_byte_timeout,
     })
@@ -280,6 +285,7 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         lockr::register,
         didomi::register,
         sourcepoint::register,
+        osano::register,
         google_tag_manager::register,
         datadome::register,
         gpt::register,
