@@ -808,6 +808,7 @@ mod tests {
             host_header_override: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
         };
         let name = stub.ensure(&spec).expect("should return a backend name");
         assert_eq!(name, "stub-backend", "should return fixed name");

@@ -389,9 +389,9 @@ impl AuctionOrchestrator {
             }
 
             // Give each provider only the remaining time from the auction
-            // deadline so that its backend first_byte_timeout doesn't extend
-            // past the overall budget. Also respect the provider's own
-            // configured timeout when it is tighter than the remaining budget.
+            // deadline so that backend transport timeouts do not extend past
+            // the overall budget. Also respect the provider's own configured
+            // timeout when it is tighter than the remaining budget.
             let remaining_ms = remaining_budget_ms(auction_start, context.timeout_ms);
             let effective_timeout = remaining_ms.min(provider.timeout_ms());
 
@@ -488,10 +488,11 @@ impl AuctionOrchestrator {
         // Enforce the auction deadline: after each select() returns, check
         // elapsed time and drop remaining requests if the timeout is exceeded.
         //
-        // NOTE: `select()` blocks until at least one backend responds (or its
-        // transport timeout fires). Hard deadline enforcement therefore depends
-        // on every backend's `first_byte_timeout` being set to at most the
-        // remaining auction budget — which Phase 1 above guarantees.
+        // NOTE: `select()` blocks until at least one backend responds and, on
+        // some adapters, buffers the selected response body before returning.
+        // Hard deadline enforcement therefore depends on every backend's
+        // first-byte and between-bytes timeouts being set to at most the
+        // remaining auction budget, which Phase 1 above guarantees.
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -976,12 +977,13 @@ impl AuctionOrchestrator {
                 }
             }
 
-            // Drain every dispatched request. Each backend was capped with a
-            // first-byte timeout at dispatch time, so by the collect phase the
-            // remaining handles may already be ready even if wall-clock time
-            // elapsed while the origin was slow — dropping them here would
-            // discard SSP responses that already arrived. The mediator launch
-            // below still observes A_deadline via `remaining_budget_ms`.
+            // Drain every dispatched request. Each backend was capped with
+            // first-byte and between-bytes timeouts at dispatch time, so by the
+            // collect phase the remaining handles may already be ready even if
+            // wall-clock time elapsed while the origin was slow. Dropping them
+            // here would discard SSP responses that already arrived. The
+            // mediator launch below still observes A_deadline via
+            // `remaining_budget_ms`.
         }
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
@@ -990,11 +992,11 @@ impl AuctionOrchestrator {
                     // Cap the mediator at whichever is tighter: its own configured
                     // timeout or the remaining auction budget (A_deadline).  The old
                     // comment here claimed origin drain could exhaust the budget before
-                    // collection, but SSP backends are given first_byte_timeout =
-                    // effective_timeout (capped at their provider timeout) at dispatch
-                    // time, so they cannot run past A_deadline independently.  Giving
-                    // the mediator an uncapped timeout lets it run past A_deadline,
-                    // violating the bounded hold invariant.
+                    // collection, but SSP backends are given first-byte and between-bytes
+                    // timeouts equal to effective_timeout (capped at their provider
+                    // timeout) at dispatch time, so they cannot run past A_deadline
+                    // independently. Giving the mediator an uncapped timeout lets it run
+                    // past A_deadline, violating the bounded hold invariant.
                     let remaining = remaining_budget_ms(auction_start, timeout_ms);
                     if remaining == 0 {
                         log::warn!(
