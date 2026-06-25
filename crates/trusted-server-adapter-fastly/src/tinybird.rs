@@ -34,12 +34,135 @@ pub(crate) fn auction_sink_from_settings(settings: &Settings) -> Arc<dyn Auction
 
 #[derive(Debug, Clone)]
 struct FastlyTinybirdAuctionTelemetrySink {
-    config: TinybirdSettings,
+    enabled: bool,
+    target: TinybirdEventsTarget,
+}
+
+#[derive(Debug, Clone)]
+struct TinybirdEventsTarget {
+    api_host: String,
+    dataset: String,
+    secret_store: StoreName,
+    token_secret: String,
+    uri: String,
+    backend_spec: PlatformBackendSpec,
+    max_body_bytes: usize,
+}
+
+impl TinybirdEventsTarget {
+    fn from_config(config: TinybirdSettings) -> Self {
+        let uri = tinybird_events_uri(&config.api_host, &config.auction_dataset);
+        let backend_spec = tinybird_backend_spec(&config.api_host);
+        Self {
+            api_host: config.api_host,
+            dataset: config.auction_dataset,
+            secret_store: StoreName::from(config.secret_store),
+            token_secret: config.auction_token_secret,
+            uri,
+            backend_spec,
+            max_body_bytes: config.max_body_bytes,
+        }
+    }
 }
 
 impl FastlyTinybirdAuctionTelemetrySink {
     fn new(config: TinybirdSettings) -> Self {
-        Self { config }
+        let enabled = config.enabled;
+        Self {
+            enabled,
+            target: TinybirdEventsTarget::from_config(config),
+        }
+    }
+
+    fn validate_batch(batch: &AuctionEventBatch) -> Result<(), Report<TrustedServerError>> {
+        if batch.row_count() > TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: format!(
+                    "auction telemetry batch has {} rows, exceeding {} row limit",
+                    batch.row_count(),
+                    TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    fn serialize_batch(
+        &self,
+        batch: &AuctionEventBatch,
+    ) -> Result<String, Report<TrustedServerError>> {
+        batch.to_ndjson(self.target.max_body_bytes)
+    }
+
+    fn load_append_token(
+        &self,
+        services: &RuntimeServices,
+    ) -> Result<String, Report<TrustedServerError>> {
+        let token = services
+            .secret_store()
+            .get_string(&self.target.secret_store, &self.target.token_secret)
+            .change_context(TrustedServerError::Proxy {
+                message: "Tinybird auction append token unavailable".to_owned(),
+            })?;
+        let token = token.trim().to_owned();
+        if token.is_empty() {
+            return Err(Report::new(TrustedServerError::Proxy {
+                message: "Tinybird auction append token is empty".to_owned(),
+            }));
+        }
+        Ok(token)
+    }
+
+    fn ensure_backend(
+        &self,
+        services: &RuntimeServices,
+    ) -> Result<String, Report<TrustedServerError>> {
+        services
+            .backend()
+            .ensure(&self.target.backend_spec)
+            .change_context(TrustedServerError::Proxy {
+                message: "Tinybird backend registration failed".to_owned(),
+            })
+    }
+
+    fn authorization_header(token: &str) -> Result<HeaderValue, Report<TrustedServerError>> {
+        HeaderValue::from_str(&format!("Bearer {token}")).change_context(
+            TrustedServerError::InvalidHeaderValue {
+                message: "invalid Tinybird authorization header".to_owned(),
+            },
+        )
+    }
+
+    fn build_events_request(
+        &self,
+        body: String,
+        auth_header: HeaderValue,
+    ) -> Result<edgezero_core::http::Request, Report<TrustedServerError>> {
+        request_builder()
+            .method(Method::POST)
+            .uri(self.target.uri.as_str())
+            .header(header::AUTHORIZATION, auth_header)
+            .header(header::CONTENT_TYPE, TINYBIRD_NDJSON_CONTENT_TYPE)
+            .body(Body::from(body))
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to build Tinybird Events API request".to_owned(),
+            })
+    }
+
+    async fn send_fire_and_forget(
+        services: &RuntimeServices,
+        request: edgezero_core::http::Request,
+        backend_name: String,
+    ) -> Result<(), Report<TrustedServerError>> {
+        let pending = services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(request, backend_name))
+            .await
+            .change_context(TrustedServerError::Proxy {
+                message: "failed to start Tinybird Events API request".to_owned(),
+            })?;
+        drop(pending);
+        Ok(())
     }
 }
 
@@ -50,78 +173,28 @@ impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
         services: &RuntimeServices,
         batch: AuctionEventBatch,
     ) -> Result<(), Report<TrustedServerError>> {
-        if !self.config.enabled || batch.is_empty() {
+        if !self.enabled || batch.is_empty() {
             return Ok(());
         }
-        if batch.row_count() > TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: format!(
-                    "auction telemetry batch has {} rows, exceeding {} row limit",
-                    batch.row_count(),
-                    TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH
-                ),
-            }));
-        }
 
-        let body = batch.to_ndjson(self.config.max_body_bytes)?;
-        let token = services
-            .secret_store()
-            .get_string(
-                &StoreName::from(self.config.secret_store.as_str()),
-                &self.config.auction_token_secret,
-            )
-            .change_context(TrustedServerError::Proxy {
-                message: "Tinybird auction append token unavailable".to_owned(),
-            })?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(Report::new(TrustedServerError::Proxy {
-                message: "Tinybird auction append token is empty".to_owned(),
-            }));
-        }
-
-        let backend_name = services
-            .backend()
-            .ensure(&tinybird_backend_spec(&self.config.api_host))
-            .change_context(TrustedServerError::Proxy {
-                message: "Tinybird backend registration failed".to_owned(),
-            })?;
-
-        let uri = tinybird_events_uri(&self.config.api_host, &self.config.auction_dataset);
-        let auth_header = HeaderValue::from_str(&format!("Bearer {token}")).change_context(
-            TrustedServerError::InvalidHeaderValue {
-                message: "invalid Tinybird authorization header".to_owned(),
-            },
-        )?;
+        Self::validate_batch(&batch)?;
+        let body = self.serialize_batch(&batch)?;
         let body_len = body.len();
-        let request = request_builder()
-            .method(Method::POST)
-            .uri(uri)
-            .header(header::AUTHORIZATION, auth_header)
-            .header(header::CONTENT_TYPE, TINYBIRD_NDJSON_CONTENT_TYPE)
-            .body(Body::from(body))
-            .change_context(TrustedServerError::Proxy {
-                message: "failed to build Tinybird Events API request".to_owned(),
-            })?;
+        let token = self.load_append_token(services)?;
+        let auth_header = Self::authorization_header(&token)?;
+        let backend_name = self.ensure_backend(services)?;
+        let request = self.build_events_request(body, auth_header)?;
 
         log::info!(
             "sending auction telemetry to Tinybird dataset={} rows={} bytes={} host={} backend={}",
-            self.config.auction_dataset,
+            self.target.dataset,
             batch.row_count(),
             body_len,
-            self.config.api_host,
+            self.target.api_host,
             backend_name
         );
 
-        let pending = services
-            .http_client()
-            .send_async(PlatformHttpRequest::new(request, backend_name))
-            .await
-            .change_context(TrustedServerError::Proxy {
-                message: "failed to start Tinybird Events API request".to_owned(),
-            })?;
-        drop(pending);
-        Ok(())
+        Self::send_fire_and_forget(services, request, backend_name).await
     }
 }
 
@@ -384,6 +457,14 @@ mod tests {
     }
 
     #[test]
+    fn events_uri_urlencodes_dataset_name() {
+        assert_eq!(
+            tinybird_events_uri("api.us-east.aws.tinybird.co", "auction events/raw"),
+            "https://api.us-east.aws.tinybird.co/v0/events?name=auction%20events%2Fraw"
+        );
+    }
+
+    #[test]
     fn backend_spec_uses_matching_tls_host() {
         let spec = tinybird_backend_spec("api.us-east.aws.tinybird.co");
         assert_eq!(spec.scheme, "https");
@@ -448,6 +529,68 @@ mod tests {
                 .expect("should lock select calls"),
             0,
             "should not wait for the Tinybird response"
+        );
+    }
+
+    #[test]
+    fn disabled_sink_does_not_dispatch() {
+        let backend = Arc::new(RecordingBackend::default());
+        let http_client = Arc::new(RecordingHttpClient::default());
+        let services = services(
+            Arc::clone(&backend),
+            Arc::clone(&http_client),
+            HashMap::new(),
+        );
+        let mut config = enabled_config();
+        config.enabled = false;
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(config);
+
+        futures::executor::block_on(
+            sink.emit_auction_events(&services, AuctionEventBatch::new(vec![test_row()])),
+        )
+        .expect("should ignore disabled sink");
+
+        assert!(
+            backend.specs.lock().expect("should lock specs").is_empty(),
+            "should not ensure backend when disabled"
+        );
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not send when disabled"
+        );
+    }
+
+    #[test]
+    fn empty_batch_does_not_dispatch() {
+        let backend = Arc::new(RecordingBackend::default());
+        let http_client = Arc::new(RecordingHttpClient::default());
+        let services = services(
+            Arc::clone(&backend),
+            Arc::clone(&http_client),
+            HashMap::new(),
+        );
+        let sink = FastlyTinybirdAuctionTelemetrySink::new(enabled_config());
+
+        futures::executor::block_on(
+            sink.emit_auction_events(&services, AuctionEventBatch::new(Vec::new())),
+        )
+        .expect("should ignore empty batch");
+
+        assert!(
+            backend.specs.lock().expect("should lock specs").is_empty(),
+            "should not ensure backend for empty batches"
+        );
+        assert!(
+            http_client
+                .requests
+                .lock()
+                .expect("should lock recorded requests")
+                .is_empty(),
+            "should not send empty batches"
         );
     }
 
