@@ -135,6 +135,31 @@ static SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Sourcepoint HTML root-absolute asset regex should compile")
 });
 
+/// Matches the wrapper's inbound-message origin guard so it can also accept
+/// same-origin messages.
+///
+/// The Sourcepoint wrapper validates messages from its message / privacy-manager
+/// iframe with `e.origin === params.msgOrigin || e.origin === params.pmOrigin`,
+/// where `msgOrigin` is `baseEndpoint` used verbatim. Under first-party proxying
+/// `baseEndpoint` is a *path* (`/integrations/sourcepoint/cdn`), so `msgOrigin`
+/// is `https://<publisher>/integrations/sourcepoint/cdn` — which never equals the
+/// iframe's **bare** origin `https://<publisher>`. The guard therefore rejects
+/// the iframe's `sp.showMessage` / choice messages: the wrapper locks scroll
+/// (`html.sp-message-open`) but never shows the dialog or releases the lock,
+/// leaving the page rendered-but-unscrollable.
+///
+/// When proxied first-party the message iframe is genuinely **same-origin**, so
+/// we append `|| <event>.origin === location.origin` to the guard. This only
+/// *additionally* trusts a same-origin frame — which already has full access to
+/// the page — so it adds no attack surface; it teaches an origin check written
+/// for a cross-origin CDN about first-party serving. The match is anchored on
+/// the semantic `.pmOrigin)` close of the guard; group 1 is the (possibly
+/// minified) event identifier and group 2 the `…pmOrigin` operand.
+static SP_MESSAGE_ORIGIN_GUARD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"([A-Za-z_$][\w$]*)\.origin===([A-Za-z_$][\w$.]*\.pmOrigin)\)"#)
+        .expect("Sourcepoint message origin guard regex should compile")
+});
+
 /// Configuration for the Sourcepoint first-party proxy.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct SourcepointConfig {
@@ -490,6 +515,12 @@ impl SourcepointIntegration {
     ///    wrapper resolves `document.currentScript.src` and appends
     ///    `"/unified/…"`. We insert the CDN prefix so chunks load from
     ///    `/integrations/sourcepoint/cdn/unified/…`.
+    ///
+    /// 3. **Inbound-message origin guard** — the wrapper rejects its own message
+    ///    iframe's postMessages because the configured origin is a first-party
+    ///    path, not an origin. We let the guard also accept same-origin messages
+    ///    so the consent dialog can show and release the scroll lock (see
+    ///    [`SP_MESSAGE_ORIGIN_GUARD_PATTERN`]).
     fn rewrite_script_content(content: &str) -> String {
         // Step 1: rewrite quoted cdn.privacy-mgmt.com URLs to root-relative paths.
         let after_cdn = SP_CDN_URL_PATTERN
@@ -505,10 +536,20 @@ impl SourcepointIntegration {
             .into_owned();
 
         // Step 2: rewrite origin+"/unified/" to origin+"/integrations/sourcepoint/cdn/unified/".
-        SP_ORIGIN_UNIFIED_PATTERN
+        let after_unified = SP_ORIGIN_UNIFIED_PATTERN
             .replace_all(&after_cdn, |caps: &regex::Captures| {
                 let quote = &caps[1];
                 format!(".origin+{quote}{SOURCEPOINT_CDN_PREFIX}/unified/")
+            })
+            .into_owned();
+
+        // Step 3: let the wrapper's message-origin guard also accept same-origin
+        // messages (the message iframe is same-origin when proxied first-party).
+        SP_MESSAGE_ORIGIN_GUARD_PATTERN
+            .replace_all(&after_unified, |caps: &regex::Captures| {
+                let event = &caps[1];
+                let pm_operand = &caps[2];
+                format!("{event}.origin==={pm_operand}||{event}.origin===location.origin)")
             })
             .into_owned()
     }
@@ -1165,6 +1206,50 @@ mod tests {
         let output = SourcepointIntegration::rewrite_script_content(input);
 
         assert_eq!(output, input, "Non-Sourcepoint URLs should be untouched");
+    }
+
+    #[test]
+    fn rewrites_message_origin_guard_to_accept_same_origin() {
+        // The wrapper's inbound-message guard; under first-party proxying the
+        // configured origin is a path, so the same-origin branch is needed for
+        // the wrapper to accept its iframe's messages and show the dialog.
+        let input = concat!(
+            r#"function(e,t,n){if((e.origin===this.params.msgOrigin"#,
+            r#"||e.origin===this.params.pmOrigin)&&("iframe"===this.params.type)){}}"#,
+        );
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"function(e,t,n){if((e.origin===this.params.msgOrigin"#,
+                r#"||e.origin===this.params.pmOrigin||e.origin===location.origin)&&("iframe"===this.params.type)){}}"#,
+            ),
+            "guard should also accept same-origin messages"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_handles_minified_identifiers() {
+        // Event/params identifiers may be minified; the rewrite must capture them.
+        let input = r#"if((o.origin===a.params.msgOrigin||o.origin===a.params.pmOrigin)&&x){}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert!(
+            output.contains("o.origin===a.params.pmOrigin||o.origin===location.origin)"),
+            "minified guard should be rewritten. Got: {output}"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_leaves_unrelated_origin_checks_untouched() {
+        let input = r#"if(e.origin===window.location.origin){accept()}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output, input,
+            "origin checks without the .pmOrigin guard anchor must be untouched"
+        );
     }
 
     #[test]
