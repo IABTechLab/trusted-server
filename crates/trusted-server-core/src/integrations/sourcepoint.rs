@@ -1242,6 +1242,34 @@ mod tests {
     }
 
     #[test]
+    fn message_origin_guard_rewrite_matches_any_object_and_event_variable() {
+        // The object holding pmOrigin and the event var can be minified to
+        // anything; the rewrite must not depend on specific names. Covers a
+        // bare `x.pmOrigin`, a different event var, and a deeper chain.
+        let cases = [
+            (
+                r#"if((e.origin===x.pmOrigin)&&z){}"#,
+                "e.origin===x.pmOrigin||e.origin===location.origin)",
+            ),
+            (
+                r#"if((q.origin===y.pmOrigin)&&z){}"#,
+                "q.origin===y.pmOrigin||q.origin===location.origin)",
+            ),
+            (
+                r#"if((_e.origin===a.b.c.pmOrigin)&&z){}"#,
+                "_e.origin===a.b.c.pmOrigin||_e.origin===location.origin)",
+            ),
+        ];
+        for (input, expect) in cases {
+            let output = SourcepointIntegration::rewrite_script_content(input);
+            assert!(
+                output.contains(expect),
+                "guard with arbitrary identifiers should be rewritten. input={input} got={output}"
+            );
+        }
+    }
+
+    #[test]
     fn message_origin_guard_rewrite_leaves_unrelated_origin_checks_untouched() {
         let input = r#"if(e.origin===window.location.origin){accept()}"#;
         let output = SourcepointIntegration::rewrite_script_content(input);
