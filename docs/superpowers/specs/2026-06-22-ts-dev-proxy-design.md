@@ -174,7 +174,7 @@ sequenceDiagram
     P-->>B: 200 (tunnel established)
     P->>P: TLS-accept with leaf cert for www.pub.com<br/>(signed by local CA)
     B->>P: GET / — Host: www.pub.com (over MITM TLS)
-    P->>P: match rule www.pub.com → TO<br/>SNI→TO; keep Host: FROM (default); add X-Orig-Host; inject auth
+    P->>P: match rule www.pub.com → TO<br/>SNI→TO; keep Host: FROM (default); add X-Forwarded-Host (+X-Orig-Host); inject auth
     P->>U: GET / — Host: www.pub.com (FROM), SNI=TO (over TLS)
     Note over P,U: SNI=TO → valid cert + Fastly routing; Host=FROM by default (--rewrite-host sends Host=TO)
     U-->>P: response
@@ -196,7 +196,8 @@ sequenceDiagram
 2. On the MITM path, read decrypted HTTP/1.1 requests **in a loop** — one
    keep-alive tunnel carries many sequential requests.
 3. For each request: rewrite upstream target + SNI to `TO`, set `Host` (§8.3),
-   add `X-Orig-Host: <FROM>`, inject auth if configured. An `Upgrade:`
+   strip any inbound `Forwarded`, add `X-Forwarded-Host: <FROM>` (and an
+   informational `X-Orig-Host: <FROM>`), inject auth if configured. An `Upgrade:`
    (WebSocket) request is out of scope in v1 (§16): log a clear note and close
    rather than corrupting the stream.
 4. Proxy opens a TLS (or plaintext) connection to `TO`, forwards the request,
@@ -585,7 +586,7 @@ overrides either. Every setting is a CLI flag (§4).
 | CA CN                     | `Trusted Server DEV-ONLY Proxy CA — DO NOT TRUST IN PRODUCTION`                                                                       |
 | Leaf validity             | ≤ 90 days                                                                                                                             |
 | ALPN (both legs)          | `http/1.1`                                                                                                                            |
-| Injected real-host header | `X-Orig-Host`                                                                                                                         |
+| Injected real-host header | `X-Forwarded-Host` (functional; TS reads it for `request_host`) + `X-Orig-Host` (informational duplicate)                             |
 | Upstream port (default)   | `443` (`80` with `--upstream-plaintext`)                                                                                              |
 
 ---
@@ -614,8 +615,9 @@ request.
 
 **Unit (`rewrite.rs`):** host matching (case-insensitivity, port stripping,
 first-match-wins, no-match pass-through); header outcomes (default `Host=FROM` +
-`X-Orig-Host`; `--rewrite-host` sends `Host=TO`; non-default `TO` port in `Host`
-but not SNI; auth injected only when absent); URI normalization.
+`X-Forwarded-Host=FROM`; `--rewrite-host` sends `Host=TO` while `X-Forwarded-Host`
+stays `FROM`; inbound `Forwarded` stripped; non-default `TO` port in `Host` but
+not SNI; auth injected only when absent); URI normalization.
 
 **Unit (`ca.rs`):** CA is generated on first run and reloaded from `--ca-dir` on
 the next run (key file mode `0600`); minted leaf carries the requested SAN,
@@ -624,8 +626,8 @@ chains to the CA, and is cached (second call returns the same `Arc`).
 **Integration (`crates/integration-tests`, native):** local HTTPS upstream with
 a known self-signed cert; run the proxy with `--insecure`; client configured to
 use the proxy and trust the dev CA; assert address-host preserved, request
-reaches upstream with rewritten `Host`/SNI + `X-Orig-Host`, response streamed
-back. Cover `--basic-auth` clearing a `401`; unmatched-host **blind tunnel**
+reaches upstream with rewritten `Host`/SNI + `X-Forwarded-Host` (+`X-Orig-Host`),
+response streamed back. Cover `--basic-auth` clearing a `401`; unmatched-host **blind tunnel**
 (bytes piped, no leaf minted, dev CA never presented); and **multiple sequential
 requests over one keep-alive tunnel**.
 
@@ -647,8 +649,9 @@ padlock and the production hostname in the address bar.
 4. **Proxy server.** CONNECT upgrade, MITM TLS via minted leaf, upstream forward
    (TLS + `--insecure` + `--upstream-plaintext`). End-to-end against a real
    upstream.
-5. **Header/auth polish.** `--basic-auth`/`--basic-auth-file`, `X-Orig-Host`,
-   `--rewrite-host` (default preserves `Host = FROM`), secret redaction in logs.
+5. **Header/auth polish.** `--basic-auth`/`--basic-auth-file`, `X-Forwarded-Host`
+   (+informational `X-Orig-Host`), inbound-`Forwarded` strip, `--rewrite-host`
+   (default preserves `Host = FROM`), secret redaction in logs.
 6. **Browser orchestration.** `--launch` list (no default — unset runs proxy
    only): Chrome + Firefox profiles, Safari PAC via `networksetup` with
    restore-on-exit; PAC generation; `ts dev proxy ca {path,install,uninstall,regenerate}`.

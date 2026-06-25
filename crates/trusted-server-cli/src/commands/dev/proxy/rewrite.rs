@@ -123,7 +123,8 @@ pub struct RewriteOutcome {
     pub sni: String,
     /// Value for the upstream `Host` header.
     pub host_header: String,
-    /// Value for the `X-Orig-Host` header (always FROM).
+    /// The original first-party host (always FROM); sent upstream as
+    /// `X-Forwarded-Host` (functional) and `X-Orig-Host` (informational).
     pub orig_host: String,
     /// Whether the upstream leg is TLS (`!plaintext`).
     pub scheme_is_tls: bool,

@@ -500,8 +500,9 @@ where
 }
 
 /// Applies the rewrite outcome: upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host`
-/// (both `FROM`), and (only when absent) the injected `Authorization`. The request
-/// URI is left origin-form, which is what an HTTP/1.1 upstream expects.
+/// (both `FROM`, after stripping any higher-priority inbound `Forwarded`), and
+/// (only when absent) the injected `Authorization`. The request URI is left
+/// origin-form, which is what an HTTP/1.1 upstream expects.
 fn rewrite_headers(
     headers: &mut hyper::HeaderMap,
     outcome: &super::rewrite::RewriteOutcome,
@@ -511,9 +512,13 @@ fn rewrite_headers(
         headers.insert(hyper::header::HOST, value);
     }
     // Tell the upstream the original first-party host (always `FROM`). Trusted
-    // Server anchors its URL rewriting to `X-Forwarded-Host` (then `Host`), so
-    // this keeps emitted first-party URLs on the production host even when
-    // `--rewrite-host` sends `Host: TO` for routing/validation (spec §8.3).
+    // Server resolves the request host from `Forwarded` → `X-Forwarded-Host` →
+    // `Host`, so a client-supplied `Forwarded` would outrank the value we inject.
+    // Remove it first so the `X-Forwarded-Host` we stamp is the one core reads,
+    // keeping emitted first-party URLs on the production host even when
+    // `--rewrite-host` sends `Host: TO` for routing/validation (spec §8.3). The
+    // `insert`s below already overwrite any inbound `X-Forwarded-Host`/`X-Orig-Host`.
+    headers.remove("forwarded");
     if let Ok(value) = HeaderValue::from_str(&outcome.orig_host) {
         headers.insert(HeaderName::from_static(X_FORWARDED_HOST), value.clone());
         headers.insert(HeaderName::from_static(X_ORIG_HOST), value);
@@ -667,6 +672,34 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("www.example-publisher.com"),
             "Host is still rewritten alongside the strip"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_strips_inbound_forwarded_so_injected_host_wins() {
+        // Trusted Server resolves the request host from `Forwarded` BEFORE
+        // `X-Forwarded-Host`. A client-supplied `Forwarded` must therefore be
+        // dropped, or it would outrank the FROM host the proxy injects.
+        let outcome = RewriteOutcome {
+            sni: "to.edgecompute.app".to_string(),
+            host_header: "to.edgecompute.app".to_string(),
+            orig_host: "www.example-publisher.com".to_string(),
+            scheme_is_tls: true,
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("host=evil.example.com"),
+        );
+        rewrite_headers(&mut headers, &outcome, None);
+        assert!(
+            !headers.contains_key("forwarded"),
+            "inbound Forwarded must be stripped so it cannot outrank X-Forwarded-Host"
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),
+            Some("www.example-publisher.com"),
+            "X-Forwarded-Host is the injected FROM host"
         );
     }
 }

@@ -1390,9 +1390,12 @@ Create `crates/trusted-server-cli/tests/proxy_e2e.rs`. It starts a local TLS "up
 
 use std::sync::Arc;
 
-// Helper: spin a local HTTPS server that echoes the Host and X-Orig-Host it saw.
-// (Implementation uses tokio + tokio-rustls + a rcgen self-signed cert for
-// "upstream.localhost"; see fixtures below.)
+// Helper: spin a local HTTPS server that echoes the Host, X-Forwarded-Host, and
+// X-Orig-Host it saw. (Implementation uses tokio + tokio-rustls + a rcgen
+// self-signed cert for "upstream.localhost"; see fixtures below.)
+//
+// Note: the functional first-party-host header is X-Forwarded-Host (TS core
+// reads it for request_host); X-Orig-Host is an informational duplicate.
 
 #[tokio::test]
 async fn matched_host_is_rewritten_and_forwarded() {
@@ -1410,8 +1413,9 @@ async fn matched_host_is_rewritten_and_forwarded() {
     // trusts the dev CA; SNI/Host are set by the proxy.
     let response = drive_request_through_proxy(cfg, ca).await;
 
-    // Assert: upstream saw Host = FROM and X-Orig-Host = FROM.
+    // Assert: upstream saw Host = FROM and X-Forwarded-Host = FROM (X-Orig-Host too).
     assert_eq!(response.seen_host, "www.example-publisher.com", "Host preserved as FROM");
+    assert_eq!(response.seen_forwarded_host, "www.example-publisher.com", "X-Forwarded-Host is FROM");
     assert_eq!(response.seen_orig_host, "www.example-publisher.com", "X-Orig-Host is FROM");
     assert_eq!(response.status, 200, "response streamed back");
 }
@@ -1461,7 +1465,7 @@ async fn keep_alive_serves_multiple_sequential_requests() {
 }
 ```
 
-> The test-support module `tests/support/mod.rs` provides: `dev_ca()` (a `CertAuthority` in a `tempfile::tempdir()`); `start_echo_upstream()` (HTTPS server, self-signed CN `upstream.localhost`, echoes the `Host`/`X-Orig-Host`/path it saw); `start_gated_upstream()` (returns `401` unless `Authorization` present); `test_config(addr)` / `test_config_without_rules()`; `drive_request_through_proxy(cfg, ca)`; `connect_through_proxy_capturing_cert(cfg, ca, addr, sni)` (returns the leaf the client saw); and `drive_sequential_requests(cfg, ca, paths)` (multiple requests over one keep-alive tunnel). Build them on `tokio` + `tokio-rustls` + rcgen + a `hyper` client that CONNECTs through `cfg.listen`. They import the crate under test as `use trusted_server_cli::commands::dev::proxy::{ca, config, server};` — possible only because Task 1 made the crate a lib + bin.
+> The test-support module `tests/support/mod.rs` provides: `dev_ca()` (a `CertAuthority` in a `tempfile::tempdir()`); `start_echo_upstream()` (HTTPS server, self-signed CN `upstream.localhost`, echoes the `Host`/`X-Forwarded-Host`/`X-Orig-Host`/path it saw); `start_gated_upstream()` (returns `401` unless `Authorization` present); `test_config(addr)` / `test_config_without_rules()`; `drive_request_through_proxy(cfg, ca)`; `connect_through_proxy_capturing_cert(cfg, ca, addr, sni)` (returns the leaf the client saw); and `drive_sequential_requests(cfg, ca, paths)` (multiple requests over one keep-alive tunnel). Build them on `tokio` + `tokio-rustls` + rcgen + a `hyper` client that CONNECTs through `cfg.listen`. They import the crate under test as `use trusted_server_cli::commands::dev::proxy::{ca, config, server};` — possible only because Task 1 made the crate a lib + bin.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1554,7 +1558,8 @@ async fn handle_connection(
 // connect_authority(): Some(host) if method == CONNECT.
 // handle_connect(): match rules; on match reply 200 + MITM via ca.server_config;
 //   on no-match loopback connect-first-then-200 blind tunnel; non-loopback -> 403.
-// For each MITM request: let out = rewrite_for(rule); set Host/X-Orig-Host/SNI;
+// For each MITM request: let out = rewrite_for(rule); strip inbound Forwarded;
+// set Host/X-Forwarded-Host(+X-Orig-Host)/SNI;
 //   inject cfg.basic_auth if Authorization absent; open upstream (TLS unless
 //   plaintext; skip verify if cfg.insecure); stream response; close on Upgrade.
 // Redact Authorization/Cookie in any logging.
@@ -1586,7 +1591,7 @@ pub fn run(args: ProxyArgs) -> error_stack::Result<(), ProxyError> {
 - [ ] **Step 5: Run the integration test to verify it passes**
 
 Run: `cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_e2e`
-Expected: PASS (4 tests) — matched host rewritten with `Host=FROM` + `X-Orig-Host`; unmatched host blind-tunneled (upstream cert, not dev CA); basic-auth clears `401`; keep-alive serves two sequential requests over one tunnel.
+Expected: PASS (4 tests) — matched host rewritten with `Host=FROM` + `X-Forwarded-Host=FROM` (+`X-Orig-Host`); unmatched host blind-tunneled (upstream cert, not dev CA); basic-auth clears `401`; keep-alive serves two sequential requests over one tunnel.
 
 - [ ] **Step 6: Lint and commit**
 
