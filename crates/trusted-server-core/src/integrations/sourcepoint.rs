@@ -9,6 +9,7 @@
 //! |-------|-----------|-----------------|
 //! | HTML attributes | `IntegrationAttributeRewriter` | Static `<script src>` / `<link href>` tags |
 //! | JS response bodies | `rewrite_script_content` | Webpack chunk paths + hardcoded CDN URLs |
+//! | HTML response bodies | `rewrite_html_content` | Root-absolute `src`/`href` in proxied iframe documents |
 //! | Runtime config | `IntegrationHeadInjector` | `window._sp_` assignments from Next.js chunks |
 //! | Dynamic DOM | TS script guard (`script_guard.ts`) | Script/link elements inserted after page load |
 //!
@@ -109,6 +110,29 @@ static SP_CDN_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static SP_ORIGIN_UNIFIED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\.origin\s*\+\s*(['"])/unified/"#)
         .expect("Sourcepoint origin+unified regex should compile")
+});
+
+/// Matches a root-absolute `src`/`href` attribute value in a proxied HTML
+/// document (e.g. the privacy-manager iframe `us_pm/index.html`).
+///
+/// These iframe documents reference their assets relative to the CDN root:
+/// ```html
+/// <script src="/PrivacyManagerUS.89867.js"></script>
+/// <link href="/PrivacyManagerUS.b9d1f.css" rel="stylesheet">
+/// ```
+/// On `cdn.privacy-mgmt.com` that resolves to the CDN; served first-party
+/// through Trusted Server the iframe origin is the publisher, so
+/// `/PrivacyManagerUS.<hash>.js` resolves to the publisher root and 404s —
+/// leaving the consent UI unable to render. We prefix these with the CDN proxy
+/// path so they load through `/integrations/sourcepoint/cdn/…`.
+///
+/// Group 1 is the attribute up to the opening quote and leading slash; group 2
+/// is the rest of the path. The `[^/"]` after the leading slash excludes
+/// protocol-relative `//host` URLs (and absolute `https://…` never starts with
+/// `/`), so only root-absolute paths are rewritten.
+static SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"((?:src|href)=")/([^/"][^"]*)""#)
+        .expect("Sourcepoint HTML root-absolute asset regex should compile")
 });
 
 /// Configuration for the Sourcepoint first-party proxy.
@@ -489,6 +513,41 @@ impl SourcepointIntegration {
             .into_owned()
     }
 
+    /// Rewrites root-absolute `src`/`href` asset references in a proxied HTML
+    /// document to the first-party CDN prefix.
+    ///
+    /// The privacy-manager iframe documents (e.g. `us_pm/index.html`) reference
+    /// their scripts/styles as `"/PrivacyManagerUS.<hash>.js"` etc., which
+    /// resolve to the publisher root (and 404) when the iframe is served
+    /// first-party. Prefixing with `/integrations/sourcepoint/cdn` routes them
+    /// back through the proxy. Protocol-relative (`//host`) and absolute
+    /// (`https://…`) URLs are left untouched (see [`SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN`]).
+    fn rewrite_html_content(content: &str) -> String {
+        SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN
+            .replace_all(content, |caps: &regex::Captures| {
+                let attr_open = &caps[1];
+                let path = &caps[2];
+                format!(r#"{attr_open}{SOURCEPOINT_CDN_PREFIX}/{path}""#)
+            })
+            .into_owned()
+    }
+
+    /// Returns `true` for CDN paths that are likely HTML documents (the
+    /// privacy-manager iframe pages), so the proxy requests uncompressed
+    /// content and can rewrite their root-absolute asset references.
+    fn is_likely_html_path(path: &str) -> bool {
+        path.ends_with(".html")
+    }
+
+    /// Returns `true` when the response `Content-Type` is HTML.
+    fn is_html_response(response: &Response<EdgeBody>) -> bool {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/html"))
+    }
+
     /// Returns `true` for CDN paths that are likely JavaScript bundles.
     ///
     /// Used to decide whether to request uncompressed content from upstream so
@@ -539,16 +598,37 @@ impl SourcepointIntegration {
     }
 
     fn rewrite_javascript_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
+        self.finalize_rewritten_response(
+            response,
+            rewritten,
+            "application/javascript; charset=utf-8",
+        );
+    }
+
+    fn rewrite_html_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
+        self.finalize_rewritten_response(response, rewritten, "text/html; charset=utf-8");
+    }
+
+    /// Replaces a rewritten body and normalises the headers: drops the stale
+    /// content encoding/length, clears `Vary: Accept-Encoding`, applies cookie
+    /// safety (or a fixed public cache policy for these versioned assets), and
+    /// sets `content_type`.
+    fn finalize_rewritten_response(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        content_type: &'static str,
+    ) {
         response.headers_mut().remove(header::CONTENT_ENCODING);
         response.headers_mut().remove(header::CONTENT_LENGTH);
         Self::remove_vary_accept_encoding(response);
 
         if !Self::apply_cookie_safety(response) {
-            // Rewritten JS bundles are static, versioned assets (paths like
-            // `/unified/4.40.1/…`), so we apply a fixed public cache policy
-            // regardless of what upstream sent. This intentionally diverges from the
-            // passthrough path's `apply_cache_headers` (which only sets a default
-            // when upstream omitted Cache-Control).
+            // Rewritten Sourcepoint assets are static, versioned files (hashed
+            // chunk names, `/unified/4.40.1/…` paths), so we apply a fixed public
+            // cache policy regardless of what upstream sent. This intentionally
+            // diverges from the passthrough path's `apply_cache_headers` (which
+            // only sets a default when upstream omitted Cache-Control).
             if let Ok(val) = HeaderValue::from_str(&format!(
                 "public, max-age={}",
                 self.config.cache_ttl_seconds
@@ -556,10 +636,9 @@ impl SourcepointIntegration {
                 response.headers_mut().insert(header::CACHE_CONTROL, val);
             }
         }
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/javascript; charset=utf-8"),
-        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
 
         *response.body_mut() = EdgeBody::from(rewritten.into_bytes());
     }
@@ -697,10 +776,13 @@ impl IntegrationProxy for SourcepointIntegration {
             self.copy_headers(services.client_info.client_ip, &source_req, &mut proxy_req);
 
         // Request uncompressed content only for paths that are likely
-        // JavaScript (the files we need to regex-rewrite).  All other CDN
+        // JavaScript or HTML (the files we need to regex-rewrite).  All other CDN
         // responses (images, JSON API responses, CSS) keep the client's
         // original Accept-Encoding for efficiency.
-        if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
+        if self.config.rewrite_sdk
+            && (Self::is_likely_javascript_path(target_path)
+                || Self::is_likely_html_path(target_path))
+        {
             proxy_req.headers_mut().insert(
                 header::ACCEPT_ENCODING,
                 HeaderValue::from_static("identity"),
@@ -761,14 +843,23 @@ impl IntegrationProxy for SourcepointIntegration {
             return Ok(response);
         }
 
-        // Rewrite CDN URLs inside JavaScript responses so that dynamically
-        // loaded chunks and API calls route through the first-party proxy.
+        // Rewrite CDN URLs inside JavaScript responses (dynamically loaded
+        // chunks, API calls) and root-absolute asset paths inside HTML iframe
+        // documents (privacy-manager pages), so both route through the
+        // first-party proxy.
+        let response_is_javascript = Self::is_javascript_response(&response);
+        let response_is_html = Self::is_html_response(&response);
         if method == Method::GET
             && response.status() == StatusCode::OK
             && self.config.rewrite_sdk
-            && Self::is_javascript_response(&response)
+            && (response_is_javascript || response_is_html)
         {
-            log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
+            let kind = if response_is_javascript {
+                "JavaScript"
+            } else {
+                "HTML"
+            };
+            log::info!("Sourcepoint: rewriting {kind} response body for {path}");
 
             // Guard against unexpectedly large responses to avoid unbounded
             // memory consumption during rewriting.
@@ -821,9 +912,13 @@ impl IntegrationProxy for SourcepointIntegration {
                     return Ok(response);
                 }
             };
-            let rewritten = Self::rewrite_script_content(&body);
-
-            self.rewrite_javascript_response(&mut response, rewritten);
+            if response_is_javascript {
+                let rewritten = Self::rewrite_script_content(&body);
+                self.rewrite_javascript_response(&mut response, rewritten);
+            } else {
+                let rewritten = Self::rewrite_html_content(&body);
+                self.rewrite_html_response(&mut response, rewritten);
+            }
             return Ok(response);
         }
 
@@ -1070,6 +1165,57 @@ mod tests {
         let output = SourcepointIntegration::rewrite_script_content(input);
 
         assert_eq!(output, input, "Non-Sourcepoint URLs should be untouched");
+    }
+
+    #[test]
+    fn rewrites_root_absolute_asset_paths_in_html() {
+        // Mirrors the privacy-manager iframe document (us_pm/index.html), whose
+        // assets are referenced root-absolute and 404 when served first-party.
+        let input = concat!(
+            r#"<link rel="manifest" href="/manifest.json">"#,
+            r#"<link href="/PrivacyManagerUS.b9d1f.css" rel="preload" as="style">"#,
+            r#"<script src="/polyfills.01516.js"></script>"#,
+            r#"<script src="/PrivacyManagerUS.89867.js"></script>"#,
+        );
+        let output = SourcepointIntegration::rewrite_html_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"<link rel="manifest" href="/integrations/sourcepoint/cdn/manifest.json">"#,
+                r#"<link href="/integrations/sourcepoint/cdn/PrivacyManagerUS.b9d1f.css" rel="preload" as="style">"#,
+                r#"<script src="/integrations/sourcepoint/cdn/polyfills.01516.js"></script>"#,
+                r#"<script src="/integrations/sourcepoint/cdn/PrivacyManagerUS.89867.js"></script>"#,
+            ),
+            "root-absolute src/href should be prefixed with the CDN proxy path"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_preserves_absolute_and_protocol_relative_urls() {
+        // Absolute and protocol-relative URLs (and non-rooted relative paths)
+        // must be left untouched — only root-absolute single-slash paths move.
+        let input = concat!(
+            r#"<script src="https://example.com/app.js"></script>"#,
+            r#"<script src="//example.com/lib.js"></script>"#,
+            r#"<link href="styles.css">"#,
+        );
+        let output = SourcepointIntegration::rewrite_html_content(input);
+
+        assert_eq!(
+            output, input,
+            "absolute, protocol-relative, and relative URLs should be untouched"
+        );
+    }
+
+    #[test]
+    fn is_likely_html_path_matches_iframe_documents() {
+        assert!(SourcepointIntegration::is_likely_html_path(
+            "/us_pm/index.html"
+        ));
+        assert!(!SourcepointIntegration::is_likely_html_path(
+            "/unified/4.40.1/PrivacyManagerUS.89867.js"
+        ));
     }
 
     #[test]
