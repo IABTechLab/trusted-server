@@ -50,6 +50,17 @@ fn resolve_max_level(configured: Option<&str>) -> log::LevelFilter {
         .unwrap_or(log::LevelFilter::Info)
 }
 
+/// Detects the maximum log level from explicit config and the Fastly hostname.
+///
+/// Explicit `EDGEZERO_LOG_LEVEL` input wins, including values that lower the
+/// level. Without an explicit value, Viceroy's `FASTLY_HOSTNAME=localhost`
+/// auto-raises local runs to `Debug`; production hostnames and missing hostnames
+/// stay at the safe `Info` default.
+fn detect_max_level(explicit: Option<&str>, hostname: Option<&str>) -> log::LevelFilter {
+    let configured = explicit.or_else(|| (hostname == Some(LOCAL_HOSTNAME)).then_some("debug"));
+    resolve_max_level(configured)
+}
+
 /// Initialises the Fastly-backed `fern` logger and installs it as the global logger.
 ///
 /// Log records are forwarded to the `tslog` Fastly endpoint and echoed to stdout.
@@ -68,15 +79,9 @@ fn resolve_max_level(configured: Option<&str>) -> log::LevelFilter {
 /// Panics if the Fastly logger cannot be built or if the global logger has already
 /// been set.
 pub(crate) fn init_logger() {
-    let configured = std::env::var(LOG_LEVEL_ENV).ok().or_else(|| {
-        // Viceroy reports the guest host as `localhost`; production cache nodes
-        // report their real hostname. Raise to debug only in that local
-        // environment so route-decision lines surface under `fastly compute
-        // serve` while production stays at the safe `Info` default.
-        (std::env::var(LOCAL_HOSTNAME_ENV).as_deref() == Ok(LOCAL_HOSTNAME))
-            .then(|| "debug".to_owned())
-    });
-    let max_level = resolve_max_level(configured.as_deref());
+    let explicit = std::env::var(LOG_LEVEL_ENV).ok();
+    let hostname = std::env::var(LOCAL_HOSTNAME_ENV).ok();
+    let max_level = detect_max_level(explicit.as_deref(), hostname.as_deref());
 
     let logger = Logger::builder()
         .default_endpoint("tslog")
@@ -159,6 +164,34 @@ mod tests {
             resolve_max_level(Some("not-a-level")),
             log::LevelFilter::Info,
             "should keep the safe Info default for an unparseable override"
+        );
+    }
+
+    #[test]
+    fn detect_max_level_explicit_override_wins_over_local_hostname() {
+        assert_eq!(
+            detect_max_level(Some("error"), Some(LOCAL_HOSTNAME)),
+            log::LevelFilter::Error,
+            "explicit override should win over Viceroy auto-debug"
+        );
+    }
+
+    #[test]
+    fn detect_max_level_auto_debugs_only_for_viceroy_hostname() {
+        assert_eq!(
+            detect_max_level(None, Some(LOCAL_HOSTNAME)),
+            log::LevelFilter::Debug,
+            "Viceroy localhost hostname should auto-raise local validation to Debug"
+        );
+        assert_eq!(
+            detect_max_level(None, Some("cache-lax1234-LAX")),
+            log::LevelFilter::Info,
+            "production Fastly hostnames must stay at Info"
+        );
+        assert_eq!(
+            detect_max_level(None, None),
+            log::LevelFilter::Info,
+            "missing hostname should stay at Info"
         );
     }
 }

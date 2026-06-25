@@ -204,10 +204,7 @@ fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
         Ok(Some(value)) => match parse_rollout_pct(&value) {
             Some(pct) => pct,
             None => {
-                log::warn!(
-                    "invalid edgezero_rollout_pct value {:?}, defaulting to 0 (legacy path)",
-                    value
-                );
+                log::warn!("invalid edgezero_rollout_pct value, defaulting to 0 (legacy path)");
                 0
             }
         },
@@ -270,6 +267,25 @@ fn should_route_to_edgezero(rollout_pct: u8, client_ip: Option<IpAddr>) -> bool 
     }
 }
 
+/// Selects the Fastly entry point for an already-opened config store and request.
+///
+/// `edgezero_enabled=false` always routes to legacy and must not require callers
+/// to read `edgezero_rollout_pct`. When enabled, `rollout_pct` is interpreted
+/// exactly as [`read_rollout_pct`] returns it: `0` is full rollback, `100` is full
+/// cutover, and intermediate values are sticky by client-IP bucket.
+fn select_edgezero_entrypoint(
+    edgezero_enabled: bool,
+    rollout_pct: u8,
+    client_ip: Option<IpAddr>,
+) -> bool {
+    if !edgezero_enabled {
+        log::debug!("routing request through legacy path (edgezero_enabled=false)");
+        return false;
+    }
+
+    should_route_to_edgezero(rollout_pct, client_ip)
+}
+
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
     if req.get_method() == FastlyMethod::GET && req.get_path() == "/health" {
         return Some(FastlyResponse::from_status(200).with_body_text_plain("ok"));
@@ -317,17 +333,16 @@ fn main() {
         }
     };
 
-    if !is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
+    let edgezero_enabled = is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
-    }) {
-        log::debug!("routing request through legacy path (edgezero_enabled=false)");
-        legacy_main(req);
-        return;
-    }
-
-    let rollout_pct = read_rollout_pct(&edgezero_config_store);
-    let route_to_edgezero = should_route_to_edgezero(rollout_pct, req.get_client_ip_addr());
+    });
+    let route_to_edgezero = if edgezero_enabled {
+        let rollout_pct = read_rollout_pct(&edgezero_config_store);
+        select_edgezero_entrypoint(edgezero_enabled, rollout_pct, req.get_client_ip_addr())
+    } else {
+        select_edgezero_entrypoint(edgezero_enabled, 0, req.get_client_ip_addr())
+    };
 
     if route_to_edgezero {
         edgezero_main(req, edgezero_config_store);
@@ -1591,6 +1606,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn entrypoint_selector_requires_enabled_flag_before_rollout() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            !select_edgezero_entrypoint(false, 100, Some(ip)),
+            "disabled EdgeZero flag should force the legacy entry point even at 100% rollout"
+        );
+    }
+
+    #[test]
+    fn entrypoint_selector_routes_rollout_edges() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            !select_edgezero_entrypoint(true, 0, Some(ip)),
+            "enabled EdgeZero with 0% rollout should route to legacy"
+        );
+        assert!(
+            select_edgezero_entrypoint(true, 100, Some(ip)),
+            "enabled EdgeZero with 100% rollout should route to EdgeZero"
+        );
+    }
+
+    #[test]
+    fn entrypoint_selector_routes_partial_hit_and_miss() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            select_edgezero_entrypoint(true, 86, Some(ip)),
+            "enabled EdgeZero should route a bucket hit to EdgeZero"
+        );
+        assert!(
+            !select_edgezero_entrypoint(true, 85, Some(ip)),
+            "enabled EdgeZero should route a bucket miss to legacy"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // read_rollout_pct — safety-critical config-store branches
     // ---------------------------------------------------------------------------
@@ -1611,8 +1664,12 @@ mod tests {
     impl edgezero_core::config_store::ConfigStore for TestConfigStore {
         fn get(
             &self,
-            _key: &str,
+            key: &str,
         ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
+            assert_eq!(
+                key, EDGEZERO_ROLLOUT_PCT_KEY,
+                "stub should pin the rollout config key"
+            );
             match &self.response {
                 StubResponse::Value(v) => Ok(Some(v.clone())),
                 StubResponse::Absent => Ok(None),
