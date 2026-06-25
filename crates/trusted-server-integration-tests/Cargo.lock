@@ -1494,9 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.1"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8be7462df143984c4598a256ef469b251d7d7f9e271135073e78fc535414f3d0"
+checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
 dependencies = [
  "bytes",
  "itoa",
@@ -1859,23 +1859,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "integration-tests"
-version = "0.1.0"
-dependencies = [
- "derive_more 2.1.1",
- "env_logger",
- "error-stack",
- "libc",
- "log",
- "reqwest",
- "scraper",
- "serde_json",
- "testcontainers",
- "trusted-server-core",
- "urlencoding",
 ]
 
 [[package]]
@@ -4012,6 +3995,23 @@ dependencies = [
  "uuid",
  "validator",
  "web-time",
+]
+
+[[package]]
+name = "trusted-server-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "derive_more 2.1.1",
+ "env_logger",
+ "error-stack",
+ "libc",
+ "log",
+ "reqwest",
+ "scraper",
+ "serde_json",
+ "testcontainers",
+ "trusted-server-core",
+ "urlencoding",
 ]
 
 [[package]]
