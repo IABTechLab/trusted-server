@@ -88,6 +88,30 @@ transitive_parity_allowlist=(
     # The workspace pins an older 0.10.x via a production-only dependency; the
     # integration tree only needs 0.13/0.14, so the 0.10 line is never resolved.
     "itertools"
+    # The native integration graph pulls tower-http/reqwest on the bitflags 2.x
+    # line; the workspace still carries a Fastly-only bitflags 1.x line.
+    "bitflags"
+    # The integration graph compiles trusted-server-core's sha2 0.10/HMAC path;
+    # the workspace also carries an older sha2 0.9 chain from another target.
+    "block-buffer"
+    "digest"
+    "sha2"
+    # EdgeZero's Axum adapter currently requires thiserror 2.x, while the
+    # workspace also carries a thiserror 1.x line.
+    "thiserror"
+    "thiserror-impl"
+    # The integration test stack pulls platform crates through tokio and
+    # testcontainers on Windows semver lines that differ from the workspace.
+    "windows-sys"
+    "windows-targets"
+    "windows_aarch64_gnullvm"
+    "windows_aarch64_msvc"
+    "windows_i686_gnu"
+    "windows_i686_gnullvm"
+    "windows_i686_msvc"
+    "windows_x86_64_gnu"
+    "windows_x86_64_gnullvm"
+    "windows_x86_64_msvc"
 )
 
 is_allowlisted() {

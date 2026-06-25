@@ -288,9 +288,7 @@ pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
         .send()
         .change_context(TestError::HttpRequest)
         .attach("TRACE / (EdgeZero entry-point canary)")?;
-    assert_status(&response, 405).attach(
-        "EdgeZero canary: TRACE should return a router-level 405",
-    )
+    assert_status(&response, 405).attach("EdgeZero canary: TRACE should return a router-level 405")
 }
 
 pub fn assert_status(resp: &Response, expected: u16) -> TestResult<()> {
