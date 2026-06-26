@@ -46,9 +46,8 @@ impl fmt::Display for Jurisdiction {
 /// Returns [`Jurisdiction::Unknown`] when no geo data is available.
 #[must_use]
 pub fn detect_jurisdiction(geo: Option<&GeoInfo>, config: &ConsentConfig) -> Jurisdiction {
-    let geo = match geo {
-        Some(g) => g,
-        None => return Jurisdiction::Unknown,
+    let Some(geo) = geo else {
+        return Jurisdiction::Unknown;
     };
 
     // Check GDPR countries first (EU/EEA/UK). This ordering also resolves

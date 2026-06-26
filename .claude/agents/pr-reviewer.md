@@ -494,7 +494,7 @@ For each changed file, evaluate:
 - Are edge cases covered (empty input, max values, error paths)?
 - If config-derived regex/pattern compilation changed: are invalid enabled-config startup failures and explicit `enabled = false` bypass cases both covered?
 - Rust tests: `cargo test --workspace`
-- JS tests: `npx vitest run` in `crates/js/lib/`
+- JS tests: `npx vitest run` in `crates/trusted-server-js/lib/`
 
 ### 5. Classify findings
 

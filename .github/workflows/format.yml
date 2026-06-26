@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: crates/js/lib
+        working-directory: crates/trusted-server-js/lib
 
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +55,7 @@ jobs:
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
-          cache-dependency-path: crates/js/lib/package.json
+          cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
         run: npm ci

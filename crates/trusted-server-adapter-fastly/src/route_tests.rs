@@ -548,8 +548,12 @@ fn test_runtime_services_with_secret_http_client_and_geo(
         .geo(geo)
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
+            tls_cipher: req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_string),
             tls_ja4: req.get_tls_ja4().map(str::to_string),
             h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
             server_hostname: None,
@@ -1022,6 +1026,120 @@ fn routes_use_request_local_consent() {
 
     // Routes no longer depend on a separate consent KV store. Live consent is
     // request-local, and EC lifecycle state uses the EC identity store only.
+}
+
+#[test]
+fn set_tester_route_is_disabled_by_default() {
+    let settings = create_test_settings();
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/_ts/set-tester");
+    let services = test_runtime_services(&req);
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route disabled tester-cookie request",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "disabled tester-cookie route should return 404"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        None,
+        "disabled tester-cookie route should not set a cookie"
+    );
+}
+
+#[test]
+fn set_tester_route_sets_cookie_on_configured_domain_when_enabled() {
+    let mut settings = create_test_settings();
+    settings.tester_cookie.enabled = true;
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/_ts/set-tester");
+    let services = test_runtime_services(&req);
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route enabled tester-cookie request",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NO_CONTENT,
+        "enabled tester-cookie route should return no content"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        Some("ts-tester=true; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax"),
+        "tester cookie should use publisher.cookie_domain"
+    );
+}
+
+#[test]
+fn clear_tester_route_is_disabled_by_default() {
+    let settings = create_test_settings();
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/_ts/clear-tester");
+    let services = test_runtime_services(&req);
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route disabled clear tester-cookie request",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "disabled clear tester-cookie route should return 404"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        None,
+        "disabled clear tester-cookie route should not set a cookie"
+    );
+}
+
+#[test]
+fn clear_tester_route_clears_cookie_on_configured_domain_when_enabled() {
+    let mut settings = create_test_settings();
+    settings.tester_cookie.enabled = true;
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+    let req = Request::get("https://test.com/_ts/clear-tester");
+    let services = test_runtime_services(&req);
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route enabled clear tester-cookie request",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NO_CONTENT,
+        "enabled clear tester-cookie route should return no content"
+    );
+    assert_eq!(
+        response.get_header_str(header::SET_COOKIE),
+        Some("ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0"),
+        "tester cookie clear should use publisher.cookie_domain"
+    );
 }
 
 #[test]

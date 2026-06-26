@@ -22,7 +22,7 @@
 
 use std::sync::LazyLock;
 
-use error_stack::{Report, ResultExt};
+use error_stack::{Report, ResultExt as _};
 
 use crate::error::TrustedServerError;
 use crate::platform::{RuntimeServices, StoreName};
@@ -56,7 +56,7 @@ pub(crate) static SIGNING_STORE_NAME: LazyLock<StoreName> =
 fn parse_active_kids(active_kids: &str) -> Vec<String> {
     active_kids
         .split(',')
-        .map(|kid| kid.trim().to_string())
+        .map(|kid| kid.trim().to_owned())
         .filter(|kid| !kid.is_empty())
         .collect()
 }

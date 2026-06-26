@@ -97,9 +97,8 @@ mod tests {
     }
 
     fn assert_orchestrator_error_contains(settings: &Settings, expected: &str) {
-        let err = match build_orchestrator(settings) {
-            Ok(_) => panic!("build_orchestrator should reject invalid auction providers"),
-            Err(err) => err,
+        let Err(err) = build_orchestrator(settings) else {
+            panic!("build_orchestrator should reject invalid auction providers");
         };
         assert!(
             err.to_string().contains(expected),
