@@ -1108,6 +1108,10 @@ mod tests {
         build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
         TrustedServerApp, NAMED_ROUTES,
     };
+    use crate::route_tests::{
+        test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
+        FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
+    };
 
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
@@ -1125,7 +1129,7 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
-    use trusted_server_core::platform::ClientInfo;
+    use trusted_server_core::platform::{ClientInfo, PlatformHttpClient};
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -2010,12 +2014,6 @@ mod tests {
         // rather than draining the origin into a buffered `Body::Once`. Injecting a
         // streaming HTTP client lets us assert the body type the entry point will
         // pipe straight to the client via `stream_to_client`.
-        use crate::route_tests::{
-            test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
-            FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
-        };
-        use trusted_server_core::platform::PlatformHttpClient;
-
         let settings = Settings::from_toml(
             r#"
             [[handlers]]
