@@ -271,15 +271,13 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Sends a non-fatal diagnostic probe for the EdgeZero entry point.
+/// Hard-asserts the deterministic EdgeZero entry-point response header.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
-/// This probe used to assert a router-level `405` for unsupported methods, but
-/// Viceroy/Fastly method handling can fall through to the publisher fallback.
-/// Keep the request as a non-fatal diagnostic so the EdgeZero CI job still runs
-/// the EC lifecycle scenarios instead of failing on a routing canary that is not
-/// stable across runtime versions.
+/// The EdgeZero entry point marks every normal response with a stable header so
+/// the EdgeZero CI job fails immediately when rollout accidentally falls back to
+/// `legacy_main`, without relying on method/status behavior.
 pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -293,11 +291,15 @@ pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
         .send()
         .change_context(TestError::HttpRequest)
         .attach("OPTIONS /_ts/api/v1/batch-sync (EdgeZero entry-point probe)")?;
-    if response.status().as_u16() != 405 {
-        log::warn!(
-            "EdgeZero entry-point probe returned status {}; continuing with EC lifecycle scenarios",
+    let header_value = response
+        .headers()
+        .get("x-ts-entry-point")
+        .and_then(|value| value.to_str().ok());
+    if header_value != Some("edgezero") {
+        return Err(Report::new(TestError::UnexpectedContent).attach(format!(
+            "expected x-ts-entry-point: edgezero from EdgeZero entry point, got {header_value:?}; status was {}",
             response.status()
-        );
+        )));
     }
     Ok(())
 }

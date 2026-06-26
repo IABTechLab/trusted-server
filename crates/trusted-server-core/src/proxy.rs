@@ -44,8 +44,14 @@ fn body_as_reader(body: EdgeBody) -> Result<Cursor<bytes::Bytes>, Report<Trusted
 
 fn request_body_bytes(
     body: EdgeBody,
-    _endpoint: &str,
+    endpoint: &str,
 ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
     Ok(body.into_bytes().unwrap_or_default())
 }
 
@@ -2064,6 +2070,16 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
             .expect("should build http post request")
+    }
+
+    fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(uri.as_ref())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming http post request")
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -4679,6 +4695,30 @@ mod tests {
                 err.current_context().status_code(),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "should return 413 for oversized sign body"
+            );
+        });
+    }
+
+    #[test]
+    fn sign_rejects_streaming_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = build_http_post_streaming_request("https://edge.example/first-party/sign");
+            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject streaming sign body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_REQUEST,
+                "should return 400 for streaming sign body"
+            );
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::BadRequest { message }
+                        if message == "first-party sign request body must be buffered, not streamed"
+                ),
+                "should explain that sign bodies must be buffered"
             );
         });
     }

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::{
@@ -68,7 +67,7 @@ mod rate_limiter;
 #[cfg(test)]
 mod route_tests;
 
-use crate::app::{build_state, load_settings_from_config_store, TrustedServerApp};
+use crate::app::{build_state, load_settings_from_config_store, EcFinalizeState, TrustedServerApp};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
@@ -78,6 +77,8 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
+const HEADER_X_TS_ENTRY_POINT: &str = "x-ts-entry-point";
+const EDGEZERO_ENTRY_POINT_VALUE: &str = "edgezero";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
 ///
@@ -400,7 +401,8 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         return;
     }
 
-    let app = TrustedServerApp::build_app();
+    let (app, app_state) = TrustedServerApp::build_app_with_state();
+    let settings_snapshot = app_state.as_ref().map(|state| Arc::clone(&state.settings));
 
     // Strip client-spoofable forwarded headers before handing off to the
     // EdgeZero dispatcher, mirroring the sanitization done in legacy_main.
@@ -507,21 +509,19 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     if !take_finalize_sentinel(&mut response) {
         // Apply finalize headers at the entry point so that router-level
         // 405/404 responses for unregistered HTTP methods (e.g. TRACE, WebDAV
-        // verbs) carry TS/geo headers. Middleware-finalized responses are
-        // skipped here to avoid a second settings read and geo lookup on the
-        // normal registered-route path.
-        match load_settings_from_config_store() {
-            Ok(settings) => {
-                let geo_info = resolve_geo_for_response(&response, client_ip, |client_ip| {
-                    FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
-                        log::warn!("entry-point geo lookup failed: {e}");
-                        None
-                    })
-                });
-                apply_finalize_headers(&settings, geo_info.as_ref(), &mut response);
-            }
-            Err(e) => {
-                log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+        // verbs) carry TS/geo headers. Prefer the request-scope settings that
+        // built the EdgeZero router; startup-error routers have no valid state,
+        // so they preserve the previous best-effort reload fallback.
+        if let Some(settings) = settings_snapshot.as_deref() {
+            apply_entry_point_finalize_headers(settings, &mut response, client_ip);
+        } else {
+            match load_settings_from_config_store() {
+                Ok(settings) => {
+                    apply_entry_point_finalize_headers(&settings, &mut response, client_ip);
+                }
+                Err(e) => {
+                    log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
+                }
             }
         }
     }
@@ -534,45 +534,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
 
     // EC response lifecycle, mirroring legacy_main: finalize EC cookies and
     // request headers on the response, send it, then run pull sync for
-    // recognized browsers. When settings or the partner registry cannot be
-    // loaded the response is sent without EC finalization rather than
-    // dropped.
+    // recognized browsers. Reuse the request-scope settings from AppState;
+    // startup-error responses have no valid state and keep the previous
+    // best-effort reload fallback.
     if let Some(ec_state) = ec_state {
-        match load_settings_from_config_store() {
-            Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
+        if let Some(settings) = settings_snapshot.as_deref() {
+            match apply_edgezero_ec_finalize(settings, &ec_state, &mut response) {
                 Ok(partner_registry) => {
-                    // KvIdentityGraph cannot ride in response extensions
-                    // (non-Sync dyn EcKvStore), so rebuild it from settings
-                    // when the handler enabled the KV write path.
-                    let finalize_kv_graph = if ec_state.use_finalize_kv {
-                        maybe_identity_graph(&settings)
-                    } else {
-                        None
-                    };
-                    ec_finalize_response(
-                        &settings,
-                        &ec_state.ec_context,
-                        finalize_kv_graph.as_ref(),
-                        &partner_registry,
-                        ec_state.eids_cookie.as_deref(),
-                        ec_state.sharedid_cookie.as_deref(),
-                        &mut response,
-                    );
-                    if let Some(effects) = &request_filter_effects {
-                        effects.apply_to_response(&mut response);
-                    }
-                    send_core_response(response);
-
-                    if ec_state.is_real_browser {
-                        if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
-                            run_pull_sync_after_send(
-                                &settings,
-                                &partner_registry,
-                                &context,
-                                &ec_state.services,
-                            );
-                        }
-                    }
+                    send_edgezero_response(response, request_filter_effects.as_ref());
+                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     return;
                 }
                 Err(e) => {
@@ -580,17 +550,94 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                         "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
                     );
                 }
-            },
-            Err(e) => {
-                log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
+            }
+        } else {
+            match load_settings_from_config_store() {
+                Ok(settings) => {
+                    match apply_edgezero_ec_finalize(&settings, &ec_state, &mut response) {
+                        Ok(partner_registry) => {
+                            send_edgezero_response(response, request_filter_effects.as_ref());
+                            run_edgezero_pull_sync_after_send(
+                                &settings,
+                                &partner_registry,
+                                &ec_state,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "EdgeZero EC finalize skipped: failed to build partner registry: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("EdgeZero EC finalize skipped: failed to reload settings: {e:?}");
+                }
             }
         }
     }
 
-    if let Some(effects) = &request_filter_effects {
-        effects.apply_to_response(&mut response);
+    send_edgezero_response(response, request_filter_effects.as_ref());
+}
+
+fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
+    response
+        .headers_mut()
+        .remove(HEADER_X_TS_FINALIZED)
+        .is_some()
+}
+
+fn apply_entry_point_finalize_headers(
+    settings: &Settings,
+    response: &mut HttpResponse,
+    client_ip: Option<std::net::IpAddr>,
+) {
+    let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
+        FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+            log::warn!("entry-point geo lookup failed: {e}");
+            None
+        })
+    });
+    apply_finalize_headers(settings, geo_info.as_ref(), response);
+}
+
+fn apply_edgezero_ec_finalize(
+    settings: &Settings,
+    ec_state: &EcFinalizeState,
+    response: &mut HttpResponse,
+) -> Result<PartnerRegistry, Report<TrustedServerError>> {
+    let partner_registry = PartnerRegistry::from_config(&settings.ec.partners)?;
+    // KvIdentityGraph cannot ride in response extensions (non-Sync dyn
+    // EcKvStore), so rebuild it from settings when the handler enabled the KV
+    // write path.
+    let finalize_kv_graph = if ec_state.use_finalize_kv {
+        maybe_identity_graph(settings)
+    } else {
+        None
+    };
+    ec_finalize_response(
+        settings,
+        &ec_state.ec_context,
+        finalize_kv_graph.as_ref(),
+        &partner_registry,
+        ec_state.eids_cookie.as_deref(),
+        ec_state.sharedid_cookie.as_deref(),
+        response,
+    );
+    Ok(partner_registry)
+}
+
+fn run_edgezero_pull_sync_after_send(
+    settings: &Settings,
+    partner_registry: &PartnerRegistry,
+    ec_state: &EcFinalizeState,
+) {
+    if ec_state.is_real_browser {
+        if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
+            run_pull_sync_after_send(settings, partner_registry, &context, &ec_state.services);
+        }
     }
-    send_core_response(response);
 }
 
 /// Sends a finalized `EdgeZero` response to the client.
@@ -601,7 +648,15 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
 /// materialize in the Wasm heap. This mirrors the legacy
 /// `HandlerOutcome::AssetStreaming` path. All other responses carry a buffered
 /// [`EdgeBody::Once`] body and are sent in a single shot.
-fn send_core_response(response: HttpResponse) {
+fn send_edgezero_response(
+    mut response: HttpResponse,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    if let Some(effects) = request_filter_effects {
+        effects.apply_to_response(&mut response);
+    }
+    mark_edgezero_entry_point(&mut response);
+
     let (parts, body) = response.into_parts();
     match body {
         EdgeBody::Stream(_) => {
@@ -630,11 +685,11 @@ fn send_core_response(response: HttpResponse) {
     }
 }
 
-fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
-    response
-        .headers_mut()
-        .remove(HEADER_X_TS_FINALIZED)
-        .is_some()
+fn mark_edgezero_entry_point(response: &mut HttpResponse) {
+    response.headers_mut().insert(
+        HEADER_X_TS_ENTRY_POINT,
+        HeaderValue::from_static(EDGEZERO_ENTRY_POINT_VALUE),
+    );
 }
 
 /// Handles a request using the original Fastly-native entry point.
