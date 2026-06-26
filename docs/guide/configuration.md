@@ -47,6 +47,12 @@ export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 openssl rand -base64 32
 ```
 
+### Strict Key Validation
+
+Trusted Server rejects unknown TOML keys in runtime configuration. Before pushing
+or upgrading config, remove stale fields and typos; otherwise config loading can
+fail and the service will return its startup-error response.
+
 ## Configuration Files
 
 | File                  | Purpose                         |

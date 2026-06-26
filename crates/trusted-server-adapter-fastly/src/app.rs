@@ -81,7 +81,7 @@
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -165,6 +165,8 @@ pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<Trust
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    warn_if_certificate_check_disabled(&settings);
+
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -176,6 +178,14 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
     }))
+}
+
+fn warn_if_certificate_check_disabled(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
+        );
+    }
 }
 
 /// Resolves per-request consent KV store services for routes that read consent data.
@@ -1041,6 +1051,25 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
+    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state();
+        let mut app = App::with_name(router, Self::name());
+        Self::configure(&mut app);
+        (app, state)
+    }
+
+    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state() {
+            Ok(state) => state,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), None);
+            }
+        };
+
+        (Self::routes_for_state(&state), Some(state))
+    }
+
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
@@ -1088,15 +1117,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        Self::routes_for_state(&state)
+        Self::router_with_state().0
     }
 }
 

@@ -110,7 +110,7 @@ fn resolve_fastly_chunk_pointer(
         ));
     }
 
-    let mut envelope_json = String::with_capacity(pointer.envelope_len);
+    let mut envelope_json = String::new();
     for chunk in pointer.chunks {
         let chunk_value = read_config_entry(config_store, store_name, &chunk.key)?;
         let chunk_len = chunk_value.len();

@@ -26,8 +26,14 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
 
 fn request_body_bytes(
     body: EdgeBody,
-    _endpoint: &str,
+    endpoint: &str,
 ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
     Ok(body.into_bytes().unwrap_or_default())
 }
 
@@ -442,6 +448,7 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
     use http::{header, Method, Request as HttpRequest, StatusCode};
@@ -465,6 +472,15 @@ mod tests {
             .uri(uri)
             .body(body)
             .expect("should build request")
+    }
+
+    fn build_streaming_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming request")
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -931,6 +947,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_signature_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/verify-signature");
+        let err = handle_verify_signature(&settings, &noop_services(), req)
+            .expect_err("should reject streaming verify body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming verify body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "verify-signature request body must be buffered, not streamed"
+            ),
+            "should explain that verify bodies must be buffered"
+        );
+    }
+
+    #[test]
     fn rotate_key_rejects_oversized_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
@@ -945,6 +982,27 @@ mod tests {
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should return 413 for rotate-key body over limit"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
+        let err = handle_rotate_key(&settings, &noop_services(), req)
+            .expect_err("should reject streaming rotate body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming rotate body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "rotate-key request body must be buffered, not streamed"
+            ),
+            "should explain that rotate bodies must be buffered"
         );
     }
 
