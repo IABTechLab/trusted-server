@@ -152,6 +152,27 @@ button.secondary:hover {
   background: #cbd5e1;
 }
 
+.checkbox-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.checkbox-list label {
+  align-items: center;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  display: inline-flex;
+  gap: 0.45rem;
+  padding: 0.5rem 0.7rem;
+}
+
+.checkbox-list input {
+  accent-color: var(--brand);
+}
+
 .status-line {
   color: var(--muted);
 }

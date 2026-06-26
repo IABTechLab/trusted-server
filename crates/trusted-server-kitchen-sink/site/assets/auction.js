@@ -3,18 +3,46 @@
 
   const { $, renderJson, setText, clearSlots, renderBidInSlot, flattenOpenRtbBids } = window.TSKitchen;
 
+  const bidders = [
+    { code: 'mocktioneer', checked: true, params: { placementId: 'kitchen-sink-mocktioneer' } },
+    { code: 'kargo', checked: false, params: { placementId: 'kitchen-sink-kargo' } },
+    { code: 'appnexus', checked: false, params: { placementId: 13144370 } },
+    { code: 'openx', checked: false, params: { unit: 'kitchen-sink-openx', delDomain: 'example.com' } },
+  ];
+
+  function renderBidderControls() {
+    $('#bidder-controls').innerHTML = bidders
+      .map(
+        (bidder) => `
+          <label>
+            <input type="checkbox" name="bidder" value="${bidder.code}" ${bidder.checked ? 'checked' : ''}>
+            ${bidder.code}
+          </label>
+        `,
+      )
+      .join('');
+  }
+
+  function selectedBidders() {
+    const checkedInputs = Array.from(document.querySelectorAll('input[name="bidder"]:checked'));
+    const selectedCodes = new Set(checkedInputs.map((input) => input.value));
+    return bidders.filter((bidder) => selectedCodes.has(bidder.code));
+  }
+
   function auctionPayload() {
+    const zone = 'header';
     return {
       adUnits: [
         {
           code: 'header-banner',
-          mediaTypes: { banner: { sizes: [[728, 90]], name: 'header' } },
-          bids: [
-            {
-              bidder: 'kargo',
-              params: { placementId: 'kitchen-sink-header', zone: 'header' },
+          mediaTypes: { banner: { sizes: [[728, 90]], name: zone } },
+          bids: selectedBidders().map((bidder) => ({
+            bidder: bidder.code,
+            params: {
+              ...bidder.params,
+              zone,
             },
-          ],
+          })),
         },
       ],
       config: {
@@ -57,6 +85,7 @@
   }
 
   document.addEventListener('DOMContentLoaded', () => {
+    renderBidderControls();
     $('#run-auction').addEventListener('click', runAuction);
     $('#clear-auction').addEventListener('click', () => {
       clearSlots();

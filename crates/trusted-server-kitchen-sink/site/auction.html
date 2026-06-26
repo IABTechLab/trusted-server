@@ -23,10 +23,12 @@
   <main>
     <section class="hero">
       <h1>Auction</h1>
-      <p>Send one fixed banner request to <code>/auction</code>.</p>
+      <p>Send one banner request with selected bidders to <code>/auction</code>.</p>
     </section>
 
     <section class="card">
+      <h2>Bidders</h2>
+      <div id="bidder-controls" class="checkbox-list" aria-label="Bidders"></div>
       <div class="actions">
         <button id="run-auction">Run auction</button>
         <button id="clear-auction" class="secondary">Clear</button>
