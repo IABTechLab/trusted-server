@@ -36,9 +36,12 @@ struct FastlyChunkRef {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::Configuration`] when the config blob is
-/// missing, cannot be read, fails envelope verification, or fails Trusted
-/// Server settings validation.
+/// Returns [`TrustedServerError::ConfigStoreUnavailable`] (HTTP 503) when the
+/// config blob (or a referenced chunk) cannot be read — store unseeded,
+/// transient backend, or a chunk key missing. Returns
+/// [`TrustedServerError::Configuration`] (HTTP 500) when the read succeeds but
+/// the blob fails envelope/chunk verification or Trusted Server settings
+/// validation.
 pub fn get_settings_from_services(
     services: &RuntimeServices,
 ) -> Result<Settings, Report<TrustedServerError>> {
@@ -66,9 +69,10 @@ pub fn default_config_key() -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TrustedServerError::Configuration`] when the config blob is
-/// missing, cannot be read, fails envelope verification, or fails Trusted
-/// Server settings validation.
+/// Returns [`TrustedServerError::ConfigStoreUnavailable`] (HTTP 503) when the
+/// config blob (or a referenced chunk) cannot be read, and
+/// [`TrustedServerError::Configuration`] (HTTP 500) when the read succeeds but
+/// envelope/chunk verification or settings validation fails.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
     store_name: &StoreName,
@@ -84,12 +88,14 @@ fn read_config_entry(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    let message = format!(
-        "failed to read Trusted Server app config key `{key}` from config store `{store_name}`"
-    );
     config_store
         .get(store_name, key)
-        .change_context(TrustedServerError::Configuration { message })
+        .change_context(TrustedServerError::ConfigStoreUnavailable {
+            store_name: store_name.to_string(),
+            message: format!(
+                "unavailable or not seeded (failed to read `{key}`) — run `ts config push`"
+            ),
+        })
 }
 
 fn resolve_fastly_chunk_pointer(
@@ -160,6 +166,7 @@ fn configuration_error<T>(message: String) -> Result<T, Report<TrustedServerErro
 mod tests {
     use super::*;
     use crate::config_payload::CONFIG_BLOB_KEY;
+    use crate::error::IntoHttpResponse;
     use crate::platform::PlatformError;
     use crate::settings::Settings;
     use crate::test_support::tests::crate_test_settings_str;
@@ -269,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn fails_when_blob_key_is_missing() {
+    fn unseeded_blob_is_config_store_unavailable_503() {
         let store = MemoryConfigStore {
             entries: BTreeMap::new(),
         };
@@ -278,9 +285,124 @@ mod tests {
             get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
                 .expect_err("should fail when blob is missing");
 
+        // Unseeded store is a read failure → 503, not an opaque 500.
+        assert_eq!(
+            err.current_context().status_code(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "unseeded config blob should map to 503"
+        );
+        // The actionable hint must ride the error chain so it reaches the
+        // server log; the public 503 body stays generic by design.
         assert!(
-            err.to_string().contains(CONFIG_BLOB_KEY),
-            "error should mention missing blob key"
+            format!("{err:?}").contains("ts config push"),
+            "error chain should carry the actionable `ts config push` hint for logs"
+        );
+    }
+
+    #[test]
+    fn missing_chunk_is_config_store_unavailable_503() {
+        // The blob key resolves to a chunk pointer, but one referenced chunk is
+        // absent — still a config-store read failure → 503.
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let envelope_json = envelope_json(&settings);
+        let midpoint = envelope_json.len() / 2;
+        let first_chunk = envelope_json[..midpoint].to_string();
+        let second_chunk = envelope_json[midpoint..].to_string();
+        let first_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
+        let second_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.1");
+        let pointer = json!({
+            "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
+            "version": 1,
+            "envelope_sha256": sha256_hex(envelope_json.as_bytes()),
+            "envelope_len": envelope_json.len(),
+            "chunks": [
+                { "key": first_key, "sha256": sha256_hex(first_chunk.as_bytes()), "len": first_chunk.len() },
+                { "key": second_key, "sha256": sha256_hex(second_chunk.as_bytes()), "len": second_chunk.len() }
+            ]
+        })
+        .to_string();
+        // Seed the pointer + the first chunk only; the second chunk is missing.
+        let store = MemoryConfigStore {
+            entries: BTreeMap::from([
+                (CONFIG_BLOB_KEY.to_string(), pointer),
+                (first_key, first_chunk),
+            ]),
+        };
+
+        let err =
+            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+                .expect_err("missing chunk must error");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "a referenced chunk missing is a read failure → 503"
+        );
+    }
+
+    #[test]
+    fn malformed_blob_stays_500() {
+        // The blob key reads fine (not a chunk pointer), but its contents are not
+        // a valid envelope — reconstruct/verify failure → 500, not 503.
+        let store = MemoryConfigStore {
+            entries: BTreeMap::from([(
+                CONFIG_BLOB_KEY.to_string(),
+                "not a valid blob envelope".to_string(),
+            )]),
+        };
+
+        let err =
+            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+                .expect_err("malformed blob must error");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "read-OK-but-invalid blob should stay 500"
+        );
+    }
+
+    #[test]
+    fn chunk_verification_failure_stays_500() {
+        // Pointer + chunks all read successfully, but a chunk's bytes no longer
+        // match the recorded length/sha — reconstruct/verify failure → 500.
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        let envelope_json = envelope_json(&settings);
+        let midpoint = envelope_json.len() / 2;
+        let first_chunk = envelope_json[..midpoint].to_string();
+        let second_chunk = envelope_json[midpoint..].to_string();
+        let first_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
+        let second_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.1");
+        let pointer = json!({
+            "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
+            "version": 1,
+            "envelope_sha256": sha256_hex(envelope_json.as_bytes()),
+            "envelope_len": envelope_json.len(),
+            "chunks": [
+                { "key": first_key, "sha256": sha256_hex(first_chunk.as_bytes()), "len": first_chunk.len() },
+                { "key": second_key, "sha256": sha256_hex(second_chunk.as_bytes()), "len": second_chunk.len() }
+            ]
+        })
+        .to_string();
+        // Store a corrupted second chunk: reads OK, but fails length/sha checks.
+        let store = MemoryConfigStore {
+            entries: BTreeMap::from([
+                (CONFIG_BLOB_KEY.to_string(), pointer),
+                (first_key, first_chunk),
+                (second_key, "corrupted chunk bytes".to_string()),
+            ]),
+        };
+
+        let err =
+            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+                .expect_err("corrupt chunk must error");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "chunk that reads but fails verification should stay 500"
         );
     }
 }
