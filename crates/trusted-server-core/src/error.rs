@@ -26,6 +26,11 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// Config store could not be read (unseeded, transient backend, or a listed
+    /// key missing) — Settings cannot be loaded. Retryable / fix by seeding.
+    #[display("Config store unavailable: {store_name} - {message}")]
+    ConfigStoreUnavailable { store_name: String, message: String },
+
     /// Auction orchestration error.
     #[display("Auction error: {message}")]
     Auction { message: String },
@@ -123,6 +128,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ConfigStoreUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
@@ -212,6 +218,13 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                TrustedServerError::ConfigStoreUnavailable {
+                    store_name: String::from("app_config"),
+                    message: String::from("store unavailable"),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
                 TrustedServerError::Prebid {
                     message: String::from("adapter error"),
                 },
@@ -286,6 +299,9 @@ mod tests {
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                TrustedServerError::ConfigStoreUnavailable { .. } => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
@@ -401,6 +417,25 @@ mod tests {
     }
 
     #[test]
+    fn config_store_unavailable_maps_to_503() {
+        let error = TrustedServerError::ConfigStoreUnavailable {
+            store_name: String::from("app_config"),
+            message: String::from("unavailable or not seeded"),
+        };
+        assert_eq!(
+            error.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config-store read failure should map to 503"
+        );
+        // Detail stays server-side; the public body is the generic catch-all.
+        assert_eq!(
+            error.user_message(),
+            "An internal error occurred",
+            "503 client body must not leak internal config-store detail"
+        );
+    }
+
+    #[test]
     fn status_code_maps_each_error_variant_to_expected_http_response() {
         // Compile-time guard: adding a TrustedServerError variant without
         // updating this test will fail to compile.
@@ -413,6 +448,7 @@ mod tests {
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
             | TrustedServerError::KvStore { .. }
+            | TrustedServerError::ConfigStoreUnavailable { .. }
             | TrustedServerError::Prebid { .. }
             | TrustedServerError::Integration { .. }
             | TrustedServerError::Proxy { .. }
@@ -496,6 +532,13 @@ mod tests {
                 TrustedServerError::KvStore {
                     store_name: "store".to_string(),
                     message: "kv failed".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::ConfigStoreUnavailable {
+                    store_name: "app_config".to_string(),
+                    message: "config store unavailable".to_string(),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
