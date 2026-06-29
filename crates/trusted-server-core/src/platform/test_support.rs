@@ -218,6 +218,9 @@ pub(crate) struct StubHttpClient {
     request_headers: Mutex<Vec<Vec<(String, String)>>>,
     // Queued select() errors — each pop makes the next select() return ready: Err.
     select_errors: Mutex<VecDeque<()>>,
+    // Reported by supports_concurrent_fanout(); set false to emulate
+    // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
+    concurrent_fanout: std::sync::atomic::AtomicBool,
     image_optimizer_options: Mutex<Vec<Option<PlatformImageOptimizerOptions>>>,
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
@@ -237,11 +240,18 @@ impl StubHttpClient {
             responses: Mutex::new(VecDeque::new()),
             request_headers: Mutex::new(Vec::new()),
             select_errors: Mutex::new(VecDeque::new()),
+            concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
             image_optimizer_options: Mutex::new(Vec::new()),
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make `supports_concurrent_fanout()` report the given value.
+    pub fn set_concurrent_fanout(&self, supported: bool) {
+        self.concurrent_fanout
+            .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Queue a canned response by status code and body bytes.
@@ -331,6 +341,11 @@ impl StubHttpClient {
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for StubHttpClient {
+    fn supports_concurrent_fanout(&self) -> bool {
+        self.concurrent_fanout
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn send(
         &self,
         request: PlatformHttpRequest,

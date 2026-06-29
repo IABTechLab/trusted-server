@@ -163,6 +163,9 @@ fn main() {
 
     // Only write when content changes to avoid unnecessary recompilation.
     let dest_path = Path::new(TRUSTED_SERVER_OUTPUT_CONFIG_PATH);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).expect("should create output directory for generated config");
+    }
     let current = fs::read_to_string(dest_path).unwrap_or_default();
     if current != merged_toml {
         fs::write(dest_path, merged_toml).unwrap_or_else(|err| {

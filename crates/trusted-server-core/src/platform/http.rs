@@ -191,6 +191,43 @@ pub struct PlatformSelectResult {
     pub failed_backend_name: Option<String>,
 }
 
+/// A [`PlatformHttpClient`] stand-in used when outbound HTTP is not available
+/// on the current platform (e.g. Cloudflare Workers, where the proxy client is
+/// managed by the edgezero dispatch layer instead).
+///
+/// Every method returns [`PlatformError::HttpClient`], ensuring that code paths
+/// that reach this stub receive a typed error. Adapter crates should use this
+/// type rather than defining their own stub so the fallback behaviour is
+/// consistent across all platform implementations.
+pub struct UnavailableHttpClient;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformHttpClient for UnavailableHttpClient {
+    async fn send(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+
+    async fn send_async(
+        &self,
+        _request: PlatformHttpRequest,
+    ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+
+    async fn select(
+        &self,
+        _pending_requests: Vec<PlatformPendingRequest>,
+    ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+        Err(Report::new(PlatformError::HttpClient)
+            .attach("HTTP client is unavailable on this platform"))
+    }
+}
+
 /// Outbound HTTP client abstraction.
 ///
 /// Supports both single-request sends ([`Self::send`]) and async fan-out
@@ -226,6 +263,19 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>>;
 
+    /// Whether [`send_async`](Self::send_async) defers execution so multiple
+    /// pending requests progress concurrently and [`select`](Self::select)
+    /// races them.
+    ///
+    /// Platforms where `send_async` executes each request eagerly before
+    /// returning (e.g. Cloudflare Workers) return `false`. On such platforms
+    /// multi-request fan-out runs sequentially and accrues the sum of the
+    /// individual latencies, so callers with a latency budget (the auction
+    /// orchestrator) must check this before launching more than one request.
+    fn supports_concurrent_fanout(&self) -> bool {
+        true
+    }
+
     /// Wait for one of the in-flight requests to complete.
     ///
     /// # Errors
@@ -251,5 +301,46 @@ pub trait PlatformHttpClient: Send + Sync {
         pending: PlatformPendingRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         self.select(vec![pending]).await?.ready
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Error-correlation interim scope (before EdgeZero #213)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn platform_response_default_has_no_backend_name() {
+        // On Axum/Cloudflare noop clients return PlatformResponse::new(response)
+        // with no backend_name. Core logic must not panic when backend_name is None.
+        let response = edgezero_core::http::response_builder()
+            .status(200)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let resp = PlatformResponse::new(response);
+        // PlatformResponse has a public field, not a method.
+        // PlatformPendingRequest has backend_name() method; PlatformResponse does not.
+        assert_eq!(
+            resp.backend_name, None,
+            "PlatformResponse without backend_name must have None field"
+        );
+    }
+
+    #[test]
+    fn platform_response_with_backend_name_is_some() {
+        // On Fastly, responses carry backend_name for error correlation.
+        let response = edgezero_core::http::response_builder()
+            .status(200)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+        let resp = PlatformResponse::new(response).with_backend_name("prebid-backend");
+        assert_eq!(
+            resp.backend_name.as_deref(),
+            Some("prebid-backend"),
+            "with_backend_name must set backend_name field"
+        );
     }
 }

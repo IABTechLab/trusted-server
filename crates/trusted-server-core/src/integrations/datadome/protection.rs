@@ -391,7 +391,7 @@ impl DataDomeIntegration {
                     );
                     return RequestFilterDecision::Continue(RequestFilterEffects::default());
                 }
-                let body_bytes = body.into_bytes().unwrap_or_default();
+                let body_bytes = body.into_bytes();
                 EdgeBody::from(body_bytes.as_ref().to_vec())
             };
             let challenge = Response::builder()
@@ -790,11 +790,7 @@ mod tests {
             "should preserve challenge status"
         );
         assert_eq!(
-            response
-                .into_body()
-                .into_bytes()
-                .unwrap_or_default()
-                .as_ref(),
+            response.into_body().into_bytes().as_ref(),
             b"",
             "HEAD challenges should not include a response body"
         );

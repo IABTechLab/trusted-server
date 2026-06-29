@@ -2,7 +2,22 @@
 /bin
 /pkg
 /target
-/crates/trusted-server-integration-tests/target
+**/target/
+
+# Node.js dependencies and build output (any crate, e.g. crates/trusted-server-js)
+**/node_modules/
+**/dist/
+**/.npm
+**/.eslintcache
+# Auto-generated JS module index
+**/src/generated-modules.ts
+
+# local Spin CLI downloads
+/spin
+/spin.sig
+
+# EdgeZero local KV store (created by edgezero-adapter-axum framework)
+.edgezero/
 
 # env
 .env*

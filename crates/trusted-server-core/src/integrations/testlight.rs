@@ -459,7 +459,7 @@ mod tests {
                 "should route outbound request through PlatformHttpClient"
             );
             let response_json: serde_json::Value =
-                serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
+                serde_json::from_slice(&response.into_body().into_bytes())
                     .expect("should parse JSON response");
             assert_eq!(
                 response_json["ok"], true,

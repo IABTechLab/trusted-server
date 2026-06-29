@@ -6,14 +6,22 @@ Learn how to test Trusted Server locally and in CI/CD.
 
 ### Viceroy
 
-Viceroy is the local test runtime for Fastly Compute applications. It simulates the Fastly environment locally.
+Viceroy is the local test runtime for Fastly Compute applications. It simulates the Fastly environment locally and is required for running the WASM crate tests.
 
 ```bash
 # Install viceroy
 cargo install viceroy --version 0.17.0 --locked --force
 
-# Run tests (viceroy is invoked automatically)
-cargo test
+# Run Fastly/WASM crate tests (viceroy is invoked automatically via .cargo/config.toml runner)
+cargo test-fastly
+```
+
+### Axum adapter tests
+
+The Axum adapter runs as a native binary — no Viceroy or WASM toolchain needed:
+
+```bash
+cargo test-axum
 ```
 
 ### Test Organization
@@ -47,40 +55,57 @@ mod tests {
 ### Unit Tests
 
 ```bash
-# Run all tests
-cargo test
+# Run Fastly/WASM crate tests (requires Viceroy)
+cargo test-fastly
 
-# Run specific test by name
-cargo test test_generate_ec_id
+# Run Axum adapter tests (native)
+cargo test-axum
 
-# Run tests with output visible
-cargo test -- --nocapture
+# Run a specific test by name (Fastly/WASM)
+cargo test-fastly test_generate_ec_id
 
-# Run tests for specific crate
+# Run a specific test by name (Axum native)
+cargo test-axum test_generate_ec_id
+
+# Run tests for a specific crate (native)
 cargo test -p trusted-server-core
 
-# Run tests matching a pattern
-cargo test ec
+# Run tests matching a pattern (Fastly/WASM)
+cargo test-fastly ec
 ```
 
 ### Integration Tests
 
-```bash
-# Run all integration tests
-cargo test --test '*'
+The integration test suite runs the full pipeline against Docker containers using both the Fastly (Viceroy) and Axum runtimes:
 
-# Run with single thread (useful for debugging)
-cargo test -- --test-threads=1
+```bash
+# Build both runtimes and run all integration tests
+./scripts/integration-tests.sh
+
+# Run a single test
+./scripts/integration-tests.sh test_wordpress_axum
+./scripts/integration-tests.sh test_wordpress_fastly
 ```
 
 ### Local Server Testing
 
+**Axum dev server** (no Fastly CLI required):
+
 ```bash
-# Start local server
+# Start the Axum dev server
+cargo run -p trusted-server-adapter-axum
+
+# Test endpoints with curl
+curl http://localhost:8787/.well-known/trusted-server.json
+```
+
+**Fastly Viceroy** (requires Fastly CLI):
+
+```bash
+# Start local Fastly simulator
 fastly compute serve
 
 # Test endpoints with curl
-curl http://localhost:7676/health
 curl http://localhost:7676/.well-known/trusted-server.json
 ```
 
@@ -239,11 +264,14 @@ cargo fmt
 ### Linting
 
 ```bash
-# Run clippy with all checks
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Run clippy for Fastly/WASM adapter
+cargo clippy-fastly
 
-# Fix clippy warnings automatically
-cargo clippy --fix --allow-dirty
+# Run clippy for Axum native adapter
+cargo clippy-axum
+
+# Fix clippy warnings automatically (Axum)
+cargo clippy-axum --fix --allow-dirty
 ```
 
 ### Code Coverage
@@ -261,20 +289,29 @@ cargo tarpaulin --out Html
 Tests run automatically on pull requests and main branch commits. See `.github/workflows/` for the complete CI configuration.
 
 ```yaml
-# Example workflow
+# Example workflow (see .github/workflows/test.yml for the full version)
 name: Test
 on: [push, pull_request]
 jobs:
-  test:
+  test-rust: # Fastly/WASM crates — requires Viceroy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-action@stable
       - name: Run tests
-        run: cargo test
+        run: cargo test-fastly
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy-fastly
+
+  test-axum: # Axum native adapter — no Viceroy needed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Axum adapter
+        run: cargo build -p trusted-server-adapter-axum
+      - name: Run Axum adapter tests
+        run: cargo test-axum
 ```
 
 ## Debugging Tests
@@ -282,13 +319,13 @@ jobs:
 ### Enable Debug Logging
 
 ```bash
-RUST_LOG=debug cargo test -- --nocapture
+RUST_LOG=debug cargo test-axum -- --nocapture
 ```
 
 ### Run Single Test with Full Output
 
 ```bash
-cargo test test_name -- --nocapture --test-threads=1
+cargo test-axum test_name -- --nocapture --test-threads=1
 ```
 
 ### Viceroy Limitations

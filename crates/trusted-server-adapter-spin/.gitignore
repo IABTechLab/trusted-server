@@ -1,0 +1,5 @@
+target/
+build/
+.edgezero/
+.spin/
+.env.spin.dev

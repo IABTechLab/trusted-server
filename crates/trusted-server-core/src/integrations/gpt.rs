@@ -445,17 +445,19 @@ impl IntegrationAttributeRewriter for GptIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_script {
             return AttributeRewriteAction::keep();
         }
 
         if Self::is_gpt_script_url(attr_value) {
-            AttributeRewriteAction::replace(format!(
-                "{}://{}/integrations/gpt/script",
-                ctx.request_scheme, ctx.request_host
-            ))
+            // Root-relative so the browser resolves it against the page host.
+            // Note: a page-level `<base href>` participates in this resolution,
+            // so on pages that set an external base URL these resolve against
+            // that base rather than the address-bar origin — an accepted
+            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
+            AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
         } else {
             AttributeRewriteAction::keep()
         }
@@ -637,8 +639,8 @@ mod tests {
         match result {
             AttributeRewriteAction::Replace(url) => {
                 assert_eq!(
-                    url, "https://edge.example.com/integrations/gpt/script",
-                    "should rewrite to first-party script endpoint"
+                    url, "/integrations/gpt/script",
+                    "should rewrite to root-relative first-party script endpoint"
                 );
             }
             other => panic!("Expected Replace action, got {:?}", other),

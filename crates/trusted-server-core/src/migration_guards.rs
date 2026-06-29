@@ -82,11 +82,13 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/finalize.rs", include_str!("ec/finalize.rs")),
         ("ec/generation.rs", include_str!("ec/generation.rs")),
         ("ec/identify.rs", include_str!("ec/identify.rs")),
+        ("ec/kv.rs", include_str!("ec/kv.rs")),
         ("ec/kv_types.rs", include_str!("ec/kv_types.rs")),
         ("ec/mod.rs", include_str!("ec/mod.rs")),
         ("ec/partner.rs", include_str!("ec/partner.rs")),
         ("ec/prebid_eids.rs", include_str!("ec/prebid_eids.rs")),
         ("ec/pull_sync.rs", include_str!("ec/pull_sync.rs")),
+        ("ec/rate_limiter.rs", include_str!("ec/rate_limiter.rs")),
         ("ec/registry.rs", include_str!("ec/registry.rs")),
         ("edge_cookie.rs", include_str!("edge_cookie.rs")),
         ("error.rs", include_str!("error.rs")),
@@ -225,35 +227,15 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn allowlisted_sources() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("ec/kv.rs", include_str!("ec/kv.rs")),
-        ("ec/rate_limiter.rs", include_str!("ec/rate_limiter.rs")),
-    ]
-}
-
 #[test]
-fn fastly_sdk_references_remain_only_in_deferred_ec_modules() {
+fn core_modules_do_not_reference_the_fastly_sdk() {
     let banned = fastly_sdk_pattern();
 
     for &(path, source) in checked_sources() {
         let uncommented = strip_line_comments(source);
         assert!(
             !banned.is_match(&uncommented),
-            "{path} should not reference the Fastly SDK outside the explicit EC KV/ERL allowlist"
-        );
-    }
-}
-
-#[test]
-fn deferred_ec_fastly_allowlist_still_tracks_actual_residual_dependencies() {
-    let banned = fastly_sdk_pattern();
-
-    for &(path, source) in allowlisted_sources() {
-        let uncommented = strip_line_comments(source);
-        assert!(
-            banned.is_match(&uncommented),
-            "{path} should remain an intentional temporary Fastly SDK dependency"
+            "{path} should not reference the Fastly SDK — core is platform-agnostic"
         );
     }
 }

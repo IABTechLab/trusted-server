@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderName, HeaderValue, Response, StatusCode};
@@ -74,7 +74,7 @@ impl Middleware for FinalizeResponseMiddleware {
             Ok(r) => r,
             Err(e) => {
                 log::error!("request handler failed: {e:?}");
-                e.into_response()?
+                e.into_response()
             }
         };
 

@@ -9,6 +9,7 @@
 //! |-------|-----------|-----------------|
 //! | HTML attributes | `IntegrationAttributeRewriter` | Static `<script src>` / `<link href>` tags |
 //! | JS response bodies | `rewrite_script_content` | Webpack chunk paths + hardcoded CDN URLs |
+//! | HTML response bodies | `rewrite_html_content` | Root-absolute `src`/`href` in proxied iframe documents |
 //! | Runtime config | `IntegrationHeadInjector` | `window._sp_` assignments from Next.js chunks |
 //! | Dynamic DOM | TS script guard (`script_guard.ts`) | Script/link elements inserted after page load |
 //!
@@ -109,6 +110,62 @@ static SP_CDN_URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static SP_ORIGIN_UNIFIED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"\.origin\s*\+\s*(['"])/unified/"#)
         .expect("Sourcepoint origin+unified regex should compile")
+});
+
+/// Matches a root-absolute `src`/`href` attribute value in a proxied HTML
+/// document (e.g. the privacy-manager iframe `us_pm/index.html`).
+///
+/// These iframe documents reference their assets relative to the CDN root:
+/// ```html
+/// <script src="/PrivacyManagerUS.89867.js"></script>
+/// <link href="/PrivacyManagerUS.b9d1f.css" rel="stylesheet">
+/// ```
+/// On `cdn.privacy-mgmt.com` that resolves to the CDN; served first-party
+/// through Trusted Server the iframe origin is the publisher, so
+/// `/PrivacyManagerUS.<hash>.js` resolves to the publisher root and 404s —
+/// leaving the consent UI unable to render. We prefix these with the CDN proxy
+/// path so they load through `/integrations/sourcepoint/cdn/…`.
+///
+/// Group 1 is the attribute up to the opening quote and leading slash; group 2
+/// is the rest of the path. The `[^/"]` after the leading slash excludes
+/// protocol-relative `//host` URLs (and absolute `https://…` never starts with
+/// `/`), so only root-absolute paths are rewritten.
+static SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"((?:src|href)=")/([^/"][^"]*)""#)
+        .expect("Sourcepoint HTML root-absolute asset regex should compile")
+});
+
+/// Matches the wrapper's inbound-message origin guard so it can also accept
+/// same-origin messages.
+///
+/// The Sourcepoint wrapper validates messages from its message / privacy-manager
+/// iframe with `e.origin === params.msgOrigin || e.origin === params.pmOrigin`,
+/// where `msgOrigin` is `baseEndpoint` used verbatim. Under first-party proxying
+/// `baseEndpoint` is a *path* (`/integrations/sourcepoint/cdn`), so `msgOrigin`
+/// is `https://<publisher>/integrations/sourcepoint/cdn` — which never equals the
+/// iframe's **bare** origin `https://<publisher>`. The guard therefore rejects
+/// the iframe's `sp.showMessage` / choice messages: the wrapper locks scroll
+/// (`html.sp-message-open`) but never shows the dialog or releases the lock,
+/// leaving the page rendered-but-unscrollable.
+///
+/// When proxied first-party the message iframe is genuinely **same-origin**, so
+/// we append `|| <event>.origin === location.origin` to the guard. This only
+/// *additionally* trusts a same-origin frame — which already has full access to
+/// the page — so it adds no attack surface; it teaches an origin check written
+/// for a cross-origin CDN about first-party serving.
+///
+/// The match is anchored on the semantic close of the guard — either `.pmOrigin)`
+/// (the combined `…msgOrigin || …pmOrigin)` form above) or a standalone
+/// `.msgOrigin)` (the `wrapperMessagingWithoutDetection.js` shape, whose guard
+/// compares only against the single `baseEndpoint`-derived `msgOrigin` value).
+/// Both field names are Sourcepoint-specific, so the rewrite stays scoped to the
+/// CMP's message handlers and leaves generic origin checks untouched. The
+/// trailing `)` requirement means the `msgOrigin` operand inside the combined
+/// form (followed by `||`, not `)`) is not matched a second time. Group 1 is the
+/// (possibly minified) event identifier and group 2 the matched operand.
+static SP_MESSAGE_ORIGIN_GUARD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"([A-Za-z_$][\w$]*)\.origin===([A-Za-z_$][\w$.]*\.(?:pmOrigin|msgOrigin))\)"#)
+        .expect("Sourcepoint message origin guard regex should compile")
 });
 
 /// Configuration for the Sourcepoint first-party proxy.
@@ -285,11 +342,7 @@ impl SourcepointIntegration {
         Ok(target.to_string())
     }
 
-    fn build_first_party_url(
-        &self,
-        source_url: &str,
-        ctx: &IntegrationAttributeContext<'_>,
-    ) -> Option<String> {
+    fn build_first_party_url(&self, source_url: &str) -> Option<String> {
         let parsed = parse_sourcepoint_url(source_url)?;
         if parsed.host_str()? != SOURCEPOINT_CDN_HOST {
             return None;
@@ -301,10 +354,12 @@ impl SourcepointIntegration {
             .map(|value| format!("?{value}"))
             .unwrap_or_default();
 
-        Some(format!(
-            "{}://{}{}{}{}",
-            ctx.request_scheme, ctx.request_host, SOURCEPOINT_CDN_PREFIX, path, query
-        ))
+        // Root-relative so the browser resolves it against the page host.
+        // Note: a page-level `<base href>` participates in this resolution, so
+        // on pages that set an external base URL these resolve against that base
+        // rather than the address-bar origin — an accepted tradeoff, matching
+        // GTM/Didomi/Testlight which are also relative.
+        Some(format!("{SOURCEPOINT_CDN_PREFIX}{path}{query}"))
     }
 
     fn copy_headers(
@@ -472,6 +527,12 @@ impl SourcepointIntegration {
     ///    wrapper resolves `document.currentScript.src` and appends
     ///    `"/unified/…"`. We insert the CDN prefix so chunks load from
     ///    `/integrations/sourcepoint/cdn/unified/…`.
+    ///
+    /// 3. **Inbound-message origin guard** — the wrapper rejects its own message
+    ///    iframe's postMessages because the configured origin is a first-party
+    ///    path, not an origin. We let the guard also accept same-origin messages
+    ///    so the consent dialog can show and release the scroll lock (see
+    ///    [`SP_MESSAGE_ORIGIN_GUARD_PATTERN`]).
     fn rewrite_script_content(content: &str) -> String {
         // Step 1: rewrite quoted cdn.privacy-mgmt.com URLs to root-relative paths.
         let after_cdn = SP_CDN_URL_PATTERN
@@ -487,12 +548,57 @@ impl SourcepointIntegration {
             .into_owned();
 
         // Step 2: rewrite origin+"/unified/" to origin+"/integrations/sourcepoint/cdn/unified/".
-        SP_ORIGIN_UNIFIED_PATTERN
+        let after_unified = SP_ORIGIN_UNIFIED_PATTERN
             .replace_all(&after_cdn, |caps: &regex::Captures| {
                 let quote = &caps[1];
                 format!(".origin+{quote}{SOURCEPOINT_CDN_PREFIX}/unified/")
             })
+            .into_owned();
+
+        // Step 3: let the wrapper's message-origin guard also accept same-origin
+        // messages (the message iframe is same-origin when proxied first-party).
+        SP_MESSAGE_ORIGIN_GUARD_PATTERN
+            .replace_all(&after_unified, |caps: &regex::Captures| {
+                let event = &caps[1];
+                let pm_operand = &caps[2];
+                format!("{event}.origin==={pm_operand}||{event}.origin===location.origin)")
+            })
             .into_owned()
+    }
+
+    /// Rewrites root-absolute `src`/`href` asset references in a proxied HTML
+    /// document to the first-party CDN prefix.
+    ///
+    /// The privacy-manager iframe documents (e.g. `us_pm/index.html`) reference
+    /// their scripts/styles as `"/PrivacyManagerUS.<hash>.js"` etc., which
+    /// resolve to the publisher root (and 404) when the iframe is served
+    /// first-party. Prefixing with `/integrations/sourcepoint/cdn` routes them
+    /// back through the proxy. Protocol-relative (`//host`) and absolute
+    /// (`https://…`) URLs are left untouched (see [`SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN`]).
+    fn rewrite_html_content(content: &str) -> String {
+        SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN
+            .replace_all(content, |caps: &regex::Captures| {
+                let attr_open = &caps[1];
+                let path = &caps[2];
+                format!(r#"{attr_open}{SOURCEPOINT_CDN_PREFIX}/{path}""#)
+            })
+            .into_owned()
+    }
+
+    /// Returns `true` for CDN paths that are likely HTML documents (the
+    /// privacy-manager iframe pages), so the proxy requests uncompressed
+    /// content and can rewrite their root-absolute asset references.
+    fn is_likely_html_path(path: &str) -> bool {
+        path.ends_with(".html")
+    }
+
+    /// Returns `true` when the response `Content-Type` is HTML.
+    fn is_html_response(response: &Response<EdgeBody>) -> bool {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/html"))
     }
 
     /// Returns `true` for CDN paths that are likely JavaScript bundles.
@@ -545,16 +651,15 @@ impl SourcepointIntegration {
     }
 
     fn rewrite_javascript_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
-        response.headers_mut().remove(header::CONTENT_ENCODING);
-        response.headers_mut().remove(header::CONTENT_LENGTH);
-        Self::remove_vary_accept_encoding(response);
+        self.finalize_rewritten_body(response, rewritten, "application/javascript; charset=utf-8");
 
+        // Rewritten JavaScript bundles are static, versioned files (hashed chunk
+        // names, `/unified/4.40.1/…` paths), so we apply a fixed public cache
+        // policy regardless of what upstream sent. This intentionally diverges
+        // from the passthrough path's `apply_cache_headers` (which only sets a
+        // default when upstream omitted Cache-Control). Responses that set
+        // cookies are kept private.
         if !Self::apply_cookie_safety(response) {
-            // Rewritten JS bundles are static, versioned assets (paths like
-            // `/unified/4.40.1/…`), so we apply a fixed public cache policy
-            // regardless of what upstream sent. This intentionally diverges from the
-            // passthrough path's `apply_cache_headers` (which only sets a default
-            // when upstream omitted Cache-Control).
             if let Ok(val) = HeaderValue::from_str(&format!(
                 "public, max-age={}",
                 self.config.cache_ttl_seconds
@@ -562,10 +667,40 @@ impl SourcepointIntegration {
                 response.headers_mut().insert(header::CACHE_CONTROL, val);
             }
         }
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/javascript; charset=utf-8"),
-        );
+    }
+
+    fn rewrite_html_response(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        forwarded_cookies: bool,
+    ) {
+        self.finalize_rewritten_body(response, rewritten, "text/html; charset=utf-8");
+
+        // Rewritten HTML iframe documents (e.g. `us_pm/index.html`) are
+        // unversioned, so — unlike the versioned JS bundles — we must not force a
+        // long public cache. Defer to the shared `apply_cache_headers` path,
+        // which preserves an upstream `Cache-Control` when present and otherwise
+        // applies the cookie-aware default (private when cookies were forwarded).
+        self.apply_cache_headers(response, forwarded_cookies);
+    }
+
+    /// Replaces a rewritten body and normalises the headers: drops the stale
+    /// content encoding/length, clears `Vary: Accept-Encoding`, and sets
+    /// `content_type`. Cache policy is applied by the caller, which differs for
+    /// versioned JavaScript versus unversioned HTML responses.
+    fn finalize_rewritten_body(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        content_type: &'static str,
+    ) {
+        response.headers_mut().remove(header::CONTENT_ENCODING);
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+        Self::remove_vary_accept_encoding(response);
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
 
         *response.body_mut() = EdgeBody::from(rewritten.into_bytes());
     }
@@ -703,10 +838,13 @@ impl IntegrationProxy for SourcepointIntegration {
             self.copy_headers(services.client_info.client_ip, &source_req, &mut proxy_req);
 
         // Request uncompressed content only for paths that are likely
-        // JavaScript (the files we need to regex-rewrite).  All other CDN
+        // JavaScript or HTML (the files we need to regex-rewrite).  All other CDN
         // responses (images, JSON API responses, CSS) keep the client's
         // original Accept-Encoding for efficiency.
-        if self.config.rewrite_sdk && Self::is_likely_javascript_path(target_path) {
+        if self.config.rewrite_sdk
+            && (Self::is_likely_javascript_path(target_path)
+                || Self::is_likely_html_path(target_path))
+        {
             proxy_req.headers_mut().insert(
                 header::ACCEPT_ENCODING,
                 HeaderValue::from_static("identity"),
@@ -767,14 +905,23 @@ impl IntegrationProxy for SourcepointIntegration {
             return Ok(response);
         }
 
-        // Rewrite CDN URLs inside JavaScript responses so that dynamically
-        // loaded chunks and API calls route through the first-party proxy.
+        // Rewrite CDN URLs inside JavaScript responses (dynamically loaded
+        // chunks, API calls) and root-absolute asset paths inside HTML iframe
+        // documents (privacy-manager pages), so both route through the
+        // first-party proxy.
+        let response_is_javascript = Self::is_javascript_response(&response);
+        let response_is_html = Self::is_html_response(&response);
         if method == Method::GET
             && response.status() == StatusCode::OK
             && self.config.rewrite_sdk
-            && Self::is_javascript_response(&response)
+            && (response_is_javascript || response_is_html)
         {
-            log::info!("Sourcepoint: rewriting JavaScript response body for {path}");
+            let kind = if response_is_javascript {
+                "JavaScript"
+            } else {
+                "HTML"
+            };
+            log::info!("Sourcepoint: rewriting {kind} response body for {path}");
 
             // Guard against unexpectedly large responses to avoid unbounded
             // memory consumption during rewriting.
@@ -827,9 +974,13 @@ impl IntegrationProxy for SourcepointIntegration {
                     return Ok(response);
                 }
             };
-            let rewritten = Self::rewrite_script_content(&body);
-
-            self.rewrite_javascript_response(&mut response, rewritten);
+            if response_is_javascript {
+                let rewritten = Self::rewrite_script_content(&body);
+                self.rewrite_javascript_response(&mut response, rewritten);
+            } else {
+                let rewritten = Self::rewrite_html_content(&body);
+                self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
+            }
             return Ok(response);
         }
 
@@ -851,11 +1002,11 @@ impl IntegrationAttributeRewriter for SourcepointIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         // `handles_attribute()` already gates on `rewrite_sdk`, so this
         // method is only called when rewriting is enabled.
-        if let Some(rewritten) = self.build_first_party_url(attr_value, ctx) {
+        if let Some(rewritten) = self.build_first_party_url(attr_value) {
             return AttributeRewriteAction::replace(rewritten);
         }
 
@@ -986,7 +1137,7 @@ mod tests {
         assert_eq!(
             rewritten,
             AttributeRewriteAction::replace(
-                "https://edge.example.com/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=821",
+                "/integrations/sourcepoint/cdn/mms/v2/get_site_data?account_id=821",
             )
         );
     }
@@ -1076,6 +1227,166 @@ mod tests {
         let output = SourcepointIntegration::rewrite_script_content(input);
 
         assert_eq!(output, input, "Non-Sourcepoint URLs should be untouched");
+    }
+
+    #[test]
+    fn rewrites_message_origin_guard_to_accept_same_origin() {
+        // The wrapper's inbound-message guard; under first-party proxying the
+        // configured origin is a path, so the same-origin branch is needed for
+        // the wrapper to accept its iframe's messages and show the dialog.
+        let input = concat!(
+            r#"function(e,t,n){if((e.origin===this.params.msgOrigin"#,
+            r#"||e.origin===this.params.pmOrigin)&&("iframe"===this.params.type)){}}"#,
+        );
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"function(e,t,n){if((e.origin===this.params.msgOrigin"#,
+                r#"||e.origin===this.params.pmOrigin||e.origin===location.origin)&&("iframe"===this.params.type)){}}"#,
+            ),
+            "guard should also accept same-origin messages"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_handles_minified_identifiers() {
+        // Event/params identifiers may be minified; the rewrite must capture them.
+        let input = r#"if((o.origin===a.params.msgOrigin||o.origin===a.params.pmOrigin)&&x){}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert!(
+            output.contains("o.origin===a.params.pmOrigin||o.origin===location.origin)"),
+            "minified guard should be rewritten. Got: {output}"
+        );
+    }
+
+    #[test]
+    fn rewrites_standalone_msg_origin_guard_to_accept_same_origin() {
+        // The `wrapperMessagingWithoutDetection.js` shape guards on the single
+        // `baseEndpoint`-derived `msgOrigin` value (no `pmOrigin` second clause).
+        // Under first-party proxying that value is a path, so the same-origin
+        // branch is needed for this wrapper to accept its iframe's messages too.
+        let input = r#"function(e,t,n){if((e.origin===this.params.msgOrigin)&&("iframe"===this.params.type)){}}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            r#"function(e,t,n){if((e.origin===this.params.msgOrigin||e.origin===location.origin)&&("iframe"===this.params.type)){}}"#,
+            "standalone msgOrigin guard should also accept same-origin messages"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_does_not_double_match_combined_guard() {
+        // The combined `msgOrigin || pmOrigin)` form must be rewritten exactly
+        // once (anchored on the trailing `pmOrigin)`); the inner `msgOrigin`,
+        // followed by `||` rather than `)`, must not be matched a second time.
+        let input = concat!(
+            r#"function(e){if((e.origin===a.params.msgOrigin"#,
+            r#"||e.origin===a.params.pmOrigin)){}}"#,
+        );
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"function(e){if((e.origin===a.params.msgOrigin"#,
+                r#"||e.origin===a.params.pmOrigin||e.origin===location.origin)){}}"#,
+            ),
+            "combined guard should gain exactly one same-origin branch"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_matches_any_object_and_event_variable() {
+        // The object holding pmOrigin and the event var can be minified to
+        // anything; the rewrite must not depend on specific names. Covers a
+        // bare `x.pmOrigin`, a different event var, and a deeper chain.
+        let cases = [
+            (
+                r#"if((e.origin===x.pmOrigin)&&z){}"#,
+                "e.origin===x.pmOrigin||e.origin===location.origin)",
+            ),
+            (
+                r#"if((q.origin===y.pmOrigin)&&z){}"#,
+                "q.origin===y.pmOrigin||q.origin===location.origin)",
+            ),
+            (
+                r#"if((_e.origin===a.b.c.pmOrigin)&&z){}"#,
+                "_e.origin===a.b.c.pmOrigin||_e.origin===location.origin)",
+            ),
+        ];
+        for (input, expect) in cases {
+            let output = SourcepointIntegration::rewrite_script_content(input);
+            assert!(
+                output.contains(expect),
+                "guard with arbitrary identifiers should be rewritten. input={input} got={output}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_leaves_unrelated_origin_checks_untouched() {
+        let input = r#"if(e.origin===window.location.origin){accept()}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output, input,
+            "origin checks without the .pmOrigin guard anchor must be untouched"
+        );
+    }
+
+    #[test]
+    fn rewrites_root_absolute_asset_paths_in_html() {
+        // Mirrors the privacy-manager iframe document (us_pm/index.html), whose
+        // assets are referenced root-absolute and 404 when served first-party.
+        let input = concat!(
+            r#"<link rel="manifest" href="/manifest.json">"#,
+            r#"<link href="/PrivacyManagerUS.b9d1f.css" rel="preload" as="style">"#,
+            r#"<script src="/polyfills.01516.js"></script>"#,
+            r#"<script src="/PrivacyManagerUS.89867.js"></script>"#,
+        );
+        let output = SourcepointIntegration::rewrite_html_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"<link rel="manifest" href="/integrations/sourcepoint/cdn/manifest.json">"#,
+                r#"<link href="/integrations/sourcepoint/cdn/PrivacyManagerUS.b9d1f.css" rel="preload" as="style">"#,
+                r#"<script src="/integrations/sourcepoint/cdn/polyfills.01516.js"></script>"#,
+                r#"<script src="/integrations/sourcepoint/cdn/PrivacyManagerUS.89867.js"></script>"#,
+            ),
+            "root-absolute src/href should be prefixed with the CDN proxy path"
+        );
+    }
+
+    #[test]
+    fn html_rewrite_preserves_absolute_and_protocol_relative_urls() {
+        // Absolute and protocol-relative URLs (and non-rooted relative paths)
+        // must be left untouched — only root-absolute single-slash paths move.
+        let input = concat!(
+            r#"<script src="https://example.com/app.js"></script>"#,
+            r#"<script src="//example.com/lib.js"></script>"#,
+            r#"<link href="styles.css">"#,
+        );
+        let output = SourcepointIntegration::rewrite_html_content(input);
+
+        assert_eq!(
+            output, input,
+            "absolute, protocol-relative, and relative URLs should be untouched"
+        );
+    }
+
+    #[test]
+    fn is_likely_html_path_matches_iframe_documents() {
+        assert!(SourcepointIntegration::is_likely_html_path(
+            "/us_pm/index.html"
+        ));
+        assert!(!SourcepointIntegration::is_likely_html_path(
+            "/unified/4.40.1/PrivacyManagerUS.89867.js"
+        ));
     }
 
     #[test]
@@ -1695,6 +2006,86 @@ mod tests {
         assert!(
             response.headers().get(header::VARY).is_none(),
             "should remove stale Vary: Accept-Encoding after stripping content encoding"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_preserves_upstream_cache_control() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(&mut response, header::CONTENT_ENCODING, "gzip");
+        set_header(&mut response, header::CONTENT_LENGTH, "4");
+        set_header(&mut response, header::CACHE_CONTROL, "no-store");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("no-store"),
+            "should preserve upstream Cache-Control for unversioned HTML documents"
+        );
+        assert_eq!(
+            get_header_str(&response, header::CONTENT_TYPE),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            String::from_utf8(take_body_bytes(response)).expect("should decode rewritten HTML"),
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_private_policy_when_cookies_were_forwarded() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), true);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("private, max-age=0"),
+            "should not publicly cache HTML that may vary by forwarded Cookie"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_public_default_without_forwarded_cookies() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some(expected_cache_control.as_str()),
+            "should apply the public default when upstream omitted Cache-Control and no cookies were forwarded"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_private_no_store_for_cookie_setting_responses() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(
+            &mut response,
+            header::SET_COOKIE,
+            "consentUUID=uuid123; Path=/",
+        );
+        set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "should avoid public caching when rewritten HTML still sets cookies"
         );
     }
 
