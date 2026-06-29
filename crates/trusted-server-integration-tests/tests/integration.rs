@@ -136,6 +136,38 @@ fn test_nextjs_fastly() {
     test_combination(&runtime, &framework).expect("should pass Next.js on Fastly");
 }
 
+#[test]
+#[ignore = "requires Docker, the `wrangler` CLI in $PATH, and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts `wrangler dev` automatically"]
+fn test_wordpress_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires Docker, the `wrangler` CLI in $PATH, and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts `wrangler dev` automatically"]
+fn test_nextjs_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_wordpress_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Axum");
+}
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_nextjs_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Axum");
+}
+
 // ---------------------------------------------------------------------------
 // EC identity lifecycle tests (no frontend framework container needed)
 // ---------------------------------------------------------------------------

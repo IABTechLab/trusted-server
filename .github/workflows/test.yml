@@ -7,7 +7,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**"]
 
 jobs:
   test-rust:
@@ -47,7 +47,33 @@ jobs:
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test-fastly
+
+  test-axum:
+    name: cargo test (axum native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          # wasm32-wasip1 is required by the "Verify Fastly WASM release
+          # build" step below; the axum build and tests are native.
+          target: wasm32-wasip1
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Build Axum adapter
+        run: cargo build -p trusted-server-adapter-axum
+
+      - name: Run Axum adapter tests
+        run: cargo test-axum
 
       - name: Verify Fastly WASM release build
         env:
@@ -56,6 +82,33 @@ jobs:
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
           TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+
+  test-cloudflare:
+    name: cargo check (cloudflare native + wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          target: wasm32-unknown-unknown
+          cache-shared-key: cargo-${{ runner.os }}
+
+      - name: Check Cloudflare adapter (native host)
+        run: cargo check -p trusted-server-adapter-cloudflare
+
+      - name: Check Cloudflare adapter (wasm32-unknown-unknown)
+        run: cargo check -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare
+
+      - name: Run Cloudflare adapter tests (native host)
+        run: cargo test-cloudflare
 
   test-typescript:
     name: vitest

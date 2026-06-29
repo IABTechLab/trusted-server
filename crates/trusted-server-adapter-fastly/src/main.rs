@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::config_store::FastlyConfigStore;
-use edgezero_adapter_fastly::request::into_core_request;
+use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
 use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::{
-    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
+    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
 };
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
@@ -25,7 +24,6 @@ use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     build_pull_sync_context, dispatch_pull_sync, PullSyncContext,
 };
-use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
@@ -43,7 +41,7 @@ use trusted_server_core::proxy::{
     AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body, BoundedWriter,
+    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
     OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
@@ -57,18 +55,22 @@ use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester}
 mod app;
 mod backend;
 mod compat;
+mod ec_kv;
 mod error;
 mod logging;
 mod management_api;
 mod middleware;
 mod platform;
+mod rate_limiter;
 #[cfg(test)]
 mod route_tests;
 
 use crate::app::{build_state, TrustedServerApp};
+use crate::ec_kv::FastlyEcKvStore;
 use crate::error::to_error_response;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
+use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
@@ -236,9 +238,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // metadata here is authoritative. detect_request_scheme in http_util
     // checks this header so scheme-sensitive logic (publisher URL rewriting,
     // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
-    if req.get_tls_protocol().ok().flatten().is_some()
-        || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
-    {
+    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
         req.set_header("fastly-ssl", "1");
     }
 
@@ -277,18 +277,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                 core_req.extensions_mut().insert(config_store);
                 core_req.extensions_mut().insert(device_signals);
                 core_req.extensions_mut().insert(client_info);
-                match futures::executor::block_on(app.router().oneshot(core_req)) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        log::error!("EdgeZero dispatch failed: {e}");
-                        FastlyResponse::from_status(
-                            fastly::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        )
-                        .with_body_text_plain("Internal Server Error")
-                        .send_to_client();
-                        return;
-                    }
-                }
+                futures::executor::block_on(app.router().oneshot(core_req))
             }
             Err(e) => {
                 log::error!("EdgeZero request conversion failed: {e}");
@@ -358,10 +347,18 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
         match get_settings() {
             Ok(settings) => match PartnerRegistry::from_config(&settings.ec.partners) {
                 Ok(partner_registry) => {
+                    // KvIdentityGraph cannot ride in response extensions
+                    // (non-Sync dyn EcKvStore), so rebuild it from settings
+                    // when the handler enabled the KV write path.
+                    let finalize_kv_graph = if ec_state.use_finalize_kv {
+                        maybe_identity_graph(&settings)
+                    } else {
+                        None
+                    };
                     ec_finalize_response(
                         &settings,
                         &ec_state.ec_context,
-                        ec_state.finalize_kv_graph.as_ref(),
+                        finalize_kv_graph.as_ref(),
                         &partner_registry,
                         ec_state.eids_cookie.as_deref(),
                         ec_state.sharedid_cookie.as_deref(),
@@ -628,14 +625,8 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .unwrap_or(FALLBACK_UNAVAILABLE);
     let cipher = req
         .get_tls_cipher_openssl_name()
-        .ok()
-        .flatten()
         .unwrap_or(FALLBACK_UNAVAILABLE);
-    let tls_version = req
-        .get_tls_protocol()
-        .ok()
-        .flatten()
-        .unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
     let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
     let ch_mobile = req
         .get_header_str("sec-ch-ua-mobile")
@@ -885,6 +876,8 @@ async fn route_request(
             let outcome = cors_preflight_identify(settings, &req);
             (outcome, false)
         }
+
+        // Tester-cookie endpoints (disabled unless `[tester_cookie].enabled`).
         (Method::GET, "/_ts/set-tester") => (handle_set_tester(settings), false),
         (Method::GET, "/_ts/clear-tester") => (handle_clear_tester(settings), false),
 
@@ -1062,7 +1055,11 @@ async fn route_request(
 }
 
 pub(crate) fn maybe_identity_graph(settings: &Settings) -> Option<KvIdentityGraph> {
-    settings.ec.ec_store.as_ref().map(KvIdentityGraph::new)
+    settings
+        .ec
+        .ec_store
+        .as_ref()
+        .map(|store_name| KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
 }
 
 fn run_pull_sync_after_send(
@@ -1081,58 +1078,6 @@ fn run_pull_sync_after_send(
 
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
     dispatch_pull_sync(settings, &kv, partner_registry, &limiter, context, services);
-}
-
-pub(crate) fn resolve_publisher_response_buffered(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<HttpResponse, Report<TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            // HEAD and bodiless statuses (204, 304) carry no body but may
-            // advertise the GET representation's length. `handle_publisher_request`
-            // already stripped the origin Content-Length for processable Stream
-            // responses, so rewriting it here to the buffered byte count (0)
-            // would replace it with a misleading length. Skip the buffer, the
-            // length rewrite, and the body replacement for those responses,
-            // mirroring the asset path's `asset_response_carries_body` guard.
-            if !publisher_response_carries_body(method, response.status()) {
-                return Ok(response);
-            }
-            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            let bytes = output.into_inner();
-            response.headers_mut().insert(
-                header::CONTENT_LENGTH,
-                HeaderValue::from(bytes.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(bytes);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
-}
-
-/// Returns `true` when a buffered publisher response should carry a body and a
-/// recomputed `Content-Length`.
-///
-/// `HEAD` responses and bodiless statuses (204, 304) carry no body; rewriting
-/// their `Content-Length` to the (empty) buffered length would mislead clients
-/// and caches. This mirrors the asset path's `asset_response_carries_body`.
-fn publisher_response_carries_body(method: &Method, status: StatusCode) -> bool {
-    *method != Method::HEAD
-        && status != StatusCode::NO_CONTENT
-        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Applies all standard response headers: geo, version, staging, and configured headers.
@@ -1172,7 +1117,7 @@ pub(crate) fn require_identity_graph(
             message: "ec.ec_store is not configured".to_owned(),
         })
     })?;
-    Ok(KvIdentityGraph::new(store_name))
+    Ok(KvIdentityGraph::new(FastlyEcKvStore::new(store_name)))
 }
 
 /// Extracts a named cookie value from the request's `Cookie` header.
@@ -1285,31 +1230,6 @@ mod tests {
         assert!(
             health_response(&req).is_none(),
             "should only short-circuit /health"
-        );
-    }
-
-    #[test]
-    fn publisher_response_carries_body_preserves_bodiless_content_length() {
-        // A processable GET 200 publisher response buffers a body and recomputes
-        // Content-Length.
-        assert!(
-            super::publisher_response_carries_body(&Method::GET, StatusCode::OK),
-            "a GET 200 publisher response should carry a buffered body"
-        );
-        // HEAD responses carry no body; recomputing Content-Length to 0 would
-        // mislead clients/caches about the GET representation length.
-        assert!(
-            !super::publisher_response_carries_body(&Method::HEAD, StatusCode::OK),
-            "HEAD publisher responses must not get a recomputed Content-Length"
-        );
-        // Bodiless statuses keep their metadata regardless of method.
-        assert!(
-            !super::publisher_response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
-            "204 responses must not get a recomputed Content-Length"
-        );
-        assert!(
-            !super::publisher_response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
-            "304 responses must not get a recomputed Content-Length"
         );
     }
 

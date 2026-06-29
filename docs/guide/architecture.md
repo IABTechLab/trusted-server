@@ -4,7 +4,7 @@ Understanding the architecture of Trusted Server.
 
 ## High-Level Overview
 
-Trusted Server is built as a Rust-based edge computing application that runs on Fastly Compute platform.
+Trusted Server is built as a Rust-based edge computing application. The core logic lives in a platform-agnostic library; platform-specific adapters target different runtimes (Fastly Compute, native Axum).
 
 ```mermaid
 flowchart TD
@@ -37,12 +37,29 @@ Core library containing shared functionality:
 
 ### trusted-server-adapter-fastly
 
-Fastly-specific implementation:
+Fastly Compute adapter (WASM binary, `wasm32-wasip1` target):
 
-- Main application entry point
-- Fastly SDK integration
-- Request/response handling
-- KV store access
+- Main application entry point for production Fastly deployment
+- Fastly SDK integration (KV stores, secret stores, geo lookup)
+- Compiled to WebAssembly and run via Viceroy locally or on Fastly's edge
+
+### trusted-server-adapter-axum
+
+Native Axum dev/test adapter (native binary):
+
+- Local development and integration-test adapter — not a production-equivalent runtime
+- Platform implementations backed by environment variables instead of Fastly stores
+- Listens on `http://localhost:8787` by default
+
+**Current limitations compared to the Fastly adapter:**
+
+| Feature                                | Axum dev server                                                                                                                              |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KV store                               | Unavailable — synthetic-ID and consent routes degrade gracefully                                                                             |
+| Geo lookup                             | Always returns `None`                                                                                                                        |
+| Config/secret-store writes             | Return an error (read-only via env vars)                                                                                                     |
+| Admin key management (`/admin/keys/*`) | Returns 501 Not Implemented                                                                                                                  |
+| Auction fan-out ordering               | Requests run concurrently via `tokio::spawn`; `select` returns first-to-complete but does not replicate Fastly's priority-queue tie-breaking |
 
 ## Design Patterns
 
@@ -105,13 +122,14 @@ User data is not persisted in storage - only processed in-flight at the edge.
 - **Request Signing** - Optional request authentication
 - **Content Security** - Creative scanning and modification
 
-## WebAssembly Target
+## Runtime Targets
 
-Compiled to `wasm32-wasip1` for Fastly Compute:
+| Adapter                         | Target          | Use case                                                          |
+| ------------------------------- | --------------- | ----------------------------------------------------------------- |
+| `trusted-server-adapter-fastly` | `wasm32-wasip1` | Production on Fastly Compute                                      |
+| `trusted-server-adapter-axum`   | native          | Local development and integration testing (see limitations above) |
 
-- Sandboxed execution
-- Fast cold starts
-- Efficient resource usage
+The Fastly adapter compiles to WebAssembly for sandboxed, low-cold-start edge execution. The Axum adapter is a standard native binary — no WASM toolchain required for local development.
 
 ## Next Steps
 

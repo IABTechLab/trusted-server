@@ -1,0 +1,6 @@
+target/
+build/
+.edgezero/
+.wrangler/
+.env.cloudflare.dev
+.dev.vars

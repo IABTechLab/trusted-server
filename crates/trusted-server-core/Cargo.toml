@@ -22,11 +22,6 @@ config = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
 error-stack = { workspace = true }
-# Still required by ec/kv.rs (KV Store compare-and-swap via InsertMode +
-# generation preconditions, which the EdgeZero KvStore trait does not expose
-# yet) and ec/rate_limiter.rs (fastly::erl Edge Rate Limiting). Removal is
-# deferred until EdgeZero grows equivalent APIs — tracked in issue #495.
-fastly = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -53,6 +48,14 @@ uuid = { workspace = true }
 validator = { workspace = true }
 ed25519-dalek = { workspace = true }
 edgezero-core = { workspace = true }
+web-time = { workspace = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Enable JS-backed RNG for `wasm32-unknown-unknown` targets (e.g. Cloudflare Workers).
+# The Fastly adapter uses `wasm32-wasip1`, which has native POSIX RNG and does not
+# need these — this block is intentionally scoped to `target_os = "unknown"` only.
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { workspace = true, features = ["js"] }
 
 [build-dependencies]
 config = { workspace = true }

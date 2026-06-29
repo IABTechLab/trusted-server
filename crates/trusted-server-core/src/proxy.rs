@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -38,7 +39,7 @@ const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes().unwrap_or_default())
+    Cursor::new(body.into_bytes())
 }
 
 /// Headers copied from the original client request to the upstream proxy request
@@ -421,13 +422,23 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     ))
 }
 
-fn finalize_proxied_response(
-    settings: &Settings,
+/// Extracted content-type and content-encoding from an origin response.
+struct OriginResponseMeta {
+    ct_raw: String,
+    content_encoding: String,
+}
+
+/// Extract content-type and content-encoding and log origin response metadata.
+///
+/// When `log_encoding` is `true`, the `ce=` field is included in the log line
+/// (used by the buffered finalizer which performs content-encoding processing).
+/// The streaming finalizer omits it since it never decodes the body.
+fn origin_response_metadata(
     req: &Request<EdgeBody>,
+    beresp: &Response<EdgeBody>,
     target_url: &str,
-    mut beresp: Response<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Determine content-type and content-encoding from response headers
+    log_encoding: bool,
+) -> OriginResponseMeta {
     let status_code = beresp.status().as_u16();
     let ct_raw = beresp
         .headers()
@@ -453,23 +464,110 @@ fn finalize_proxied_response(
         .unwrap_or("-");
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    let ce_for_log: &str = if content_encoding.is_empty() {
-        "-"
-    } else {
-        &content_encoding
-    };
-    log::info!(
-        "origin response status={} ct={} ce={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        ce_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
 
-    let ct = ct_raw.to_ascii_lowercase();
-    let compression = Compression::from_content_encoding(&content_encoding);
+    if log_encoding {
+        let ce_for_log: &str = if content_encoding.is_empty() {
+            "-"
+        } else {
+            &content_encoding
+        };
+        log::info!(
+            "origin response status={} ct={} ce={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            ce_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    } else {
+        log::info!(
+            "origin response status={} ct={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    }
+
+    OriginResponseMeta {
+        ct_raw,
+        content_encoding,
+    }
+}
+
+/// Apply image content-type header and log pixel heuristics.
+///
+/// Sets a generic `image/*` content-type when the response has none, then logs
+/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// sites pass the response through unchanged afterwards, so this returns
+/// nothing.
+fn apply_image_passthrough_metadata(
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    ct: &str,
+    beresp: &mut Response<EdgeBody>,
+    log_prefix: &str,
+) {
+    let req_accept_images = req
+        .headers()
+        .get(HEADER_ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("image/"))
+        .unwrap_or(false);
+
+    if !ct.starts_with("image/") && !req_accept_images {
+        return;
+    }
+
+    if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
+        );
+    }
+
+    let mut is_pixel = false;
+    if let Some(cl) = beresp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl <= 256 {
+            is_pixel = true;
+        }
+    }
+    if !is_pixel {
+        let lower = target_url.to_ascii_lowercase();
+        if lower.contains("/pixel")
+            || lower.ends_with("/p.gif")
+            || lower.contains("1x1")
+            || lower.contains("/track")
+        {
+            is_pixel = true;
+        }
+    }
+    if is_pixel {
+        log::info!(
+            "{}likely pixel image fetched: {} ct={}",
+            log_prefix,
+            target_url,
+            ct
+        );
+    }
+}
+
+fn finalize_proxied_response(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    mut beresp: Response<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let meta = origin_response_metadata(req, &beresp, target_url, true);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    let compression = Compression::from_content_encoding(&meta.content_encoding);
 
     if ct.contains("text/html") {
         let processor = CreativeHtmlProcessor::new(settings);
@@ -493,56 +591,7 @@ fn finalize_proxied_response(
         );
     }
 
-    // Image handling: set a valid fallback content type if missing and log pixel heuristics
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
-            );
-        }
-
-        // Heuristics to log likely tracking pixels without altering response
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                // typical 1x1 PNG/GIF are very small
-                is_pixel = true;
-            }
-        }
-
-        // Path heuristics: common pixel patterns
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
-        }
-
-        return Ok(beresp);
-    }
-
-    // Passthrough for non-text, non-image responses
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
     Ok(beresp)
 }
 
@@ -551,83 +600,9 @@ fn finalize_proxied_response_streaming(
     target_url: &str,
     mut beresp: Response<EdgeBody>,
 ) -> Response<EdgeBody> {
-    let status_code = beresp.status().as_u16();
-    let ct_raw = beresp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let cl_raw = beresp
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-    let accept_raw = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-
-    let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    log::info!(
-        "origin response status={} ct={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
-
-    let ct = ct_raw.to_ascii_lowercase();
-
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
-            );
-        }
-
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                is_pixel = true;
-            }
-        }
-
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!(
-                "stream: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
-        }
-    }
-
+    let meta = origin_response_metadata(req, &beresp, target_url, false);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "stream: ");
     beresp
 }
 
@@ -872,7 +847,17 @@ fn apply_asset_origin_auth(
                 headers,
                 &config.region,
                 credentials.as_ref(),
-                SystemTime::now(),
+                // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
+                // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
+                // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
+                // equivalent `std::time::SystemTime` from the wasm-safe `web_time` clock:
+                // `UNIX_EPOCH + elapsed` is pure arithmetic and never calls the panicking
+                // `now()`. On Fastly (wasm32-wasip1) and native, `web_time` delegates to
+                // the std clock, so behavior is unchanged there.
+                std::time::UNIX_EPOCH
+                    + web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .unwrap_or_default(),
             )
         }
     }
@@ -1558,7 +1543,7 @@ pub async fn handle_first_party_proxy_sign(
     let req_url = req.uri().to_string();
 
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes().unwrap_or_default();
+        let body_bytes = req.into_body().into_bytes();
         enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
@@ -1673,7 +1658,7 @@ pub async fn handle_first_party_proxy_rebuild(
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes().unwrap_or_default();
+        let body_bytes = req.into_body().into_bytes();
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
@@ -2043,14 +2028,8 @@ mod tests {
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(
-            response
-                .into_body()
-                .into_bytes()
-                .unwrap_or_default()
-                .to_vec(),
-        )
-        .expect("response body should be valid UTF-8")
+        String::from_utf8(response.into_body().into_bytes().to_vec())
+            .expect("response body should be valid UTF-8")
     }
 
     struct QueuedHttpResponse {
@@ -2850,7 +2829,7 @@ mod tests {
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
+        let compressed_output = out.into_body().into_bytes();
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
         decoder
@@ -2906,7 +2885,7 @@ mod tests {
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
+        let compressed_output = out.into_body().into_bytes();
         let mut decoder = Decompressor::new(&compressed_output[..], 4096);
         let mut decompressed = String::new();
         decoder

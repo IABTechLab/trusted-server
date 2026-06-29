@@ -15,6 +15,8 @@ real-time bidding integration, and publisher-side JavaScript injection.
 crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
+  trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
+  trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
 ```
@@ -40,8 +42,8 @@ Supporting files: `fastly.toml`, `trusted-server.toml`, `.env.dev`,
 ### Rust
 
 ```bash
-# Build
-cargo build
+# Build (per-target aliases — bare `cargo build` fails at the workspace root)
+cargo build-fastly && cargo build-axum && cargo build-cloudflare
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -51,22 +53,40 @@ fastly compute serve
 
 # Deploy to Fastly
 fastly compute publish
+
+# Run Axum dev server (native — no Viceroy)
+cargo run -p trusted-server-adapter-axum
+
+# Test Axum adapter only
+cargo test-axum
+
+# Check Cloudflare adapter (native)
+cargo check -p trusted-server-adapter-cloudflare
+
+# Check Cloudflare adapter (WASM target — alias for the full command)
+cargo check-cloudflare
+
+# Test Cloudflare adapter (native host)
+cargo test-cloudflare
 ```
 
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests (uses viceroy)
-cargo test --workspace
+# Run all Rust tests — use workspace aliases (see .cargo/config.toml)
+# default-members = [fastly] so Viceroy can locate the binary via `cargo run --bin`.
+cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-axum        # Axum dev server adapter (native)
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
 
 # Format
 cargo fmt --all -- --check
 
 # Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
 
-# Check compilation
-cargo check
+# Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
+cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
 cd crates/trusted-server-js/lib && npx vitest run
@@ -278,8 +298,8 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-3. `cargo test --workspace`
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare`
+3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare`
 4. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
 5. JS format (`cd crates/trusted-server-js/lib && npm run format`)
 6. Docs format (`cd docs && npm run format`)
@@ -292,7 +312,7 @@ Every PR must pass:
 2. **Get approval** — for non-trivial changes, present a plan first.
 3. **Implement incrementally** — small, testable changes. Every change should
    impact as little code as possible.
-4. **Test after every change** — `cargo test --workspace`.
+4. **Test after every change** — `cargo test-fastly && cargo test-axum`.
 5. **Explain as you go** — describe what you changed and why.
 6. **If blocked** — explain what's blocking and why.
 

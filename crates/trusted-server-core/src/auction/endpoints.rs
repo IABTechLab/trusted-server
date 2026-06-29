@@ -78,7 +78,7 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
+    let body_bytes = body.into_bytes();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_none_without_registry() {
-        let kv = KvIdentityGraph::new("test_store");
+        let kv = KvIdentityGraph::failing("test_store");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_none_when_consent_denied() {
-        let kv = KvIdentityGraph::new("test_store");
+        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_none_when_no_ec() {
-        let kv = KvIdentityGraph::new("test_store");
+        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn resolve_auction_eids_returns_empty_on_kv_miss() {
-        let kv = KvIdentityGraph::new("nonexistent_store");
+        let kv = KvIdentityGraph::failing("nonexistent_store");
         let registry = PartnerRegistry::empty();
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));

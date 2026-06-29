@@ -1,0 +1,38 @@
+[package]
+name = "trusted-server-adapter-cloudflare"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "trusted_server_adapter_cloudflare"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Keep for explicit `cargo check --features cloudflare --target wasm32-unknown-unknown`
+cloudflare = ["edgezero-adapter-cloudflare/cloudflare", "dep:worker"]
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+edgezero-adapter-cloudflare = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+log = { workspace = true }
+trusted-server-core = { path = "../trusted-server-core" }
+trusted-server-js = { path = "../trusted-server-js" }
+worker = { version = "0.7", default-features = false, features = ["http"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
+js-sys = { workspace = true }
+worker = { version = "0.7", default-features = false, features = ["http"] }
+
+[dev-dependencies]
+edgezero-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
