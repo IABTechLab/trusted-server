@@ -5,5 +5,7 @@ pub(crate) fn cli_error<T>(message: impl Into<String>) -> CliResult<T> {
 }
 
 pub(crate) fn report_error(message: impl Into<String>) -> String {
-    message.into()
+    let message = message.into();
+    log::error!("{message}");
+    message
 }

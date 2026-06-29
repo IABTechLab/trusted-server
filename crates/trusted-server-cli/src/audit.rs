@@ -421,16 +421,20 @@ mod tests {
             requested_url: "https://publisher.example/page".to_string(),
             final_url: "https://publisher.example/page".to_string(),
             page_title: Some("Example Publisher".to_string()),
-            html: r#"<html><head><title>Example Publisher</title><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></head></html>"#.to_string(),
-            script_tags: vec![CollectedScriptTag {
-                src: Some("https://www.googletagmanager.com/gtm.js?id=GTM-ABC123".to_string()),
-                inline_text: None,
-            }],
+            html: r#"<html><head><title>Example Publisher</title></head></html>"#.to_string(),
+            script_tags: vec![
+                CollectedScriptTag {
+                    src: Some("https://www.googletagmanager.com/gtm.js?id=GTM-ABC123".to_string()),
+                    inline_text: None,
+                },
+                CollectedScriptTag {
+                    src: Some("https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()),
+                    inline_text: None,
+                },
+            ],
             network_requests: vec![CollectedRequest {
                 url: "https://cdn.publisher.example/app.js".to_string(),
-                method: "GET".to_string(),
                 resource_type: Some("script".to_string()),
-                status: None,
             }],
             warnings: Vec::new(),
         }

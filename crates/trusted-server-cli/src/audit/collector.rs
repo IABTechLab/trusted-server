@@ -27,9 +27,7 @@ pub(crate) struct CollectedScriptTag {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct CollectedRequest {
     pub(crate) url: String,
-    pub(crate) method: String,
     pub(crate) resource_type: Option<String>,
-    pub(crate) status: Option<u16>,
 }
 
 impl CollectedPage {

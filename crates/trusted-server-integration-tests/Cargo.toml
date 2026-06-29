@@ -22,7 +22,7 @@ trusted-server-core = { path = "../trusted-server-core" }
 [dev-dependencies]
 testcontainers = { version = "0.25", features = ["blocking"] }
 reqwest = { version = "0.12", features = ["blocking", "cookies", "json"] }
-scraper = "0.21"
+scraper = "0.24.0"
 log = "0.4.33"
 error-stack = "0.6"
 derive_more = { version = "2.0", features = ["display"] }
