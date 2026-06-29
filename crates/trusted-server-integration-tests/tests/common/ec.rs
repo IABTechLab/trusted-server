@@ -271,12 +271,12 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Hard-asserts the deterministic EdgeZero entry-point response header.
+/// Hard-asserts the deterministic `EdgeZero` entry-point response header.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
-/// The EdgeZero entry point marks every normal response with a stable header so
-/// the EdgeZero CI job fails immediately when rollout accidentally falls back to
+/// The `EdgeZero` entry point marks every normal response with a stable header so
+/// the `EdgeZero` CI job fails immediately when rollout accidentally falls back to
 /// `legacy_main`, without relying on method/status behavior.
 pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
     let client = Client::builder()

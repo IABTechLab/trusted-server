@@ -845,9 +845,9 @@ mod tests {
             .uri("https://example.com/")
             .body(Body::empty())
             .expect("should build request");
-        edgezero_adapter_spin::SpinRequestContext::insert(
+        edgezero_adapter_spin::context::SpinRequestContext::insert(
             &mut req,
-            edgezero_adapter_spin::SpinRequestContext {
+            edgezero_adapter_spin::context::SpinRequestContext {
                 client_addr: Some("203.0.113.42".parse().expect("should parse test IP")),
                 full_url: None,
             },

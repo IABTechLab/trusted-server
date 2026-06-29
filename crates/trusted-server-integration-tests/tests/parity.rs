@@ -10,7 +10,7 @@
 // axum::http re-exports from the `http` crate, so HeaderMap types are identical.
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
-use edgezero_adapter_axum::EdgeZeroAxumService;
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;

@@ -219,7 +219,14 @@ fn is_edgezero_enabled(config_store: &FastlyConfigStore) -> Result<bool, fastly:
 /// | Key present, invalid            | `0`          | All legacy (safe default)  |
 /// | Key read error                  | `0`          | All legacy (safe default)  |
 fn read_rollout_pct(config_store: &FastlyConfigStore) -> u8 {
-    match config_store.try_get(EDGEZERO_ROLLOUT_PCT_KEY) {
+    rollout_pct_from_store_result(config_store.try_get(EDGEZERO_ROLLOUT_PCT_KEY))
+}
+
+fn rollout_pct_from_store_result<E>(value: Result<Option<String>, E>) -> u8
+where
+    E: core::fmt::Display,
+{
+    match value {
         Ok(Some(value)) => match parse_rollout_pct(&value) {
             Some(pct) => pct,
             None => {
@@ -1794,37 +1801,22 @@ mod tests {
         Unavailable,
     }
 
-    struct TestConfigStore {
+    fn rollout_result(
         response: StubResponse,
-    }
-
-    impl edgezero_core::config_store::ConfigStore for TestConfigStore {
-        fn get(
-            &self,
-            key: &str,
-        ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
-            assert_eq!(
-                key, EDGEZERO_ROLLOUT_PCT_KEY,
-                "stub should pin the rollout config key"
-            );
-            match &self.response {
-                StubResponse::Value(v) => Ok(Some(v.clone())),
-                StubResponse::Absent => Ok(None),
-                StubResponse::Unavailable => Err(
-                    edgezero_core::config_store::ConfigStoreError::unavailable("boom"),
-                ),
-            }
+    ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
+        match response {
+            StubResponse::Value(v) => Ok(Some(v)),
+            StubResponse::Absent => Ok(None),
+            StubResponse::Unavailable => Err(
+                edgezero_core::config_store::ConfigStoreError::unavailable("boom"),
+            ),
         }
-    }
-
-    fn rollout_handle(response: StubResponse) -> ConfigStoreHandle {
-        ConfigStoreHandle::new(Arc::new(TestConfigStore { response }))
     }
 
     #[test]
     fn read_rollout_pct_absent_defaults_to_legacy() {
         assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Absent)),
+            rollout_pct_from_store_result(rollout_result(StubResponse::Absent)),
             0,
             "absent key should fail safe to 0 (legacy), like every other failure branch"
         );
@@ -1833,7 +1825,7 @@ mod tests {
     #[test]
     fn read_rollout_pct_valid_value_is_parsed() {
         assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("42".into()))),
+            rollout_pct_from_store_result(rollout_result(StubResponse::Value("42".into()))),
             42,
             "a valid in-range value should be returned verbatim"
         );
@@ -1842,7 +1834,7 @@ mod tests {
     #[test]
     fn read_rollout_pct_invalid_value_defaults_to_zero() {
         assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("abc".into()))),
+            rollout_pct_from_store_result(rollout_result(StubResponse::Value("abc".into()))),
             0,
             "an unparseable value should fail safe to 0 (legacy)"
         );
@@ -1851,7 +1843,7 @@ mod tests {
     #[test]
     fn read_rollout_pct_out_of_range_defaults_to_zero() {
         assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Value("101".into()))),
+            rollout_pct_from_store_result(rollout_result(StubResponse::Value("101".into()))),
             0,
             "an out-of-range value should fail safe to 0 (legacy)"
         );
@@ -1860,7 +1852,7 @@ mod tests {
     #[test]
     fn read_rollout_pct_read_error_defaults_to_zero() {
         assert_eq!(
-            read_rollout_pct(&rollout_handle(StubResponse::Unavailable)),
+            rollout_pct_from_store_result(rollout_result(StubResponse::Unavailable)),
             0,
             "a config-store read error should fail safe to 0 (legacy)"
         );

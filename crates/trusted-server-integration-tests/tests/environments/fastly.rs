@@ -75,7 +75,7 @@ impl FastlyViceroy {
     /// secret stores) plus generated test application config stores.
     ///
     /// Honors the `VICEROY_CONFIG_PATH` environment variable so CI jobs can
-    /// point the same WASM binary at generated legacy or EdgeZero configs. This
+    /// point the same WASM binary at generated legacy or `EdgeZero` configs. This
     /// mirrors the browser harness's `global-setup.ts`, which reads the same
     /// variable. Falls back to the local generated legacy config path when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {

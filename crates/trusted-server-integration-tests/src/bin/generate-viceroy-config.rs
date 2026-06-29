@@ -21,10 +21,10 @@ struct Args {
 }
 
 fn main() -> Result<(), DynError> {
-    run(parse_args(env::args().skip(1))?)
+    run(&parse_args(env::args().skip(1))?)
 }
 
-fn run(args: Args) -> Result<(), DynError> {
+fn run(args: &Args) -> Result<(), DynError> {
     let template = fs::read_to_string(&args.template).map_err(|error| {
         error_box(format!(
             "failed to read Viceroy template `{}`: {error}",

@@ -965,7 +965,12 @@ mod tests {
                     .uri(path)
                     .body(edgezero_core::body::Body::empty())
                     .expect("should build request");
-                let status = router.oneshot(req).await.status().as_u16();
+                let status = router
+                    .oneshot(req)
+                    .await
+                    .expect("should route startup-error request")
+                    .status()
+                    .as_u16();
                 assert_eq!(
                     status, 503,
                     "{method} {path} must return 503 from the startup fallback, got {status}"
@@ -988,7 +993,10 @@ mod tests {
             .uri("/health")
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
-        let resp = router.oneshot(req).await;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("should route startup-error health request");
 
         assert_eq!(
             resp.status().as_u16(),
