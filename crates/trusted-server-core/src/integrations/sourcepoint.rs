@@ -152,11 +152,19 @@ static SP_HTML_ROOT_ABSOLUTE_ASSET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// we append `|| <event>.origin === location.origin` to the guard. This only
 /// *additionally* trusts a same-origin frame — which already has full access to
 /// the page — so it adds no attack surface; it teaches an origin check written
-/// for a cross-origin CDN about first-party serving. The match is anchored on
-/// the semantic `.pmOrigin)` close of the guard; group 1 is the (possibly
-/// minified) event identifier and group 2 the `…pmOrigin` operand.
+/// for a cross-origin CDN about first-party serving.
+///
+/// The match is anchored on the semantic close of the guard — either `.pmOrigin)`
+/// (the combined `…msgOrigin || …pmOrigin)` form above) or a standalone
+/// `.msgOrigin)` (the `wrapperMessagingWithoutDetection.js` shape, whose guard
+/// compares only against the single `baseEndpoint`-derived `msgOrigin` value).
+/// Both field names are Sourcepoint-specific, so the rewrite stays scoped to the
+/// CMP's message handlers and leaves generic origin checks untouched. The
+/// trailing `)` requirement means the `msgOrigin` operand inside the combined
+/// form (followed by `||`, not `)`) is not matched a second time. Group 1 is the
+/// (possibly minified) event identifier and group 2 the matched operand.
 static SP_MESSAGE_ORIGIN_GUARD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"([A-Za-z_$][\w$]*)\.origin===([A-Za-z_$][\w$.]*\.pmOrigin)\)"#)
+    Regex::new(r#"([A-Za-z_$][\w$]*)\.origin===([A-Za-z_$][\w$.]*\.(?:pmOrigin|msgOrigin))\)"#)
         .expect("Sourcepoint message origin guard regex should compile")
 });
 
@@ -639,22 +647,45 @@ impl SourcepointIntegration {
     }
 
     fn rewrite_javascript_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
-        self.finalize_rewritten_response(
-            response,
-            rewritten,
-            "application/javascript; charset=utf-8",
-        );
+        self.finalize_rewritten_body(response, rewritten, "application/javascript; charset=utf-8");
+
+        // Rewritten JavaScript bundles are static, versioned files (hashed chunk
+        // names, `/unified/4.40.1/…` paths), so we apply a fixed public cache
+        // policy regardless of what upstream sent. This intentionally diverges
+        // from the passthrough path's `apply_cache_headers` (which only sets a
+        // default when upstream omitted Cache-Control). Responses that set
+        // cookies are kept private.
+        if !Self::apply_cookie_safety(response) {
+            if let Ok(val) = HeaderValue::from_str(&format!(
+                "public, max-age={}",
+                self.config.cache_ttl_seconds
+            )) {
+                response.headers_mut().insert(header::CACHE_CONTROL, val);
+            }
+        }
     }
 
-    fn rewrite_html_response(&self, response: &mut Response<EdgeBody>, rewritten: String) {
-        self.finalize_rewritten_response(response, rewritten, "text/html; charset=utf-8");
+    fn rewrite_html_response(
+        &self,
+        response: &mut Response<EdgeBody>,
+        rewritten: String,
+        forwarded_cookies: bool,
+    ) {
+        self.finalize_rewritten_body(response, rewritten, "text/html; charset=utf-8");
+
+        // Rewritten HTML iframe documents (e.g. `us_pm/index.html`) are
+        // unversioned, so — unlike the versioned JS bundles — we must not force a
+        // long public cache. Defer to the shared `apply_cache_headers` path,
+        // which preserves an upstream `Cache-Control` when present and otherwise
+        // applies the cookie-aware default (private when cookies were forwarded).
+        self.apply_cache_headers(response, forwarded_cookies);
     }
 
     /// Replaces a rewritten body and normalises the headers: drops the stale
-    /// content encoding/length, clears `Vary: Accept-Encoding`, applies cookie
-    /// safety (or a fixed public cache policy for these versioned assets), and
-    /// sets `content_type`.
-    fn finalize_rewritten_response(
+    /// content encoding/length, clears `Vary: Accept-Encoding`, and sets
+    /// `content_type`. Cache policy is applied by the caller, which differs for
+    /// versioned JavaScript versus unversioned HTML responses.
+    fn finalize_rewritten_body(
         &self,
         response: &mut Response<EdgeBody>,
         rewritten: String,
@@ -663,20 +694,6 @@ impl SourcepointIntegration {
         response.headers_mut().remove(header::CONTENT_ENCODING);
         response.headers_mut().remove(header::CONTENT_LENGTH);
         Self::remove_vary_accept_encoding(response);
-
-        if !Self::apply_cookie_safety(response) {
-            // Rewritten Sourcepoint assets are static, versioned files (hashed
-            // chunk names, `/unified/4.40.1/…` paths), so we apply a fixed public
-            // cache policy regardless of what upstream sent. This intentionally
-            // diverges from the passthrough path's `apply_cache_headers` (which
-            // only sets a default when upstream omitted Cache-Control).
-            if let Ok(val) = HeaderValue::from_str(&format!(
-                "public, max-age={}",
-                self.config.cache_ttl_seconds
-            )) {
-                response.headers_mut().insert(header::CACHE_CONTROL, val);
-            }
-        }
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -958,7 +975,7 @@ impl IntegrationProxy for SourcepointIntegration {
                 self.rewrite_javascript_response(&mut response, rewritten);
             } else {
                 let rewritten = Self::rewrite_html_content(&body);
-                self.rewrite_html_response(&mut response, rewritten);
+                self.rewrite_html_response(&mut response, rewritten, forwarded_cookies);
             }
             return Ok(response);
         }
@@ -1238,6 +1255,43 @@ mod tests {
         assert!(
             output.contains("o.origin===a.params.pmOrigin||o.origin===location.origin)"),
             "minified guard should be rewritten. Got: {output}"
+        );
+    }
+
+    #[test]
+    fn rewrites_standalone_msg_origin_guard_to_accept_same_origin() {
+        // The `wrapperMessagingWithoutDetection.js` shape guards on the single
+        // `baseEndpoint`-derived `msgOrigin` value (no `pmOrigin` second clause).
+        // Under first-party proxying that value is a path, so the same-origin
+        // branch is needed for this wrapper to accept its iframe's messages too.
+        let input = r#"function(e,t,n){if((e.origin===this.params.msgOrigin)&&("iframe"===this.params.type)){}}"#;
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            r#"function(e,t,n){if((e.origin===this.params.msgOrigin||e.origin===location.origin)&&("iframe"===this.params.type)){}}"#,
+            "standalone msgOrigin guard should also accept same-origin messages"
+        );
+    }
+
+    #[test]
+    fn message_origin_guard_rewrite_does_not_double_match_combined_guard() {
+        // The combined `msgOrigin || pmOrigin)` form must be rewritten exactly
+        // once (anchored on the trailing `pmOrigin)`); the inner `msgOrigin`,
+        // followed by `||` rather than `)`, must not be matched a second time.
+        let input = concat!(
+            r#"function(e){if((e.origin===a.params.msgOrigin"#,
+            r#"||e.origin===a.params.pmOrigin)){}}"#,
+        );
+        let output = SourcepointIntegration::rewrite_script_content(input);
+
+        assert_eq!(
+            output,
+            concat!(
+                r#"function(e){if((e.origin===a.params.msgOrigin"#,
+                r#"||e.origin===a.params.pmOrigin||e.origin===location.origin)){}}"#,
+            ),
+            "combined guard should gain exactly one same-origin branch"
         );
     }
 
@@ -1948,6 +2002,86 @@ mod tests {
         assert!(
             response.headers().get(header::VARY).is_none(),
             "should remove stale Vary: Accept-Encoding after stripping content encoding"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_preserves_upstream_cache_control() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(&mut response, header::CONTENT_ENCODING, "gzip");
+        set_header(&mut response, header::CONTENT_LENGTH, "4");
+        set_header(&mut response, header::CACHE_CONTROL, "no-store");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("no-store"),
+            "should preserve upstream Cache-Control for unversioned HTML documents"
+        );
+        assert_eq!(
+            get_header_str(&response, header::CONTENT_TYPE),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            String::from_utf8(take_body_bytes(response)).expect("should decode rewritten HTML"),
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_private_policy_when_cookies_were_forwarded() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), true);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("private, max-age=0"),
+            "should not publicly cache HTML that may vary by forwarded Cookie"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_public_default_without_forwarded_cookies() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        let expected_cache_control = format!("public, max-age={}", default_cache_ttl());
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some(expected_cache_control.as_str()),
+            "should apply the public default when upstream omitted Cache-Control and no cookies were forwarded"
+        );
+    }
+
+    #[test]
+    fn rewrite_html_response_uses_private_no_store_for_cookie_setting_responses() {
+        let integration = SourcepointIntegration::new(Arc::new(config(true)));
+        let mut response = make_resp_with_status(StatusCode::OK);
+        set_header(
+            &mut response,
+            header::SET_COOKIE,
+            "consentUUID=uuid123; Path=/",
+        );
+        set_header(&mut response, header::CACHE_CONTROL, "public, max-age=3600");
+        *response.body_mut() = EdgeBody::from(b"payload".to_vec());
+
+        integration.rewrite_html_response(&mut response, "rewritten".to_string(), false);
+
+        assert_eq!(
+            get_header_str(&response, header::CACHE_CONTROL),
+            Some("private, no-store"),
+            "should avoid public caching when rewritten HTML still sets cookies"
         );
     }
 
