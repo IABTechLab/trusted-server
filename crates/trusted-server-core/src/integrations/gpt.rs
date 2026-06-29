@@ -443,6 +443,10 @@ impl IntegrationAttributeRewriter for GptIntegration {
 
         if Self::is_gpt_script_url(attr_value) {
             // Root-relative so the browser resolves it against the page host.
+            // Note: a page-level `<base href>` participates in this resolution,
+            // so on pages that set an external base URL these resolve against
+            // that base rather than the address-bar origin — an accepted
+            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
             AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
         } else {
             AttributeRewriteAction::keep()

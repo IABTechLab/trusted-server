@@ -52,7 +52,7 @@
 //! automatically rewrite `DataDome` script URLs in HTML responses:
 //!
 //! - `<script src="https://js.datadome.co/tags.js">` becomes
-//!   `<script src="https://publisher.com/integrations/datadome/tags.js">`
+//!   `<script src="/integrations/datadome/tags.js">`
 //! - Handles both `src` and `href` attributes (for preload/prefetch links)
 
 use std::sync::{Arc, LazyLock};
@@ -815,6 +815,10 @@ impl IntegrationAttributeRewriter for DataDomeIntegration {
 
         let path = Self::extract_datadome_path(attr_value);
         // Root-relative so the browser resolves it against the page host.
+        // Note: a page-level `<base href>` participates in this resolution, so
+        // on pages that set an external base URL these resolve against that base
+        // rather than the address-bar origin — an accepted tradeoff, matching
+        // GTM/Didomi/Testlight which are also relative.
         let new_url = format!("/integrations/datadome{path}");
 
         log::info!(
