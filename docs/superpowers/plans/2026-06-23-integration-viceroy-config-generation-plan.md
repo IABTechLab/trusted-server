@@ -22,8 +22,8 @@ That fixed CI, but it is hard to maintain:
   blob.
 - The EdgeZero-specific template duplicates almost all of the base Viceroy
   template just to flip `trusted_server_config.edgezero_enabled`.
-- The EdgeZero entry-point canary became brittle because it inferred routing path
-  from runtime method behavior instead of an explicit runtime signal.
+- The EdgeZero entry-point canary should not require a production-visible
+  response header solely to expose routing path.
 
 ## Goals
 
@@ -180,7 +180,6 @@ Workflow changes:
 
    ```bash
    VICEROY_CONFIG_PATH=$ARTIFACTS_DIR/configs/viceroy-edgezero.toml
-   EXPECT_EDGEZERO_ENTRY_POINT=true
    ```
 
 5. In the browser integration-test job, set `VICEROY_CONFIG_PATH` to the legacy
@@ -241,7 +240,7 @@ If no local runner currently exists for a specific path, document the commands i
 2. Upload generated configs with the existing artifact bundle.
 3. Update integration jobs to point at generated config artifact paths instead of
    source-controlled Viceroy templates.
-4. Keep `EXPECT_EDGEZERO_ENTRY_POINT=true` only on the EdgeZero job.
+4. Do not add public response headers solely to identify the selected entry point.
 
 ### Stage 5 — Wire local scripts and docs
 
@@ -255,18 +254,10 @@ If no local runner currently exists for a specific path, document the commands i
 
 ### Stage 6 — Revisit the EdgeZero probe
 
-Short-term:
-
-- Keep the current non-fatal probe if it is still useful diagnostic output.
-- Do not rely on method-routing behavior as a required assertion.
-
-Better follow-up:
-
-- Add an explicit EdgeZero-only observable signal, such as a response extension
-  surfaced as a debug header in integration mode, or a dedicated test-only route
-  compiled only for integration builds.
-- Once an explicit signal exists, make the EdgeZero CI job assert that signal and
-  remove the heuristic probe.
+The public `x-ts-entry-point` response header was removed instead of becoming a
+production-visible CI signal. If a stronger EdgeZero-only canary is needed later,
+prefer a test-only route or a probe-scoped signal that is not emitted on normal
+client responses.
 
 ## Definition of done
 
@@ -312,7 +303,6 @@ cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \
   test_ec_lifecycle_fastly -- --include-ignored --test-threads=1
 
 VICEROY_CONFIG_PATH=/tmp/integration-test-artifacts/configs/viceroy-edgezero.toml \
-EXPECT_EDGEZERO_ENTRY_POINT=true \
 WASM_BINARY_PATH=target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm \
 INTEGRATION_ORIGIN_PORT=8888 \
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml \

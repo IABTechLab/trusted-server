@@ -89,6 +89,11 @@ impl Validate for TrustedServerAppConfig {
 }
 
 impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
+    // Phase 1 intentionally preserves the existing inline-settings model:
+    // `ts config push` publishes the validated Trusted Server config as one
+    // app-config blob. Migrating app-level secrets to `EdgeZero` secret-store
+    // references needs nested/array extraction support and operator migration
+    // work tracked separately.
     const SECRET_FIELDS: &'static [edgezero_core::app_config::SecretField] = &[];
 }
 

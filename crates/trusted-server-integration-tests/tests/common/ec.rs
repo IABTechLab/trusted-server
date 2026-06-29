@@ -271,39 +271,6 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Hard-asserts the deterministic `EdgeZero` entry-point response header.
-///
-/// `main()` silently falls back to the legacy entry point when the config store
-/// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
-/// The `EdgeZero` entry point marks every normal response with a stable header so
-/// the `EdgeZero` CI job fails immediately when rollout accidentally falls back to
-/// `legacy_main`, without relying on method/status behavior.
-pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("should build EdgeZero canary client");
-    let response = client
-        .request(
-            reqwest::Method::OPTIONS,
-            format!("{base_url}/_ts/api/v1/batch-sync"),
-        )
-        .send()
-        .change_context(TestError::HttpRequest)
-        .attach("OPTIONS /_ts/api/v1/batch-sync (EdgeZero entry-point probe)")?;
-    let header_value = response
-        .headers()
-        .get("x-ts-entry-point")
-        .and_then(|value| value.to_str().ok());
-    if header_value != Some("edgezero") {
-        return Err(Report::new(TestError::UnexpectedContent).attach(format!(
-            "expected x-ts-entry-point: edgezero from EdgeZero entry point, got {header_value:?}; status was {}",
-            response.status()
-        )));
-    }
-    Ok(())
-}
-
 pub fn assert_status(resp: &Response, expected: u16) -> TestResult<()> {
     let actual = resp.status().as_u16();
     if actual != expected {

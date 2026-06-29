@@ -79,8 +79,6 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
 const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
-const HEADER_X_TS_ENTRY_POINT: &str = "x-ts-entry-point";
-const EDGEZERO_ENTRY_POINT_VALUE: &str = "edgezero";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
 ///
@@ -681,7 +679,6 @@ fn send_edgezero_response(
     if let Some(effects) = request_filter_effects {
         effects.apply_to_response(&mut response);
     }
-    mark_edgezero_entry_point(&mut response);
 
     let (parts, body) = response.into_parts();
     match body {
@@ -709,13 +706,6 @@ fn send_edgezero_response(
             compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
         }
     }
-}
-
-fn mark_edgezero_entry_point(response: &mut HttpResponse) {
-    response.headers_mut().insert(
-        HEADER_X_TS_ENTRY_POINT,
-        HeaderValue::from_static(EDGEZERO_ENTRY_POINT_VALUE),
-    );
 }
 
 /// Handles a request using the original Fastly-native entry point.

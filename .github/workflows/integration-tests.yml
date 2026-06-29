@@ -157,10 +157,6 @@ jobs:
           WASM_BINARY_PATH: ${{ env.WASM_ARTIFACT_PATH }}
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
           VICEROY_CONFIG_PATH: ${{ env.ARTIFACTS_DIR }}/configs/viceroy-edgezero.toml
-          # Opt into the EdgeZero entry-point probe in test_ec_lifecycle_fastly.
-          # Only set here, so the legacy integration-tests job runs the same
-          # scenarios through legacy_main without the EdgeZero diagnostic probe.
-          EXPECT_EDGEZERO_ENTRY_POINT: "true"
           RUST_LOG: info
 
   browser-tests:
