@@ -864,6 +864,63 @@ describe('prebid/installRefreshHandler', () => {
     );
   });
 
+  it('resolves the exact slot when div_ids share a prefix', () => {
+    // Regression: a single find() with a startsWith() clause returned the
+    // first slot whose div_id is a prefix of the element id. With div_ids
+    // "div-ad" and "div-ad-header", refreshing the "div-ad-header" element
+    // must resolve to the header slot, not the shorter prefix slot.
+    const originalRefresh = vi.fn();
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: originalRefresh,
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    (window as any).googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    (window as any).tsjs = {
+      adSlots: [
+        {
+          id: 'prefix_ad',
+          gam_unit_path: '/123/prefix',
+          div_id: 'div-ad',
+          formats: [[300, 250]],
+          targeting: { zone: 'prefix' },
+        },
+        {
+          id: 'header_ad',
+          gam_unit_path: '/123/header',
+          div_id: 'div-ad-header',
+          formats: [[970, 250]],
+          targeting: { zone: 'header' },
+        },
+      ],
+    };
+
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adUnits: [
+          expect.objectContaining({
+            code: 'div-ad-header',
+            mediaTypes: {
+              banner: {
+                name: 'header',
+                sizes: [[970, 250]],
+              },
+            },
+          }),
+        ],
+      })
+    );
+  });
+
   it('scopes the GPT targeting call to the refreshed slot code', () => {
     const setTargetingForGPTAsync = vi.fn();
     (mockPbjs as any).setTargetingForGPTAsync = setTargetingForGPTAsync;

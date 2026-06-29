@@ -176,7 +176,6 @@ async fn dispatch_fallback(
     };
     handle_publisher_request(
         &state.settings,
-        &state.registry,
         services,
         None,
         &mut ec_context,

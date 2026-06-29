@@ -305,7 +305,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 };
                 handle_publisher_request(
                     &state.settings,
-                    &state.registry,
                     &services,
                     None,
                     &mut ec_context,

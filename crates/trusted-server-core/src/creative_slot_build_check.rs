@@ -337,9 +337,15 @@ pub(crate) fn validate_creative_slot(
             for format in formats {
                 let width = format.get("width").and_then(serde_json::Value::as_u64);
                 let height = format.get("height").and_then(serde_json::Value::as_u64);
-                if !matches!((width, height), (Some(w), Some(h)) if w > 0 && h > 0) {
+                // Runtime dimensions are `u32`, so a value above `u32::MAX` passes
+                // a bare `> 0` check here but fails `from_value::<u32>` at runtime
+                // settings load on every request — the exact failure this build
+                // check exists to prevent.
+                let in_u32 =
+                    |v: Option<u64>| matches!(v, Some(n) if n > 0 && n <= u64::from(u32::MAX));
+                if !(in_u32(width) && in_u32(height)) {
                     return Err(format!(
-                        "slot `{id}` format must have positive width and height"
+                        "slot `{id}` format must have positive width and height within u32 range"
                     ));
                 }
             }

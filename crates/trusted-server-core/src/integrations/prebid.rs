@@ -1017,6 +1017,17 @@ impl PrebidAuctionProvider {
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
                     } else if self.config.bidders.iter().any(|b| b == name) {
                         bidder.insert(name.clone(), params.clone());
+                    } else if name != "aps" {
+                        // `aps` is intentionally handled by its own provider. Any
+                        // other unrecognized key is likely a misconfiguration (a
+                        // slot bidder absent from `config.bidders`) that silently
+                        // yields an empty bidder map and a stored-request no-bid —
+                        // log it so the drop is diagnosable.
+                        log::debug!(
+                            "prebid: dropping slot '{}' bidder '{}' — not in config.bidders and not a known provider key",
+                            slot.id,
+                            name
+                        );
                     }
                 }
 

@@ -68,6 +68,7 @@
           for (var i = 0; i < idElements.length; i++) {
             var candidate = idElements[i];
             if (
+              slot.div_id &&
               candidate.id.startsWith(slot.div_id) &&
               !candidate.id.endsWith("-container")
             ) {

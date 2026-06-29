@@ -53,6 +53,7 @@ mod creative_opportunities {
     }
 
     #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
     pub struct CreativeOpportunitiesConfig {
         pub gam_network_id: String,
         #[serde(default)]

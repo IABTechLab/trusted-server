@@ -257,6 +257,12 @@ pub(crate) fn apply_finalize_headers(
     }
 }
 
+/// Surrogate cache headers stripped from every cookie-bearing response. A single
+/// source of truth so the legacy ([`crate::enforce_set_cookie_cache_privacy`])
+/// and `EdgeZero` copies of the privacy downgrade cannot drift apart.
+pub(crate) const SURROGATE_CACHE_HEADERS: &[&str] =
+    &["surrogate-control", "fastly-surrogate-control"];
+
 /// Forces cookie-bearing responses to stay private to shared caches.
 ///
 /// Mirrors [`crate::enforce_set_cookie_cache_privacy`] for the [`Response`] type
@@ -277,8 +283,9 @@ pub(crate) fn enforce_set_cookie_cache_privacy(response: &mut Response) {
     // one already carrying a stricter `no-store`/`private` directive — they are
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    response.headers_mut().remove("surrogate-control");
-    response.headers_mut().remove("fastly-surrogate-control");
+    for name in SURROGATE_CACHE_HEADERS {
+        response.headers_mut().remove(*name);
+    }
     // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
     // against a lowercased copy — `No-Store` / `Private` must count.
     let already_uncacheable = response

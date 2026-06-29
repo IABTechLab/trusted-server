@@ -270,7 +270,12 @@ function sanitizeAuctionUid(uid: {
 
   const sanitizedUid: AuctionEid['uids'][number] = { id: uid.id };
 
-  if (Number.isInteger(uid.atype) && uid.atype >= 0 && uid.atype <= 255) {
+  if (
+    typeof uid.atype === 'number' &&
+    Number.isInteger(uid.atype) &&
+    uid.atype >= 0 &&
+    uid.atype <= 255
+  ) {
     sanitizedUid.atype = uid.atype;
   }
 
@@ -330,11 +335,18 @@ function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefin
     return undefined;
   }
 
-  return window.tsjs?.adSlots?.find(
-    (adSlot) =>
-      elementId === adSlot.div_id ||
-      elementId === `${adSlot.div_id}-container` ||
-      elementId.startsWith(adSlot.div_id)
+  const slots = window.tsjs?.adSlots;
+  if (!slots) {
+    return undefined;
+  }
+
+  // Prefer an exact (or container) match across all slots before the prefix
+  // fallback, so prefix-overlapping div_ids (e.g. "ad" and "ad-header") resolve
+  // to the correct slot instead of the first slot whose div_id is a prefix.
+  return (
+    slots.find(
+      (adSlot) => elementId === adSlot.div_id || elementId === `${adSlot.div_id}-container`
+    ) ?? slots.find((adSlot) => adSlot.div_id.length > 0 && elementId.startsWith(adSlot.div_id))
   );
 }
 

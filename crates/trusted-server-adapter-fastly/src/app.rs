@@ -729,7 +729,6 @@ async fn dispatch_fallback(
                 };
                 handle_publisher_request(
                     &state.settings,
-                    &state.registry,
                     &publisher_services,
                     ec.kv_graph.as_ref(),
                     &mut ec.ec_context,

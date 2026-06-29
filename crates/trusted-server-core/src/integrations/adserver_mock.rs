@@ -108,14 +108,24 @@ fn build_bid_index(bidder_responses: &[AuctionResponse]) -> BidIndex {
     let mut index = BidIndex::new();
     for response in bidder_responses {
         for bid in &response.bids {
-            index.insert(
-                (
-                    response.provider.clone(),
-                    bid.slot_id.clone(),
-                    bid.bidder.clone(),
-                ),
-                bid.clone(),
+            let key = (
+                response.provider.clone(),
+                bid.slot_id.clone(),
+                bid.bidder.clone(),
             );
+            // OpenRTB permits a seat to return multiple bids per imp. This index
+            // is last-write-wins, so a collision means an earlier bid's
+            // nurl/burl/cache_* are dropped and win/billing-URL restoration can
+            // be mis-attributed during mediation. Low severity for the mock
+            // mediator, but log it so the collision is visible.
+            if index.insert(key, bid.clone()).is_some() {
+                log::debug!(
+                    "adserver_mock: duplicate bid for (provider '{}', slot '{}', bidder '{}'); keeping the last — win/billing URL restoration may be mis-attributed",
+                    response.provider,
+                    bid.slot_id,
+                    bid.bidder
+                );
+            }
         }
     }
     index

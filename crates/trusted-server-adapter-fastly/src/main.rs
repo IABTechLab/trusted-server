@@ -1270,7 +1270,6 @@ async fn route_request(
 
                 match handle_publisher_request(
                     settings,
-                    integration_registry,
                     runtime_services,
                     kv_graph.as_ref(),
                     &mut ec_context,
@@ -1399,8 +1398,9 @@ fn enforce_set_cookie_cache_privacy(response: &mut FastlyResponse) {
     // keeping a stricter `no-store`/`private` directive — Surrogate-Control is
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    response.remove_header("surrogate-control");
-    response.remove_header("fastly-surrogate-control");
+    for name in crate::middleware::SURROGATE_CACHE_HEADERS {
+        response.remove_header(*name);
+    }
     let already_uncacheable = response
         .get_header_str("cache-control")
         .map(str::to_ascii_lowercase)

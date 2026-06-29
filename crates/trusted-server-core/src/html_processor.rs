@@ -366,6 +366,15 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
                             Ok(())
                         });
                     handlers.push(handler);
+                } else {
+                    // No end tag (implicitly closed or EOF `<body>`): lol_html
+                    // cannot attach an end-tag handler, so tsjs.bids/adInit() are
+                    // never injected even though adSlots was injected at `<head>`.
+                    // The whole server-side ad feature then silently fails to
+                    // render — warn so the failure is diagnosable.
+                    log::warn!(
+                        "`<body>` has no end tag (implicitly closed or EOF); tsjs.bids and adInit() were not injected — server-side ads will not render"
+                    );
                 }
                 Ok(())
             }

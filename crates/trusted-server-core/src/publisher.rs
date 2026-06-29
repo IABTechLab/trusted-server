@@ -10,21 +10,19 @@
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
 //!
-//! **Note on platform coupling:** This module is currently coupled to
-//! `fastly::Body`/`Request`/`Response` at its handler boundaries — the entry
-//! points ([`handle_publisher_request`], [`stream_publisher_body`]) still
-//! accept and return `fastly::Body` and `fastly::Response`. The streaming
-//! processor itself is generic: `process_response_streaming` writes into
-//! any [`Write`] (a `Vec<u8>` for buffered routes, a `StreamingBody` for the
-//! streaming route). The HTTP-type coupling will be addressed in the
-//! platform HTTP-type migration alongside all other
-//! `fastly::Request`/`Response`/`Body` migrations. It is not a
-//! content-rewriting concern.
+//! **Note on platform coupling:** The handler boundaries use portable HTTP
+//! types: [`handle_publisher_request`] and [`stream_publisher_body`] take and
+//! return `http::Request`/`http::Response` over `EdgeBody`, and platform I/O is
+//! reached through `RuntimeServices` rather than `fastly::*` directly. The
+//! streaming processor itself is generic: `process_response_streaming` writes
+//! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
+//! the streaming route). It is not a content-rewriting concern.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -45,7 +43,7 @@ use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::http_util::{is_navigation_request, serve_static_with_etag, RequestInfo};
 use crate::integrations::IntegrationRegistry;
-use crate::platform::{PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
+use crate::platform::{GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices};
 use crate::price_bucket::{price_bucket, PriceGranularity};
 use crate::rsc_flight::RscFlightUrlRewriter;
 use crate::settings::Settings;
@@ -333,9 +331,9 @@ pub enum PublisherResponse {
     Buffered(Response<EdgeBody>),
     /// Response headers are ready for a streaming response. Covers processable
     /// content on any status (2xx or non-2xx — e.g., branded 404/500 HTML and
-    /// error JSON still get URL rewriting) where the encoding is supported
-    /// and either the content is non-HTML or no HTML post-processors are
-    /// registered. The caller must:
+    /// error JSON still get URL rewriting) where the encoding is supported.
+    /// Post-processors run inside the streaming processor, so processable HTML
+    /// is streamed regardless of whether any are registered. The caller must:
     /// 1. Call `finalize_response()` on the response
     /// 2. Call `response.stream_to_client()` to get a `StreamingBody`
     /// 3. Call `stream_publisher_body()` with the body and streaming writer
@@ -398,7 +396,6 @@ pub(crate) fn classify_response_route(
     content_type: &str,
     content_encoding: &str,
     request_host: &str,
-    _has_post_processors: bool,
 ) -> ResponseRoute {
     if status == StatusCode::NO_CONTENT || status == StatusCode::RESET_CONTENT {
         return ResponseRoute::BufferedUnmodified;
@@ -1150,7 +1147,6 @@ pub struct AuctionDispatch<'a> {
 /// origin backend is unreachable.
 pub async fn handle_publisher_request(
     settings: &Settings,
-    integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
     kv: Option<&KvIdentityGraph>,
     ec_context: &mut EcContext,
@@ -1307,33 +1303,19 @@ pub async fn handle_publisher_request(
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok()),
         );
-        let ts_eids_value = cookie_jar
-            .as_ref()
-            .and_then(|j| j.get(COOKIE_TS_EIDS))
-            .map(|c| c.value().to_owned());
-        let client_eids = if ec_id.is_some() {
-            resolve_client_auction_eids(None, ts_eids_value.as_deref())
-        } else {
-            None
-        };
-        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
-        let merged_eids = merge_auction_eids(client_eids, kv_eids);
-        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-        auction_request.user.eids =
-            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-        if had_eids && auction_request.user.eids.is_none() {
-            log::warn!("Server-side auction EIDs stripped by TCF consent gating");
-        }
-        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
-        if client_ip.is_some() || geo.is_some() {
-            let device = auction_request.device.get_or_insert(DeviceInfo {
-                user_agent: None,
-                ip: None,
-                geo: None,
-            });
-            device.ip = client_ip;
-            device.geo = geo.clone();
-        }
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: cookie_jar.as_ref(),
+                ec_id,
+                kv,
+                partner_registry: auction.registry,
+                ec_context,
+                services,
+                geo: geo.as_ref(),
+                path_label: "Server-side",
+            },
+        );
         let auction_context = AuctionContext {
             settings,
             request: &req,
@@ -1439,15 +1421,7 @@ pub async fn handle_publisher_request(
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_lowercase();
-    let has_post_processors = integration_registry.has_html_post_processors();
-
-    let route = classify_response_route(
-        status,
-        &content_type,
-        &content_encoding,
-        request_host,
-        has_post_processors,
-    );
+    let route = classify_response_route(status, &content_type, &content_encoding, request_host);
 
     match route {
         ResponseRoute::PassThrough => {
@@ -1539,6 +1513,70 @@ pub async fn handle_publisher_request(
 pub(crate) struct MatchedSlotsContext<'a> {
     pub matched_slots: &'a [crate::creative_opportunities::CreativeOpportunitySlot],
     pub request_path: &'a str,
+}
+
+/// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
+/// helper within the project's 7-argument cap.
+struct AuctionEidTargeting<'a> {
+    cookie_jar: Option<&'a CookieJar>,
+    ec_id: Option<&'a str>,
+    kv: Option<&'a KvIdentityGraph>,
+    partner_registry: Option<&'a PartnerRegistry>,
+    ec_context: &'a EcContext,
+    services: &'a RuntimeServices,
+    geo: Option<&'a GeoInfo>,
+    /// Prefix for the consent-stripped warning (e.g. `"Server-side"`).
+    path_label: &'a str,
+}
+
+/// Resolves client + KV EIDs, consent-gates them onto `auction_request`, and
+/// attaches the client IP/geo to its device record.
+///
+/// Shared verbatim by the initial-page and page-bids dispatch paths so the EID
+/// resolution and consent gating live in one place; `path_label` only varies
+/// the consent-stripped warning message.
+fn apply_auction_eids_and_device(
+    auction_request: &mut AuctionRequest,
+    targeting: &AuctionEidTargeting<'_>,
+) {
+    let ts_eids_value = targeting
+        .cookie_jar
+        .and_then(|j| j.get(COOKIE_TS_EIDS))
+        .map(|c| c.value().to_owned());
+    let client_eids = if targeting.ec_id.is_some() {
+        resolve_client_auction_eids(None, ts_eids_value.as_deref())
+    } else {
+        None
+    };
+    let kv_eids = resolve_auction_eids(
+        targeting.kv,
+        targeting.partner_registry,
+        targeting.ec_context,
+    );
+    let merged_eids = merge_auction_eids(client_eids, kv_eids);
+    let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
+    auction_request.user.eids =
+        gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
+    if had_eids && auction_request.user.eids.is_none() {
+        log::warn!(
+            "{} auction EIDs stripped by TCF consent gating",
+            targeting.path_label
+        );
+    }
+    let client_ip = targeting
+        .services
+        .client_info()
+        .client_ip
+        .map(|ip| ip.to_string());
+    if client_ip.is_some() || targeting.geo.is_some() {
+        let device = auction_request.device.get_or_insert(DeviceInfo {
+            user_agent: None,
+            ip: None,
+            geo: None,
+        });
+        device.ip = client_ip;
+        device.geo = targeting.geo.cloned();
+    }
 }
 
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
@@ -1948,33 +1986,19 @@ pub async fn handle_page_bids(
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok()),
         );
-        let ts_eids_value = cookie_jar
-            .as_ref()
-            .and_then(|j| j.get(COOKIE_TS_EIDS))
-            .map(|c| c.value().to_owned());
-        let client_eids = if ec_id.is_some() {
-            resolve_client_auction_eids(None, ts_eids_value.as_deref())
-        } else {
-            None
-        };
-        let kv_eids = resolve_auction_eids(kv, auction.registry, ec_context);
-        let merged_eids = merge_auction_eids(client_eids, kv_eids);
-        let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
-        auction_request.user.eids =
-            gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
-        if had_eids && auction_request.user.eids.is_none() {
-            log::warn!("Page-bids auction EIDs stripped by TCF consent gating");
-        }
-        let client_ip = services.client_info().client_ip.map(|ip| ip.to_string());
-        if client_ip.is_some() || geo.is_some() {
-            let device = auction_request.device.get_or_insert(DeviceInfo {
-                user_agent: None,
-                ip: None,
-                geo: None,
-            });
-            device.ip = client_ip;
-            device.geo = geo.clone();
-        }
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: cookie_jar.as_ref(),
+                ec_id,
+                kv,
+                partner_registry: auction.registry,
+                ec_context,
+                services,
+                geo: geo.as_ref(),
+                path_label: "Page-bids",
+            },
+        );
         let timeout_ms = co_config
             .auction_timeout_ms
             .unwrap_or(settings.auction.timeout_ms);
@@ -2306,10 +2330,9 @@ mod tests {
 
     /// Drive `handle_publisher_request` with no creative opportunities — a plain
     /// proxy with no server-side auction. Hides the auction/EC wiring so callers
-    /// read like a simple `(settings, registry, services, req)` proxy.
+    /// read like a simple `(settings, services, req)` proxy.
     async fn run_publisher_proxy(
         settings: &Settings,
-        integration_registry: &IntegrationRegistry,
         services: &RuntimeServices,
         req: Request<EdgeBody>,
     ) -> PublisherResponse {
@@ -2318,7 +2341,6 @@ mod tests {
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
         handle_publisher_request(
             settings,
-            integration_registry,
             services,
             None,
             &mut ec_context,
@@ -2336,8 +2358,6 @@ mod tests {
     #[tokio::test]
     async fn publisher_request_uses_platform_http_client_with_http_types() {
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"origin response".to_vec());
         let services = build_services_with_http_client(
@@ -2350,7 +2370,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = match run_publisher_proxy(&settings, &registry, &services, req).await {
+        let response = match run_publisher_proxy(&settings, &services, req).await {
             PublisherResponse::Buffered(r) => r,
             PublisherResponse::PassThrough { mut response, body } => {
                 *response.body_mut() = body;
@@ -2378,8 +2398,6 @@ mod tests {
         // exactly the conditions under which the old inline call would have
         // generated one.
         let settings = create_test_settings();
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"<html><body>ok</body></html>".to_vec());
         let services = build_services_with_http_client(
@@ -2408,7 +2426,6 @@ mod tests {
 
         let _ = handle_publisher_request(
             &settings,
-            &registry,
             &services,
             None,
             &mut ec_context,
@@ -2647,8 +2664,7 @@ mod tests {
                 StatusCode::OK,
                 "text/html; charset=utf-8",
                 "zstd",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::BufferedUnmodified,
         );
@@ -2702,8 +2718,7 @@ mod tests {
                 StatusCode::OK,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::Stream,
         );
@@ -2716,8 +2731,7 @@ mod tests {
                 StatusCode::OK,
                 "Text/HTML; Charset=utf-8",
                 "gzip",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::Stream,
             "HTML MIME type matching must be case-insensitive",
@@ -2731,8 +2745,7 @@ mod tests {
                 StatusCode::OK,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                true,
+                "example.com"
             ),
             ResponseRoute::Stream,
         );
@@ -2741,13 +2754,7 @@ mod tests {
     #[test]
     fn route_streams_non_html_even_with_post_processors_registered() {
         assert_eq!(
-            classify_response_route(
-                StatusCode::OK,
-                "application/json",
-                "gzip",
-                "example.com",
-                true,
-            ),
+            classify_response_route(StatusCode::OK, "application/json", "gzip", "example.com"),
             ResponseRoute::Stream,
         );
     }
@@ -2755,7 +2762,7 @@ mod tests {
     #[test]
     fn route_buffers_unmodified_on_unsupported_encoding() {
         assert_eq!(
-            classify_response_route(StatusCode::OK, "text/html", "zstd", "example.com", false,),
+            classify_response_route(StatusCode::OK, "text/html", "zstd", "example.com"),
             ResponseRoute::BufferedUnmodified,
         );
     }
@@ -2763,7 +2770,7 @@ mod tests {
     #[test]
     fn route_passes_through_non_processable_2xx() {
         assert_eq!(
-            classify_response_route(StatusCode::OK, "image/png", "", "example.com", false,),
+            classify_response_route(StatusCode::OK, "image/png", "", "example.com"),
             ResponseRoute::PassThrough,
         );
     }
@@ -2771,7 +2778,7 @@ mod tests {
     #[test]
     fn route_buffers_non_processable_error_responses() {
         assert_eq!(
-            classify_response_route(StatusCode::NOT_FOUND, "image/png", "", "example.com", false,),
+            classify_response_route(StatusCode::NOT_FOUND, "image/png", "", "example.com"),
             ResponseRoute::BufferedUnmodified,
         );
     }
@@ -2779,13 +2786,7 @@ mod tests {
     #[test]
     fn route_excludes_204_from_pass_through() {
         assert_eq!(
-            classify_response_route(
-                StatusCode::NO_CONTENT,
-                "image/png",
-                "",
-                "example.com",
-                false,
-            ),
+            classify_response_route(StatusCode::NO_CONTENT, "image/png", "", "example.com"),
             ResponseRoute::BufferedUnmodified,
         );
     }
@@ -2793,13 +2794,7 @@ mod tests {
     #[test]
     fn route_excludes_205_from_pass_through() {
         assert_eq!(
-            classify_response_route(
-                StatusCode::RESET_CONTENT,
-                "image/png",
-                "",
-                "example.com",
-                false,
-            ),
+            classify_response_route(StatusCode::RESET_CONTENT, "image/png", "", "example.com"),
             ResponseRoute::BufferedUnmodified,
         );
     }
@@ -2811,8 +2806,7 @@ mod tests {
                 StatusCode::NO_CONTENT,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::BufferedUnmodified,
             "204 + HTML must not route to Stream",
@@ -2822,8 +2816,7 @@ mod tests {
                 StatusCode::NO_CONTENT,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                true,
+                "example.com"
             ),
             ResponseRoute::BufferedUnmodified,
             "204 + HTML + post-processors must not route to Stream",
@@ -2837,8 +2830,7 @@ mod tests {
                 StatusCode::RESET_CONTENT,
                 "application/json",
                 "",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::BufferedUnmodified,
             "205 + JSON must not route to Stream",
@@ -2852,8 +2844,7 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::Stream,
         );
@@ -2862,8 +2853,7 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "application/json",
                 "gzip",
-                "example.com",
-                false,
+                "example.com"
             ),
             ResponseRoute::Stream,
         );
@@ -2876,8 +2866,7 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "text/html; charset=utf-8",
                 "gzip",
-                "example.com",
-                true,
+                "example.com"
             ),
             ResponseRoute::Stream,
         );
@@ -2886,7 +2875,7 @@ mod tests {
     #[test]
     fn route_passes_through_non_processable_even_with_empty_request_host() {
         assert_eq!(
-            classify_response_route(StatusCode::OK, "image/png", "", "", false,),
+            classify_response_route(StatusCode::OK, "image/png", "", ""),
             ResponseRoute::PassThrough,
         );
     }
@@ -2894,7 +2883,7 @@ mod tests {
     #[test]
     fn route_buffers_processable_content_with_empty_request_host() {
         assert_eq!(
-            classify_response_route(StatusCode::OK, "text/html", "gzip", "", false,),
+            classify_response_route(StatusCode::OK, "text/html", "gzip", ""),
             ResponseRoute::BufferedUnmodified,
         );
     }
@@ -3186,8 +3175,6 @@ mod tests {
     async fn publisher_request_sends_configured_host_header_override() {
         let mut settings = create_test_settings();
         settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
-        let registry =
-            IntegrationRegistry::new(&settings).expect("should create integration registry");
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response(200, b"origin response".to_vec());
         let services = build_services_with_http_client(
@@ -3200,7 +3187,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let _ = run_publisher_proxy(&settings, &registry, &services, req).await;
+        let _ = run_publisher_proxy(&settings, &services, req).await;
 
         let recorded_headers = stub.recorded_request_headers();
         let outbound_headers = recorded_headers
@@ -3465,7 +3452,6 @@ mod tests {
                 "text/html; charset=utf-8",
                 "",
                 "proxy.example.com",
-                registry.has_html_post_processors(),
             ),
             ResponseRoute::Stream,
             "HTML with post-processors must route to Stream"

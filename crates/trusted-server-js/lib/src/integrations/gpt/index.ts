@@ -259,8 +259,9 @@ export function installGptShim(): boolean {
 function injectAdmIntoSlot(divId: string, adm: string): void {
   try {
     // divId may be the container div (used by GPT slot) or the inner div.
-    // Search both so we can find the GAM iframe wherever it was rendered.
-    const slotEl = document.getElementById(divId);
+    // Resolve it the same way the rest of adInit does (exact then prefix) so
+    // a config div_id prefix with a render-time suffix still finds the element.
+    const slotEl = findSlotElementByDivId(divId);
     if (!slotEl) return;
 
     // Extract the first iframe src from the adm (e.g. mocktioneer creative
@@ -679,6 +680,7 @@ export function installSpaAuctionHook(): void {
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
+    const previousPath = currentPath;
     currentPath = path;
     inflight?.abort();
     const controller = new AbortController();
@@ -694,7 +696,14 @@ export function installSpaAuctionHook(): void {
         headers: { 'X-TSJS-Page-Bids': '1' },
         signal: controller.signal,
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        // A transient page-bids failure must not strand this route: roll the
+        // committed path back so a later navigation here retries instead of
+        // being skipped by the no-op guard at the top. Only roll back when no
+        // newer navigation has already advanced currentPath.
+        if (inflight === controller) currentPath = previousPath;
+        return;
+      }
       const data = (await res.json()) as PageBidsResponse;
       if (inflight !== controller) return;
       // Defer applying bids until the new route's ad containers exist, so a
@@ -716,6 +725,7 @@ export function installSpaAuctionHook(): void {
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
+      if (inflight === controller) currentPath = previousPath;
       log.warn('SPA auction hook: fetch failed', err);
     }
   }
