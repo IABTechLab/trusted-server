@@ -412,17 +412,19 @@ impl IntegrationAttributeRewriter for LockrIntegration {
         &self,
         _attr_name: &str,
         attr_value: &str,
-        ctx: &IntegrationAttributeContext<'_>,
+        _ctx: &IntegrationAttributeContext<'_>,
     ) -> AttributeRewriteAction {
         if !self.config.rewrite_sdk {
             return AttributeRewriteAction::Keep;
         }
 
         if self.is_lockr_sdk_url(attr_value) {
-            let replacement = format!(
-                "{}://{}/integrations/lockr/sdk",
-                ctx.request_scheme, ctx.request_host
-            );
+            // Root-relative so the browser resolves it against the page host.
+            // Note: a page-level `<base href>` participates in this resolution,
+            // so on pages that set an external base URL these resolve against
+            // that base rather than the address-bar origin — an accepted
+            // tradeoff, matching GTM/Didomi/Testlight which are also relative.
+            let replacement = "/integrations/lockr/sdk".to_string();
             log::debug!("Rewriting Lockr SDK URL to {}", replacement);
             AttributeRewriteAction::Replace(replacement)
         } else {
@@ -532,10 +534,8 @@ mod tests {
 
         assert_eq!(
             result,
-            AttributeRewriteAction::Replace(
-                "https://edge.example.com/integrations/lockr/sdk".to_string()
-            ),
-            "should rewrite Lockr SDK URL to first-party proxy"
+            AttributeRewriteAction::Replace("/integrations/lockr/sdk".to_string()),
+            "should rewrite Lockr SDK URL to root-relative first-party proxy"
         );
     }
 
