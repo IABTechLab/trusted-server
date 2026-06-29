@@ -45,6 +45,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 toml = { workspace = true }
 trusted-server-js = { path = "../trusted-server-js" }
+trusted-server-kitchen-sink = { workspace = true }
 trusted-server-openrtb = { path = "../trusted-server-openrtb" }
 url = { workspace = true }
 urlencoding = { workspace = true }

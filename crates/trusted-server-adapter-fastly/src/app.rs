@@ -32,8 +32,8 @@
 //! | GET | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/sign` | [`handle_first_party_proxy_sign`] |
 //! | POST | `/first-party/proxy-rebuild` | [`handle_first_party_proxy_rebuild`] |
-//! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, or publisher fallback |
-//! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy or publisher fallback |
+//! | GET | `/` and `/{*rest}` | tsjs (if `/static/tsjs=` prefix), integration proxy, kitchen-sink, or publisher fallback |
+//! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | `/` and `/{*rest}` | integration proxy, kitchen-sink, or publisher fallback |
 //! | POST, HEAD, OPTIONS, PUT, PATCH, DELETE | named paths above | publisher fallback (legacy parity for non-primary methods) |
 //!
 //! > **Note:** Methods not in the list above (e.g. `TRACE`, `CONNECT`, WebDAV verbs) return a
@@ -106,6 +106,7 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
+use trusted_server_core::kitchen_sink::{handle_kitchen_sink_request, is_kitchen_sink_path};
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
@@ -267,6 +268,19 @@ fn publisher_fallback_methods() -> [Method; 7] {
 
 fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
     *method == Method::GET && path.starts_with("/static/tsjs=")
+}
+
+fn generate_navigation_ec_if_needed(settings: &Settings, ec: &mut EcRequestState, req: &Request) {
+    // Only for document navigations by recognised browsers; subresource
+    // requests may lack consent signals such as Sec-GPC.
+    if ec.is_real_browser && is_navigation_request(req) {
+        if let Err(err) = ec
+            .ec_context
+            .generate_if_needed(settings, ec.kv_graph.as_ref())
+        {
+            log::warn!("EC generation failed for publisher-like navigation: {err:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +709,9 @@ async fn dispatch_fallback(
                     message: format!("Unknown integration route: {path}"),
                 }))
             })
+    } else if is_kitchen_sink_path(&path) {
+        generate_navigation_ec_if_needed(&state.settings, &mut ec, &req);
+        handle_kitchen_sink_request(&state.settings, &state.registry, services, &req)
     } else {
         // Asset-route fallback (GET/HEAD), mirroring the legacy catch-all arm:
         // matched asset paths proxy to the configured asset origin instead of the
@@ -708,17 +725,7 @@ async fn dispatch_fallback(
             return dispatch_asset_fallback(state, services, req, asset_route, &effects).await;
         }
 
-        // Generate an EC ID if needed — mirrors the legacy catch-all arm.
-        // Only for document navigations by recognised browsers; subresource
-        // requests may lack consent signals such as Sec-GPC.
-        if ec.is_real_browser && is_navigation_request(&req) {
-            if let Err(err) = ec
-                .ec_context
-                .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
-            {
-                log::warn!("EC generation failed for publisher proxy: {err:?}");
-            }
-        }
+        generate_navigation_ec_if_needed(&state.settings, &mut ec, &req);
 
         // Publisher pages read consent data, so the consent KV store must be
         // available — fail closed with 503 when it is configured but cannot
@@ -1128,7 +1135,7 @@ mod tests {
     use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
 
     use edgezero_core::body::Body;
-    use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::http::{header, request_builder, HeaderValue, Method, StatusCode};
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1144,7 +1151,7 @@ mod tests {
         RequestFilterEffects, RequestFilterInput,
     };
     use trusted_server_core::platform::ClientInfo;
-    use trusted_server_core::settings::Settings;
+    use trusted_server_core::settings::{ProxyAssetRoute, Settings};
 
     fn settings_with_missing_consent_store() -> Settings {
         Settings::from_toml(
@@ -1247,6 +1254,25 @@ mod tests {
         TrustedServerApp::routes_for_state(&state)
     }
 
+    fn kitchen_sink_router(enabled: bool) -> RouterService {
+        let mut settings = test_settings();
+        settings.debug.kitchen_sink_enabled = enabled;
+        let state = build_state_from_settings(settings).expect("should build kitchen sink state");
+        TrustedServerApp::routes_for_state(&state)
+    }
+
+    fn kitchen_sink_router_with_asset_route() -> RouterService {
+        let mut settings = test_settings();
+        settings.debug.kitchen_sink_enabled = true;
+        settings
+            .proxy
+            .asset_routes
+            .push(ProxyAssetRoute::new("/_ts/", "https://assets.example.com"));
+        let state = build_state_from_settings(settings)
+            .expect("should build kitchen sink state with asset route");
+        TrustedServerApp::routes_for_state(&state)
+    }
+
     /// Builds a router whose `AppState` uses a registry containing the given
     /// request filters (and no routes), so dispatch-level request-filter
     /// behavior can be exercised without a real integration.
@@ -1336,6 +1362,64 @@ mod tests {
                 response_headers: Vec::new(),
             }))
         }
+    }
+
+    #[test]
+    fn kitchen_sink_disabled_returns_not_found_without_publisher_fallback() {
+        let router = kitchen_sink_router(false);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/kitchen-sink/")))
+            .expect("router oneshot should produce a response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "disabled kitchen sink should be owned by Trusted Server and not fall through"
+        );
+    }
+
+    #[test]
+    fn kitchen_sink_enabled_serves_processed_index() {
+        let router = kitchen_sink_router(true);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/kitchen-sink/")))
+            .expect("router oneshot should produce a response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-trusted-server-kitchen-sink"),
+            Some(&HeaderValue::from_static("processed")),
+            "router should dispatch to the kitchen-sink handler"
+        );
+    }
+
+    #[test]
+    fn kitchen_sink_redirects_bare_prefix() {
+        let router = kitchen_sink_router(true);
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/kitchen-sink")))
+            .expect("router oneshot should produce a response");
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&HeaderValue::from_static("/_ts/kitchen-sink/"))
+        );
+    }
+
+    #[test]
+    fn kitchen_sink_precedes_broad_asset_route() {
+        let router = kitchen_sink_router_with_asset_route();
+
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/kitchen-sink/")))
+            .expect("router oneshot should produce a response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-trusted-server-kitchen-sink"),
+            Some(&HeaderValue::from_static("processed")),
+            "kitchen sink should dispatch before broad /_ts/ asset routes"
+        );
     }
 
     #[test]

@@ -266,6 +266,15 @@ fn default_script_patterns() -> Vec<String> {
         .collect()
 }
 
+fn openrtb_auction_url(server_url: &str) -> String {
+    let trimmed = server_url.trim_end_matches('/');
+    if trimmed.ends_with("/openrtb2/auction") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/openrtb2/auction")
+    }
+}
+
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
     engine: Arc<BidParamOverrideEngine>,
@@ -1524,9 +1533,10 @@ impl AuctionProvider for PrebidAuctionProvider {
         }
 
         // Create HTTP request
+        let auction_url = openrtb_auction_url(&self.config.server_url);
         let mut pbs_req = http::Request::builder()
             .method(http::Method::POST)
-            .uri(format!("{}/openrtb2/auction", self.config.server_url))
+            .uri(auction_url)
             .body(EdgeBody::empty())
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to build Prebid request".to_string(),
@@ -1874,6 +1884,33 @@ mod tests {
             stub.recorded_backend_names().len(),
             1,
             "should launch one upstream request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn openrtb_auction_url_appends_path_for_origin_url() {
+        assert_eq!(
+            openrtb_auction_url("https://prebid.example"),
+            "https://prebid.example/openrtb2/auction",
+            "should append the OpenRTB auction path when server_url is an origin"
+        );
+    }
+
+    #[test]
+    fn openrtb_auction_url_preserves_full_auction_endpoint() {
+        assert_eq!(
+            openrtb_auction_url("https://prebid.example/openrtb2/auction"),
+            "https://prebid.example/openrtb2/auction",
+            "should not duplicate the OpenRTB auction path"
+        );
+    }
+
+    #[test]
+    fn openrtb_auction_url_trims_trailing_slashes() {
+        assert_eq!(
+            openrtb_auction_url("https://prebid.example/openrtb2/auction/"),
+            "https://prebid.example/openrtb2/auction",
+            "should normalize trailing slashes before checking the path"
         );
     }
 

@@ -1,0 +1,13 @@
+[package]
+name = "trusted-server-kitchen-sink"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }

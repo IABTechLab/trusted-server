@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Identity · Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Minimal identity fixture for Trusted Server.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+  <script defer src="assets/diagnostics.js"></script>
+</head>
+<body data-page="identity">
+  <header class="site-header">
+    <a class="brand" href="./">Trusted Server Kitchen Sink</a>
+    <nav class="nav" aria-label="Primary">
+      <a href="./" data-nav="home">Home</a>
+      <a href="auction.html" data-nav="auction">Auction</a>
+      <a href="prebid.html" data-nav="prebid">Prebid</a>
+      <a href="identity.html" data-nav="identity">Identity</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Identity</h1>
+      <p>Inspect Trusted Server cookies and tester-cookie behavior.</p>
+    </section>
+
+    <section class="card">
+      <div class="actions">
+        <button id="refresh-diagnostics">Refresh</button>
+        <button id="set-tester-cookie" class="secondary">Set tester cookie</button>
+        <span id="identity-status" class="status-line">Idle</span>
+      </div>
+      <dl id="identity-summary" class="summary-list"></dl>
+    </section>
+
+    <section class="card">
+      <h2>Cookies</h2>
+      <pre id="identity-cookies-json">Not inspected yet.</pre>
+    </section>
+  </main>
+</body>
+</html>

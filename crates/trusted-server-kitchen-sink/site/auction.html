@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auction · Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Minimal /auction fixture for Trusted Server.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+  <script defer src="assets/auction.js"></script>
+</head>
+<body data-page="auction">
+  <header class="site-header">
+    <a class="brand" href="./">Trusted Server Kitchen Sink</a>
+    <nav class="nav" aria-label="Primary">
+      <a href="./" data-nav="home">Home</a>
+      <a href="auction.html" data-nav="auction">Auction</a>
+      <a href="prebid.html" data-nav="prebid">Prebid</a>
+      <a href="identity.html" data-nav="identity">Identity</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Auction</h1>
+      <p>Send one banner request with selected bidders to <code>/auction</code>.</p>
+    </section>
+
+    <section class="card">
+      <h2>Bidders</h2>
+      <div id="bidder-controls" class="checkbox-list" aria-label="Bidders"></div>
+      <div class="actions">
+        <button id="run-auction">Run auction</button>
+        <button id="clear-auction" class="secondary">Clear</button>
+        <span id="auction-status" class="status-line">Idle</span>
+      </div>
+    </section>
+
+    <section class="ad-slot" data-ad-slot="header-banner" data-width="728" data-height="90" aria-label="Ad slot">
+      <div class="ad-slot__head">
+        <strong>header-banner</strong>
+        <span class="ad-slot__meta">728×90</span>
+      </div>
+      <div class="ad-slot__mount"><div class="ad-placeholder">No creative rendered</div></div>
+    </section>
+
+    <section class="card-grid card-grid--wide">
+      <article class="card">
+        <h2>Request</h2>
+        <pre id="auction-request-json">Not run yet.</pre>
+      </article>
+      <article class="card">
+        <h2>Response</h2>
+        <pre id="auction-response-json">Not run yet.</pre>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

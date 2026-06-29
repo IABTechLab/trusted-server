@@ -51,6 +51,7 @@ pub(crate) mod host_rewrite;
 pub mod html_processor;
 pub mod http_util;
 pub mod integrations;
+pub mod kitchen_sink;
 pub mod models;
 pub mod openrtb;
 pub mod platform;

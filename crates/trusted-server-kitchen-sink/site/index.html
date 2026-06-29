@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trusted Server Kitchen Sink</title>
+  <meta name="description" content="Embedded Trusted Server fixture pages.">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="home">
+  <header class="site-header">
+    <a class="brand" href="./">Trusted Server Kitchen Sink</a>
+    <nav class="nav" aria-label="Primary">
+      <a href="./" data-nav="home">Home</a>
+      <a href="auction.html" data-nav="auction">Auction</a>
+      <a href="prebid.html" data-nav="prebid">Prebid</a>
+      <a href="identity.html" data-nav="identity">Identity</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1>Minimal embedded publisher fixture.</h1>
+      <p>These pages are served from <code>/_ts/kitchen-sink/</code> and run through Trusted Server HTML processing.</p>
+    </section>
+
+    <section class="card-grid" aria-label="Fixture pages">
+      <a class="card card-link" href="auction.html">
+        <h2>Auction</h2>
+        <p>POST one fixed ad unit to <code>/auction</code>.</p>
+      </a>
+      <a class="card card-link" href="prebid.html">
+        <h2>Prebid</h2>
+        <p>Publisher Prebid placeholder and TSJS injection check.</p>
+      </a>
+      <a class="card card-link" href="identity.html">
+        <h2>Identity</h2>
+        <p>Cookie summary and tester-cookie probe.</p>
+      </a>
+    </section>
+  </main>
+</body>
+</html>
