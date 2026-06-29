@@ -25,6 +25,7 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+serde_json = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../trusted-server-js" }
 worker = { version = "0.8", default-features = false, features = ["http"], optional = true }

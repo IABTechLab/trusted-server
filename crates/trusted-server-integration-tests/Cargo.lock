@@ -4269,6 +4269,7 @@ dependencies = [
  "futures",
  "js-sys",
  "log",
+ "serde_json",
  "trusted-server-core",
  "trusted-server-js",
  "worker",

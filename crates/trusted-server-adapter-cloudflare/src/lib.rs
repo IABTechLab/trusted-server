@@ -18,6 +18,10 @@ use worker::{Context, Env, Request, Response, Result, event};
 #[cfg(target_arch = "wasm32")]
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
+        app::set_cloudflare_config_json(config.to_string());
+    }
+
     match edgezero_adapter_cloudflare::run_app::<app::TrustedServerApp>(req, env, ctx).await {
         Ok(resp) => Ok(resp),
         Err(e) => {

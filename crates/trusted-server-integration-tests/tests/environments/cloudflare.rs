@@ -1,5 +1,6 @@
+use crate::common::config::cloudflare_config_json;
 use crate::common::runtime::{
-    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
+    RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
 use error_stack::ResultExt as _;
 use std::io::{BufRead as _, BufReader};
@@ -22,6 +23,31 @@ pub struct CloudflareWorkers;
 
 /// Fallback port when dynamic allocation fails.
 const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
+const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
+const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
+
+fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
+    let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
+    let template = std::fs::read_to_string(&template_path)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to read Cloudflare CI wrangler config at {}",
+            template_path.display()
+        ))?;
+    let config_json = cloudflare_config_json(origin_port())?;
+    let generated = template.replace(
+        "TRUSTED_SERVER_CONFIG = \"{}\"",
+        &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
+    );
+    let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
+    std::fs::write(&output_path, generated)
+        .change_context(TestError::RuntimeSpawn)
+        .attach(format!(
+            "failed to write generated Cloudflare CI wrangler config at {}",
+            output_path.display()
+        ))?;
+    Ok(GENERATED_CI_CONFIG.to_string())
+}
 
 impl RuntimeEnvironment for CloudflareWorkers {
     fn id(&self) -> &'static str {
@@ -31,9 +57,9 @@ impl RuntimeEnvironment for CloudflareWorkers {
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = if std::env::var("CI").is_ok() {
-            "wrangler.ci.toml"
+            write_generated_ci_config(&wrangler_dir)?
         } else {
-            "wrangler.toml"
+            "wrangler.toml".to_string()
         };
 
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
@@ -45,7 +71,7 @@ impl RuntimeEnvironment for CloudflareWorkers {
                 .args([
                     "dev",
                     "--config",
-                    config,
+                    config.as_str(),
                     "--port",
                     &port.to_string(),
                     "--ip",
@@ -70,7 +96,7 @@ impl RuntimeEnvironment for CloudflareWorkers {
             .args([
                 "dev",
                 "--config",
-                config,
+                config.as_str(),
                 "--port",
                 &port.to_string(),
                 "--ip",

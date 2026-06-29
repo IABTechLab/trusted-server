@@ -3977,6 +3977,7 @@ dependencies = [
  "futures",
  "js-sys",
  "log",
+ "serde_json",
  "tokio",
  "trusted-server-core",
  "trusted-server-js",
