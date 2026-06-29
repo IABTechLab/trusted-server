@@ -2,6 +2,7 @@
 /bin
 /pkg
 /target
+**/target/
 
 # Node.js dependencies and build output (any crate, e.g. crates/trusted-server-js)
 **/node_modules/
@@ -13,7 +14,6 @@
 
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
-/crates/trusted-server-integration-tests/target
 
 # env
 .env*

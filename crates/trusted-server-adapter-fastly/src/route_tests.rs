@@ -1025,6 +1025,52 @@ fn routes_use_request_local_consent() {
 }
 
 #[test]
+fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+    // Regression for the credential-leak finding on the legacy route_request
+    // path: the production basic-auth regex `^/_ts/admin` does not match
+    // `/admin/keys/*`, so those aliases are not auth-gated. They must be denied
+    // locally with 404 rather than fall through to the publisher fallback, which
+    // forwards the request — including the `Authorization` header and key body —
+    // to the origin, leaking admin credentials. A 404 (not a 5xx proxy error)
+    // proves the local deny arm ran instead of the publisher fallback.
+    let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry = test_partner_registry(&settings);
+
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in [Method::POST, Method::GET] {
+            let alias_req = if method == Method::POST {
+                Request::post(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .with_body("{\"key_id\":\"leak-me\"}")
+            } else {
+                Request::get(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            };
+            let services = test_runtime_services(&alias_req);
+            let resp = futures::executor::block_on(route_request(
+                &settings,
+                &orchestrator,
+                &integration_registry,
+                &partner_registry,
+                &services,
+                compat::from_fastly_request(alias_req),
+                DeviceSignals::derive("", None, None),
+            ))
+            .expect("should route legacy admin alias request");
+
+            assert_eq!(
+                resp.outcome.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
+    }
+}
+
+#[test]
 fn set_tester_route_is_disabled_by_default() {
     let settings = create_test_settings();
     let (orchestrator, integration_registry) = build_route_stack(&settings);

@@ -92,6 +92,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     response
 }
 
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the Axum dev server.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Shared handler executor
 // ---------------------------------------------------------------------------
@@ -176,6 +193,9 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
+    /// reach the publisher fallback (which would leak admin credentials).
+    LegacyAdminDenied,
     Auction,
     FirstPartyProxy,
     FirstPartyClick,
@@ -189,7 +209,17 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 9] {
+const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
+
+fn named_routes() -> [NamedRoute; 11] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -201,15 +231,34 @@ fn named_routes() -> [NamedRoute; 9] {
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::VerifySignature,
         },
+        // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+        // and the production basic-auth handler regex (`^/_ts/admin`), so they
+        // are auth-gated under a production-shaped config.
         NamedRoute {
-            path: "/admin/keys/rotate",
+            path: "/_ts/admin/keys/rotate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
         },
         NamedRoute {
-            path: "/admin/keys/deactivate",
+            path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with
+        // a 404, matching the Fastly and Cloudflare adapters: the production
+        // basic-auth handler regex `^/_ts/admin` does not match them, and letting
+        // any publisher-fallback method fall through would forward the caller's
+        // `Authorization` header and key-management payload to the origin,
+        // leaking admin credentials.
+        NamedRoute {
+            path: "/admin/keys/rotate",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::LegacyAdminDenied,
+        },
+        NamedRoute {
+            path: "/admin/keys/deactivate",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::LegacyAdminDenied,
         },
         NamedRoute {
             path: "/auction",
@@ -272,6 +321,7 @@ fn named_route_handler(
                         );
                         Ok(resp)
                     }
+                    NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
                     NamedRouteHandler::Auction => {
                         let ec_context = EcContext::default();
                         handle_auction(

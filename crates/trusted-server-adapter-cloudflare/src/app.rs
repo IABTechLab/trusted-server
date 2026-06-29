@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -22,7 +22,8 @@ use trusted_server_core::publisher::{
     PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
-    handle_trusted_server_discovery, handle_verify_signature,
+    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
+    handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::get_settings;
@@ -48,15 +49,16 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_with_settings(get_settings()?)
+    let settings = get_settings()?;
+    build_state_with_settings(settings)
 }
 
-/// Build the application state from already-loaded [`Settings`].
+/// Build the application state from explicit settings.
 ///
 /// # Errors
 ///
-/// Returns an error when the auction orchestrator or the integration registry
-/// fail to initialise.
+/// Returns an error when the auction orchestrator or the integration
+/// registry fail to initialise.
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -109,27 +111,6 @@ where
     }
 }
 
-/// Fixed `501 Not Implemented` response for admin key-management routes.
-///
-/// Cloudflare's config and secret stores reject writes (the platform stores
-/// surface `PlatformError` on `put`/`delete`), so wiring `/admin/keys/*` to the
-/// real `handle_rotate_key`/`handle_deactivate_key` handlers would fail on the
-/// first store write and surface an opaque 500. Returning a fixed 501 makes the
-/// "not supported on this runtime" contract explicit, matching the Axum adapter.
-fn admin_not_supported_response() -> Response {
-    let body = edgezero_core::body::Body::from(
-        "Admin key management is not supported on the Cloudflare Workers runtime.\n\
-         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
-    );
-    let mut resp = Response::new(body);
-    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp
-}
-
 // ---------------------------------------------------------------------------
 // Publisher response helper
 // ---------------------------------------------------------------------------
@@ -162,6 +143,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the Cloudflare adapter.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -244,9 +242,9 @@ impl Hooks for TrustedServerApp {
 impl TrustedServerApp {
     /// Build the full application router from explicit settings.
     ///
-    /// Testing seam: integration tests drive the router with known-good
-    /// settings instead of the baked `get_settings()` result, whose embedded
-    /// placeholder secrets fail validation by design.
+    /// Testing seam: cross-adapter parity tests use this to drive the router
+    /// with known-good settings instead of the baked `get_settings()` result,
+    /// whose embedded placeholder secrets fail validation by design.
     ///
     /// # Errors
     ///
@@ -260,136 +258,164 @@ impl TrustedServerApp {
     }
 }
 
-/// Assemble the router and middleware chain from an already-built [`AppState`].
 fn build_router(state: &Arc<AppState>) -> RouterService {
-    let state = Arc::clone(state);
-    // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
-    async fn dispatch(state: Arc<AppState>, ctx: RequestContext) -> Result<Response, EdgeError> {
-        let services = build_per_request_services(&ctx);
-        let req = ctx.into_request();
-        let path = req.uri().path().to_owned();
-        let method = req.method().clone();
-        // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
-        let allow_tsjs = method == Method::GET;
+    {
+        let state = Arc::clone(state);
 
-        let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
-            handle_tsjs_dynamic(&req, &state.registry)
-        } else if state.registry.has_route(&method, &path) {
-            let mut ec_context = EcContext::default();
-            state
-                .registry
-                .handle_proxy(ProxyDispatchInput {
-                    method: &method,
-                    path: &path,
-                    settings: &state.settings,
-                    kv: None,
-                    ec_context: &mut ec_context,
-                    services: &services,
-                    req,
-                })
-                .await
-                .unwrap_or_else(|| {
-                    Err(Report::new(TrustedServerError::BadRequest {
-                        message: format!("Unknown integration route: {path}"),
-                    }))
-                })
-        } else {
-            handle_publisher_request(&state.settings, &state.registry, &services, req)
-                .await
-                .and_then(|pr| {
-                    resolve_publisher_response(pr, &method, &state.settings, &state.registry)
-                })
+        // Shared fallback dispatch: routes to tsjs (GET only), integration proxy, or publisher.
+        async fn dispatch(
+            state: Arc<AppState>,
+            ctx: RequestContext,
+        ) -> Result<Response, EdgeError> {
+            let services = build_per_request_services(&ctx);
+            let req = ctx.into_request();
+            let path = req.uri().path().to_owned();
+            let method = req.method().clone();
+            // tsjs assets are served for GET only, matching the Axum/Fastly adapters.
+            let allow_tsjs = method == Method::GET;
+
+            let result = if allow_tsjs && path.starts_with("/static/tsjs=") {
+                handle_tsjs_dynamic(&req, &state.registry)
+            } else if state.registry.has_route(&method, &path) {
+                let mut ec_context = EcContext::default();
+                state
+                    .registry
+                    .handle_proxy(ProxyDispatchInput {
+                        method: &method,
+                        path: &path,
+                        settings: &state.settings,
+                        kv: None,
+                        ec_context: &mut ec_context,
+                        services: &services,
+                        req,
+                    })
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(Report::new(TrustedServerError::BadRequest {
+                            message: format!("Unknown integration route: {path}"),
+                        }))
+                    })
+            } else {
+                handle_publisher_request(&state.settings, &state.registry, &services, req)
+                    .await
+                    .and_then(|pr| {
+                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
+                    })
+            };
+
+            Ok(result.unwrap_or_else(|e| http_error(&e)))
+        }
+
+        let fallback = {
+            let s = Arc::clone(&state);
+            move |ctx: RequestContext| {
+                let s = Arc::clone(&s);
+                dispatch(s, ctx)
+            }
         };
 
-        Ok(result.unwrap_or_else(|e| http_error(&e)))
-    }
+        let mut router = RouterService::builder()
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
+            .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
+            .get(
+                "/.well-known/trusted-server.json",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_trusted_server_discovery(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/verify-signature",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_verify_signature(&s.settings, &services, req)
+                }),
+            )
+            // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
+            // and the production basic-auth handler regex (`^/_ts/admin`), so they
+            // are auth-gated under a production-shaped config.
+            //
+            // The legacy non-`/_ts` aliases (`/admin/keys/*`) are registered
+            // below to a local 404 for every publisher-fallback method: the
+            // production handler regex `^/_ts/admin` does not match them, and
+            // letting them fall through would forward the caller's
+            // `Authorization` header and key-management payload to the origin,
+            // leaking admin credentials.
+            .post(
+                "/_ts/admin/keys/rotate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_rotate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/_ts/admin/keys/deactivate",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_deactivate_key(&s.settings, &services, req)
+                }),
+            )
+            .post(
+                "/auction",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    let ec_context = EcContext::default();
+                    handle_auction(
+                        &s.settings,
+                        &s.orchestrator,
+                        None,
+                        None,
+                        &ec_context,
+                        &services,
+                        req,
+                    )
+                    .await
+                }),
+            )
+            .get(
+                "/first-party/proxy",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy(&s.settings, &services, req).await
+                }),
+            )
+            .get(
+                "/first-party/click",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_click(&s.settings, &services, req).await
+                }),
+            )
+            .get(
+                "/first-party/sign",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_sign(&s.settings, &services, req).await
+                }),
+            )
+            .post(
+                "/first-party/sign",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_sign(&s.settings, &services, req).await
+                }),
+            )
+            .post(
+                "/first-party/proxy-rebuild",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    handle_first_party_proxy_rebuild(&s.settings, &services, req).await
+                }),
+            );
 
-    let fallback = {
-        let s = Arc::clone(&state);
-        move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            dispatch(s, ctx)
+        let legacy_admin_deny =
+            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                Ok(legacy_admin_alias_denied())
+            });
+        for method in publisher_fallback_methods() {
+            router = router.route(
+                "/admin/keys/rotate",
+                method.clone(),
+                legacy_admin_deny.clone(),
+            );
+            router = router.route("/admin/keys/deactivate", method, legacy_admin_deny.clone());
         }
-    };
 
-    let mut router = RouterService::builder()
-        .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)))
-        .middleware(AuthMiddleware::new(Arc::clone(&state.settings)))
-        .get(
-            "/.well-known/trusted-server.json",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_trusted_server_discovery(&s.settings, &services, req)
-            }),
-        )
-        .post(
-            "/verify-signature",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_verify_signature(&s.settings, &services, req)
-            }),
-        )
-        .post(
-            "/admin/keys/rotate",
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(admin_not_supported_response())
-            }),
-        )
-        .post(
-            "/admin/keys/deactivate",
-            make_handler(Arc::clone(&state), |_s, _services, _req| async move {
-                Ok(admin_not_supported_response())
-            }),
-        )
-        .post(
-            "/auction",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                let ec_context = EcContext::default();
-                handle_auction(
-                    &s.settings,
-                    &s.orchestrator,
-                    None,
-                    None,
-                    &ec_context,
-                    &services,
-                    req,
-                )
-                .await
-            }),
-        )
-        .get(
-            "/first-party/proxy",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_first_party_proxy(&s.settings, &services, req).await
-            }),
-        )
-        .get(
-            "/first-party/click",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_first_party_click(&s.settings, &services, req).await
-            }),
-        )
-        .get(
-            "/first-party/sign",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_first_party_proxy_sign(&s.settings, &services, req).await
-            }),
-        )
-        .post(
-            "/first-party/sign",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_first_party_proxy_sign(&s.settings, &services, req).await
-            }),
-        )
-        .post(
-            "/first-party/proxy-rebuild",
-            make_handler(Arc::clone(&state), |s, services, req| async move {
-                handle_first_party_proxy_rebuild(&s.settings, &services, req).await
-            }),
-        );
+        for method in publisher_fallback_methods() {
+            router = router.route("/", method.clone(), fallback.clone());
+            router = router.route("/{*rest}", method, fallback.clone());
+        }
 
-    for method in publisher_fallback_methods() {
-        router = router.route("/", method.clone(), fallback.clone());
-        router = router.route("/{*rest}", method, fallback.clone());
+        router.build()
     }
-
-    router.build()
 }

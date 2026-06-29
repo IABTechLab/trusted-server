@@ -84,3 +84,7 @@ temp-env = { workspace = true }
 [[bench]]
 name = "consent_decode"
 harness = false
+
+[[bench]]
+name = "html_processor_bench"
+harness = false

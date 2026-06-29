@@ -18,17 +18,17 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
 
-# worker-build must match the worker crate's 0.7 API surface pinned in Cargo.toml.
-# A globally installed worker-build 0.8.x rejects worker 0.7 with
-# "Unsupported version worker@0.7.x, expected at least worker@0.8.4", so check the
-# installed major.minor and (re)install ^0.7 when it is absent or mismatched
-# rather than only when it is missing.
-worker_build_version=""
-if command -v worker-build >/dev/null 2>&1; then
-    worker_build_version="$(worker-build --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+# worker-build 0.8+ requires worker >= 0.8.4, but this crate and the pinned
+# edgezero adapter use worker 0.7. Install a matching 0.7-series worker-build
+# into a crate-local root so a newer globally-installed worker-build (used by
+# other projects) is neither required nor disturbed. The version guard also
+# re-pins if the local copy is somehow on a non-0.7 series.
+WORKER_BUILD_ROOT="$SCRIPT_DIR/.worker-build"
+WORKER_BUILD_BIN="$WORKER_BUILD_ROOT/bin/worker-build"
+if ! "$WORKER_BUILD_BIN" --version 2>/dev/null | grep -qE '0\.7\.'; then
+    # --force so a stale non-0.7 binary already in the root is overwritten;
+    # without it `cargo install` refuses to replace the existing binary and the
+    # guard can never self-heal an incompatible local worker-build.
+    cargo install -q --force --version '^0.7' --root "$WORKER_BUILD_ROOT" worker-build
 fi
-case "$worker_build_version" in
-    0.7.*) ;;
-    *) cargo install -q --version '^0.7' --force worker-build ;;
-esac
-worker-build --release
+"$WORKER_BUILD_BIN" --release

@@ -858,15 +858,28 @@ async fn route_request(
 
         // Admin endpoints
         // Keep in sync with Settings::ADMIN_ENDPOINTS in crates/trusted-server-core/src/settings.rs
-        (Method::POST, "/admin/keys/rotate") | (Method::POST, "/_ts/admin/keys/rotate") => {
+        //
+        // Only the canonical `/_ts/admin/keys/*` paths execute key operations.
+        // The legacy `/admin/keys/*` aliases are denied locally below so stale
+        // clients do not leak admin Basic credentials or key-management payloads
+        // to the publisher origin via the organic fallback.
+        (
+            Method::GET
+            | Method::POST
+            | Method::HEAD
+            | Method::OPTIONS
+            | Method::PUT
+            | Method::PATCH
+            | Method::DELETE,
+            "/admin/keys/rotate" | "/admin/keys/deactivate",
+        ) => (Ok(legacy_admin_alias_denied()), false),
+        (Method::POST, "/_ts/admin/keys/rotate") => {
             (handle_rotate_key(settings, runtime_services, req), false)
         }
-        (Method::POST, "/admin/keys/deactivate") | (Method::POST, "/_ts/admin/keys/deactivate") => {
-            (
-                handle_deactivate_key(settings, runtime_services, req),
-                false,
-            )
-        }
+        (Method::POST, "/_ts/admin/keys/deactivate") => (
+            handle_deactivate_key(settings, runtime_services, req),
+            false,
+        ),
         (Method::GET, "/_ts/api/v1/identify") => {
             let outcome = require_identity_graph(settings)
                 .and_then(|kv| handle_identify(settings, &kv, partner_registry, &req, &ec_context));
@@ -1090,6 +1103,23 @@ fn run_pull_sync_after_send(
 /// This means operators can intentionally override any managed header.
 fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
     apply_finalize_headers(settings, geo_info, response);
+}
+
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they must fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the client's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> HttpResponse {
+    let mut response = HttpResponse::new(EdgeBody::from("Not found\n"));
+    *response.status_mut() = edgezero_core::http::StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn http_error_response(report: &Report<TrustedServerError>) -> HttpResponse {

@@ -3558,6 +3558,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
@@ -3576,6 +3577,7 @@ name = "trusted-server-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "edgezero-adapter-cloudflare",
  "edgezero-core",
