@@ -79,10 +79,17 @@
         # Routes requests through the EdgeZero entry point. `is_edgezero_enabled`
         # in the Fastly adapter reads this key at runtime; `"true"` (or `"1"`)
         # enables EdgeZero, anything else falls back to the legacy path.
+        #
+        # `edgezero_rollout_pct` must also be set: the cutover-canary gating in
+        # `main()` only routes to `edgezero_main` when both the flag is enabled
+        # and the rollout percentage covers the request. `read_rollout_pct`
+        # fails safe to 0 (legacy) when the key is absent, so `"100"` (full
+        # cutover) is required to force every request onto the EdgeZero path.
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"
         [local_server.config_stores.trusted_server_config.contents]
             edgezero_enabled = "true"
+            edgezero_rollout_pct = "100"
 
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
