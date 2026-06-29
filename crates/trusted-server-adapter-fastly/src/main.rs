@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use edgezero_adapter_fastly::{into_core_request, FastlyConfigStore};
@@ -74,6 +75,7 @@ use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
 const EDGEZERO_ENABLED_KEY: &str = "edgezero_enabled";
+const EDGEZERO_ROLLOUT_PCT_KEY: &str = "edgezero_rollout_pct";
 
 /// Result of routing a request, distinguishing buffered from streaming publisher responses.
 ///
@@ -117,6 +119,50 @@ fn parse_edgezero_flag(value: &str) -> bool {
     v.eq_ignore_ascii_case("true") || v == "1"
 }
 
+/// Parses a rollout percentage string into a value in `0..=100`.
+///
+/// Accepts only integer strings in the range 0–100 (inclusive) after whitespace
+/// trimming. Returns `None` for anything else: non-integer, out-of-range,
+/// empty string.
+fn parse_rollout_pct(value: &str) -> Option<u8> {
+    let n: u16 = value.trim().parse().ok()?;
+    if n > 100 {
+        return None;
+    }
+    Some(n as u8)
+}
+
+/// Maps an arbitrary string to a deterministic bucket in `0..100`.
+///
+/// Uses FNV-1a (32-bit variant) to produce a uniform-enough distribution for
+/// canary traffic splitting without pulling in any hash crates. The same input
+/// always produces the same output across Rust versions because the algorithm
+/// is defined here, not delegated to `DefaultHasher`.
+fn fnv1a_bucket(key: &str) -> u8 {
+    const FNV_OFFSET: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % 100) as u8
+}
+
+/// Returns `true` if the given bucket should be routed to the `EdgeZero` path.
+///
+/// `bucket` must be in `0..100`; `rollout_pct` in `0..=100`.
+/// When `rollout_pct = 0` no bucket ever routes to `EdgeZero` (instant rollback).
+/// When `rollout_pct = 100` every bucket routes to `EdgeZero` (full cutover).
+fn routes_to_edgezero(bucket: u8, rollout_pct: u8) -> bool {
+    debug_assert!(bucket < 100, "should be a value produced by fnv1a_bucket");
+    debug_assert!(
+        rollout_pct <= 100,
+        "should be a value produced by read_rollout_pct"
+    );
+    bucket < rollout_pct
+}
+
 /// Opens the shared Fastly Config Store used by both the `EdgeZero` flag read and
 /// `EdgeZero` dispatch metadata.
 ///
@@ -143,6 +189,101 @@ fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly:
         .get(EDGEZERO_ENABLED_KEY)
         .map_err(|e| fastly::Error::msg(format!("failed to read edgezero_enabled: {e}")))?;
     Ok(value.as_deref().is_some_and(parse_edgezero_flag))
+}
+
+/// Reads `edgezero_rollout_pct` from the config store.
+///
+/// | Config store state              | Return value | Effect                     |
+/// |---------------------------------|--------------|----------------------------|
+/// | Key absent                      | `0`          | All legacy (safe default)  |
+/// | Key present, valid 0–100        | parsed value | Partial or full rollout    |
+/// | Key present, invalid            | `0`          | All legacy (safe default)  |
+/// | Key read error                  | `0`          | All legacy (safe default)  |
+fn read_rollout_pct(config_store: &ConfigStoreHandle) -> u8 {
+    match config_store.get(EDGEZERO_ROLLOUT_PCT_KEY) {
+        Ok(Some(value)) => match parse_rollout_pct(&value) {
+            Some(pct) => pct,
+            None => {
+                log::warn!("invalid edgezero_rollout_pct value, defaulting to 0 (legacy path)");
+                0
+            }
+        },
+        Ok(None) => {
+            // Absent key fails safe to legacy, matching every other failure branch
+            // (unreadable flag, invalid value, read error all resolve to legacy).
+            // Deleting the key can never trigger a full cutover. Fires per-request
+            // when the key is absent and edgezero_enabled=true, so emit at debug to
+            // avoid a per-request log flood at production QPS.
+            log::debug!(
+                "edgezero_rollout_pct key absent, defaulting to 0 (legacy path — fail safe)"
+            );
+            0
+        }
+        Err(e) => {
+            log::warn!("failed to read edgezero_rollout_pct: {e}, defaulting to 0 (legacy path)");
+            0
+        }
+    }
+}
+
+/// Decides whether a request routes to the `EdgeZero` path for the given rollout state.
+///
+/// `rollout_pct` must be in `0..=100` (as produced by [`read_rollout_pct`]).
+///
+/// The degenerate rollout values short-circuit the per-request routing-key
+/// allocation and FNV hash, which together cover most of the canary's lifetime:
+/// `0` always routes to legacy (full rollback) and `100` always routes to
+/// `EdgeZero` (full cutover). Only the partial-rollout path hashes the client IP
+/// (or the empty string when absent) into a `0..100` bucket via [`fnv1a_bucket`]
+/// and compares it against `rollout_pct` with [`routes_to_edgezero`].
+fn should_route_to_edgezero(rollout_pct: u8, client_ip: Option<IpAddr>) -> bool {
+    match rollout_pct {
+        0 => {
+            log::debug!("routing request through legacy path (rollout_pct=0)");
+            false
+        }
+        100 => {
+            log::debug!("routing request through EdgeZero path (rollout_pct=100)");
+            true
+        }
+        pct => {
+            let routing_key = match client_ip {
+                Some(ip) => ip.to_string(),
+                None => {
+                    log::debug!(
+                        "no client IP available, using empty routing key (deterministic bucket 61)"
+                    );
+                    String::new()
+                }
+            };
+            let bucket = fnv1a_bucket(&routing_key);
+            let routed = routes_to_edgezero(bucket, pct);
+            log::debug!(
+                "routing request through {} path (bucket={bucket}, rollout_pct={pct})",
+                if routed { "EdgeZero" } else { "legacy" }
+            );
+            routed
+        }
+    }
+}
+
+/// Selects the Fastly entry point for an already-opened config store and request.
+///
+/// `edgezero_enabled=false` always routes to legacy and must not require callers
+/// to read `edgezero_rollout_pct`. When enabled, `rollout_pct` is interpreted
+/// exactly as [`read_rollout_pct`] returns it: `0` is full rollback, `100` is full
+/// cutover, and intermediate values are sticky by client-IP bucket.
+fn select_edgezero_entrypoint(
+    edgezero_enabled: bool,
+    rollout_pct: u8,
+    client_ip: Option<IpAddr>,
+) -> bool {
+    if !edgezero_enabled {
+        log::debug!("routing request through legacy path (edgezero_enabled=false)");
+        return false;
+    }
+
+    should_route_to_edgezero(rollout_pct, client_ip)
 }
 
 fn health_response(req: &FastlyRequest) -> Option<FastlyResponse> {
@@ -192,14 +333,20 @@ fn main() {
         }
     };
 
-    if is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
+    let edgezero_enabled = is_edgezero_enabled(&edgezero_config_store).unwrap_or_else(|e| {
         log::warn!("failed to read edgezero_enabled flag, falling back to legacy path: {e}");
         false
-    }) {
-        log::debug!("routing request through EdgeZero path");
+    });
+    let route_to_edgezero = if edgezero_enabled {
+        let rollout_pct = read_rollout_pct(&edgezero_config_store);
+        select_edgezero_entrypoint(edgezero_enabled, rollout_pct, req.get_client_ip_addr())
+    } else {
+        select_edgezero_entrypoint(edgezero_enabled, 0, req.get_client_ip_addr())
+    };
+
+    if route_to_edgezero {
         edgezero_main(req, edgezero_config_store);
     } else {
-        log::debug!("routing request through legacy path");
         legacy_main(req);
     }
 }
@@ -1260,6 +1407,326 @@ mod tests {
             "should not parse whitespace-only"
         );
         assert!(!parse_edgezero_flag("yes"), "should not parse 'yes'");
+    }
+
+    // ---------------------------------------------------------------------------
+    // parse_rollout_pct
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn parses_valid_rollout_percentages() {
+        assert_eq!(parse_rollout_pct("0"), Some(0), "should parse '0'");
+        assert_eq!(parse_rollout_pct("1"), Some(1), "should parse '1'");
+        assert_eq!(parse_rollout_pct("50"), Some(50), "should parse '50'");
+        assert_eq!(parse_rollout_pct("100"), Some(100), "should parse '100'");
+        assert_eq!(
+            parse_rollout_pct("  50  "),
+            Some(50),
+            "should trim whitespace"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rollout_percentages() {
+        assert_eq!(
+            parse_rollout_pct("101"),
+            None,
+            "should reject values above 100"
+        );
+        assert_eq!(parse_rollout_pct(""), None, "should reject empty string");
+        assert_eq!(parse_rollout_pct("abc"), None, "should reject non-integer");
+        assert_eq!(
+            parse_rollout_pct("-1"),
+            None,
+            "should reject negative value"
+        );
+        assert_eq!(
+            parse_rollout_pct("1.5"),
+            None,
+            "should reject decimal value"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // fnv1a_bucket
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn bucket_is_in_range_0_to_99() {
+        for key in &["1.2.3.4", "255.255.255.255", "::1", "", "unknown"] {
+            let b = fnv1a_bucket(key);
+            assert!(b < 100, "bucket must be 0..100 for key {key:?}, got {b}");
+        }
+    }
+
+    #[test]
+    fn bucket_is_deterministic() {
+        let key = "192.168.1.1";
+        assert_eq!(
+            fnv1a_bucket(key),
+            fnv1a_bucket(key),
+            "same key must produce the same bucket"
+        );
+    }
+
+    #[test]
+    fn bucket_matches_known_fnv1a_vector() {
+        // FNV-1a 32-bit: XOR-then-multiply. Verified against reference implementation.
+        assert_eq!(
+            fnv1a_bucket("1.2.3.4"),
+            85,
+            "should match pinned FNV-1a vector"
+        );
+        assert_eq!(
+            fnv1a_bucket(""),
+            61,
+            "should match pinned FNV-1a vector for empty key"
+        );
+    }
+
+    #[test]
+    fn bucket_distributes_across_range() {
+        // Smoke-test that fnv1a_bucket produces a spread of values (not a constant).
+        // 256 distinct IP-like keys must produce at least 50 unique buckets.
+        let buckets: std::collections::HashSet<u8> = (0u16..=255)
+            .map(|i| fnv1a_bucket(&format!("10.0.0.{i}")))
+            .collect();
+        assert!(
+            buckets.len() > 50,
+            "fnv1a_bucket should distribute across buckets; got only {} unique values in 256 keys",
+            buckets.len()
+        );
+    }
+
+    #[test]
+    fn empty_key_bucket_is_valid() {
+        let b = fnv1a_bucket("");
+        assert!(
+            b < 100,
+            "empty key must still produce a valid bucket, got {b}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // routes_to_edgezero
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn rollout_zero_routes_all_to_legacy() {
+        for bucket in 0u8..100 {
+            assert!(
+                !routes_to_edgezero(bucket, 0),
+                "pct=0 should route all to legacy, bucket={bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_hundred_routes_all_to_edgezero() {
+        for bucket in 0u8..100 {
+            assert!(
+                routes_to_edgezero(bucket, 100),
+                "pct=100 should route all to EdgeZero, bucket={bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_fifty_routes_exactly_half_of_bucket_space() {
+        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 50)).count();
+        assert_eq!(
+            edgezero_count, 50,
+            "pct=50 should route exactly 50 out of 100 buckets to EdgeZero"
+        );
+    }
+
+    #[test]
+    fn rollout_one_routes_exactly_one_bucket() {
+        let edgezero_count = (0u8..100).filter(|&b| routes_to_edgezero(b, 1)).count();
+        assert_eq!(
+            edgezero_count, 1,
+            "pct=1 should route exactly 1 out of 100 buckets to EdgeZero"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // should_route_to_edgezero — entry-point dispatch matrix
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn should_route_zero_pct_always_routes_to_legacy() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            !should_route_to_edgezero(0, Some(ip)),
+            "rollout_pct=0 should route to legacy regardless of client IP"
+        );
+        assert!(
+            !should_route_to_edgezero(0, None),
+            "rollout_pct=0 should route to legacy when client IP is absent"
+        );
+    }
+
+    #[test]
+    fn should_route_hundred_pct_always_routes_to_edgezero() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            should_route_to_edgezero(100, Some(ip)),
+            "rollout_pct=100 should route to EdgeZero regardless of client IP"
+        );
+        assert!(
+            should_route_to_edgezero(100, None),
+            "rollout_pct=100 should route to EdgeZero when client IP is absent"
+        );
+    }
+
+    #[test]
+    fn should_route_partial_buckets_client_ip() {
+        // "1.2.3.4" hashes to bucket 85 (pinned FNV-1a vector).
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+        assert!(
+            should_route_to_edgezero(86, Some(ip)),
+            "bucket 85 < 86 should route to EdgeZero (hit)"
+        );
+        assert!(
+            !should_route_to_edgezero(85, Some(ip)),
+            "bucket 85 is not < 85 should route to legacy (miss)"
+        );
+    }
+
+    #[test]
+    fn should_route_partial_absent_ip_uses_empty_key_bucket() {
+        // The empty routing key hashes to bucket 61 (pinned FNV-1a vector).
+        assert!(
+            should_route_to_edgezero(62, None),
+            "bucket 61 < 62 should route to EdgeZero (hit)"
+        );
+        assert!(
+            !should_route_to_edgezero(61, None),
+            "bucket 61 is not < 61 should route to legacy (miss)"
+        );
+    }
+
+    #[test]
+    fn entrypoint_selector_requires_enabled_flag_before_rollout() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            !select_edgezero_entrypoint(false, 100, Some(ip)),
+            "disabled EdgeZero flag should force the legacy entry point even at 100% rollout"
+        );
+    }
+
+    #[test]
+    fn entrypoint_selector_routes_rollout_edges() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            !select_edgezero_entrypoint(true, 0, Some(ip)),
+            "enabled EdgeZero with 0% rollout should route to legacy"
+        );
+        assert!(
+            select_edgezero_entrypoint(true, 100, Some(ip)),
+            "enabled EdgeZero with 100% rollout should route to EdgeZero"
+        );
+    }
+
+    #[test]
+    fn entrypoint_selector_routes_partial_hit_and_miss() {
+        let ip: IpAddr = "1.2.3.4".parse().expect("should parse IP");
+
+        assert!(
+            select_edgezero_entrypoint(true, 86, Some(ip)),
+            "enabled EdgeZero should route a bucket hit to EdgeZero"
+        );
+        assert!(
+            !select_edgezero_entrypoint(true, 85, Some(ip)),
+            "enabled EdgeZero should route a bucket miss to legacy"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // read_rollout_pct — safety-critical config-store branches
+    // ---------------------------------------------------------------------------
+
+    // Canned config-store response so the safety-critical defaults can be pinned
+    // without a live Fastly Config Store. `ConfigStoreError` is not `Clone`, so the
+    // error case is built fresh inside `get` rather than stored.
+    enum StubResponse {
+        Value(String),
+        Absent,
+        Unavailable,
+    }
+
+    struct TestConfigStore {
+        response: StubResponse,
+    }
+
+    impl edgezero_core::config_store::ConfigStore for TestConfigStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<String>, edgezero_core::config_store::ConfigStoreError> {
+            assert_eq!(
+                key, EDGEZERO_ROLLOUT_PCT_KEY,
+                "stub should pin the rollout config key"
+            );
+            match &self.response {
+                StubResponse::Value(v) => Ok(Some(v.clone())),
+                StubResponse::Absent => Ok(None),
+                StubResponse::Unavailable => Err(
+                    edgezero_core::config_store::ConfigStoreError::unavailable("boom"),
+                ),
+            }
+        }
+    }
+
+    fn rollout_handle(response: StubResponse) -> ConfigStoreHandle {
+        ConfigStoreHandle::new(Arc::new(TestConfigStore { response }))
+    }
+
+    #[test]
+    fn read_rollout_pct_absent_defaults_to_legacy() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Absent)),
+            0,
+            "absent key should fail safe to 0 (legacy), like every other failure branch"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_valid_value_is_parsed() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("42".into()))),
+            42,
+            "a valid in-range value should be returned verbatim"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_invalid_value_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("abc".into()))),
+            0,
+            "an unparseable value should fail safe to 0 (legacy)"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_out_of_range_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Value("101".into()))),
+            0,
+            "an out-of-range value should fail safe to 0 (legacy)"
+        );
+    }
+
+    #[test]
+    fn read_rollout_pct_read_error_defaults_to_zero() {
+        assert_eq!(
+            read_rollout_pct(&rollout_handle(StubResponse::Unavailable)),
+            0,
+            "a config-store read error should fail safe to 0 (legacy)"
+        );
     }
 
     #[test]

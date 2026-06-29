@@ -1510,10 +1510,11 @@ specifics. Summary of what each PR adds:
   config flag (PR 14). Traffic splitting at percentage levels is controlled
   via **edge dictionary percentage check**: a config store key
   `edgezero_rollout_pct` (integer 0-100) compared against a hash of the
-  request ID. This runs inside the entry point, after flag check but before
-  path dispatch. The ops team owns the config store value and advances it
-  through the canary stages. Rollback = set `edgezero_rollout_pct` to `0`
-  (immediate, no deploy required)
+  client IP. This runs inside the entry point, after flag check but before
+  path dispatch, and keeps routing sticky per client IP at each rollout
+  percentage. The ops team owns the config store value and advances it through
+  the canary stages. Rollback = set `edgezero_rollout_pct` to `0` (immediate,
+  no deploy required)
 - Run canary traffic progression with hold points:
   - **1%** — hold **30 min**, verify no error-rate increase
   - **10%** — hold **2 hours**, verify p95 latency within **±10%** of baseline
