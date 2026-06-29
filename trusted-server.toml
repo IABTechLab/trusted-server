@@ -339,6 +339,22 @@ timeout_ms = 2000  # override per-publisher via TRUSTED_SERVER__AUCTION__TIMEOUT
 # Keys not in this list are silently dropped. An empty list blocks all keys.
 allowed_context_keys = ["permutive_segments"]
 
+# Direct Tinybird Events API telemetry. Disabled by default; configure the
+# regional API host and Fastly Secret Store key names in private deployment
+# configuration. Tokens must be datasource-scoped APPEND tokens, not Grafana
+# read tokens or admin tokens.
+[tinybird]
+enabled = false
+api_host = ""
+secret_store = "ts_secrets"
+auction_dataset = "auction_events_raw"
+auction_token_secret = "tinybird_auction_append_token"
+access_enabled = false
+access_dataset = "access_logs_raw"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.0
+max_body_bytes = 1048576
+
 [integrations.aps]
 enabled = false
 pub_id = "example-publisher"

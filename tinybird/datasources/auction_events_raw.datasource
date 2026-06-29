@@ -1,0 +1,43 @@
+DESCRIPTION >
+  Raw best-effort Trusted Server auction telemetry rows from Fastly Compute.
+
+SCHEMA >
+  `event_ts` DateTime64(3),
+  `event_kind` LowCardinality(String),
+  `auction_id` UUID,
+  `auction_source` LowCardinality(String),
+  `publisher_domain` String,
+  `page_path` String,
+  `country` LowCardinality(String),
+  `region` Nullable(String),
+  `is_mobile` UInt8,
+  `is_known_browser` UInt8,
+  `gdpr_applies` UInt8,
+  `consent_present` UInt8,
+  `terminal_status` LowCardinality(Nullable(String)),
+  `terminal_reason` LowCardinality(Nullable(String)),
+  `slot_count` Nullable(UInt16),
+  `total_time_ms` Nullable(UInt32),
+  `winning_bid_count` Nullable(UInt16),
+  `provider` LowCardinality(Nullable(String)),
+  `provider_role` LowCardinality(Nullable(String)),
+  `status` LowCardinality(Nullable(String)),
+  `provider_response_time_ms` Nullable(UInt32),
+  `provider_bid_count` Nullable(UInt16),
+  `slot_id` Nullable(String),
+  `slot_w` Nullable(UInt16),
+  `slot_h` Nullable(UInt16),
+  `media_type` LowCardinality(Nullable(String)),
+  `seat` LowCardinality(Nullable(String)),
+  `price_cpm` Nullable(Float64),
+  `currency` LowCardinality(Nullable(String)),
+  `is_win` Nullable(UInt8),
+  `ad_domain` Nullable(String),
+  `ad_id` Nullable(String),
+  `event_date` Date DEFAULT toDate(event_ts)
+
+ENGINE "MergeTree"
+ENGINE_SORTING_KEY "event_date, publisher_domain, event_kind, auction_source, auction_id"
+TTL "event_date + INTERVAL 30 DAY"
+
+TOKEN ts_ingest APPEND

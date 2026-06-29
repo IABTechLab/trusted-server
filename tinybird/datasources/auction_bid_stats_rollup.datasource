@@ -1,0 +1,17 @@
+DESCRIPTION >
+  Per-minute bid and canonical win rollup target.
+
+SCHEMA >
+  `minute` DateTime,
+  `publisher_domain` String,
+  `auction_source` LowCardinality(String),
+  `provider` LowCardinality(String),
+  `seat` LowCardinality(String),
+  `bids` AggregateFunction(count),
+  `wins` AggregateFunction(sum, UInt64),
+  `winning_cpm_quantiles` AggregateFunction(quantiles(0.5, 0.95, 0.99), Float64),
+  `event_date` Date DEFAULT toDate(minute)
+
+ENGINE "AggregatingMergeTree"
+ENGINE_SORTING_KEY "event_date, minute, publisher_domain, auction_source, provider, seat"
+TTL "event_date + INTERVAL 13 MONTH"

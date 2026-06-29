@@ -1688,6 +1688,170 @@ impl Proxy {
     }
 }
 
+/// Direct Tinybird Events API telemetry configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TinybirdSettings {
+    /// Master enablement for auction telemetry ingestion.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Regional Tinybird API host, without scheme or path.
+    #[serde(default)]
+    pub api_host: String,
+    /// Fastly Secret Store name containing Tinybird append tokens.
+    #[serde(default = "default_tinybird_secret_store")]
+    pub secret_store: String,
+    /// Auction Events API datasource name.
+    #[serde(default = "default_tinybird_auction_dataset")]
+    pub auction_dataset: String,
+    /// Secret key containing the auction datasource APPEND token.
+    #[serde(default = "default_tinybird_auction_token_secret")]
+    pub auction_token_secret: String,
+    /// Enable optional access-log telemetry.
+    #[serde(default)]
+    pub access_enabled: bool,
+    /// Access-log Events API datasource name.
+    #[serde(default = "default_tinybird_access_dataset")]
+    pub access_dataset: String,
+    /// Secret key containing the access-log datasource APPEND token.
+    #[serde(default = "default_tinybird_access_token_secret")]
+    pub access_token_secret: String,
+    /// Fraction of requests to emit for optional access telemetry.
+    #[serde(default)]
+    pub access_sample_rate: f64,
+    /// Defensive maximum NDJSON body size for one Events API request.
+    #[serde(default = "default_tinybird_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+fn default_tinybird_secret_store() -> String {
+    "ts_secrets".to_owned()
+}
+
+fn default_tinybird_auction_dataset() -> String {
+    "auction_events_raw".to_owned()
+}
+
+fn default_tinybird_auction_token_secret() -> String {
+    "tinybird_auction_append_token".to_owned()
+}
+
+fn default_tinybird_access_dataset() -> String {
+    "access_logs_raw".to_owned()
+}
+
+fn default_tinybird_access_token_secret() -> String {
+    "tinybird_access_append_token".to_owned()
+}
+
+fn default_tinybird_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
+impl Default for TinybirdSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_host: String::new(),
+            secret_store: default_tinybird_secret_store(),
+            auction_dataset: default_tinybird_auction_dataset(),
+            auction_token_secret: default_tinybird_auction_token_secret(),
+            access_enabled: false,
+            access_dataset: default_tinybird_access_dataset(),
+            access_token_secret: default_tinybird_access_token_secret(),
+            access_sample_rate: 0.0,
+            max_body_bytes: default_tinybird_max_body_bytes(),
+        }
+    }
+}
+
+impl TinybirdSettings {
+    fn normalize(&mut self) {
+        self.api_host = self.api_host.trim().to_ascii_lowercase();
+        self.secret_store = self.secret_store.trim().to_owned();
+        self.auction_dataset = self.auction_dataset.trim().to_owned();
+        self.auction_token_secret = self.auction_token_secret.trim().to_owned();
+        self.access_dataset = self.access_dataset.trim().to_owned();
+        self.access_token_secret = self.access_token_secret.trim().to_owned();
+    }
+
+    fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
+        self.normalize();
+        if !(0.0..=1.0).contains(&self.access_sample_rate) {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_sample_rate must be between 0.0 and 1.0".to_owned(),
+            }));
+        }
+        if self.max_body_bytes < 1024 {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
+            }));
+        }
+        if !self.enabled && !self.access_enabled {
+            return Ok(());
+        }
+        validate_tinybird_api_host(&self.api_host)?;
+        if self.secret_store.is_empty() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message:
+                    "tinybird.secret_store must not be empty when Tinybird telemetry is enabled"
+                        .to_owned(),
+            }));
+        }
+        if self.enabled {
+            validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
+            validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
+        }
+        if self.access_enabled {
+            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
+            validate_tinybird_secret(&self.access_token_secret, "tinybird.access_token_secret")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_tinybird_api_host(host: &str) -> Result<(), Report<TrustedServerError>> {
+    if host.is_empty()
+        || host.contains('/')
+        || host.contains(':')
+        || host.chars().any(char::is_control)
+        || host.starts_with("http://")
+        || host.starts_with("https://")
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "tinybird.api_host must be a regional host without scheme, port, or path"
+                .to_owned(),
+        }));
+    }
+    validate_host_header_override_value(host).map_err(|reason| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("tinybird.api_host {reason}"),
+        })
+    })
+}
+
+fn validate_tinybird_dataset(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty datasource identifier"),
+        }));
+    }
+    Ok(())
+}
+
+fn validate_tinybird_secret(value: &str, setting: &str) -> Result<(), Report<TrustedServerError>> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!("{setting} must be a non-empty Secret Store key"),
+        }));
+    }
+    Ok(())
+}
+
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DebugConfig {
@@ -1753,6 +1917,8 @@ pub struct Settings {
     pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
     #[serde(default)]
     pub image_optimizer: ImageOptimizerSettings,
+    #[serde(default)]
+    pub tinybird: TinybirdSettings,
     #[serde(default)]
     pub debug: DebugConfig,
 }
@@ -1846,6 +2012,7 @@ impl Settings {
     pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
+        self.tinybird.prepare_runtime()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
@@ -2378,6 +2545,49 @@ mod tests {
     };
     use crate::redacted::Redacted;
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+
+    #[test]
+    fn tinybird_defaults_to_disabled_placeholders() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without tinybird block");
+
+        assert!(
+            !settings.tinybird.enabled,
+            "Tinybird should default disabled"
+        );
+        assert_eq!(settings.tinybird.secret_store, "ts_secrets");
+        assert_eq!(settings.tinybird.auction_dataset, "auction_events_raw");
+        assert_eq!(
+            settings.tinybird.auction_token_secret,
+            "tinybird_auction_append_token"
+        );
+    }
+
+    #[test]
+    fn tinybird_enabled_requires_host_dataset_and_token() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"https://api.example.com/path\"\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml).expect_err("should reject invalid api host");
+        assert!(
+            format!("{err:?}").contains("tinybird.api_host"),
+            "should report tinybird.api_host validation error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn tinybird_accepts_region_host_without_scheme() {
+        let toml = format!(
+            "{}\n[tinybird]\nenabled = true\napi_host = \"api.us-east.aws.tinybird.co\"\n",
+            crate_test_settings_str()
+        );
+
+        let settings = Settings::from_toml(&toml).expect("should accept Tinybird region host");
+        assert!(settings.tinybird.enabled);
+        assert_eq!(settings.tinybird.api_host, "api.us-east.aws.tinybird.co");
+    }
 
     #[test]
     fn test_settings_from_valid_toml() {

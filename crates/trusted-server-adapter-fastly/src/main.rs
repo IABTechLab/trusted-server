@@ -64,10 +64,15 @@ mod middleware;
 mod platform;
 #[cfg(test)]
 mod route_tests;
+mod tinybird;
 
 use crate::app::{build_state, TrustedServerApp};
 use crate::error::to_error_response;
-use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
+use crate::middleware::{
+    apply_finalize_headers, cache_control_is_uncacheable, resolve_geo_for_response,
+    FASTLY_SURROGATE_CONTROL_HEADER, HEADER_X_TS_FINALIZED, PRIVATE_CACHE_CONTROL_VALUE,
+    SURROGATE_CONTROL_HEADER,
+};
 use crate::platform::{build_runtime_services, client_info_from_request, FastlyPlatformGeo};
 
 const TRUSTED_SERVER_CONFIG_STORE: &str = "trusted_server_config";
@@ -493,8 +498,11 @@ fn legacy_main(mut req: FastlyRequest) {
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
     let device_signals = derive_device_signals(&req);
-    let runtime_services =
-        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
+    let runtime_services = build_runtime_services(
+        &req,
+        std::sync::Arc::clone(&state.default_kv_store),
+        std::sync::Arc::clone(&state.auction_telemetry_sink),
+    );
     let http_req = compat::from_fastly_request(req);
 
     let route_result = futures::executor::block_on(route_request(
@@ -1266,14 +1274,13 @@ fn enforce_set_cookie_cache_privacy(response: &mut FastlyResponse) {
     // keeping a stricter `no-store`/`private` directive — Surrogate-Control is
     // independent of Cache-Control and would otherwise let a shared cache store
     // and replay one visitor's Set-Cookie.
-    response.remove_header("surrogate-control");
-    response.remove_header("fastly-surrogate-control");
+    response.remove_header(SURROGATE_CONTROL_HEADER);
+    response.remove_header(FASTLY_SURROGATE_CONTROL_HEADER);
     let already_uncacheable = response
         .get_header_str("cache-control")
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+        .is_some_and(cache_control_is_uncacheable);
     if !already_uncacheable {
-        response.set_header("cache-control", "private, max-age=0");
+        response.set_header("cache-control", PRIVATE_CACHE_CONTROL_VALUE);
     }
 }
 

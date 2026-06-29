@@ -10,6 +10,7 @@ use crate::platform::{PlatformPendingRequest, RuntimeServices};
 
 use super::config::AuctionConfig;
 use super::provider::AuctionProvider;
+use super::telemetry::AbandonedProviderCall;
 use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus};
 
 /// In-flight auction requests dispatched to SSP backends.
@@ -22,11 +23,55 @@ use super::types::{AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStat
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
     backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)>,
+    launch_responses: Vec<AuctionResponse>,
     auction_start: Instant,
     timeout_ms: u32,
     floor_prices: HashMap<String, f64>,
     /// Carried so the mediator call in collect can pass it as the auction request.
     request: AuctionRequest,
+}
+
+/// Outcome of attempting to dispatch split-phase auction provider requests.
+pub enum DispatchAuctionOutcome {
+    /// No provider request was started and no provider failure was observed.
+    NotStarted,
+    /// No provider request could be launched, but launch failures were observed.
+    DispatchFailed {
+        /// Original auction request.
+        request: AuctionRequest,
+        /// Provider launch-failure responses.
+        provider_responses: Vec<AuctionResponse>,
+        /// Elapsed dispatch time.
+        elapsed_ms: u64,
+    },
+    /// One or more provider requests are in flight.
+    Dispatched(DispatchedAuction),
+}
+
+impl DispatchedAuction {
+    /// Consume the dispatch token without collecting provider responses.
+    #[must_use]
+    pub fn abandon(
+        self,
+    ) -> (
+        AuctionRequest,
+        Vec<AuctionResponse>,
+        Vec<AbandonedProviderCall>,
+        u64,
+    ) {
+        let elapsed_ms = self.auction_start.elapsed().as_millis() as u64;
+        let abandoned = self
+            .backend_to_provider
+            .into_values()
+            .map(|(provider_name, start_time, _)| {
+                AbandonedProviderCall::bidder(
+                    provider_name,
+                    Some(u32::try_from(start_time.elapsed().as_millis()).unwrap_or(u32::MAX)),
+                )
+            })
+            .collect();
+        (self.request, self.launch_responses, abandoned, elapsed_ms)
+    }
 }
 
 #[cfg(test)]
@@ -35,6 +80,7 @@ impl DispatchedAuction {
         Self {
             pending_requests: Vec::new(),
             backend_to_provider: HashMap::new(),
+            launch_responses: Vec::new(),
             auction_start: Instant::now(),
             timeout_ms,
             floor_prices: HashMap::new(),
@@ -48,6 +94,7 @@ const PROVIDER_ERROR_MESSAGE_CHARS: usize = 500;
 const ERROR_TYPE_PARSE_RESPONSE: &str = "parse_response";
 const ERROR_TYPE_LAUNCH_FAILED: &str = "launch_failed";
 const ERROR_TYPE_TRANSPORT: &str = "transport";
+const ERROR_TYPE_TIMEOUT: &str = "timeout";
 
 // SECURITY: the returned string is included verbatim (truncated to
 // PROVIDER_ERROR_MESSAGE_CHARS) in the public /auction response via
@@ -91,6 +138,12 @@ fn provider_transport_failed_response(
     AuctionResponse::error(provider_name, response_time_ms)
         .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TRANSPORT))
         .with_metadata("message", serde_json::json!("Provider request failed"))
+}
+
+fn provider_timeout_response(provider_name: &str, response_time_ms: u64) -> AuctionResponse {
+    AuctionResponse::error(provider_name, response_time_ms)
+        .with_metadata("error_type", serde_json::json!(ERROR_TYPE_TIMEOUT))
+        .with_metadata("message", serde_json::json!("Provider request timed out"))
 }
 
 /// Compute the remaining time budget from a deadline.
@@ -597,6 +650,12 @@ impl AuctionOrchestrator {
             }
         }
 
+        for (provider_name, start_time, _) in backend_to_provider.into_values() {
+            let response_time_ms = start_time.elapsed().as_millis() as u64;
+            log::warn!("Provider '{provider_name}' timed out before auction collection completed");
+            responses.push(provider_timeout_response(provider_name, response_time_ms));
+        }
+
         Ok(responses)
     }
 
@@ -726,24 +785,26 @@ impl AuctionOrchestrator {
     /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
     /// while WASM continues to `pending_origin.wait()`.
     ///
-    /// Returns `None` when no providers are configured or all providers are
-    /// disabled / over budget. The caller should fall back to the synchronous
-    /// `run_auction` path.
+    /// Returns [`DispatchAuctionOutcome::NotStarted`] when no providers are configured or
+    /// all providers are disabled / over budget. Returns
+    /// [`DispatchAuctionOutcome::DispatchFailed`] when provider launch attempts
+    /// happened but none could be started.
     #[must_use]
     pub async fn dispatch_auction(
         &self,
         request: &AuctionRequest,
         context: &AuctionContext<'_>,
-    ) -> Option<DispatchedAuction> {
+    ) -> DispatchAuctionOutcome {
         let provider_names = self.config.provider_names();
         if provider_names.is_empty() {
-            return None;
+            return DispatchAuctionOutcome::NotStarted;
         }
 
         let auction_start = Instant::now();
         let mut backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)> =
             HashMap::new();
         let mut pending_requests: Vec<PlatformPendingRequest> = Vec::new();
+        let mut launch_responses: Vec<AuctionResponse> = Vec::new();
 
         for provider_name in provider_names {
             let provider = match self.providers.get(provider_name) {
@@ -815,17 +876,30 @@ impl AuctionOrchestrator {
                     pending_requests.push(pending.with_backend_name(backend_name));
                 }
                 Err(e) => {
+                    let response_time_ms = start_time.elapsed().as_millis() as u64;
                     log::warn!(
                         "Provider '{}' failed to dispatch request: {:?}",
                         provider.provider_name(),
                         e
                     );
+                    launch_responses.push(provider_launch_failed_response(
+                        provider.provider_name(),
+                        response_time_ms,
+                    ));
                 }
             }
         }
 
         if pending_requests.is_empty() {
-            return None;
+            return if launch_responses.is_empty() {
+                DispatchAuctionOutcome::NotStarted
+            } else {
+                DispatchAuctionOutcome::DispatchFailed {
+                    request: request.clone(),
+                    provider_responses: launch_responses,
+                    elapsed_ms: auction_start.elapsed().as_millis() as u64,
+                }
+            };
         }
 
         log::info!(
@@ -834,9 +908,10 @@ impl AuctionOrchestrator {
             context.timeout_ms
         );
 
-        Some(DispatchedAuction {
+        DispatchAuctionOutcome::Dispatched(DispatchedAuction {
             pending_requests,
             backend_to_provider,
+            launch_responses,
             auction_start,
             timeout_ms: context.timeout_ms,
             floor_prices: self.floor_prices_by_slot(request),
@@ -863,6 +938,7 @@ impl AuctionOrchestrator {
         let DispatchedAuction {
             pending_requests,
             mut backend_to_provider,
+            launch_responses,
             auction_start,
             timeout_ms,
             floor_prices,
@@ -876,7 +952,7 @@ impl AuctionOrchestrator {
             remaining_budget_ms(auction_start, timeout_ms),
         );
 
-        let mut responses: Vec<AuctionResponse> = Vec::new();
+        let mut responses: Vec<AuctionResponse> = launch_responses;
         let mut remaining = pending_requests;
 
         while !remaining.is_empty() {
@@ -985,6 +1061,13 @@ impl AuctionOrchestrator {
             // mediator launch below still observes A_deadline via
             // `remaining_budget_ms`.
         }
+
+        for (provider_name, start_time, _) in backend_to_provider.values() {
+            let response_time_ms = start_time.elapsed().as_millis() as u64;
+            log::warn!("Provider '{provider_name}' timed out before dispatched auction collection completed");
+            responses.push(provider_timeout_response(provider_name, response_time_ms));
+        }
+        backend_to_provider.clear();
 
         let (mediator_response, winning_bids) = if let Some(mediator_name) = &self.config.mediator {
             match self.providers.get(mediator_name.as_str()) {
