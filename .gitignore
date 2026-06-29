@@ -12,6 +12,10 @@
 # Auto-generated JS module index
 **/src/generated-modules.ts
 
+# local Spin CLI downloads
+/spin
+/spin.sig
+
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
 

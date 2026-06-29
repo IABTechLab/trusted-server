@@ -2,6 +2,7 @@
 #   trusted-server-adapter-fastly    → wasm32-wasip1         (Fastly Compute)
 #   trusted-server-adapter-axum      → native                (dev server)
 #   trusted-server-adapter-cloudflare → wasm32-unknown-unknown (Cloudflare Workers)
+#   trusted-server-adapter-spin      → wasm32-wasip1         (Fermyon Spin)
 #
 # All adapters are workspace members so `-p` resolves each.
 # default-members = [fastly] — required so Viceroy can locate the binary via `cargo run --bin`.
@@ -9,29 +10,34 @@
 
 [alias]
 # Fastly adapter + shared crates (wasm32-wasip1 via Viceroy)
-# Excludes Axum (native-only) and Cloudflare (wasm32-unknown-unknown, separate job)
-test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
+# Excludes Axum (native-only), Cloudflare (wasm32-unknown-unknown), and Spin (separate wasm32-wasip1 job)
+test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
 # Axum dev server adapter (native)
 test-axum = ["test", "-p", "trusted-server-adapter-axum"]
 # Cloudflare adapter (native host; WASM target checked separately in CI)
 test-cloudflare = ["test", "-p", "trusted-server-adapter-cloudflare"]
 # Cloudflare adapter WASM target check (wasm32-unknown-unknown requires --features cloudflare)
 check-cloudflare = ["check", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
+# Spin adapter (native host tests; WASM target checked separately with --features spin)
+test-spin = ["test", "-p", "trusted-server-adapter-spin"]
+check-spin = ["check", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin"]
 
 # Clippy — target-matched to avoid cross-target compile failures
-clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
+clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
 clippy-axum = ["clippy", "-p", "trusted-server-adapter-axum", "--all-targets", "--all-features", "--", "-D", "warnings"]
 # No --all-features: the `cloudflare` feature has a compile_error! guard on
 # non-wasm32 targets. WASM-feature coverage comes from `cargo check-cloudflare`.
 clippy-cloudflare = ["clippy", "-p", "trusted-server-adapter-cloudflare", "--all-targets", "--", "-D", "warnings"]
+clippy-spin-native = ["clippy", "-p", "trusted-server-adapter-spin", "--all-targets", "--", "-D", "warnings"]
+clippy-spin-wasm = ["clippy", "-p", "trusted-server-adapter-spin", "--target", "wasm32-wasip1", "--features", "spin", "--lib", "--", "-D", "warnings"]
 
 # Build — target-matched, same split as test/clippy
-build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
+build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
 build-axum = ["build", "-p", "trusted-server-adapter-axum"]
 build-cloudflare = ["build", "-p", "trusted-server-adapter-cloudflare", "--target", "wasm32-unknown-unknown", "--features", "cloudflare"]
 
 # Check — fast compile validation, same split
-check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--target", "wasm32-wasip1"]
+check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
 check-axum = ["check", "-p", "trusted-server-adapter-axum"]
 
 [target.'cfg(all(target_arch = "wasm32"))']

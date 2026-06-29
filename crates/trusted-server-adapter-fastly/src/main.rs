@@ -238,12 +238,33 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // metadata here is authoritative. detect_request_scheme in http_util
     // checks this header so scheme-sensitive logic (publisher URL rewriting,
     // etc.) produces https URLs on HTTPS traffic, matching legacy path parity.
-    if req.get_tls_protocol().is_some() || req.get_tls_cipher_openssl_name().is_some() {
+    if req.get_tls_protocol().ok().flatten().is_some()
+        || req.get_tls_cipher_openssl_name().ok().flatten().is_some()
+    {
         req.set_header("fastly-ssl", "1");
     }
 
     // Capture client IP before the request is consumed by dispatch.
     let client_ip = req.get_client_ip_addr();
+
+    // Strip any client-supplied x-ts-tls-* headers before injecting the
+    // trusted values from the Fastly SDK. Without this, a plain-HTTP request
+    // carrying X-TS-TLS-Protocol: TLSv1.3 would sail through and cause
+    // detect_request_scheme to return "https", spoofing cookie Secure and
+    // URL rewriting. Must run after sanitize_fastly_forwarded_headers.
+    req.remove_header("x-ts-tls-protocol");
+    req.remove_header("x-ts-tls-cipher");
+    if let Some(proto) = req.get_tls_protocol().ok().flatten().map(str::to_owned) {
+        req.set_header("x-ts-tls-protocol", proto);
+    }
+    if let Some(cipher) = req
+        .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
+        .map(str::to_owned)
+    {
+        req.set_header("x-ts-tls-cipher", cipher);
+    }
 
     // Capture the full ClientInfo (TLS protocol/cipher, JA4, H2 fingerprint, and
     // server hostname/region) from the original FastlyRequest before conversion.
@@ -625,8 +646,14 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .unwrap_or(FALLBACK_UNAVAILABLE);
     let cipher = req
         .get_tls_cipher_openssl_name()
+        .ok()
+        .flatten()
         .unwrap_or(FALLBACK_UNAVAILABLE);
-    let tls_version = req.get_tls_protocol().unwrap_or(FALLBACK_UNAVAILABLE);
+    let tls_version = req
+        .get_tls_protocol()
+        .ok()
+        .flatten()
+        .unwrap_or(FALLBACK_UNAVAILABLE);
     let ua = req.get_header_str("user-agent").unwrap_or(FALLBACK_NONE);
     let ch_mobile = req
         .get_header_str("sec-ch-ua-mobile")

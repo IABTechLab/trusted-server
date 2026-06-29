@@ -18,17 +18,19 @@ ROOT_ENV="$SCRIPT_DIR/../../.env"
 # of which directory wrangler was invoked from.
 cd "$SCRIPT_DIR"
 
-# worker-build 0.8+ requires worker >= 0.8.4, but this crate and the pinned
-# edgezero adapter use worker 0.7. Install a matching 0.7-series worker-build
-# into a crate-local root so a newer globally-installed worker-build (used by
-# other projects) is neither required nor disturbed. The version guard also
-# re-pins if the local copy is somehow on a non-0.7 series.
-WORKER_BUILD_ROOT="$SCRIPT_DIR/.worker-build"
-WORKER_BUILD_BIN="$WORKER_BUILD_ROOT/bin/worker-build"
-if ! "$WORKER_BUILD_BIN" --version 2>/dev/null | grep -qE '0\.7\.'; then
-    # --force so a stale non-0.7 binary already in the root is overwritten;
-    # without it `cargo install` refuses to replace the existing binary and the
-    # guard can never self-heal an incompatible local worker-build.
-    cargo install -q --force --version '^0.7' --root "$WORKER_BUILD_ROOT" worker-build
+# Pin worker-build to the exact `worker` crate version resolved in Cargo.lock.
+# worker-build is released in lockstep with worker and downloads the wasm-bindgen
+# CLI matching the locked `wasm-bindgen`. A floating `^0.8` install pulled
+# worker-build 0.8.5, which passes `--force-enable-abort-handler` to wasm-bindgen
+# — a flag the CLI matching the pinned wasm-bindgen (0.2.123, via worker 0.8.4)
+# does not understand. Tracking the locked worker version keeps the toolchain in
+# lockstep, and the pin advances automatically when the lockfile bumps.
+WORKER_VERSION="$(
+  grep -A1 '^name = "worker"$' "$SCRIPT_DIR/../../Cargo.lock" |
+    sed -nE 's/^version = "(.*)"/\1/p' | head -1
+)"
+if [ -z "$WORKER_VERSION" ]; then
+  echo "error: could not determine the worker crate version from Cargo.lock" >&2
+  exit 1
 fi
-"$WORKER_BUILD_BIN" --release
+cargo install -q --force --version "=$WORKER_VERSION" worker-build && worker-build --release

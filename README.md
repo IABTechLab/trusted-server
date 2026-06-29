@@ -36,6 +36,9 @@ cargo test-axum
 # Run tests (Cloudflare Workers adapter — native host)
 cargo test-cloudflare
 
+# Run tests (Spin adapter — native host)
+cargo test-spin
+
 # Start local server — Axum (no Fastly CLI or Viceroy required)
 cargo run -p trusted-server-adapter-axum
 
@@ -49,13 +52,19 @@ fastly compute serve
 # Format code
 cargo fmt
 
-# Lint
-cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare
+# Lint — use target-matched aliases (workspace has multiple WASM runtimes;
+# broad --all-features clippy is not a reliable gate across adapters)
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-spin-native
+cargo clippy-spin-wasm
 
 # Run all tests
 cargo test-fastly      # Fastly/WASM (requires Viceroy)
 cargo test-axum        # Axum native adapter
 cargo test-cloudflare  # Cloudflare Workers adapter (native host)
+cargo test-spin        # Spin adapter (native host)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

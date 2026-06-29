@@ -81,7 +81,7 @@ impl AxumDevServer {
             return std::path::PathBuf::from(path);
         }
 
-        // CARGO_MANIFEST_DIR is crates/integration-tests → go up two levels to workspace root
+        // CARGO_MANIFEST_DIR is crates/trusted-server-integration-tests -> go up two levels to workspace root
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug/trusted-server-axum")
     }

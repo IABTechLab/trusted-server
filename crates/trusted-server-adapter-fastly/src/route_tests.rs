@@ -548,8 +548,12 @@ fn test_runtime_services_with_secret_http_client_and_geo(
         .geo(geo)
         .client_info(ClientInfo {
             client_ip: req.get_client_ip_addr(),
-            tls_protocol: req.get_tls_protocol().map(str::to_string),
-            tls_cipher: req.get_tls_cipher_openssl_name().map(str::to_string),
+            tls_protocol: req.get_tls_protocol().ok().flatten().map(str::to_string),
+            tls_cipher: req
+                .get_tls_cipher_openssl_name()
+                .ok()
+                .flatten()
+                .map(str::to_string),
             tls_ja4: req.get_tls_ja4().map(str::to_string),
             h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
             server_hostname: None,
