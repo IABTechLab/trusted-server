@@ -2083,8 +2083,14 @@ mod tests {
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("response body should be valid UTF-8")
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("response body should be valid UTF-8")
     }
 
     struct QueuedHttpResponse {
@@ -2969,7 +2975,7 @@ mod tests {
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes();
+        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
         decoder
@@ -3025,7 +3031,7 @@ mod tests {
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes();
+        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
         let mut decoder = Decompressor::new(&compressed_output[..], 4096);
         let mut decompressed = String::new();
         decoder

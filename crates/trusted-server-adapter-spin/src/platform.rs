@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::{ConfigStoreHandle, KvHandle, KvPage, KvStore};
+use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use http_body_util::BodyExt as _;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
     PlatformError, PlatformGeo, PlatformHttpClient, PlatformKvStore, PlatformSecretStore,
@@ -114,8 +117,7 @@ struct ConfigStoreHandleAdapter(ConfigStoreHandle);
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
         let variable_name = spin_variable_name(key, PlatformError::ConfigStore)?;
-        self.0
-            .get(&variable_name)
+        futures::executor::block_on(self.0.get(&variable_name))
             .map_err(|e| {
                 Report::new(PlatformError::ConfigStore)
                     .attach(format!(
@@ -474,8 +476,9 @@ impl SpinPlatformHttpClient {
         let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
 
-        let mut builder = spin_sdk::http::Request::builder();
-        builder.method(into_spin_method(&method)).uri(uri.clone());
+        let mut builder = spin_sdk::http::Request::builder()
+            .method(into_spin_method(&method))
+            .uri(uri.clone());
 
         for (name, value) in request.request.headers() {
             // WASI HTTP forbids these headers on outbound requests:
@@ -485,7 +488,7 @@ impl SpinPlatformHttpClient {
             }
             match value.to_str() {
                 Ok(value) => {
-                    builder.header(name.as_str(), value);
+                    builder = builder.header(name.as_str(), value);
                 }
                 Err(_) => {
                     log::warn!(
@@ -507,8 +510,12 @@ impl SpinPlatformHttpClient {
                     .attach("streaming request bodies are not supported on Spin outbound HTTP"));
             }
         };
-        builder.body(body_bytes);
-        let spin_request = builder.build();
+        let spin_request = builder
+            .body(spin_sdk::http::FullBody::new(Bytes::from(body_bytes)))
+            .map_err(|error| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("failed to build Spin outbound request: {error}"))
+            })?;
 
         let spin_response: spin_sdk::http::Response =
             spin_sdk::http::send(spin_request).await.map_err(|e| {
@@ -516,12 +523,23 @@ impl SpinPlatformHttpClient {
                     .attach(format!("outbound request to {uri} failed: {e}"))
             })?;
 
-        let status = *spin_response.status();
+        let status = spin_response.status().as_u16();
         let headers: HeaderPairs = spin_response
             .headers()
+            .iter()
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
-        let body = spin_response.into_body();
+        let body = spin_response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| {
+                Report::new(PlatformError::HttpClient).attach(format!(
+                    "failed to read Spin outbound response body: {error}"
+                ))
+            })?
+            .to_bytes()
+            .to_vec();
 
         let (headers, body) = apply_spin_response_policy(&method, status, headers, body)?;
         let mut edge_builder = edgezero_core::http::response_builder().status(status);
@@ -629,18 +647,8 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Method {
-    match *method {
-        edgezero_core::http::Method::GET => spin_sdk::http::Method::Get,
-        edgezero_core::http::Method::POST => spin_sdk::http::Method::Post,
-        edgezero_core::http::Method::PUT => spin_sdk::http::Method::Put,
-        edgezero_core::http::Method::DELETE => spin_sdk::http::Method::Delete,
-        edgezero_core::http::Method::PATCH => spin_sdk::http::Method::Patch,
-        edgezero_core::http::Method::HEAD => spin_sdk::http::Method::Head,
-        edgezero_core::http::Method::OPTIONS => spin_sdk::http::Method::Options,
-        edgezero_core::http::Method::CONNECT => spin_sdk::http::Method::Connect,
-        edgezero_core::http::Method::TRACE => spin_sdk::http::Method::Trace,
-        ref other => spin_sdk::http::Method::Other(other.to_string()),
-    }
+    spin_sdk::http::Method::from_bytes(method.as_str().as_bytes())
+        .expect("should convert valid HTTP method")
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +679,7 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
         key: &str,
     ) -> Result<Vec<u8>, Report<PlatformError>> {
         let variable_name = spin_secret_variable_name(store_name, key)?;
-        match spin_sdk::variables::get(&variable_name) {
+        match futures::executor::block_on(spin_sdk::variables::get(&variable_name)) {
             Ok(value) => Ok(value.into_bytes()),
             Err(error) => Err(Report::new(PlatformError::SecretStore).attach(format!(
                 "secret lookup failed for key `{key}` as Spin variable `{variable_name}`: {error}"
@@ -709,12 +717,12 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
     let config_store: Arc<dyn PlatformConfigStore> = ctx
-        .config_store()
+        .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
     let kv_store: Arc<dyn PlatformKvStore> = ctx
-        .kv_handle()
+        .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
         .unwrap_or_else(|| Arc::new(UnavailableKvStore));
 
@@ -770,7 +778,8 @@ impl PlatformGeo for NullGeo {
 /// Cloudflare adapters receive. Deployments fronting Spin with such a hop must
 /// account for this.
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    edgezero_adapter_spin::SpinRequestContext::get(ctx.request()).and_then(|c| c.client_addr)
+    edgezero_adapter_spin::context::SpinRequestContext::get(ctx.request())
+        .and_then(|c| c.client_addr)
 }
 
 #[cfg(test)]

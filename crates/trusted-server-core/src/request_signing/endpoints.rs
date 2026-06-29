@@ -535,8 +535,14 @@ mod tests {
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("should decode response body")
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("should decode response body")
     }
 
     fn assert_json_content_type(response: &http::Response<EdgeBody>) {

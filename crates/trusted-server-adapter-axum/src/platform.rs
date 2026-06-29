@@ -534,7 +534,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         );
     });
 
-    let client_ip = edgezero_adapter_axum::AxumRequestContext::get(ctx.request())
+    let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
@@ -734,7 +734,11 @@ mod tests {
             "should preserve end-to-end headers"
         );
         assert_eq!(
-            response.into_body().into_bytes().as_ref(),
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .as_ref(),
             b"ok",
             "should preserve decoded response body"
         );

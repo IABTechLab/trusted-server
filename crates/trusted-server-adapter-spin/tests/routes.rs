@@ -97,7 +97,7 @@ async fn health_route_returns_ok() {
         "health probe should return 200"
     );
 
-    let body = resp.into_body().into_bytes();
+    let body = resp.into_body().into_bytes().unwrap_or_default();
     assert_eq!(&body[..], b"ok", "health probe should return the body `ok`");
 }
 
@@ -471,7 +471,7 @@ async fn first_party_sign_get_with_path_only_uri_signs_target() {
         200,
         "GET /first-party/sign must parse its query from the reconstructed absolute URI"
     );
-    let body = String::from_utf8(resp.into_body().into_bytes().to_vec())
+    let body = String::from_utf8(resp.into_body().into_bytes().unwrap_or_default().to_vec())
         .expect("sign response body should be UTF-8");
     assert!(
         body.contains("\"href\""),
@@ -504,8 +504,14 @@ async fn first_party_proxy_round_trip_through_spin_router() {
         200,
         "sign step must succeed before the proxy round-trip"
     );
-    let sign_body = String::from_utf8(sign_resp.into_body().into_bytes().to_vec())
-        .expect("sign response body should be UTF-8");
+    let sign_body = String::from_utf8(
+        sign_resp
+            .into_body()
+            .into_bytes()
+            .unwrap_or_default()
+            .to_vec(),
+    )
+    .expect("sign response body should be UTF-8");
     let href = json_string_field(&sign_body, "href")
         .expect("sign response must include a signed href path");
     assert!(

@@ -5,9 +5,11 @@ use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyCo
 use edgezero_adapter_fastly::request::into_core_request;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
     header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
 };
+use edgezero_core::response::IntoResponse;
 use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{
@@ -473,7 +475,10 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                 core_req.extensions_mut().insert(config_store);
                 core_req.extensions_mut().insert(device_signals);
                 core_req.extensions_mut().insert(client_info);
-                futures::executor::block_on(app.router().oneshot(core_req))
+                match futures::executor::block_on(app.router().oneshot(core_req)) {
+                    Ok(response) => response,
+                    Err(error) => edge_error_response(error),
+                }
             }
             Err(e) => {
                 log::error!("EdgeZero request conversion failed: {e}");
@@ -579,6 +584,20 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     }
 
     send_edgezero_response(response, request_filter_effects.as_ref());
+}
+
+fn edge_error_response(error: EdgeError) -> HttpResponse {
+    log::error!("EdgeZero router returned error: {error:?}");
+    match error.into_response() {
+        Ok(response) => response,
+        Err(error) => {
+            log::error!("failed to convert EdgeZero error into response: {error:?}");
+            edgezero_core::http::response_builder()
+                .status(edgezero_core::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(EdgeBody::from("Internal Server Error"))
+                .expect("should build EdgeZero error response")
+        }
+    }
 }
 
 fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
