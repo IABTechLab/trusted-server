@@ -206,6 +206,7 @@ fn tinybird_backend_spec(api_host: &str) -> PlatformBackendSpec {
         host_header_override: None,
         certificate_check: true,
         first_byte_timeout: TINYBIRD_FIRST_BYTE_TIMEOUT,
+        between_bytes_timeout: TINYBIRD_FIRST_BYTE_TIMEOUT,
     }
 }
 
