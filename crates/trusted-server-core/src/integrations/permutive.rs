@@ -257,11 +257,14 @@ impl PermutiveIntegration {
 
     /// Copy relevant request headers for proxying.
     fn copy_request_headers(&self, from: &HeaderMap<HeaderValue>, to: &mut HeaderMap<HeaderValue>) {
+        // `Authorization` is intentionally NOT forwarded: it carries the
+        // publisher site's own credential (e.g. staging basic-auth), which would
+        // leak to the third-party upstream and can break APIs that reject an
+        // unexpected `Authorization` header.
         let headers_to_copy = [
             header::CONTENT_TYPE,
             header::ACCEPT,
             header::USER_AGENT,
-            header::AUTHORIZATION,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
         ];

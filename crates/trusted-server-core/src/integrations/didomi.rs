@@ -164,6 +164,10 @@ impl DidomiIntegration {
             );
         }
 
+        // `Authorization` is intentionally NOT forwarded: it carries the
+        // publisher site's own credential (e.g. staging basic-auth), which would
+        // leak to the third-party upstream and can break APIs that reject an
+        // unexpected `Authorization` header.
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
@@ -172,7 +176,6 @@ impl DidomiIntegration {
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
-            header::AUTHORIZATION,
         ] {
             if let Some(value) = original_headers.get(&header_name) {
                 proxy_headers.insert(header_name, value.clone());

@@ -248,11 +248,14 @@ impl LockrIntegration {
         from: &HeaderMap<HeaderValue>,
         to: &mut HeaderMap<HeaderValue>,
     ) -> Result<(), Report<TrustedServerError>> {
+        // NOTE: `Authorization` is intentionally NOT forwarded. It carries the
+        // publisher site's own credential (e.g. staging basic-auth), which the
+        // Lockr API rejects with `{"code":400,"message":"Invalid request"}` —
+        // and forwarding it would leak the publisher credential to a third party.
         let headers_to_copy = [
             header::CONTENT_TYPE,
             header::ACCEPT,
             header::USER_AGENT,
-            header::AUTHORIZATION,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
         ];
@@ -598,6 +601,62 @@ mod tests {
             stub.recorded_backend_names().len(),
             1,
             "should route one outbound request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn lockr_proxy_forwards_body_and_strips_authorization() {
+        // Regression guard for two upstream-rejection causes:
+        // 1. The POST body (and content-type) must be forwarded, otherwise the
+        //    Lockr API returns `{"code":400,"message":"Invalid request"}`.
+        // 2. The publisher's `Authorization` header (e.g. site basic-auth) must
+        //    NOT be forwarded — the Lockr API rejects it with the same 400, and
+        //    forwarding it would leak the publisher credential to a third party.
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"success":true,"data":{}}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = LockrIntegration::new(test_config());
+
+        let payload = br#"{"appID":"test-app-id"}"#;
+        let req = http::Request::builder()
+            .method(HttpMethod::POST)
+            .uri("https://publisher.example/integrations/lockr/api/publisher/app/v2/identityLockr/settings")
+            .header(header::CONTENT_TYPE, "application/json;charset=UTF-8")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(EdgeBody::from(payload.to_vec()))
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+        assert_eq!(response.status(), http::StatusCode::OK, "should return OK");
+
+        let bodies = stub.recorded_request_bodies();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "should forward exactly one upstream request"
+        );
+        assert_eq!(
+            bodies[0], payload,
+            "should forward the POST body unchanged to the Lockr API"
+        );
+
+        let headers = stub.recorded_request_headers();
+        assert!(
+            headers[0]
+                .iter()
+                .any(|(name, value)| name == "content-type"
+                    && value == "application/json;charset=UTF-8"),
+            "should forward the content-type header to the Lockr API"
+        );
+        assert!(
+            !headers[0]
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            "should NOT forward the publisher's Authorization header to the Lockr API"
         );
     }
 
