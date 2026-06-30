@@ -37,6 +37,13 @@ pub enum ConfigError {
     /// `--basic-auth-file` could not be read.
     #[display("cannot read --basic-auth-file `{path}`")]
     BasicAuthFile { path: String },
+    /// `--basic-auth`/`--basic-auth-file` was combined with a non-loopback listen.
+    #[display(
+        "refusing to inject --basic-auth on non-loopback --listen {value}: a matched CONNECT is \
+         MITM'd even off loopback, so the upstream credentials would be exposed to any client that \
+         can reach the proxy. Bind a loopback address, or drop --basic-auth."
+    )]
+    BasicAuthNonLoopback { value: String },
     /// An unknown browser name was passed to `--launch`.
     #[display("unknown browser `{value}` (expected chrome|firefox|safari|all)")]
     Browser { value: String },
@@ -260,6 +267,14 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
     };
 
     let basic_auth = resolve_basic_auth(args).map_err(Report::from)?;
+    // Injected Basic auth on a non-loopback bind would hand the developer's
+    // upstream credentials to any client that can reach the proxy (a matched
+    // CONNECT is MITM'd even off loopback). Refuse the combination.
+    if !is_loopback && basic_auth.is_some() {
+        return Err(Report::new(ConfigError::BasicAuthNonLoopback {
+            value: args.listen.clone(),
+        }));
+    }
     let ca_dir = ca_dir(args);
     let resolve = build_resolve(args).map_err(Report::from)?;
 
@@ -424,6 +439,33 @@ mod tests {
         let mut args = base_args();
         args.map = vec!["not-a-map".into()];
         assert!(resolve(&args).is_err(), "malformed --map errors");
+    }
+
+    #[test]
+    fn basic_auth_on_non_loopback_listen_is_rejected() {
+        // Injected Basic auth on a non-loopback bind would expose the upstream
+        // credentials to any reachable network client.
+        let mut args = base_args();
+        args.map = vec!["a.example.com=b.edgecompute.app".into()];
+        args.listen = "0.0.0.0:18080".into();
+        args.allow_non_loopback = true;
+        args.basic_auth = Some("dev:secret".into());
+        let err =
+            resolve(&args).expect_err("non-loopback listen with --basic-auth should be rejected");
+        assert!(
+            matches!(
+                err.current_context(),
+                ConfigError::BasicAuthNonLoopback { .. }
+            ),
+            "should be a BasicAuthNonLoopback error"
+        );
+
+        // The same non-loopback bind without credentials is allowed.
+        args.basic_auth = None;
+        assert!(
+            resolve(&args).is_ok(),
+            "non-loopback without --basic-auth is allowed"
+        );
     }
 
     #[test]

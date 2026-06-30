@@ -164,8 +164,25 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
                          Remove the old CA manually (Keychain Access), then retry.",
                     ));
                 }
-                std::fs::remove_file(&cert_path).ok();
-                std::fs::remove_file(ca_dir.join("ca-key.pem")).ok();
+                // Delete the old cert/key BEFORE regenerating. `load_or_generate`
+                // reloads any existing pair, so a silently-ignored delete failure
+                // would leave the old key in use while we print "regenerated" —
+                // breaking the invalidates-prior-trust promise. Treat already-absent
+                // as success; abort on any other removal error.
+                for path in [&cert_path, &ca_dir.join("ca-key.pem")] {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(error_stack::Report::new(ProxyError::CertAuthority)
+                                .attach(format!(
+                                    "could not remove old CA file {} during regenerate ({err}); \
+                                     aborting so the stale key is not silently reused",
+                                    path.display()
+                                )));
+                        }
+                    }
+                }
                 ca::CertAuthority::load_or_generate(&ca_dir)
                     .change_context(ProxyError::CertAuthority)?;
                 output::info("regenerated CA — re-run `ca install` to trust it");

@@ -31,6 +31,7 @@ use super::rewrite::rewrite_for;
 
 const X_ORIG_HOST: &str = "x-orig-host";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
+const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
 
 /// Binds the listen socket. Separate from [`serve_on`] so the caller can open
 /// the port (queueing connections) before launching browsers (spec §9, Task 6).
@@ -500,7 +501,8 @@ where
 }
 
 /// Applies the rewrite outcome: upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host`
-/// (both `FROM`, after stripping any higher-priority inbound `Forwarded`), and
+/// (both `FROM`, after stripping any higher-priority inbound `Forwarded`), an
+/// authoritative `X-Forwarded-Proto: https` (the browser leg is always TLS), and
 /// (only when absent) the injected `Authorization`. The request URI is left
 /// origin-form, which is what an HTTP/1.1 upstream expects.
 fn rewrite_headers(
@@ -523,6 +525,16 @@ fn rewrite_headers(
         headers.insert(HeaderName::from_static(X_FORWARDED_HOST), value.clone());
         headers.insert(HeaderName::from_static(X_ORIG_HOST), value);
     }
+    // The browser→proxy leg is always TLS, so the original scheme is `https`.
+    // Stamp it authoritatively (overwriting any inbound value) and drop the
+    // spoofable `Fastly-SSL` signal, so a plaintext upstream (`--upstream-plaintext`)
+    // — or a spoofed header — cannot downgrade the first-party scheme Trusted
+    // Server derives for its URL rewriting (spec §8.3).
+    headers.insert(
+        HeaderName::from_static(X_FORWARDED_PROTO),
+        HeaderValue::from_static("https"),
+    );
+    headers.remove("fastly-ssl");
     if let Some(auth) = basic_auth
         && !headers.contains_key(hyper::header::AUTHORIZATION)
         && let Ok(value) = HeaderValue::from_str(&auth.header_value())
@@ -700,6 +712,37 @@ mod tests {
             headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),
             Some("www.example-publisher.com"),
             "X-Forwarded-Host is the injected FROM host"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_stamps_https_scheme_and_drops_spoofed_signals() {
+        // The browser leg is always TLS, so the scheme is authoritatively https;
+        // a client-supplied X-Forwarded-Proto / Fastly-SSL must not downgrade it.
+        let outcome = RewriteOutcome {
+            sni: "to.edgecompute.app".to_string(),
+            host_header: "www.example-publisher.com".to_string(),
+            orig_host: "www.example-publisher.com".to_string(),
+            scheme_is_tls: true,
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_PROTO),
+            HeaderValue::from_static("http"),
+        );
+        headers.insert(
+            HeaderName::from_static("fastly-ssl"),
+            HeaderValue::from_static("0"),
+        );
+        rewrite_headers(&mut headers, &outcome, None);
+        assert_eq!(
+            headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
+            Some("https"),
+            "X-Forwarded-Proto is stamped https, overwriting the inbound http"
+        );
+        assert!(
+            !headers.contains_key("fastly-ssl"),
+            "spoofable Fastly-SSL is stripped"
         );
     }
 }

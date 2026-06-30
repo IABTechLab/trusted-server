@@ -1,6 +1,6 @@
 //! Browser launch/config, PAC generation, and CA trust commands (spec §9, §7.3).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,14 +26,40 @@ const SAFARI_RESTORE_FILE: &str = "safari-proxy-restore";
 /// All other requests fall through to `DIRECT`.
 #[must_use]
 pub fn generate_pac(rules: &RuleTable, listen: SocketAddr) -> String {
+    let proxy = proxy_connect_addr(listen);
     let mut checks = String::new();
     for rule in &rules.0 {
         checks.push_str(&format!(
-            "  if (url.substring(0,6) == \"https:\" && host == \"{}\") return \"PROXY {}\";\n",
-            rule.from, listen
+            "  if (url.substring(0,6) == \"https:\" && host == \"{}\") return \"PROXY {proxy}\";\n",
+            rule.from
         ));
     }
     format!("function FindProxyForURL(url, host) {{\n{checks}  return \"DIRECT\";\n}}\n")
+}
+
+/// The `host:port` a browser on this machine should connect to for the proxy.
+///
+/// A wildcard bind (`0.0.0.0` / `::`) is normalized to loopback — the proxy is
+/// always local — while any explicit bind IP is used verbatim. `SocketAddr`'s
+/// `Display` brackets IPv6 (e.g. `[::1]:18080`). Use this everywhere a browser is
+/// pointed at the proxy so a non-default `--listen` is honored, not hard-coded.
+fn proxy_connect_addr(listen: SocketAddr) -> String {
+    SocketAddr::new(proxy_connect_ip(listen), listen.port()).to_string()
+}
+
+/// The bare host (no port) a browser should connect to — for configs like
+/// Firefox prefs that take host and port separately.
+fn proxy_connect_host(listen: SocketAddr) -> String {
+    proxy_connect_ip(listen).to_string()
+}
+
+/// Normalizes a wildcard bind to loopback; passes any explicit IP through.
+fn proxy_connect_ip(listen: SocketAddr) -> IpAddr {
+    match listen.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    }
 }
 
 /// Adds the CA certificate to the macOS login keychain (spec §7.3).
@@ -233,12 +259,12 @@ fn make_temp_dir(label: &str) -> Option<PathBuf> {
 /// Uses `--proxy-server="https=<addr>"` so only HTTPS traffic goes through the
 /// proxy; HTTP and other schemes bypass it (spec §9).
 fn launch_chrome(cfg: &ResolvedConfig) {
-    let port = cfg.listen.port();
-    let proxy_arg = format!("https=127.0.0.1:{port}");
+    let addr = proxy_connect_addr(cfg.listen);
+    let proxy_arg = format!("https={addr}");
 
     let Some(tmpdir) = make_temp_dir("chrome") else {
         output::warn(&format!(
-            "Chrome: launch Chrome manually with --proxy-server=\"https=127.0.0.1:{port}\""
+            "Chrome: launch Chrome manually with --proxy-server=\"https={addr}\""
         ));
         return;
     };
@@ -266,7 +292,7 @@ fn launch_chrome(cfg: &ResolvedConfig) {
         Err(err) => {
             output::warn(&format!(
                 "Chrome: could not launch: {err}; \
-                 start Chrome manually with --proxy-server=\"https=127.0.0.1:{port}\""
+                 start Chrome manually with --proxy-server=\"https={addr}\""
             ));
             let _ = std::fs::remove_dir_all(&tmpdir);
         }
@@ -298,36 +324,44 @@ fn chrome_command() -> Command {
 /// the CA into the profile's NSS database via `certutil` if available.
 fn launch_firefox(cfg: &ResolvedConfig) {
     let port = cfg.listen.port();
+    let host = proxy_connect_host(cfg.listen);
 
     let Some(tmpdir) = make_temp_dir("firefox") else {
         output::warn(&format!(
-            "Firefox: configure Firefox manually (proxy SSL/TLS: 127.0.0.1:{port})"
+            "Firefox: configure Firefox manually (proxy SSL/TLS host={host} port={port})"
         ));
         return;
     };
 
     let user_js = format!(
         "user_pref(\"network.proxy.type\", 1);\n\
-         user_pref(\"network.proxy.ssl\", \"127.0.0.1\");\n\
+         user_pref(\"network.proxy.ssl\", \"{host}\");\n\
          user_pref(\"network.proxy.ssl_port\", {port});\n"
     );
 
     if let Err(err) = std::fs::write(tmpdir.join("user.js"), &user_js) {
         output::warn(&format!(
             "Firefox: could not write user.js: {err}; \
-             configure Firefox manually (proxy SSL/TLS: 127.0.0.1:{port})"
+             configure Firefox manually (proxy SSL/TLS host={host} port={port})"
         ));
         let _ = std::fs::remove_dir_all(&tmpdir);
         return;
     }
 
-    // Import CA into the profile's NSS DB via certutil. If certutil is missing
-    // or fails, Firefox would launch with no CA trust, so warn with the exact
-    // manual command instead of silently continuing.
+    // Import the CA into the profile's NSS DB via certutil. A freshly-created
+    // profile has no NSS DB, and `certutil -A` against an empty dir fails with
+    // SEC_ERROR_BAD_DATABASE — so first initialise an empty modern (`sql:`) DB,
+    // then import into it. If certutil is missing or fails, Firefox would launch
+    // with no CA trust, so warn with the exact manual commands instead of
+    // silently continuing.
     let cert_path = super::ca::CertAuthority::cert_path(&cfg.ca_dir);
     if cert_path.exists() {
         let cert = cert_path.to_string_lossy();
-        let profile = tmpdir.to_string_lossy();
+        let db = format!("sql:{}", tmpdir.to_string_lossy());
+        // Best-effort DB init; the -A import below is the step we check.
+        let _ = Command::new("certutil")
+            .args(["-N", "--empty-password", "-d", &db])
+            .status();
         let certutil = Command::new("certutil")
             .args([
                 "-A",
@@ -338,16 +372,17 @@ fn launch_firefox(cfg: &ResolvedConfig) {
                 "-i",
                 &cert,
                 "-d",
-                &profile,
+                &db,
             ])
             .status();
         if !matches!(certutil, Ok(ref s) if s.success()) {
             output::warn(&format!(
                 "Firefox: could not import the dev CA into the profile (certutil missing or \
                  failed); HTTPS to proxied hosts will fail until you trust it. Run: \
-                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {} -d {}",
-                shell_quote(&cert),
-                shell_quote(&profile)
+                 certutil -N --empty-password -d {db_q} && \
+                 certutil -A -n \"{CA_COMMON_NAME}\" -t \"CT,,\" -i {cert_q} -d {db_q}",
+                db_q = shell_quote(&db),
+                cert_q = shell_quote(&cert),
             ));
         }
     }
@@ -369,7 +404,7 @@ fn launch_firefox(cfg: &ResolvedConfig) {
         Err(err) => {
             output::warn(&format!(
                 "Firefox: could not launch: {err}; \
-                 start Firefox manually with SSL proxy 127.0.0.1:{port}"
+                 start Firefox manually with SSL proxy host={host} port={port}"
             ));
             let _ = std::fs::remove_dir_all(&tmpdir);
         }
@@ -399,8 +434,7 @@ fn firefox_command() -> Command {
 /// at the next startup (crash recovery) or on clean Ctrl-C exit.  If the
 /// process is SIGKILL'd the file remains and is recovered on the next run.
 fn launch_safari(cfg: &ResolvedConfig) {
-    let port = cfg.listen.port();
-    let pac_url = format!("http://127.0.0.1:{port}/proxy.pac");
+    let pac_url = format!("http://{}/proxy.pac", proxy_connect_addr(cfg.listen));
 
     // A restore file left by a previous (hard-killed) run records the user's real
     // original proxy state. The startup recovery in `run()` is non-interactive, so
@@ -731,6 +765,56 @@ mod tests {
             service_for_interface(ns, "en99"),
             None,
             "an unknown interface yields no service"
+        );
+    }
+
+    #[test]
+    fn proxy_connect_addr_normalizes_wildcard_and_passes_through_explicit() {
+        // Wildcard binds normalize to loopback; explicit IPs pass through; IPv6
+        // is bracketed.
+        assert_eq!(
+            proxy_connect_addr("0.0.0.0:18080".parse().expect("addr")),
+            "127.0.0.1:18080",
+            "IPv4 wildcard maps to loopback"
+        );
+        assert_eq!(
+            proxy_connect_addr("[::]:18080".parse().expect("addr")),
+            "[::1]:18080",
+            "IPv6 wildcard maps to loopback, bracketed"
+        );
+        assert_eq!(
+            proxy_connect_addr("127.0.0.2:9000".parse().expect("addr")),
+            "127.0.0.2:9000",
+            "explicit loopback IP passes through"
+        );
+        assert_eq!(
+            proxy_connect_addr("192.0.2.10:443".parse().expect("addr")),
+            "192.0.2.10:443",
+            "explicit non-loopback IP passes through verbatim"
+        );
+        assert_eq!(
+            proxy_connect_host("0.0.0.0:18080".parse().expect("addr")),
+            "127.0.0.1",
+            "host-only form drops the port and normalizes the wildcard"
+        );
+    }
+
+    #[test]
+    fn pac_uses_normalized_connect_address_for_wildcard_bind() {
+        let rules = RuleTable(vec![Rule {
+            from: "www.example-publisher.com".into(),
+            to: Authority::parse("to.edgecompute.app", false).expect("should parse authority"),
+            rewrite_host: false,
+            plaintext: false,
+        }]);
+        let pac = generate_pac(&rules, "0.0.0.0:18080".parse().expect("addr"));
+        assert!(
+            pac.contains("PROXY 127.0.0.1:18080"),
+            "PAC points the browser at loopback, not the 0.0.0.0 wildcard. Got: {pac}"
+        );
+        assert!(
+            !pac.contains("0.0.0.0"),
+            "PAC must not hand the browser an unconnectable wildcard address"
         );
     }
 
