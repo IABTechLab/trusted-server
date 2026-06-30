@@ -191,13 +191,6 @@ fn is_edgezero_enabled(config_store: &ConfigStoreHandle) -> Result<bool, fastly:
     Ok(value.as_deref().is_some_and(parse_edgezero_flag))
 }
 
-fn edgezero_can_handle_settings(settings: &Settings) -> bool {
-    settings
-        .creative_opportunities
-        .as_ref()
-        .is_none_or(|creative_opportunities| creative_opportunities.slot.is_empty())
-}
-
 /// Reads `edgezero_rollout_pct` from the config store.
 ///
 /// | Config store state              | Return value | Effect                     |
@@ -352,24 +345,8 @@ fn main() {
     };
 
     if route_to_edgezero {
-        match get_settings() {
-            Ok(settings) if edgezero_can_handle_settings(&settings) => {
-                log::debug!("routing request through EdgeZero path");
-                edgezero_main(req, edgezero_config_store);
-            }
-            Ok(_) => {
-                log::warn!(
-                    "EdgeZero path does not yet support configured creative_opportunity slots; routing through legacy path"
-                );
-                legacy_main(req);
-            }
-            Err(e) => {
-                log::warn!(
-                    "failed to load settings for EdgeZero compatibility check, falling back to legacy path: {e:?}"
-                );
-                legacy_main(req);
-            }
-        }
+        log::debug!("routing request through EdgeZero path");
+        edgezero_main(req, edgezero_config_store);
     } else {
         legacy_main(req);
     }
@@ -1513,71 +1490,6 @@ mod tests {
         .expect("should parse test settings")
     }
 
-    fn test_settings_with_empty_creative_opportunities() -> Settings {
-        Settings::from_toml(
-            r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [request_signing]
-            enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
-
-            [creative_opportunities]
-            gam_network_id = "12345"
-            auction_timeout_ms = 500
-            "#,
-        )
-        .expect("should parse test settings with creative opportunities")
-    }
-
-    fn test_settings_with_configured_creative_opportunities() -> Settings {
-        Settings::from_toml(
-            r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.com"
-            cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
-            proxy_secret = "unit-test-proxy-secret"
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [request_signing]
-            enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
-
-            [creative_opportunities]
-            gam_network_id = "12345"
-            auction_timeout_ms = 500
-
-            [[creative_opportunities.slot]]
-            id = "atf"
-            page_patterns = ["/article/*"]
-            formats = [{ width = 300, height = 250 }]
-            "#,
-        )
-        .expect("should parse test settings with configured creative opportunities")
-    }
-
     #[test]
     fn parses_true_flag_values() {
         assert!(parse_edgezero_flag("true"), "should parse 'true'");
@@ -1922,36 +1834,6 @@ mod tests {
             read_rollout_pct(&rollout_handle(StubResponse::Unavailable)),
             0,
             "a config-store read error should fail safe to 0 (legacy)"
-        );
-    }
-
-    #[test]
-    fn edgezero_accepts_settings_without_creative_opportunities() {
-        let settings = test_settings();
-
-        assert!(
-            edgezero_can_handle_settings(&settings),
-            "should allow EdgeZero when server-side ad templates are not configured"
-        );
-    }
-
-    #[test]
-    fn edgezero_accepts_settings_with_empty_creative_opportunities() {
-        let settings = test_settings_with_empty_creative_opportunities();
-
-        assert!(
-            edgezero_can_handle_settings(&settings),
-            "should allow EdgeZero when server-side ad templates are configured but no slots are enabled"
-        );
-    }
-
-    #[test]
-    fn edgezero_rejects_settings_with_configured_creative_opportunity_slots() {
-        let settings = test_settings_with_configured_creative_opportunities();
-
-        assert!(
-            !edgezero_can_handle_settings(&settings),
-            "should route through legacy path while EdgeZero lacks server-side ad-template support"
         );
     }
 

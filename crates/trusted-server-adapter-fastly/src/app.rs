@@ -114,7 +114,7 @@ use trusted_server_core::proxy::{
     AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+    buffer_publisher_response_async, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -715,19 +715,24 @@ async fn dispatch_fallback(
         // be opened, matching legacy behavior.
         match runtime_services_for_consent_route(&state.settings, services) {
             Ok(publisher_services) => {
-                // Server-side auction is not yet wired into the EdgeZero buffered
-                // finalize path (`buffer_publisher_response` runs the
-                // synchronous pipeline, which does not collect dispatched SSP
-                // bids). Pass no slots so `handle_publisher_request` dispatches no
-                // auction and no bid requests are wasted. The legacy path runs the
-                // full server-side auction; wiring it here is deferred to the
-                // EdgeZero cutover.
+                // Run the server-side auction with the configured creative-
+                // opportunity slots and collect the dispatched bids in the
+                // buffered finalize (`buffer_publisher_response_async`), matching
+                // the legacy streaming path. `handle_publisher_request` matches the
+                // slots against the request path. EID targeting stays off here
+                // (`registry: None`) until per-platform KV enrichment is wired.
+                let slots = state
+                    .settings
+                    .creative_opportunities
+                    .as_ref()
+                    .map(|creative_opportunities| creative_opportunities.slot.as_slice())
+                    .unwrap_or(&[]);
                 let auction = trusted_server_core::publisher::AuctionDispatch {
                     orchestrator: &state.orchestrator,
-                    slots: &[],
+                    slots,
                     registry: None,
                 };
-                handle_publisher_request(
+                match handle_publisher_request(
                     &state.settings,
                     &publisher_services,
                     ec.kv_graph.as_ref(),
@@ -736,14 +741,20 @@ async fn dispatch_fallback(
                     req,
                 )
                 .await
-                .and_then(|pub_response| {
-                    buffer_publisher_response(
-                        pub_response,
-                        &method,
-                        &state.settings,
-                        &state.registry,
-                    )
-                })
+                {
+                    Ok(pub_response) => {
+                        buffer_publisher_response_async(
+                            pub_response,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                            &state.orchestrator,
+                            &publisher_services,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
