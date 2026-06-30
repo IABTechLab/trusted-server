@@ -1,9 +1,9 @@
 use crate::common::assertions;
 use crate::common::ec::{
-    assert_json_response, assert_status, batch_sync, batch_sync_no_auth, identify,
-    identify_with_headers, is_ec_cookie_expired, normalize_ec_id, BatchMapping, EcTestClient,
+    BatchMapping, EcTestClient, assert_json_response, assert_status, batch_sync,
+    batch_sync_no_auth, identify, identify_with_headers, is_ec_cookie_expired, normalize_ec_id,
 };
-use crate::common::runtime::{origin_port, TestError, TestResult};
+use crate::common::runtime::{TestError, TestResult, origin_port};
 use error_stack::Report;
 use error_stack::ResultExt as _;
 
@@ -44,7 +44,7 @@ pub enum CustomScenario {
     /// Next.js: Form action URLs are rewritten from origin to proxy.
     NextJsFormAction,
 
-    /// WordPress: Admin pages (`/wp-admin/`) receive script injection.
+    /// `WordPress`: Admin pages (`/wp-admin/`) receive script injection.
     ///
     /// The trusted server currently injects into ALL HTML responses
     /// regardless of path. This test documents that behavior and guards
@@ -535,7 +535,7 @@ fn ec_full_lifecycle(base_url: &str) -> TestResult<()> {
     let json = assert_json_response(resp, 200)
         .attach("EC full lifecycle: batch sync should return 200")?;
 
-    let accepted = json.get("accepted").and_then(|v| v.as_u64());
+    let accepted = json.get("accepted").and_then(serde_json::Value::as_u64);
     if accepted != Some(1) {
         return Err(Report::new(TestError::JsonFieldMismatch {
             field: "accepted".to_owned(),
@@ -725,7 +725,7 @@ fn ec_batch_sync_happy_path(base_url: &str) -> TestResult<()> {
     let resp = batch_sync(&client, INTTEST_API_TOKEN, &mappings)?;
     let json = assert_json_response(resp, 200).attach("batch sync should return 200")?;
 
-    let accepted = json.get("accepted").and_then(|v| v.as_u64());
+    let accepted = json.get("accepted").and_then(serde_json::Value::as_u64);
     if accepted != Some(1) {
         return Err(Report::new(TestError::JsonFieldMismatch {
             field: "accepted".to_owned(),

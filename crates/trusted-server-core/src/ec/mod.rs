@@ -18,11 +18,12 @@
 //! - [`consent`] — EC-specific consent gating wrapper
 //! - [`cookies`] — `Set-Cookie` header creation and expiration helpers
 //! - [`kv`] — KV Store identity graph operations (CAS, tombstones, debounce)
+//! - [`kv_backend`] — Platform-neutral KV primitives implemented by adapters
 //! - [`kv_types`] — Schema types for KV identity graph entries
 //! - [`device`] — Device signal derivation (UA, JA4, H2 fingerprinting)
 //! - [`partner`] — Partner validation helpers (ID format, pull sync config)
 //! - [`registry`] — In-memory partner registry built from config
-//! - [`rate_limiter`] — Rate limiting abstraction (Fastly Edge Rate Limiting)
+//! - [`rate_limiter`] — Rate limiting abstraction (implemented by adapters)
 //! - [`identify`] — Identity read endpoint (`GET /_ts/api/v1/identify`)
 //! - [`eids`] — Shared EID resolution and formatting helpers
 //! - [`batch_sync`] — S2S batch sync endpoint (`POST /_ts/api/v1/batch-sync`)
@@ -39,6 +40,7 @@ pub mod finalize;
 pub mod generation;
 pub mod identify;
 pub mod kv;
+pub mod kv_backend;
 pub mod kv_types;
 pub mod partner;
 pub mod prebid_eids;
@@ -474,17 +476,18 @@ impl EcContext {
 
 /// Returns the current Unix timestamp in seconds.
 ///
-/// Uses `std::time::SystemTime` which is supported on `wasm32-wasip1`.
+/// Uses [`web_time::SystemTime`], which maps to `std::time::SystemTime` on
+/// native and `wasm32-wasip1` targets and to a JS-backed clock on
+/// `wasm32-unknown-unknown` (Cloudflare Workers), where `std::time` is not
+/// available.
 pub(crate) fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or_else(
-            |err| {
-                log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");
-                0
-            },
-            |duration| duration.as_secs(),
-        )
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_else(|err| {
+            log::error!("SystemTime::now() failed, falling back to epoch 0: {err}");
+            0
+        })
 }
 
 #[cfg(test)]

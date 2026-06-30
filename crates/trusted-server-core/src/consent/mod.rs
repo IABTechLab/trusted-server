@@ -45,7 +45,8 @@ pub use types::{
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;

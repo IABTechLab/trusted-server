@@ -70,15 +70,15 @@ impl FastlyViceroy {
     ///
     /// Honors the `VICEROY_CONFIG_PATH` environment variable so a CI job can
     /// point the same WASM binary at an alternative config store — e.g. the
-    /// EdgeZero fixture that sets `trusted_server_config.edgezero_enabled =
-    /// "true"` to exercise the EdgeZero entry point. Mirrors the browser
+    /// `EdgeZero` fixture that sets `trusted_server_config.edgezero_enabled =
+    /// "true"` to exercise the `EdgeZero` entry point. Mirrors the browser
     /// harness's `global-setup.ts`, which reads the same variable. Falls back to
     /// the default legacy template when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {
-        if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH") {
-            if !path.is_empty() {
-                return std::path::PathBuf::from(path);
-            }
+        if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH")
+            && !path.is_empty()
+        {
+            return std::path::PathBuf::from(path);
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/configs/viceroy-template.toml")
