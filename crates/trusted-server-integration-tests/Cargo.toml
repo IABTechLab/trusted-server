@@ -15,7 +15,7 @@ path = "tests/parity.rs"
 harness = true
 
 [dependencies]
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "89f592665a8b386111995da5cbf3fcc068113dfc", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", default-features = false }
 serde_json = "1.0.149"
 trusted-server-core = { path = "../trusted-server-core" }
 
@@ -38,7 +38,7 @@ trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
 # root Cargo.toml. Any edgezero rev bump must be applied in BOTH places, or
 # this crate compiles edgezero-core at a different rev than the adapters
 # under test and fails with a type mismatch.
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "89f592665a8b386111995da5cbf3fcc068113dfc", features = ["axum"] }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", features = ["axum"] }
 axum = "0.8.9"
 tower = { version = "0.4", features = ["util"] }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] } # exact pin — keep in sync with workspace-resolved tokio version
