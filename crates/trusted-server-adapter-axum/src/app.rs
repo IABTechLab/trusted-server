@@ -168,7 +168,21 @@ async fn dispatch_fallback(
 
     // Run the server-side auction with the configured creative-opportunity
     // slots; `handle_publisher_request` matches them against the request path.
-    let mut ec_context = EcContext::default();
+    // Build the EC context (consent + jurisdiction) from the request like the
+    // Fastly entry point — `EcContext::default()` leaves jurisdiction Unknown,
+    // which fails the auction consent gate closed. Geo comes from the platform
+    // (no-op on the local Axum dev server, so jurisdiction stays Unknown there
+    // unless the request carries TCF consent).
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    let mut ec_context =
+        EcContext::read_from_request_with_geo(&state.settings, &req, services, geo_info.as_ref())
+            .unwrap_or_default();
     let slots = state
         .settings
         .creative_opportunities

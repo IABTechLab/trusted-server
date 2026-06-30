@@ -611,7 +611,25 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                let mut ec_context = EcContext::default();
+                // Build the EC context (consent + jurisdiction) from the request
+                // like the Fastly entry point — `EcContext::default()` leaves
+                // jurisdiction Unknown and fails the auction consent gate closed.
+                // Spin's platform geo is a no-op, so jurisdiction stays Unknown
+                // unless the request carries TCF consent.
+                let geo_info = services
+                    .geo()
+                    .lookup(services.client_info().client_ip)
+                    .unwrap_or_else(|e| {
+                        log::warn!("geo lookup failed: {e}");
+                        None
+                    });
+                let mut ec_context = EcContext::read_from_request_with_geo(
+                    &state.settings,
+                    &req,
+                    &services,
+                    geo_info.as_ref(),
+                )
+                .unwrap_or_default();
                 let slots = state
                     .settings
                     .creative_opportunities
