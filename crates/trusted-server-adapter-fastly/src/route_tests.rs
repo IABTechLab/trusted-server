@@ -683,6 +683,24 @@ fn route_buffered_response(
     route_result_to_fastly_response(settings, services, &partner_registry, route_result)
 }
 
+fn route_with_settings(
+    settings: &Settings,
+    req: Request,
+    expect_message: &str,
+) -> fastly::Response {
+    let (orchestrator, integration_registry) = build_route_stack(settings);
+    let services = test_runtime_services(&req);
+
+    route_buffered_response(
+        settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        expect_message,
+    )
+}
+
 fn valid_banner_ad_unit_body() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "adUnits": [
@@ -697,6 +715,94 @@ fn valid_banner_ad_unit_body() -> Vec<u8> {
         ]
     }))
     .expect("should serialize valid auction route test body")
+}
+
+#[test]
+fn static_tsjs_route_serves_unified_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=tsjs-unified.min.js");
+
+    let mut response = route_with_settings(&settings, req, "should route static tsjs request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should serve the unified static bundle"
+    );
+    assert_eq!(
+        response.get_header_str(header::CONTENT_TYPE),
+        Some("application/javascript; charset=utf-8"),
+        "should serve the unified bundle as JavaScript"
+    );
+    assert!(
+        response.take_body_str().contains("requestAds"),
+        "should serve unified bundle content with the core requestAds API"
+    );
+}
+
+#[test]
+fn static_tsjs_route_returns_not_found_for_unknown_tsjs_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=tsjs-doesnotexist.min.js");
+
+    let response = route_with_settings(&settings, req, "should route static tsjs request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "should let the static tsjs branch own unknown bundle paths"
+    );
+}
+
+#[test]
+fn unknown_route_falls_back_to_publisher_proxy_path() {
+    let settings = create_test_settings();
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+
+    let req = Request::get("https://test.com/articles/example");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::BAD_GATEWAY));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route publisher fallback",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should return the publisher origin response through fallback routing"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "should send exactly one publisher fallback request"
+    );
+    assert_eq!(
+        calls[0].method,
+        Method::GET,
+        "should preserve the fallback request method"
+    );
+    assert_eq!(
+        calls[0].backend_name, "https-origin.test-publisher.com",
+        "should dispatch to the publisher origin backend"
+    );
+    assert_eq!(
+        calls[0].uri, "https://origin.test-publisher.com/articles/example",
+        "should send the fallback request to the publisher origin"
+    );
 }
 
 #[test]
