@@ -1322,6 +1322,17 @@ pub async fn handle_publisher_request(
         auction.orchestrator.is_enabled(),
     );
     let should_run_auction = should_run_ad_stack;
+    // Diagnostic: shows which gate suppresses the server-side auction. Pair with
+    // the `EC context: ... jurisdiction=...` line from EC-context construction
+    // when `consent_allows_auction=false`.
+    log::debug!(
+        "server-side ad-stack gate: is_get={is_get} is_navigation={is_navigation} \
+         is_prefetch={is_prefetch} is_bot={is_bot} matched_slots={} \
+         consent_allows_auction={consent_allows_auction} orchestrator_enabled={} \
+         -> should_run_auction={should_run_auction}",
+        matched_slots.len(),
+        auction.orchestrator.is_enabled(),
+    );
 
     if matched_slots.is_empty() && settings.creative_opportunities.is_some() {
         log::debug!(
