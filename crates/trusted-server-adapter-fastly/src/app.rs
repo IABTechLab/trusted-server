@@ -719,39 +719,45 @@ async fn dispatch_fallback(
                 // opportunity slots and collect the dispatched bids in the
                 // buffered finalize (`buffer_publisher_response_async`), matching
                 // the legacy streaming path. `handle_publisher_request` matches the
-                // slots against the request path. EID targeting stays off here
-                // (`registry: None`) until per-platform KV enrichment is wired.
+                // slots against the request path. The partner registry plus the
+                // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
+                // server-side EIDs, same as the legacy auction.
                 let slots = state
                     .settings
                     .creative_opportunities
                     .as_ref()
                     .map(|creative_opportunities| creative_opportunities.slot.as_slice())
                     .unwrap_or(&[]);
-                let auction = trusted_server_core::publisher::AuctionDispatch {
-                    orchestrator: &state.orchestrator,
-                    slots,
-                    registry: None,
-                };
-                match handle_publisher_request(
-                    &state.settings,
-                    &publisher_services,
-                    ec.kv_graph.as_ref(),
-                    &mut ec.ec_context,
-                    auction,
-                    req,
-                )
-                .await
-                {
-                    Ok(pub_response) => {
-                        buffer_publisher_response_async(
-                            pub_response,
-                            &method,
+                match PartnerRegistry::from_config(&state.settings.ec.partners) {
+                    Ok(partner_registry) => {
+                        let auction = trusted_server_core::publisher::AuctionDispatch {
+                            orchestrator: &state.orchestrator,
+                            slots,
+                            registry: Some(&partner_registry),
+                        };
+                        match handle_publisher_request(
                             &state.settings,
-                            &state.registry,
-                            &state.orchestrator,
                             &publisher_services,
+                            ec.kv_graph.as_ref(),
+                            &mut ec.ec_context,
+                            auction,
+                            req,
                         )
                         .await
+                        {
+                            Ok(pub_response) => {
+                                buffer_publisher_response_async(
+                                    pub_response,
+                                    &method,
+                                    &state.settings,
+                                    &state.registry,
+                                    &state.orchestrator,
+                                    &publisher_services,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                     Err(e) => Err(e),
                 }
