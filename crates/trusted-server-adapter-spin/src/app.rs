@@ -14,12 +14,13 @@ use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::sanitize_forwarded_headers;
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
+use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response, handle_publisher_request,
+    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_publisher_request,
     handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
@@ -79,16 +80,27 @@ fn build_state_with_settings(
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Delegates to the shared [`buffer_publisher_response`], which enforces
-/// `settings.publisher.max_buffered_body_bytes` so a large processable
-/// origin response fails safely instead of exhausting the Wasm heap.
-fn resolve_publisher_response(
+/// Delegates to the shared [`buffer_publisher_response_async`], which collects
+/// the dispatched server-side auction and enforces
+/// `settings.publisher.max_buffered_body_bytes` so a large processable origin
+/// response fails safely instead of exhausting the Wasm heap.
+async fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
 ) -> Result<Response, Report<TrustedServerError>> {
-    buffer_publisher_response(publisher_response, method, settings, registry)
+    buffer_publisher_response_async(
+        publisher_response,
+        method,
+        settings,
+        registry,
+        orchestrator,
+        services,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -600,12 +612,18 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     })
             } else {
                 let mut ec_context = EcContext::default();
+                let slots = state
+                    .settings
+                    .creative_opportunities
+                    .as_ref()
+                    .map(|co| co.slot.as_slice())
+                    .unwrap_or(&[]);
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
-                    slots: &[],
+                    slots,
                     registry: None,
                 };
-                handle_publisher_request(
+                match handle_publisher_request(
                     &state.settings,
                     &services,
                     None,
@@ -614,9 +632,20 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     req,
                 )
                 .await
-                .and_then(|pr| {
-                    resolve_publisher_response(pr, &method, &state.settings, &state.registry)
-                })
+                {
+                    Ok(pr) => {
+                        resolve_publisher_response(
+                            pr,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                            &state.orchestrator,
+                            &services,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))

@@ -19,7 +19,7 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, buffer_publisher_response_async, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
@@ -166,15 +166,21 @@ async fn dispatch_fallback(
             });
     }
 
-    // Server-side auction is deferred for the EdgeZero adapters: pass no slots
-    // so `handle_publisher_request` dispatches no auction.
+    // Run the server-side auction with the configured creative-opportunity
+    // slots; `handle_publisher_request` matches them against the request path.
     let mut ec_context = EcContext::default();
+    let slots = state
+        .settings
+        .creative_opportunities
+        .as_ref()
+        .map(|co| co.slot.as_slice())
+        .unwrap_or(&[]);
     let auction = AuctionDispatch {
         orchestrator: &state.orchestrator,
-        slots: &[],
+        slots,
         registry: None,
     };
-    handle_publisher_request(
+    let publisher_response = handle_publisher_request(
         &state.settings,
         services,
         None,
@@ -182,8 +188,18 @@ async fn dispatch_fallback(
         auction,
         req,
     )
+    .await?;
+    // Async finalize so the dispatched auction is collected and its bids are
+    // injected before `</body>` (the sync buffer path would drop them).
+    buffer_publisher_response_async(
+        publisher_response,
+        &method,
+        &state.settings,
+        &state.registry,
+        &state.orchestrator,
+        services,
+    )
     .await
-    .and_then(|pr| buffer_publisher_response(pr, &method, &state.settings, &state.registry))
 }
 
 fn fallback_handler(

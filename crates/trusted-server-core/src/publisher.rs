@@ -495,6 +495,65 @@ pub fn buffer_publisher_response(
     }
 }
 
+/// Async variant of [`buffer_publisher_response`] that collects the dispatched
+/// server-side auction before buffering.
+///
+/// The sync [`buffer_publisher_response`] drives [`stream_publisher_body`],
+/// which ignores `params.dispatched_auction`, so its `</body>` injection always
+/// falls back to empty `tsjs.bids`. Adapters that finalize on an async runtime
+/// (Axum, Cloudflare, Spin) call this instead: it drives
+/// [`stream_publisher_body_async`], which awaits
+/// [`AuctionOrchestrator::collect_dispatched_auction`], writes the winning bids
+/// into `ad_bids_state`, and injects them before `</body>`.
+///
+/// # Errors
+///
+/// Returns an error if the streaming pipeline fails to process the response
+/// body, or if the processed body exceeds the configured buffer cap.
+pub async fn buffer_publisher_response_async(
+    publisher_response: PublisherResponse,
+    method: &Method,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
+) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            mut params,
+        } => {
+            if !response_carries_body(method, response.status()) {
+                return Ok(response);
+            }
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body_async(
+                body,
+                &mut output,
+                &mut params,
+                settings,
+                integration_registry,
+                orchestrator,
+                services,
+            )
+            .await?;
+            let bytes = output.into_inner();
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(bytes.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(bytes);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
 /// Returns `true` when a buffered publisher response should carry a body and a
 /// recomputed `Content-Length`.
 ///
