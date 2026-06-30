@@ -255,6 +255,7 @@ impl LockrIntegration {
             header::AUTHORIZATION,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
+            header::REFERER,
         ];
 
         for header_name in &headers_to_copy {
@@ -266,13 +267,30 @@ impl LockrIntegration {
         // Always strip consent cookies — consent travels through the OpenRTB body
         self.copy_cookie_header(from, to)?;
 
-        // Use origin override if configured, otherwise forward original
-        let origin = self.config.origin_override.as_deref().or_else(|| {
-            from.get(header::ORIGIN)
-                .and_then(|value| value.to_str().ok())
-        });
+        // Present the publisher's `Origin` to the Lockr API.
+        //
+        // Behind the first-party proxy the browser's call to
+        // `/integrations/lockr/api` is same-origin, so it carries no `Origin`
+        // header — yet the Lockr API rejects requests that lack one. Fall back
+        // to the page origin derived from `Referer` (and finally to a configured
+        // override) so the upstream sees the same `Origin` a direct cross-origin
+        // browser call would have sent.
+        let origin = self
+            .config
+            .origin_override
+            .clone()
+            .or_else(|| {
+                from.get(header::ORIGIN)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                from.get(header::REFERER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(origin_from_url)
+            });
         if let Some(origin) = origin {
-            match HeaderValue::from_str(origin) {
+            match HeaderValue::from_str(&origin) {
                 Ok(value) => {
                     to.insert(header::ORIGIN, value);
                 }
@@ -453,6 +471,22 @@ fn default_rewrite_sdk() -> bool {
     true
 }
 
+/// Extract the `scheme://host[:port]` origin from a URL string.
+///
+/// Returns [`None`] when the value has no `://` separator, an empty scheme, or
+/// an empty host. Any path, query, or fragment is discarded.
+fn origin_from_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -513,6 +547,98 @@ mod tests {
         assert!(
             !integration.is_lockr_sdk_url("https://example.com/script.js"),
             "should not match unrelated domains"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_derives_origin_from_referer() {
+        // Behind the first-party proxy the same-origin browser call carries no
+        // Origin header, only a Referer — the proxy must synthesize the Origin.
+        let integration = LockrIntegration::new(test_config());
+        let mut from = HeaderMap::new();
+        from.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://www.example.com/news/some-article"),
+        );
+
+        let mut to = HeaderMap::new();
+        integration
+            .copy_request_headers(&from, &mut to)
+            .expect("should copy headers");
+
+        assert_eq!(
+            to.get(header::ORIGIN).and_then(|value| value.to_str().ok()),
+            Some("https://www.example.com"),
+            "should derive Origin from the page Referer when none is present"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_prefers_request_origin_over_referer() {
+        let integration = LockrIntegration::new(test_config());
+        let mut from = HeaderMap::new();
+        from.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://www.example.com"),
+        );
+        from.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://other.example.org/page"),
+        );
+
+        let mut to = HeaderMap::new();
+        integration
+            .copy_request_headers(&from, &mut to)
+            .expect("should copy headers");
+
+        assert_eq!(
+            to.get(header::ORIGIN).and_then(|value| value.to_str().ok()),
+            Some("https://www.example.com"),
+            "should keep the request's own Origin when present"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_prefers_override_over_referer() {
+        let config = LockrConfig {
+            origin_override: Some("https://override.example.com".to_string()),
+            ..test_config()
+        };
+        let integration = LockrIntegration::new(config);
+        let mut from = HeaderMap::new();
+        from.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://www.example.com/article"),
+        );
+
+        let mut to = HeaderMap::new();
+        integration
+            .copy_request_headers(&from, &mut to)
+            .expect("should copy headers");
+
+        assert_eq!(
+            to.get(header::ORIGIN).and_then(|value| value.to_str().ok()),
+            Some("https://override.example.com"),
+            "configured origin_override should win over the derived Referer origin"
+        );
+    }
+
+    #[test]
+    fn origin_from_url_extracts_origin() {
+        assert_eq!(
+            origin_from_url("https://www.example.com/a/b?c=d#e"),
+            Some("https://www.example.com".to_string()),
+            "should strip path, query, and fragment"
+        );
+        assert_eq!(
+            origin_from_url("https://www.example.com"),
+            Some("https://www.example.com".to_string()),
+            "should accept a bare origin"
+        );
+        assert_eq!(
+            origin_from_url("not-a-url"),
+            None,
+            "should reject values without a scheme separator"
         );
     }
 
