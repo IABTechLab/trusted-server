@@ -116,6 +116,27 @@ describe('auction/buildAdRequest', () => {
     ]);
   });
 
+  it('includes request-level testMode when provided', () => {
+    const result = buildAdRequest(
+      [
+        {
+          code: 'div-1',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ],
+      { testMode: true }
+    );
+
+    expect(result.testMode).toBe(true);
+  });
+
+  it('omits request-level testMode when false', () => {
+    const result = buildAdRequest([], { testMode: false });
+
+    expect(result.testMode).toBeUndefined();
+  });
+
   it('handles units without mediaTypes', () => {
     const units = [{ code: 'div-1', bids: [{ bidder: 'appnexus' }] }];
     const result = buildAdRequest(units);

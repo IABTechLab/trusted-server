@@ -714,6 +714,7 @@ mod tests {
                 geo: None,
             }),
             site: None,
+            test_mode: false,
             context: HashMap::new(),
         }
     }

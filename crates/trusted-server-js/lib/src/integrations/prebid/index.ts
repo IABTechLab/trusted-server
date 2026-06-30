@@ -38,6 +38,7 @@ import { DEFAULT_PREBID_USER_ID_MODULES, PREBID_USER_ID_MODULE_REGISTRY } from '
 const ADAPTER_CODE = 'trustedServer';
 const BIDDER_PARAMS_KEY = 'bidderParams';
 const ZONE_KEY = 'zone';
+const TEST_MODE_KEY = 'testMode';
 
 /** Configuration options for the Prebid integration. */
 export interface PrebidNpmConfig {
@@ -47,6 +48,8 @@ export interface PrebidNpmConfig {
   timeout?: number;
   /** Enable Prebid.js debug logging. Defaults to false. */
   debug?: boolean;
+  /** Enable top-level OpenRTB `test: 1` on Trusted Server auction requests. */
+  testMode?: boolean;
 }
 
 /**
@@ -57,6 +60,7 @@ interface InjectedPrebidConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
+  testMode?: boolean;
   bidders?: string[];
   /** Bidders that run client-side via native Prebid.js adapters. */
   clientSideBidders?: string[];
@@ -217,6 +221,7 @@ type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  params?: Record<string, unknown>;
 };
 type TrustedServerRequest = {
   method: 'POST';
@@ -256,6 +261,23 @@ function sanitizeAuctionUid(uid: {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+function readRequestTestMode(requestObj: unknown): boolean {
+  if (!requestObj || typeof requestObj !== 'object') {
+    return false;
+  }
+
+  const candidate = requestObj as {
+    testMode?: unknown;
+    trustedServer?: { testMode?: unknown };
+  };
+
+  return candidate.testMode === true || candidate.trustedServer?.testMode === true;
+}
+
+function bidRequestHasTestMode(bidRequest: TrustedServerBidRequest): boolean {
+  return bidRequest.params?.[TEST_MODE_KEY] === true;
 }
 
 function collectAuctionEids(): AuctionEid[] | undefined {
@@ -299,6 +321,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     endpoint: config?.endpoint,
     timeout: config?.timeout ?? injected?.timeout,
     debug: config?.debug ?? injected?.debug,
+    testMode: config?.testMode ?? injected?.testMode,
   };
 
   auctionEndpoint = merged.endpoint ?? '/auction';
@@ -321,7 +344,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       if (hasUserIdApi && !auctionEids) {
         clearPrebidEidsCookie();
       }
-      const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
+      const requestTestMode =
+        merged.testMode === true || validBidRequests.some(bidRequestHasTestMode);
+      const payload = buildAdRequest(validBidRequests, {
+        eids: auctionEids,
+        testMode: requestTestMode,
+      });
       return {
         method: 'POST',
         url: auctionEndpoint,
@@ -363,6 +391,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     log.debug('[tsjs-prebid] requestBids called');
 
     const opts = requestObj || {};
+    const requestTestMode = merged.testMode === true || readRequestTestMode(opts);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const adUnits = ((opts as any).adUnits || pbjs.adUnits || []) as TrustedServerAdUnit[];
 
@@ -403,16 +432,18 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       const tsParams: Record<string, unknown> = {
         [BIDDER_PARAMS_KEY]: bidderParams,
         ...(zone ? { [ZONE_KEY]: zone } : {}),
+        ...(requestTestMode ? { [TEST_MODE_KEY]: true } : {}),
       };
       const existingTsBid = unit.bids.find((b) => b.bidder === ADAPTER_CODE);
       if (existingTsBid) {
-        const paramsWithoutZone = {
+        const paramsWithoutReservedKeys = {
           ...(existingTsBid.params ?? {}),
         };
-        delete paramsWithoutZone[ZONE_KEY];
+        delete paramsWithoutReservedKeys[ZONE_KEY];
+        delete paramsWithoutReservedKeys[TEST_MODE_KEY];
 
         existingTsBid.params = {
-          ...paramsWithoutZone,
+          ...paramsWithoutReservedKeys,
           ...tsParams,
         };
       } else {

@@ -289,6 +289,40 @@ describe('prebid/installPrebidNpm', () => {
       expect(payload.eids).toBeUndefined();
     });
 
+    it('buildRequests includes request-level testMode when trustedServer params enable it', () => {
+      const spec = getAdapterSpec();
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: { testMode: true },
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.testMode).toBe(true);
+    });
+
+    it('buildRequests includes request-level testMode when configured', () => {
+      mockRegisterBidAdapter.mockClear();
+      installPrebidNpm({ testMode: true });
+      const spec = mockRegisterBidAdapter.mock.calls[0][2];
+
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+
+      const payload = JSON.parse(result.data);
+      expect(payload.testMode).toBe(true);
+    });
+
     it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
       const spec = getAdapterSpec();
       mockGetUserIdsAsEids.mockReturnValue([
@@ -577,6 +611,34 @@ describe('prebid/installPrebidNpm', () => {
       expect(adUnits[0].bids.map((b: any) => b.bidder)).toEqual(['trustedServer']);
     });
 
+    it('adds request-level testMode to trustedServer params', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [
+        {
+          bids: [{ bidder: 'appnexus', params: { placementId: 123 } }],
+        },
+      ];
+      pbjs.requestBids({ adUnits, trustedServer: { testMode: true } } as any);
+
+      const trustedServerBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer');
+      expect(trustedServerBid.params.testMode).toBe(true);
+    });
+
+    it('adds configured testMode to trustedServer params', () => {
+      const pbjs = installPrebidNpm({ testMode: true });
+
+      const adUnits = [
+        {
+          bids: [{ bidder: 'appnexus', params: {} }],
+        },
+      ];
+      pbjs.requestBids({ adUnits } as any);
+
+      const trustedServerBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer');
+      expect(trustedServerBid.params.testMode).toBe(true);
+    });
+
     it('adds bids array to ad units that have none', () => {
       const pbjs = installPrebidNpm();
 
@@ -662,6 +724,27 @@ describe('prebid/installPrebidNpm', () => {
 
       tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
       expect(tsBid.params.zone).toBeUndefined();
+      expect(tsBid.params.custom).toBe('keep');
+    });
+
+    it('clears stale testMode when existing trustedServer bid is reused', () => {
+      const pbjs = installPrebidNpm();
+
+      const adUnits = [
+        {
+          code: 'ad-header-0',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [
+            { bidder: 'trustedServer', params: { custom: 'keep', testMode: true } },
+            { bidder: 'kargo', params: { placementId: '_abc' } },
+          ],
+        },
+      ];
+
+      pbjs.requestBids({ adUnits } as any);
+
+      const tsBid = adUnits[0].bids.find((b: any) => b.bidder === 'trustedServer') as any;
+      expect(tsBid.params.testMode).toBeUndefined();
       expect(tsBid.params.custom).toBe('keep');
     });
 
@@ -755,6 +838,23 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     expect(mockSetConfig).toHaveBeenCalledWith(
       expect.objectContaining({ debug: false, bidderTimeout: 3000 })
     );
+  });
+
+  it('reads testMode from window.__tsjs_prebid', () => {
+    (window as any).__tsjs_prebid = { testMode: true };
+
+    installPrebidNpm();
+    const spec = mockRegisterBidAdapter.mock.calls[0][2];
+    const result = spec.buildRequests([
+      {
+        adUnitCode: 'div-gpt-1',
+        bidder: 'trustedServer',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        params: {},
+      },
+    ]);
+
+    expect(JSON.parse(result.data).testMode).toBe(true);
   });
 
   it('works with no config argument and no injected config', () => {

@@ -107,6 +107,33 @@ Enabling `debug` increases response sizes and adds overhead. Use it in developme
 
 You can combine both to get debug diagnostics on test traffic, or use `debug` alone to inspect live auctions without affecting revenue.
 
+### Per-auction test mode
+
+For one-off Prebid test traffic, the `/auction` request body can opt in with a top-level `testMode` field:
+
+```json
+{
+  "testMode": true,
+  "adUnits": [
+    {
+      "code": "header-banner",
+      "mediaTypes": { "banner": { "sizes": [[728, 90]] } }
+    }
+  ]
+}
+```
+
+Trusted Server sets OpenRTB `test: 1` when either `[integrations.prebid].test_mode = true` or the current request has `testMode: true`. A request can only enable test mode; it cannot disable config-level `test_mode`.
+
+When using the TSJS Prebid shim, pass the flag per `requestBids` call:
+
+```js
+pbjs.requestBids({
+  trustedServer: { testMode: true },
+  adUnits,
+})
+```
+
 ## Features
 
 ### Server-Side Header Bidding
@@ -477,7 +504,7 @@ The `to_openrtb()` method in `PrebidAuctionProvider` builds OpenRTB requests:
 - Includes device info (user-agent, client IP) and geo (lat/lon/metro) when available
 - Sets `tmax` from the configured timeout and `cur` to `["USD"]`
 - Sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus` when `debug` is enabled
-- Sets the top-level `test: 1` flag when `test_mode` is enabled
+- Sets the top-level `test: 1` flag when `test_mode` or request-body `testMode` is enabled
 - Appends `debug_query_params` to page URL when configured
 - Applies `bid_param_overrides`, `bid_param_zone_overrides`, and `bid_param_override_rules` via the unified override engine before request dispatch
 - Signs requests when request signing is enabled

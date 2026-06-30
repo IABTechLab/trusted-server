@@ -32,6 +32,7 @@
   function auctionPayload() {
     const zone = 'header';
     return {
+      testMode: true,
       adUnits: [
         {
           code: 'header-banner',

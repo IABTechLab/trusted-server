@@ -35,6 +35,15 @@ export interface AdRequest {
   adUnits: AdRequestUnit[];
   config?: Record<string, unknown>;
   eids?: AuctionEid[];
+  /** Enables top-level OpenRTB `test: 1` for this auction request. */
+  testMode?: boolean;
+}
+
+/** Options for building an {@link AdRequest}. */
+export interface BuildAdRequestOptions {
+  eids?: AuctionEid[];
+  /** Enables top-level OpenRTB `test: 1` for this auction request. */
+  testMode?: boolean;
 }
 
 /** A parsed bid from an OpenRTB seatbid response. */
@@ -68,7 +77,7 @@ export interface AuctionBid {
  * objects (which carry `adUnitCode` instead of `code`).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }): AdRequest {
+export function buildAdRequest(units: any[], options?: BuildAdRequestOptions): AdRequest {
   const unitMap = new Map<string, AdRequestUnit>();
 
   for (const u of units) {
@@ -104,6 +113,9 @@ export function buildAdRequest(units: any[], options?: { eids?: AuctionEid[] }):
   const request: AdRequest = { adUnits: [...unitMap.values()] };
   if (options?.eids && options.eids.length > 0) {
     request.eids = options.eids;
+  }
+  if (options?.testMode === true) {
+    request.testMode = true;
   }
   return request;
 }

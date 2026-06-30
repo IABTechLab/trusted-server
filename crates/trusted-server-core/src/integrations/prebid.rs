@@ -510,6 +510,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             account_id: &'a str,
             timeout: u32,
             debug: bool,
+            test_mode: bool,
             bidders: &'a [String],
             #[serde(skip_serializing_if = "<[String]>::is_empty")]
             client_side_bidders: &'a [String],
@@ -519,6 +520,7 @@ impl IntegrationHeadInjector for PrebidIntegration {
             account_id: self.config.account_id.as_deref().unwrap_or_default(),
             timeout: self.config.timeout_ms,
             debug: self.config.debug,
+            test_mode: self.config.test_mode,
             bidders: &self.config.bidders,
             client_side_bidders: &self.config.client_side_bidders,
         };
@@ -1193,6 +1195,7 @@ impl PrebidAuctionProvider {
             .unwrap_or((None, None, None, None));
 
         let debug_enabled = self.config.debug;
+        let test_mode_enabled = self.config.test_mode || request.test_mode;
 
         let ext = RequestExt {
             prebid: Some(PrebidExt {
@@ -1236,7 +1239,7 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
-            test: self.config.test_mode.then_some(true),
+            test: test_mode_enabled.then_some(true),
             tmax,
             cur: vec![DEFAULT_CURRENCY.to_string()],
             ext,
@@ -1837,6 +1840,7 @@ mod tests {
             },
             device: None,
             site: None,
+            test_mode: false,
             context: HashMap::new(),
         }
     }
@@ -2429,6 +2433,36 @@ server_url = "https://prebid.example"
             serialized["test"],
             json!(1),
             "should serialize top-level test as 1 when test_mode is enabled"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_sets_test_flag_when_request_test_mode_enabled() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.test_mode = true;
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert_eq!(
+            openrtb.test,
+            Some(true),
+            "should set top-level OpenRTB test field when request test_mode is enabled"
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["test"],
+            json!(1),
+            "should serialize top-level test as 1 when request test_mode is enabled"
         );
     }
 
@@ -3534,6 +3568,7 @@ server_url = "https://prebid.example"
                 geo: None,
             }),
             site: None,
+            test_mode: false,
             context: HashMap::new(),
         }
     }

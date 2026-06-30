@@ -25,6 +25,13 @@ pub struct AuctionRequest {
     pub device: Option<DeviceInfo>,
     /// Site information
     pub site: Option<SiteInfo>,
+    /// Request-level opt-in for top-level `OpenRTB` `test: 1` traffic.
+    ///
+    /// This can enable test traffic for a single auction, but provider-level
+    /// configuration may also force test mode on and cannot be disabled by the
+    /// request payload.
+    #[serde(default)]
+    pub test_mode: bool,
     /// Additional context forwarded from the JS client payload.
     pub context: HashMap<String, ContextValue>,
 }

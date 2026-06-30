@@ -156,6 +156,7 @@ Client (browser, Prebid.js, tsjs) sends a POST request to `/auction` with ad uni
 
 ```json
 {
+  "testMode": true,
   "adUnits": [
     {
       "code": "header-banner",
@@ -168,6 +169,8 @@ Client (browser, Prebid.js, tsjs) sends a POST request to `/auction` with ad uni
   ]
 }
 ```
+
+`testMode` is optional. When true, providers that support OpenRTB test traffic (currently Prebid) set the outgoing top-level `test: 1` flag for that auction.
 
 #### 2. Format Transformation
 The system transforms the Prebid.js format into an internal `AuctionRequest`:

@@ -36,6 +36,9 @@ pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
     pub eids: Option<JsonValue>,
+    /// Request-level opt-in to set top-level `OpenRTB` `test: 1` for this auction.
+    #[serde(default)]
+    pub test_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +197,7 @@ pub fn convert_tsjs_to_auction_request(
             domain: settings.publisher.domain.clone(),
             page: format!("https://{}", settings.publisher.domain),
         }),
+        test_mode: body.test_mode,
         context,
     })
 }
@@ -394,6 +398,7 @@ mod tests {
             },
             device: None,
             site: None,
+            test_mode: false,
             context: HashMap::new(),
         }
     }
@@ -467,6 +472,7 @@ mod tests {
             }],
             config,
             eids: None,
+            test_mode: false,
         }
     }
 
@@ -484,6 +490,20 @@ mod tests {
             None,
         )
         .expect("should convert banner request")
+    }
+
+    #[test]
+    fn ad_request_deserializes_camel_case_test_mode() {
+        let body: AdRequest = serde_json::from_value(json!({
+            "adUnits": [],
+            "testMode": true,
+        }))
+        .expect("should deserialize auction request body");
+
+        assert!(
+            body.test_mode,
+            "should deserialize top-level testMode into request test_mode"
+        );
     }
 
     #[test]
@@ -740,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn convert_tsjs_to_auction_request_propagates_request_test_mode() {
+        let settings = make_settings();
+        let mut body = make_banner_body(None);
+        body.test_mode = true;
+        let auction_request = convert_body_to_auction_request(&body, &settings);
+
+        assert!(
+            auction_request.test_mode,
+            "should preserve request-level test mode opt-in"
+        );
+    }
+
+    #[test]
     fn convert_tsjs_to_auction_request_allows_empty_banner_sizes() {
         let settings = make_settings();
         let req = make_request();
@@ -754,6 +787,7 @@ mod tests {
             }],
             config: None,
             eids: None,
+            test_mode: false,
         };
 
         let auction_request = convert_tsjs_to_auction_request(
@@ -791,6 +825,7 @@ mod tests {
             }],
             config: None,
             eids: None,
+            test_mode: false,
         };
 
         let err = convert_tsjs_to_auction_request(
@@ -830,6 +865,7 @@ mod tests {
             ],
             config: None,
             eids: None,
+            test_mode: false,
         };
 
         let auction_request = convert_tsjs_to_auction_request(

@@ -64,6 +64,7 @@
       livePbjs.addAdUnits([adUnit]);
       livePbjs.requestBids({
         timeout: 1500,
+        trustedServer: { testMode: true },
         bidsBackHandler: () => {
           const rendered = renderPrebidBids();
           setText('#prebid-status', `bidsBackHandler fired; rendered ${rendered}`);

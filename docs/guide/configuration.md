@@ -1076,6 +1076,8 @@ See [Prebid Integration](/guide/integrations/prebid) for full details.
 
 Compatibility fields are normalized into the same runtime engine as canonical rules. Explicit `bid_param_override_rules` run after compatibility-derived rules, so later canonical rules win on conflicts.
 
+**Per-request test mode**: `/auction` callers can also enable non-billable test traffic for a single request by sending top-level `"testMode": true` in the JSON body. Effective Prebid test mode is `test_mode || request.testMode`, so request payloads can enable test mode but cannot disable config-level `test_mode`.
+
 ### Next.js Integration
 
 **Section**: `[integrations.nextjs]`
