@@ -492,8 +492,10 @@ mod tests {
             "should return 401 without Bearer token"
         );
         assert_no_store(&response);
-        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
-            .expect("should decode JSON body");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode JSON body");
         assert_eq!(
             body["error"], "invalid_token",
             "should return invalid_token error"
@@ -548,8 +550,10 @@ mod tests {
             "should return 403 when consent denies EC"
         );
         assert_no_store(&response);
-        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
-            .expect("should decode JSON body");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode JSON body");
         assert_eq!(
             body,
             serde_json::json!({ "consent": "denied" }),
@@ -610,8 +614,10 @@ mod tests {
             response.headers().get("x-ts-ec").is_none(),
             "should not emit x-ts-ec header"
         );
-        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
-            .expect("should decode identify response JSON");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON");
 
         assert_eq!(body["ec"], ec_id, "should echo EC in body");
         assert_eq!(

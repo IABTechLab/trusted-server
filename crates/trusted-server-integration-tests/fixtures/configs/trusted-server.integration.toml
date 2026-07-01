@@ -1,0 +1,122 @@
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "integration-admin-password-32-bytes-ok"
+
+[publisher]
+domain = "localhost"
+cookie_domain = "localhost"
+origin_url = "http://127.0.0.1:8888"
+proxy_secret = "integration-test-proxy-secret"
+
+[ec]
+passphrase = "integration-test-ec-secret-padded-32"
+ec_store = "ec_identity_store"
+pull_sync_concurrency = 3
+
+[[ec.partners]]
+name = "Integration Test Partner"
+source_domain = "inttest.example.com"
+bidstream_enabled = true
+api_token = "integration-test-token-alpha-32-bytes-ok"
+
+[[ec.partners]]
+name = "Integration Test Partner 2"
+source_domain = "inttest2.example.com"
+bidstream_enabled = true
+api_token = "integration-test-token-bravo-32-bytes-ok"
+
+[request_signing]
+enabled = false
+config_store_id = "app_config"
+secret_store_id = "secrets"
+
+[integrations.prebid]
+enabled = false
+server_url = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 1000
+bidders = []
+debug = false
+client_side_bidders = []
+
+[integrations.nextjs]
+enabled = false
+rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+max_combined_payload_bytes = 10485760
+
+[integrations.testlight]
+enabled = false
+endpoint = "https://testlight.example.com/openrtb2/auction"
+timeout_ms = 1200
+rewrite_scripts = true
+
+[integrations.didomi]
+enabled = false
+sdk_origin = "https://sdk.example.com"
+api_origin = "https://api.example.com"
+
+[integrations.sourcepoint]
+enabled = false
+rewrite_sdk = true
+cdn_origin = "https://cdn.example.com"
+cache_ttl_seconds = 3600
+
+[integrations.permutive]
+enabled = false
+organization_id = ""
+workspace_id = ""
+project_id = ""
+api_endpoint = "https://api.example.com"
+secure_signals_endpoint = "https://secure-signals.example.com"
+
+[integrations.lockr]
+enabled = false
+app_id = ""
+api_endpoint = "https://identity.example.com"
+sdk_url = "https://identity.example.com/trusted-server.js"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.datadome]
+enabled = false
+sdk_origin = "https://sdk.example.com"
+api_origin = "https://api.example.com"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.gpt]
+enabled = false
+script_url = "https://ads.example.com/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = true
+
+[proxy]
+certificate_check = false
+
+[auction]
+enabled = false
+providers = []
+timeout_ms = 2000
+allowed_context_keys = []
+
+[integrations.aps]
+enabled = false
+pub_id = "example-aps-publisher-id"
+endpoint = "https://aps.example.com/e/dtb/bid"
+timeout_ms = 1000
+
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-EXAMPLE"
+upstream_url = "https://tags.example.com"
+
+[integrations.adserver_mock]
+enabled = false
+endpoint = "https://adserver.example.com/mediate"
+timeout_ms = 1000
+
+[integrations.adserver_mock.context_query_params]
+example_segments = "segments"
+
+[debug]
+ja4_endpoint_enabled = false

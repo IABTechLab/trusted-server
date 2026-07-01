@@ -1,0 +1,23 @@
+[package]
+name = "trusted-server-cli"
+version = "0.1.0"
+authors = []
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "ts"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { workspace = true }
+edgezero-cli = { workspace = true }
+log = { workspace = true }
+trusted-server-core = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }

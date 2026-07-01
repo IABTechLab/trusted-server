@@ -1,3 +1,4 @@
+#[cfg(test)]
 use config::{Config, Environment, File, FileFormat};
 use error_stack::{Report, ResultExt};
 use regex::Regex;
@@ -17,7 +18,9 @@ use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
 use crate::redacted::Redacted;
 
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TRUSTED_SERVER";
+#[cfg(test)]
 pub const ENVIRONMENT_VARIABLE_SEPARATOR: &str = "__";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -286,6 +289,7 @@ impl DerefMut for IntegrationSettings {
 /// registered via API. At startup, each partner's `api_token` is hashed
 /// (SHA-256) for O(1) auth lookups; the plaintext is never stored at runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct EcPartner {
     /// Human-readable partner name.
     pub name: String,
@@ -437,6 +441,7 @@ impl EcPartner {
 /// Mapped from the `[ec]` TOML section. Controls EC identity generation,
 /// KV store names, and partner registry.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Ec {
     /// Publisher passphrase used as HMAC key for EC generation.
     #[validate(custom(function = Ec::validate_passphrase))]
@@ -531,6 +536,7 @@ impl Ec {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
     /// URLs from these domains will not be proxied through first-party endpoints.
@@ -567,6 +573,7 @@ impl Rewrite {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Handler {
     #[validate(length(min = 1), custom(function = validate_path))]
     pub path: String,
@@ -580,6 +587,23 @@ pub struct Handler {
 }
 
 impl Handler {
+    /// Known handler password placeholders that must not be used in deployments.
+    pub const PASSWORD_PLACEHOLDERS: &[&str] = &[
+        "replace-with-admin-password-32-bytes",
+        "replace-with-admin-password",
+        "change-me-admin-password",
+    ];
+
+    /// Returns `true` if `password` matches a known placeholder value
+    /// (case-insensitive).
+    #[must_use]
+    pub fn is_placeholder_password(password: &str) -> bool {
+        let password = password.trim();
+        Self::PASSWORD_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.eq_ignore_ascii_case(password))
+    }
+
     fn compiled_regex(&self) -> Result<&Regex, Report<TrustedServerError>> {
         match self
             .regex
@@ -615,6 +639,7 @@ impl Handler {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestSigning {
     #[serde(default = "default_request_signing_enabled")]
     pub enabled: bool,
@@ -690,7 +715,7 @@ pub enum OriginQueryPolicy {
 
 /// Authentication configuration for an asset origin.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AssetOriginAuth {
     /// Sign asset origin requests with AWS Signature Version 4 for `S3`.
     #[serde(rename = "s3_sigv4", alias = "s3_sig_v4")]
@@ -801,6 +826,7 @@ impl S3SigV4AuthConfig {
 /// transformation table lives under top-level [`ImageOptimizerSettings`] so
 /// multiple routes can share one closed set of profiles.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetImageOptimizerConfig {
     /// Enables Image Optimizer for this route when the table is present.
     #[serde(
@@ -867,6 +893,7 @@ pub enum UnknownProfilePolicy {
 /// site-specific profile tables in private configuration overlays when those
 /// values should not be committed to the public repository.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerSettings {
     /// Named profile sets referenced by asset routes.
     #[serde(default)]
@@ -901,6 +928,7 @@ impl ImageOptimizerSettings {
 /// supported subset: `quality`, `resize-filter`, `format`, `width`, `height`,
 /// and `crop`. Profile-specific parameters override [`Self::base_params`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerProfileSet {
     /// Params applied to every profile before profile-specific params.
     #[serde(default)]
@@ -991,6 +1019,7 @@ impl ImageOptimizerProfileSet {
 /// profile crop is replaced with an aspect-ratio crop derived from the request
 /// query value.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerAspectRatioConfig {
     /// Allowed aspect ratio query values such as `1-1` or `16-9`.
     #[serde(default, deserialize_with = "vec_from_seq_or_map")]
@@ -1059,6 +1088,7 @@ pub enum MissingCropOffsetMode {
 /// Offset bucketing caps output variant cardinality. Request values outside
 /// `0..=100` or values that fail to parse fall back to [`Self::default`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageOptimizerCropOffsetsConfig {
     /// Enable crop offset normalization.
     #[serde(
@@ -1310,6 +1340,7 @@ fn validate_crop_param(
 
 /// A path-prefix asset route that proxies matched first-party requests to an alternate origin.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyAssetRoute {
     /// Path prefix matched against the incoming request path. Must start with `/`.
     ///
@@ -1554,6 +1585,7 @@ impl ProxyAssetRoute {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Proxy {
     /// Enable TLS certificate verification when proxying to HTTPS origins.
     /// Defaults to true for secure production use.
@@ -1581,10 +1613,11 @@ fn default_certificate_check() -> bool {
 }
 
 fn is_admin_placeholder_password(password: &str) -> bool {
-    matches!(
-        password.trim().to_ascii_lowercase().as_str(),
-        "changeme" | "password" | "admin"
-    )
+    Handler::is_placeholder_password(password)
+        || matches!(
+            password.trim().to_ascii_lowercase().as_str(),
+            "changeme" | "password" | "admin"
+        )
 }
 
 impl Default for Proxy {
@@ -1623,7 +1656,7 @@ impl Proxy {
         }
 
         if self.allowed_domains.is_empty() {
-            log::info!(
+            log::debug!(
                 "proxy.allowed_domains is empty: all redirect destinations are permitted (open mode)"
             );
         }
@@ -1689,6 +1722,7 @@ impl Proxy {
 
 /// Debug-only features. All flags default to `false` (off in production).
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebugConfig {
     /// Expose the JA4/TLS fingerprint debug endpoint at `GET /_ts/debug/ja4`.
     ///
@@ -1708,6 +1742,7 @@ pub struct TesterCookieConfig {
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
@@ -1740,46 +1775,49 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Creates a new [`Settings`] instance from a pre-built TOML string.
-    ///
-    /// Use this for the runtime path where the TOML has already been
-    /// fully resolved (env vars baked in by build.rs).
+    /// Creates a new [`Settings`] instance from a TOML string.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     pub fn from_toml(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        let mut settings: Self =
+        let settings: Self =
             toml::from_str(toml_str).change_context(TrustedServerError::Configuration {
                 message: "Failed to deserialize TOML configuration".to_string(),
             })?;
 
-        settings.proxy.normalize();
-        settings.image_optimizer.normalize();
-        settings.consent.validate();
-        settings.prepare_runtime()?;
-
-        settings.validate().map_err(|err| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("Configuration validation failed: {err}"),
-            })
-        })?;
-
-        settings.validate_admin_coverage()?;
-        settings.validate_admin_handler_passwords()?;
-
-        Ok(settings)
+        Self::finalize_deserialized(settings, "Configuration")
     }
 
-    /// Creates a new [`Settings`] instance from a TOML string, applying
-    /// environment variable overrides using the `TRUSTED_SERVER__` prefix.
+    /// Creates a new [`Settings`] instance from a JSON value.
     ///
-    /// Used by build.rs to merge the base config with env vars before
-    /// baking the result into the binary.
+    /// Runtime config-store loading uses this after verifying the `app_config`
+    /// blob envelope and extracting the same typed settings shape.
+    ///
+    /// # Errors
+    ///
+    /// - [`TrustedServerError::Configuration`] if the JSON value is invalid or missing required fields
+    pub fn from_json_value(value: JsonValue) -> Result<Self, Report<TrustedServerError>> {
+        let settings: Self =
+            serde_json::from_value(value).change_context(TrustedServerError::Configuration {
+                message: "Failed to deserialize JSON configuration".to_string(),
+            })?;
+
+        Self::finalize_deserialized(settings, "Configuration")
+    }
+
+    /// Creates a new [`Settings`] instance from a TOML string with legacy
+    /// test-only `TRUSTED_SERVER__` environment variable overrides.
+    ///
+    /// Runtime loading does not use this legacy helper; `EdgeZero` CLI app-config
+    /// overlays are applied before deserializing [`crate::config::TrustedServerAppConfig`].
+    /// This helper remains available to existing tests that exercise legacy
+    /// parsing behavior.
     ///
     /// # Errors
     ///
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
+    #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
@@ -1793,25 +1831,33 @@ impl Settings {
             .change_context(TrustedServerError::Configuration {
                 message: "Failed to build configuration".to_string(),
             })?;
-        let mut settings: Self =
+        let settings: Self =
             config
                 .try_deserialize()
                 .change_context(TrustedServerError::Configuration {
                     message: "Failed to deserialize configuration".to_string(),
                 })?;
 
+        Self::finalize_deserialized(settings, "Build-time configuration")
+    }
+
+    pub(crate) fn finalize_deserialized(
+        mut settings: Self,
+        validation_label: &str,
+    ) -> Result<Self, Report<TrustedServerError>> {
         settings.integrations.normalize();
         settings.proxy.normalize();
         settings.image_optimizer.normalize();
         settings.consent.validate();
 
+        settings.prepare_runtime()?;
+
         settings.validate().map_err(|err| {
             Report::new(TrustedServerError::Configuration {
-                message: format!("Build-time configuration validation failed: {err}"),
+                message: format!("{validation_label} validation failed: {err}"),
             })
         })?;
 
-        settings.prepare_runtime()?;
         settings.validate_admin_coverage()?;
         settings.validate_admin_handler_passwords()?;
 
@@ -1866,6 +1912,11 @@ impl Settings {
         for partner in &self.ec.partners {
             if EcPartner::is_placeholder_api_token(partner.api_token.expose()) {
                 insecure_fields.push(format!("ec.partners[{}].api_token", partner.source_domain));
+            }
+        }
+        for handler in &self.handlers {
+            if Handler::is_placeholder_password(handler.password.expose()) {
+                insecure_fields.push(format!("handlers[{}].password", handler.path));
             }
         }
 
@@ -1930,7 +1981,7 @@ impl Settings {
 
     /// Known admin endpoint paths that must be covered by a handler.
     ///
-    /// [`from_toml_and_env`](Self::from_toml_and_env) rejects configurations
+    /// [`from_toml`](Self::from_toml) rejects configurations
     /// where any of these paths lack a matching handler, ensuring admin
     /// endpoints are always protected by authentication.
     /// Update [`ADMIN_ENDPOINTS`](Self::ADMIN_ENDPOINTS) when adding new
@@ -1940,8 +1991,8 @@ impl Settings {
 
     /// Returns admin endpoint paths that no configured handler covers.
     ///
-    /// Called by [`from_toml_and_env`](Self::from_toml_and_env) at build time
-    /// to enforce that every admin endpoint has a handler. An empty return
+    /// Called during settings finalization to enforce that every admin endpoint
+    /// has a handler. An empty return
     /// value means all admin endpoints are properly covered.
     ///
     /// # Errors
@@ -2681,6 +2732,32 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     #[test]
+    fn is_placeholder_handler_password_rejects_known_template_value() {
+        assert!(
+            Handler::is_placeholder_password("replace-with-admin-password-32-bytes"),
+            "init-template handler password should be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_placeholder_secrets_includes_handler_passwords() {
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.publisher.proxy_secret = Redacted::new("unit-test-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("test-secret-key-32-bytes-minimum".to_owned());
+        settings.handlers[0].password =
+            Redacted::new("replace-with-admin-password-32-bytes".to_owned());
+
+        let err = settings
+            .reject_placeholder_secrets()
+            .expect_err("should reject placeholder handler password");
+        assert!(
+            format!("{err:?}").contains("handlers"),
+            "error should mention handler password field"
+        );
+    }
+
+    #[test]
     fn test_settings_empty_toml() {
         let toml_str = "";
         let settings = Settings::from_toml(toml_str);
@@ -3394,7 +3471,10 @@ origin_host_header_overide = "www.example.com""#,
         let toml_str = crate_test_settings_str() + "\nhello = 1";
 
         let settings = Settings::from_toml(&toml_str);
-        assert!(settings.is_ok(), "Extra fields should be ignored");
+        assert!(
+            settings.is_err(),
+            "unknown top-level fields should be rejected"
+        );
     }
 
     #[test]

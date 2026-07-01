@@ -6,16 +6,13 @@ kind = "http"
 [adapters.spin]
 
 [stores.kv]
-name = "trusted_server_kv"
-
-[stores.kv.adapters.spin]
-name = "default"
+ids = ["trusted_server_kv"]
+default = "trusted_server_kv"
 
 [stores.config]
-name = "trusted_server_config"
+ids = ["trusted_server_config"]
+default = "trusted_server_config"
 
 [stores.secrets]
-name = "trusted_server_secrets"
-
-[stores.secrets.adapters.spin]
-enabled = true
+ids = ["trusted_server_secrets"]
+default = "trusted_server_secrets"

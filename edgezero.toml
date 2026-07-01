@@ -1,0 +1,25 @@
+[app]
+name = "trusted-server"
+
+[adapters.fastly.adapter]
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+auth-login = "fastly profile create"
+auth-logout = "fastly profile delete"
+auth-status = "fastly profile list"
+build = "cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 --color always"
+serve = "fastly compute serve"
+deploy = "fastly compute publish"
+
+[stores.config]
+ids = ["app_config"]
+default = "app_config"
+
+[stores.secrets]
+ids = ["secrets"]
+default = "secrets"
+
+[stores.kv]
+ids = ["ec_identity_store"]
+default = "ec_identity_store"

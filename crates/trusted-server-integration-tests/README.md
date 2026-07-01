@@ -21,10 +21,11 @@ containers using [Testcontainers](https://testcontainers.com/) and
 
 This script handles everything:
 
-1. Builds the WASM binary with test-specific config (origin URL pointing to
-   Docker containers)
-2. Builds the WordPress and Next.js Docker images
-3. Runs all integration tests sequentially
+1. Builds the WASM binary
+2. Generates Viceroy configs from the readable `trusted-server.integration.toml`
+   fixture
+3. Builds the WordPress and Next.js Docker images
+4. Runs all integration tests sequentially
 
 ### Browser tests
 
@@ -35,8 +36,9 @@ This script handles everything:
 This script:
 
 1. Builds the WASM binary and Docker images (same as above)
-2. Installs Playwright and Chromium
-3. Runs browser tests for Next.js and WordPress sequentially
+2. Generates the Viceroy config consumed by Playwright global setup
+3. Installs Playwright and Chromium
+4. Runs browser tests for Next.js and WordPress sequentially
 
 ### Run a single test
 
@@ -45,9 +47,11 @@ This script:
 ./scripts/integration-tests.sh test_wordpress_fastly
 ./scripts/integration-tests.sh test_nextjs_fastly
 
-# Browser — single framework
+# Browser — single framework after building WASM/images and generating configs
 cd crates/trusted-server-integration-tests/browser
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
 TEST_FRAMEWORK=nextjs npx playwright test
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
 TEST_FRAMEWORK=wordpress npx playwright test
 ```
 
@@ -80,6 +84,32 @@ docker build \
   -t test-nextjs:latest \
   crates/trusted-server-integration-tests/fixtures/frameworks/nextjs/
 ```
+
+## Generated Viceroy configs
+
+The source-controlled Viceroy template contains only local runtime resources such
+as KV stores, secret stores, and JWKS config. The Trusted Server application
+config is kept as readable TOML in
+`fixtures/configs/trusted-server.integration.toml` and converted into an
+EdgeZero `BlobEnvelope` at test setup time.
+
+Generate both legacy and EdgeZero Viceroy configs manually with:
+
+```bash
+ARTIFACTS_DIR=target/integration-test-artifacts \
+INTEGRATION_ORIGIN_PORT=8888 \
+./scripts/generate-integration-viceroy-configs.sh
+```
+
+Generated outputs:
+
+| File | Purpose |
+|---|---|
+| `target/integration-test-artifacts/configs/viceroy-legacy.toml` | Standard legacy-entry integration and browser tests (`edgezero_enabled = "false"`) |
+| `target/integration-test-artifacts/configs/viceroy-edgezero.toml` | EdgeZero EC lifecycle job (`edgezero_enabled = "true"`) |
+
+Set `VICEROY_CONFIG_PATH` to one of those generated files when invoking
+`cargo test` or Playwright directly.
 
 ## Test scenarios
 
@@ -158,7 +188,8 @@ browser/
     wordpress/         # WordPress-specific browser tests
 fixtures/
   configs/
-    viceroy-template.toml  # Viceroy local_server config (KV stores, secrets)
+    trusted-server.integration.toml  # Readable Trusted Server app-config source
+    viceroy-template.toml            # Viceroy local_server template (KV stores, secrets)
   frameworks/
     wordpress/             # WordPress Docker image source
     nextjs/                # Next.js Docker image source
@@ -168,9 +199,11 @@ fixtures/
 
 1. A Docker container starts for the frontend framework, mapped to a fixed
    origin port (default 8888)
-2. The WASM binary is pre-built with `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL`
-   pointing to `http://127.0.0.1:8888` so the proxy knows where to forward
-3. Viceroy spawns with the WASM binary on a random port
+2. `scripts/generate-integration-viceroy-configs.sh` reads
+   `fixtures/configs/trusted-server.integration.toml`, wraps it in an EdgeZero
+   `BlobEnvelope`, and injects it into generated Viceroy configs under
+   `target/integration-test-artifacts/configs/`
+3. Viceroy spawns with the WASM binary and generated config on a random port
 4. **HTTP tests**: reqwest sends requests to Viceroy and asserts on responses
 5. **Browser tests**: Playwright opens Chromium pointing at Viceroy and verifies
    script injection, bundle loading, and client-side navigation in a real browser
@@ -189,11 +222,14 @@ triggered by:
 - Pull request opened, updated, or reopened
 - Manual dispatch
 
-Three jobs run in sequence then parallel:
+Four jobs run in sequence then parallel:
 
-1. **prepare-artifacts** — builds the WASM binary and Docker images once
+1. **prepare-artifacts** — builds the WASM binary, Docker images, and generated
+   legacy/EdgeZero Viceroy configs once
 2. **integration-tests** — HTTP-level tests (Rust + testcontainers), runs after `prepare-artifacts`
-3. **browser-tests** — Playwright tests (Node.js + Chromium), runs after `prepare-artifacts` in parallel with `integration-tests`
+3. **integration-tests-edgezero** — EC lifecycle smoke tests against the
+   generated EdgeZero Viceroy config
+4. **browser-tests** — Playwright tests (Node.js + Chromium), runs after `prepare-artifacts` in parallel with `integration-tests`
 
 They are **not** part of `cargo test --workspace` because the integration-tests
 crate requires a native target while the workspace default is `wasm32-wasip1`.

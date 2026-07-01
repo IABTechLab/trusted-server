@@ -25,6 +25,8 @@ edgezero-adapter-spin = { workspace = true }
 edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
+futures = { workspace = true }
+http-body-util = "0.1"
 log = { workspace = true }
 trusted-server-core = { path = "../trusted-server-core" }
 trusted-server-js = { path = "../trusted-server-js" }
