@@ -535,7 +535,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
                     if let Some(effects) = &request_filter_effects {
                         effects.apply_to_response(&mut response);
                     }
-                    compat::to_fastly_response(response).send_to_client();
+                    send_core_response(response);
 
                     if ec_state.is_real_browser {
                         if let Some(context) = build_pull_sync_context(&ec_state.ec_context) {
@@ -564,7 +564,44 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     if let Some(effects) = &request_filter_effects {
         effects.apply_to_response(&mut response);
     }
-    compat::to_fastly_response(response).send_to_client();
+    send_core_response(response);
+}
+
+/// Sends a finalized `EdgeZero` response to the client.
+///
+/// Asset responses carry an [`EdgeBody::Stream`] body: the headers are committed
+/// first via [`fastly::Response::stream_to_client`], then the origin body is
+/// piped chunk-by-chunk with [`stream_asset_body`] so large images never
+/// materialize in the Wasm heap. This mirrors the legacy
+/// `HandlerOutcome::AssetStreaming` path. All other responses carry a buffered
+/// [`EdgeBody::Once`] body and are sent in a single shot.
+fn send_core_response(response: HttpResponse) {
+    let (parts, body) = response.into_parts();
+    match body {
+        EdgeBody::Stream(_) => {
+            let skeleton = compat::to_fastly_response_skeleton(HttpResponse::from_parts(
+                parts,
+                EdgeBody::empty(),
+            ));
+            let mut streaming_body = skeleton.stream_to_client();
+            match futures::executor::block_on(stream_asset_body(body, &mut streaming_body)) {
+                Ok(()) => {
+                    if let Err(e) = streaming_body.finish() {
+                        log::error!("failed to finish EdgeZero asset streaming body: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("EdgeZero asset streaming failed: {e:?}");
+                    // Headers already committed; drop the body so the client sees
+                    // a truncated response (EOF mid-stream), standard proxy behavior.
+                    drop(streaming_body);
+                }
+            }
+        }
+        once => {
+            compat::to_fastly_response(HttpResponse::from_parts(parts, once)).send_to_client();
+        }
+    }
 }
 
 fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
