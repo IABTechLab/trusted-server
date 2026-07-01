@@ -36,6 +36,9 @@ ts config init
 # Edit trusted-server.toml
 ts config validate
 
+# Audit a public page with Chrome/Chromium to bootstrap a draft config
+ts audit https://publisher.example
+
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly
 

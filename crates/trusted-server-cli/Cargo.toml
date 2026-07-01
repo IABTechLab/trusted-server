@@ -14,10 +14,20 @@ path = "src/main.rs"
 workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chromiumoxide = { workspace = true }
 clap = { workspace = true }
 edgezero-cli = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
+regex = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
 trusted-server-core = { workspace = true }
+url = { workspace = true }
+which = { workspace = true }
 
 # `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
 # automation via `networksetup`, and a native TLS / networking stack. Scoping
