@@ -58,20 +58,28 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    #[cfg(target_arch = "wasm32")]
-    if let Some(settings) = settings_from_cloudflare_config_json()? {
-        return build_state_with_settings(settings);
-    }
-
-    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
+    let settings = load_startup_settings()?;
     build_state_with_settings(settings)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn settings_from_cloudflare_config_json() -> Result<Option<Settings>, Report<TrustedServerError>> {
-    let Some(raw_config) = CLOUDFLARE_CONFIG_JSON.get() else {
-        return Ok(None);
-    };
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    settings_from_cloudflare_config_json()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
+        })
+        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+    })?;
     let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
         Report::new(TrustedServerError::Configuration {
             message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
@@ -86,7 +94,7 @@ fn settings_from_cloudflare_config_json() -> Result<Option<Settings>, Report<Tru
                 message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
             })
         })?;
-    settings_from_config_blob(envelope).map(Some)
+    settings_from_config_blob(envelope)
 }
 
 /// Build the application state from explicit settings.

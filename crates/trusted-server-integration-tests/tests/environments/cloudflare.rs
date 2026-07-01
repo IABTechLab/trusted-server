@@ -2,7 +2,7 @@ use crate::common::config::cloudflare_config_json;
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult, origin_port,
 };
-use error_stack::ResultExt as _;
+use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +25,7 @@ pub struct CloudflareWorkers;
 const CLOUDFLARE_DEFAULT_PORT: u16 = 8787;
 const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
 const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
+const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
 
 fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
     let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
@@ -35,10 +36,7 @@ fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
             template_path.display()
         ))?;
     let config_json = cloudflare_config_json(origin_port())?;
-    let generated = template.replace(
-        "TRUSTED_SERVER_CONFIG = \"{}\"",
-        &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
-    );
+    let generated = inject_cloudflare_config(&template, &config_json)?;
     let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
@@ -47,6 +45,20 @@ fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
             output_path.display()
         ))?;
     Ok(GENERATED_CI_CONFIG.to_string())
+}
+
+fn inject_cloudflare_config(template: &str, config_json: &str) -> TestResult<String> {
+    let placeholder_count = template.matches(TRUSTED_SERVER_CONFIG_PLACEHOLDER).count();
+    if placeholder_count != 1 {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "Cloudflare CI wrangler config must contain exactly one `{TRUSTED_SERVER_CONFIG_PLACEHOLDER}` placeholder, found {placeholder_count}"
+        )));
+    }
+
+    Ok(template.replace(
+        TRUSTED_SERVER_CONFIG_PLACEHOLDER,
+        &format!("TRUSTED_SERVER_CONFIG = '''{config_json}'''"),
+    ))
 }
 
 impl RuntimeEnvironment for CloudflareWorkers {
@@ -180,5 +192,45 @@ impl Drop for CloudflareHandle {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_cloudflare_config_replaces_single_placeholder() {
+        let template = format!("[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n");
+
+        let generated = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#)
+            .expect("should inject Cloudflare config");
+
+        assert!(
+            generated.contains("TRUSTED_SERVER_CONFIG = '''{\"app_config\":\"blob\"}'''"),
+            "should inject generated config JSON"
+        );
+        assert!(
+            !generated.contains(TRUSTED_SERVER_CONFIG_PLACEHOLDER),
+            "should remove placeholder"
+        );
+    }
+
+    #[test]
+    fn inject_cloudflare_config_rejects_missing_placeholder() {
+        let result = inject_cloudflare_config("[vars]\n", r#"{"app_config":"blob"}"#);
+
+        assert!(result.is_err(), "should reject missing placeholder");
+    }
+
+    #[test]
+    fn inject_cloudflare_config_rejects_duplicate_placeholders() {
+        let template = format!(
+            "[vars]\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n{TRUSTED_SERVER_CONFIG_PLACEHOLDER}\n"
+        );
+
+        let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
+
+        assert!(result.is_err(), "should reject duplicate placeholders");
     }
 }
