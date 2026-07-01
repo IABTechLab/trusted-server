@@ -201,9 +201,10 @@ jobs:
           components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
 
-      - name: cargo fmt (check)
-        run: cargo fmt --manifest-path crates/trusted-server-cli/Cargo.toml --check
-
+      # No separate `cargo fmt` here: `trusted-server-cli` is a workspace member,
+      # so the main `cargo fmt --all` job already formats it. Clippy still needs a
+      # native run — the workspace clippy jobs are wasm/adapter-scoped and never
+      # lint the CLI's host-only code (macOS dev proxy vs Linux audit differ by cfg).
       - name: cargo clippy
         run: |
           cargo clippy --manifest-path crates/trusted-server-cli/Cargo.toml --target "$(rustc -vV | sed -n 's/host: //p')" --all-targets -- -D warnings
