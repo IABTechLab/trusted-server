@@ -271,19 +271,36 @@ fi
 **One worktree setup, idempotent, common to all worktree-using modes**
 (BRANCH-LOCAL has `WT=""` and skips this entire block):
 
+This block adds the worktree **at most once** per invocation, and reuses the
+one from a prior invocation rather than adding a second. The decision keys off
+git's worktree *registry* — the source of truth — not just the directory's
+existence, because the two can disagree (a registered worktree whose directory
+was manually `rm -rf`'d, or a leftover directory git never registered). Keying
+off the directory alone would send a dangling-but-registered path into
+`git worktree add`, which then fails with "missing but already registered"
+instead of recreating.
+
 ```bash
 if [ -n "$WT" ]; then
-    if [ ! -e "$WT" ]; then
-        # First-time setup. `realpath "$WT"` would fail on a path that
-        # doesn't exist yet, so the existence check comes first.
-        git worktree add "$WT" "$HEAD_REF"
-    elif git worktree list --porcelain | grep -qx "worktree $(realpath "$WT")"; then
-        # Registered worktree from a prior invocation. The parent repo
-        # already ran the shared fetch above and verified $HEAD_OID_EXPECTED
-        # — linked worktrees share `.git`, so $HEAD_REF and
-        # `refs/remotes/origin/$BASE_BRANCH` are already current here. A
-        # second fetch would re-pull whatever the PR head looks like *now*
-        # (which could have moved between the verify and the reset), so
+    # Clear admin entries whose working directory was removed out from under
+    # git (e.g. a prior `rm -rf "$WT"`). This only touches already-broken
+    # registrations — a live worktree is never pruned — and it's what keeps a
+    # dangling entry from blocking the `git worktree add` below. `--expire now`
+    # forces immediate pruning rather than waiting out gc.worktreePruneExpire.
+    git worktree prune --expire now
+
+    # Is this exact path a *live* registered worktree? `git worktree list`
+    # prints absolute, symlink-resolved paths, so compare against the resolved
+    # form. `realpath` only runs when the directory exists (it errors on a
+    # missing path), so gate it behind the existence check.
+    if [ -e "$WT" ] && git worktree list --porcelain \
+            | grep -qx "worktree $(realpath "$WT")"; then
+        # Registered worktree from a prior invocation — reuse it, don't add a
+        # second. The parent repo already ran the shared fetch above and
+        # verified $HEAD_OID_EXPECTED; linked worktrees share `.git`, so
+        # $HEAD_REF and `refs/remotes/origin/$BASE_BRANCH` are already current
+        # here. A second fetch would re-pull whatever the PR head looks like
+        # *now* (which could have moved between the verify and the reset), so
         # don't fetch again; just reset to the already-verified $HEAD_REF.
         #
         # `reset --hard` + `clean -fd` restores tracked files and removes
@@ -298,13 +315,18 @@ if [ -n "$WT" ]; then
         git -C "$WT" reset --hard "$HEAD_REF"
         git -C "$WT" clean -fd
         git -C "$WT" clean -fdx crates/js/dist
-    else
-        # A directory exists at $WT but git doesn't know about it (aborted
-        # prior session, manual `rm -rf` of the metadata, etc.). Refuse to
-        # clobber it; the user can `git worktree remove --force "$WT"` or
-        # `rm -rf "$WT"` and re-invoke.
+    elif [ -e "$WT" ]; then
+        # A directory exists at $WT but git doesn't track it as a worktree
+        # (aborted prior session, manual copy, etc.). Refuse to clobber it; the
+        # user can `git worktree remove --force "$WT"` or `rm -rf "$WT"` and
+        # re-invoke.
         echo "$WT exists but is not a registered worktree; refusing to overwrite" >&2
         exit 1
+    else
+        # No directory (first-time setup, or the prune above cleared a dangling
+        # registration). This is the only `git worktree add` in the flow, and
+        # it's reached only when no live worktree exists for $WT.
+        git worktree add "$WT" "$HEAD_REF"
     fi
 fi
 ```
