@@ -1,6 +1,6 @@
 # Viceroy local server configuration template for integration tests.
 # This configures the Viceroy runtime itself (backends, KV stores, etc.),
-# separate from the application config (trusted-server.toml).
+# separate from the generated Trusted Server application config blob.
 
 [local_server]
 
@@ -67,6 +67,10 @@
             data = "test-api-key"
 
     [local_server.config_stores]
+        # Generated integration configs inject the app_config blob and
+        # trusted_server_config rollout flag at this marker.
+        # GENERATED_TRUSTED_SERVER_CONFIG_STORES
+
         [local_server.config_stores.jwks_store]
             format = "inline-toml"
         [local_server.config_stores.jwks_store.contents]

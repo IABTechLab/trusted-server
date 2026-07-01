@@ -65,8 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Streaming publisher responses** are buffered (bounded by
+//! - **Publisher responses** are buffered (bounded by
 //!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
+//!   Asset responses are streamed straight to the client (see
+//!   [`dispatch_asset_fallback`]), matching legacy.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -76,14 +78,14 @@
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
 //! finalization (geo and TS headers) when settings can be reloaded via
-//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
-//! fails, they are returned without geo or TS headers.
+//! [`load_settings_from_config_store`]; if settings loading itself fails, they
+//! are returned without geo or TS headers.
 
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use edgezero_adapter_fastly::FastlyRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -110,18 +112,19 @@ use trusted_server_core::integrations::{
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
-    AssetProxyCachePolicy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -152,12 +155,20 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(get_settings()?)
+    build_state_from_settings(load_settings_from_config_store()?)
+}
+
+pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
 }
 
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    warn_if_certificate_check_disabled(&settings);
+
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -169,6 +180,14 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
     }))
+}
+
+fn warn_if_certificate_check_disabled(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
+        );
+    }
 }
 
 /// Resolves per-request consent KV store services for routes that read consent data.
@@ -734,13 +753,13 @@ async fn dispatch_fallback(
     attach_dispatch_extensions(response, ec, effects)
 }
 
-/// Returns `true` when an asset response should carry a buffered body and a
-/// recomputed `Content-Length`.
+/// Returns `true` when an asset response should carry a (streamed) body.
 ///
 /// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
 /// representation length in their `Content-Length` header while carrying no
-/// body. Rewriting that header to the buffered byte count (0) would corrupt the
-/// metadata, so those responses keep the origin's `Content-Length` untouched.
+/// body. Attaching the origin stream would either contradict that header or
+/// stream bytes a client does not expect, so those responses drop the stream and
+/// keep the origin's `Content-Length` untouched.
 fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
     *method != Method::HEAD
         && status != StatusCode::NO_CONTENT
@@ -756,13 +775,13 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
 /// legacy `should_finalize_ec = false` behavior for asset responses.
 ///
-/// Unlike legacy `route_request`, which streams asset bodies straight to the
-/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
-/// converts the whole response before sending, so there is no streaming seam
-/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
-/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
-/// uncapped streaming are both resolved by the streaming cutover (issue #495);
-/// whether assets get a dedicated cap is deferred to that work.
+/// Like legacy `route_request`, asset bodies are streamed straight to the client
+/// with no cap: the origin stream is attached to the response and `edgezero_main`
+/// commits the headers, then pipes the body chunk-by-chunk via
+/// [`fastly::Response::stream_to_client`] and
+/// [`stream_asset_body`](trusted_server_core::proxy::stream_asset_body). The
+/// origin stream is left untouched here, so large images never materialize in
+/// the Wasm heap.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -779,30 +798,13 @@ async fn dispatch_asset_fallback(
             let cache_policy = asset_response.cache_policy();
             let (mut response, stream_body) = asset_response.into_response_and_body();
 
+            // Attach the origin stream so `edgezero_main` streams it to the
+            // client. HEAD and bodiless statuses (204, 304) advertise the origin
+            // Content-Length but carry no body, so their stream is dropped to
+            // preserve that header and avoid a length/body mismatch.
             if let Some(body) = stream_body {
-                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
-                    .await
-                {
-                    Ok(bytes) => {
-                        // Preserve the origin's Content-Length for HEAD and
-                        // bodiless statuses; only body-bearing responses get a
-                        // recomputed length and the buffered body attached.
-                        if asset_response_carries_body(&method, response.status()) {
-                            response.headers_mut().insert(
-                                header::CONTENT_LENGTH,
-                                HeaderValue::from(bytes.len() as u64),
-                            );
-                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
-                        }
-                    }
-                    Err(report) => {
-                        let mut response = http_error(&report);
-                        response
-                            .extensions_mut()
-                            .insert(AssetProxyCachePolicy::NoStorePrivate);
-                        attach_request_filter_effects(&mut response, effects);
-                        return response;
-                    }
+                if asset_response_carries_body(&method, response.status()) {
+                    *response.body_mut() = body;
                 }
             }
 
@@ -831,23 +833,6 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
     if !effects.response_headers.is_empty() {
         response.extensions_mut().insert(effects.clone());
     }
-}
-
-/// Buffers a streaming asset body into memory, bounded by `max_bytes`
-/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
-/// [`dispatch_asset_fallback`]).
-///
-/// # Errors
-///
-/// Returns an error if the body exceeds the configured cap or the underlying
-/// stream yields an error.
-async fn buffer_asset_body(
-    body: edgezero_core::body::Body,
-    max_bytes: usize,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let mut output = BoundedWriter::new(max_bytes);
-    stream_asset_body(body, &mut output).await?;
-    Ok(output.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1059,25 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
+    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state();
+        let mut app = App::with_name(router, Self::name());
+        Self::configure(&mut app);
+        (app, state)
+    }
+
+    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state() {
+            Ok(state) => state,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), None);
+            }
+        };
+
+        (Self::routes_for_state(&state), Some(state))
+    }
+
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
@@ -1121,15 +1125,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        Self::routes_for_state(&state)
+        Self::router_with_state().0
     }
 }
 
@@ -1141,9 +1137,13 @@ mod tests {
         build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
         TrustedServerApp, NAMED_ROUTES,
     };
+    use crate::route_tests::{
+        test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
+        FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
+    };
 
     use edgezero_core::body::Body;
-    use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::http::{header, request_builder, Method, Response, StatusCode};
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1158,7 +1158,7 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
-    use trusted_server_core::platform::ClientInfo;
+    use trusted_server_core::platform::{ClientInfo, PlatformHttpClient};
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1215,6 +1215,10 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
+    }
+
+    fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
+        block_on(router.oneshot(request)).expect("should route request")
     }
 
     fn test_settings() -> Settings {
@@ -1360,8 +1364,8 @@ mod tests {
         });
         let router = startup_error_router(&report);
 
-        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")));
-        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")));
+        let head_response = route(&router, empty_request(Method::HEAD, "/"));
+        let options_response = route(&router, empty_request(Method::OPTIONS, "/any"));
 
         assert_eq!(
             head_response.status(),
@@ -1451,7 +1455,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1571,7 +1575,7 @@ mod tests {
                     .body(Body::from("{\"key_id\":\"leak-me\"}"))
                     .expect("should build authorized legacy-alias request");
 
-                let response = block_on(router.oneshot(req));
+                let response = route(&router, req);
 
                 assert_eq!(
                     response.status(),
@@ -1589,8 +1593,10 @@ mod tests {
         // header), not the publisher fallback, which would fail with a
         // gateway error without a live backend.
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
+        let response = route(
+            &router,
+            empty_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1606,7 +1612,7 @@ mod tests {
         // require_identity_graph fails with a KvStore error (503) — proving
         // the request was NOT proxied to the publisher origin.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
 
         assert_eq!(
             response.status(),
@@ -1623,8 +1629,10 @@ mod tests {
         // ec.ec_store configured, require_identity_graph fails with a KvStore
         // error (503).
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
+        let response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1636,7 +1644,7 @@ mod tests {
     #[test]
     fn dispatch_set_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1655,7 +1663,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1677,7 +1685,7 @@ mod tests {
     #[test]
     fn dispatch_clear_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1696,7 +1704,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1722,7 +1730,7 @@ mod tests {
         // point via response extensions — even on error responses — so that
         // edgezero_main can run ec_finalize_response and pull sync.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
@@ -1747,7 +1755,7 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         let finalize = response
             .extensions()
@@ -1766,7 +1774,7 @@ mod tests {
         // documents the regression the extension threading fixes: the same
         // request that looks like a browser above is treated as a bot here.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let finalize = response
             .extensions()
@@ -1802,7 +1810,7 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = block_on(router.oneshot(req));
+        let _ = route(&router, req);
 
         let observed = captured
             .lock()
@@ -1846,10 +1854,10 @@ mod tests {
         // Named routes must also thread EC finalize state, mirroring how the
         // legacy path finalizes every response with the pre-routing EcContext.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(
-            Method::GET,
-            "/.well-known/trusted-server.json",
-        )));
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
 
         assert!(
             response
@@ -1872,7 +1880,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::HEAD, "/first-party/proxy");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_ne!(
             response.status(),
@@ -1893,7 +1901,7 @@ mod tests {
             .body(Body::from(body))
             .expect("should build auction request");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1917,7 +1925,7 @@ mod tests {
             "/",
         );
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1938,8 +1946,10 @@ mod tests {
         let state = app_state_for_settings(settings_with_missing_consent_store());
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/admin/keys/rotate")));
+        let admin_response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/admin/keys/rotate"),
+        );
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
@@ -1951,15 +1961,14 @@ mod tests {
             .uri("/auction")
             .body(Body::from(r#"{"adUnits":[]}"#))
             .expect("should build auction request");
-        let auction_response = block_on(router.oneshot(auction_request));
+        let auction_response = route(&router, auction_request);
         assert_eq!(
             auction_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "auction should fail closed when configured consent KV cannot be opened"
         );
 
-        let publisher_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
+        let publisher_response = route(&router, empty_request(Method::GET, "/articles/example"));
         assert_eq!(
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1969,8 +1978,10 @@ mod tests {
         // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
         // is wired only into the publisher and auction branches of dispatch_fallback, not into
         // the integration proxy branch. A missing consent store must not 503 integration routes.
-        let integration_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        let integration_response = route(
+            &router,
+            empty_request(Method::GET, "/integrations/datadome/tags.js"),
+        );
         assert_ne!(
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2018,7 +2029,7 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+        let response = route(&router, empty_request(Method::GET, "/.image/banner.png"));
 
         assert!(
             response
@@ -2037,6 +2048,79 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
+        // Regression guard for the EdgeZero asset streaming cutover: a successful
+        // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
+        // rather than draining the origin into a buffered `Body::Once`. Injecting a
+        // streaming HTTP client lets us assert the body type the entry point will
+        // pipe straight to the client via `stream_to_client`.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+
+        let fastly_req = fastly::Request::get("https://test-publisher.com/.images/logo.png");
+        let http_client = Arc::new(StreamingRecordingHttpClient::new());
+        let services = test_runtime_services_with_secret_http_client_and_geo(
+            &fastly_req,
+            Arc::new(FixedBackend),
+            Arc::new(NoopSecretStore),
+            Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+            Arc::new(FixedGeo(us_california_geo())),
+        );
+        let req = crate::compat::from_fastly_request(fastly_req);
+        let asset_route = state
+            .settings
+            .asset_route_for_path("/.images/logo.png")
+            .expect("should match the configured asset route");
+        let effects = RequestFilterEffects::default();
+
+        let response = block_on(super::dispatch_asset_fallback(
+            &state,
+            &services,
+            req,
+            asset_route,
+            &effects,
+        ));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should preserve the streaming origin status"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero asset dispatch must stream the origin body, not buffer it"
+        );
+    }
+
+    #[test]
     fn dispatch_runs_request_filter_and_threads_response_effects() {
         // Regression guard for the EdgeZero request-filter bypass: the publisher
         // fallback must run the integration request-filter pipeline (DataDome
@@ -2046,7 +2130,7 @@ mod tests {
         // still carry the RequestFilterEffects the filter emitted — proving the
         // filter ran on the dispatch path.
         let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let effects = response
             .extensions()
@@ -2068,7 +2152,7 @@ mod tests {
         // fallback, return its own response, still carry EcFinalizeState (legacy
         // parity: Respond keeps EC finalization), and thread its response effects.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert_eq!(
             response.status(),

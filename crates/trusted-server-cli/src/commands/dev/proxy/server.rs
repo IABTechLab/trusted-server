@@ -475,7 +475,7 @@ async fn proxy_to_upstream(
         send_over(TokioIo::new(tcp), req).await?
     };
 
-    Ok(response.map(|body| body.boxed()))
+    Ok(response.map(http_body_util::BodyExt::boxed))
 }
 
 /// Drives one HTTP/1.1 request/response over an established (TLS or plain) IO.

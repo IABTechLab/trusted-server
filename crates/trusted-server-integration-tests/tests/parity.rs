@@ -10,7 +10,7 @@
 // axum::http re-exports from the `http` crate, so HeaderMap types are identical.
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
-use edgezero_adapter_axum::EdgeZeroAxumService;
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
@@ -143,7 +143,7 @@ async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     let resp = router.oneshot(req).await.expect("should respond");
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes();
+    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
     (status, headers, body_bytes)
 }
 
@@ -164,7 +164,7 @@ async fn spin_get_body(uri: &str) -> (u16, HeaderMap, bytes::Bytes) {
     let resp = router.oneshot(req).await.expect("should respond");
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes();
+    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
     (status, headers, body_bytes)
 }
 
@@ -186,7 +186,7 @@ async fn spin_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     let resp = router.oneshot(req).await.expect("should respond");
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body_bytes = resp.into_body().into_bytes();
+    let body_bytes = resp.into_body().into_bytes().unwrap_or_default();
     (status, headers, body_bytes)
 }
 
@@ -326,7 +326,7 @@ async fn discovery_route_body_is_json_parity() {
             .expect("should build GET request");
         let resp = router.oneshot(req).await.expect("should respond");
         let status = resp.status().as_u16();
-        let body = resp.into_body().into_bytes();
+        let body = resp.into_body().into_bytes().unwrap_or_default();
         (status, body)
     };
 

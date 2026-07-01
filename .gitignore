@@ -21,6 +21,7 @@
 
 # env
 .env*
+trusted-server.toml
 
 # backup
 **/*.rs.bk

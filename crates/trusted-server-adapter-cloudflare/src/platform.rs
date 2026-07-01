@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::{ConfigStoreHandle, KvHandle, KvPage, KvStore};
+use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::Report;
 use trusted_server_core::platform::{
     ClientInfo, GeoInfo, KvError, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
@@ -99,8 +100,7 @@ struct ConfigStoreHandleAdapter(ConfigStoreHandle);
 
 impl PlatformConfigStore for ConfigStoreHandleAdapter {
     fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        self.0
-            .get(key)
+        futures::executor::block_on(self.0.get(key))
             .map_err(|e| {
                 Report::new(PlatformError::ConfigStore)
                     .attach(format!("config store lookup failed: {e}"))
@@ -559,20 +559,20 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
 
     // Config: use the ConfigStoreHandle injected by run_app — no #[cfg] needed.
     let config_store: Arc<dyn PlatformConfigStore> = ctx
-        .config_store()
+        .config_store_default()
         .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
     // KV: use the KvHandle injected by run_app — no #[cfg] needed.
     let kv_store: Arc<dyn PlatformKvStore> = ctx
-        .kv_handle()
+        .kv_store_default()
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
         .unwrap_or_else(|| Arc::new(UnavailableKvStore));
 
     // Secrets: still requires wasm32-specific env.secret() (async/sync mismatch).
     #[cfg(target_arch = "wasm32")]
     let secret_store: Arc<dyn PlatformSecretStore> =
-        edgezero_adapter_cloudflare::CloudflareRequestContext::get(ctx.request())
+        edgezero_adapter_cloudflare::context::CloudflareRequestContext::get(ctx.request())
             .map(|cf_ctx| {
                 Arc::new(CloudflareSecretStoreAdapter {
                     env: cf_ctx.env().clone(),

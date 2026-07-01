@@ -128,10 +128,10 @@ pub enum CaCommand {
 ///
 /// Returns [`ProxyError`] if configuration, the CA, the server, or browser
 /// orchestration fails.
-pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<ProxyError>> {
+pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<ProxyError>> {
     // CA subcommands need only the CA directory — handle them before rule resolution.
     if let Some(ProxySub::Ca { action }) = &args.command {
-        let ca_dir = config::ca_dir(&args);
+        let ca_dir = config::ca_dir(args);
         let cert_path = ca::CertAuthority::cert_path(&ca_dir);
         match action {
             CaCommand::Path => {
@@ -147,7 +147,10 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
                 browser::ca_install(&cert_path);
             }
             CaCommand::Uninstall => {
-                browser::ca_uninstall();
+                // `ca_uninstall` warns loudly on a failed removal; for the
+                // explicit `ca uninstall` command that warning is the signal, so
+                // the boolean result is intentionally not escalated to an error.
+                let _ = browser::ca_uninstall();
             }
             CaCommand::Regenerate => {
                 // Revoke OS trust for the OLD CA first. The old and new CA share
@@ -195,9 +198,9 @@ pub fn run(args: ProxyArgs) -> core::result::Result<(), error_stack::Report<Prox
     // BEFORE resolving rules: a missing/bad rule must not strand the system
     // proxy. `ca_dir` needs no rule. Non-interactive so an unrelated startup
     // never blocks on a sudo password prompt.
-    browser::restore_system_proxy_if_pending(&config::ca_dir(&args), false);
+    browser::restore_system_proxy_if_pending(&config::ca_dir(args), false);
 
-    let cfg = Arc::new(config::resolve(&args).change_context(ProxyError::Config)?);
+    let cfg = Arc::new(config::resolve(args).change_context(ProxyError::Config)?);
 
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)

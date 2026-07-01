@@ -125,6 +125,10 @@ impl CertAuthority {
     /// # Errors
     ///
     /// Returns [`CaError`] if leaf minting or rustls config construction fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the leaf-cache mutex is poisoned by a prior panic while held.
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>, Report<CaError>> {
         // Fast path: return a cached config without holding the lock during minting.
         {

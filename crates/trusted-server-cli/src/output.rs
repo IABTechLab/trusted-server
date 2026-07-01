@@ -13,8 +13,3 @@ pub fn info(message: &str) {
 pub fn warn(message: &str) {
     eprintln!("warning: {message}");
 }
-
-/// Prints an error line to stderr.
-pub fn error(message: &str) {
-    eprintln!("error: {message}");
-}

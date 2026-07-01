@@ -2,8 +2,8 @@
 //! hosts on loopback are blind-tunnelled; injected Basic auth clears a gate; and
 //! one keep-alive tunnel carries many sequential requests (spec §5/§8/§11/§14).
 //!
-//! Run with: cargo test --manifest-path crates/trusted-server-cli/Cargo.toml \
-//!   --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_e2e
+//! Run with: `cargo test --manifest-path crates/trusted-server-cli/Cargo.toml
+//!   --target "$(rustc -vV | sed -n 's/host: //p')" --test proxy_e2e`
 
 // The proxy under test is macOS-only (see `lib.rs`); skip this entire test crate
 // on other targets so it does not reference the macOS-scoped dev-dependencies.

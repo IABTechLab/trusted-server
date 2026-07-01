@@ -1,26 +1,30 @@
-[workspace]
-
 [package]
 name = "trusted-server-cli"
 version = "0.1.0"
+authors = []
 edition = "2024"
 publish = false
-
-[lib]
-name = "trusted_server_cli"
-path = "src/lib.rs"
+license = "Apache-2.0"
 
 [[bin]]
 name = "ts"
 path = "src/main.rs"
 
-# `ts dev proxy` (this crate's only command) is macOS-only — CA trust via the
-# login keychain, Safari automation via `networksetup`, and a native TLS /
-# networking stack. Scoping every dependency to macOS keeps unsupported targets
-# (notably the repo-default `wasm32-wasip1` from `.cargo/config.toml`) from
-# trying to build `tokio`, `ring`, or `aws-lc-sys` for a target they do not
-# support; on those targets the crate is an empty shell. Build natively with an
-# explicit `--target` (e.g. `aarch64-apple-darwin`).
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { workspace = true }
+edgezero-cli = { workspace = true }
+log = { workspace = true }
+trusted-server-core = { workspace = true }
+
+# `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
+# automation via `networksetup`, and a native TLS / networking stack. Scoping
+# these dependencies to macOS keeps unsupported targets (notably the
+# repo-default `wasm32-wasip1` from `.cargo/config.toml`) from trying to build
+# `tokio`, `ring`, or `aws-lc-sys` for a target they do not support; on those
+# targets the `dev` subcommand is simply absent.
 [target.'cfg(target_os = "macos")'.dependencies]
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
@@ -33,11 +37,8 @@ webpki-roots = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 rustls-pemfile = "2"
-clap = { version = "4", features = ["derive"] }
 error-stack = "0.6"
 derive_more = { version = "2.0", features = ["display", "error"] }
-log = "0.4"
-env_logger = "0.11"
 base64 = "0.22"
 directories = "5"
 # Secure (O_EXCL, random-named, 0700) temp dirs for throwaway browser profiles.
@@ -47,8 +48,5 @@ tempfile = "3"
 reqwest = { version = "0.12", features = ["blocking"] }
 x509-parser = "0.16"
 
-[lints.clippy]
-unwrap_used = "deny"
-panic = "deny"
-print_stdout = "warn"
-print_stderr = "warn"
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = { workspace = true }

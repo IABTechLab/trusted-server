@@ -103,6 +103,12 @@ cargo test-axum
 
 ## Configuration
 
+Create a starter Trusted Server config with the `ts` CLI:
+
+```bash
+ts config init
+```
+
 Edit `trusted-server.toml` to configure:
 
 - Ad server integrations
@@ -110,7 +116,13 @@ Edit `trusted-server.toml` to configure:
 - EC configuration
 - GDPR settings
 
-See [Configuration](/guide/configuration) for details.
+Validate the config before pushing it to platform storage:
+
+```bash
+ts config validate
+```
+
+See [Configuration](/guide/configuration) and [Trusted Server CLI](/guide/cli) for details.
 
 ## Deploy to Fastly
 

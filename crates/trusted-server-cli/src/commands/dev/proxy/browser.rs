@@ -107,6 +107,7 @@ pub fn ca_install(cert_path: &Path) {
 /// the CA's common name after repeated installs, so it deletes until none are
 /// found. On non-macOS systems, prints a manual note and returns `true`. Never
 /// panics.
+#[must_use]
 pub fn ca_uninstall() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -336,7 +337,7 @@ fn chrome_command() -> Command {
 
 /// Launches Firefox in a temporary profile configured for HTTPS-only proxying.
 ///
-/// Writes `user.js` with `network.proxy.type=1` (manual) and ssl/ssl_port
+/// Writes `user.js` with `network.proxy.type=1` (manual) and `ssl`/`ssl_port`
 /// settings only — HTTP traffic is left to go direct (spec §9).  Also imports
 /// the CA into the profile's NSS database via `certutil` if available.
 fn launch_firefox(cfg: &ResolvedConfig) {

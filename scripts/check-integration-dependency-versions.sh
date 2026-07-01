@@ -85,6 +85,27 @@ transitive_parity_allowlist=(
     "wasm-bindgen-shared"
     # Forced newer by an integration-only dependency.
     "num-conv"
+    # The workspace now pulls these through EdgeZero / production-only config
+    # tooling while the integration crate's native test stack resolves different
+    # compatible major/minor lines, or no longer resolves the old line after
+    # trusted-server-core stopped depending on the config crate.
+    "convert_case"
+    "hashbrown"
+    "reqwest"
+    "toml_datetime"
+    "winnow"
+    # The integration crate's native dependency tree and the wasm workspace pull
+    # different Windows support crate lines; Linux CI does not exercise these.
+    "windows_aarch64_gnullvm"
+    "windows_aarch64_msvc"
+    "windows_i686_gnu"
+    "windows_i686_gnullvm"
+    "windows_i686_msvc"
+    "windows_x86_64_gnu"
+    "windows_x86_64_gnullvm"
+    "windows_x86_64_msvc"
+    "windows-sys"
+    "windows-targets"
     # The workspace pins an older 0.10.x via a production-only dependency; the
     # integration tree only needs 0.13/0.14, so the 0.10 line is never resolved.
     "itertools"
@@ -93,7 +114,6 @@ transitive_parity_allowlist=(
     # the lines needed by its native test graph.
     "bitflags"
     "matchit"
-    "reqwest"
     "syn"
     "tower"
     # The integration graph compiles trusted-server-core's sha2 0.10/HMAC path;
@@ -105,18 +125,6 @@ transitive_parity_allowlist=(
     # workspace also carries a thiserror 1.x line.
     "thiserror"
     "thiserror-impl"
-    # The integration test stack pulls platform crates through tokio and
-    # testcontainers on Windows semver lines that differ from the workspace.
-    "windows-sys"
-    "windows-targets"
-    "windows_aarch64_gnullvm"
-    "windows_aarch64_msvc"
-    "windows_i686_gnu"
-    "windows_i686_gnullvm"
-    "windows_i686_msvc"
-    "windows_x86_64_gnu"
-    "windows_x86_64_gnullvm"
-    "windows_x86_64_msvc"
     # WASI/component-model crates are resolved by target-specific adapter
     # dependencies; the native integration graph does not use every line.
     "wit-bindgen"

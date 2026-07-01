@@ -2,8 +2,8 @@
 #
 # Run integration tests locally.
 #
-# Builds the WASM binary with test-specific config overrides,
-# Docker test images, and runs all integration tests.
+# Builds the WASM binary, generates Viceroy app_config runtime config,
+# builds Docker test images, and runs all integration tests.
 #
 # Prerequisites:
 #   - Docker running
@@ -15,7 +15,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Fixed origin port — must match the port baked into the WASM binary.
+# Fixed origin port used by generated Viceroy app_config.
 # Docker containers are mapped to this port so the trusted-server
 # can proxy requests to them.
 ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
@@ -50,13 +50,8 @@ if [ -z "$TARGET" ]; then
     exit 1
 fi
 
-echo "==> Building Fastly WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
-TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
-TRUSTED_SERVER__EC__PASSPHRASE="integration-test-ec-secret-padded-32" \
-TRUSTED_SERVER__EC__PARTNERS='[{"name":"Integration Test Partner","source_domain":"inttest.example.com","bidstream_enabled":true,"api_token":"integration-test-token-alpha-32-bytes-ok"},{"name":"Integration Test Partner 2","source_domain":"inttest2.example.com","bidstream_enabled":true,"api_token":"integration-test-token-bravo-32-bytes-ok"}]' \
-TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
-    cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+echo "==> Building WASM binary..."
+cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 
 echo "==> Building Axum native binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
@@ -64,6 +59,10 @@ TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
 TRUSTED_SERVER__EDGE_COOKIE__SECRET_KEY="integration-test-secret-key" \
 TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
     cargo build -p trusted-server-adapter-axum
+
+echo "==> Generating Viceroy configs..."
+INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
+VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
 
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
@@ -79,6 +78,7 @@ echo "==> Running integration tests (target: $TARGET, origin port: $ORIGIN_PORT)
 WASM_BINARY_PATH="$REPO_ROOT/target/wasm32-wasip1/release/trusted-server-adapter-fastly.wasm" \
 AXUM_BINARY_PATH="$REPO_ROOT/target/debug/trusted-server-axum" \
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" \
+VICEROY_CONFIG_PATH="$VICEROY_CONFIG_PATH" \
 RUST_LOG=info \
     cargo test \
         --manifest-path crates/trusted-server-integration-tests/Cargo.toml \

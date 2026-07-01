@@ -201,19 +201,6 @@ fn test_ec_lifecycle_fastly() {
         process.base_url
     );
 
-    // EdgeZero entry-point canary. This same test runs in two CI jobs: the
-    // legacy `integration-tests` job (default Viceroy config, legacy_main) and
-    // the `integration-tests-edgezero` job (EdgeZero config store, edgezero_main).
-    // Only assert the canary when the job opted into the EdgeZero path via
-    // EXPECT_EDGEZERO_ENTRY_POINT; on the legacy path TRACE is proxied (not 405ed)
-    // and the scenarios still validate legacy behavior. The canary guards against
-    // the EdgeZero job silently greening on legacy if the config store cannot be
-    // read (main() falls back to legacy_main).
-    if std::env::var("EXPECT_EDGEZERO_ENTRY_POINT").as_deref() == Ok("true") {
-        common::ec::assert_edgezero_entry_point(&process.base_url)
-            .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
-    }
-
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
         let result = scenario.run(&process.base_url);

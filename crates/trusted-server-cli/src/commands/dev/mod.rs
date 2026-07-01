@@ -1,20 +1,25 @@
+// `ts dev proxy` is macOS-only; its dependencies are scoped to macOS in
+// `Cargo.toml`, so the module and the `Proxy` subcommand only exist there. On
+// other host targets `ts dev` parses but exposes no subcommands.
+#[cfg(target_os = "macos")]
 pub mod proxy;
-
-use proxy::{ProxyArgs, ProxyError};
 
 /// The `ts dev …` command group.
 #[derive(Debug, clap::Subcommand)]
 pub enum DevCommand {
-    /// Run the local production-hostname dev proxy.
-    Proxy(ProxyArgs),
+    /// Run the local production-hostname dev proxy (macOS only).
+    #[cfg(target_os = "macos")]
+    Proxy(proxy::ProxyArgs),
 }
 
 /// Dispatches a `dev` subcommand.
 ///
 /// # Errors
-/// Propagates failures from the chosen subcommand.
-pub fn run(command: DevCommand) -> Result<(), error_stack::Report<ProxyError>> {
+/// Returns the subcommand's failure rendered as a message. On non-macOS targets
+/// `DevCommand` has no variants, so this never returns an error there.
+pub fn run(command: DevCommand) -> Result<(), String> {
     match command {
-        DevCommand::Proxy(args) => proxy::run(args),
+        #[cfg(target_os = "macos")]
+        DevCommand::Proxy(args) => proxy::run(&args).map_err(|report| format!("{report:?}")),
     }
 }
