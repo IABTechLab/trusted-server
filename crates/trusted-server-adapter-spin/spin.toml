@@ -46,4 +46,4 @@ v_active_x2dkids = "{{ v_active_x2dkids }}"
 
 [component.trusted-server.build]
 command = "cargo build --target wasm32-wasip1 --release -p trusted-server-adapter-spin --features spin"
-watch = ["src/**/*.rs", "Cargo.toml", "edgezero.toml", "spin.toml"]
+watch = ["src/**/*.rs", "Cargo.toml", "../../edgezero.toml", "spin.toml"]
