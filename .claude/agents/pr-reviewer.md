@@ -126,9 +126,16 @@ resolved input values before running the block.
 ```bash
 # === PR mode ===
 NUMBER="<number>"
+# Normalize to bare digits so the same PR always maps to the same worktree and
+# review ref: a "#707" input and a "707" input must both yield pr-707-review,
+# not two separate worktrees.
+NUMBER="${NUMBER#\#}"
 gh pr view "$NUMBER" --json \
     number,title,body,headRefName,headRefOid,baseRefName,headRepository,headRepositoryOwner,isCrossRepository,commits
 MODE=PR
+# Exactly one worktree per PR: keyed on $NUMBER, reused across passes on the
+# same PR (the idempotent setup below resets it to $HEAD_REF rather than adding
+# a second worktree).
 WT=.claude/worktrees/pr-${NUMBER}-review
 BASE_BRANCH="<baseRefName>"
 BASE_REF=origin/$BASE_BRANCH
