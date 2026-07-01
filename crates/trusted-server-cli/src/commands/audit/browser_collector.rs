@@ -11,7 +11,7 @@ use tokio::time::{sleep, timeout};
 use url::Url;
 use which::which;
 
-use crate::audit::collector::{
+use crate::commands::audit::collector::{
     AuditCollector, CollectedPage, CollectedRequest, CollectedScriptTag,
 };
 use crate::error::{CliResult, report_error};
