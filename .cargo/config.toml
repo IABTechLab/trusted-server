@@ -15,12 +15,15 @@
 test_details = ["test", "--target", "aarch64-apple-darwin"]
 
 # --- Fastly adapter (wasm32-wasip1, run via Viceroy) ---
-# Fastly + shared crates only. Excludes Axum (native), Cloudflare
-# (wasm32-unknown-unknown), and Spin (separate wasm32-wasip1 job).
-build-fastly = ["build", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
-check-fastly = ["check", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
-clippy-fastly = ["clippy", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
-test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
+# Whitelist the wasm-buildable crates (the Fastly adapter + the shared crates it
+# builds/tests on wasm) rather than blacklisting every native crate — so adding a
+# native crate needs no change here. Axum (native), Cloudflare
+# (wasm32-unknown-unknown), Spin, the CLI (native), and integration-tests
+# (native) are simply not listed.
+build-fastly = ["build", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+check-fastly = ["check", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
+clippy-fastly = ["clippy", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--all-targets", "--all-features", "--target", "wasm32-wasip1", "--", "-D", "warnings"]
+test-fastly = ["test", "-p", "trusted-server-core", "-p", "trusted-server-adapter-fastly", "-p", "trusted-server-js", "-p", "trusted-server-openrtb", "--target", "wasm32-wasip1"]
 
 # --- Axum adapter (native dev server) ---
 build-axum = ["build", "-p", "trusted-server-adapter-axum"]

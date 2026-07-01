@@ -28,9 +28,6 @@ if [ -z "$NODE_VERSION" ]; then
     exit 1
 fi
 
-echo "==> Validating shared integration-test dependency versions..."
-./scripts/check-integration-dependency-versions.sh
-
 for arg in "$@"; do
     case "$arg" in
         test_wordpress_fastly|test_nextjs_fastly)

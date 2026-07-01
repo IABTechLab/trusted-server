@@ -26,14 +26,14 @@ error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
-trusted-server-core = { path = "../trusted-server-core" }
-trusted-server-js = { path = "../trusted-server-js" }
-worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
+trusted-server-core = { workspace = true }
+trusted-server-js = { workspace = true }
+worker = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
 js-sys = { workspace = true }
-worker = { version = "0.8", default-features = false, features = ["http"] }
+worker = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
