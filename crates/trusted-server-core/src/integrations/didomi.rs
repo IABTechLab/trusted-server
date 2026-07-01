@@ -164,6 +164,10 @@ impl DidomiIntegration {
             );
         }
 
+        // `Authorization` is intentionally NOT forwarded: it carries the
+        // publisher site's own credential (e.g. staging basic-auth), which would
+        // leak to the third-party upstream and can break APIs that reject an
+        // unexpected `Authorization` header.
         for header_name in [
             header::ACCEPT,
             header::ACCEPT_LANGUAGE,
@@ -172,7 +176,6 @@ impl DidomiIntegration {
             header::USER_AGENT,
             header::REFERER,
             header::ORIGIN,
-            header::AUTHORIZATION,
         ] {
             if let Some(value) = original_headers.get(&header_name) {
                 proxy_headers.insert(header_name, value.clone());
@@ -444,6 +447,46 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1.2.3.4"),
             "should set X-Forwarded-For from client_ip"
+        );
+    }
+
+    #[test]
+    fn copy_headers_strips_authorization() {
+        // Security regression guard: the publisher's Authorization header must
+        // not be forwarded to the Didomi upstream (credential leak).
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Api;
+        let original_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/test")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build original request");
+        let mut proxy_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://api.privacy-center.org/test")
+            .body(EdgeBody::empty())
+            .expect("should build proxy request");
+
+        integration.copy_headers(
+            &backend,
+            None,
+            original_req.headers(),
+            proxy_req.headers_mut(),
+        );
+
+        assert!(
+            proxy_req.headers().get(header::AUTHORIZATION).is_none(),
+            "should NOT forward the publisher's Authorization header to Didomi"
+        );
+        assert_eq!(
+            proxy_req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("test-agent"),
+            "should still forward required headers (user-agent)"
         );
     }
 

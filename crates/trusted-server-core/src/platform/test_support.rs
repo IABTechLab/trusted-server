@@ -214,6 +214,9 @@ struct StubPendingResponse {
 /// exercising the code under test, then inspect
 /// [`recorded_backend_names`](Self::recorded_backend_names) to assert call
 /// sites.
+/// Upper bound on the request body bytes captured per `send` call.
+const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub(crate) struct StubHttpClient {
     calls: Mutex<Vec<String>>,
     responses: Mutex<VecDeque<StubHttpResponse>>,
@@ -228,6 +231,8 @@ pub(crate) struct StubHttpClient {
     stream_response_flags: Mutex<Vec<bool>>,
     request_methods: Mutex<Vec<String>>,
     request_uris: Mutex<Vec<String>>,
+    // Outgoing request bodies captured per send call, collected to bytes.
+    request_bodies: Mutex<Vec<Vec<u8>>>,
 }
 
 struct StubHttpResponse {
@@ -248,6 +253,7 @@ impl StubHttpClient {
             stream_response_flags: Mutex::new(Vec::new()),
             request_methods: Mutex::new(Vec::new()),
             request_uris: Mutex::new(Vec::new()),
+            request_bodies: Mutex::new(Vec::new()),
         }
     }
 
@@ -339,6 +345,17 @@ impl StubHttpClient {
             .expect("should lock request URIs")
             .clone()
     }
+
+    /// Return request bodies captured per `send` call, in order.
+    ///
+    /// Each entry is the outgoing request body collected to bytes. Bodies are
+    /// only captured by [`send`](PlatformHttpClient::send).
+    pub fn recorded_request_bodies(&self) -> Vec<Vec<u8>> {
+        self.request_bodies
+            .lock()
+            .expect("should lock request bodies")
+            .clone()
+    }
 }
 
 // ?Send matches PlatformHttpClient. See http.rs for the full rationale.
@@ -390,6 +407,21 @@ impl PlatformHttpClient for StubHttpClient {
             .lock()
             .expect("should lock request_headers")
             .push(headers);
+
+        // Capture the outgoing request body so tests can assert it is forwarded.
+        // Propagate collection failures instead of recording an empty body, so
+        // tests cannot mistake a capture failure for an intentionally empty body.
+        let (_, body) = request.request.into_parts();
+        let body_bytes = body
+            .into_bytes_bounded(MAX_RECORDED_BODY_BYTES)
+            .await
+            .change_context(PlatformError::HttpClient)
+            .attach("failed to capture StubHttpClient request body")?
+            .to_vec();
+        self.request_bodies
+            .lock()
+            .expect("should lock request bodies")
+            .push(body_bytes);
 
         let response = self
             .responses
