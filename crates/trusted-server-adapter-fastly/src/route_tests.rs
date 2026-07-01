@@ -73,7 +73,7 @@ impl PlatformConfigStore for StubJwksConfigStore {
     }
 }
 
-struct NoopSecretStore;
+pub(crate) struct NoopSecretStore;
 
 struct HashMapSecretStore {
     data: HashMap<String, Vec<u8>>,
@@ -155,7 +155,7 @@ struct RecordingHttpClient {
     response_body: Vec<u8>,
 }
 
-struct StreamingRecordingHttpClient {
+pub(crate) struct StreamingRecordingHttpClient {
     calls: Mutex<Vec<RecordedHttpCall>>,
 }
 
@@ -187,7 +187,7 @@ impl RecordingHttpClient {
 }
 
 impl StreamingRecordingHttpClient {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
         }
@@ -201,7 +201,7 @@ struct RecordedHttpCall {
     stream_response: bool,
 }
 
-struct FixedBackend;
+pub(crate) struct FixedBackend;
 
 impl PlatformBackend for FixedBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -365,7 +365,7 @@ impl AuctionProvider for DisabledRouteProvider {
     }
 }
 
-struct FixedGeo(GeoInfo);
+pub(crate) struct FixedGeo(pub(crate) GeoInfo);
 
 impl PlatformGeo for FixedGeo {
     fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
@@ -373,7 +373,7 @@ impl PlatformGeo for FixedGeo {
     }
 }
 
-fn us_california_geo() -> GeoInfo {
+pub(crate) fn us_california_geo() -> GeoInfo {
     GeoInfo {
         city: "Example City".to_string(),
         country: "US".to_string(),
@@ -559,7 +559,7 @@ fn test_runtime_services_with_secret_and_http_client(
     )
 }
 
-fn test_runtime_services_with_secret_http_client_and_geo(
+pub(crate) fn test_runtime_services_with_secret_http_client_and_geo(
     req: &Request,
     backend: Arc<dyn PlatformBackend>,
     secret_store: Arc<dyn PlatformSecretStore>,
