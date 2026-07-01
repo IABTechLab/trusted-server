@@ -1,0 +1,8 @@
+[app]
+name = "trusted-server"
+version = "0.1.0"
+kind = "http"
+
+[adapters.axum.logging]
+level = "info"
+echo_stdout = true

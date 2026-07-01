@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn handle_identify_rejects_missing_bearer_token() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let registry = PartnerRegistry::empty();
         let req = Request::builder()
             .method("GET")
@@ -492,10 +492,8 @@ mod tests {
             "should return 401 without Bearer token"
         );
         assert_no_store(&response);
-        let body = serde_json::from_slice::<serde_json::Value>(
-            &response.into_body().into_bytes().unwrap_or_default(),
-        )
-        .expect("should decode JSON body");
+        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
+            .expect("should decode JSON body");
         assert_eq!(
             body["error"], "invalid_token",
             "should return invalid_token error"
@@ -505,7 +503,7 @@ mod tests {
     #[test]
     fn handle_identify_rejects_invalid_bearer_token() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -530,7 +528,7 @@ mod tests {
     #[test]
     fn handle_identify_denied_consent_returns_403() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -550,10 +548,8 @@ mod tests {
             "should return 403 when consent denies EC"
         );
         assert_no_store(&response);
-        let body = serde_json::from_slice::<serde_json::Value>(
-            &response.into_body().into_bytes().unwrap_or_default(),
-        )
-        .expect("should decode JSON body");
+        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
+            .expect("should decode JSON body");
         assert_eq!(
             body,
             serde_json::json!({ "consent": "denied" }),
@@ -564,7 +560,7 @@ mod tests {
     #[test]
     fn handle_identify_without_ec_returns_204() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -589,7 +585,7 @@ mod tests {
     #[test]
     fn handle_identify_kv_failure_sets_degraded_true() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -614,10 +610,8 @@ mod tests {
             response.headers().get("x-ts-ec").is_none(),
             "should not emit x-ts-ec header"
         );
-        let body = serde_json::from_slice::<serde_json::Value>(
-            &response.into_body().into_bytes().unwrap_or_default(),
-        )
-        .expect("should decode identify response JSON");
+        let body = serde_json::from_slice::<serde_json::Value>(&response.into_body().into_bytes())
+            .expect("should decode identify response JSON");
 
         assert_eq!(body["ec"], ec_id, "should echo EC in body");
         assert_eq!(
@@ -642,7 +636,7 @@ mod tests {
     #[test]
     fn handle_identify_denies_mismatched_browser_origin() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
@@ -668,7 +662,7 @@ mod tests {
     #[test]
     fn handle_identify_allows_browser_origin_and_reflects_cors_headers() {
         let settings = create_test_settings();
-        let kv = KvIdentityGraph::new("missing_store");
+        let kv = KvIdentityGraph::failing("missing_store");
         let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()

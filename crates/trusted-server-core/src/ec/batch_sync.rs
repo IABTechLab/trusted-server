@@ -135,7 +135,7 @@ fn handle_batch_sync_with_writer(
         ));
     }
 
-    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
+    let body_bytes = req.into_body().into_bytes();
     if body_bytes.len() > MAX_BODY_SIZE {
         return Ok(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn handle_batch_sync_rejects_missing_auth() {
-        let kv = KvIdentityGraph::new("test_store");
+        let kv = KvIdentityGraph::failing("test_store");
         let registry = PartnerRegistry::empty();
         let limiter = MockRateLimiter {
             should_exceed: false,

@@ -63,7 +63,7 @@ impl PlatformConfigStore for StubJwksConfigStore {
     }
 }
 
-struct NoopSecretStore;
+pub(crate) struct NoopSecretStore;
 
 struct HashMapSecretStore {
     data: HashMap<String, Vec<u8>>,
@@ -145,7 +145,7 @@ struct RecordingHttpClient {
     response_body: Vec<u8>,
 }
 
-struct StreamingRecordingHttpClient {
+pub(crate) struct StreamingRecordingHttpClient {
     calls: Mutex<Vec<RecordedHttpCall>>,
 }
 
@@ -177,7 +177,7 @@ impl RecordingHttpClient {
 }
 
 impl StreamingRecordingHttpClient {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
         }
@@ -191,7 +191,7 @@ struct RecordedHttpCall {
     stream_response: bool,
 }
 
-struct FixedBackend;
+pub(crate) struct FixedBackend;
 
 impl PlatformBackend for FixedBackend {
     fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -355,7 +355,7 @@ impl AuctionProvider for DisabledRouteProvider {
     }
 }
 
-struct FixedGeo(GeoInfo);
+pub(crate) struct FixedGeo(pub(crate) GeoInfo);
 
 impl PlatformGeo for FixedGeo {
     fn lookup(&self, _client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
@@ -363,7 +363,7 @@ impl PlatformGeo for FixedGeo {
     }
 }
 
-fn us_california_geo() -> GeoInfo {
+pub(crate) fn us_california_geo() -> GeoInfo {
     GeoInfo {
         city: "Example City".to_string(),
         country: "US".to_string(),
@@ -532,7 +532,7 @@ fn test_runtime_services_with_secret_and_http_client(
     )
 }
 
-fn test_runtime_services_with_secret_http_client_and_geo(
+pub(crate) fn test_runtime_services_with_secret_http_client_and_geo(
     req: &Request,
     backend: Arc<dyn PlatformBackend>,
     secret_store: Arc<dyn PlatformSecretStore>,
@@ -683,6 +683,24 @@ fn route_buffered_response(
     route_result_to_fastly_response(settings, services, &partner_registry, route_result)
 }
 
+fn route_with_settings(
+    settings: &Settings,
+    req: Request,
+    expect_message: &str,
+) -> fastly::Response {
+    let (orchestrator, integration_registry) = build_route_stack(settings);
+    let services = test_runtime_services(&req);
+
+    route_buffered_response(
+        settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        expect_message,
+    )
+}
+
 fn valid_banner_ad_unit_body() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "adUnits": [
@@ -697,6 +715,94 @@ fn valid_banner_ad_unit_body() -> Vec<u8> {
         ]
     }))
     .expect("should serialize valid auction route test body")
+}
+
+#[test]
+fn static_tsjs_route_serves_unified_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=tsjs-unified.min.js");
+
+    let mut response = route_with_settings(&settings, req, "should route static tsjs request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::OK,
+        "should serve the unified static bundle"
+    );
+    assert_eq!(
+        response.get_header_str(header::CONTENT_TYPE),
+        Some("application/javascript; charset=utf-8"),
+        "should serve the unified bundle as JavaScript"
+    );
+    assert!(
+        response.take_body_str().contains("requestAds"),
+        "should serve unified bundle content with the core requestAds API"
+    );
+}
+
+#[test]
+fn static_tsjs_route_returns_not_found_for_unknown_tsjs_bundle() {
+    let settings = create_test_settings();
+    let req = Request::get("https://test.com/static/tsjs=tsjs-doesnotexist.min.js");
+
+    let response = route_with_settings(&settings, req, "should route static tsjs request");
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::NOT_FOUND,
+        "should let the static tsjs branch own unknown bundle paths"
+    );
+}
+
+#[test]
+fn unknown_route_falls_back_to_publisher_proxy_path() {
+    let settings = create_test_settings();
+    let (orchestrator, integration_registry) = build_route_stack(&settings);
+
+    let req = Request::get("https://test.com/articles/example");
+    let http_client = Arc::new(RecordingHttpClient::new(StatusCode::BAD_GATEWAY));
+    let services = test_runtime_services_with_http_client(
+        &req,
+        Arc::new(FixedBackend),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+    );
+
+    let response = route_buffered_response(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &services,
+        req,
+        "should route publisher fallback",
+    );
+
+    assert_eq!(
+        response.get_status(),
+        StatusCode::BAD_GATEWAY,
+        "should return the publisher origin response through fallback routing"
+    );
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "should send exactly one publisher fallback request"
+    );
+    assert_eq!(
+        calls[0].method,
+        Method::GET,
+        "should preserve the fallback request method"
+    );
+    assert_eq!(
+        calls[0].backend_name, "https-origin.test-publisher.com",
+        "should dispatch to the publisher origin backend"
+    );
+    assert_eq!(
+        calls[0].uri, "https://origin.test-publisher.com/articles/example",
+        "should send the fallback request to the publisher origin"
+    );
 }
 
 #[test]
@@ -1026,6 +1132,52 @@ fn routes_use_request_local_consent() {
 
     // Routes no longer depend on a separate consent KV store. Live consent is
     // request-local, and EC lifecycle state uses the EC identity store only.
+}
+
+#[test]
+fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+    // Regression for the credential-leak finding on the legacy route_request
+    // path: the production basic-auth regex `^/_ts/admin` does not match
+    // `/admin/keys/*`, so those aliases are not auth-gated. They must be denied
+    // locally with 404 rather than fall through to the publisher fallback, which
+    // forwards the request — including the `Authorization` header and key body —
+    // to the origin, leaking admin credentials. A 404 (not a 5xx proxy error)
+    // proves the local deny arm ran instead of the publisher fallback.
+    let settings = create_test_settings();
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry = test_partner_registry(&settings);
+
+    for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+        for method in [Method::POST, Method::GET] {
+            let alias_req = if method == Method::POST {
+                Request::post(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .with_body("{\"key_id\":\"leak-me\"}")
+            } else {
+                Request::get(format!("https://test.com{path}"))
+                    .with_header("Authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            };
+            let services = test_runtime_services(&alias_req);
+            let resp = futures::executor::block_on(route_request(
+                &settings,
+                &orchestrator,
+                &integration_registry,
+                &partner_registry,
+                &services,
+                compat::from_fastly_request(alias_req),
+                DeviceSignals::derive("", None, None),
+            ))
+            .expect("should route legacy admin alias request");
+
+            assert_eq!(
+                resp.outcome.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+            );
+        }
+    }
 }
 
 #[test]

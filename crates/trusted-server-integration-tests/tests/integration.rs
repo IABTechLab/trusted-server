@@ -136,6 +136,38 @@ fn test_nextjs_fastly() {
     test_combination(&runtime, &framework).expect("should pass Next.js on Fastly");
 }
 
+#[test]
+#[ignore = "requires Docker, the `wrangler` CLI in $PATH, and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts `wrangler dev` automatically"]
+fn test_wordpress_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires Docker, the `wrangler` CLI in $PATH, and a prebuilt Cloudflare Workers bundle (run build.sh first); the test starts `wrangler dev` automatically"]
+fn test_nextjs_cloudflare() {
+    let runtime = environments::cloudflare::CloudflareWorkers;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Cloudflare Workers");
+}
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_wordpress_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::wordpress::WordPress;
+    test_combination(&runtime, &framework).expect("should pass WordPress on Axum");
+}
+
+#[test]
+#[ignore = "requires Docker and pre-built trusted-server-axum binary"]
+fn test_nextjs_axum() {
+    let runtime = environments::axum::AxumDevServer;
+    let framework = frameworks::nextjs::NextJs;
+    test_combination(&runtime, &framework).expect("should pass Next.js on Axum");
+}
+
 // ---------------------------------------------------------------------------
 // EC identity lifecycle tests (no frontend framework container needed)
 // ---------------------------------------------------------------------------
@@ -164,7 +196,10 @@ fn test_ec_lifecycle_fastly() {
         .spawn(&wasm_path)
         .expect("should spawn Viceroy for EC tests");
 
-    log::info!("EC lifecycle tests: Viceroy running at {}", process.base_url);
+    log::info!(
+        "EC lifecycle tests: Viceroy running at {}",
+        process.base_url
+    );
 
     // EdgeZero entry-point canary. This same test runs in two CI jobs: the
     // legacy `integration-tests` job (default Viceroy config, legacy_main) and
@@ -181,8 +216,10 @@ fn test_ec_lifecycle_fastly() {
 
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");
-        scenario
-            .run(&process.base_url)
-            .unwrap_or_else(|e| panic!("EC scenario {scenario:?} failed: {e:?}"));
+        let result = scenario.run(&process.base_url);
+        assert!(
+            result.is_ok(),
+            "EC scenario {scenario:?} should succeed: {result:?}"
+        );
     }
 }

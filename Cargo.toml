@@ -3,19 +3,29 @@ resolver = "2"
 members = [
     "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
+    "crates/trusted-server-adapter-axum",
+    "crates/trusted-server-adapter-cloudflare",
+    "crates/trusted-server-adapter-spin",
     "crates/trusted-server-js",
     "crates/trusted-server-openrtb",
 ]
 # trusted-server-integration-tests is intentionally excluded from workspace members because it
 # requires a native target (testcontainers, reqwest) while the workspace default
 # is wasm32-wasip1. Run it via: ./scripts/integration-tests.sh
+# Crates excluded from workspace — must be built/tested outside the workspace:
+#   cargo test-cloudflare → trusted-server-adapter-cloudflare (wasm32-unknown-unknown)
 exclude = [
     "crates/trusted-server-integration-tests",
     "crates/trusted-server-openrtb-codegen",
 ]
 
+# Viceroy (cargo test-fastly runner) calls `cargo run --bin trusted-server-adapter-fastly`
+# against the default-run packages. It must be the sole default member so Cargo can
+# locate the binary. Use aliases to test each adapter with the correct target:
+#   cargo test-fastly → wasm32-wasip1 (Fastly + core, via Viceroy)
+#   cargo test-axum   → native        (Axum)
+#   cargo test-spin   → native        (Spin host route tests)
 default-members = [
-    "crates/trusted-server-core",
     "crates/trusted-server-adapter-fastly",
 ]
 
@@ -23,7 +33,9 @@ default-members = [
 debug = 1
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
+axum = "0.8"
 base64 = "0.22"
 brotli = "8.0"
 build-print = "1.0.1"
@@ -34,10 +46,11 @@ config = "0.15.19"
 cookie = "0.18.1"
 derive_more = { version = "2.0", features = ["display", "error"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
-edgezero-core = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-cloudflare = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-fastly = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-adapter-spin = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "ce6bcf74b529d9066d08ba87b2971af8379eb29e", default-features = false }
 error-stack = "0.6"
 fastly = "0.12"
 fern = "0.7.1"
@@ -48,6 +61,7 @@ hmac = "0.12.1"
 http = "1.4.0"
 iab_gpp = "0.1"
 jose-jwk = "0.1.2"
+js-sys = "0.3"
 log = "0.4.29"
 log-fastly = "0.12"
 lol_html = "2.7.2"
@@ -55,18 +69,23 @@ matchit = "0.9"
 mime = "0.3"
 rand = "0.8"
 regex = "1.12.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
+simple_logger = "5"
 sha2 = "0.10.9"
+spin-sdk = { version = "5.2", default-features = false }
 subtle = "2.6"
 temp-env = "0.3.6"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 toml = "1.1"
+tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"
 urlencoding = "2.1"
 uuid = { version = "1.18", features = ["v4"] }
 validator = { version = "0.20", features = ["derive"] }
+web-time = "1"
 which = "8"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 

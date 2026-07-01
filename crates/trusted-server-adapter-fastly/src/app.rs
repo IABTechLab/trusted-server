@@ -10,6 +10,9 @@
 //! protocol or cipher metadata. `edgezero_main` injects a trusted `fastly-ssl`
 //! header after stripping client-spoofable headers, so [`detect_request_scheme`]
 //! in `http_util` can still derive the correct scheme for HTTPS traffic.
+//! It also captures the full [`ClientInfo`] (TLS, JA4, H2 fingerprint, server
+//! metadata) into the request extensions, which [`build_per_request_services`]
+//! reads back so integration bot protection sees the authoritative signals.
 //!
 //! # Route inventory
 //!
@@ -19,8 +22,6 @@
 //! | POST | `/verify-signature` | [`handle_verify_signature`] |
 //! | POST | `/_ts/admin/keys/rotate` | [`handle_rotate_key`] |
 //! | POST | `/_ts/admin/keys/deactivate` | [`handle_deactivate_key`] |
-//! | POST | `/admin/keys/rotate` (legacy alias) | [`handle_rotate_key`] |
-//! | POST | `/admin/keys/deactivate` (legacy alias) | [`handle_deactivate_key`] |
 //! | POST | `/_ts/api/v1/batch-sync` | [`handle_batch_sync`] |
 //! | GET | `/_ts/api/v1/identify` | [`handle_identify`] |
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
@@ -64,8 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Streaming publisher responses** are buffered (bounded by
+//! - **Publisher responses** are buffered (bounded by
 //!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
+//!   Asset responses are streamed straight to the client (see
+//!   [`dispatch_asset_fallback`]), matching legacy.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -80,7 +83,8 @@
 
 use std::sync::Arc;
 
-use edgezero_adapter_fastly::context::FastlyRequestContext;
+use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
+use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -97,7 +101,6 @@ use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -109,11 +112,10 @@ use trusted_server_core::integrations::{
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
-    AssetProxyCachePolicy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -173,9 +175,11 @@ pub(crate) fn build_state_from_settings(
 /// Resolves per-request consent KV store services for routes that read consent data.
 ///
 /// When `settings.consent.consent_store` is configured and the named KV store cannot
-/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This
-/// matches the legacy `route_request` behavior where a misconfigured consent store
-/// makes consent-dependent routes unavailable rather than proceeding without consent.
+/// be opened, returns `Err` so the caller can respond with 503 (fail-closed). This is
+/// intentional hardening over the legacy `route_request` path, which builds
+/// `runtime_services` with `UnavailableKvStore` and never opens the named consent
+/// store, so it never fails closed — the `EdgeZero` path instead makes consent-dependent
+/// routes unavailable rather than proceeding without consent.
 ///
 /// # Errors
 ///
@@ -265,7 +269,11 @@ fn uses_dynamic_tsjs_fallback(method: &Method, path: &str) -> bool {
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    pub(crate) finalize_kv_graph: Option<KvIdentityGraph>,
+    /// Whether EC finalization may write to the KV identity graph.
+    /// `KvIdentityGraph` wraps a non-`Sync` `dyn EcKvStore` and cannot ride
+    /// in response extensions, so `edgezero_main` rebuilds the graph from
+    /// settings when this is set.
+    pub(crate) use_finalize_kv: bool,
     pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
@@ -301,7 +309,7 @@ impl EcRequestState {
     fn into_finalize_state(self) -> EcFinalizeState {
         EcFinalizeState {
             ec_context: self.ec_context,
-            finalize_kv_graph: self.finalize_kv_graph,
+            use_finalize_kv: self.finalize_kv_graph.is_some(),
             eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
@@ -533,6 +541,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::RotateKey => handle_rotate_key(&state.settings, services, req),
         NamedRouteHandler::DeactivateKey => handle_deactivate_key(&state.settings, services, req),
+        NamedRouteHandler::LegacyAdminDenied => Ok(legacy_admin_alias_denied()),
         NamedRouteHandler::BatchSync => {
             // Dispatched by execute_named before EC state is built.
             unreachable!("batch-sync should be handled by run_batch_sync")
@@ -611,7 +620,7 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     // ec_finalize_response with a default EC context and no finalize KV graph.
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: EcContext::default(),
-        finalize_kv_graph: None,
+        use_finalize_kv: false,
         eids_cookie,
         sharedid_cookie,
         is_real_browser,
@@ -658,7 +667,7 @@ async fn dispatch_fallback(
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
         // Only the handle_publisher_request branch below routes through
-        // resolve_publisher_response_buffered. Integration responses are small in practice
+        // buffer_publisher_response. Integration responses are small in practice
         // and the EdgeZero flag is off by default; extend the cap here if that changes.
         state
             .registry
@@ -710,7 +719,7 @@ async fn dispatch_fallback(
                 handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
                     .await
                     .and_then(|pub_response| {
-                        crate::resolve_publisher_response_buffered(
+                        buffer_publisher_response(
                             pub_response,
                             &method,
                             &state.settings,
@@ -726,13 +735,13 @@ async fn dispatch_fallback(
     attach_dispatch_extensions(response, ec, effects)
 }
 
-/// Returns `true` when an asset response should carry a buffered body and a
-/// recomputed `Content-Length`.
+/// Returns `true` when an asset response should carry a (streamed) body.
 ///
 /// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
 /// representation length in their `Content-Length` header while carrying no
-/// body. Rewriting that header to the buffered byte count (0) would corrupt the
-/// metadata, so those responses keep the origin's `Content-Length` untouched.
+/// body. Attaching the origin stream would either contradict that header or
+/// stream bytes a client does not expect, so those responses drop the stream and
+/// keep the origin's `Content-Length` untouched.
 fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
     *method != Method::HEAD
         && status != StatusCode::NO_CONTENT
@@ -748,13 +757,13 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
 /// legacy `should_finalize_ec = false` behavior for asset responses.
 ///
-/// Unlike legacy `route_request`, which streams asset bodies straight to the
-/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
-/// converts the whole response before sending, so there is no streaming seam
-/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
-/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
-/// uncapped streaming are both resolved by the streaming cutover (issue #495);
-/// whether assets get a dedicated cap is deferred to that work.
+/// Like legacy `route_request`, asset bodies are streamed straight to the client
+/// with no cap: the origin stream is attached to the response and `edgezero_main`
+/// commits the headers, then pipes the body chunk-by-chunk via
+/// [`fastly::Response::stream_to_client`] and
+/// [`stream_asset_body`](trusted_server_core::proxy::stream_asset_body). The
+/// origin stream is left untouched here, so large images never materialize in
+/// the Wasm heap.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -771,30 +780,13 @@ async fn dispatch_asset_fallback(
             let cache_policy = asset_response.cache_policy();
             let (mut response, stream_body) = asset_response.into_response_and_body();
 
+            // Attach the origin stream so `edgezero_main` streams it to the
+            // client. HEAD and bodiless statuses (204, 304) advertise the origin
+            // Content-Length but carry no body, so their stream is dropped to
+            // preserve that header and avoid a length/body mismatch.
             if let Some(body) = stream_body {
-                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
-                    .await
-                {
-                    Ok(bytes) => {
-                        // Preserve the origin's Content-Length for HEAD and
-                        // bodiless statuses; only body-bearing responses get a
-                        // recomputed length and the buffered body attached.
-                        if asset_response_carries_body(&method, response.status()) {
-                            response.headers_mut().insert(
-                                header::CONTENT_LENGTH,
-                                HeaderValue::from(bytes.len() as u64),
-                            );
-                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
-                        }
-                    }
-                    Err(report) => {
-                        let mut response = http_error(&report);
-                        response
-                            .extensions_mut()
-                            .insert(AssetProxyCachePolicy::NoStorePrivate);
-                        attach_request_filter_effects(&mut response, effects);
-                        return response;
-                    }
+                if asset_response_carries_body(&method, response.status()) {
+                    *response.body_mut() = body;
                 }
             }
 
@@ -825,23 +817,6 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
     }
 }
 
-/// Buffers a streaming asset body into memory, bounded by `max_bytes`
-/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
-/// [`dispatch_asset_fallback`]).
-///
-/// # Errors
-///
-/// Returns an error if the body exceeds the configured cap or the underlying
-/// stream yields an error.
-async fn buffer_asset_body(
-    body: edgezero_core::body::Body,
-    max_bytes: usize,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let mut output = BoundedWriter::new(max_bytes);
-    stream_asset_body(body, &mut output).await?;
-    Ok(output.into_inner())
-}
-
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -858,6 +833,23 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`
+/// aliases on the `EdgeZero` path.
+///
+/// These non-`/_ts` aliases are not matched by the `^/_ts/admin` basic-auth
+/// handler, so they fail closed locally rather than fall through to the
+/// publisher fallback — which would forward the caller's `Authorization` header
+/// and key-management payload to the origin, leaking admin credentials.
+fn legacy_admin_alias_denied() -> Response {
+    let mut response = Response::new(edgezero_core::body::Body::from("Not found\n"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -908,6 +900,9 @@ enum NamedRouteHandler {
     VerifySignature,
     RotateKey,
     DeactivateKey,
+    /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
+    /// reach the publisher fallback (which would leak admin credentials).
+    LegacyAdminDenied,
     BatchSync,
     Identify,
     SetTester,
@@ -924,6 +919,16 @@ struct NamedRoute {
     primary_methods: &'static [Method],
     handler: NamedRouteHandler,
 }
+
+const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+];
 
 const NAMED_ROUTES: &[NamedRoute] = &[
     NamedRoute {
@@ -946,18 +951,21 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::DeactivateKey,
     },
-    // Legacy aliases without the `/_ts` prefix, kept for parity with
-    // route_request in main.rs. Auth coverage comes from settings.handlers
-    // (enforced by AuthMiddleware), same as on the legacy path.
+    // The legacy non-`/_ts` aliases (`/admin/keys/*`) are denied locally with a
+    // 404 instead of executing key operations: the production basic-auth handler
+    // regex `^/_ts/admin` does not match them, and letting them fall through to
+    // publisher fallback for any fallback method would forward the caller's
+    // `Authorization` header and key-management payload to the origin, leaking
+    // admin credentials.
     NamedRoute {
         path: "/admin/keys/rotate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::RotateKey,
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
+        handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
         path: "/admin/keys/deactivate",
-        primary_methods: &[Method::POST],
-        handler: NamedRouteHandler::DeactivateKey,
+        primary_methods: LEGACY_ADMIN_DENY_METHODS,
+        handler: NamedRouteHandler::LegacyAdminDenied,
     },
     NamedRoute {
         path: "/_ts/api/v1/batch-sync",
@@ -1096,7 +1104,14 @@ impl Hooks for TrustedServerApp {
 mod tests {
     use std::sync::Arc;
 
-    use super::{build_state_from_settings, startup_error_router, AppState, TrustedServerApp};
+    use super::{
+        build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
+        TrustedServerApp, NAMED_ROUTES,
+    };
+    use crate::route_tests::{
+        test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
+        FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
+    };
 
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
@@ -1114,7 +1129,7 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
-    use trusted_server_core::platform::ClientInfo;
+    use trusted_server_core::platform::{ClientInfo, PlatformHttpClient};
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -1316,10 +1331,8 @@ mod tests {
         });
         let router = startup_error_router(&report);
 
-        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")))
-            .expect("router oneshot should produce a response");
-        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")))
-            .expect("router oneshot should produce a response");
+        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")));
+        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")));
 
         assert_eq!(
             head_response.status(),
@@ -1409,8 +1422,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
-        let response =
-            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(req));
 
         assert_eq!(
             response.status(),
@@ -1428,24 +1440,116 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_admin_alias_routes_are_registered_and_auth_gated() {
-        // Parity guard for the legacy non-`/_ts` admin aliases: both alias
-        // paths must be registered (no router-level 405) and protected by the
-        // `^/admin` handler in the test settings, mirroring how legacy
-        // route_request applies enforce_basic_auth before its route match.
-        let router = test_router();
+    fn legacy_admin_aliases_route_to_local_deny_not_key_handlers() {
+        // Security guard for the legacy non-`/_ts` admin aliases. They must be
+        // registered to the local `LegacyAdminDenied` 404 handler — not the
+        // rotate/deactivate key handlers, and not left unrouted. Leaving them
+        // unrouted would fall through to the publisher fallback, which forwards
+        // the request (including the `Authorization` header and key-management
+        // payload) to the origin, leaking admin credentials. Mapping them to the
+        // key handlers would expose key operations, since the production
+        // basic-auth regex `^/_ts/admin` does not match `/admin/keys/*`.
+        let handler_for = |path: &str| {
+            NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .map(|route| route.handler)
+        };
+        let methods_for = |path: &str| {
+            NAMED_ROUTES
+                .iter()
+                .find(|route| route.path == path)
+                .map(|route| route.primary_methods)
+                .unwrap_or(&[])
+        };
+
+        assert!(
+            matches!(
+                handler_for("/_ts/admin/keys/rotate"),
+                Some(NamedRouteHandler::RotateKey)
+            ),
+            "canonical /_ts/admin/keys/rotate must map to the rotate handler"
+        );
+        assert!(
+            matches!(
+                handler_for("/_ts/admin/keys/deactivate"),
+                Some(NamedRouteHandler::DeactivateKey)
+            ),
+            "canonical /_ts/admin/keys/deactivate must map to the deactivate handler"
+        );
+        assert!(
+            matches!(
+                handler_for("/admin/keys/rotate"),
+                Some(NamedRouteHandler::LegacyAdminDenied)
+            ),
+            "legacy /admin/keys/rotate must map to the local deny handler, not the key handler"
+        );
+        assert!(
+            matches!(
+                handler_for("/admin/keys/deactivate"),
+                Some(NamedRouteHandler::LegacyAdminDenied)
+            ),
+            "legacy /admin/keys/deactivate must map to the local deny handler, not the key handler"
+        );
 
         for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
-            let req = empty_request(Method::POST, path);
+            for method in super::publisher_fallback_methods() {
+                assert!(
+                    methods_for(path).contains(&method),
+                    "legacy {method} {path} must route to the local deny handler, not publisher fallback"
+                );
+            }
+        }
+    }
 
-            let response =
-                block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+    #[test]
+    fn legacy_admin_aliases_denied_locally_not_proxied_to_publisher() {
+        // Regression for the credential-leak finding: with a production-shaped
+        // config (only `^/_ts/admin` is auth-gated, so `/admin/keys/*` is NOT
+        // matched by any handler), any publisher-fallback method to a legacy
+        // alias carrying an `Authorization` header must be denied locally with
+        // 404 — never proxied to the publisher origin (which would leak the
+        // admin credentials and the key-management body). A publisher-fallback
+        // proxy without a backend would surface as a 5xx, so a 404 proves the
+        // deny route ran instead.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
 
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "POST {path} without credentials should be rejected by AuthMiddleware"
-            );
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+            "#,
+        )
+        .expect("should parse production-shaped settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        for path in ["/admin/keys/rotate", "/admin/keys/deactivate"] {
+            for method in super::publisher_fallback_methods() {
+                let req = request_builder()
+                    .method(method.clone())
+                    .uri(format!("https://test-publisher.com{path}"))
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46YWRtaW4tcGFzcw==")
+                    .body(Body::from("{\"key_id\":\"leak-me\"}"))
+                    .expect("should build authorized legacy-alias request");
+
+                let response = block_on(router.oneshot(req));
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} with Authorization must be denied locally (404), not proxied to publisher"
+                );
+            }
         }
     }
 
@@ -1457,8 +1561,7 @@ mod tests {
         // gateway error without a live backend.
         let router = test_router();
         let response =
-            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")))
-                .expect("router oneshot should produce a response");
+            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
 
         assert_eq!(
             response.status(),
@@ -1474,8 +1577,7 @@ mod tests {
         // require_identity_graph fails with a KvStore error (503) — proving
         // the request was NOT proxied to the publisher origin.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
 
         assert_eq!(
             response.status(),
@@ -1493,8 +1595,7 @@ mod tests {
         // error (503).
         let router = test_router();
         let response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")))
-                .expect("router oneshot should produce a response");
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
 
         assert_eq!(
             response.status(),
@@ -1506,8 +1607,7 @@ mod tests {
     #[test]
     fn dispatch_set_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
 
         assert_eq!(
             response.status(),
@@ -1526,8 +1626,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
 
         assert_eq!(
             response.status(),
@@ -1549,8 +1648,7 @@ mod tests {
     #[test]
     fn dispatch_clear_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
 
         assert_eq!(
             response.status(),
@@ -1569,8 +1667,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
 
         assert_eq!(
             response.status(),
@@ -1596,8 +1693,7 @@ mod tests {
         // point via response extensions — even on error responses — so that
         // edgezero_main can run ec_finalize_response and pull sync.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
 
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
@@ -1622,8 +1718,7 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
 
-        let response =
-            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(req));
 
         let finalize = response
             .extensions()
@@ -1642,8 +1737,7 @@ mod tests {
         // documents the regression the extension threading fixes: the same
         // request that looks like a browser above is treated as a bot here.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
 
         let finalize = response
             .extensions()
@@ -1679,7 +1773,7 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let _ = block_on(router.oneshot(req));
 
         let observed = captured
             .lock()
@@ -1726,8 +1820,7 @@ mod tests {
         let response = block_on(router.oneshot(empty_request(
             Method::GET,
             "/.well-known/trusted-server.json",
-        )))
-        .expect("router oneshot should produce a response");
+        )));
 
         assert!(
             response
@@ -1750,8 +1843,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::HEAD, "/first-party/proxy");
 
-        let response =
-            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(req));
 
         assert_ne!(
             response.status(),
@@ -1772,8 +1864,7 @@ mod tests {
             .body(Body::from(body))
             .expect("should build auction request");
 
-        let response =
-            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(req));
 
         assert_eq!(
             response.status(),
@@ -1797,8 +1888,7 @@ mod tests {
             "/",
         );
 
-        let response =
-            block_on(router.oneshot(req)).expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(req));
 
         assert_eq!(
             response.status(),
@@ -1820,8 +1910,7 @@ mod tests {
         let router = TrustedServerApp::routes_for_state(&state);
 
         let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/admin/keys/rotate")))
-                .expect("router oneshot should produce a response");
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/admin/keys/rotate")));
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
@@ -1833,8 +1922,7 @@ mod tests {
             .uri("/auction")
             .body(Body::from(r#"{"adUnits":[]}"#))
             .expect("should build auction request");
-        let auction_response = block_on(router.oneshot(auction_request))
-            .expect("router oneshot should produce a response");
+        let auction_response = block_on(router.oneshot(auction_request));
         assert_eq!(
             auction_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1842,8 +1930,7 @@ mod tests {
         );
 
         let publisher_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")))
-                .expect("router oneshot should produce a response");
+            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
         assert_eq!(
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1854,8 +1941,7 @@ mod tests {
         // is wired only into the publisher and auction branches of dispatch_fallback, not into
         // the integration proxy branch. A missing consent store must not 503 integration routes.
         let integration_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")))
-                .expect("router oneshot should produce a response");
+            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
         assert_ne!(
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1903,8 +1989,7 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
 
         assert!(
             response
@@ -1923,6 +2008,79 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
+        // Regression guard for the EdgeZero asset streaming cutover: a successful
+        // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
+        // rather than draining the origin into a buffered `Body::Once`. Injecting a
+        // streaming HTTP client lets us assert the body type the entry point will
+        // pipe straight to the client via `stream_to_client`.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+
+        let fastly_req = fastly::Request::get("https://test-publisher.com/.images/logo.png");
+        let http_client = Arc::new(StreamingRecordingHttpClient::new());
+        let services = test_runtime_services_with_secret_http_client_and_geo(
+            &fastly_req,
+            Arc::new(FixedBackend),
+            Arc::new(NoopSecretStore),
+            Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+            Arc::new(FixedGeo(us_california_geo())),
+        );
+        let req = crate::compat::from_fastly_request(fastly_req);
+        let asset_route = state
+            .settings
+            .asset_route_for_path("/.images/logo.png")
+            .expect("should match the configured asset route");
+        let effects = RequestFilterEffects::default();
+
+        let response = block_on(super::dispatch_asset_fallback(
+            &state,
+            &services,
+            req,
+            asset_route,
+            &effects,
+        ));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should preserve the streaming origin status"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero asset dispatch must stream the origin body, not buffer it"
+        );
+    }
+
+    #[test]
     fn dispatch_runs_request_filter_and_threads_response_effects() {
         // Regression guard for the EdgeZero request-filter bypass: the publisher
         // fallback must run the integration request-filter pipeline (DataDome
@@ -1932,8 +2090,7 @@ mod tests {
         // still carry the RequestFilterEffects the filter emitted — proving the
         // filter ran on the dispatch path.
         let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
 
         let effects = response
             .extensions()
@@ -1955,8 +2112,7 @@ mod tests {
         // fallback, return its own response, still carry EcFinalizeState (legacy
         // parity: Respond keeps EC finalization), and thread its response effects.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")))
-            .expect("router oneshot should produce a response");
+        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
 
         assert_eq!(
             response.status(),

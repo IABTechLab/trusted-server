@@ -67,6 +67,11 @@ pub const INTERNAL_HEADERS: &[&str] = &[
     "x-request-id",
     "x-compress-hint",
     "x-debug-fastly-pop",
+    // Trusted TLS metadata injected by the Fastly EdgeZero entry point.
+    // Injected after stripping spoofable forwarded headers so they cannot be
+    // client-supplied. Must not be forwarded to downstream origins.
+    "x-ts-tls-protocol",
+    "x-ts-tls-cipher",
 ];
 
 // Consent-related cookie names
