@@ -311,6 +311,8 @@ pub struct ProxyRequestConfig<'a> {
     pub copy_request_headers: bool,
     /// When true, stream the origin response without HTML/CSS rewrites.
     pub stream_passthrough: bool,
+    /// When true, ask the platform adapter to preserve the upstream response body as a stream.
+    pub stream_response: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
     /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
@@ -339,6 +341,7 @@ impl<'a> ProxyRequestConfig<'a> {
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &[],
             require_https: false,
         }
@@ -390,6 +393,13 @@ impl<'a> ProxyRequestConfig<'a> {
     #[must_use]
     pub fn with_https_only(mut self) -> Self {
         self.require_https = true;
+        self
+    }
+
+    /// Ask the platform adapter to preserve the upstream response body as a stream.
+    #[must_use]
+    pub fn with_stream_response(mut self) -> Self {
+        self.stream_response = true;
         self
     }
 }
@@ -669,6 +679,7 @@ struct ProxyRequestHeaders<'a> {
 struct ProxyRedirectPolicy<'a> {
     follow_redirects: bool,
     stream_passthrough: bool,
+    stream_response: bool,
     allowed_domains: &'a [String],
     require_https: bool,
 }
@@ -697,6 +708,7 @@ pub async fn proxy_request(
         headers,
         copy_request_headers,
         stream_passthrough,
+        stream_response,
         allowed_domains,
         require_https,
     } = config;
@@ -724,6 +736,7 @@ pub async fn proxy_request(
         ProxyRedirectPolicy {
             follow_redirects,
             stream_passthrough,
+            stream_response,
             allowed_domains,
             require_https,
         },
@@ -1331,10 +1344,15 @@ async fn proxy_with_redirects(
                     message: "failed to build proxy request".to_string(),
                 })?;
 
+        let mut platform_request = PlatformHttpRequest::new(edge_req, backend_name);
+        if redirect_policy.stream_response {
+            platform_request = platform_request.with_stream_response();
+        }
+
         let platform_resp = request_headers
             .services
             .http_client()
-            .send(PlatformHttpRequest::new(edge_req, backend_name))
+            .send(platform_request)
             .await
             .change_context(TrustedServerError::Proxy {
                 message: "Failed to proxy".to_string(),
@@ -1492,6 +1510,7 @@ pub async fn handle_first_party_proxy(
             headers: Vec::new(),
             copy_request_headers: true,
             stream_passthrough: false,
+            stream_response: false,
             allowed_domains: &settings.proxy.allowed_domains,
             require_https: false,
         },
@@ -2422,7 +2441,8 @@ mod tests {
                 HeaderValue::from_static("application/octet-stream"),
             )
             .without_forward_headers()
-            .with_streaming();
+            .with_streaming()
+            .with_stream_response();
 
         assert_eq!(cfg.target_url, "https://example.com/asset");
         assert!(cfg.follow_redirects, "should follow redirects by default");
@@ -2436,6 +2456,10 @@ mod tests {
         assert!(
             cfg.stream_passthrough,
             "should enable streaming passthrough"
+        );
+        assert!(
+            cfg.stream_response,
+            "should request streaming platform responses"
         );
     }
 
@@ -3147,6 +3171,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3188,6 +3213,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3234,6 +3260,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3244,6 +3271,38 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response_body_string(response), "redirected");
+        });
+    }
+
+    #[test]
+    fn proxy_request_forwards_stream_response_flag_to_platform_request() {
+        futures::executor::block_on(async {
+            use crate::platform::test_support::StubHttpClient;
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"ok".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let settings = create_test_settings();
+            let req = build_http_request(Method::GET, "https://example.com/");
+
+            proxy_request(
+                &settings,
+                req,
+                ProxyRequestConfig::new("https://example.com/resource")
+                    .without_forward_headers()
+                    .with_stream_response(),
+                &services,
+            )
+            .await
+            .expect("should proxy successfully");
+
+            assert_eq!(
+                stub.recorded_stream_response_flags(),
+                vec![true],
+                "should request a streaming platform response"
+            );
         });
     }
 
@@ -3283,6 +3342,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: true,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },
@@ -3348,6 +3408,7 @@ mod tests {
                     headers: Vec::new(),
                     copy_request_headers: false,
                     stream_passthrough: false,
+                    stream_response: false,
                     allowed_domains: &[],
                     require_https: false,
                 },

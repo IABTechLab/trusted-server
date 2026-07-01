@@ -286,6 +286,10 @@ pub(crate) struct IntegrationBuilder {
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
         IntegrationBuilder {
+            id: "js_asset_proxy",
+            build: js_asset_proxy::register,
+        },
+        IntegrationBuilder {
             id: "prebid",
             build: prebid::register,
         },
@@ -328,10 +332,6 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         IntegrationBuilder {
             id: "gpt",
             build: gpt::register,
-        },
-        IntegrationBuilder {
-            id: "js_asset_proxy",
-            build: js_asset_proxy::register,
         },
     ]
 }
