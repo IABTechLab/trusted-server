@@ -1552,6 +1552,84 @@ fn asset_routes_stream_asset_responses_directly() {
 }
 
 #[test]
+fn integration_routes_preserve_streaming_proxy_responses() {
+    let mut settings = create_test_settings();
+    settings
+        .integrations
+        .insert_config(
+            "js_asset_proxy",
+            &json!({
+                "enabled": true,
+                "assets": [{
+                    "path": "/assets/vendor.js",
+                    "origin_url": "https://cdn.example.com/vendor.js",
+                    "proxy": "enabled"
+                }]
+            }),
+        )
+        .expect("should insert JS asset proxy config");
+    let orchestrator = build_orchestrator(&settings).expect("should build auction orchestrator");
+    let integration_registry =
+        IntegrationRegistry::new(&settings).expect("should create integration registry");
+    let partner_registry = test_partner_registry(&settings);
+
+    let fastly_req = Request::get("https://test.com/assets/vendor.js");
+    let http_client = Arc::new(StreamingRecordingHttpClient::new());
+    let services = test_runtime_services_with_secret_http_client_and_geo(
+        &fastly_req,
+        Arc::new(FixedBackend),
+        Arc::new(NoopSecretStore),
+        Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+        Arc::new(FixedGeo(us_california_geo())),
+    );
+    let req = compat::from_fastly_request(fastly_req);
+
+    let outcome = futures::executor::block_on(route_request(
+        &settings,
+        &orchestrator,
+        &integration_registry,
+        &partner_registry,
+        &services,
+        req,
+        browser_device_signals(),
+    ))
+    .expect("should route streaming integration request");
+
+    let (response, body) = match outcome.outcome {
+        HandlerOutcome::RawStreaming { response, body } => Some((response, body)),
+        _ => None,
+    }
+    .expect("should preserve streaming integration response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        matches!(body, EdgeBody::Stream(_)),
+        "should preserve the integration response stream"
+    );
+
+    let calls = http_client
+        .calls
+        .lock()
+        .expect("should lock recorded calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "should send exactly one integration request"
+    );
+    assert!(
+        calls[0].stream_response,
+        "JS asset proxy should request a streaming origin response from the platform"
+    );
+    assert_eq!(
+        calls[0].backend_name, "https-cdn.example.com",
+        "should resolve the configured JS asset origin backend"
+    );
+    assert_eq!(
+        calls[0].uri, "https://cdn.example.com/vendor.js",
+        "should send the request to the configured JS asset origin URL"
+    );
+}
+
+#[test]
 fn asset_origin_failure_does_not_fall_back_to_publisher_origin() {
     let mut settings = create_test_settings();
     settings.proxy.asset_routes = vec![ProxyAssetRoute::new(

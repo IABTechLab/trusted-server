@@ -190,6 +190,29 @@ fn path_contains_parent_segment(path: &str) -> bool {
     path.split('/').any(|segment| segment == "..")
 }
 
+fn normalize_script_src(script_src: &str, request_scheme: &str) -> Option<String> {
+    let candidate = if script_src.starts_with("//") {
+        let request_scheme = request_scheme.to_ascii_lowercase();
+        if !matches!(request_scheme.as_str(), "http" | "https") {
+            return None;
+        }
+        format!("{request_scheme}:{script_src}")
+    } else {
+        script_src.to_string()
+    };
+
+    let mut url = Url::parse(&candidate).ok()?;
+    let has_default_port = matches!(
+        (url.scheme(), url.port()),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    if has_default_port {
+        url.set_port(None).ok()?;
+    }
+
+    Some(url.to_string())
+}
+
 /// JavaScript asset proxy integration implementation.
 pub struct JsAssetProxyIntegration {
     config: JsAssetProxyConfig,
@@ -221,12 +244,24 @@ impl JsAssetProxyIntegration {
             .find(|asset| asset.origin_url == origin_url)
     }
 
+    fn asset_for_script_src(
+        &self,
+        script_src: &str,
+        ctx: &IntegrationAttributeContext<'_>,
+    ) -> Option<&JsAssetProxyAsset> {
+        self.asset_for_origin_url(script_src).or_else(|| {
+            let normalized_src = normalize_script_src(script_src, ctx.request_scheme)?;
+            self.asset_for_origin_url(&normalized_src)
+        })
+    }
+
     fn build_proxy_config<'a>(
         origin_url: &'a str,
         req: &Request<EdgeBody>,
     ) -> ProxyRequestConfig<'a> {
         let mut config = ProxyRequestConfig::new(origin_url)
             .with_streaming()
+            .with_stream_response()
             .without_forward_headers();
         config.follow_redirects = false;
         config.forward_ec_id = false;
@@ -472,7 +507,7 @@ impl IntegrationAttributeRewriter for JsAssetProxyIntegration {
             return AttributeRewriteAction::keep();
         }
 
-        let Some(asset) = self.asset_for_origin_url(attr_value) else {
+        let Some(asset) = self.asset_for_script_src(attr_value, ctx) else {
             return AttributeRewriteAction::keep();
         };
 
@@ -540,11 +575,18 @@ mod tests {
         integration: Arc<JsAssetProxyIntegration>,
     ) -> String {
         let rewriter: Arc<dyn IntegrationAttributeRewriter> = integration;
+        process_html_with_registry(
+            html,
+            IntegrationRegistry::from_rewriters(vec![rewriter], Vec::new()),
+        )
+    }
+
+    fn process_html_with_registry(html: &str, integrations: IntegrationRegistry) -> String {
         let processor = create_html_processor(HtmlProcessorConfig {
             origin_host: "origin.example.com".to_string(),
             request_host: "publisher.example.com".to_string(),
             request_scheme: "https".to_string(),
-            integrations: IntegrationRegistry::from_rewriters(vec![rewriter], Vec::new()),
+            integrations,
             max_buffered_body_bytes: 16 * 1024 * 1024,
         });
         let pipeline_config = PipelineConfig {
@@ -722,6 +764,134 @@ mod tests {
         assert!(processed.contains(r#"<img src="https://cdn.example.com/enabled.js">"#));
         assert!(!processed.contains("blocked()"));
         assert!(processed.contains(r#"<img src="https://cdn.example.com/blocked.js">"#));
+    }
+
+    #[test]
+    fn script_src_matching_normalizes_common_browser_url_forms() {
+        let integration = JsAssetProxyIntegration::new(config_with_assets(vec![asset(
+            "/assets/vendor.js",
+            "https://cdn.example.com/vendor.js",
+            JsAssetProxyMode::Enabled,
+        )]));
+        let ctx = rewrite_context();
+
+        for script_src in [
+            "//cdn.example.com/vendor.js",
+            "HTTPS://CDN.EXAMPLE.COM/vendor.js",
+            "https://cdn.example.com:443/vendor.js",
+        ] {
+            assert!(
+                matches!(
+                    integration.rewrite("src", script_src, &ctx),
+                    AttributeRewriteAction::Replace(ref value) if value == "/assets/vendor.js"
+                ),
+                "script src {script_src} should normalize to the configured origin URL"
+            );
+        }
+    }
+
+    #[test]
+    fn js_asset_proxy_rewriter_takes_precedence_over_native_rewriters() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &json!({ "enabled": true }))
+            .expect("should insert GPT config");
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/gpt.js",
+                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "proxy": "enabled"
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+
+        let processed = process_html_with_registry(html, registry);
+
+        assert!(
+            processed.contains(r#"<script src="/assets/gpt.js"></script>"#),
+            "JS asset proxy should rewrite before GPT native rewriter: {processed}"
+        );
+        assert!(
+            !processed.contains("/integrations/gpt/script"),
+            "GPT native rewrite should not override JS asset proxy"
+        );
+    }
+
+    #[test]
+    fn js_asset_proxy_blocking_takes_precedence_over_native_rewriters() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &json!({ "enabled": true }))
+            .expect("should insert GPT config");
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/gpt.js",
+                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "proxy": "blocked"
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js">googletag.cmd.push(() => {});</script></body></html>"#;
+
+        let processed = process_html_with_registry(html, registry);
+
+        assert!(
+            !processed.contains("googletag.cmd"),
+            "blocked JS asset should remove the script element before GPT can rewrite it"
+        );
+        assert!(
+            !processed.contains("/integrations/gpt/script"),
+            "GPT native rewrite should not keep a blocked script"
+        );
+    }
+
+    #[test]
+    fn disabled_js_asset_proxy_candidate_allows_native_rewriters() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("gpt", &json!({ "enabled": true }))
+            .expect("should insert GPT config");
+        settings
+            .integrations
+            .insert_config(
+                JS_ASSET_PROXY_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "assets": [{
+                        "path": "/assets/gpt.js",
+                        "origin_url": "https://securepubads.g.doubleclick.net/tag/js/gpt.js",
+                        "proxy": "disabled"
+                    }]
+                }),
+            )
+            .expect("should insert JS asset proxy config");
+        let registry = IntegrationRegistry::new(&settings).expect("should build registry");
+        let html = r#"<html><body><script src="https://securepubads.g.doubleclick.net/tag/js/gpt.js"></script></body></html>"#;
+
+        let processed = process_html_with_registry(html, registry);
+
+        assert!(
+            processed.contains(r#"<script src="/integrations/gpt/script"></script>"#),
+            "disabled JS asset proxy entries should not suppress native integration rewrites"
+        );
     }
 
     #[test]
@@ -1099,6 +1269,8 @@ mod tests {
         assert!(!config.copy_request_headers);
         assert!(!config.follow_redirects);
         assert!(!config.forward_ec_id);
+        assert!(config.stream_passthrough);
+        assert!(config.stream_response);
 
         let forwarded: Vec<(String, String)> = config
             .headers

@@ -426,7 +426,7 @@ fn build_js_asset_proxy_section(
         "# Audit note: some discovered scripts may be runtime-injected and may not appear\n",
     );
     toml.push_str(
-        "# in origin HTML. JS Asset Proxy rewrites only exact script src values present in\n",
+        "# in origin HTML. JS Asset Proxy rewrites only matching script src URLs present in\n",
     );
     toml.push_str("# HTML processed by Trusted Server.\n");
 

@@ -279,6 +279,7 @@ type IntegrationBuilder =
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
+        js_asset_proxy::register,
         prebid::register,
         testlight::register,
         nextjs::register,
@@ -290,6 +291,5 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
         google_tag_manager::register,
         datadome::register,
         gpt::register,
-        js_asset_proxy::register,
     ]
 }

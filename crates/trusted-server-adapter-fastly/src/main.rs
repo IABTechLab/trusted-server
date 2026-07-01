@@ -100,6 +100,10 @@ enum HandlerOutcome {
         response: HttpResponse,
         body: EdgeBody,
     },
+    RawStreaming {
+        response: HttpResponse,
+        body: EdgeBody,
+    },
 }
 
 impl HandlerOutcome {
@@ -108,8 +112,20 @@ impl HandlerOutcome {
         match self {
             HandlerOutcome::Buffered(resp) | HandlerOutcome::AuthChallenge(resp) => resp.status(),
             HandlerOutcome::Streaming { response, .. }
-            | HandlerOutcome::AssetStreaming { response, .. } => response.status(),
+            | HandlerOutcome::AssetStreaming { response, .. }
+            | HandlerOutcome::RawStreaming { response, .. } => response.status(),
         }
+    }
+}
+
+fn response_to_legacy_outcome(response: HttpResponse) -> HandlerOutcome {
+    let (parts, body) = response.into_parts();
+    match body {
+        EdgeBody::Stream(_) => HandlerOutcome::RawStreaming {
+            response: HttpResponse::from_parts(parts, EdgeBody::empty()),
+            body,
+        },
+        body => HandlerOutcome::Buffered(HttpResponse::from_parts(parts, body)),
     }
 }
 
@@ -912,6 +928,46 @@ fn legacy_main(mut req: FastlyRequest) {
                 log::error!("failed to finish asset streaming body: {e}");
             }
         }
+        HandlerOutcome::RawStreaming { mut response, body } => {
+            finalize_response(&state.settings, geo_info.as_ref(), &mut response);
+            asset_cache_policy.apply_after_route_finalization(&mut response);
+            if should_finalize_ec {
+                ec_finalize_response(
+                    &state.settings,
+                    &ec_context,
+                    finalize_kv_graph.as_ref(),
+                    &partner_registry,
+                    eids_cookie.as_deref(),
+                    sharedid_cookie.as_deref(),
+                    &mut response,
+                );
+            }
+            request_filter_effects.apply_to_response(&mut response);
+            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut streaming_body = fastly_resp.stream_to_client();
+            let mut stream_succeeded = false;
+            if let Err(e) =
+                futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
+            {
+                log::error!("raw response streaming failed: {e:?}");
+                drop(streaming_body);
+            } else if let Err(e) = streaming_body.finish() {
+                log::error!("failed to finish raw streaming body: {e}");
+            } else {
+                stream_succeeded = true;
+            }
+
+            if is_real_browser && stream_succeeded {
+                if let Some(context) = build_pull_sync_context(&ec_context) {
+                    run_pull_sync_after_send(
+                        &state.settings,
+                        &partner_registry,
+                        &context,
+                        &runtime_services,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1359,7 +1415,7 @@ async fn route_request(
     let _ = organic_route;
 
     let outcome = result
-        .map(HandlerOutcome::Buffered)
+        .map(response_to_legacy_outcome)
         .unwrap_or_else(|e| HandlerOutcome::Buffered(http_error_response(&e)));
 
     Ok(RouteResult {
