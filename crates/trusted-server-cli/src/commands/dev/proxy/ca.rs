@@ -77,6 +77,15 @@ impl CertAuthority {
         let key_path = ca_dir.join(CA_KEY_FILE);
 
         let (cert_pem, key_pem) = if cert_path.exists() && key_path.exists() {
+            // Re-secure existing material before reusing it: a backup restore,
+            // manual copy, partial recovery, or older build may have left the
+            // directory or the private key group/world-readable. Restore the
+            // freshly-generated posture (dir `0700`, key `0600`) so a trusted
+            // root CA private key is never used with loose permissions.
+            fs::set_permissions(ca_dir, fs::Permissions::from_mode(0o700))
+                .change_context(CaError::Dir)?;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+                .change_context(CaError::Io)?;
             (
                 fs::read_to_string(&cert_path).change_context(CaError::Io)?,
                 fs::read_to_string(&key_path).change_context(CaError::Io)?,
@@ -253,6 +262,26 @@ mod tests {
         let cert_after = std::fs::read(dir.path().join("ca-cert.pem")).expect("should read cert");
         assert_eq!(cert_before, cert_after, "reload does not rewrite the CA");
         drop(ca1);
+    }
+
+    #[test]
+    fn reload_resecures_loosened_key_permissions() {
+        let dir = tempfile::tempdir().expect("should create tempdir");
+        CertAuthority::load_or_generate(dir.path()).expect("should generate");
+        let key_path = dir.path().join("ca-key.pem");
+
+        // Simulate a drifted/backup-restored key with group/world-readable perms.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("should loosen perms");
+
+        // Reloading must re-secure it to 0600 before reusing the key material.
+        CertAuthority::load_or_generate(dir.path()).expect("should reload");
+        let mode = std::fs::metadata(&key_path)
+            .expect("should read key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "reload re-secures the key file to 0600");
     }
 
     #[test]

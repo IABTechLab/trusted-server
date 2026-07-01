@@ -10,7 +10,14 @@ fn main() {
 }
 
 // `ts dev proxy` is macOS-only (its deps are macOS-scoped in `Cargo.toml`), so
-// on other targets the crate is an empty shell; this trivial entry point just
-// keeps the binary target's shape valid.
+// on other targets the crate is an empty shell. Fail loudly with a clear message
+// and a nonzero exit rather than silently succeeding, so a run on an unsupported
+// platform is never mistaken for a working command.
 #[cfg(not(target_os = "macos"))]
-fn main() {}
+fn main() {
+    trusted_server_cli::output::error(
+        "`ts dev proxy` is supported on macOS only (it uses the macOS login keychain, \
+         `networksetup`, and Safari automation). Build and run it on macOS.",
+    );
+    std::process::exit(2);
+}

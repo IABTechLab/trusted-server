@@ -1,9 +1,8 @@
 //! Browser launch/config, PAC generation, and CA trust commands (spec §9, §7.3).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::ProxyError;
 use super::ca::CA_COMMON_NAME;
@@ -62,6 +61,14 @@ fn proxy_connect_ip(listen: SocketAddr) -> IpAddr {
     }
 }
 
+/// Path to the macOS login keychain — the single trust location this tool
+/// installs into and uninstalls from, so both operations target the same store.
+#[cfg(target_os = "macos")]
+fn login_keychain() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/Library/Keychains/login.keychain-db")
+}
+
 /// Adds the CA certificate to the macOS login keychain (spec §7.3).
 ///
 /// On non-macOS systems, or if the `security` command fails, prints manual
@@ -69,8 +76,7 @@ fn proxy_connect_ip(listen: SocketAddr) -> IpAddr {
 pub fn ca_install(cert_path: &Path) {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let keychain = format!("{home}/Library/Keychains/login.keychain-db");
+        let keychain = login_keychain();
         let status = Command::new("security")
             .args(["add-trusted-cert", "-r", "trustRoot", "-k", &keychain])
             .arg(cert_path)
@@ -104,19 +110,25 @@ pub fn ca_install(cert_path: &Path) {
 pub fn ca_uninstall() -> bool {
     #[cfg(target_os = "macos")]
     {
-        // Delete every keychain entry matching the CA's CN; stop when none remain.
+        // Scope both queries to the same login keychain `ca_install` trusts into,
+        // so we don't fail on (or delete) a matching cert in another keychain and
+        // we operate on exactly the trust location this tool manages.
+        let keychain = login_keychain();
+        // Delete every login-keychain entry matching the CA's CN; stop when none remain.
         for _ in 0..16 {
             let present = Command::new("security")
-                .args(["find-certificate", "-c", CA_COMMON_NAME])
+                .args(["find-certificate", "-c", CA_COMMON_NAME, &keychain])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !present {
-                output::info("CA is not present in the keychain (removed or never installed)");
+                output::info(
+                    "CA is not present in the login keychain (removed or never installed)",
+                );
                 return true;
             }
             let deleted = Command::new("security")
-                .args(["delete-certificate", "-c", CA_COMMON_NAME])
+                .args(["delete-certificate", "-c", CA_COMMON_NAME, &keychain])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -237,16 +249,20 @@ pub fn restore_system_proxy_if_pending(ca_dir: &Path, interactive: bool) {
     }
 }
 
-/// Creates a unique temp directory under the system temp dir.
+/// Creates a secure, unique temp directory for a throwaway browser profile.
 ///
-/// Returns `None` and prints a warning with `label` if the directory cannot be created.
-fn make_temp_dir(label: &str) -> Option<PathBuf> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let dir = std::env::temp_dir().join(format!("ts-dev-proxy-{label}-{ts}"));
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => Some(dir),
+/// Uses `tempfile` (random name, `0700`, created with `O_EXCL`) rather than a
+/// predictable, timestamp-named path with `create_dir_all` — which succeeds if
+/// the directory already exists and lets a local racer supply an
+/// attacker-controlled profile. Returns `None` and prints a warning with `label`
+/// on failure. The caller keeps the returned [`tempfile::TempDir`] alive until
+/// the browser exits; dropping it removes the profile.
+fn make_temp_dir(label: &str) -> Option<tempfile::TempDir> {
+    match tempfile::Builder::new()
+        .prefix(&format!("ts-dev-proxy-{label}-"))
+        .tempdir()
+    {
+        Ok(dir) => Some(dir),
         Err(err) => {
             output::warn(&format!("{label}: could not create temp dir: {err}"));
             None
@@ -273,7 +289,7 @@ fn launch_chrome(cfg: &ResolvedConfig) {
     cmd.args([
         "--no-first-run",
         "--no-default-browser-check",
-        &format!("--user-data-dir={}", tmpdir.display()),
+        &format!("--user-data-dir={}", tmpdir.path().display()),
         &format!("--proxy-server={proxy_arg}"),
     ]);
 
@@ -283,10 +299,11 @@ fn launch_chrome(cfg: &ResolvedConfig) {
 
     match cmd.spawn() {
         Ok(mut child) => {
-            // Clean up the temp dir after the browser exits.
+            // Keep the profile dir alive until the browser exits; dropping the
+            // TempDir then removes it.
             std::thread::spawn(move || {
                 let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&tmpdir);
+                drop(tmpdir);
             });
         }
         Err(err) => {
@@ -294,7 +311,7 @@ fn launch_chrome(cfg: &ResolvedConfig) {
                 "Chrome: could not launch: {err}; \
                  start Chrome manually with --proxy-server=\"https={addr}\""
             ));
-            let _ = std::fs::remove_dir_all(&tmpdir);
+            // `tmpdir` drops here, removing the profile.
         }
     }
 }
@@ -339,12 +356,12 @@ fn launch_firefox(cfg: &ResolvedConfig) {
          user_pref(\"network.proxy.ssl_port\", {port});\n"
     );
 
-    if let Err(err) = std::fs::write(tmpdir.join("user.js"), &user_js) {
+    if let Err(err) = std::fs::write(tmpdir.path().join("user.js"), &user_js) {
         output::warn(&format!(
             "Firefox: could not write user.js: {err}; \
              configure Firefox manually (proxy SSL/TLS host={host} port={port})"
         ));
-        let _ = std::fs::remove_dir_all(&tmpdir);
+        // `tmpdir` drops here, removing the profile.
         return;
     }
 
@@ -357,7 +374,7 @@ fn launch_firefox(cfg: &ResolvedConfig) {
     let cert_path = super::ca::CertAuthority::cert_path(&cfg.ca_dir);
     if cert_path.exists() {
         let cert = cert_path.to_string_lossy();
-        let db = format!("sql:{}", tmpdir.to_string_lossy());
+        let db = format!("sql:{}", tmpdir.path().to_string_lossy());
         // Best-effort DB init; the -A import below is the step we check.
         let _ = Command::new("certutil")
             .args(["-N", "--empty-password", "-d", &db])
@@ -388,7 +405,7 @@ fn launch_firefox(cfg: &ResolvedConfig) {
     }
 
     let mut cmd = firefox_command();
-    cmd.args(["-profile", &tmpdir.to_string_lossy(), "--no-remote"]);
+    cmd.args(["-profile", &tmpdir.path().to_string_lossy(), "--no-remote"]);
 
     if let Some(rule) = cfg.rules.0.first() {
         cmd.arg(format!("https://{}", rule.from));
@@ -396,9 +413,11 @@ fn launch_firefox(cfg: &ResolvedConfig) {
 
     match cmd.spawn() {
         Ok(mut child) => {
+            // Keep the profile dir alive until the browser exits; dropping the
+            // TempDir then removes it.
             std::thread::spawn(move || {
                 let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&tmpdir);
+                drop(tmpdir);
             });
         }
         Err(err) => {
@@ -406,7 +425,7 @@ fn launch_firefox(cfg: &ResolvedConfig) {
                 "Firefox: could not launch: {err}; \
                  start Firefox manually with SSL proxy host={host} port={port}"
             ));
-            let _ = std::fs::remove_dir_all(&tmpdir);
+            // `tmpdir` drops here, removing the profile.
         }
     }
 }

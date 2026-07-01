@@ -500,16 +500,54 @@ where
         .change_context(ProxyError::Server)
 }
 
-/// Applies the rewrite outcome: upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host`
-/// (both `FROM`, after stripping any higher-priority inbound `Forwarded`), an
-/// authoritative `X-Forwarded-Proto: https` (the browser leg is always TLS), and
-/// (only when absent) the injected `Authorization`. The request URI is left
-/// origin-form, which is what an HTTP/1.1 upstream expects.
+/// Removes RFC 7230 hop-by-hop request headers, plus every header named in an
+/// inbound `Connection` token, before authoritative headers are stamped.
+///
+/// Without this, a client could send `Connection: X-Forwarded-Host, …` and any
+/// downstream HTTP intermediary that honors hop-by-hop semantics would discard
+/// exactly the headers this proxy relies on for host anchoring, scheme
+/// preservation, or Basic-auth injection. Token-named headers are collected
+/// before `Connection` itself is removed.
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    let named: Vec<HeaderName> = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect();
+    for name in named {
+        headers.remove(&name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+}
+
+/// Applies the rewrite outcome: strips inbound hop-by-hop headers, then sets
+/// upstream `Host`, `X-Forwarded-Host`/`X-Orig-Host` (both `FROM`, after
+/// stripping any higher-priority inbound `Forwarded`), an authoritative
+/// `X-Forwarded-Proto: https` (the browser leg is always TLS), and (only when
+/// absent) the injected `Authorization`. The request URI is left origin-form,
+/// which is what an HTTP/1.1 upstream expects.
 fn rewrite_headers(
     headers: &mut hyper::HeaderMap,
     outcome: &super::rewrite::RewriteOutcome,
     basic_auth: Option<&super::config::BasicAuth>,
 ) {
+    // Strip hop-by-hop headers first, so a client cannot flag the authoritative
+    // headers we stamp below as connection-specific and have them dropped.
+    strip_hop_by_hop(headers);
     if let Ok(value) = HeaderValue::from_str(&outcome.host_header) {
         headers.insert(hyper::header::HOST, value);
     }
@@ -541,8 +579,6 @@ fn rewrite_headers(
     {
         headers.insert(hyper::header::AUTHORIZATION, value);
     }
-    // Drop the hop-by-hop proxy header so it never reaches the upstream (spec §8.3).
-    headers.remove("proxy-connection");
 }
 
 /// Builds a rustls client config: a no-verification verifier when `insecure`,
@@ -743,6 +779,51 @@ mod tests {
         assert!(
             !headers.contains_key("fastly-ssl"),
             "spoofable Fastly-SSL is stripped"
+        );
+    }
+
+    #[test]
+    fn rewrite_headers_strips_connection_named_headers_but_keeps_injected() {
+        // A client naming the proxy's own headers in `Connection` must not cause
+        // them to be dropped downstream: we strip the client's copies + the
+        // `Connection` header, then stamp our authoritative values.
+        let outcome = RewriteOutcome {
+            sni: "to.edgecompute.app".to_string(),
+            host_header: "to.edgecompute.app".to_string(),
+            orig_host: "www.example-publisher.com".to_string(),
+            scheme_is_tls: true,
+        };
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONNECTION,
+            HeaderValue::from_static("x-forwarded-host, x-forwarded-proto, keep-alive"),
+        );
+        headers.insert(
+            HeaderName::from_static(X_FORWARDED_HOST),
+            HeaderValue::from_static("evil.example.com"),
+        );
+        headers.insert(
+            HeaderName::from_static("keep-alive"),
+            HeaderValue::from_static("timeout=5"),
+        );
+        rewrite_headers(&mut headers, &outcome, None);
+        assert!(
+            !headers.contains_key(hyper::header::CONNECTION),
+            "inbound Connection is stripped"
+        );
+        assert!(
+            !headers.contains_key("keep-alive"),
+            "a Connection-named hop-by-hop header is stripped"
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_HOST).and_then(|v| v.to_str().ok()),
+            Some("www.example-publisher.com"),
+            "the proxy-injected X-Forwarded-Host survives even though the client named it in Connection"
+        );
+        assert_eq!(
+            headers.get(X_FORWARDED_PROTO).and_then(|v| v.to_str().ok()),
+            Some("https"),
+            "the proxy-injected X-Forwarded-Proto survives too"
         );
     }
 }
