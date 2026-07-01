@@ -18,7 +18,6 @@ use serde::Deserialize;
 use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
-use crate::cookies::{strip_cookies, CONSENT_COOKIE_NAMES};
 use crate::error::TrustedServerError;
 use crate::integrations::{
     collect_body_bounded, collect_response_bounded, ensure_integration_backend,
@@ -248,11 +247,19 @@ impl LockrIntegration {
         from: &HeaderMap<HeaderValue>,
         to: &mut HeaderMap<HeaderValue>,
     ) -> Result<(), Report<TrustedServerError>> {
+        // NOTE: `Authorization` and `Cookie` are intentionally NOT forwarded.
+        // Under the first-party proxy the browser attaches the publisher's own
+        // credentials to `/integrations/lockr/api/...` — `Authorization` (e.g.
+        // staging basic-auth) and every publisher session/auth cookie. Both
+        // would leak to the third-party upstream, and the Lockr API rejects an
+        // unexpected `Authorization` with `{"code":400,"message":"Invalid
+        // request"}`. The SDK already passes the identity cookie data it needs
+        // in the request body (`firstPartyCookies`), so no `Cookie` header is
+        // required upstream.
         let headers_to_copy = [
             header::CONTENT_TYPE,
             header::ACCEPT,
             header::USER_AGENT,
-            header::AUTHORIZATION,
             header::ACCEPT_LANGUAGE,
             header::ACCEPT_ENCODING,
         ];
@@ -262,9 +269,6 @@ impl LockrIntegration {
                 to.insert(header_name, value.clone());
             }
         }
-
-        // Always strip consent cookies — consent travels through the OpenRTB body
-        self.copy_cookie_header(from, to)?;
 
         // Use origin override if configured, otherwise forward original
         let origin = self.config.origin_override.as_deref().or_else(|| {
@@ -286,34 +290,6 @@ impl LockrIntegration {
             let name_str = name.as_str();
             if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
                 to.append(name.clone(), value.clone());
-            }
-        }
-
-        Ok(())
-    }
-
-    fn copy_cookie_header(
-        &self,
-        from: &HeaderMap<HeaderValue>,
-        to: &mut HeaderMap<HeaderValue>,
-    ) -> Result<(), Report<TrustedServerError>> {
-        let Some(cookie_value) = from.get(header::COOKIE) else {
-            return Ok(());
-        };
-
-        match cookie_value.to_str() {
-            Ok(value) => {
-                let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-                if stripped.is_empty() {
-                    return Ok(());
-                }
-
-                let cookie_header = HeaderValue::from_str(&stripped)
-                    .change_context(Self::error("Failed to rebuild stripped cookie header"))?;
-                to.insert(header::COOKIE, cookie_header);
-            }
-            Err(_) => {
-                to.insert(header::COOKIE, cookie_value.clone());
             }
         }
 
@@ -598,6 +574,71 @@ mod tests {
             stub.recorded_backend_names().len(),
             1,
             "should route one outbound request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn lockr_proxy_forwards_body_and_strips_publisher_credentials() {
+        // Regression guard for the upstream-rejection / credential-leak causes:
+        // 1. The POST body (and content-type) must be forwarded, otherwise the
+        //    Lockr API returns `{"code":400,"message":"Invalid request"}`.
+        // 2. The publisher's `Authorization` header (e.g. site basic-auth) must
+        //    NOT be forwarded — the Lockr API rejects it with the same 400, and
+        //    forwarding it would leak the publisher credential to a third party.
+        // 3. The publisher's `Cookie` header (session/auth cookies the browser
+        //    attaches to the first-party route) must NOT be forwarded either.
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, br#"{"success":true,"data":{}}"#.to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = LockrIntegration::new(test_config());
+
+        let payload = br#"{"appID":"test-app-id"}"#;
+        let req = http::Request::builder()
+            .method(HttpMethod::POST)
+            .uri("https://publisher.example/integrations/lockr/api/publisher/app/v2/identityLockr/settings")
+            .header(header::CONTENT_TYPE, "application/json;charset=UTF-8")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::COOKIE, "session_id=secret; euconsent-v2=tcf")
+            .body(EdgeBody::from(payload.to_vec()))
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+        assert_eq!(response.status(), http::StatusCode::OK, "should return OK");
+
+        let bodies = stub.recorded_request_bodies();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "should forward exactly one upstream request"
+        );
+        assert_eq!(
+            bodies[0], payload,
+            "should forward the POST body unchanged to the Lockr API"
+        );
+
+        let headers = stub.recorded_request_headers();
+        assert!(
+            headers[0]
+                .iter()
+                .any(|(name, value)| name == "content-type"
+                    && value == "application/json;charset=UTF-8"),
+            "should forward the content-type header to the Lockr API"
+        );
+        assert!(
+            !headers[0]
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            "should NOT forward the publisher's Authorization header to the Lockr API"
+        );
+        assert!(
+            !headers[0]
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cookie")),
+            "should NOT forward the publisher's Cookie header to the Lockr API"
         );
     }
 
