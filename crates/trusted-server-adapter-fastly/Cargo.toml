@@ -21,7 +21,6 @@ log = { workspace = true }
 log-fastly = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }

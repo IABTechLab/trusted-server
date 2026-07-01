@@ -53,6 +53,11 @@ pub struct AdFormat {
 }
 
 /// Media type enumeration.
+///
+/// `Default` is `Banner` for programmatic construction only. Do **not** add
+/// `#[serde(default)]` to any field of this type: it would coerce an
+/// unknown/missing media type to `Banner` rather than failing, silently
+/// mis-typing video/native slots. Deserialization must stay strict.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {

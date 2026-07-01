@@ -1490,9 +1490,12 @@ impl PrebidAuctionProvider {
                 .map(std::string::ToString::to_string)
         };
 
+        // `adid` is the creative/ad identifier. The OpenRTB `id` is the bid ID,
+        // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
+        // (which is exposed raw in the debug bid) would mislead any consumer that
+        // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
         let ad_id = bid_obj
             .get("adid")
-            .or_else(|| bid_obj.get("id"))
             .and_then(|v| v.as_str())
             .map(String::from);
 

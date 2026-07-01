@@ -20,8 +20,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_publisher_request,
-    handle_tsjs_dynamic,
+    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -143,7 +143,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
+fn named_fallback_paths() -> [(&'static str, &'static [Method]); 12] {
     [
         ("/.well-known/trusted-server.json", &[Method::GET]),
         ("/verify-signature", &[Method::POST]),
@@ -152,6 +152,7 @@ fn named_fallback_paths() -> [(&'static str, &'static [Method]); 11] {
         ("/admin/keys/rotate", LEGACY_ADMIN_DENY_METHODS),
         ("/admin/keys/deactivate", LEGACY_ADMIN_DENY_METHODS),
         ("/auction", &[Method::POST]),
+        ("/__ts/page-bids", &[Method::GET, Method::OPTIONS]),
         ("/first-party/proxy", &[Method::GET]),
         ("/first-party/click", &[Method::GET]),
         ("/first-party/sign", &[Method::GET, Method::POST]),
@@ -320,6 +321,30 @@ fn health_response() -> Response {
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     resp
+}
+
+/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
+/// `/__ts/page-bids`, and the publisher fallback).
+///
+/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
+/// Unknown, which fails the auction consent gate closed even for consented
+/// users. Spin's platform geo is a no-op, so jurisdiction stays Unknown unless
+/// the request carries TCF consent. A malformed consent string is logged and
+/// falls back to the default (fail-closed) context rather than being silently
+/// swallowed.
+fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .unwrap_or_else(|e| {
+            log::warn!("EC context read failed: {e:?}");
+            EcContext::default()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +531,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 // OpenRTB metadata that auction signing derives from
                 // `RequestInfo::from_request` uses the trusted runtime authority.
                 let req = ctx.into_request();
-                let ec_context = EcContext::default();
+                // Build the geo-aware EC context so the auction consent gate sees
+                // the caller's jurisdiction — `EcContext::default()` fails it
+                // closed for consented users.
+                let ec_context = build_ec_context(&s.settings, &services, &req);
                 Ok(handle_auction(
                     &s.settings,
                     &s.orchestrator,
@@ -519,6 +547,33 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 .await
                 .unwrap_or_else(|e| http_error(&e)))
             }
+        };
+
+        // GET /__ts/page-bids — SPA re-auction endpoint.
+        let s = Arc::clone(&state);
+        let page_bids_handler = move |ctx: RequestContext| {
+            let s = Arc::clone(&s);
+            async move {
+                let services = build_runtime_services(&ctx);
+                let req = ctx.into_request();
+                let ec_context = build_ec_context(&s.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    orchestrator: &s.orchestrator,
+                    slots: s.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                Ok(
+                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req)
+                        .await
+                        .unwrap_or_else(|e| http_error(&e)),
+                )
+            }
+        };
+
+        // OPTIONS /__ts/page-bids — deny the CORS preflight for this
+        // side-effecting GET so the `X-TSJS-Page-Bids` gate stays trustworthy.
+        let page_bids_options_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(page_bids_preflight_denied())
         };
 
         // GET /first-party/proxy
@@ -611,34 +666,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                // Build the EC context (consent + jurisdiction) from the request
-                // like the Fastly entry point — `EcContext::default()` leaves
-                // jurisdiction Unknown and fails the auction consent gate closed.
-                // Spin's platform geo is a no-op, so jurisdiction stays Unknown
-                // unless the request carries TCF consent.
-                let geo_info = services
-                    .geo()
-                    .lookup(services.client_info().client_ip)
-                    .unwrap_or_else(|e| {
-                        log::warn!("geo lookup failed: {e}");
-                        None
-                    });
-                let mut ec_context = EcContext::read_from_request_with_geo(
-                    &state.settings,
-                    &req,
-                    &services,
-                    geo_info.as_ref(),
-                )
-                .unwrap_or_default();
-                let slots = state
-                    .settings
-                    .creative_opportunities
-                    .as_ref()
-                    .map(|co| co.slot.as_slice())
-                    .unwrap_or(&[]);
+                let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
                     orchestrator: &state.orchestrator,
-                    slots,
+                    slots: state.settings.creative_opportunity_slots(),
                     registry: None,
                 };
                 match handle_publisher_request(
@@ -708,6 +739,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post("/_ts/admin/keys/rotate", rotate_handler)
             .post("/_ts/admin/keys/deactivate", deactivate_handler)
             .post("/auction", auction_handler)
+            .get("/__ts/page-bids", page_bids_handler)
+            .route(
+                "/__ts/page-bids",
+                Method::OPTIONS,
+                page_bids_options_handler,
+            )
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)
             .get("/first-party/sign", fp_sign_handler)

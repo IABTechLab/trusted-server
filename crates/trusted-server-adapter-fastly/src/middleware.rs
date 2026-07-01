@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use edgezero_adapter_fastly::FastlyRequestContext;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderName, HeaderValue, Response, StatusCode};
+use edgezero_core::http::{HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
 use std::net::IpAddr;
@@ -223,84 +223,29 @@ pub(crate) fn apply_finalize_headers(
     }
 
     // Any response that sets a per-user cookie (notably the EC identity cookie)
-    // must never be shared-cached, or a shared cache could replay one user's
-    // Set-Cookie to others. Skip when the response is already uncacheable so we
-    // don't clobber a stricter directive (e.g. `no-store`).
-    enforce_set_cookie_cache_privacy(response);
-
-    // Per-user responses (assembled HTML, page-bids, cookie-bearing navigations)
-    // carry an uncacheable Cache-Control directive (`private` or `no-store`).
-    // Operator headers must not re-enable shared caching for them — neither by
-    // replacing Cache-Control nor by reintroducing the surrogate cache headers
-    // the privacy paths stripped.
-    let response_is_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-
-    for (key, value) in &settings.response_headers {
-        if response_is_uncacheable
-            && (key.eq_ignore_ascii_case(header::CACHE_CONTROL.as_str())
-                || key.eq_ignore_ascii_case("surrogate-control")
-                || key.eq_ignore_ascii_case("fastly-surrogate-control"))
-        {
-            continue;
-        }
-        let header_name = HeaderName::from_bytes(key.as_bytes())
-            .expect("should be a valid header name: response_headers validated in prepare_runtime");
-        let header_value = HeaderValue::from_str(value).expect(
-            "should be a valid header value: response_headers validated in prepare_runtime",
-        );
-        response.headers_mut().insert(header_name, header_value);
-    }
+    // must never be shared-cached, and per-user responses (assembled HTML,
+    // page-bids, cookie-bearing navigations) must not have their uncacheable
+    // Cache-Control re-enabled by operator headers. This shared helper runs
+    // byte-identically on every adapter so the privacy guarantee can't drift.
+    trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
+        settings, response,
+    );
 }
 
-/// Surrogate cache headers stripped from every cookie-bearing response. A single
-/// source of truth so the legacy ([`crate::enforce_set_cookie_cache_privacy`])
-/// and `EdgeZero` copies of the privacy downgrade cannot drift apart.
-pub(crate) const SURROGATE_CACHE_HEADERS: &[&str] =
-    &["surrogate-control", "fastly-surrogate-control"];
+/// Surrogate cache headers stripped from every cookie-bearing response.
+///
+/// Re-exported from [`trusted_server_core::response_privacy`] so the legacy
+/// [`crate::enforce_set_cookie_cache_privacy`] `FastlyResponse` variant and the
+/// shared [`Response`] downgrade cannot drift apart.
+pub(crate) use trusted_server_core::response_privacy::SURROGATE_CACHE_HEADERS;
 
 /// Forces cookie-bearing responses to stay private to shared caches.
 ///
-/// Mirrors [`crate::enforce_set_cookie_cache_privacy`] for the [`Response`] type
-/// from `edgezero_core::http`. The `EdgeZero` entry point re-applies this after
+/// Re-exported from [`trusted_server_core::response_privacy`] so the `EdgeZero`
+/// entry point (`main.rs`) can re-apply it after
 /// [`ec_finalize_response`](trusted_server_core::ec::finalize::ec_finalize_response)
-/// and request-filter effects, because the EC identity `Set-Cookie` is written
-/// after [`apply_finalize_headers`] runs and would otherwise reach a shared cache
-/// with inherited `public`/surrogate cache headers.
-///
-/// Idempotent: a response already marked `private`/`no-store` keeps its stricter
-/// `Cache-Control`, but the surrogate cache headers are stripped regardless so a
-/// `no-store` cookie response can never retain shared cacheability.
-pub(crate) fn enforce_set_cookie_cache_privacy(response: &mut Response) {
-    if !response.headers().contains_key(header::SET_COOKIE) {
-        return;
-    }
-    // Surrogate cache headers must come off every cookie-bearing response, even
-    // one already carrying a stricter `no-store`/`private` directive — they are
-    // independent of Cache-Control and would otherwise let a shared cache store
-    // and replay one visitor's Set-Cookie.
-    for name in SURROGATE_CACHE_HEADERS {
-        response.headers_mut().remove(*name);
-    }
-    // Cache-Control directives are case-insensitive (RFC 9111 §5.2), so match
-    // against a lowercased copy — `No-Store` / `Private` must count.
-    let already_uncacheable = response
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
-    if !already_uncacheable {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=0"),
-        );
-    }
-}
+/// writes the EC identity `Set-Cookie`, using the single shared implementation.
+pub(crate) use trusted_server_core::response_privacy::enforce_set_cookie_cache_privacy;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -317,7 +262,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{request_builder, response_builder, Method, StatusCode};
+    use edgezero_core::http::{request_builder, response_builder, HeaderName, Method, StatusCode};
     use edgezero_core::middleware::Next;
     use edgezero_core::params::PathParams;
     use error_stack::Report;

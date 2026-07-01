@@ -631,6 +631,9 @@ const SPA_SLOT_WAIT_MS = 2000;
  * nothing to wait for, or when `MutationObserver` is unavailable.
  */
 function waitForSlotElements(slots: AuctionSlot[], signal: AbortSignal): Promise<void> {
+  // A newer navigation may have aborted this signal before we were called; skip
+  // installing an observer/timer that the stale run would only tear down.
+  if (signal.aborted) return Promise.resolve();
   const allPresent = (): boolean => slots.every((slot) => !!findSlotElementByDivId(slot.div_id));
   if (slots.length === 0 || allPresent() || typeof MutationObserver === 'undefined') {
     return Promise.resolve();
@@ -757,6 +760,7 @@ export function installSpaAuctionHook(): void {
  * bundle build target ships in a later phase).
  */
 export function installSlimPrebidLoader(): void {
+  if (typeof window === 'undefined') return;
   const url = (window as GptWindow).__tsjs_slim_prebid_url;
   if (!url) return;
   window.addEventListener('load', () => {
@@ -793,6 +797,13 @@ const TS_DISPLAY_RENDERER =
  */
 export function installTsRenderBridge(): void {
   if (typeof window === 'undefined') return;
+
+  // adIds whose PBS Cache render is in flight. `fireWinBillingBeacons` only
+  // dedups after the async cache fetch resolves, so two Prebid Request messages
+  // for the same adId arriving before the first fetch settles would both fetch
+  // and both fire the nurl/burl beacons. Tracking in-flight adIds prevents the
+  // concurrent double-fire; the entry is cleared once the fetch settles.
+  const renderingAdIds = new Set<string>();
 
   window.addEventListener('message', (e: MessageEvent) => {
     let data: Record<string, unknown>;
@@ -860,6 +871,11 @@ export function installTsRenderBridge(): void {
     // TS owns this adId — stop Prebid from also processing it.
     e.stopImmediatePropagation();
 
+    // Skip a concurrent re-render of the same adId so its win/billing beacons
+    // fire at most once even before the first cache fetch resolves.
+    if (renderingAdIds.has(adId)) return;
+    renderingAdIds.add(adId);
+
     const cacheUrl = `https://${matchedBid.hb_cache_host}${matchedBid.hb_cache_path}?uuid=${encodeURIComponent(adId)}`;
 
     fetch(cacheUrl, { mode: 'cors' })
@@ -880,6 +896,9 @@ export function installTsRenderBridge(): void {
       })
       .catch((err) => {
         log.warn(`[tsjs-gpt] pbRender bridge: PBS Cache fetch failed for '${slotId}'`, err);
+      })
+      .finally(() => {
+        renderingAdIds.delete(adId);
       });
   });
 }

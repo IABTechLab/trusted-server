@@ -345,7 +345,20 @@ impl ApsAuctionProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&slot.id)
                     .to_string();
-                slot_id_map.insert(aps_slot_id.clone(), slot.id.clone());
+                // Last-write-wins: two slots configuring the same
+                // `[bidders.aps].slotID` would remap one slot's bids to the
+                // wrong creative slot. Log the collision so a misconfiguration
+                // is diagnosable, mirroring the build_bid_index collision log.
+                if let Some(previous_slot_id) =
+                    slot_id_map.insert(aps_slot_id.clone(), slot.id.clone())
+                {
+                    log::debug!(
+                        "APS slot ID '{aps_slot_id}' maps to multiple creative slots \
+                         ('{previous_slot_id}' overwritten by '{}'); bids for this APS \
+                         slot will resolve to the last one",
+                        slot.id,
+                    );
+                }
 
                 // Extract sizes from banner formats
                 let sizes: Vec<[u32; 2]> = slot

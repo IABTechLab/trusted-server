@@ -355,8 +355,9 @@ enabled = false
 endpoint = "https://mediator.example.com/adserver/mediate"
 timeout_ms = 1000
 
-# Debug configuration (all flags default to false — do not enable in production)
-[debug]
+# Debug configuration (all flags default to false — do not enable in production).
+# Uncomment the [debug] header together with any flag you enable.
+# [debug]
 # Inject <!-- ts-debug: ssp=N mediator=ok(N_bids) winning=N --> before </body>.
 # Visible in page source. Disable after investigation.
 # auction_html_comment = true

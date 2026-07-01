@@ -440,68 +440,23 @@ pub struct OwnedProcessResponseParams {
     pub(crate) price_granularity: PriceGranularity,
 }
 
-/// Buffer a [`PublisherResponse`] into a single [`Response`].
+/// Buffers a [`PublisherResponse`] into a single [`Response`], collecting the
+/// dispatched server-side auction before buffering.
 ///
 /// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
-/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
-/// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
+/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into
+/// memory, and reattaches [`PublisherResponse::PassThrough`] bodies directly.
 ///
 /// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
-/// (16 MiB by default), so processable origin responses cannot grow the
-/// buffer without bound and exhaust the Wasm heap.
+/// (16 MiB by default), so processable origin responses cannot grow the buffer
+/// without bound and exhaust the Wasm heap.
 ///
-/// `method` is used to preserve metadata for bodiless responses: `HEAD` and
-/// bodiless statuses (204, 304) carry no body but may advertise the `GET`
-/// representation's length. `handle_publisher_request` already strips the origin
-/// `Content-Length` for processable [`PublisherResponse::Stream`] responses, so
-/// rewriting it here to the buffered byte count (`0`) would replace it with a
-/// misleading length. Those responses skip the buffer, the length rewrite, and
-/// the body replacement, mirroring the asset path's bodiless guard.
+/// `method` preserves metadata for bodiless responses: `HEAD` and bodiless
+/// statuses (204, 304) carry no body but may advertise the `GET` representation's
+/// length, so they skip the buffer and length rewrite.
 ///
-/// # Errors
-///
-/// Returns an error if the streaming pipeline fails to process the response
-/// body, or if the processed body exceeds the configured buffer cap.
-pub fn buffer_publisher_response(
-    publisher_response: PublisherResponse,
-    method: &Method,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
-    match publisher_response {
-        PublisherResponse::Buffered(response) => Ok(response),
-        PublisherResponse::Stream {
-            mut response,
-            body,
-            params,
-        } => {
-            if !response_carries_body(method, response.status()) {
-                return Ok(response);
-            }
-            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
-            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
-            let bytes = output.into_inner();
-            response.headers_mut().insert(
-                http::header::CONTENT_LENGTH,
-                http::HeaderValue::from(bytes.len() as u64),
-            );
-            *response.body_mut() = EdgeBody::from(bytes);
-            Ok(response)
-        }
-        PublisherResponse::PassThrough { mut response, body } => {
-            *response.body_mut() = body;
-            Ok(response)
-        }
-    }
-}
-
-/// Async variant of [`buffer_publisher_response`] that collects the dispatched
-/// server-side auction before buffering.
-///
-/// The sync [`buffer_publisher_response`] drives [`stream_publisher_body`],
-/// which ignores `params.dispatched_auction`, so its `</body>` injection always
-/// falls back to empty `tsjs.bids`. Adapters that finalize on an async runtime
-/// (Axum, Cloudflare, Spin) call this instead: it drives
+/// Every adapter (Axum, Cloudflare, Spin, and the Fastly `EdgeZero` path) calls
+/// this: it drives
 /// [`stream_publisher_body_async`], which awaits
 /// [`AuctionOrchestrator::collect_dispatched_auction`], writes the winning bids
 /// into `ad_bids_state`, and injects them before `</body>`.
@@ -526,6 +481,17 @@ pub async fn buffer_publisher_response_async(
             mut params,
         } => {
             if !response_carries_body(method, response.status()) {
+                if params.dispatched_auction.is_some() {
+                    // A bodiless response (HEAD navigation, 204/304) has no
+                    // `</body>` to inject bids into, so the dispatched SSP
+                    // requests are wasted — surface it for quota observability,
+                    // matching the pass-through / buffered-unmodified arms.
+                    log::warn!(
+                        "Server-side auction dispatched but response is bodiless (method: {}, status: {}); in-flight SSP bid requests will not be collected",
+                        method,
+                        response.status(),
+                    );
+                }
                 return Ok(response);
             }
             let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
@@ -685,10 +651,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     if !is_html {
         // Non-HTML: collect auction first, then stream.  There is no </body>
         // to hold, so delaying the entire body until collection is acceptable.
-        let placeholder = Request::builder()
-            .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
-            .body(EdgeBody::empty())
-            .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
+        let placeholder = mediator_placeholder_request();
         let result = orchestrator
             .collect_dispatched_auction(
                 dispatched,
@@ -734,6 +697,20 @@ pub async fn stream_publisher_body_async<W: Write>(
         },
     )
     .await
+}
+
+/// Builds the canonical mediator placeholder [`Request`] passed to the collect
+/// phase via [`make_collect_context`].
+///
+/// The URI is the compile-time constant
+/// [`MEDIATOR_PLACEHOLDER_URL`](crate::auction::types::MEDIATOR_PLACEHOLDER_URL),
+/// so the builder is infallible; a default-URI fallback would trip
+/// [`make_collect_context`]'s `debug_assert_eq!`.
+fn mediator_placeholder_request() -> Request<EdgeBody> {
+    Request::builder()
+        .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
+        .body(EdgeBody::empty())
+        .expect("MEDIATOR_PLACEHOLDER_URL should be a valid URI")
 }
 
 /// Build a minimal [`AuctionContext`] for the collect phase.
@@ -1127,10 +1104,7 @@ async fn collect_stream_auction(
     settings: &Settings,
 ) {
     log::info!("body_close_hold_loop: collecting dispatched auction before held body tail");
-    let placeholder = Request::builder()
-        .uri(crate::auction::types::MEDIATOR_PLACEHOLDER_URL)
-        .body(EdgeBody::empty())
-        .unwrap_or_else(|_| Request::new(EdgeBody::empty()));
+    let placeholder = mediator_placeholder_request();
     let collect_ctx = make_collect_context(settings, services, &placeholder);
     let result = orchestrator
         .collect_dispatched_auction(dispatched, services, &collect_ctx)
@@ -1831,6 +1805,38 @@ pub(crate) fn build_empty_bids_script() -> String {
     build_bids_script(&serde_json::Map::new())
 }
 
+/// Builds the client-facing JSON wire shape for one creative-opportunity slot.
+///
+/// Shared verbatim by [`build_ad_slots_script`] (initial page render) and
+/// [`handle_page_bids`] (SPA navigation) so the slot wire shape has a single
+/// definition and the two paths cannot silently diverge. Property names match
+/// what the client-side TSJS bundle expects: `gam_unit_path`, `div_id`,
+/// `formats`, and `targeting`.
+fn build_slot_json(
+    slot: &crate::creative_opportunities::CreativeOpportunitySlot,
+    co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
+) -> serde_json::Value {
+    let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
+    let div_id = slot.resolved_div_id();
+    let formats: Vec<serde_json::Value> = slot
+        .formats
+        .iter()
+        .map(|f| serde_json::json!([f.width, f.height]))
+        .collect();
+    let targeting: serde_json::Map<String, serde_json::Value> = slot
+        .targeting
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+    serde_json::json!({
+        "id": slot.id,
+        "gam_unit_path": gam_path,
+        "div_id": div_id,
+        "formats": formats,
+        "targeting": targeting,
+    })
+}
+
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
@@ -1841,27 +1847,7 @@ pub(crate) fn build_ad_slots_script(
 ) -> String {
     let slots: Vec<serde_json::Value> = matched_slots
         .iter()
-        .map(|slot| {
-            let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
-            let div_id = slot.resolved_div_id();
-            let formats: Vec<serde_json::Value> = slot
-                .formats
-                .iter()
-                .map(|f| serde_json::json!([f.width, f.height]))
-                .collect();
-            let targeting: serde_json::Map<String, serde_json::Value> = slot
-                .targeting
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            serde_json::json!({
-                "id": slot.id,
-                "gam_unit_path": gam_path,
-                "div_id": div_id,
-                "formats": formats,
-                "targeting": targeting,
-            })
-        })
+        .map(|slot| build_slot_json(slot, co_config))
         .collect();
     let json = serde_json::to_string(&slots)
         .expect("serde_json::to_string of Vec<Value> should be infallible");
@@ -1929,6 +1915,25 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
     }
 }
 
+/// Builds the `403 Forbidden` returned for a CORS preflight (`OPTIONS`) to the
+/// side-effecting `/__ts/page-bids` endpoint.
+///
+/// The GET handler's [`page_bids_request_allowed`] gate trusts the
+/// `X-TSJS-Page-Bids` header precisely because this endpoint never grants a
+/// preflight; letting `OPTIONS` fall through to the publisher origin (which may
+/// return permissive CORS) would defeat that, allowing a cross-site page to
+/// trigger real PBS/APS auctions from a visitor's browser. Every adapter returns
+/// this same response for `OPTIONS /__ts/page-bids`.
+pub fn page_bids_preflight_denied() -> Response<EdgeBody> {
+    let mut response = Response::new(EdgeBody::from("Forbidden"));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
 /// Normalizes the client-supplied `path` query parameter before glob matching.
 ///
 /// The SPA hook sends `location.pathname`, but the parameter is
@@ -1948,6 +1953,11 @@ fn normalize_page_bids_path(raw: &str) -> String {
 /// Matches creative opportunity slots for the given path, runs a server-side
 /// auction (APS + PBS), and returns the slot definitions and winning bids as JSON.
 /// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
+///
+/// `kv` enriches the bid request with server-side EIDs from the EC identity
+/// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
+/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
+/// on every adapter, so no adapter forwards unconsented EIDs.
 ///
 /// # Errors
 ///
@@ -2105,27 +2115,7 @@ pub async fn handle_page_bids(
     let slots_json: Vec<serde_json::Value> = if ad_stack_enabled {
         matched_slots
             .iter()
-            .map(|slot| {
-                let gam_path = slot.resolved_gam_unit_path(&co_config.gam_network_id);
-                let div_id = slot.resolved_div_id();
-                let formats: Vec<serde_json::Value> = slot
-                    .formats
-                    .iter()
-                    .map(|f| serde_json::json!([f.width, f.height]))
-                    .collect();
-                let targeting: serde_json::Map<String, serde_json::Value> = slot
-                    .targeting
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect();
-                serde_json::json!({
-                    "id": slot.id,
-                    "gam_unit_path": gam_path,
-                    "div_id": div_id,
-                    "formats": formats,
-                    "targeting": targeting,
-                })
-            })
+            .map(|slot| build_slot_json(slot, co_config))
             .collect()
     } else {
         Vec::new()

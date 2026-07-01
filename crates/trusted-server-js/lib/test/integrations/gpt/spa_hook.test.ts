@@ -320,6 +320,39 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).not.toHaveBeenCalled();
   });
 
+  it('retries the same path after a failed page-bids fetch (currentPath rollback)', async () => {
+    // A failed load must roll `currentPath` back so re-navigating to the SAME
+    // path retries instead of being swallowed by the no-op guard at the top of
+    // onNavigate. Without the rollback, currentPath would already equal the
+    // failed path and the second navigation would return early.
+    document.body.innerHTML = '<div id="div-s1"></div>';
+    fetchStub.mockResolvedValueOnce({ ok: false, status: 500 }).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        slots: [{ id: 's1', div_id: 'div-s1' }],
+        bids: { s1: { hb_pb: '1.00' } },
+      }),
+    });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    // First navigation to the path fails; nothing is applied.
+    history.pushState({}, '', '/retry-page');
+    await flushAsync();
+    expect(ts.adSlots).toBeUndefined();
+
+    // Re-navigate to the same path — the retry must re-fetch and apply.
+    history.pushState({}, '', '/retry-page');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(ts.adSlots).toEqual([{ id: 's1', div_id: 'div-s1' }]);
+    expect(adInit).toHaveBeenCalledTimes(1);
+  });
+
   it('is idempotent — repeated install calls do not double-fetch a navigation', async () => {
     fetchStub.mockResolvedValue({
       ok: true,

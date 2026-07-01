@@ -541,7 +541,14 @@ impl AuctionOrchestrator {
                     {
                         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-                        match provider.parse_response(response, response_time_ms).await {
+                        // Use the context-aware parse so a provider overriding
+                        // `parse_response_with_context` behaves identically on the
+                        // parallel (`/auction`, page-bids) and collect (publisher)
+                        // paths. The default impl delegates to `parse_response`.
+                        match provider
+                            .parse_response_with_context(response, response_time_ms, context)
+                            .await
+                        {
                             Ok(auction_response) => {
                                 log::info!(
                                     "Provider '{}' returned {} bids (status: {:?}, time: {}ms)",

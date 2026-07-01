@@ -114,7 +114,8 @@ use trusted_server_core::proxy::{
     AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response_async, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+    buffer_publisher_response_async, handle_page_bids, handle_publisher_request,
+    handle_tsjs_dynamic, page_bids_preflight_denied, AuctionDispatch, BoundedWriter,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -584,6 +585,38 @@ async fn run_named_route(
             )
             .await
         }
+        NamedRouteHandler::PageBids => {
+            // SPA re-auction endpoint. `OPTIONS` is a CORS preflight for this
+            // side-effecting GET and is always denied so the GET handler's
+            // `X-TSJS-Page-Bids` gate stays trustworthy.
+            if req.method() == Method::OPTIONS {
+                return Ok(page_bids_preflight_denied());
+            }
+            // Like the auction, page-bids reads consent data, so the consent KV
+            // store must be available — fail closed with 503 when configured but
+            // unopenable, matching legacy.
+            let consent_services = runtime_services_for_consent_route(&state.settings, services)?;
+            let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
+            let registry_ref = if partner_registry.is_empty() {
+                None
+            } else {
+                Some(&partner_registry)
+            };
+            let auction = AuctionDispatch {
+                orchestrator: &state.orchestrator,
+                slots: state.settings.creative_opportunity_slots(),
+                registry: registry_ref,
+            };
+            handle_page_bids(
+                &state.settings,
+                &consent_services,
+                ec.kv_graph.as_ref(),
+                auction,
+                &ec.ec_context,
+                req,
+            )
+            .await
+        }
         NamedRouteHandler::FirstPartyProxy => {
             handle_first_party_proxy(&state.settings, services, req).await
         }
@@ -722,15 +755,10 @@ async fn dispatch_fallback(
                 // slots against the request path. The partner registry plus the
                 // EC identity-graph KV (`ec.kv_graph`) enrich the bid request with
                 // server-side EIDs, same as the legacy auction.
-                let slots = state
-                    .settings
-                    .creative_opportunities
-                    .as_ref()
-                    .map(|creative_opportunities| creative_opportunities.slot.as_slice())
-                    .unwrap_or(&[]);
+                let slots = state.settings.creative_opportunity_slots();
                 match PartnerRegistry::from_config(&state.settings.ec.partners) {
                     Ok(partner_registry) => {
-                        let auction = trusted_server_core::publisher::AuctionDispatch {
+                        let auction = AuctionDispatch {
                             orchestrator: &state.orchestrator,
                             slots,
                             registry: Some(&partner_registry),
@@ -977,6 +1005,7 @@ enum NamedRouteHandler {
     SetTester,
     ClearTester,
     Auction,
+    PageBids,
     FirstPartyProxy,
     FirstPartyClick,
     FirstPartySign,
@@ -1060,6 +1089,13 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
+    },
+    // GET runs the SPA re-auction; OPTIONS is denied in-handler as a CORS
+    // preflight guard for this side-effecting endpoint.
+    NamedRoute {
+        path: "/__ts/page-bids",
+        primary_methods: &[Method::GET, Method::OPTIONS],
+        handler: NamedRouteHandler::PageBids,
     },
     NamedRoute {
         path: "/first-party/proxy",

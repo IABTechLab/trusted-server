@@ -479,6 +479,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_format_dimension_above_u32_range() {
+        // Runtime dimensions are `u32`; a value above `u32::MAX` would silently
+        // truncate when parsed into the runtime slot, so it must fail at build.
+        let slot = json!({
+            "id": "atf",
+            "page_patterns": ["/20**"],
+            "formats": [{ "width": 5_000_000_000_u64, "height": 250 }]
+        });
+        let err = validate_creative_slot(&slot, "123456789")
+            .expect_err("width above u32::MAX must fail at build time");
+        assert!(err.contains("within u32 range"), "got: {err}");
+    }
+
+    #[test]
     fn rejects_empty_page_patterns() {
         let slot = json!({
             "id": "atf",
