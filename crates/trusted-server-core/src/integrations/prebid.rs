@@ -231,6 +231,7 @@ pub fn validate_config_for_startup(
         return Ok(None);
     };
     BidParamOverrideEngine::try_from_config(&config)?;
+    validate_external_bundle_config(&config, &settings.proxy.allowed_domains)?;
     Ok(Some(config))
 }
 
