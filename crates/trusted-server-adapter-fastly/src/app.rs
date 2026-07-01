@@ -65,8 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Streaming publisher responses** are buffered (bounded by
+//! - **Publisher responses** are buffered (bounded by
 //!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
+//!   Asset responses are streamed straight to the client (see
+//!   [`dispatch_asset_fallback`]), matching legacy.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -110,11 +112,10 @@ use trusted_server_core::integrations::{
 use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
-    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, stream_asset_body,
-    AssetProxyCachePolicy,
+    handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic, BoundedWriter,
+    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -734,13 +735,13 @@ async fn dispatch_fallback(
     attach_dispatch_extensions(response, ec, effects)
 }
 
-/// Returns `true` when an asset response should carry a buffered body and a
-/// recomputed `Content-Length`.
+/// Returns `true` when an asset response should carry a (streamed) body.
 ///
 /// `HEAD` responses and bodiless statuses (204, 304) advertise the origin
 /// representation length in their `Content-Length` header while carrying no
-/// body. Rewriting that header to the buffered byte count (0) would corrupt the
-/// metadata, so those responses keep the origin's `Content-Length` untouched.
+/// body. Attaching the origin stream would either contradict that header or
+/// stream bytes a client does not expect, so those responses drop the stream and
+/// keep the origin's `Content-Length` untouched.
 fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
     *method != Method::HEAD
         && status != StatusCode::NO_CONTENT
@@ -756,13 +757,13 @@ fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
 /// is intentionally skipped: no [`EcFinalizeState`] is attached, matching the
 /// legacy `should_finalize_ec = false` behavior for asset responses.
 ///
-/// Unlike legacy `route_request`, which streams asset bodies straight to the
-/// client with no cap, the `EdgeZero` path buffers them: `edgezero_main`
-/// converts the whole response before sending, so there is no streaming seam
-/// yet. The buffer is bounded by `publisher.max_buffered_body_bytes` as an
-/// interim Wasm-heap OOM guard. Reusing the publisher cap and restoring
-/// uncapped streaming are both resolved by the streaming cutover (issue #495);
-/// whether assets get a dedicated cap is deferred to that work.
+/// Like legacy `route_request`, asset bodies are streamed straight to the client
+/// with no cap: the origin stream is attached to the response and `edgezero_main`
+/// commits the headers, then pipes the body chunk-by-chunk via
+/// [`fastly::Response::stream_to_client`] and
+/// [`stream_asset_body`](trusted_server_core::proxy::stream_asset_body). The
+/// origin stream is left untouched here, so large images never materialize in
+/// the Wasm heap.
 async fn dispatch_asset_fallback(
     state: &AppState,
     services: &RuntimeServices,
@@ -779,30 +780,13 @@ async fn dispatch_asset_fallback(
             let cache_policy = asset_response.cache_policy();
             let (mut response, stream_body) = asset_response.into_response_and_body();
 
+            // Attach the origin stream so `edgezero_main` streams it to the
+            // client. HEAD and bodiless statuses (204, 304) advertise the origin
+            // Content-Length but carry no body, so their stream is dropped to
+            // preserve that header and avoid a length/body mismatch.
             if let Some(body) = stream_body {
-                match buffer_asset_body(body, state.settings.publisher.max_buffered_body_bytes)
-                    .await
-                {
-                    Ok(bytes) => {
-                        // Preserve the origin's Content-Length for HEAD and
-                        // bodiless statuses; only body-bearing responses get a
-                        // recomputed length and the buffered body attached.
-                        if asset_response_carries_body(&method, response.status()) {
-                            response.headers_mut().insert(
-                                header::CONTENT_LENGTH,
-                                HeaderValue::from(bytes.len() as u64),
-                            );
-                            *response.body_mut() = edgezero_core::body::Body::from(bytes);
-                        }
-                    }
-                    Err(report) => {
-                        let mut response = http_error(&report);
-                        response
-                            .extensions_mut()
-                            .insert(AssetProxyCachePolicy::NoStorePrivate);
-                        attach_request_filter_effects(&mut response, effects);
-                        return response;
-                    }
+                if asset_response_carries_body(&method, response.status()) {
+                    *response.body_mut() = body;
                 }
             }
 
@@ -831,23 +815,6 @@ fn attach_request_filter_effects(response: &mut Response, effects: &RequestFilte
     if !effects.response_headers.is_empty() {
         response.extensions_mut().insert(effects.clone());
     }
-}
-
-/// Buffers a streaming asset body into memory, bounded by `max_bytes`
-/// (the interim `publisher.max_buffered_body_bytes` OOM guard; see
-/// [`dispatch_asset_fallback`]).
-///
-/// # Errors
-///
-/// Returns an error if the body exceeds the configured cap or the underlying
-/// stream yields an error.
-async fn buffer_asset_body(
-    body: edgezero_core::body::Body,
-    max_bytes: usize,
-) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    let mut output = BoundedWriter::new(max_bytes);
-    stream_asset_body(body, &mut output).await?;
-    Ok(output.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1108,10 @@ mod tests {
         build_state_from_settings, startup_error_router, AppState, NamedRouteHandler,
         TrustedServerApp, NAMED_ROUTES,
     };
+    use crate::route_tests::{
+        test_runtime_services_with_secret_http_client_and_geo, us_california_geo, FixedBackend,
+        FixedGeo, NoopSecretStore, StreamingRecordingHttpClient,
+    };
 
     use edgezero_core::body::Body;
     use edgezero_core::http::{header, request_builder, Method, StatusCode};
@@ -1158,7 +1129,7 @@ mod tests {
         HeaderMutation, IntegrationRegistry, IntegrationRequestFilter, RequestFilterDecision,
         RequestFilterEffects, RequestFilterInput,
     };
-    use trusted_server_core::platform::ClientInfo;
+    use trusted_server_core::platform::{ClientInfo, PlatformHttpClient};
     use trusted_server_core::settings::Settings;
 
     fn settings_with_missing_consent_store() -> Settings {
@@ -2033,6 +2004,79 @@ mod tests {
                 .get::<super::EcFinalizeState>()
                 .is_none(),
             "asset-route responses must skip EC finalization (no EcFinalizeState)"
+        );
+    }
+
+    #[test]
+    fn dispatch_asset_fallback_streams_origin_body_without_buffering() {
+        // Regression guard for the EdgeZero asset streaming cutover: a successful
+        // asset proxy must hand `edgezero_main` a streaming body (`Body::Stream`)
+        // rather than draining the origin into a buffered `Body::Once`. Injecting a
+        // streaming HTTP client lets us assert the body type the entry point will
+        // pipe straight to the client via `stream_to_client`.
+        let settings = Settings::from_toml(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [request_signing]
+            enabled = false
+            config_store_id = "test-config-store-id"
+            secret_store_id = "test-secret-store-id"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/.images/"
+            origin_url = "https://assets.example.com"
+            "#,
+        )
+        .expect("should parse asset-route settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+
+        let fastly_req = fastly::Request::get("https://test-publisher.com/.images/logo.png");
+        let http_client = Arc::new(StreamingRecordingHttpClient::new());
+        let services = test_runtime_services_with_secret_http_client_and_geo(
+            &fastly_req,
+            Arc::new(FixedBackend),
+            Arc::new(NoopSecretStore),
+            Arc::clone(&http_client) as Arc<dyn PlatformHttpClient>,
+            Arc::new(FixedGeo(us_california_geo())),
+        );
+        let req = crate::compat::from_fastly_request(fastly_req);
+        let asset_route = state
+            .settings
+            .asset_route_for_path("/.images/logo.png")
+            .expect("should match the configured asset route");
+        let effects = RequestFilterEffects::default();
+
+        let response = block_on(super::dispatch_asset_fallback(
+            &state,
+            &services,
+            req,
+            asset_route,
+            &effects,
+        ));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should preserve the streaming origin status"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "EdgeZero asset dispatch must stream the origin body, not buffer it"
         );
     }
 
