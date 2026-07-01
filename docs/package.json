@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10",
-    "@types/node": "^24.10",
+    "@types/node": "^26.0",
     "eslint": "^10",
     "mermaid": "^11.12.3",
     "prettier": "^3.4.2",
