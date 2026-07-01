@@ -312,8 +312,10 @@ fi
 After this step every later step uses `${WT:-.}` for cwd (so BRANCH-LOCAL
 implicitly runs from the project root) and `$DIFF_RANGE` for diffs. There
 are no more per-mode forks until step 7e (which checks `[ -n "$WT" ]` for
-scratch verification) and step 8 (which is skipped entirely for BRANCH-*
-modes — no PR to submit a review to).
+scratch verification) and step 8, where only **step 8b (the GitHub review
+submission)** is skipped for BRANCH-* modes — no PR to submit a review to.
+Step 8a still runs in every mode to compose the review artifact and, in
+BRANCH-* modes, render the would-have-been verdict and findings into chat.
 
 Stash the `HEAD_OID_EXPECTED` value — step 8 re-checks it immediately
 before submission and pins it into the review payload as `commit_id`.
@@ -540,7 +542,9 @@ Per finding, show:
 - Description and suggested fix
 - For suggestion-eligible findings, the literal `\`\`\`suggestion … \`\`\``
   body as it would appear in the inline comment, fenced so the user sees
-  exactly what they're approving
+  exactly what they're approving (widen the fence per step 7a's fence-length
+  rule when the replacement contains its own backtick run, so the preview
+  matches what gets submitted)
 - For prose-only findings, the proposed code in a non-`suggestion` fenced
   block plus the one-line reason it can't be auto-applied
 - Whether it would be an inline comment or land in the body-level section
@@ -651,6 +655,30 @@ In all of those cases, give the proposed code in a plain fenced block (e.g.
 ```` ```rust ````) and end with a short "Apply manually — can't be auto-applied
 as a suggestion because …" sentence.
 
+##### Fence length when the replacement itself contains backticks
+
+The default `` ```suggestion `` fence is three backticks. If the replacement
+bytes contain a line that is itself a run of three-or-more backticks — common
+for Markdown/docs suggestions that include a nested code fence — that inner run
+closes the outer `suggestion` block early, and the rendered one-click
+suggestion is truncated or malformed rather than matching the bytes the user
+approved. Before displaying or submitting any suggestion:
+
+1. Scan the replacement for the longest run of consecutive backticks, `N`.
+2. If `N < 3`, use the normal three-backtick `` ```suggestion `` fence.
+3. If `N >= 3`, open and close the block with a fence of `N + 1` backticks
+   (e.g. ` ````suggestion ` for an inner ```` ``` ````), so the outer fence is
+   strictly longer than any inner run — GitHub follows the CommonMark rule that
+   a fence closes only on a run of **at least** as many backticks. Verify in
+   step 7e's scratch pass that the rendered suggestion still applies as one
+   click; if the longer-fence form does not render as an applicable suggestion,
+   **demote the finding to prose-only** (a plain fenced block plus the
+   "Apply manually …" sentence) rather than posting a malformed suggestion.
+
+Apply this identically to the triage preview (step 6) and the final inline
+comment body (step 7b) — the user must approve the exact fence and bytes that
+get submitted.
+
 #### 7b. Inline comment with a suggestion
 
 Each comment carries a `path`, `line` (and `start_line` for a multi-line
@@ -681,6 +709,13 @@ For a multi-line suggestion, add `start_line` and `start_side`:
 
 **Indentation matters**: the block replaces the original lines verbatim, so
 leading whitespace must match exactly what the file expects after the fix.
+
+**Fence length matters too**: the `` ```suggestion `` fences above use three
+backticks, which only holds when the replacement contains no three-or-more
+backtick run of its own. When it does (e.g. a docs suggestion with a nested
+code fence), widen the outer fence per step 7a's fence-length rule or demote
+the finding to prose — never post a suggestion whose inner backtick run closes
+the block early.
 
 #### 7c. Inline comment without a suggestion
 
