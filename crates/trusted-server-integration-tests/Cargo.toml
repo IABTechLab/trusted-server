@@ -15,7 +15,7 @@ path = "tests/parity.rs"
 harness = true
 
 [dependencies]
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", default-features = false }
+edgezero-core = { git = "https://github.com/stackpop/edgezero", branch = "main", default-features = false }
 serde_json = "1.0.149"
 trusted-server-core = { path = "../trusted-server-core" }
 
@@ -33,12 +33,12 @@ urlencoding = "2.1"
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
 trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
-# This crate is excluded from the workspace, so the edgezero git rev below
+# This crate is excluded from the workspace, so the edgezero git source below
 # cannot come from [workspace.dependencies] and duplicates the pin in the
-# root Cargo.toml. Any edgezero rev bump must be applied in BOTH places, or
-# this crate compiles edgezero-core at a different rev than the adapters
-# under test and fails with a type mismatch.
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", features = ["axum"] }
+# root Cargo.toml. Any edgezero source change (branch/rev) must be applied in
+# BOTH places, or this crate compiles edgezero-core at a different revision than
+# the adapters under test and fails with a type mismatch.
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", branch = "main", features = ["axum"] }
 axum = "0.8.9"
 tower = { version = "0.4", features = ["util"] }
 tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] } # exact pin — keep in sync with workspace-resolved tokio version
