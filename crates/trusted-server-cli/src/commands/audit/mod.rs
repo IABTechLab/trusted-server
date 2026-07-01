@@ -447,7 +447,7 @@ fn build_js_asset_proxy_section(
         "# Audit note: some discovered scripts may be runtime-injected and may not appear\n",
     );
     toml.push_str(
-        "# in origin HTML. JS Asset Proxy rewrites only exact script src values present in\n",
+        "# in origin HTML. JS Asset Proxy rewrites only matching script src URLs present in\n",
     );
     toml.push_str("# HTML processed by Trusted Server.\n");
 
@@ -1031,19 +1031,25 @@ mod tests {
             draft.js_asset_proxy_candidate_count, 2,
             "should report generated disabled entries"
         );
-        assert!(draft
-            .toml
-            .contains("[integrations.js_asset_proxy]\nenabled = false"));
+        assert!(
+            draft
+                .toml
+                .contains("[integrations.js_asset_proxy]\nenabled = false")
+        );
         assert!(draft.toml.contains("/assets/aaaaaaaaaaaaaaaaaaaaaaaa.js"));
         assert!(draft.toml.contains("/assets/bbbbbbbbbbbbbbbbbbbbbbbb.js"));
-        assert!(draft
-            .toml
-            .contains("origin_url = \"https://cdn.vendor.example/sdk.js\""));
+        assert!(
+            draft
+                .toml
+                .contains("origin_url = \"https://cdn.vendor.example/sdk.js\"")
+        );
         assert!(draft.toml.contains("proxy = \"disabled\""));
         assert!(draft.toml.contains("Detected integration: gpt"));
-        assert!(draft
-            .toml
-            .contains("Native integration may be preferable: [integrations.gpt]"));
+        assert!(
+            draft
+                .toml
+                .contains("Native integration may be preferable: [integrations.gpt]")
+        );
         assert!(
             !draft.toml.contains("example-vendor-loader"),
             "should remove starter-template placeholder asset"
@@ -1160,9 +1166,11 @@ mod tests {
             .expect("should build draft config");
 
         assert_eq!(draft.js_asset_proxy_candidate_count, 0);
-        assert!(draft
-            .toml
-            .contains("No eligible third-party HTTPS script assets"));
+        assert!(
+            draft
+                .toml
+                .contains("No eligible third-party HTTPS script assets")
+        );
         assert!(
             !draft
                 .toml

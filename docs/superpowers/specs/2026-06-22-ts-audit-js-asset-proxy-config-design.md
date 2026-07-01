@@ -240,12 +240,12 @@ The generated config is safe by default:
 | `integrations.js_asset_proxy.enabled` | `false`                      | Prevent route registration and rewriting until reviewed.           |
 | `assets[].proxy`                      | `disabled`                   | Keep candidate inventory without rewriting, proxying, or blocking. |
 | `assets[].path`                       | opaque random `/assets/*.js` | Avoid exposing vendor names in first-party URLs.                   |
-| `assets[].origin_url`                 | exact audited URL            | Match JS Asset Proxy's exact-match behavior.                       |
+| `assets[].origin_url`                 | audited URL                  | Match JS Asset Proxy's normalized URL matching behavior.           |
 
 The operator can choose among:
 
 - `proxy = "enabled"` to rewrite matching script tags and serve the first-party path;
-- `proxy = "blocked"` to remove exact matching script tags;
+- `proxy = "blocked"` to remove matching script tags;
 - leaving `proxy = "disabled"` to keep the candidate as review inventory.
 
 ---
@@ -253,18 +253,18 @@ The operator can choose among:
 ## 8. Important operator warning
 
 The audit sees rendered scripts and browser network requests. The JS Asset Proxy
-rewrites server-returned HTML by exact `<script src="..."></script>` matches.
+rewrites server-returned HTML by matching `<script src="..."></script>` URLs.
 
 Therefore, some generated candidates may be runtime-only scripts injected by tag
 managers or other JavaScript. Those entries are still useful as inventory, but
-enabling them may not cause rewriting unless the exact `origin_url` appears in
+enabling them may not cause rewriting unless a matching `src` URL appears in
 origin HTML processed by Trusted Server.
 
 The generated config should include a warning comment near the asset proxy block:
 
 ```toml
 # Audit note: some discovered scripts may be runtime-injected and may not appear
-# in origin HTML. JS Asset Proxy rewrites only exact script src values present in
+# in origin HTML. JS Asset Proxy rewrites only matching script src URLs present in
 # HTML processed by Trusted Server.
 ```
 
@@ -357,4 +357,4 @@ Update `docs/guide/cli.md` and `docs/guide/getting-started.md` to say:
 - enabling requires setting both `integrations.js_asset_proxy.enabled = true` and
   individual `assets[].proxy = "enabled"` or `"blocked"`;
 - runtime-injected scripts may appear in audit output but may not be rewritten
-  unless they appear as exact script URLs in origin HTML.
+  unless matching script URLs appear in origin HTML.

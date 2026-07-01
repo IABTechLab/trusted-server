@@ -91,13 +91,13 @@ The implementation may use stricter validation if it keeps the configuration con
 
 Each asset has a `proxy` setting that controls both page rewriting and route registration:
 
-| Value      | Behavior                                                                                                                                                                                |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`  | Rewrite exact matching `<script src="<origin_url>">` references to the configured first-party `path`, register one exact `GET` route for that path, and proxy requests to `origin_url`. |
-| `disabled` | Keep the asset in configuration but perform no page rewriting, no blocking, and no route registration.                                                                                  |
-| `blocked`  | Remove exact matching `<script src="<origin_url>">` elements from HTML and do not register a proxy route.                                                                               |
+| Value      | Behavior                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`  | Rewrite matching `<script src>` references to the configured first-party `path`, register one exact `GET` route for that path, and proxy requests to `origin_url`. |
+| `disabled` | Keep the asset in configuration but perform no page rewriting, no blocking, and no route registration.                                                             |
+| `blocked`  | Remove matching `<script src>` elements from HTML and do not register a proxy route.                                                                               |
 
-Page rewriting and blocking match only the exact configured `origin_url`. They do not match by host, path prefix, wildcard, or partial URL.
+Page rewriting and blocking match the configured `origin_url` after supported URL normalization, including protocol-relative URLs on matching schemes, host/scheme case normalization, and default-port removal. They do not match by host, path prefix, wildcard, or partial URL.
 
 ---
 
@@ -124,7 +124,7 @@ For a matching request:
 
 1. Identify the enabled configured asset by exact request path.
 2. Build an upstream `GET` request to the asset's configured `origin_url`.
-3. Use the existing proxy request infrastructure with streaming passthrough enabled.
+3. Use the existing proxy request infrastructure with streaming passthrough and platform response streaming enabled.
 4. Do not append EC IDs or any other per-user identifiers to the upstream URL.
 5. Do not perform server-side JavaScript rewriting.
 6. Finalize the response with the header policy below.
@@ -136,6 +136,7 @@ The JS asset proxy should use the same shape as existing script proxy integratio
 ```rust
 let mut config = ProxyRequestConfig::new(origin_url)
     .with_streaming()
+    .with_stream_response()
     .without_forward_headers();
 config.follow_redirects = false;
 config.forward_ec_id = false;
@@ -329,9 +330,9 @@ Add unit tests covering:
 
 - disabled config does not register routes;
 - enabled config requires at least one asset;
-- `proxy = "enabled"` registers a route and rewrites exact matching script `src` values to the configured first-party path;
-- `proxy = "disabled"` does not register a route and leaves exact matching script `src` values unchanged;
-- `proxy = "blocked"` does not register a route and removes exact matching script elements;
+- `proxy = "enabled"` registers a route and rewrites matching script `src` URLs to the configured first-party path;
+- `proxy = "disabled"` does not register a route and leaves matching script `src` URLs unchanged;
+- `proxy = "blocked"` does not register a route and removes matching script elements;
 - non-exact `origin_url` matches are not rewritten or blocked;
 - duplicate asset paths are rejected;
 - duplicate `origin_url` values are rejected;
