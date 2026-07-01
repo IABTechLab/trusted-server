@@ -22,6 +22,8 @@ const SETTLE_MAX_WAIT: Duration = Duration::from_secs(6);
 const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
+const RESOURCE_TIMING_BUFFER_WARNING: &str =
+    "browser resource timing buffer reached its default size; some network assets may be missing";
 
 #[derive(Default)]
 pub(crate) struct BrowserAuditCollector;
@@ -181,11 +183,8 @@ async fn collect_page_from_browser(
             ))
         })?;
 
-    if network_requests.len() >= RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD {
-        warnings.push(
-            "browser resource timing buffer reached its default size; some network assets may be missing"
-                .to_string(),
-        );
+    if let Some(warning) = resource_timing_buffer_warning(network_requests.len()) {
+        warnings.push(warning.to_string());
     }
 
     Ok(CollectedPage {
@@ -280,6 +279,11 @@ fn is_successful_navigation_status(status: i64) -> bool {
     (200..400).contains(&status)
 }
 
+fn resource_timing_buffer_warning(resource_count: usize) -> Option<&'static str> {
+    (resource_count >= RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD)
+        .then_some(RESOURCE_TIMING_BUFFER_WARNING)
+}
+
 fn find_browser_executable() -> CliResult<PathBuf> {
     for candidate in browser_executable_path_candidates() {
         if let Ok(path) = which(candidate) {
@@ -352,6 +356,12 @@ struct BrowserPerformanceEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
+    use chromiumoxide::cdp::browser_protocol::security::SecurityState;
+    use chromiumoxide::handler::http::HttpRequest;
+
     use super::*;
 
     #[test]
@@ -365,11 +375,61 @@ mod tests {
     }
 
     #[test]
+    fn navigation_response_returns_warning_for_http_error_status() {
+        let warning =
+            validate_navigation_response(navigation_response_with_status(403, "Forbidden"))
+                .expect("should validate navigation response")
+                .expect("should return warning for HTTP error status");
+
+        assert_eq!(
+            warning,
+            "audit request returned HTTP 403 Forbidden for `https://example.com/`; results may be partial",
+            "should warn and continue when the main document returns an HTTP error"
+        );
+    }
+
+    #[test]
+    fn resource_timing_buffer_warning_starts_at_threshold() {
+        assert_eq!(
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD - 1),
+            None,
+            "should not warn before the resource timing buffer threshold"
+        );
+        assert_eq!(
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD),
+            Some(RESOURCE_TIMING_BUFFER_WARNING),
+            "should warn when the resource timing buffer reaches the threshold"
+        );
+    }
+
+    #[test]
     fn browser_path_candidates_include_common_names() {
         let candidates = browser_executable_path_candidates();
 
         assert!(candidates.contains(&"google-chrome"));
         assert!(candidates.contains(&"chromium"));
         assert!(candidates.contains(&"Google Chrome for Testing"));
+    }
+
+    fn navigation_response_with_status(status: i64, status_text: &str) -> ArcHttpRequest {
+        let mut request =
+            HttpRequest::new(RequestId::new("request-1"), None, None, false, Vec::new());
+        request.response = Some(
+            Response::builder()
+                .url("https://example.com/")
+                .status(status)
+                .status_text(status_text)
+                .headers(Headers::default())
+                .mime_type("text/html")
+                .charset("utf-8")
+                .connection_reused(false)
+                .connection_id(1.0)
+                .encoded_data_length(0.0)
+                .security_state(SecurityState::Secure)
+                .build()
+                .expect("should build navigation response"),
+        );
+
+        Some(Arc::new(request))
     }
 }
