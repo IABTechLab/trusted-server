@@ -663,4 +663,55 @@ mod tests {
             "should route outbound request through PlatformHttpClient"
         );
     }
+
+    #[test]
+    fn permutive_proxy_strips_authorization() {
+        // Security regression guard: the publisher's Authorization header must
+        // not be forwarded to the Permutive upstream (credential leak).
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = PermutiveIntegration::new(PermutiveConfig {
+            enabled: true,
+            organization_id: "myorg".to_string(),
+            workspace_id: "workspace-123".to_string(),
+            project_id: String::new(),
+            api_endpoint: default_api_endpoint(),
+            secure_signals_endpoint: default_secure_signals_endpoint(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+        });
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://publisher.example/integrations/permutive/api/v2.0/events")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "should return stubbed response"
+        );
+
+        let headers = stub.recorded_request_headers();
+        assert!(
+            !headers[0]
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            "should NOT forward the publisher's Authorization header to Permutive"
+        );
+        assert!(
+            headers[0]
+                .iter()
+                .any(|(name, value)| name == "user-agent" && value == "test-agent"),
+            "should still forward required headers (user-agent)"
+        );
+    }
 }

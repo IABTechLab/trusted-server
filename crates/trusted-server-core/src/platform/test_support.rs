@@ -409,12 +409,15 @@ impl PlatformHttpClient for StubHttpClient {
             .push(headers);
 
         // Capture the outgoing request body so tests can assert it is forwarded.
+        // Propagate collection failures instead of recording an empty body, so
+        // tests cannot mistake a capture failure for an intentionally empty body.
         let (_, body) = request.request.into_parts();
         let body_bytes = body
             .into_bytes_bounded(MAX_RECORDED_BODY_BYTES)
             .await
-            .map(|bytes| bytes.to_vec())
-            .unwrap_or_default();
+            .change_context(PlatformError::HttpClient)
+            .attach("failed to capture StubHttpClient request body")?
+            .to_vec();
         self.request_bodies
             .lock()
             .expect("should lock request bodies")

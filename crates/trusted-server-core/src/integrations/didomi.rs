@@ -451,6 +451,46 @@ mod tests {
     }
 
     #[test]
+    fn copy_headers_strips_authorization() {
+        // Security regression guard: the publisher's Authorization header must
+        // not be forwarded to the Didomi upstream (credential leak).
+        let integration = DidomiIntegration::new(Arc::new(config(true)));
+        let backend = DidomiBackend::Api;
+        let original_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/test")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build original request");
+        let mut proxy_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://api.privacy-center.org/test")
+            .body(EdgeBody::empty())
+            .expect("should build proxy request");
+
+        integration.copy_headers(
+            &backend,
+            None,
+            original_req.headers(),
+            proxy_req.headers_mut(),
+        );
+
+        assert!(
+            proxy_req.headers().get(header::AUTHORIZATION).is_none(),
+            "should NOT forward the publisher's Authorization header to Didomi"
+        );
+        assert_eq!(
+            proxy_req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("test-agent"),
+            "should still forward required headers (user-agent)"
+        );
+    }
+
+    #[test]
     fn registers_custom_proxy_path() {
         let mut settings = create_test_settings();
         let custom_config = DidomiIntegrationConfig {
