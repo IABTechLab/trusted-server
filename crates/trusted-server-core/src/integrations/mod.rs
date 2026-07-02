@@ -17,6 +17,7 @@ pub mod datadome;
 pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
+pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
 pub mod osano;
@@ -278,6 +279,7 @@ type IntegrationBuilder =
 
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     &[
+        js_asset_proxy::register,
         prebid::register,
         testlight::register,
         nextjs::register,
