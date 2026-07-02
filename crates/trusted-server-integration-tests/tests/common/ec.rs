@@ -271,13 +271,13 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Sends a non-fatal diagnostic probe for the EdgeZero entry point.
+/// Sends a non-fatal diagnostic probe for the `EdgeZero` entry point.
 ///
 /// `main()` silently falls back to the legacy entry point when the config store
 /// cannot be opened or read, and the EC lifecycle scenarios pass on either path.
 /// This probe used to assert a router-level `405` for unsupported methods, but
 /// Viceroy/Fastly method handling can fall through to the publisher fallback.
-/// Keep the request as a non-fatal diagnostic so the EdgeZero CI job still runs
+/// Keep the request as a non-fatal diagnostic so the `EdgeZero` CI job still runs
 /// the EC lifecycle scenarios instead of failing on a routing canary that is not
 /// stable across runtime versions.
 pub fn assert_edgezero_entry_point(base_url: &str) -> TestResult<()> {
