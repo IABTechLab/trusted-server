@@ -256,7 +256,7 @@ Integrations that ship additional JS (such as Testlight) typically expose a `shi
 ### 8. Test Locally
 
 1. Add minimal config (`trusted-server.toml` + `.env.*` overrides).
-2. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+2. Run `cargo fmt --all -- --check` and `cargo clippy-fastly && cargo clippy-axum`.
 3. Execute targeted tests, e.g. `cargo test -p trusted-server-core html_processor`.
 4. Use `fastly compute serve` (with Viceroy installed) to hit `/integrations/<id>/…` and fetch HTML from your origin to confirm rewrites are applied.
 

@@ -10,6 +10,7 @@ use crate::settings::Settings;
 
 const DEFAULT_CONFIG_STORE_ID: &str = "app_config";
 const FASTLY_CHUNK_POINTER_KIND: &str = "fastly_config_chunks";
+const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 
 #[derive(Debug, Deserialize)]
 struct FastlyChunkPointer {
@@ -115,8 +116,40 @@ fn resolve_fastly_chunk_pointer(
             pointer.version
         ));
     }
+    if value.len() > FASTLY_CONFIG_ENTRY_LIMIT {
+        return configuration_error(format!(
+            "Fastly config chunk pointer is {} bytes, exceeding the {} byte entry limit",
+            value.len(),
+            FASTLY_CONFIG_ENTRY_LIMIT
+        ));
+    }
+
+    let mut declared_envelope_len = 0usize;
+    for chunk in &pointer.chunks {
+        if chunk.len > FASTLY_CONFIG_ENTRY_LIMIT {
+            return configuration_error(format!(
+                "Fastly config chunk `{}` declares {} bytes, exceeding the {} byte entry limit",
+                chunk.key, chunk.len, FASTLY_CONFIG_ENTRY_LIMIT
+            ));
+        }
+        declared_envelope_len = match declared_envelope_len.checked_add(chunk.len) {
+            Some(total) => total,
+            None => {
+                return configuration_error(
+                    "Fastly config chunk lengths overflowed usize".to_string(),
+                );
+            }
+        };
+    }
+    if declared_envelope_len != pointer.envelope_len {
+        return configuration_error(format!(
+            "Fastly config chunk lengths total mismatch: expected envelope length {}, got {}",
+            pointer.envelope_len, declared_envelope_len
+        ));
+    }
 
     let mut envelope_json = String::with_capacity(pointer.envelope_len);
+    let mut actual_envelope_len = 0usize;
     for chunk in pointer.chunks {
         let chunk_value = read_config_entry(config_store, store_name, &chunk.key)?;
         let chunk_len = chunk_value.len();
@@ -124,6 +157,13 @@ fn resolve_fastly_chunk_pointer(
             return configuration_error(format!(
                 "Fastly config chunk `{}` length mismatch: expected {}, got {}",
                 chunk.key, chunk.len, chunk_len
+            ));
+        }
+        actual_envelope_len = actual_envelope_len.saturating_add(chunk_len);
+        if actual_envelope_len > pointer.envelope_len {
+            return configuration_error(format!(
+                "Fastly config envelope exceeded declared length {} while reading chunk `{}`",
+                pointer.envelope_len, chunk.key
             ));
         }
         let chunk_sha = sha256_hex(chunk_value.as_bytes());
@@ -296,6 +336,37 @@ mod tests {
         assert!(
             format!("{err:?}").contains("ts config push"),
             "error chain should carry the actionable `ts config push` hint for logs"
+        );
+    }
+
+    #[test]
+    fn rejects_chunk_pointer_when_declared_lengths_do_not_match_envelope_len() {
+        let chunk_key = format!("{CONFIG_BLOB_KEY}.__edgezero_chunks.test.0");
+        let pointer = json!({
+            "edgezero_kind": FASTLY_CHUNK_POINTER_KIND,
+            "version": 1,
+            "envelope_sha256": sha256_hex(b"ab"),
+            "envelope_len": 1,
+            "chunks": [
+                {
+                    "key": chunk_key,
+                    "sha256": sha256_hex(b"ab"),
+                    "len": 2
+                }
+            ]
+        })
+        .to_string();
+        let store = MemoryConfigStore {
+            entries: BTreeMap::from([(CONFIG_BLOB_KEY.to_string(), pointer)]),
+        };
+
+        let err =
+            get_settings_from_config_store(&store, &StoreName::from("app_config"), CONFIG_BLOB_KEY)
+                .expect_err("should reject malformed chunk length metadata");
+
+        assert!(
+            err.to_string().contains("chunk lengths total mismatch"),
+            "error should explain chunk length mismatch: {err:?}"
         );
     }
 

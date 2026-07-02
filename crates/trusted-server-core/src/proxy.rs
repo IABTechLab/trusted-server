@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -43,8 +44,14 @@ fn body_as_reader(body: EdgeBody) -> Result<Cursor<bytes::Bytes>, Report<Trusted
 
 fn request_body_bytes(
     body: EdgeBody,
-    _endpoint: &str,
+    endpoint: &str,
 ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
     Ok(body.into_bytes().unwrap_or_default())
 }
 
@@ -428,13 +435,23 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     ))
 }
 
-fn finalize_proxied_response(
-    settings: &Settings,
+/// Extracted content-type and content-encoding from an origin response.
+struct OriginResponseMeta {
+    ct_raw: String,
+    content_encoding: String,
+}
+
+/// Extract content-type and content-encoding and log origin response metadata.
+///
+/// When `log_encoding` is `true`, the `ce=` field is included in the log line
+/// (used by the buffered finalizer which performs content-encoding processing).
+/// The streaming finalizer omits it since it never decodes the body.
+fn origin_response_metadata(
     req: &Request<EdgeBody>,
+    beresp: &Response<EdgeBody>,
     target_url: &str,
-    mut beresp: Response<EdgeBody>,
-) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Determine content-type and content-encoding from response headers
+    log_encoding: bool,
+) -> OriginResponseMeta {
     let status_code = beresp.status().as_u16();
     let ct_raw = beresp
         .headers()
@@ -460,23 +477,110 @@ fn finalize_proxied_response(
         .unwrap_or("-");
 
     let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    let ce_for_log: &str = if content_encoding.is_empty() {
-        "-"
-    } else {
-        &content_encoding
-    };
-    log::info!(
-        "origin response status={} ct={} ce={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        ce_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
 
-    let ct = ct_raw.to_ascii_lowercase();
-    let compression = Compression::from_content_encoding(&content_encoding);
+    if log_encoding {
+        let ce_for_log: &str = if content_encoding.is_empty() {
+            "-"
+        } else {
+            &content_encoding
+        };
+        log::info!(
+            "origin response status={} ct={} ce={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            ce_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    } else {
+        log::info!(
+            "origin response status={} ct={} cl={} accept={} url={}",
+            status_code,
+            ct_for_log,
+            cl_raw,
+            accept_raw,
+            target_url
+        );
+    }
+
+    OriginResponseMeta {
+        ct_raw,
+        content_encoding,
+    }
+}
+
+/// Apply image content-type header and log pixel heuristics.
+///
+/// Sets a generic `image/*` content-type when the response has none, then logs
+/// a warning if size or path heuristics suggest a tracking pixel. Both call
+/// sites pass the response through unchanged afterwards, so this returns
+/// nothing.
+fn apply_image_passthrough_metadata(
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    ct: &str,
+    beresp: &mut Response<EdgeBody>,
+    log_prefix: &str,
+) {
+    let req_accept_images = req
+        .headers()
+        .get(HEADER_ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_ascii_lowercase().contains("image/"))
+        .unwrap_or(false);
+
+    if !ct.starts_with("image/") && !req_accept_images {
+        return;
+    }
+
+    if beresp.headers().get(header::CONTENT_TYPE).is_none() {
+        beresp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
+        );
+    }
+
+    let mut is_pixel = false;
+    if let Some(cl) = beresp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl <= 256 {
+            is_pixel = true;
+        }
+    }
+    if !is_pixel {
+        let lower = target_url.to_ascii_lowercase();
+        if lower.contains("/pixel")
+            || lower.ends_with("/p.gif")
+            || lower.contains("1x1")
+            || lower.contains("/track")
+        {
+            is_pixel = true;
+        }
+    }
+    if is_pixel {
+        log::info!(
+            "{}likely pixel image fetched: {} ct={}",
+            log_prefix,
+            target_url,
+            ct
+        );
+    }
+}
+
+fn finalize_proxied_response(
+    settings: &Settings,
+    req: &Request<EdgeBody>,
+    target_url: &str,
+    mut beresp: Response<EdgeBody>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    let meta = origin_response_metadata(req, &beresp, target_url, true);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    let compression = Compression::from_content_encoding(&meta.content_encoding);
 
     if ct.contains("text/html") {
         let processor = CreativeHtmlProcessor::new(settings);
@@ -500,56 +604,7 @@ fn finalize_proxied_response(
         );
     }
 
-    // Image handling: set a valid fallback content type if missing and log pixel heuristics
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
-            );
-        }
-
-        // Heuristics to log likely tracking pixels without altering response
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                // typical 1x1 PNG/GIF are very small
-                is_pixel = true;
-            }
-        }
-
-        // Path heuristics: common pixel patterns
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!("likely pixel image fetched: {} ct={}", target_url, ct);
-        }
-
-        return Ok(beresp);
-    }
-
-    // Passthrough for non-text, non-image responses
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "");
     Ok(beresp)
 }
 
@@ -558,83 +613,9 @@ fn finalize_proxied_response_streaming(
     target_url: &str,
     mut beresp: Response<EdgeBody>,
 ) -> Response<EdgeBody> {
-    let status_code = beresp.status().as_u16();
-    let ct_raw = beresp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let cl_raw = beresp
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-    let accept_raw = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("-");
-
-    let ct_for_log: &str = if ct_raw.is_empty() { "-" } else { &ct_raw };
-    log::info!(
-        "origin response status={} ct={} cl={} accept={} url={}",
-        status_code,
-        ct_for_log,
-        cl_raw,
-        accept_raw,
-        target_url
-    );
-
-    let ct = ct_raw.to_ascii_lowercase();
-
-    let req_accept_images = req
-        .headers()
-        .get(HEADER_ACCEPT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_ascii_lowercase().contains("image/"))
-        .unwrap_or(false);
-
-    if ct.starts_with("image/") || req_accept_images {
-        if beresp.headers().get(header::CONTENT_TYPE).is_none() {
-            beresp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(IMAGE_FALLBACK_CONTENT_TYPE),
-            );
-        }
-
-        let mut is_pixel = false;
-        if let Some(cl) = beresp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            if cl <= 256 {
-                is_pixel = true;
-            }
-        }
-
-        if !is_pixel {
-            let lower = target_url.to_ascii_lowercase();
-            if lower.contains("/pixel")
-                || lower.ends_with("/p.gif")
-                || lower.contains("1x1")
-                || lower.contains("/track")
-            {
-                is_pixel = true;
-            }
-        }
-
-        if is_pixel {
-            log::info!(
-                "stream: likely pixel image fetched: {} ct={}",
-                target_url,
-                ct
-            );
-        }
-    }
-
+    let meta = origin_response_metadata(req, &beresp, target_url, false);
+    let ct = meta.ct_raw.to_ascii_lowercase();
+    apply_image_passthrough_metadata(req, target_url, &ct, &mut beresp, "stream: ");
     beresp
 }
 
@@ -879,7 +860,17 @@ fn apply_asset_origin_auth(
                 headers,
                 &config.region,
                 credentials.as_ref(),
-                SystemTime::now(),
+                // s3_sigv4 converts this via chrono's `DateTime::<Utc>::from`, which
+                // only accepts `std::time::SystemTime`. `std::time::SystemTime::now()`
+                // panics on `wasm32-unknown-unknown` (Cloudflare Workers), so derive an
+                // equivalent `std::time::SystemTime` from the wasm-safe `web_time` clock:
+                // `UNIX_EPOCH + elapsed` is pure arithmetic and never calls the panicking
+                // `now()`. On Fastly (wasm32-wasip1) and native, `web_time` delegates to
+                // the std clock, so behavior is unchanged there.
+                std::time::UNIX_EPOCH
+                    + web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .unwrap_or_default(),
             )
         }
     }
@@ -1737,6 +1728,11 @@ pub async fn handle_first_party_proxy_rebuild(
             message: "invalid tsclick path".to_string(),
         }));
     }
+    // Validate the tstoken on the original click URL before applying any changes.
+    // Without this, an attacker could submit an unsigned tsclick and mint valid
+    // click redirects to arbitrary URLs.
+    reconstruct_and_validate_signed_target(settings, &format!("{}{}", base, payload.tsclick))?;
+
     // Extract tsurl and original params (exclude tstoken if present)
     let mut tsurl: Option<String> = None;
     let mut orig: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -1754,18 +1750,45 @@ pub async fn handle_first_party_proxy_rebuild(
         })
     })?;
 
+    // Do not apply `proxy.allowed_domains` to the click target here. That setting
+    // governs server-side proxy *fetch* redirect-chain SSRF, not advertiser click
+    // 302s — and `handle_first_party_click` itself redirects any valid signed
+    // target without consulting it. Applying it only during rebuild would reject
+    // signed targets that normal click redirects still allow, a cross-adapter
+    // regression. The original signed click URL (including `tsurl`) is already
+    // validated above via `reconstruct_and_validate_signed_target`, and `tsurl`
+    // is a reserved signing parameter callers cannot alter, so the redirect host
+    // is fixed by the validated original.
+
     // Keep a snapshot before modifications for diagnostics
     let orig_before = orig.clone();
+
+    // Signing-control parameters that callers must not add or remove during a
+    // rebuild. `tsexp` is the short-lived replay bound that
+    // handle_first_party_proxy_sign attaches; `tstoken`/`tsurl` are the signature
+    // and target. Allowing del/add here would let a public rebuild request strip
+    // the expiration from a still-valid click URL and re-sign a non-expiring one.
+    const RESERVED_SIGNING_PARAMS: &[&str] = &["tsexp", "tstoken", "tsurl"];
 
     // Apply removals
     if let Some(del) = &payload.del {
         for k in del {
+            if RESERVED_SIGNING_PARAMS.contains(&k.as_str()) {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("cannot delete reserved signing parameter: {k}"),
+                }));
+            }
             orig.remove(k);
         }
     }
     // Apply additions (must be new keys only)
     if let Some(add) = &payload.add {
         for (k, v) in add {
+            if RESERVED_SIGNING_PARAMS.contains(&k.as_str()) {
+                return Err(Report::new(TrustedServerError::Proxy {
+                    message: format!("cannot add reserved signing parameter: {k}"),
+                }));
+            }
             if orig.contains_key(k) {
                 return Err(Report::new(TrustedServerError::Proxy {
                     message: format!("cannot modify existing parameter: {}", k),
@@ -2047,6 +2070,16 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(EdgeBody::from(body.to_string()))
             .expect("should build http post request")
+    }
+
+    fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(uri.as_ref())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming http post request")
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -2513,8 +2546,16 @@ mod tests {
     fn proxy_rebuild_adds_and_removes_params() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
-            // Original canonical (no token)
-            let tsclick = "/first-party/click?tsurl=https%3A%2F%2Fcdn.example%2Flanding.html&x=1";
+            // Build a properly signed click URL — rebuild validates tstoken before mutating.
+            let tsurl = "https://cdn.example/landing.html";
+            let full_for_token = format!("{}?x=1", tsurl);
+            let token =
+                crate::http_util::compute_encrypted_sha256_token(&settings, &full_for_token);
+            let tsclick = format!(
+                "/first-party/click?tsurl={}&x=1&tstoken={}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+                token,
+            );
             let body = serde_json::json!({
                 "tsclick": tsclick,
                 "add": {"y": "2"},
@@ -2542,6 +2583,83 @@ mod tests {
             );
             assert!(json.contains("\"added\":{\"y\":\"2\"}"), "{}", json);
             assert!(json.contains("\"removed\":[\"x\"]"), "{}", json);
+        });
+    }
+
+    // Build a signed `/first-party/click` URL carrying a future `tsexp` replay
+    // bound, returning (tsclick, tsexp_value).
+    fn signed_click_with_tsexp(settings: &crate::settings::Settings) -> (String, String) {
+        let tsurl = "https://cdn.example/landing.html";
+        let tsexp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("should compute unix time")
+            .as_secs()
+            + 3600)
+            .to_string();
+        // Token is computed over tsurl + params in order, including tsexp.
+        let full_for_token = format!("{tsurl}?x=1&tsexp={tsexp}");
+        let token = crate::http_util::compute_encrypted_sha256_token(settings, &full_for_token);
+        let tsclick = format!(
+            "/first-party/click?tsurl={}&x=1&tsexp={}&tstoken={}",
+            url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            tsexp,
+            token,
+        );
+        (tsclick, tsexp)
+    }
+
+    #[test]
+    fn proxy_rebuild_rejects_deleting_tsexp() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let (tsclick, _) = signed_click_with_tsexp(&settings);
+            let body = serde_json::json!({
+                "tsclick": tsclick,
+                "del": ["tsexp"],
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+            let err = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect_err("deleting tsexp must be rejected");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "rejecting a reserved-param deletion should surface as a proxy error"
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_rebuild_retains_tsexp_when_not_deleted() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let (tsclick, tsexp) = signed_click_with_tsexp(&settings);
+            let body = serde_json::json!({
+                "tsclick": tsclick,
+                "add": {"y": "2"},
+            });
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/proxy-rebuild")
+                .body(EdgeBody::from(
+                    serde_json::to_string(&body).expect("test JSON should serialize"),
+                ))
+                .expect("should build proxy rebuild request");
+            let resp = handle_first_party_proxy_rebuild(&settings, &noop_services(), req)
+                .await
+                .expect("rebuild ok");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let json = response_body_string(resp);
+            assert!(
+                json.contains(&format!("tsexp={tsexp}")),
+                "rebuilt URL must retain the original tsexp replay bound: {json}"
+            );
         });
     }
 
@@ -4583,6 +4701,30 @@ mod tests {
                 err.current_context().status_code(),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "should return 413 for oversized sign body"
+            );
+        });
+    }
+
+    #[test]
+    fn sign_rejects_streaming_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = build_http_post_streaming_request("https://edge.example/first-party/sign");
+            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject streaming sign body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_REQUEST,
+                "should return 400 for streaming sign body"
+            );
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::BadRequest { message }
+                        if message == "first-party sign request body must be buffered, not streamed"
+                ),
+                "should explain that sign bodies must be buffered"
             );
         });
     }

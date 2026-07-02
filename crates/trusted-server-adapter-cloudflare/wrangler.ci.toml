@@ -1,0 +1,14 @@
+name = "trusted-server"
+main = "build/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+# No [build] section — bundle is pre-built in CI; wrangler dev must not rebuild.
+
+[[kv_namespaces]]
+binding = "TRUSTED_SERVER_KV"
+id = "ci-local-kv"
+
+[vars]
+# Placeholder replaced by the integration test harness with a JSON object that
+# contains the runtime Trusted Server app-config blob envelope.
+TRUSTED_SERVER_CONFIG = "{}"

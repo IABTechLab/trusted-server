@@ -22,8 +22,10 @@ The guide in `docs/guide/` (published at the link below) is the source of truth 
 See the [Getting Started guide](https://iabtechlab.github.io/trusted-server/guide/getting-started) for installation and setup instructions.
 
 ```bash
-# Build the runtime
-cargo build
+# Build per adapter (target-matched aliases from .cargo/config.toml)
+cargo build-fastly       # Fastly adapter + core (wasm32-wasip1)
+cargo build-axum         # Axum dev server (native)
+cargo build-cloudflare   # Cloudflare Workers (wasm32-unknown-unknown)
 
 # Build the host-target CLI
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -36,6 +38,24 @@ ts config validate
 
 # Audit a public page with Chrome/Chromium to bootstrap a draft config
 ts audit https://publisher.example
+
+# Run tests (Fastly/WASM crates — requires Viceroy)
+cargo test-fastly
+
+# Run tests (Axum native adapter)
+cargo test-axum
+
+# Run tests (Cloudflare Workers adapter — native host)
+cargo test-cloudflare
+
+# Run tests (Spin adapter — native host)
+cargo test-spin
+
+# Start local server — Axum (no Fastly CLI or Viceroy required)
+cargo run -p trusted-server-adapter-axum
+
+# Start local server — Fastly (requires Fastly CLI + Viceroy)
+fastly compute serve
 ```
 
 ## Development
@@ -44,11 +64,19 @@ ts audit https://publisher.example
 # Format code
 cargo fmt
 
-# Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Lint — use target-matched aliases (workspace has multiple WASM runtimes;
+# broad --all-features clippy is not a reliable gate across adapters)
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-spin-native
+cargo clippy-spin-wasm
 
-# Run tests
-cargo test
+# Run all tests
+cargo test-fastly      # Fastly/WASM (requires Viceroy)
+cargo test-axum        # Axum native adapter
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
+cargo test-spin        # Spin adapter (native host)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.

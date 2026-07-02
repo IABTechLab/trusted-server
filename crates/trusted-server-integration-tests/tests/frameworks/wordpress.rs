@@ -4,10 +4,10 @@ use crate::common::runtime::TestResult;
 use testcontainers::core::{ContainerRequest, IntoContainerPort};
 use testcontainers::{GenericImage, ImageExt as _};
 
-/// WordPress frontend framework for integration testing.
+/// `WordPress` frontend framework for integration testing.
 ///
 /// Uses a pre-built Docker image (`test-wordpress:latest`) that serves
-/// a minimal WordPress site with a test theme. The image must be built
+/// a minimal `WordPress` site with a test theme. The image must be built
 /// before running tests:
 ///
 /// ```bash

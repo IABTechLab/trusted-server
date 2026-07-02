@@ -1,0 +1,40 @@
+[package]
+name = "trusted-server-adapter-spin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "trusted_server_adapter_spin"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+spin = ["edgezero-adapter-spin/spin"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+edgezero-adapter-spin = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+http-body-util = "0.1"
+log = { workspace = true }
+trusted-server-core = { path = "../trusted-server-core" }
+trusted-server-js = { path = "../trusted-server-js" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+spin-sdk = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+edgezero-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

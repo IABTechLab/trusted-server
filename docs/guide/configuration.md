@@ -47,6 +47,12 @@ export TRUSTED_SERVER__EC__PASSPHRASE=replace-with-32-plus-byte-random-secret
 openssl rand -base64 32
 ```
 
+### Strict Key Validation
+
+Trusted Server rejects unknown TOML keys in runtime configuration. Before pushing
+or upgrading config, remove stale fields and typos; otherwise config loading can
+fail and the service will return its startup-error response.
+
 ## Configuration Files
 
 | File                  | Purpose                         |
@@ -1228,20 +1234,18 @@ at build time), the EdgeZero entry point is toggled at **runtime** through a
 Fastly Config Store. This lets operators switch request handling without
 rebuilding or redeploying the binary.
 
-### `edgezero_enabled`
+### EdgeZero Canary Routing
 
 **Purpose**: Routes incoming requests through the EdgeZero entry point instead of
-the legacy entry point.
+the legacy entry point, with an optional percentage rollout.
 
 **Source**: Fastly Config Store, not `trusted-server.toml` or an environment
 variable.
 
-| Property        | Value                                              |
-| --------------- | -------------------------------------------------- |
-| Config store    | `trusted_server_config`                            |
-| Key             | `edgezero_enabled`                                 |
-| Accepted "true" | `true` or `1` (whitespace-trimmed, any ASCII case) |
-| Any other value | Treated as disabled (legacy path)                  |
+| Key                    | Value                                              | Behavior                                                                                 |
+| ---------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `edgezero_enabled`     | `true` or `1` (whitespace-trimmed, any ASCII case) | Master switch. Any other value, missing key, or read error routes all traffic to legacy. |
+| `edgezero_rollout_pct` | Integer string `0` through `100`                   | Percentage of enabled traffic routed to EdgeZero by deterministic client-IP bucket.      |
 
 **Fallback behavior** (fail-safe to the legacy path):
 
@@ -1250,6 +1254,8 @@ variable.
 - If the `edgezero_enabled` key is missing or cannot be read, requests use the
   legacy path.
 - Any value other than `true`/`1` keeps the legacy path.
+- If `edgezero_enabled=true` but `edgezero_rollout_pct` is missing, invalid, or
+  cannot be read, rollout defaults to `0` and requests use the legacy path.
 
 **Local development** (`fastly.toml`):
 
@@ -1259,19 +1265,28 @@ variable.
     format = "inline-toml"
     [local_server.config_stores.trusted_server_config.contents]
       edgezero_enabled = "true"
+      edgezero_rollout_pct = "0"
 ```
 
 **Production setup** (Fastly CLI):
 
 ```bash
-# Create the store (once) and attach it to the service, then set the key.
+# Create the store (once) and attach it to the service, then set the keys.
 fastly config-store create --name trusted_server_config
 fastly config-store-entry create \
   --store-id <STORE_ID> --key edgezero_enabled --value true
+fastly config-store-entry create \
+  --store-id <STORE_ID> --key edgezero_rollout_pct --value 0
 ```
 
-**Rollback**: Set `edgezero_enabled` to `false` (or delete the key) to return all
-traffic to the legacy path immediately — no rebuild or redeploy required.
+**Rollout**: With `edgezero_enabled=true`, increase `edgezero_rollout_pct`
+through staged values such as `1`, `10`, `50`, and `100`. Routing is sticky per
+client IP at a given percentage.
+
+**Rollback**: Set `edgezero_rollout_pct` to `0` to return enabled traffic to the
+legacy path immediately. Set `edgezero_enabled` to `false` (or delete the key) to
+disable the EdgeZero entry point entirely. Neither rollback requires a rebuild or
+redeploy.
 
 ## Validation
 

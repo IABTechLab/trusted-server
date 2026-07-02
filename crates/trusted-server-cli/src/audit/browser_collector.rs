@@ -7,7 +7,7 @@ use futures::StreamExt as _;
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use url::Url;
 use which::which;
 
@@ -19,6 +19,11 @@ use crate::error::{report_error, CliResult};
 const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SETTLE_MAX_WAIT: Duration = Duration::from_secs(6);
+const NAVIGATION_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD: usize = 250;
+const RESOURCE_TIMING_BUFFER_WARNING: &str =
+    "browser resource timing buffer reached its default size; some network assets may be missing";
 
 #[derive(Default)]
 pub(crate) struct BrowserAuditCollector;
@@ -72,10 +77,14 @@ async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<Collected
 
     let result = collect_page_from_browser(&mut browser, target_url).await;
 
-    let close_result = browser
-        .close()
+    let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
         .await
-        .map_err(|error| report_error(format!("failed to close browser after audit: {error}")));
+        .map_err(|_| report_error("timed out closing browser after audit"))
+        .and_then(|result| {
+            result.map_err(|error| {
+                report_error(format!("failed to close browser after audit: {error}"))
+            })
+        });
     if close_result.is_err() {
         handler_task.abort();
     }
@@ -95,18 +104,28 @@ async fn collect_page_from_browser(
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
 
-    page.goto(target_url.as_str())
+    timeout(NAVIGATION_TIMEOUT, page.goto(target_url.as_str()))
         .await
+        .map_err(|_| report_error(format!("timed out navigating to `{target_url}`")))?
         .map_err(|error| report_error(format!("failed to navigate to `{target_url}`: {error}")))?;
 
-    let navigation_response = page.wait_for_navigation_response().await.map_err(|error| {
-        report_error(format!(
-            "failed to read main document navigation response: {error}"
-        ))
-    })?;
-    validate_navigation_response(navigation_response)?;
+    let navigation_response = timeout(NAVIGATION_TIMEOUT, page.wait_for_navigation_response())
+        .await
+        .map_err(|_| {
+            report_error(format!(
+                "timed out waiting for main document navigation response from `{target_url}`"
+            ))
+        })?
+        .map_err(|error| {
+            report_error(format!(
+                "failed to read main document navigation response: {error}"
+            ))
+        })?;
 
     let mut warnings = Vec::new();
+    if let Some(warning) = validate_navigation_response(navigation_response)? {
+        warnings.push(warning);
+    }
     if !wait_for_page_settle(&page).await? {
         warnings.push(
             "browser audit timed out while waiting for the page to settle; results may be partial"
@@ -164,6 +183,10 @@ async fn collect_page_from_browser(
             ))
         })?;
 
+    if let Some(warning) = resource_timing_buffer_warning(network_requests.len()) {
+        warnings.push(warning.to_string());
+    }
+
     Ok(CollectedPage {
         requested_url: target_url.to_string(),
         final_url,
@@ -180,9 +203,7 @@ async fn collect_page_from_browser(
             .into_iter()
             .map(|entry| CollectedRequest {
                 url: entry.url,
-                method: "GET".to_string(),
                 resource_type: entry.initiator_type,
-                status: None,
             })
             .collect(),
         warnings,
@@ -230,7 +251,7 @@ async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
     Ok(false)
 }
 
-fn validate_navigation_response(navigation_response: ArcHttpRequest) -> CliResult<()> {
+fn validate_navigation_response(navigation_response: ArcHttpRequest) -> CliResult<Option<String>> {
     let request = navigation_response
         .ok_or_else(|| report_error("browser audit did not capture the main document response"))?;
 
@@ -245,17 +266,22 @@ fn validate_navigation_response(navigation_response: ArcHttpRequest) -> CliResul
     })?;
 
     if is_successful_navigation_status(response.status) {
-        return Ok(());
+        return Ok(None);
     }
 
-    Err(report_error(format!(
-        "audit request returned HTTP {} {} for `{}`",
+    Ok(Some(format!(
+        "audit request returned HTTP {} {} for `{}`; results may be partial",
         response.status, response.status_text, response.url
     )))
 }
 
 fn is_successful_navigation_status(status: i64) -> bool {
     (200..400).contains(&status)
+}
+
+fn resource_timing_buffer_warning(resource_count: usize) -> Option<&'static str> {
+    (resource_count >= RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD)
+        .then_some(RESOURCE_TIMING_BUFFER_WARNING)
 }
 
 fn find_browser_executable() -> CliResult<PathBuf> {
@@ -330,6 +356,12 @@ struct BrowserPerformanceEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use chromiumoxide::cdp::browser_protocol::network::{Headers, RequestId, Response};
+    use chromiumoxide::cdp::browser_protocol::security::SecurityState;
+    use chromiumoxide::handler::http::HttpRequest;
+
     use super::*;
 
     #[test]
@@ -343,11 +375,61 @@ mod tests {
     }
 
     #[test]
+    fn navigation_response_returns_warning_for_http_error_status() {
+        let warning =
+            validate_navigation_response(navigation_response_with_status(403, "Forbidden"))
+                .expect("should validate navigation response")
+                .expect("should return warning for HTTP error status");
+
+        assert_eq!(
+            warning,
+            "audit request returned HTTP 403 Forbidden for `https://example.com/`; results may be partial",
+            "should warn and continue when the main document returns an HTTP error"
+        );
+    }
+
+    #[test]
+    fn resource_timing_buffer_warning_starts_at_threshold() {
+        assert_eq!(
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD - 1),
+            None,
+            "should not warn before the resource timing buffer threshold"
+        );
+        assert_eq!(
+            resource_timing_buffer_warning(RESOURCE_TIMING_BUFFER_WARNING_THRESHOLD),
+            Some(RESOURCE_TIMING_BUFFER_WARNING),
+            "should warn when the resource timing buffer reaches the threshold"
+        );
+    }
+
+    #[test]
     fn browser_path_candidates_include_common_names() {
         let candidates = browser_executable_path_candidates();
 
         assert!(candidates.contains(&"google-chrome"));
         assert!(candidates.contains(&"chromium"));
         assert!(candidates.contains(&"Google Chrome for Testing"));
+    }
+
+    fn navigation_response_with_status(status: i64, status_text: &str) -> ArcHttpRequest {
+        let mut request =
+            HttpRequest::new(RequestId::new("request-1"), None, None, false, Vec::new());
+        request.response = Some(
+            Response::builder()
+                .url("https://example.com/")
+                .status(status)
+                .status_text(status_text)
+                .headers(Headers::default())
+                .mime_type("text/html")
+                .charset("utf-8")
+                .connection_reused(false)
+                .connection_id(1.0)
+                .encoded_data_length(0.0)
+                .security_state(SecurityState::Secure)
+                .build()
+                .expect("should build navigation response"),
+        );
+
+        Some(Arc::new(request))
     }
 }

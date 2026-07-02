@@ -15,6 +15,9 @@ real-time bidding integration, and publisher-side JavaScript injection.
 crates/
   trusted-server-core/                  # Core library — shared logic, integrations, HTML processing
   trusted-server-adapter-fastly/        # Fastly Compute entry point (wasm32-wasip1 binary)
+  trusted-server-adapter-axum/          # Axum dev server entry point (native binary)
+  trusted-server-adapter-cloudflare/    # Cloudflare Workers entry point (wasm32-unknown-unknown binary)
+  trusted-server-adapter-spin/          # Fermyon Spin entry point (wasm32-wasip1 component)
   trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-js/                    # TypeScript/JS build — per-integration IIFE bundles
     lib/         # TS source, Vitest tests, esbuild pipeline
@@ -42,8 +45,8 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 ### Rust
 
 ```bash
-# Build
-cargo build
+# Build (per-target aliases — bare `cargo build` fails at the workspace root)
+cargo build-fastly && cargo build-axum && cargo build-cloudflare
 
 # Production build for Fastly
 cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
@@ -53,13 +56,52 @@ fastly compute serve
 
 # Deploy to Fastly
 fastly compute publish
+
+# Run Axum dev server (native — no Viceroy)
+cargo run -p trusted-server-adapter-axum
+
+# Test Axum adapter only
+cargo test-axum
+
+# Check Cloudflare adapter (native)
+cargo check -p trusted-server-adapter-cloudflare
+
+# Check Cloudflare adapter (WASM target — alias for the full command)
+cargo check-cloudflare
+
+# Test Cloudflare adapter (native host)
+cargo test-cloudflare
+
+# Check Spin adapter (native)
+cargo check -p trusted-server-adapter-spin
+
+# Check Spin adapter (WASM target)
+cargo check-spin
+
+# Test Spin adapter (native host)
+cargo test-spin
+
+# Production-style Spin WASM artifact used by crates/trusted-server-adapter-spin/spin.toml
+cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+# Optional local Spin runtime smoke, if the Spin CLI is installed
+spin up --from crates/trusted-server-adapter-spin
 ```
 
 ### Testing & Quality
 
 ```bash
-# Run all Rust tests (uses viceroy)
-cargo test --workspace
+# Run all Rust tests — use workspace aliases (see .cargo/config.toml)
+# default-members = [fastly] so Viceroy can locate the binary via `cargo run --bin`.
+cargo test-fastly      # Fastly adapter + core (wasm32-wasip1 via Viceroy)
+cargo test-axum        # Axum dev server adapter (native)
+cargo test-cloudflare  # Cloudflare Workers adapter (native host)
+cargo test-spin        # Spin adapter route tests (native host)
+
+# Run host-target CLI tests (workspace default target is wasm32-wasip1)
+# Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
+# or aarch64-apple-darwin on Apple Silicon macOS.
+cargo test --package trusted-server-cli --target <host-triple>
 
 # Run host-target CLI tests (workspace default target is wasm32-wasip1)
 # Use your host triple, for example x86_64-unknown-linux-gnu on CI/Linux
@@ -69,11 +111,18 @@ cargo test --package trusted-server-cli --target <host-triple>
 # Format
 cargo fmt --all -- --check
 
-# Lint
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Lint by adapter target — target-matched clippy is the blocking gate because
+# the workspace has multiple wasm runtimes and runtime-specific SDKs. A plain
+# `cargo clippy --workspace --all-features` would trip the cloudflare
+# feature's non-wasm32 compile_error! guard.
+cargo clippy-fastly
+cargo clippy-axum
+cargo clippy-cloudflare
+cargo clippy-spin-native
+cargo clippy-spin-wasm
 
-# Check compilation
-cargo check
+# Check compilation (per-target aliases — bare `cargo check` fails at the workspace root)
+cargo check-fastly && cargo check-axum && cargo check-cloudflare
 
 # JS tests
 cd crates/trusted-server-js/lib && npx vitest run
@@ -162,6 +211,7 @@ pub struct UserId(Uuid);
 ## Error Handling
 
 - Use `error-stack` (`Report<MyError>`) — not anyhow or eyre.
+  - **Exception**: `crates/trusted-server-adapter-spin/src/lib.rs` entry point returns `anyhow::Result` because `edgezero_adapter_spin::run_app` forces this type at the WASM FFI boundary. Do not use `anyhow` anywhere else.
 - Use `Box<dyn Error>` only in tests or prototyping.
 - Use concrete error types with `Report<E>`.
 - Use `ensure!()` / `bail!()` macros for early returns.
@@ -287,11 +337,12 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-3. `cargo test --workspace`
-4. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
-5. JS format (`cd crates/trusted-server-js/lib && npm run format`)
-6. Docs format (`cd docs && npm run format`)
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-spin-native && cargo clippy-spin-wasm`
+3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
+4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
+5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)
+6. JS format (`cd crates/trusted-server-js/lib && npm run format`)
+7. Docs format (`cd docs && npm run format`)
 
 ---
 
@@ -301,7 +352,8 @@ Every PR must pass:
 2. **Get approval** — for non-trivial changes, present a plan first.
 3. **Implement incrementally** — small, testable changes. Every change should
    impact as little code as possible.
-4. **Test after every change** — `cargo test --workspace`.
+4. **Test after every change** — run the target-matched adapter test for the
+   code you changed; before PR handoff, run the full CI gate list above.
 5. **Explain as you go** — describe what you changed and why.
 6. **If blocked** — explain what's blocking and why.
 

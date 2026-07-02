@@ -260,7 +260,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tower",
+ "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -463,7 +463,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "pin-project-lite",
- "reqwest",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1109,7 +1109,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "toml",
 ]
@@ -1117,7 +1117,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1131,13 +1131,13 @@ dependencies = [
  "http",
  "log",
  "redb",
- "reqwest",
+ "reqwest 0.13.4",
  "serde_json",
  "simple_logger",
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "tower",
+ "tower 0.5.3",
  "tracing",
  "walkdir",
 ]
@@ -1145,7 +1145,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1162,12 +1162,13 @@ dependencies = [
  "tempfile",
  "toml_edit",
  "walkdir",
+ "worker",
 ]
 
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1196,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1212,6 +1213,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "spin-sdk",
  "subtle",
  "thiserror 2.0.18",
  "toml",
@@ -1222,7 +1224,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "chrono",
  "clap",
@@ -1247,7 +1249,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1278,7 +1280,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/stackpop/edgezero?rev=89f592665a8b386111995da5cbf3fcc068113dfc#89f592665a8b386111995da5cbf3fcc068113dfc"
+source = "git+https://github.com/stackpop/edgezero?rev=e4837232670aa2e704311018fd1a2dfbbd990c7d#e4837232670aa2e704311018fd1a2dfbbd990c7d"
 dependencies = [
  "log",
  "proc-macro2",
@@ -1896,6 +1898,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2060,6 +2063,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "id-arena"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2094,6 +2103,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2279,6 +2290,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "leb128fmt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2403,6 +2420,12 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "matchit"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matchit"
@@ -2795,6 +2818,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3103,6 +3146,44 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower 0.5.3",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
+
+[[package]]
+name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
@@ -3131,7 +3212,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tower",
+ "tower 0.5.3",
  "tower-http",
  "tower-service",
  "url",
@@ -3248,6 +3329,7 @@ checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -3466,6 +3548,17 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3690,6 +3783,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
+name = "spin-macro"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11e483b94d5bcfac493caf0427fa875063e3e8604d0466a4ab491ec200a42857"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "spin-sdk"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fd2abac3eb2ee249c2241ab87f7b1287f36172c8cc1ea815c19c85e41ede44d"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "spin-macro",
+ "thiserror 2.0.18",
+ "wasip3",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3735,6 +3856,15 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
 
 [[package]]
 name = "strum_macros"
@@ -4045,6 +4175,21 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tower"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
+dependencies = [
+ "futures-core",
+ "futures-util",
+ "pin-project",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
@@ -4071,7 +4216,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
- "tower",
+ "tower 0.5.3",
  "tower-layer",
  "tower-service",
  "url",
@@ -4122,6 +4267,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-adapter-axum"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "edgezero-adapter-axum",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "log",
+ "reqwest 0.12.28",
+ "simple_logger",
+ "temp-env",
+ "tokio",
+ "tower 0.4.13",
+ "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-adapter-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "edgezero-adapter-cloudflare",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "js-sys",
+ "log",
+ "serde_json",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-js",
+ "worker",
+]
+
+[[package]]
 name = "trusted-server-adapter-fastly"
 version = "0.1.0"
 dependencies = [
@@ -4142,6 +4327,28 @@ dependencies = [
  "trusted-server-core",
  "url",
  "urlencoding",
+]
+
+[[package]]
+name = "trusted-server-adapter-spin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "brotli",
+ "bytes",
+ "edgezero-adapter-spin",
+ "edgezero-core",
+ "error-stack",
+ "flate2",
+ "futures",
+ "http-body-util",
+ "log",
+ "spin-sdk",
+ "tokio",
+ "trusted-server-core",
+ "trusted-server-js",
 ]
 
 [[package]]
@@ -4181,9 +4388,9 @@ dependencies = [
  "ed25519-dalek",
  "edgezero-core",
  "error-stack",
- "fastly",
  "flate2",
  "futures",
+ "getrandom 0.2.17",
  "hex",
  "hmac",
  "http",
@@ -4207,6 +4414,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "validator",
+ "web-time",
 ]
 
 [[package]]
@@ -4433,6 +4641,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasip3"
+version = "0.6.0+wasi-0.3.0-rc-2026-03-15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed83456dd6a0b8581998c0365e4651fa2997e5093b49243b7f35391afaa7a3d9"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "thiserror 2.0.18",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4488,6 +4709,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.247.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30b6733b8b91d010a6ac5b0fb237dc46a19650bc4c67db66857e2e787d437204"
+dependencies = [
+ "leb128fmt",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.247.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "665fe59e56cc9b419ca6fcca56673e3421d1a5011e3b65caf6b726fd9e041d10"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "wasm-encoder",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7d3be8814f5ba5f074491a469eed3d73c273ffad955f25ed1635efac4b0d269"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.247.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e6fb4c2bee46c5ea4d40f8cdb5c131725cd976718ec56f1c8e82fbde5fa2a80"
+dependencies = [
+ "bitflags 2.13.0",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "semver",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4524,6 +4792,15 @@ name = "webpki-root-certs"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -4806,6 +5083,147 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 dependencies = [
  "bitflags 2.13.0",
+ "futures",
+ "wit-bindgen-rust-macro",
+]
+
+[[package]]
+name = "wit-bindgen-core"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02dee27a2dc20d1008016c742ec9fc6ea498492994ba3750be7454cbc97ff04c"
+dependencies = [
+ "anyhow",
+ "heck",
+ "wit-parser",
+]
+
+[[package]]
+name = "wit-bindgen-rust"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5007dae772945b7a5003d69d90a3a4a78929d41f19d004e980c4259a6af4484"
+dependencies = [
+ "anyhow",
+ "heck",
+ "indexmap",
+ "prettyplease",
+ "syn 2.0.118",
+ "wasm-metadata",
+ "wit-bindgen-core",
+ "wit-component",
+]
+
+[[package]]
+name = "wit-bindgen-rust-macro"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af9237d678e3513ad24e96fe98beacdc0db6405284ba2a2400418cf0d42caa89"
+dependencies = [
+ "anyhow",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+ "wit-bindgen-core",
+ "wit-bindgen-rust",
+]
+
+[[package]]
+name = "wit-component"
+version = "0.247.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d567162a6b9843080e5e0053f696623ff694bae8ae017c9ec536d1873bbe3d8"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.0",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder",
+ "wasm-metadata",
+ "wasmparser",
+ "wit-parser",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.247.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ffe4064318cdf3c08cb99343b44c039fcefe61ccdf58aa9975285f13d74d1fc"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.1",
+ "id-arena",
+ "indexmap",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser",
+]
+
+[[package]]
+name = "worker"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f8adbf6c9ae45b665dee995c5e3a342c2bd7d58a2e8ca5c75b50ce8b1b8bfd9"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures-channel",
+ "futures-util",
+ "http",
+ "http-body",
+ "js-sys",
+ "matchit 0.7.3",
+ "pin-project",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "serde_urlencoded",
+ "strum",
+ "tokio",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
+ "worker-macros",
+ "worker-sys",
+]
+
+[[package]]
+name = "worker-macros"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d908735d273dd7f9c325a842623f4e5a745e0686187ce465b34dc162ad348df"
+dependencies = [
+ "async-trait",
+ "proc-macro2",
+ "quote",
+ "strum",
+ "syn 2.0.118",
+ "wasm-bindgen",
+ "wasm-bindgen-macro-support",
+ "worker-sys",
+]
+
+[[package]]
+name = "worker-sys"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33faa1a8fa6c7eec67b196e008859c44d468a5ad4f991855cdc856f119e0e98f"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

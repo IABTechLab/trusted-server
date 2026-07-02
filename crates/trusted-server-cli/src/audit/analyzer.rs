@@ -11,6 +11,24 @@ use crate::error::{report_error, CliResult};
 
 static GTM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]+\b").expect("should compile GTM regex"));
+static GPT_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:googletag|gpt\.js|googletagservices|securepubads)\b")
+        .expect("should compile GPT inline regex")
+});
+static DIDOMI_INLINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdidomi\b").expect("should compile Didomi inline regex"));
+static DATADOME_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bdatadome\b").expect("should compile DataDome inline regex")
+});
+static PERMUTIVE_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bpermutive\b").expect("should compile Permutive inline regex")
+});
+static LOCKR_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\blockr\b|\bloc\.kr\b)").expect("should compile Lockr inline regex")
+});
+static PREBID_INLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\bprebid\b|\bpbjs\b)").expect("should compile Prebid inline regex")
+});
 
 pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<AuditArtifact> {
     let final_url = collected
@@ -22,7 +40,6 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
 
     let document = Html::parse_document(&collected.html);
     let title_selector = Selector::parse("title").expect("should parse title selector");
-    let script_selector = Selector::parse("script").expect("should parse script selector");
     let derived_title = document
         .select(&title_selector)
         .next()
@@ -46,29 +63,14 @@ pub(crate) fn analyze_collected_page(collected: &CollectedPage) -> CliResult<Aud
         ));
     }
 
-    for element in document.select(&script_selector) {
-        if let Some(src) = element.value().attr("src") {
+    for tag in &collected.script_tags {
+        if let Some(src) = &tag.src {
             if let Ok(asset_url) = final_url.join(src) {
                 let integration = detect_integration_from_url(&asset_url);
                 record_integration(&mut integrations, &integration, asset_url.as_str());
                 insert_asset(&mut assets_by_url, &final_url, &asset_url, integration);
             } else {
                 warnings.push(format!("could not resolve script URL `{src}`"));
-            }
-        } else {
-            let inline_text = element.text().collect::<Vec<_>>().join(" ");
-            for (integration_id, evidence) in detect_integrations_from_inline_script(&inline_text) {
-                integrations.entry(integration_id).or_insert(evidence);
-            }
-        }
-    }
-
-    for tag in &collected.script_tags {
-        if let Some(src) = &tag.src {
-            if let Ok(asset_url) = Url::parse(src) {
-                let integration = detect_integration_from_url(&asset_url);
-                record_integration(&mut integrations, &integration, asset_url.as_str());
-                insert_asset(&mut assets_by_url, &final_url, &asset_url, integration);
             }
         }
 
@@ -167,6 +169,7 @@ pub(crate) fn classify_party(page_url: &Url, asset_url: &Url) -> AssetParty {
 }
 
 fn host_matches(page_host: &str, asset_host: &str) -> bool {
+    // This is an advisory heuristic, not public-suffix-aware eTLD+1 classification.
     asset_host == page_host
         || asset_host
             .strip_suffix(page_host)
@@ -213,9 +216,15 @@ pub(crate) fn detect_integrations_from_inline_script(script: &str) -> Vec<(Strin
         ));
     }
 
-    let lowered = script.to_ascii_lowercase();
-    for integration in ["gpt", "didomi", "datadome", "permutive", "lockr", "prebid"] {
-        if lowered.contains(integration) {
+    for (integration, regex) in [
+        ("gpt", &*GPT_INLINE_REGEX),
+        ("didomi", &*DIDOMI_INLINE_REGEX),
+        ("datadome", &*DATADOME_INLINE_REGEX),
+        ("permutive", &*PERMUTIVE_INLINE_REGEX),
+        ("lockr", &*LOCKR_INLINE_REGEX),
+        ("prebid", &*PREBID_INLINE_REGEX),
+    ] {
+        if regex.is_match(script) {
             matches.push((
                 integration.to_string(),
                 format!("inline script matched `{integration}`"),
@@ -259,16 +268,20 @@ mod tests {
             requested_url: "https://publisher.example/page".to_string(),
             final_url: "https://publisher.example/page".to_string(),
             page_title: Some("Browser Title".to_string()),
-            html: r#"<html><head><title>HTML Title</title><script src="https://www.googletagmanager.com/gtm.js?id=GTM-ABCD123"></script></head></html>"#.to_string(),
-            script_tags: vec![CollectedScriptTag {
-                src: Some("https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()),
-                inline_text: None,
-            }],
+            html: r#"<html><head><title>HTML Title</title></head></html>"#.to_string(),
+            script_tags: vec![
+                CollectedScriptTag {
+                    src: Some("https://www.googletagmanager.com/gtm.js?id=GTM-ABCD123".to_string()),
+                    inline_text: None,
+                },
+                CollectedScriptTag {
+                    src: Some("https://securepubads.g.doubleclick.net/tag/js/gpt.js".to_string()),
+                    inline_text: None,
+                },
+            ],
             network_requests: vec![CollectedRequest {
                 url: "https://cdn.example.com/dynamic.js".to_string(),
-                method: "GET".to_string(),
                 resource_type: Some("Script".to_string()),
-                status: Some(200),
             }],
             warnings: vec!["partial settle".to_string()],
         };
@@ -345,9 +358,7 @@ mod tests {
             }],
             network_requests: vec![CollectedRequest {
                 url: "https://cdn.example.com/prebid.js".to_string(),
-                method: "GET".to_string(),
                 resource_type: Some("script".to_string()),
-                status: Some(200),
             }],
             warnings: Vec::new(),
         };
@@ -371,8 +382,17 @@ mod tests {
             requested_url: "https://publisher.example/page".to_string(),
             final_url: "https://publisher.example/path/page".to_string(),
             page_title: None,
-            html: r#"<html><head><script src="/static/app.js"></script><script src="http://[invalid"></script></head></html>"#.to_string(),
-            script_tags: Vec::new(),
+            html: "<html><head></head></html>".to_string(),
+            script_tags: vec![
+                CollectedScriptTag {
+                    src: Some("/static/app.js".to_string()),
+                    inline_text: None,
+                },
+                CollectedScriptTag {
+                    src: Some("http://[invalid".to_string()),
+                    inline_text: None,
+                },
+            ],
             network_requests: Vec::new(),
             warnings: Vec::new(),
         };
@@ -461,6 +481,22 @@ mod tests {
         assert!(matches
             .iter()
             .any(|(integration, _)| integration == "didomi"));
+    }
+
+    #[test]
+    fn detect_integrations_from_inline_script_avoids_short_substring_matches() {
+        let matches = detect_integrations_from_inline_script("const svgptimize = blockrResult;");
+
+        assert!(
+            !matches.iter().any(|(integration, _)| integration == "gpt"),
+            "should not match incidental GPT substrings"
+        );
+        assert!(
+            !matches
+                .iter()
+                .any(|(integration, _)| integration == "lockr"),
+            "should not match lockr inside a larger token"
+        );
     }
 
     #[test]

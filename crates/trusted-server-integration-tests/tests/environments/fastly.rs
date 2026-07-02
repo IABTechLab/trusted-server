@@ -1,7 +1,7 @@
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
 };
-use error_stack::ResultExt as _;
+use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -23,6 +23,12 @@ impl RuntimeEnvironment for FastlyViceroy {
         let port = super::find_available_port()?;
 
         let viceroy_config = self.viceroy_config_path();
+        if !viceroy_config.exists() {
+            return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+                "Viceroy config `{}` does not exist; run `scripts/generate-integration-viceroy-configs.sh` or `scripts/integration-tests.sh`, or set VICEROY_CONFIG_PATH to a generated config",
+                viceroy_config.display()
+            )));
+        }
 
         let mut child = Command::new("viceroy")
             .arg(wasm_path)
@@ -69,7 +75,7 @@ impl FastlyViceroy {
     /// secret stores) plus generated test application config stores.
     ///
     /// Honors the `VICEROY_CONFIG_PATH` environment variable so CI jobs can
-    /// point the same WASM binary at generated legacy or EdgeZero configs. This
+    /// point the same WASM binary at generated legacy or `EdgeZero` configs. This
     /// mirrors the browser harness's `global-setup.ts`, which reads the same
     /// variable. Falls back to the local generated legacy config path when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {

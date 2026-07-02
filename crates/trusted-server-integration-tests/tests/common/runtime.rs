@@ -52,7 +52,10 @@ pub enum TestError {
     #[display("JSON field assertion failed: {field}")]
     JsonFieldMismatch { field: String },
 
-    // Resource errors
+    // Resource/config errors
+    #[display("Failed to generate runtime configuration")]
+    ConfigGeneration,
+
     #[display("No available port found")]
     NoPortAvailable,
 }

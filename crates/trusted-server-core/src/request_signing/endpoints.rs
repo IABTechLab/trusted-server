@@ -26,8 +26,14 @@ fn json_response(status: StatusCode, body: String) -> Response<EdgeBody> {
 
 fn request_body_bytes(
     body: EdgeBody,
-    _endpoint: &str,
+    endpoint: &str,
 ) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
     Ok(body.into_bytes().unwrap_or_default())
 }
 
@@ -207,7 +213,10 @@ fn signing_store_ids(
         })
 }
 
-fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+/// Validates the structural constraints every kid must satisfy regardless of
+/// operation: non-empty, length-bounded, and limited to a safe charset so a kid
+/// cannot smuggle a CSV separator or other control characters into storage.
+fn validate_kid_format(kid: &str) -> Result<(), Report<TrustedServerError>> {
     if kid.is_empty() || kid.len() > MAX_KID_LENGTH {
         return Err(Report::new(TrustedServerError::BadRequest {
             message: format!("kid must be 1..={MAX_KID_LENGTH} characters"),
@@ -224,6 +233,50 @@ fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
     }
 
     Ok(())
+}
+
+/// Validates a kid for creation/rotation.
+///
+/// Enforces the **portable-KID contract**: a kid created through any adapter must
+/// be storable by every platform's key-name encoder, so create/rotate validates
+/// against the strictest common denominator. Concretely the kid must start with a
+/// lowercase ASCII letter, on top of the structural [`validate_kid_format`]
+/// charset checks.
+///
+/// That floor is currently set by the Fermyon Spin variable encoder
+/// (`spin_variable_name` in the Spin adapter's `platform.rs`), which requires a
+/// lowercase ASCII leading character: it would otherwise alias digit-leading keys
+/// (`1foo` and `n1foo` both map to `v_n1foo`) or reject uppercase/punctuation
+/// leading keys (`KidA`, `_kid`, `-kid`, `.kid`, `:kid`) at storage time.
+/// Enforcing the floor here turns those into a client-correctable 400 on every
+/// adapter instead of a runtime 5xx on Spin. [`kid_is_creatable`] exposes this
+/// predicate so adapter crates can pin the contract with a test — core must never
+/// accept a kid its encoder rejects. System-generated KIDs (`ts-YYYY-MM-DD`)
+/// start with `t` and are unaffected.
+///
+/// Deactivation/deletion deliberately uses the looser [`validate_kid_format`] so
+/// legacy KIDs created under earlier validation rules remain removable.
+fn validate_kid(kid: &str) -> Result<(), Report<TrustedServerError>> {
+    validate_kid_format(kid)?;
+
+    if !kid.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "kid must start with a lowercase ASCII letter".into(),
+        }));
+    }
+
+    Ok(())
+}
+
+/// Returns whether `kid` satisfies the create/rotate portable-KID contract
+/// enforced by [`validate_kid`].
+///
+/// Exposed so platform adapter crates can assert their key-name encoder accepts
+/// every kid this validation admits, pinning the cross-adapter contract against
+/// silent drift between this validation floor and an adapter's storage encoder.
+#[must_use]
+pub fn kid_is_creatable(kid: &str) -> bool {
+    validate_kid(kid).is_ok()
 }
 
 /// Rotates the current active kid by generating and saving a new one.
@@ -378,7 +431,11 @@ pub fn handle_deactivate_key(
 
     let manager = KeyRotationManager::new(config_store_id, secret_store_id);
 
-    let result = validate_kid(&deactivate_req.kid).and_then(|()| {
+    // Use the looser format validation here so legacy KIDs created under earlier
+    // validation rules (e.g. digit- or uppercase-leading) can still be
+    // deactivated or deleted. The stricter validate_kid only gates new key
+    // creation/rotation.
+    let result = validate_kid_format(&deactivate_req.kid).and_then(|()| {
         if deactivate_req.delete {
             manager.delete_key(services, &deactivate_req.kid)
         } else {
@@ -442,6 +499,7 @@ pub fn handle_deactivate_key(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use error_stack::Report;
     use http::{header, Method, Request as HttpRequest, StatusCode};
@@ -465,6 +523,15 @@ mod tests {
             .uri(uri)
             .body(body)
             .expect("should build request")
+    }
+
+    fn build_streaming_request(method: Method, uri: &str) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming request")
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -931,6 +998,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_signature_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/verify-signature");
+        let err = handle_verify_signature(&settings, &noop_services(), req)
+            .expect_err("should reject streaming verify body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming verify body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "verify-signature request body must be buffered, not streamed"
+            ),
+            "should explain that verify bodies must be buffered"
+        );
+    }
+
+    #[test]
     fn rotate_key_rejects_oversized_body() {
         let settings = crate::test_support::tests::create_test_settings();
         let oversized = "x".repeat(ADMIN_MAX_BODY_BYTES + 1);
@@ -945,6 +1033,27 @@ mod tests {
             err.current_context().status_code(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should return 413 for rotate-key body over limit"
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_streaming_body() {
+        let settings = crate::test_support::tests::create_test_settings();
+        let req = build_streaming_request(Method::POST, "https://test.com/admin/keys/rotate");
+        let err = handle_rotate_key(&settings, &noop_services(), req)
+            .expect_err("should reject streaming rotate body");
+        assert_eq!(
+            err.current_context().status_code(),
+            StatusCode::BAD_REQUEST,
+            "should return 400 for streaming rotate body"
+        );
+        assert!(
+            matches!(
+                err.current_context(),
+                TrustedServerError::BadRequest { message }
+                    if message == "rotate-key request body must be buffered, not streamed"
+            ),
+            "should explain that rotate bodies must be buffered"
         );
     }
 
@@ -990,6 +1099,74 @@ mod tests {
         let result = validate_kid("kid-a,kid-b");
 
         assert!(result.is_err(), "should reject commas in kid values");
+    }
+
+    #[test]
+    fn validate_kid_rejects_digit_leading_ids() {
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject digit-leading kid value: {kid}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_kid_rejects_non_lowercase_leading_ids() {
+        // The Spin variable encoder requires a lowercase ASCII leading character,
+        // so uppercase- and punctuation-leading KIDs that pass validate_kid_format
+        // must be rejected on the create/rotate path to avoid a runtime 5xx on Spin.
+        for kid in &["KidA", "_kid", "-kid", ".kid", ":kid"] {
+            assert!(
+                validate_kid(kid).is_err(),
+                "should reject non-lowercase-leading kid value: {kid}"
+            );
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should still accept {kid}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_kid_format_allows_digit_leading_for_legacy_removal() {
+        // Deactivation/deletion uses validate_kid_format so digit-leading KIDs
+        // created under earlier rules stay removable, while the stricter
+        // validate_kid still blocks them on the create/rotate path.
+        for kid in &["2026-key", "0abc", "9xyz", "1-key"] {
+            validate_kid_format(kid)
+                .unwrap_or_else(|e| panic!("format check should accept legacy kid {kid}: {e:?}"));
+            assert!(
+                validate_kid(kid).is_err(),
+                "create/rotate validation must still reject digit-leading kid: {kid}"
+            );
+        }
+    }
+
+    #[test]
+    fn deactivate_allows_legacy_digit_leading_kid_past_validation() {
+        // A digit-leading legacy kid must pass validation and reach storage
+        // (which fails with the noop test stores -> 500) rather than being
+        // rejected up front as a 400 bad request.
+        let settings = crate::test_support::tests::create_test_settings();
+        let req_body = DeactivateKeyRequest {
+            kid: "1legacy-key".to_string(),
+            delete: true,
+        };
+        let body_json =
+            serde_json::to_string(&req_body).expect("should serialize deactivate request");
+        let req = build_request(
+            Method::POST,
+            "https://test.com/admin/keys/deactivate",
+            Some(&body_json),
+        );
+
+        let resp = handle_deactivate_key(&settings, &noop_services(), req)
+            .expect("should return a response for a legacy digit-leading kid");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "legacy digit-leading kid must not be rejected as a bad request on deactivation"
+        );
     }
 
     #[test]

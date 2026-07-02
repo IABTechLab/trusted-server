@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**"]
 
 permissions:
   contents: read
@@ -32,8 +32,23 @@ jobs:
       - name: Run cargo fmt
         uses: actions-rust-lang/rustfmt@v1
 
-      - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run cargo clippy (Fastly — wasm32-wasip1)
+        run: cargo clippy-fastly
+
+      - name: Run cargo clippy (Axum — native)
+        run: cargo clippy-axum
+
+      - name: Run cargo clippy (Cloudflare — native)
+        run: cargo clippy-cloudflare
+
+      - name: Run cargo clippy (Spin — native)
+        run: cargo clippy-spin-native
+
+      - name: Run cargo clippy (Spin — wasm32-wasip1)
+        run: cargo clippy-spin-wasm
+
+      - name: Run host-target CLI clippy
+        run: cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings
 
       - name: Run host-target CLI clippy
         run: cargo clippy --package trusted-server-cli --target x86_64-unknown-linux-gnu --all-targets --all-features -- -D warnings

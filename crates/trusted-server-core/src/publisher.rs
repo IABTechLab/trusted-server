@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
-use http::{header, HeaderValue, Request, Response, StatusCode, Uri};
+use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
@@ -407,12 +407,77 @@ pub struct OwnedProcessResponseParams {
     pub(crate) content_type: String,
 }
 
+/// Buffer a [`PublisherResponse`] into a single [`Response`].
+///
+/// Handles all three variants: returns [`PublisherResponse::Buffered`] unchanged,
+/// pipes [`PublisherResponse::Stream`] through the streaming pipeline into memory,
+/// and reattaches [`PublisherResponse::PassThrough`] bodies directly.
+///
+/// The buffered size is capped by `settings.publisher.max_buffered_body_bytes`
+/// (16 MiB by default), so processable origin responses cannot grow the
+/// buffer without bound and exhaust the Wasm heap.
+///
+/// `method` is used to preserve metadata for bodiless responses: `HEAD` and
+/// bodiless statuses (204, 304) carry no body but may advertise the `GET`
+/// representation's length. `handle_publisher_request` already strips the origin
+/// `Content-Length` for processable [`PublisherResponse::Stream`] responses, so
+/// rewriting it here to the buffered byte count (`0`) would replace it with a
+/// misleading length. Those responses skip the buffer, the length rewrite, and
+/// the body replacement, mirroring the asset path's bodiless guard.
+///
+/// # Errors
+///
+/// Returns an error if the streaming pipeline fails to process the response
+/// body, or if the processed body exceeds the configured buffer cap.
+pub fn buffer_publisher_response(
+    publisher_response: PublisherResponse,
+    method: &Method,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) -> Result<Response<EdgeBody>, Report<crate::error::TrustedServerError>> {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => Ok(response),
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            if !response_carries_body(method, response.status()) {
+                return Ok(response);
+            }
+            let mut output = BoundedWriter::new(settings.publisher.max_buffered_body_bytes);
+            stream_publisher_body(body, &mut output, &params, settings, integration_registry)?;
+            let bytes = output.into_inner();
+            response.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from(bytes.len() as u64),
+            );
+            *response.body_mut() = EdgeBody::from(bytes);
+            Ok(response)
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            Ok(response)
+        }
+    }
+}
+
+/// Returns `true` when a buffered publisher response should carry a body and a
+/// recomputed `Content-Length`.
+///
+/// `HEAD` responses and bodiless statuses (204, 304) carry no body; rewriting
+/// their `Content-Length` to the (empty) buffered length would mislead clients
+/// and caches, so the origin metadata is preserved instead.
+fn response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
 /// Stream the publisher response body through the processing pipeline.
 ///
 /// Called by the adapter after `stream_to_client()` has committed the response
-/// headers. Runs synchronously against an already-materialised body; the async
-/// I/O happened upstream in [`handle_publisher_request`]. Writes processed
-/// chunks directly to `output`.
+/// headers. Writes processed chunks directly to `output`.
 ///
 /// # Errors
 ///
@@ -849,6 +914,30 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build test request")
+    }
+
+    #[test]
+    fn response_carries_body_preserves_bodiless_metadata() {
+        // A processable GET 200 buffers a body and recomputes Content-Length.
+        assert!(
+            super::response_carries_body(&Method::GET, StatusCode::OK),
+            "a GET 200 publisher response should carry a buffered body"
+        );
+        // HEAD carries no body; recomputing Content-Length to 0 would mislead
+        // clients/caches about the GET representation length.
+        assert!(
+            !super::response_carries_body(&Method::HEAD, StatusCode::OK),
+            "HEAD publisher responses must not get a recomputed Content-Length"
+        );
+        // Bodiless statuses keep their metadata regardless of method.
+        assert!(
+            !super::response_carries_body(&Method::GET, StatusCode::NO_CONTENT),
+            "204 responses must not get a recomputed Content-Length"
+        );
+        assert!(
+            !super::response_carries_body(&Method::GET, StatusCode::NOT_MODIFIED),
+            "304 responses must not get a recomputed Content-Length"
+        );
     }
 
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
@@ -2036,6 +2125,41 @@ mod tests {
         assert!(
             !processed.contains("origin.example.com"),
             "origin host must not leak. Got: {processed}"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_accepts_writes_within_limit() {
+        let mut writer = BoundedWriter::new(10);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        writer
+            .write_all(b"67890")
+            .expect("should accept write up to exact limit");
+
+        assert_eq!(
+            writer.into_inner(),
+            b"1234567890",
+            "should preserve all written bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_writes_exceeding_limit() {
+        let mut writer = BoundedWriter::new(8);
+
+        writer
+            .write_all(b"12345")
+            .expect("should accept write within limit");
+        let err = writer
+            .write_all(b"6789")
+            .expect_err("should reject write that exceeds the limit");
+
+        assert!(
+            err.to_string().contains("maximum buffered size"),
+            "should report the buffer cap in the error message"
         );
     }
 }
