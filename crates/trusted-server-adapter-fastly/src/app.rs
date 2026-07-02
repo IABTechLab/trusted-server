@@ -1175,6 +1175,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [proxy]
+                allowed_domains = ["*.example", "*.example.com"]
+
                 [ec]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
@@ -1189,6 +1192,7 @@ mod tests {
                 [integrations.prebid]
                 enabled = true
                 server_url = "https://test-prebid.com/openrtb2/auction"
+                external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
                 [integrations.datadome]
                 enabled = true
@@ -1240,6 +1244,9 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
@@ -1251,6 +1258,7 @@ mod tests {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 
             [auction]
             enabled = true

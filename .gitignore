@@ -18,6 +18,7 @@
 
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
+/dist/prebid/
 
 # env
 .env*

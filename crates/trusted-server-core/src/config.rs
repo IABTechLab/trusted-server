@@ -18,12 +18,27 @@ use crate::error::TrustedServerError;
 use crate::integrations::{
     adserver_mock::AdServerMockConfig, aps::ApsConfig, datadome::DataDomeConfig,
     didomi::DidomiIntegrationConfig, google_tag_manager::GoogleTagManagerConfig, gpt::GptConfig,
-    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, permutive::PermutiveConfig, prebid,
-    sourcepoint::SourcepointConfig, testlight::TestlightConfig,
+    lockr::LockrConfig, nextjs::NextJsIntegrationConfig, osano::OsanoConfig,
+    permutive::PermutiveConfig, prebid, sourcepoint::SourcepointConfig, testlight::TestlightConfig,
 };
 use crate::settings::{IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
+const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
+    "prebid",
+    "aps",
+    "adserver_mock",
+    "testlight",
+    "nextjs",
+    "permutive",
+    "lockr",
+    "didomi",
+    "sourcepoint",
+    "osano",
+    "google_tag_manager",
+    "datadome",
+    "gpt",
+];
 
 /// Typed app-config root used by the `ts` CLI.
 ///
@@ -118,7 +133,8 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 fn validate_enabled_integrations(
     settings: &Settings,
 ) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
-    let mut enabled_auction_providers = HashSet::new();
+    let mut enabled_auction_providers =
+        HashSet::with_capacity(DEPLOY_VALIDATED_INTEGRATION_IDS.len());
 
     if validate_prebid(settings)? {
         enabled_auction_providers.insert("prebid");
@@ -135,6 +151,7 @@ fn validate_enabled_integrations(
     validate_integration::<LockrConfig>(settings, "lockr")?;
     validate_integration::<DidomiIntegrationConfig>(settings, "didomi")?;
     validate_integration::<SourcepointConfig>(settings, "sourcepoint")?;
+    validate_integration::<OsanoConfig>(settings, "osano")?;
     validate_integration::<GoogleTagManagerConfig>(settings, "google_tag_manager")?;
     validate_integration::<DataDomeConfig>(settings, "datadome")?;
     validate_integration::<GptConfig>(settings, "gpt")?;
@@ -199,7 +216,10 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     fn valid_settings() -> Settings {
-        Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
     }
 
     #[test]
@@ -258,6 +278,55 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
+        let mut settings = valid_settings();
+        settings.proxy.allowed_domains.clear();
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject external Prebid bundle without proxy allowlist");
+
+        assert!(
+            err.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_covers_registered_integration_builders() {
+        let validated_ids: HashSet<&'static str> =
+            DEPLOY_VALIDATED_INTEGRATION_IDS.iter().copied().collect();
+        let missing_ids = crate::integrations::registered_builder_ids()
+            .filter(|id| !validated_ids.contains(id))
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing_ids.is_empty(),
+            "deploy validation should cover all registered integration builders: {missing_ids:?}"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_invalid_osano_config() {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "osano",
+                &serde_json::json!({ "enabled": true, "typo": true }),
+            )
+            .expect("should insert Osano config");
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject invalid Osano config during deploy validation");
+        let error_text = format!("{err:?}");
+
+        assert!(
+            error_text.contains("osano") || error_text.contains("typo"),
+            "error should mention Osano or the invalid field: {err:?}"
         );
     }
 

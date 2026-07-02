@@ -393,6 +393,9 @@ fn base_route_settings_toml() -> &'static str {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 
@@ -408,7 +411,8 @@ fn prebid_integration_toml() -> &'static str {
             [integrations.prebid]
             enabled = true
             server_url = "https://test-prebid.com/openrtb2/auction"
-        "#
+            external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+            "#
 }
 
 fn create_test_settings() -> Settings {

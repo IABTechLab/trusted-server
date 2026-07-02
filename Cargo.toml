@@ -85,6 +85,7 @@ temp-env = "0.3.6"
 tempfile = "3.24"
 tokio = { version = "1.49", features = ["sync", "macros", "io-util", "rt", "time"] }
 toml = "1.1"
+toml_edit = "0.23.10"
 tower = "0.4"
 trusted-server-core = { path = "crates/trusted-server-core" }
 url = "2.5.8"

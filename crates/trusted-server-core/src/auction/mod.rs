@@ -92,8 +92,10 @@ mod tests {
 
     fn settings_with_auction_config(auction_config: &str) -> Settings {
         let settings_str = format!("{}\n{auction_config}", crate_test_settings_str());
-        Settings::from_toml(&settings_str)
-            .expect("should parse auction provider validation test settings")
+        let mut settings = Settings::from_toml(&settings_str)
+            .expect("should parse auction provider validation test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
     }
 
     fn assert_orchestrator_error_contains(settings: &Settings, expected: &str) {

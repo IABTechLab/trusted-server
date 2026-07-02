@@ -45,6 +45,10 @@ bidders = []
 debug = false
 client_side_bidders = []
 
+[integrations.prebid.bundle]
+adapters = ["rubicon"]
+# user_id_modules = ["sharedIdSystem"]
+
 [integrations.nextjs]
 enabled = false
 rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
@@ -98,7 +102,8 @@ rewrite_script = true
 
 [proxy]
 # certificate_check = true
-# allowed_domains = ["ads.example.com", "*.cdn.example.com"]
+# Required for integrations.prebid.external_bundle_url and first-party proxy redirects.
+# allowed_domains = ["ads.example.com", "assets.example.com", "*.cdn.example.com"]
 
 [auction]
 enabled = false

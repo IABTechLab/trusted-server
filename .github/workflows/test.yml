@@ -80,7 +80,7 @@ jobs:
         run: cargo bench -p trusted-server-core --bench html_processor_bench -- --test
 
       - name: Run host-target CLI tests
-        run: cargo test --package trusted-server-cli --target x86_64-unknown-linux-gnu
+        run: ./scripts/test-cli.sh
 
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
