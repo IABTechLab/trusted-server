@@ -54,10 +54,14 @@ pub fn get_settings_from_services(
 /// Returns the default `EdgeZero` app-config store name.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
-    StoreName::from(
-        std::env::var("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME")
-            .unwrap_or_else(|_| DEFAULT_CONFIG_STORE_ID.to_string()),
-    )
+    config_store_name_from(&EnvConfig::from_env())
+}
+
+/// Resolves the app-config store name from an [`EnvConfig`], falling back to
+/// the logical id when the override is unset, blank, or contains control
+/// characters (the `EnvConfig::store_name` fallback semantics).
+fn config_store_name_from(env_config: &EnvConfig) -> StoreName {
+    StoreName::from(env_config.store_name("config", DEFAULT_CONFIG_STORE_ID))
 }
 
 /// Returns the default config-store key containing the app-config blob.
@@ -99,6 +103,11 @@ fn read_config_entry(
         })
 }
 
+// Mirrors `edgezero-adapter-fastly`'s crate-private `chunked_config` resolver
+// (same wire format). Kept local because the upstream one collapses missing
+// chunks (retryable, 503 here) and corrupt chunks (terminal, 500 here) into
+// one opaque error — see the design doc's follow-up section for the plan to
+// delete this once upstream exports a resolver that keeps that distinction.
 fn resolve_fastly_chunk_pointer(
     config_store: &dyn PlatformConfigStore,
     store_name: &StoreName,
@@ -474,6 +483,43 @@ mod tests {
             err.current_context().status_code(),
             http::StatusCode::INTERNAL_SERVER_ERROR,
             "chunk that reads but fails verification should stay 500"
+        );
+    }
+
+    #[test]
+    fn config_store_name_uses_env_override() {
+        let env_config =
+            EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "custom_store")]);
+
+        assert_eq!(
+            config_store_name_from(&env_config).to_string(),
+            "custom_store",
+            "should use the env override when set to a valid name"
+        );
+    }
+
+    #[test]
+    fn config_store_name_falls_back_when_override_blank() {
+        for blank in ["", "   ", "\t", "with\u{0000}control"] {
+            let env_config =
+                EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", blank)]);
+
+            assert_eq!(
+                config_store_name_from(&env_config).to_string(),
+                DEFAULT_CONFIG_STORE_ID,
+                "blank/control override {blank:?} should fall back to the logical id"
+            );
+        }
+    }
+
+    #[test]
+    fn config_store_name_falls_back_when_override_unset() {
+        let env_config = EnvConfig::from_vars(std::iter::empty::<(&str, String)>());
+
+        assert_eq!(
+            config_store_name_from(&env_config).to_string(),
+            DEFAULT_CONFIG_STORE_ID,
+            "unset override should fall back to the logical id"
         );
     }
 }

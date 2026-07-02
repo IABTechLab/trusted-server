@@ -400,9 +400,7 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
             }
             Err(e) => {
                 log::warn!("EdgeZero JA4 endpoint: failed to load settings: {e:?}");
-                FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_body_text_plain("Internal Server Error")
-                    .send_to_client();
+                to_error_response(&e).send_to_client();
             }
         }
         return;

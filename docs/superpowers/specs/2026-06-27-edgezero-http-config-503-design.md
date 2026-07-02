@@ -2,7 +2,7 @@
 
 - **Date:** 2026-06-27
 - **Author:** Prakash (HTTP-layer / runtime).
-- **Status:** implemented on `feature/edgezero-269-http` (stacked on `feature/ts-cli-audit`).
+- **Status:** implemented on `feature/edgezero-269-http` (targets `main`).
 - **Supersedes:** the earlier per-key flatten/hash variant of this design. The
   CLI now stores Trusted Server config as a single **blob** (optionally chunked
   for Fastly value-size limits — `config_payload::settings_from_config_blob`,
@@ -62,9 +62,12 @@ to the new variant; all verify/parse paths are untouched. No `PlatformError`
 or `PlatformConfigStore` change.
 
 **Security:** the actionable hint rides the error chain (`Display`) to the
-**server log** only. The public 503 body stays the generic
-`user_message()` catch-all — no `user_message()` arm is added for this variant —
-so internal tooling/paths never leak to clients.
+**server log** only. The public 503 body is a generic, retry-flavored
+`user_message()` arm shared by the retryable 503 variants
+(`ConfigStoreUnavailable | KvStore`): `"Service temporarily unavailable"`.
+It carries no internal detail, but — unlike the 500-flavored catch-all
+(`"An internal error occurred"`) — lets clients and monitoring distinguish
+*retryable* from *terminal* without leaking tooling/paths.
 
 ## 5. Out of scope / follow-up
 
@@ -76,3 +79,13 @@ so internal tooling/paths never leak to clients.
   separate, cross-cutting change, not this PR.
 - Non-Fastly adapter (cloudflare/spin/axum) parity rides the EdgeZero adapter
   stack.
+- `settings_data::resolve_fastly_chunk_pointer` duplicates
+  `edgezero-adapter-fastly`'s `chunked_config` resolver (same wire format:
+  `edgezero_kind = "fastly_config_chunks"`, version 1, per-chunk len + sha,
+  envelope len + sha). The upstream resolver is `pub(crate)` and, when reached
+  transparently through `edgezero_adapter_fastly::config_store::FastlyConfigStore::get`,
+  collapses **missing chunk** (retryable, this spec's 503) and **corrupt chunk**
+  (terminal, 500) into one opaque error — so delegating today would lose the
+  503/500 contract above. Swap to the upstream resolver and delete the local
+  copy once edgezero exports it (or its error taxonomy distinguishes
+  missing from corrupt) — needs an upstream change + repin.
