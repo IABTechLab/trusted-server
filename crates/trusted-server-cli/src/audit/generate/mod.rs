@@ -10,12 +10,34 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use url::Url;
 
-use crate::audit::collector::AuditCollector;
+use crate::audit::generate::collector::AuditCollector;
 use crate::config_init::EXAMPLE_CONFIG;
 use crate::error::{cli_error, report_error, CliResult};
-use crate::run::AuditArgs;
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
+
+/// Arguments for `ts audit generate <url>` — bootstraps draft Trusted Server
+/// config and JavaScript asset audit files from a live page (issue #800).
+#[derive(Debug, clap::Args)]
+pub(crate) struct GenerateArgs {
+    /// Public HTTP(S) URL to audit.
+    pub(crate) url: String,
+    /// JavaScript asset audit output path.
+    #[arg(long)]
+    pub(crate) js_assets: Option<std::path::PathBuf>,
+    /// Draft Trusted Server config output path.
+    #[arg(long)]
+    pub(crate) config: Option<std::path::PathBuf>,
+    /// Do not write the JavaScript asset audit file.
+    #[arg(long)]
+    pub(crate) no_js_assets: bool,
+    /// Do not write the draft Trusted Server config file.
+    #[arg(long)]
+    pub(crate) no_config: bool,
+    /// Overwrite existing output files.
+    #[arg(long)]
+    pub(crate) force: bool,
+}
 
 const DEFAULT_JS_ASSETS_PATH: &str = "js-assets.toml";
 const DEFAULT_CONFIG_PATH: &str = "trusted-server.toml";
@@ -68,8 +90,8 @@ struct AuditOutputPlan {
     config_path: Option<PathBuf>,
 }
 
-pub(crate) fn run_audit(
-    args: &AuditArgs,
+pub(crate) fn run_generate(
+    args: &GenerateArgs,
     collector: &dyn AuditCollector,
     out: &mut dyn Write,
 ) -> CliResult<()> {
@@ -94,7 +116,7 @@ fn parse_audit_url(value: &str) -> CliResult<Url> {
     Ok(url)
 }
 
-fn resolve_output_plan(args: &AuditArgs) -> CliResult<AuditOutputPlan> {
+fn resolve_output_plan(args: &GenerateArgs) -> CliResult<AuditOutputPlan> {
     if args.no_js_assets && args.no_config {
         return cli_error("nothing to do: both --no-js-assets and --no-config were set");
     }
@@ -393,7 +415,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::audit::collector::{CollectedPage, CollectedRequest, CollectedScriptTag};
+    use crate::audit::generate::collector::{CollectedPage, CollectedRequest, CollectedScriptTag};
 
     struct FakeCollector {
         collected: CollectedPage,
@@ -440,8 +462,8 @@ mod tests {
         }
     }
 
-    fn audit_args(url: &str) -> AuditArgs {
-        AuditArgs {
+    fn audit_args(url: &str) -> GenerateArgs {
+        GenerateArgs {
             url: url.to_string(),
             js_assets: None,
             config: None,
@@ -519,11 +541,11 @@ mod tests {
     }
 
     #[test]
-    fn run_audit_writes_selected_outputs_and_summary() {
+    fn run_generate_writes_selected_outputs_and_summary() {
         let temp = TempDir::new().expect("should create temp dir");
         let js_assets = temp.path().join("audit/js-assets.toml");
         let config = temp.path().join("audit/trusted-server.toml");
-        let args = AuditArgs {
+        let args = GenerateArgs {
             url: "https://publisher.example/page".to_string(),
             js_assets: Some(js_assets.clone()),
             config: Some(config.clone()),
@@ -534,7 +556,7 @@ mod tests {
         let collector = FakeCollector::new(collected_page());
         let mut out = Vec::new();
 
-        run_audit(&args, &collector, &mut out).expect("should run audit");
+        run_generate(&args, &collector, &mut out).expect("should run audit");
 
         assert_eq!(collector.calls.get(), 1, "should collect page once");
         assert!(js_assets.exists(), "should write JS assets");
@@ -546,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn run_audit_respects_no_config() {
+    fn run_generate_respects_no_config() {
         let temp = TempDir::new().expect("should create temp dir");
         let js_assets = temp.path().join("js-assets.toml");
         let mut args = audit_args("https://publisher.example/page");
@@ -554,7 +576,7 @@ mod tests {
         args.no_config = true;
         let collector = FakeCollector::new(collected_page());
 
-        run_audit(&args, &collector, &mut Vec::new()).expect("should run audit");
+        run_generate(&args, &collector, &mut Vec::new()).expect("should run audit");
 
         assert!(js_assets.exists(), "should write assets");
         assert!(
@@ -564,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn run_audit_respects_no_js_assets() {
+    fn run_generate_respects_no_js_assets() {
         let temp = TempDir::new().expect("should create temp dir");
         let config = temp.path().join("trusted-server.toml");
         let mut args = audit_args("https://publisher.example/page");
@@ -573,7 +595,7 @@ mod tests {
         let collector = FakeCollector::new(collected_page());
         let mut out = Vec::new();
 
-        run_audit(&args, &collector, &mut out).expect("should run audit");
+        run_generate(&args, &collector, &mut out).expect("should run audit");
 
         assert!(config.exists(), "should write config");
         assert!(
@@ -585,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn run_audit_writes_collector_warnings_to_asset_artifact() {
+    fn run_generate_writes_collector_warnings_to_asset_artifact() {
         let temp = TempDir::new().expect("should create temp dir");
         let js_assets = temp.path().join("js-assets.toml");
         let mut args = audit_args("https://publisher.example/page");
@@ -598,7 +620,7 @@ mod tests {
         );
         let collector = FakeCollector::new(collected);
 
-        run_audit(&args, &collector, &mut Vec::new()).expect("should run audit");
+        run_generate(&args, &collector, &mut Vec::new()).expect("should run audit");
 
         let artifact = fs::read_to_string(js_assets).expect("should read artifact");
         assert!(
@@ -608,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn run_audit_conflict_prevents_collection() {
+    fn run_generate_conflict_prevents_collection() {
         let temp = TempDir::new().expect("should create temp dir");
         let js_assets = temp.path().join("js-assets.toml");
         fs::write(&js_assets, "existing").expect("should write existing file");
@@ -617,7 +639,7 @@ mod tests {
         args.no_config = true;
         let collector = FakeCollector::new(collected_page());
 
-        let error = run_audit(&args, &collector, &mut Vec::new())
+        let error = run_generate(&args, &collector, &mut Vec::new())
             .expect_err("should reject existing output");
 
         assert_eq!(collector.calls.get(), 0, "should not collect page");

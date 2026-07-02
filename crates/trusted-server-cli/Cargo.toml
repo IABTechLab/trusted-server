@@ -16,12 +16,14 @@ workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { workspace = true }
 clap = { workspace = true }
+edgezero-core = { workspace = true }
 edgezero-cli = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

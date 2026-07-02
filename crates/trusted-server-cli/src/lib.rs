@@ -11,7 +11,13 @@
 )]
 
 #[cfg(not(target_arch = "wasm32"))]
+mod ad_templates;
+#[cfg(not(target_arch = "wasm32"))]
+mod app_config;
+#[cfg(not(target_arch = "wasm32"))]
 mod audit;
+#[cfg(not(target_arch = "wasm32"))]
+mod config_ad_templates;
 #[cfg(not(target_arch = "wasm32"))]
 mod config_init;
 #[cfg(not(target_arch = "wasm32"))]
