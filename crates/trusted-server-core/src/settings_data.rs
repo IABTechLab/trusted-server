@@ -94,7 +94,7 @@ fn read_config_entry(
         .change_context(TrustedServerError::ConfigStoreUnavailable {
             store_name: store_name.to_string(),
             message: format!(
-                "unavailable or not seeded (failed to read `{key}`) — run `ts config push`"
+                "read failed for `{key}` (unseeded, missing, or transient) — run `ts config push` to (re)seed"
             ),
         })
 }

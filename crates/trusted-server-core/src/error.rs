@@ -148,6 +148,12 @@ impl IntoHttpResponse for TrustedServerError {
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            // Retryable 503s: signal transient unavailability so clients and
+            // monitoring can distinguish retry-me from terminal, without leaking
+            // any internal detail (full details are logged in to_error_response).
+            Self::ConfigStoreUnavailable { .. } | Self::KvStore { .. } => {
+                "Service temporarily unavailable".to_string()
+            }
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
             _ => "An internal error occurred".to_string(),
@@ -333,10 +339,6 @@ mod tests {
             TrustedServerError::Configuration {
                 message: "secret db path".into(),
             },
-            TrustedServerError::KvStore {
-                store_name: "users".into(),
-                message: "timeout".into(),
-            },
             TrustedServerError::Proxy {
                 message: "upstream 10.0.0.1 refused".into(),
             },
@@ -427,12 +429,39 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "config-store read failure should map to 503"
         );
-        // Detail stays server-side; the public body is the generic catch-all.
+        // Detail stays server-side; the public body signals retryable
+        // unavailability without leaking internal config-store detail.
         assert_eq!(
             error.user_message(),
-            "An internal error occurred",
-            "503 client body must not leak internal config-store detail"
+            "Service temporarily unavailable",
+            "503 client body must be retry-flavored and leak no internal detail"
         );
+    }
+
+    #[test]
+    fn retryable_503_variants_return_service_unavailable_body() {
+        let cases = [
+            TrustedServerError::ConfigStoreUnavailable {
+                store_name: "app_config".into(),
+                message: "unseeded".into(),
+            },
+            TrustedServerError::KvStore {
+                store_name: "users".into(),
+                message: "timeout".into(),
+            },
+        ];
+        for error in &cases {
+            assert_eq!(
+                error.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "should map to 503 for {error:?}"
+            );
+            assert_eq!(
+                error.user_message(),
+                "Service temporarily unavailable",
+                "503 body should be retry-flavored and leak no detail for {error:?}"
+            );
+        }
     }
 
     #[test]
