@@ -67,7 +67,7 @@ or `PlatformConfigStore` change.
 (`ConfigStoreUnavailable | KvStore`): `"Service temporarily unavailable"`.
 It carries no internal detail, but — unlike the 500-flavored catch-all
 (`"An internal error occurred"`) — lets clients and monitoring distinguish
-*retryable* from *terminal* without leaking tooling/paths.
+_retryable_ from _terminal_ without leaking tooling/paths.
 
 ## 5. Out of scope / follow-up
 
