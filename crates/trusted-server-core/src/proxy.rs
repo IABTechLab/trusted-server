@@ -38,8 +38,8 @@ const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
-fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes().unwrap_or_default())
+fn body_as_reader(body: EdgeBody) -> Result<Cursor<bytes::Bytes>, Report<TrustedServerError>> {
+    Ok(Cursor::new(body.into_bytes().unwrap_or_default()))
 }
 
 fn request_body_bytes(
@@ -422,7 +422,7 @@ fn process_response_with_pipeline<P: StreamProcessor>(
     let mut output = Vec::new();
     let mut pipeline = StreamingPipeline::new(config, processor);
     pipeline
-        .process(body_as_reader(body), &mut output)
+        .process(body_as_reader(body)?, &mut output)
         .change_context(TrustedServerError::Proxy {
             message: error_context.to_string(),
         })?;

@@ -26,6 +26,11 @@ pub enum TrustedServerError {
     #[display("Configuration error: {message}")]
     Configuration { message: String },
 
+    /// Config store could not be read (unseeded, transient backend, or a listed
+    /// key missing) — Settings cannot be loaded. Retryable / fix by seeding.
+    #[display("Config store unavailable: {store_name} - {message}")]
+    ConfigStoreUnavailable { store_name: String, message: String },
+
     /// Auction orchestration error.
     #[display("Auction error: {message}")]
     Auction { message: String },
@@ -123,6 +128,7 @@ impl IntoHttpResponse for TrustedServerError {
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ConfigStoreUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Prebid { .. } => StatusCode::BAD_GATEWAY,
             Self::Integration { .. } => StatusCode::BAD_GATEWAY,
             Self::Proxy { .. } => StatusCode::BAD_GATEWAY,
@@ -142,6 +148,12 @@ impl IntoHttpResponse for TrustedServerError {
             // Consent strings may contain user data; return category only.
             Self::GdprConsent { .. } => "GDPR consent error".to_string(),
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
+            // Retryable 503s: signal transient unavailability so clients and
+            // monitoring can distinguish retry-me from terminal, without leaking
+            // any internal detail (full details are logged in to_error_response).
+            Self::ConfigStoreUnavailable { .. } | Self::KvStore { .. } => {
+                "Service temporarily unavailable".to_string()
+            }
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
             _ => "An internal error occurred".to_string(),
@@ -208,6 +220,13 @@ mod tests {
                 TrustedServerError::KvStore {
                     store_name: String::from("sessions"),
                     message: String::from("timeout"),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::ConfigStoreUnavailable {
+                    store_name: String::from("app_config"),
+                    message: String::from("store unavailable"),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -286,6 +305,9 @@ mod tests {
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                TrustedServerError::ConfigStoreUnavailable { .. } => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 TrustedServerError::Prebid { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Integration { .. } => StatusCode::BAD_GATEWAY,
                 TrustedServerError::Proxy { .. } => StatusCode::BAD_GATEWAY,
@@ -316,10 +338,6 @@ mod tests {
         let cases = [
             TrustedServerError::Configuration {
                 message: "secret db path".into(),
-            },
-            TrustedServerError::KvStore {
-                store_name: "users".into(),
-                message: "timeout".into(),
             },
             TrustedServerError::Proxy {
                 message: "upstream 10.0.0.1 refused".into(),
@@ -401,6 +419,52 @@ mod tests {
     }
 
     #[test]
+    fn config_store_unavailable_maps_to_503() {
+        let error = TrustedServerError::ConfigStoreUnavailable {
+            store_name: String::from("app_config"),
+            message: String::from("unavailable or not seeded"),
+        };
+        assert_eq!(
+            error.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config-store read failure should map to 503"
+        );
+        // Detail stays server-side; the public body signals retryable
+        // unavailability without leaking internal config-store detail.
+        assert_eq!(
+            error.user_message(),
+            "Service temporarily unavailable",
+            "503 client body must be retry-flavored and leak no internal detail"
+        );
+    }
+
+    #[test]
+    fn retryable_503_variants_return_service_unavailable_body() {
+        let cases = [
+            TrustedServerError::ConfigStoreUnavailable {
+                store_name: "app_config".into(),
+                message: "unseeded".into(),
+            },
+            TrustedServerError::KvStore {
+                store_name: "users".into(),
+                message: "timeout".into(),
+            },
+        ];
+        for error in &cases {
+            assert_eq!(
+                error.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "should map to 503 for {error:?}"
+            );
+            assert_eq!(
+                error.user_message(),
+                "Service temporarily unavailable",
+                "503 body should be retry-flavored and leak no detail for {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn status_code_maps_each_error_variant_to_expected_http_response() {
         // Compile-time guard: adding a TrustedServerError variant without
         // updating this test will fail to compile.
@@ -413,6 +477,7 @@ mod tests {
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
             | TrustedServerError::KvStore { .. }
+            | TrustedServerError::ConfigStoreUnavailable { .. }
             | TrustedServerError::Prebid { .. }
             | TrustedServerError::Integration { .. }
             | TrustedServerError::Proxy { .. }
@@ -496,6 +561,13 @@ mod tests {
                 TrustedServerError::KvStore {
                     store_name: "store".to_string(),
                     message: "kv failed".to_string(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                TrustedServerError::ConfigStoreUnavailable {
+                    store_name: "app_config".to_string(),
+                    message: "config store unavailable".to_string(),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
