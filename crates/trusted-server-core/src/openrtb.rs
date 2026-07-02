@@ -65,7 +65,7 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
@@ -74,7 +74,7 @@ pub struct Eid {
 }
 
 /// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Uid {
     /// The identifier value.
     pub id: String,
@@ -152,9 +152,21 @@ pub struct ImpExt {
 
 impl ToExt for ImpExt {}
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct PrebidImpExt {
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub bidder: std::collections::HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storedrequest: Option<ImpStoredRequest>,
+}
+
+/// PBS imp-level stored request reference.
+///
+/// PBS merges the stored imp JSON (keyed by `id`) into the outgoing request,
+/// populating bidder params that are not sent inline.
+#[derive(Debug, Serialize)]
+pub struct ImpStoredRequest {
+    pub id: String,
 }
 
 #[derive(Debug, Serialize)]

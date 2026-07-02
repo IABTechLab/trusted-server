@@ -93,7 +93,7 @@ secret_store_id = "01GYYY"
 
 [integrations.prebid]
 enabled = true
-server_url = "https://prebid-server.com/openrtb2/auction"
+server_url = "https://prebid-server.example.com/openrtb2/auction"
 timeout_ms = 1200
 bidders = ["kargo", "appnexus", "openx"]
 client_side_bidders = ["rubicon"]
@@ -1011,6 +1011,8 @@ apply when the integration section exists in `trusted-server.toml`.
 | `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                           |
 | `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                        |
 | `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts         |
+| `suppress_nurl`            | Boolean       | `false`                                                                | Strip `nurl` and `burl` from every PBS bid when the PBS deployment fires win/billing notifications server-side                                        |
+| `suppress_nurl_bidders`    | Array[String] | `[]`                                                                   | Bidder seats whose `nurl` and `burl` should be stripped while preserving client-side win/billing pixels for other bidders                             |
 | `debug`                    | Boolean       | `false`                                                                | Enable debug mode (sets `ext.prebid.debug` and `returnallbidstatus`; surfaces debug metadata in responses)                                            |
 | `test_mode`                | Boolean       | `false`                                                                | Set OpenRTB `test: 1` flag for non-billable test traffic (independent of `debug`)                                                                     |
 | `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                             |
@@ -1207,8 +1209,8 @@ timeout_ms = 2000
 
 [integrations.aps]
 enabled = true
-pub_id = "5128"
-endpoint = "https://aax.amazon-adsystem.com/e/dtb/bid"
+pub_id = "example-publisher"
+endpoint = "https://aps.example.com/e/dtb/bid"
 
 [integrations.prebid]
 enabled = true

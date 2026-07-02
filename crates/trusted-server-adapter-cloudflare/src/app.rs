@@ -21,7 +21,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
-    PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    AuctionDispatch, PublisherResponse, buffer_publisher_response_async, handle_page_bids,
+    handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -124,6 +125,29 @@ fn build_per_request_services(ctx: &RequestContext) -> RuntimeServices {
     build_runtime_services(ctx)
 }
 
+/// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
+/// `/__ts/page-bids`, and the publisher fallback).
+///
+/// Mirrors the Fastly entry point: `EcContext::default()` leaves jurisdiction
+/// Unknown, which fails the auction consent gate closed even for consented
+/// users. Geo comes from the Workers `cf` object when deployed. A malformed
+/// consent string is logged and falls back to the default (fail-closed) context
+/// rather than being silently swallowed.
+fn build_ec_context(settings: &Settings, services: &RuntimeServices, req: &Request) -> EcContext {
+    let geo_info = services
+        .geo()
+        .lookup(services.client_info().client_ip)
+        .unwrap_or_else(|e| {
+            log::warn!("geo lookup failed: {e}");
+            None
+        });
+    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+        .unwrap_or_else(|e| {
+            log::warn!("EC context read failed: {e:?}");
+            EcContext::default()
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Handler factory
 // ---------------------------------------------------------------------------
@@ -161,16 +185,27 @@ where
 
 /// Collapse a [`PublisherResponse`] into a plain [`Response`].
 ///
-/// Delegates to the shared [`buffer_publisher_response`], which enforces
+/// Delegates to the shared [`buffer_publisher_response_async`], which collects
+/// the dispatched server-side auction and enforces
 /// `settings.publisher.max_buffered_body_bytes`, then removes any
 /// `Transfer-Encoding` header since the buffered body is no longer chunked.
-fn resolve_publisher_response(
+async fn resolve_publisher_response(
     publisher_response: PublisherResponse,
     method: &Method,
     settings: &Settings,
     registry: &IntegrationRegistry,
+    orchestrator: &AuctionOrchestrator,
+    services: &RuntimeServices,
 ) -> Result<Response, Report<TrustedServerError>> {
-    let mut response = buffer_publisher_response(publisher_response, method, settings, registry)?;
+    let mut response = buffer_publisher_response_async(
+        publisher_response,
+        method,
+        settings,
+        registry,
+        orchestrator,
+        services,
+    )
+    .await?;
     response.headers_mut().remove(header::TRANSFER_ENCODING);
     Ok(response)
 }
@@ -340,11 +375,35 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         }))
                     })
             } else {
-                handle_publisher_request(&state.settings, &state.registry, &services, req)
-                    .await
-                    .and_then(|pr| {
-                        resolve_publisher_response(pr, &method, &state.settings, &state.registry)
-                    })
+                let mut ec_context = build_ec_context(&state.settings, &services, &req);
+                let auction = AuctionDispatch {
+                    orchestrator: &state.orchestrator,
+                    slots: state.settings.creative_opportunity_slots(),
+                    registry: None,
+                };
+                match handle_publisher_request(
+                    &state.settings,
+                    &services,
+                    None,
+                    &mut ec_context,
+                    auction,
+                    req,
+                )
+                .await
+                {
+                    Ok(pr) => {
+                        resolve_publisher_response(
+                            pr,
+                            &method,
+                            &state.settings,
+                            &state.registry,
+                            &state.orchestrator,
+                            &services,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             Ok(result.unwrap_or_else(|e| http_error(&e)))
@@ -398,7 +457,10 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {
-                    let ec_context = EcContext::default();
+                    // Build the geo-aware EC context so the auction consent gate
+                    // sees the caller's jurisdiction — `EcContext::default()`
+                    // fails it closed for consented users.
+                    let ec_context = build_ec_context(&s.settings, &services, &req);
                     handle_auction(
                         &s.settings,
                         &s.orchestrator,
@@ -409,6 +471,28 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         req,
                     )
                     .await
+                }),
+            )
+            // SPA re-auction endpoint. The OPTIONS preflight for this
+            // side-effecting GET is denied so the GET handler's `X-TSJS-Page-Bids`
+            // gate stays trustworthy.
+            .route(
+                "/__ts/page-bids",
+                Method::OPTIONS,
+                make_handler(Arc::clone(&state), |_s, _services, _req| async move {
+                    Ok(page_bids_preflight_denied())
+                }),
+            )
+            .get(
+                "/__ts/page-bids",
+                make_handler(Arc::clone(&state), |s, services, req| async move {
+                    let ec_context = build_ec_context(&s.settings, &services, &req);
+                    let auction = AuctionDispatch {
+                        orchestrator: &s.orchestrator,
+                        slots: s.settings.creative_opportunity_slots(),
+                        registry: None,
+                    };
+                    handle_page_bids(&s.settings, &services, None, auction, &ec_context, req).await
                 }),
             )
             .get(

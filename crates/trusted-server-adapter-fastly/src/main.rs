@@ -46,7 +46,7 @@ use trusted_server_core::proxy::{
     AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body,
+    handle_page_bids, handle_publisher_request, handle_tsjs_dynamic, stream_publisher_body_async,
     OwnedProcessResponseParams, PublisherResponse,
 };
 use trusted_server_core::request_signing::{
@@ -94,7 +94,7 @@ enum HandlerOutcome {
     Streaming {
         response: HttpResponse,
         body: EdgeBody,
-        params: OwnedProcessResponseParams,
+        params: Box<OwnedProcessResponseParams>,
     },
     AssetStreaming {
         response: HttpResponse,
@@ -680,6 +680,11 @@ fn send_edgezero_response(
         effects.apply_to_response(&mut response);
     }
 
+    // Final cache guard: EC finalization and request-filter effects may have
+    // added a per-user Set-Cookie after `apply_finalize_headers` ran, so
+    // re-apply the privacy downgrade before send, mirroring legacy_main.
+    crate::middleware::enforce_set_cookie_cache_privacy(&mut response);
+
     let (parts, body) = response.into_parts();
     match body {
         EdgeBody::Stream(_) => {
@@ -771,6 +776,7 @@ fn legacy_main(mut req: FastlyRequest) {
         &state.registry,
         &partner_registry,
         &runtime_services,
+        state.settings.creative_opportunity_slots(),
         http_req,
         device_signals,
     ))
@@ -828,8 +834,14 @@ fn legacy_main(mut req: FastlyRequest) {
                     &mut response,
                 );
             }
+            // Apply request-filter response effects (e.g. a DataDome allow
+            // Set-Cookie) before the final cache guard so any per-user cookie
+            // they add is covered. EC finalization above may also have added the
+            // identity Set-Cookie; the guard runs last so it observes both.
             request_filter_effects.apply_to_response(&mut response);
-            compat::to_fastly_response(response).send_to_client();
+            let mut fastly_resp = compat::to_fastly_response(response);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
+            fastly_resp.send_to_client();
 
             if is_real_browser {
                 if let Some(context) = build_pull_sync_context(&ec_context) {
@@ -845,7 +857,7 @@ fn legacy_main(mut req: FastlyRequest) {
         HandlerOutcome::Streaming {
             mut response,
             body,
-            params,
+            mut params,
         } => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
@@ -860,17 +872,24 @@ fn legacy_main(mut req: FastlyRequest) {
                     &mut response,
                 );
             }
+            // Apply request-filter response effects (e.g. a DataDome allow
+            // Set-Cookie) before the final cache guard so any per-user cookie
+            // they add is covered. EC finalization above may also have added the
+            // identity Set-Cookie; the guard runs last so it observes both.
             request_filter_effects.apply_to_response(&mut response);
-            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             let mut stream_succeeded = false;
-            match stream_publisher_body(
+            match futures::executor::block_on(stream_publisher_body_async(
                 body,
                 &mut streaming_body,
-                &params,
+                &mut params,
                 &state.settings,
                 &state.registry,
-            ) {
+                &state.orchestrator,
+                &runtime_services,
+            )) {
                 Ok(()) => {
                     if let Err(e) = streaming_body.finish() {
                         log::error!("failed to finish streaming body: {e}");
@@ -900,8 +919,12 @@ fn legacy_main(mut req: FastlyRequest) {
         HandlerOutcome::AssetStreaming { mut response, body } => {
             finalize_response(&state.settings, geo_info.as_ref(), &mut response);
             asset_cache_policy.apply_after_route_finalization(&mut response);
+            // A request filter (e.g. DataDome allow) can append a per-user
+            // Set-Cookie via response effects even on an otherwise cacheable
+            // asset, so guard against shared caching after applying them.
             request_filter_effects.apply_to_response(&mut response);
-            let fastly_resp = compat::to_fastly_response_skeleton(response);
+            let mut fastly_resp = compat::to_fastly_response_skeleton(response);
+            enforce_set_cookie_cache_privacy(&mut fastly_resp);
             let mut streaming_body = fastly_resp.stream_to_client();
             if let Err(e) =
                 futures::executor::block_on(stream_asset_body(body, &mut streaming_body))
@@ -963,12 +986,18 @@ fn build_ja4_debug_response(req: &FastlyRequest) -> FastlyResponse {
         .with_body(body)
 }
 
+// Combines the server-side ad-stack inputs (creative-opportunity `slots`) with
+// the EdgeZero dual-path requirement that `device_signals` be derived from the
+// `FastlyRequest` before conversion and passed in, pushing this central
+// dispatch helper to eight arguments.
+#[allow(clippy::too_many_arguments)]
 async fn route_request(
     settings: &Settings,
     orchestrator: &AuctionOrchestrator,
     integration_registry: &IntegrationRegistry,
     partner_registry: &PartnerRegistry,
     runtime_services: &RuntimeServices,
+    slots: &[trusted_server_core::creative_opportunities::CreativeOpportunitySlot],
     mut req: HttpRequest,
     device_signals: DeviceSignals,
 ) -> Result<RouteResult, Report<TrustedServerError>> {
@@ -1142,6 +1171,12 @@ async fn route_request(
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
+    let registry_ref = if partner_registry.is_empty() {
+        None
+    } else {
+        Some(partner_registry)
+    };
+
     let mut asset_cache_policy = AssetProxyCachePolicy::OriginControlled;
     let mut should_finalize_ec = true;
 
@@ -1202,27 +1237,54 @@ async fn route_request(
         (Method::GET, "/_ts/set-tester") => (handle_set_tester(settings), false),
         (Method::GET, "/_ts/clear-tester") => (handle_clear_tester(settings), false),
 
-        // Unified auction endpoint.
-        (Method::POST, "/auction") => {
-            let registry_ref = if partner_registry.is_empty() {
-                None
-            } else {
-                Some(partner_registry)
-            };
-            (
-                handle_auction(
-                    settings,
-                    orchestrator,
-                    kv_graph.as_ref(),
-                    registry_ref,
-                    &ec_context,
-                    runtime_services,
-                    req,
-                )
-                .await,
-                false,
+        // Unified auction endpoint (returns creative HTML inline)
+        (Method::POST, "/auction") => (
+            handle_auction(
+                settings,
+                orchestrator,
+                kv_graph.as_ref(),
+                registry_ref,
+                &ec_context,
+                runtime_services,
+                req,
             )
+            .await,
+            false,
+        ),
+
+        // Reject CORS preflight for the side-effecting page-bids endpoint at the
+        // adapter. The GET handler's legacy fallback trusts `X-TSJS-Page-Bids`
+        // precisely because this endpoint never grants a preflight; letting
+        // OPTIONS fall through to the publisher origin (which may return
+        // permissive CORS) would defeat that, allowing a cross-site page to
+        // trigger real PBS/APS auctions from a visitor's browser.
+        (Method::OPTIONS, "/__ts/page-bids") => {
+            let mut response = HttpResponse::new(EdgeBody::from("Forbidden"));
+            *response.status_mut() = edgezero_core::http::StatusCode::FORBIDDEN;
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            (Ok(response), false)
         }
+
+        // SPA/CSR navigation endpoint — returns slots + bids JSON for the given path
+        (Method::GET, "/__ts/page-bids") => (
+            handle_page_bids(
+                settings,
+                runtime_services,
+                kv_graph.as_ref(),
+                trusted_server_core::publisher::AuctionDispatch {
+                    orchestrator,
+                    slots,
+                    registry: registry_ref,
+                },
+                &ec_context,
+                req,
+            )
+            .await,
+            false,
+        ),
 
         // First-party proxy/click/sign/rebuild endpoints
         (Method::GET, "/first-party/proxy") => (
@@ -1315,8 +1377,14 @@ async fn route_request(
 
                 match handle_publisher_request(
                     settings,
-                    integration_registry,
                     runtime_services,
+                    kv_graph.as_ref(),
+                    &mut ec_context,
+                    trusted_server_core::publisher::AuctionDispatch {
+                        orchestrator,
+                        slots,
+                        registry: registry_ref,
+                    },
                     req,
                 )
                 .await
@@ -1410,7 +1478,43 @@ fn run_pull_sync_after_send(
 /// version/staging, then operator-configured `settings.response_headers`.
 /// This means operators can intentionally override any managed header.
 fn finalize_response(settings: &Settings, geo_info: Option<&GeoInfo>, response: &mut HttpResponse) {
+    // Legacy and EdgeZero paths share one protected finalizer so the cache /
+    // Set-Cookie privacy hardening cannot drift between them. `HttpResponse` and
+    // the middleware's `Response` are the same `edgezero_core::http::Response`.
     apply_finalize_headers(settings, geo_info, response);
+}
+
+/// Forces cookie-bearing Fastly responses to stay private to shared caches.
+///
+/// [`finalize_response`] applies this same downgrade on the [`HttpResponse`],
+/// but the EC identity cookie is written later by [`ec_finalize_response`] onto
+/// the converted [`FastlyResponse`], so the earlier guard never sees it.
+/// Re-apply it here so a first-visit navigation whose only per-user payload is
+/// the EC `Set-Cookie` can never be served with `public`/surrogate cache headers
+/// inherited from the origin or operator response headers — a shared cache must
+/// not be able to store and replay one visitor's EC cookie to others.
+///
+/// Idempotent: a response already marked `private`/`no-store` keeps its stricter
+/// `Cache-Control`, but the surrogate cache headers are stripped regardless so a
+/// `no-store` cookie response can never retain shared Fastly cacheability.
+fn enforce_set_cookie_cache_privacy(response: &mut FastlyResponse) {
+    if response.get_header("set-cookie").is_none() {
+        return;
+    }
+    // Strip surrogate cache headers on every cookie-bearing response, even when
+    // keeping a stricter `no-store`/`private` directive — Surrogate-Control is
+    // independent of Cache-Control and would otherwise let a shared cache store
+    // and replay one visitor's Set-Cookie.
+    for name in crate::middleware::SURROGATE_CACHE_HEADERS {
+        response.remove_header(*name);
+    }
+    let already_uncacheable = response
+        .get_header_str("cache-control")
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|v| v.contains("private") || v.contains("no-store"));
+    if !already_uncacheable {
+        response.set_header("cache-control", "private, max-age=0");
+    }
 }
 
 /// Builds the local `404 Not Found` returned for legacy `/admin/keys/*`

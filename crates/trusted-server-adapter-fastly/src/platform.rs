@@ -159,6 +159,7 @@ fn backend_config_from_spec(spec: &PlatformBackendSpec) -> BackendConfig<'_> {
         .host_header_override(spec.host_header_override.as_deref())
         .certificate_check(spec.certificate_check)
         .first_byte_timeout(spec.first_byte_timeout)
+        .between_bytes_timeout(spec.between_bytes_timeout)
 }
 
 impl PlatformBackend for FastlyPlatformBackend {
@@ -676,6 +677,7 @@ mod tests {
             host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
         };
 
         let name = backend
@@ -683,7 +685,7 @@ mod tests {
             .expect("should compute backend name for valid spec");
 
         assert_eq!(
-            name, "backend_https_origin_example_com_443_t15000",
+            name, "backend_https_origin_example_com_443_fb15000_bb15000",
             "should match BackendConfig naming convention"
         );
     }
@@ -698,6 +700,7 @@ mod tests {
             host_header_override: Some("www.example.com".to_string()),
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
         };
 
         let name = backend
@@ -705,7 +708,7 @@ mod tests {
             .expect("should compute backend name for host header override");
 
         assert_eq!(
-            name, "backend_https_origin_example_com_443_oh_www_example_com_t15000",
+            name, "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb15000",
             "should match BackendConfig naming convention with host header override"
         );
     }
@@ -720,6 +723,7 @@ mod tests {
             host_header_override: None,
             certificate_check: false,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
         };
 
         let name = backend
@@ -742,6 +746,7 @@ mod tests {
             host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_secs(15),
+            between_bytes_timeout: Duration::from_secs(15),
         };
 
         let result = backend.predict_name(&spec);
@@ -759,6 +764,7 @@ mod tests {
             host_header_override: None,
             certificate_check: true,
             first_byte_timeout: Duration::from_millis(2000),
+            between_bytes_timeout: Duration::from_millis(2000),
         };
 
         let name = backend
@@ -766,8 +772,8 @@ mod tests {
             .expect("should compute name with custom timeout");
 
         assert!(
-            name.ends_with("_t2000"),
-            "should encode 2000ms timeout in name"
+            name.ends_with("_fb2000_bb2000"),
+            "should encode 2000ms first-byte and between-bytes timeouts in name"
         );
     }
 
