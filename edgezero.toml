@@ -14,21 +14,20 @@ kind = "http"
 version = "0.1.0"
 
 # -- Stores ------------------------------------------------------------------
-# Logical store ids only. The union covers every adapter's binding; `default`
-# names the primary id (Fastly production for kv/config/secrets). Runtime store
-# names resolve per platform outside this manifest.
+# Logical store ids only. These are the portable Trusted Server names; the
+# physical store each adapter binds is overridable out of band (Fastly binds
+# `ec_identity_store`/`app_config`/secret stores in `fastly.toml`, Spin via its
+# runtime config, Cloudflare via bindings), so the ids here do not have to match
+# any one platform's names. `default` is the primary logical id.
 
 [stores.kv]
-ids = ["trusted_server_kv", "ec_identity_store"]
+ids = ["trusted_server_kv"]
 default = "trusted_server_kv"
 
 [stores.config]
 ids = ["trusted_server_config"]
 default = "trusted_server_config"
 
-# Secrets: axum/cloudflare/spin are Single-capable for secrets stores, so this
-# declares exactly one logical id. Runtime binds the platform secret store out
-# of band (fastly.toml secret stores, Spin runtime, Cloudflare bindings).
 [stores.secrets]
 ids = ["trusted_server_secrets"]
 default = "trusted_server_secrets"

@@ -123,6 +123,9 @@ pub struct ResolvedConfig {
     /// an upstream host is present here, the proxy dials this IP instead of
     /// resolving the name, leaving the SNI/`Host` untouched.
     pub resolve: HashMap<String, IpAddr>,
+    /// Upstream connect timeout (`--connect-timeout`), bounding each dial so a
+    /// black-holed upstream fails fast into a `502`.
+    pub connect_timeout: std::time::Duration,
 }
 
 /// Default CA directory (spec §7.1/§12): `$XDG_DATA_HOME/trusted-server/dev-proxy`,
@@ -298,6 +301,7 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         basic_auth,
         ca_dir,
         resolve,
+        connect_timeout: std::time::Duration::from_secs(args.connect_timeout),
     })
 }
 
@@ -306,7 +310,9 @@ fn resolve_basic_auth(args: &ProxyArgs) -> Result<Option<BasicAuth>, ConfigError
     if let Some(path) = &args.basic_auth_file {
         let raw = std::fs::read_to_string(path)
             .map_err(|_| ConfigError::BasicAuthFile { path: path.clone() })?;
-        return Ok(Some(BasicAuth::parse(raw.trim())?));
+        // Strip only a trailing newline (the file's line terminator), not all
+        // whitespace — a password may legitimately begin or end with a space.
+        return Ok(Some(BasicAuth::parse(raw.trim_end_matches(['\r', '\n']))?));
     }
     match &args.basic_auth {
         Some(raw) => Ok(Some(BasicAuth::parse(raw)?)),

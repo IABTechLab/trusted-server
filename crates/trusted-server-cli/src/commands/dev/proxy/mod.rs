@@ -91,6 +91,12 @@ pub struct ProxyArgs {
     #[arg(long, value_name = "PATH")]
     pub ca_dir: Option<String>,
 
+    /// Upstream connect timeout, in seconds. A black-holed upstream (easy to hit
+    /// with a wrong `--resolve` pin) fails fast into a `502` instead of stalling
+    /// the browser tab until the OS TCP timeout.
+    #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+    pub connect_timeout: u64,
+
     /// Optional nested subcommand (`ts dev proxy ca …`). When absent, the proxy
     /// runs with the options above.
     #[command(subcommand)]
@@ -200,13 +206,12 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
     // never blocks on a sudo password prompt.
     browser::restore_system_proxy_if_pending(&config::ca_dir(args), false);
 
-    let cfg = Arc::new(config::resolve(args).change_context(ProxyError::Config)?);
+    let mut cfg = config::resolve(args).change_context(ProxyError::Config)?;
 
     let ca = Arc::new(
         ca::CertAuthority::load_or_generate(&cfg.ca_dir)
             .change_context(ProxyError::CertAuthority)?,
     );
-    let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
 
     // `--insecure` disables all upstream TLS verification — make it loud.
     if cfg.insecure {
@@ -215,10 +220,16 @@ pub fn run(args: &ProxyArgs) -> core::result::Result<(), error_stack::Report<Pro
 
     let runtime = tokio::runtime::Runtime::new().change_context(ProxyError::Server)?;
     runtime.block_on(async move {
-        // Bind first: the port is open and connections queue before we launch browsers.
+        // Bind first: the port is open and connections queue before we launch
+        // browsers. Binding also resolves an ephemeral `--listen …:0` to the real
+        // OS-assigned port, which the PAC and browser launch below must point at —
+        // so update `cfg.listen` to the bound address before generating either.
         let listener = server::bind(cfg.listen)
             .await
             .change_context(ProxyError::Server)?;
+        cfg.listen = listener.local_addr().change_context(ProxyError::Server)?;
+        let cfg = Arc::new(cfg);
+        let pac: Arc<str> = Arc::from(browser::generate_pac(&cfg.rules, cfg.listen).as_str());
         output::info(&format!("ts dev proxy listening on {}", cfg.listen));
         let server = tokio::spawn(server::serve_on(
             listener,

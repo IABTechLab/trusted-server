@@ -530,11 +530,16 @@ fn launch_safari(cfg: &ResolvedConfig) {
             }
         }
         _ => {
+            // The service name is a local config value that can contain shell
+            // metacharacters; shell-quote both the service and URL so the
+            // copy-pasteable command cannot execute unintended shell code.
+            let quoted_service = shell_quote(&service);
+            let quoted_url = shell_quote(&pac_url);
             output::warn(&format!(
                 "Safari: could not set the system PAC (sudo declined or no terminal). Set it \
                  manually in System Settings → Network → {service} → Details → Proxies → \
                  Automatic Proxy Configuration: {pac_url} \
-                 (or run: sudo networksetup -setautoproxyurl \"{service}\" {pac_url})"
+                 (or run: sudo networksetup -setautoproxyurl {quoted_service} {quoted_url})"
             ));
             // Remove the restore file — nothing was applied, nothing to restore.
             let _ = std::fs::remove_file(&restore_path);

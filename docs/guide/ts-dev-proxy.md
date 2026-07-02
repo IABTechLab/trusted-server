@@ -35,9 +35,10 @@ Fastly service. Local only, developer-facing.
 
 ## Build and run
 
-`ts dev proxy` is part of `crates/trusted-server-cli`, a native binary excluded
-from the workspace (the workspace default target is `wasm32-wasip1`). Build and
-run it with an explicit native target:
+`ts dev proxy` is part of `crates/trusted-server-cli`, a workspace member that
+builds for the host. Because the workspace default target is `wasm32-wasip1`
+(where the CLI is an empty shell), build and run it with an explicit native
+target:
 
 ```bash
 cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
@@ -200,9 +201,18 @@ the hostname.
 
 **Sending `Host: TO`.** If your upstream routes or validates on its _own_
 hostname (e.g. a Fastly Deliver service that rejects an unconfigured `Host`), pass
-`--rewrite-host` to send `Host: <TO>`. First-party URLs **still stay on `FROM`**
-because `X-Forwarded-Host` anchors them — so this is safe with Trusted Server
-upstreams too. The TLS SNI is always the `TO` host either way:
+`--rewrite-host` to send `Host: <TO>`. The proxy still stamps
+`X-Forwarded-Host: <FROM>`, so first-party URL rewriting stays anchored to `FROM`
+**as long as the upstream preserves that header**.
+
+> **Caveat with real Trusted Server adapters.** The Fastly and Spin adapter
+> request paths strip inbound `X-Forwarded-Host` before routing, so with
+> `--rewrite-host` a real Trusted Server upstream falls back to `Host` (`TO`) and
+> emits first-party URLs on `TO`, not `FROM`. Prefer the default (no
+> `--rewrite-host`) with Trusted Server upstreams; reach for `--rewrite-host`
+> only when the upstream rejects an unconfigured `Host`.
+
+The TLS SNI is always the `TO` host either way:
 
 | Form             | `Host` header | `X-Forwarded-Host` | TLS SNI   |
 | ---------------- | ------------- | ------------------ | --------- |
