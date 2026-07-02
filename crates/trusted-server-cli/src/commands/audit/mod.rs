@@ -10,12 +10,33 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use url::Url;
 
-use crate::audit::collector::AuditCollector;
-use crate::config_init::EXAMPLE_CONFIG;
-use crate::error::{cli_error, report_error, CliResult};
-use crate::run::AuditArgs;
+use crate::commands::audit::collector::AuditCollector;
+use crate::commands::config::init::EXAMPLE_CONFIG;
+use crate::error::{CliResult, cli_error, report_error};
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
+
+/// Arguments for the `ts audit` command.
+#[derive(Debug, clap::Args)]
+pub(crate) struct AuditArgs {
+    /// Public HTTP(S) URL to audit.
+    pub(crate) url: String,
+    /// JavaScript asset audit output path.
+    #[arg(long)]
+    pub(crate) js_assets: Option<std::path::PathBuf>,
+    /// Draft Trusted Server config output path.
+    #[arg(long)]
+    pub(crate) config: Option<std::path::PathBuf>,
+    /// Do not write the JavaScript asset audit file.
+    #[arg(long)]
+    pub(crate) no_js_assets: bool,
+    /// Do not write the draft Trusted Server config file.
+    #[arg(long)]
+    pub(crate) no_config: bool,
+    /// Overwrite existing output files.
+    #[arg(long)]
+    pub(crate) force: bool,
+}
 
 const DEFAULT_JS_ASSETS_PATH: &str = "js-assets.toml";
 const DEFAULT_CONFIG_PATH: &str = "trusted-server.toml";
@@ -393,7 +414,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::audit::collector::{CollectedPage, CollectedRequest, CollectedScriptTag};
+    use crate::commands::audit::collector::{CollectedPage, CollectedRequest, CollectedScriptTag};
 
     struct FakeCollector {
         collected: CollectedPage,

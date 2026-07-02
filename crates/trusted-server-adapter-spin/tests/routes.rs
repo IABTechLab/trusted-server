@@ -57,8 +57,9 @@ fn routes_build_without_panic() {
 
 #[test]
 fn edgezero_manifest_loads_and_resolves_spin_stores() {
-    let loader =
-        edgezero_core::manifest::ManifestLoader::load_from_str(include_str!("../edgezero.toml"));
+    let loader = edgezero_core::manifest::ManifestLoader::load_from_str(include_str!(
+        "../../../edgezero.toml"
+    ));
     let manifest = loader.manifest();
 
     assert!(
