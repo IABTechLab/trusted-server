@@ -180,7 +180,7 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 | Item | File(s) | Phase | Replaced by |
 |---|---|---|---|
 | Fastly chunk-pointer resolver | `core/src/settings_data.rs` | 1 | EdgeZero `FastlyConfigStore` + `chunked_config.rs` |
-| Bespoke config/secret store traits | `core/src/platform/{traits,types,mod}.rs` | 1 | EdgeZero `ConfigStore`/`SecretStore`/`StoreRegistry` |
+| Bespoke config/secret store traits | `core/src/platform/traits.rs` (config+secret trait defs); `mod.rs`/`types.rs` edited, not deleted (KV re-export + shrinking `RuntimeServices` stay) | 1 | EdgeZero `ConfigStore`/`SecretStore`/`StoreRegistry` |
 | 4× per-adapter store impls | `adapter-*/src/platform.rs` | 1 | per-adapter EdgeZero store impls |
 | Fastly management REST client | `adapter-fastly/src/management_api.rs` | 1 | EdgeZero CLI provision |
 | `include_str!` config baking | `adapter-{cloudflare,spin}/src/app.rs` | 2 | store-loaded config |
