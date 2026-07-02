@@ -16,8 +16,14 @@ build_cli_macos = ["build", "--package", "trusted-server-cli", "--target", "aarc
 test_cli_linux = ["test", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
 build_cli_linux = ["build", "--package", "trusted-server-cli", "--target", "x86_64-unknown-linux-gnu"]
 # Fastly adapter + shared crates (wasm32-wasip1 via Viceroy)
-# Excludes Axum (native-only), Cloudflare (wasm32-unknown-unknown), and Spin (separate wasm32-wasip1 job)
-test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--target", "wasm32-wasip1"]
+# Excludes Axum (native-only), Cloudflare (wasm32-unknown-unknown), and Spin
+# (each a separate job/target). Also excludes the provider crates under
+# crates/<type>/<vendor> (trusted-server-device-fastly, trusted-server-geo-fastly):
+# their depth puts them outside the Viceroy runner's `-C ../../fastly.toml` path.
+# Both depend on the Fastly SDK, so they are wasm-only, compiled for wasm by
+# clippy/check/build with no host-runtime tests to run. Their pure classification
+# logic is unit-tested in trusted-server-core.
+test-fastly = ["test", "--workspace", "--exclude", "trusted-server-adapter-axum", "--exclude", "trusted-server-adapter-cloudflare", "--exclude", "trusted-server-adapter-spin", "--exclude", "trusted-server-device-fastly", "--exclude", "trusted-server-geo-fastly", "--target", "wasm32-wasip1"]
 # Axum dev server adapter (native)
 test-axum = ["test", "-p", "trusted-server-adapter-axum"]
 # Cloudflare adapter (native host; WASM target checked separately in CI)

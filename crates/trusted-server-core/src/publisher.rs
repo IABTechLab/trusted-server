@@ -17,7 +17,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
-use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
+use crate::consent::{build_consent_context, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, HEADER_X_COMPRESS_HINT, HEADER_X_TS_EC};
 use crate::cookies::handle_request_cookies;
 use crate::edge_cookie::get_or_generate_ec_id_from_http_request;
@@ -600,9 +600,11 @@ pub async fn handle_publisher_request(
         .and_then(|jar| jar.get(COOKIE_TS_EC))
         .map(|cookie| cookie.value().to_owned());
 
-    // Generate EC identifiers before the request body is consumed.
-    // Always generated for internal use (KV lookups, logging) even when
-    // consent is absent — the cookie is only *set* when consent allows it.
+    // Resolve the EC identifier before the request body is consumed. This is
+    // `None` when no Edge Cookie provider is configured (the stateless default),
+    // in which case the request proceeds without an Edge Cookie. When present it
+    // is used internally (KV lookups, logging); the cookie is only *set* when
+    // consent also allows it.
     let ec_id = get_or_generate_ec_id_from_http_request(settings, services, &req)?;
 
     // Extract, decode, and log consent signals (TCF, GPP, US Privacy, GPC)
@@ -622,15 +624,29 @@ pub async fn handle_publisher_request(
         req: &req,
         config: &settings.consent,
         geo: geo.as_ref(),
-        ec_id: Some(ec_id.as_str()),
+        ec_id: ec_id.as_deref(),
         kv_store: settings
             .consent
             .consent_store
             .as_deref()
             .map(|_| services.kv_store()),
     });
-    let ec_allowed = allows_ec_creation(&consent_context);
-    log::debug!("Proxy ec_allowed: {}", ec_allowed);
+    // Gate the Edge Cookie provider on the permissions its data use requires.
+    // The decision lives in the EC subsystem; this asks it whether the configured
+    // provider's required permissions are set for this request. The gate builds
+    // the provider with any host signals the host supplies, so a provider needing
+    // a service the host cannot supply fails here. Reading required permissions
+    // needs no request data, so no request snapshot is taken.
+    let ec_allowed = crate::ec::consent::ec_permission_granted(
+        settings,
+        &consent_context,
+        geo.as_ref(),
+        services.host_signals(),
+    )?;
+    log::debug!(
+        "Proxy ec_allowed (required permissions set): {}",
+        ec_allowed
+    );
 
     let parsed_origin = url::Url::parse(&settings.publisher.origin_url).change_context(
         TrustedServerError::Proxy {
@@ -708,7 +724,7 @@ pub async fn handle_publisher_request(
         settings,
         services,
         &mut response,
-        &ec_id,
+        ec_id.as_deref(),
         ec_allowed,
         existing_ec_cookie.as_deref(),
         &consent_context,
@@ -848,46 +864,67 @@ fn is_supported_content_encoding(encoding: &str) -> bool {
 /// Extracted so headers can be set before streaming begins (headers must
 /// be finalized before `stream_to_client()` commits them).
 ///
-/// Consent-gated EC creation:
-/// - Consent given → set EC ID header + cookie.
-/// - Consent absent + existing cookie → revoke (expire cookie + delete KV entry).
-/// - Consent absent + no cookie → do nothing.
+/// Permission-gated EC creation:
+/// - EC permitted → set EC ID header + cookie.
+/// - Explicit withdrawal signal + existing cookie → revoke (expire cookie +
+///   delete KV entry).
+/// - EC not permitted with no withdrawal signal → set nothing, but leave an
+///   already-issued cookie intact (a pre-consent or fail-closed request is not
+///   a withdrawal).
 fn apply_ec_headers(
     settings: &Settings,
     services: &RuntimeServices,
     response: &mut Response<EdgeBody>,
-    ec_id: &str,
+    ec_id: Option<&str>,
     ec_allowed: bool,
     existing_ec_cookie: Option<&str>,
     consent_context: &crate::consent::ConsentContext,
 ) {
     if ec_allowed {
-        // HeaderValue::from_str rejects \r, \n, and \0, so the EC ID
-        // cannot inject additional response headers.
-        match HeaderValue::from_str(ec_id) {
-            Ok(v) => {
-                response.headers_mut().insert(HEADER_X_TS_EC, v);
+        // The Edge Cookie is permitted. Set it only when a provider produced
+        // one; with no provider configured there is nothing to set, and any
+        // existing cookie is left untouched (this is not a withdrawal).
+        if let Some(ec_id) = ec_id {
+            // HeaderValue::from_str rejects \r, \n, and \0, so the EC ID
+            // cannot inject additional response headers.
+            match HeaderValue::from_str(ec_id) {
+                Ok(v) => {
+                    response.headers_mut().insert(HEADER_X_TS_EC, v);
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Rejecting EC ID response header: value is not a valid header value"
+                    );
+                }
             }
-            Err(_) => {
-                log::warn!("Rejecting EC ID response header: value is not a valid header value");
-            }
+            // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
+            // characters. The header is still emitted when the EC is permitted.
+            crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
         }
-        // Cookie persistence is skipped if the EC ID contains RFC 6265-illegal
-        // characters. The header is still emitted when consent allows it.
-        crate::ec::cookies::set_ec_cookie(settings, response, ec_id);
     } else if let Some(cookie_ec_id) = existing_ec_cookie {
-        log::info!(
-            "EC revoked for '{}': consent withdrawn (jurisdiction={})",
-            cookie_ec_id,
-            consent_context.jurisdiction,
-        );
-        crate::ec::cookies::expire_ec_cookie(settings, response);
-        if settings.consent.consent_store.is_some() {
-            crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
+        // Destructive withdrawal (expire the cookie, delete the KV entry) only
+        // on an explicit signal, mirroring `ec_finalize_response`. A merely
+        // not-permitted request (pre-consent, missing geo) sets no EC but must
+        // not destroy an already-issued identifier.
+        if crate::ec::consent::ec_storage_withdrawn(consent_context) {
+            log::info!(
+                "EC revoked for '{}': explicit withdrawal signal (jurisdiction={})",
+                crate::ec::log_id(cookie_ec_id),
+                consent_context.jurisdiction,
+            );
+            crate::ec::cookies::expire_ec_cookie(settings, response);
+            if settings.consent.consent_store.is_some() {
+                crate::consent::kv::delete_consent_from_kv(services.kv_store(), cookie_ec_id);
+            }
+        } else {
+            log::debug!(
+                "EC not permitted and no withdrawal signal: leaving existing cookie (jurisdiction={})",
+                consent_context.jurisdiction,
+            );
         }
     } else {
         log::debug!(
-            "EC skipped: no consent and no existing cookie (jurisdiction={})",
+            "EC skipped: not permitted and no existing cookie (jurisdiction={})",
             consent_context.jurisdiction,
         );
     }
@@ -1467,7 +1504,8 @@ mod tests {
             "should read revocation target from cookie value"
         );
         assert_eq!(
-            resolved_ec_id, "header_id",
+            resolved_ec_id.as_deref(),
+            Some("header_id"),
             "should still resolve request EC ID from header precedence"
         );
     }
@@ -1484,13 +1522,18 @@ mod tests {
             .with_kv_store(Arc::clone(&recording) as Arc<dyn crate::platform::PlatformKvStore>);
 
         let mut response = Response::new(EdgeBody::empty());
-        let consent_ctx = crate::consent::ConsentContext::default();
+        // An explicit withdrawal signal (GPC): the destructive path requires
+        // one, a merely not-permitted request must not revoke.
+        let consent_ctx = crate::consent::ConsentContext {
+            gpc: true,
+            ..Default::default()
+        };
 
         apply_ec_headers(
             &settings,
             &services,
             &mut response,
-            "new-ec-id",
+            Some("new-ec-id"),
             false,
             Some("cookie-ec-id"),
             &consent_ctx,
@@ -1500,6 +1543,42 @@ mod tests {
             recording.deleted_keys(),
             vec!["cookie-ec-id"],
             "should delete KV entry for the revoked EC cookie ID"
+        );
+    }
+
+    #[test]
+    fn not_permitted_without_withdrawal_leaves_cookie_and_kv() {
+        use crate::platform::test_support::RecordingKvStore;
+
+        let mut settings = create_test_settings();
+        settings.consent.consent_store = Some("test-consent-store".to_string());
+
+        let recording = Arc::new(RecordingKvStore::new());
+        let services = noop_services()
+            .with_kv_store(Arc::clone(&recording) as Arc<dyn crate::platform::PlatformKvStore>);
+
+        let mut response = Response::new(EdgeBody::empty());
+        // No signal at all: a pre-consent or fail-closed request is not a
+        // withdrawal, so nothing is destroyed.
+        let consent_ctx = crate::consent::ConsentContext::default();
+
+        apply_ec_headers(
+            &settings,
+            &services,
+            &mut response,
+            Some("new-ec-id"),
+            false,
+            Some("cookie-ec-id"),
+            &consent_ctx,
+        );
+
+        assert!(
+            recording.deleted_keys().is_empty(),
+            "no withdrawal signal should mean no KV deletion"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "no withdrawal signal should mean the existing cookie is left intact"
         );
     }
 
@@ -1514,13 +1593,18 @@ mod tests {
             .with_kv_store(Arc::clone(&recording) as Arc<dyn crate::platform::PlatformKvStore>);
 
         let mut response = Response::new(EdgeBody::empty());
-        let consent_ctx = crate::consent::ConsentContext::default();
+        // A withdrawal signal is present, so only the missing consent_store can
+        // be the reason nothing is deleted.
+        let consent_ctx = crate::consent::ConsentContext {
+            gpc: true,
+            ..Default::default()
+        };
 
         apply_ec_headers(
             &settings,
             &services,
             &mut response,
-            "new-ec-id",
+            Some("new-ec-id"),
             false,
             Some("cookie-ec-id"),
             &consent_ctx,

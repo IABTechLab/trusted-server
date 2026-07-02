@@ -9,10 +9,22 @@ cookie_domain = "localhost"
 origin_url = "http://127.0.0.1:8888"
 proxy_secret = "integration-test-proxy-secret"
 
+# Viceroy does not resolve geolocation for the loopback test client, so the
+# request carries no country and default_country supplies the baseline the
+# permission model uses. US/CA is a US opt-out state (every purpose granted
+# without a signal), so the EC lifecycle scenarios can assert
+# permission-driven behavior, for example GPC revoking store-on-device so the
+# EC is no longer permitted and the ts-ec cookie is expired.
+[geo]
+default_country = "US/CA"
+
 [ec]
-passphrase = "integration-test-ec-secret-padded-32"
+provider = "hmac"
 ec_store = "ec_identity_store"
 pull_sync_concurrency = 3
+
+[ec.providers.hmac]
+passphrase = "integration-test-ec-secret-padded-32"
 
 [[ec.partners]]
 name = "Integration Test Partner"

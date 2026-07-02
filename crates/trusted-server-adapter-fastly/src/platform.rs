@@ -6,25 +6,25 @@
 //! incoming Fastly request.
 
 use std::io::Read as _;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::key_value_store::FastlyKvStore;
 use edgezero_core::key_value_store::KvError;
 use error_stack::{Report, ResultExt};
-use fastly::geo::{geo_lookup, Geo};
 use fastly::{ConfigStore, Request, SecretStore};
 
 use crate::backend::BackendConfig;
 pub(crate) use trusted_server_core::platform::UnavailableKvStore;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
-    PlatformGeo, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
+    build_geo_provider, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
+    PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformImageOptimizerCrop,
     PlatformImageOptimizerCropMode, PlatformImageOptimizerOptions, PlatformImageOptimizerParams,
     PlatformImageOptimizerRegion, PlatformKvStore, PlatformPendingRequest, PlatformResponse,
     PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
 };
+use trusted_server_core::settings::Settings;
+use trusted_server_device_fastly::FastlyHostSignals;
 
 // ---------------------------------------------------------------------------
 // FastlyPlatformConfigStore
@@ -533,33 +533,12 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 // FastlyPlatformGeo
 // ---------------------------------------------------------------------------
 
-/// Convert a Fastly [`Geo`] value into a platform-neutral [`GeoInfo`].
-///
-/// Shared by `FastlyPlatformGeo::lookup` in `trusted-server-adapter-fastly` so
-/// that field mapping is never duplicated.
-fn geo_from_fastly(geo: &Geo) -> GeoInfo {
-    GeoInfo {
-        city: geo.city().to_string(),
-        country: geo.country_code().to_string(),
-        continent: format!("{:?}", geo.continent()),
-        latitude: geo.latitude(),
-        longitude: geo.longitude(),
-        metro_code: geo.metro_code(),
-        region: geo.region().map(str::to_string),
-        asn: None,
-    }
-}
-
-/// Fastly geo-lookup implementation of [`PlatformGeo`].
-pub struct FastlyPlatformGeo;
-
-impl PlatformGeo for FastlyPlatformGeo {
-    fn lookup(&self, client_ip: Option<IpAddr>) -> Result<Option<GeoInfo>, Report<PlatformError>> {
-        Ok(client_ip
-            .and_then(geo_lookup)
-            .map(|geo| geo_from_fastly(&geo)))
-    }
-}
+/// The Fastly host geo provider now lives in its own crate,
+/// `trusted-server-geo-fastly`, so every provider implementation sits under
+/// `crates/<type>/<vendor>`. It is re-exported here so this module's
+/// [`build_runtime_services`] and the adapter's existing call sites keep
+/// referring to it through `crate::platform`.
+pub(crate) use trusted_server_geo_fastly::FastlyPlatformGeo;
 
 // ---------------------------------------------------------------------------
 // Entry-point helper
@@ -574,19 +553,34 @@ impl PlatformGeo for FastlyPlatformGeo {
 ///
 /// `kv_store` is an [`Arc<dyn PlatformKvStore>`] opened by the caller for
 /// the primary KV store. Use [`open_kv_store`] to construct it.
+///
+/// `settings` selects the geo provider via the `[geo] provider` selector,
+/// defaulting to the Fastly platform geo lookup.
 #[must_use]
 pub fn build_runtime_services(
     req: &Request,
     kv_store: Arc<dyn PlatformKvStore>,
+    settings: &Settings,
 ) -> RuntimeServices {
+    let geo = build_geo_provider(settings, Arc::new(FastlyPlatformGeo));
+    let client_info = client_info_from_request(req);
+    // Reuse the fingerprints already captured into the client metadata as the
+    // injected host-signal service, so a host-signal provider reads them without
+    // another SDK call. Fastly always supplies the capability, so this is always
+    // set; a request that carried no fingerprint simply yields `None`.
+    let host_signals = FastlyHostSignals::new(
+        client_info.tls_ja4.clone(),
+        client_info.h2_fingerprint.clone(),
+    );
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(kv_store)
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
-        .client_info(client_info_from_request(req))
+        .geo(geo)
+        .client_info(client_info)
+        .host_signals(Arc::new(host_signals))
         .build()
 }
 
@@ -776,7 +770,7 @@ mod tests {
     #[test]
     fn build_runtime_services_client_info_is_none_without_tls() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(&req, noop_kv_store(), &Settings::default());
 
         assert!(
             services.client_info().tls_protocol.is_none(),
@@ -791,7 +785,7 @@ mod tests {
     #[test]
     fn build_runtime_services_returns_cloneable_services() {
         let req = Request::get("https://example.com/");
-        let services = build_runtime_services(&req, noop_kv_store());
+        let services = build_runtime_services(&req, noop_kv_store(), &Settings::default());
         let cloned = services.clone();
 
         assert_eq!(

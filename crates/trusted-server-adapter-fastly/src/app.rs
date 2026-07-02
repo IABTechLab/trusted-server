@@ -27,6 +27,7 @@
 //! | GET | `/_ts/set-tester` | [`handle_set_tester`] |
 //! | GET | `/_ts/clear-tester` | [`handle_clear_tester`] |
 //! | OPTIONS | `/_ts/api/v1/identify` | [`cors_preflight_identify`] |
+//! | POST | `/_ts/api/v1/ec/resolve` | [`handle_ec_resolve`] |
 //! | POST | `/auction` | [`handle_auction`] |
 //! | GET | `/first-party/proxy` | [`handle_first_party_proxy`] |
 //! | GET | `/first-party/click` | [`handle_first_party_click`] |
@@ -97,11 +98,12 @@ use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{build_orchestrator, AuctionOrchestrator};
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
+use trusted_server_core::ec::consent::ec_storage_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
+use trusted_server_core::ec::resolve::handle_ec_resolve;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::http_util::is_navigation_request;
@@ -109,7 +111,9 @@ use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::{ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices};
+use trusted_server_core::platform::{
+    build_geo_provider, ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices,
+};
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
@@ -126,6 +130,7 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_device_fastly::FastlyHostSignals;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::{
@@ -246,14 +251,35 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
+    // The TLS JA4 and HTTP/2 fingerprints arrive as trusted internal headers
+    // injected by the entry point. They build the host-signal service a
+    // host-signal provider reads; Fastly always supplies the capability, so the
+    // service is always set even when a request carried no fingerprint.
+    let tls_ja4 = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-ja4")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let h2_fingerprint = ctx
+        .request()
+        .headers()
+        .get("x-ts-h2-fingerprint")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
         .kv_store(Arc::clone(&state.default_kv_store))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(build_geo_provider(
+            &state.settings,
+            Arc::new(FastlyPlatformGeo),
+        ))
         .client_info(client_info)
+        .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)))
         .build()
 }
 
@@ -376,7 +402,7 @@ fn build_ec_request_state(
     req: &Request,
 ) -> EcRequestState {
     let device_signals = device_signals_for(req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     if !is_real_browser {
         log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
@@ -407,11 +433,14 @@ fn build_ec_request_state(
         };
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations keep the write path so tombstones stay
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // stays open for withdrawal so tombstones remain authoritative even for
+    // privacy-extension-heavy clients that do not look like known browsers. A
+    // merely not-permitted (pre-consent or fail-closed) request writes nothing,
+    // so it does not need the graph.
     let kv_graph = crate::maybe_identity_graph(settings);
     let finalize_kv_graph = if setup_error.is_none()
-        && (is_real_browser || ec_consent_withdrawn(ec_context.consent()))
+        && (is_real_browser || ec_storage_withdrawn(ec_context.consent()))
     {
         kv_graph.clone()
     } else {
@@ -581,6 +610,7 @@ async fn run_named_route(
         }
         NamedRouteHandler::SetTester => handle_set_tester(&state.settings),
         NamedRouteHandler::ClearTester => handle_clear_tester(&state.settings),
+        NamedRouteHandler::EcResolve => handle_ec_resolve(&state.settings, req, &ec.ec_context),
         NamedRouteHandler::Auction => {
             // The auction reads consent data, so the consent KV store must be
             // available — fail closed with 503 when it is configured but
@@ -623,7 +653,7 @@ async fn run_named_route(
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
@@ -925,6 +955,7 @@ enum NamedRouteHandler {
     Identify,
     SetTester,
     ClearTester,
+    EcResolve,
     Auction,
     FirstPartyProxy,
     FirstPartyClick,
@@ -1006,6 +1037,11 @@ const NAMED_ROUTES: &[NamedRoute] = &[
         handler: NamedRouteHandler::ClearTester,
     },
     NamedRoute {
+        path: "/_ts/api/v1/ec/resolve",
+        primary_methods: &[Method::POST],
+        handler: NamedRouteHandler::EcResolve,
+    },
+    NamedRoute {
         path: "/auction",
         primary_methods: &[Method::POST],
         handler: NamedRouteHandler::Auction,
@@ -1082,7 +1118,7 @@ impl TrustedServerApp {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                Arc::new(FastlyPlatformGeo),
+                build_geo_provider(&state.settings, Arc::new(FastlyPlatformGeo)),
             ))
             .middleware(AuthMiddleware::new(Arc::clone(&state.settings)));
 
@@ -1175,7 +1211,13 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [geo]
+                default_country = "FR"
+
                 [ec]
+                provider = "hmac"
+
+                [ec.providers.hmac]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
                 [request_signing]
@@ -1240,7 +1282,13 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -1558,7 +1606,13 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
             "#,
         )
@@ -1721,6 +1775,25 @@ mod tests {
             set_cookie,
             "ts-tester=; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=0",
             "tester cookie clear should use publisher.cookie_domain"
+        );
+    }
+
+    #[test]
+    fn dispatch_ec_resolve_routes_to_resolve_handler() {
+        // Parity guard: POST /_ts/api/v1/ec/resolve must reach the resolve
+        // handler, not the publisher fallback or a router-level 405. The test
+        // settings configure no client-cycle provider, so the handler returns
+        // 204, proving the request was handled here rather than proxied to the
+        // publisher origin (which would error without a live backend).
+        let router = test_router();
+        let response =
+            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/ec/resolve")))
+                .expect("should route request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "POST ec/resolve should reach the resolve handler and 204, not proxy to the publisher"
         );
     }
 
@@ -2010,7 +2083,13 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]
@@ -2067,7 +2146,13 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]

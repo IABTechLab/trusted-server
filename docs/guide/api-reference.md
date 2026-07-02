@@ -187,6 +187,18 @@ Server-to-server batch sync endpoint for writing EC ID to partner UID mappings. 
 
 ---
 
+### POST /\_ts/api/v1/ec/resolve
+
+Resolve endpoint for client-side Edge Cookie providers. The page posts a value that the provider verifies and mints into the Edge Cookie. Used only when a client-side provider is selected (for example the `client-fixed` demo). Server-side providers such as HMAC do not use it.
+
+**Auth:** None. This is a first-party POST from the page. The provider is responsible for verifying the posted value before trusting it.
+
+**Request Body:** the provider's value, opaque to the core. For the `client-fixed` demo this is the fixed known word sent as `text/plain`.
+
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) and the status is `200`. When the gate is closed, no client-side provider is configured, or the provider produces no identifier, the response is `204` with no cookie. An oversized body is rejected with `413`.
+
+---
+
 ### POST /third-party/ad
 
 Client-side auction endpoint for TSJS library.

@@ -393,7 +393,13 @@ fn base_route_settings_toml() -> &'static str {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]

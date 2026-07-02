@@ -7,7 +7,7 @@ use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
-    header, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
+    header, HeaderMap, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse,
 };
 use edgezero_core::response::IntoResponse;
 use error_stack::Report;
@@ -21,8 +21,8 @@ use trusted_server_core::auction::AuctionOrchestrator;
 use trusted_server_core::auth::enforce_basic_auth;
 use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use trusted_server_core::ec::batch_sync::handle_batch_sync;
-use trusted_server_core::ec::consent::ec_consent_withdrawn;
-use trusted_server_core::ec::device::DeviceSignals;
+use trusted_server_core::ec::consent::ec_storage_withdrawn;
+use trusted_server_core::ec::device::{build_device_provider, DeviceProvider, DeviceSignals};
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -32,13 +32,14 @@ use trusted_server_core::ec::pull_sync::{
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse, TrustedServerError};
+use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
     IntegrationRegistry, ProxyDispatchInput, RequestFilterEffects, RequestFilterRegistryInput,
     RequestFilterRegistryOutcome,
 };
-use trusted_server_core::platform::PlatformGeo as _;
+use trusted_server_core::platform::build_geo_provider;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{
     handle_asset_proxy_request, handle_first_party_click, handle_first_party_proxy,
@@ -55,6 +56,7 @@ use trusted_server_core::request_signing::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
+use trusted_server_device_fastly::{FastlyDeviceProvider, FastlyHostSignals};
 
 mod app;
 mod backend;
@@ -457,6 +459,23 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // defaulting those fields to empty as the EdgeZero context alone would.
     let client_info = client_info_from_request(&req);
 
+    // Strip and re-inject the TLS JA4 and HTTP/2 fingerprints from the
+    // authoritative Fastly SDK values, under the same trust model, so the
+    // EdgeZero app path can build the host-signal service from these internal
+    // headers (the SDK accessors return real values only on the live client
+    // request, not on a request rebuilt from EdgeZero HTTP types).
+    req.remove_header("x-ts-tls-ja4");
+    req.remove_header("x-ts-h2-fingerprint");
+    // Take ownership before setting: unlike the static TLS protocol/cipher
+    // names, these accessors borrow the request, which would otherwise conflict
+    // with the mutable `set_header`.
+    if let Some(ja4) = req.get_tls_ja4().map(str::to_string) {
+        req.set_header("x-ts-tls-ja4", ja4);
+    }
+    if let Some(h2) = req.get_client_h2_fingerprint().map(str::to_string) {
+        req.set_header("x-ts-h2-fingerprint", h2);
+    }
+
     // Derive device signals from the original FastlyRequest before conversion.
     // Fastly's `get_tls_ja4()` and `get_client_h2_fingerprint()` accessors only
     // return real values on the client request; a synthetic request rebuilt from
@@ -464,7 +483,17 @@ fn edgezero_main(mut req: FastlyRequest, config_store: ConfigStoreHandle) {
     // the EC bot gate needs and misclassify real browsers as bots. Stored in the
     // request extensions so `build_ec_request_state` reads the authoritative
     // signals instead of re-deriving from the reconstructed request.
-    let device_signals = derive_device_signals(&req);
+    // Reuse the settings snapshot already loaded for the app state rather than
+    // fetching and validating the config-store blob a second time per request.
+    let device_signals = match settings_snapshot.as_deref() {
+        Some(settings) => derive_device_signals(settings, &req),
+        None => {
+            log::warn!(
+                "EdgeZero device signals: settings unavailable, using UA-only classification"
+            );
+            DeviceSignals::derive_ua_only(req.get_header_str("user-agent").unwrap_or(""))
+        }
+    };
 
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. The standard dispatch helpers
@@ -617,8 +646,11 @@ fn apply_entry_point_finalize_headers(
     response: &mut HttpResponse,
     client_ip: Option<std::net::IpAddr>,
 ) {
+    // Route through the [geo] provider selector, so a deployment with no geo
+    // provider makes no host geo call on the entry-point finalize path either.
+    let geo = build_geo_provider(settings, Arc::new(FastlyPlatformGeo));
     let geo_info = resolve_geo_for_response(response, client_ip, |client_ip| {
-        FastlyPlatformGeo.lookup(client_ip).unwrap_or_else(|e| {
+        geo.lookup(client_ip).unwrap_or_else(|e| {
             log::warn!("entry-point geo lookup failed: {e}");
             None
         })
@@ -760,9 +792,12 @@ fn legacy_main(mut req: FastlyRequest) {
     // any request-derived context or converting to the core HTTP types.
     compat::sanitize_fastly_forwarded_headers(&mut req);
 
-    let device_signals = derive_device_signals(&req);
-    let runtime_services =
-        build_runtime_services(&req, std::sync::Arc::clone(&state.default_kv_store));
+    let device_signals = derive_device_signals(&state.settings, &req);
+    let runtime_services = build_runtime_services(
+        &req,
+        std::sync::Arc::clone(&state.default_kv_store),
+        &state.settings,
+    );
     let http_req = compat::from_fastly_request(req);
 
     let route_result = futures::executor::block_on(route_request(
@@ -972,7 +1007,7 @@ async fn route_request(
     mut req: HttpRequest,
     device_signals: DeviceSignals,
 ) -> Result<RouteResult, Report<TrustedServerError>> {
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
 
     if !is_real_browser {
         log::info!(
@@ -1064,14 +1099,13 @@ async fn route_request(
     ec_context.set_device_signals(device_signals);
 
     // Bot gate: suppress KV-backed EC writes for unrecognized clients, except
-    // consent withdrawals. Revocations need the KV graph so tombstones remain
-    // authoritative even for privacy-extension-heavy clients that do not look
-    // like known browsers.
-    // Build the KV identity graph once. The write-path (finalize_kv_graph) is
-    // also given to bots when they signal consent withdrawal so tombstones are
-    // authoritative even for privacy-extension-heavy clients.
+    // when the request carries an explicit withdrawal signal. The write path
+    // (finalize_kv_graph) is still given to bots on withdrawal so tombstones
+    // remain authoritative even for privacy-extension-heavy clients that do not
+    // look like known browsers. A merely not-permitted (pre-consent or
+    // fail-closed) request writes nothing, so it does not need the graph.
     let kv_graph = maybe_identity_graph(settings);
-    let finalize_kv_graph = if is_real_browser || ec_consent_withdrawn(ec_context.consent()) {
+    let finalize_kv_graph = if is_real_browser || ec_storage_withdrawn(ec_context.consent()) {
         kv_graph.clone()
     } else {
         None
@@ -1472,16 +1506,32 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
     None
 }
 
-/// Derives device signals from TLS, H2, and UA request data.
+/// Derives device signals via the configured device-detection provider.
 ///
-/// All extraction is pure in-memory — no KV I/O. The Fastly SDK provides
-/// `get_tls_ja4()` and `get_client_h2_fingerprint()` on client requests.
-pub(crate) fn derive_device_signals(req: &FastlyRequest) -> DeviceSignals {
-    let ua = req.get_header_str("user-agent").unwrap_or("");
-    let ja4 = req.get_tls_ja4();
-    let h2_fp = req.get_client_h2_fingerprint();
-
-    DeviceSignals::derive(ua, ja4, h2_fp)
+/// The providers read request data from injected services: device classification
+/// reads only the User-Agent, borrowed here through a `BorrowedRequestInfo`, while the
+/// Fastly provider also reads the TLS/H2 fingerprints captured into a
+/// [`FastlyHostSignals`]. The Fastly provider, and so the fingerprint capture, is
+/// built only when selected, so the default request path makes no Fastly-specific
+/// fingerprint call.
+pub(crate) fn derive_device_signals(settings: &Settings, req: &FastlyRequest) -> DeviceSignals {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = req
+        .get_header_str(header::USER_AGENT.as_str())
+        .and_then(|user_agent| HeaderValue::from_str(user_agent).ok())
+    {
+        headers.insert(header::USER_AGENT, value);
+    }
+    let client_ip = req
+        .get_client_ip_addr()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let request_info = BorrowedRequestInfo::new(&client_ip, Some(&headers));
+    build_device_provider(settings, || {
+        let host_signals: Arc<dyn HostSignals> = Arc::new(FastlyHostSignals::from_request(req));
+        Box::new(FastlyDeviceProvider::new(host_signals)) as Box<dyn DeviceProvider>
+    })
+    .detect(&request_info)
 }
 
 #[cfg(test)]
@@ -1504,7 +1554,13 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            default_country = "FR"
+
             [ec]
+            provider = "hmac"
+
+            [ec.providers.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
 
             [request_signing]

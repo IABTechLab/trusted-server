@@ -577,6 +577,18 @@ pub trait IntegrationHeadInjector: Send + Sync {
     fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String>;
 }
 
+/// Trait for integration-provided outbound response header mutations.
+///
+/// Lets an integration add headers (for example `Accept-CH` or detection result
+/// headers) to outbound responses. Applied on the platform-neutral
+/// [`http::Response`] before it is handed to the host adapter.
+pub trait IntegrationResponseMutator: Send + Sync {
+    /// Identifier for logging/diagnostics.
+    fn integration_id(&self) -> &'static str;
+    /// Add headers to an outbound response.
+    fn add_response_headers(&self, headers: &mut http::HeaderMap);
+}
+
 /// Registration payload returned by integration builders.
 pub struct IntegrationRegistration {
     pub integration_id: &'static str,
@@ -587,6 +599,7 @@ pub struct IntegrationRegistration {
     pub html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     pub head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     pub request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    pub response_mutators: Vec<Arc<dyn IntegrationResponseMutator>>,
 }
 
 impl IntegrationRegistration {
@@ -612,6 +625,7 @@ impl IntegrationRegistrationBuilder {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
             },
         }
     }
@@ -658,6 +672,12 @@ impl IntegrationRegistrationBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_response_mutator(mut self, mutator: Arc<dyn IntegrationResponseMutator>) -> Self {
+        self.registration.response_mutators.push(mutator);
+        self
+    }
+
     /// Mark this integration's JS module for deferred loading via
     /// `<script defer>` instead of the main synchronous bundle.
     #[must_use]
@@ -693,6 +713,11 @@ struct IntegrationRegistryInner {
     html_post_processors: Vec<Arc<dyn IntegrationHtmlPostProcessor>>,
     head_injectors: Vec<Arc<dyn IntegrationHeadInjector>>,
     request_filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    response_mutators: Vec<Arc<dyn IntegrationResponseMutator>>,
+    /// JS module IDs to include in the bundle that come from a source other than
+    /// a registered integration, for example a module tied to the selected Edge
+    /// Cookie provider. Populated in [`IntegrationRegistry::new`] from settings.
+    extra_js_module_ids: Vec<&'static str>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -712,7 +737,9 @@ impl Default for IntegrationRegistryInner {
             html_post_processors: Vec::new(),
             head_injectors: Vec::new(),
             request_filters: Vec::new(),
+            response_mutators: Vec::new(),
             deferred_js_ids: Vec::new(),
+            extra_js_module_ids: Vec::new(),
         }
     }
 }
@@ -838,10 +865,22 @@ impl IntegrationRegistry {
                     .extend(registration.html_post_processors);
                 inner.head_injectors.extend(registration.head_injectors);
                 inner.request_filters.extend(registration.request_filters);
+                inner
+                    .response_mutators
+                    .extend(registration.response_mutators);
                 if registration.js_deferred {
                     inner.deferred_js_ids.push(registration.integration_id);
                 }
             }
+        }
+
+        // A client-cycle Edge Cookie provider ships a page script that posts its
+        // result to the resolve endpoint. The script rides the tsjs bundle, so
+        // include its module when that provider is selected. The same module
+        // list drives both the served bundle and the injected `<script>` hash,
+        // so they stay consistent.
+        if settings.ec.provider.as_deref() == Some("client-fixed") {
+            inner.extra_js_module_ids.push("ec_client_fixed");
         }
 
         Ok(Self {
@@ -1035,6 +1074,14 @@ impl IntegrationRegistry {
         inserts
     }
 
+    /// Apply each registered integration's response-header mutations to an
+    /// outbound response's headers.
+    pub fn apply_response_headers(&self, headers: &mut http::HeaderMap) {
+        for mutator in &self.inner.response_mutators {
+            mutator.add_response_headers(headers);
+        }
+    }
+
     /// Provide a snapshot of registered integrations and their hooks.
     #[must_use]
     pub fn registered_integrations(&self) -> Vec<IntegrationMetadata> {
@@ -1104,6 +1151,14 @@ impl IntegrationRegistry {
             }
         }
 
+        // Modules not tied to a registered integration, for example the
+        // client-cycle provider's page script.
+        for id in &self.inner.extra_js_module_ids {
+            if !ids.contains(id) {
+                ids.push(id);
+            }
+        }
+
         ids
     }
 
@@ -1153,7 +1208,9 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1181,7 +1238,9 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors,
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1205,7 +1264,9 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters,
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1269,7 +1330,9 @@ impl IntegrationRegistry {
                 html_post_processors: Vec::new(),
                 head_injectors: Vec::new(),
                 request_filters: Vec::new(),
+                response_mutators: Vec::new(),
                 deferred_js_ids: Vec::new(),
+                extra_js_module_ids: Vec::new(),
             }),
         }
     }
@@ -1281,6 +1344,39 @@ mod tests {
     use crate::constants::COOKIE_TS_EC;
     use crate::platform::test_support::noop_services;
     use http::{header, HeaderValue, StatusCode};
+
+    struct TestResponseMutator;
+
+    impl IntegrationResponseMutator for TestResponseMutator {
+        fn integration_id(&self) -> &'static str {
+            "test"
+        }
+
+        fn add_response_headers(&self, headers: &mut http::HeaderMap) {
+            headers.insert("x-test-mutator", HeaderValue::from_static("applied"));
+        }
+    }
+
+    #[test]
+    fn apply_response_headers_runs_registered_mutators() {
+        let registry = IntegrationRegistry {
+            inner: Arc::new(IntegrationRegistryInner {
+                response_mutators: vec![Arc::new(TestResponseMutator)],
+                ..Default::default()
+            }),
+        };
+        let mut headers = http::HeaderMap::new();
+        registry.apply_response_headers(&mut headers);
+        assert_eq!(
+            headers
+                .get("x-test-mutator")
+                .expect("should add the mutator header")
+                .to_str()
+                .expect("header value should be valid ASCII"),
+            "applied",
+            "registered response mutator should add its header"
+        );
+    }
 
     // Mock integration proxy for testing
     struct MockProxy;
@@ -1988,6 +2084,20 @@ mod tests {
     }
 
     #[test]
+    fn js_module_ids_include_client_fixed_when_provider_selected() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.ec.provider = Some("client-fixed".to_owned());
+        let registry = IntegrationRegistry::new(&settings).expect("should create registry");
+
+        assert!(
+            registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "selecting the client-fixed provider should inject its demo page script"
+        );
+    }
+
+    #[test]
     fn js_module_ids_include_explicitly_enabled_cmp_mirrors() {
         let mut settings = crate::test_support::tests::create_test_settings();
         settings
@@ -2015,6 +2125,20 @@ mod tests {
         assert!(
             metadata.iter().any(|integration| integration.id == "osano"),
             "should include JS-only Osano registration in metadata"
+        );
+    }
+
+    #[test]
+    fn js_module_ids_exclude_client_fixed_without_provider() {
+        let registry =
+            IntegrationRegistry::new(&crate::test_support::tests::create_test_settings())
+                .expect("should create registry");
+
+        assert!(
+            !registry
+                .js_module_ids_immediate()
+                .contains(&"ec_client_fixed"),
+            "the demo page script should not ship unless the client-fixed provider is selected"
         );
     }
 
