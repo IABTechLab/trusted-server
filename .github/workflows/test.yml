@@ -82,9 +82,6 @@ jobs:
       - name: Run host-target CLI tests
         run: cargo test --package trusted-server-cli --target x86_64-unknown-linux-gnu
 
-      - name: Run host-target CLI tests
-        run: cargo test --package trusted-server-cli --target x86_64-unknown-linux-gnu
-
       - name: Verify Fastly WASM release build
         run: cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
 

@@ -64,10 +64,6 @@ echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
 VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
 
-echo "==> Generating Viceroy configs..."
-INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
-
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
     crates/trusted-server-integration-tests/fixtures/frameworks/wordpress/

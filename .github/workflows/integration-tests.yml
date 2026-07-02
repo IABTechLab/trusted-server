@@ -38,11 +38,6 @@ jobs:
         env:
           INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
 
-      - name: Generate integration Viceroy configs
-        run: ./scripts/generate-integration-viceroy-configs.sh
-        env:
-          INTEGRATION_ORIGIN_PORT: ${{ env.ORIGIN_PORT }}
-
       - name: Package integration test artifacts
         run: |
           mkdir -p "$(dirname "$WASM_ARTIFACT_PATH")" "$(dirname "$AXUM_ARTIFACT_PATH")" "$(dirname "$DOCKER_ARTIFACT_PATH")" "$CF_BUILD_ARTIFACT_PATH"
