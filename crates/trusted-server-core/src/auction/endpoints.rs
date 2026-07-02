@@ -132,7 +132,7 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes();
+    let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -609,7 +609,7 @@ mod tests {
             StatusCode::OK,
             "gated auction should return a 200 no-bid response"
         );
-        let body_bytes = response.into_body().into_bytes();
+        let body_bytes = response.into_body().into_bytes().unwrap_or_default();
         let parsed: JsonValue =
             serde_json::from_slice(&body_bytes).expect("response body should be valid JSON");
         let seatbid_empty = match parsed.get("seatbid").and_then(JsonValue::as_array) {
@@ -1139,6 +1139,53 @@ mod tests {
                 response.status(),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "should return 413 for auction body over limit"
+            );
+        });
+    }
+
+    #[test]
+    fn auction_rejects_streaming_body_instead_of_treating_as_empty() {
+        futures::executor::block_on(async {
+            use bytes::Bytes;
+            use edgezero_core::body::Body as EdgeBody;
+            use http::{Method, Request as HttpRequest};
+
+            use crate::auction::build_orchestrator;
+            use crate::consent::ConsentContext;
+            use crate::ec::EcContext;
+            use crate::error::TrustedServerError;
+            use crate::platform::test_support::noop_services;
+            use crate::test_support::tests::create_test_settings;
+
+            let settings = create_test_settings();
+            let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
+            let services = noop_services();
+            let ec_context = EcContext::new_for_test(None, ConsentContext::default());
+            let stream = futures::stream::iter([Bytes::from_static(br#"{}"#)]);
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://test.com/auction")
+                .body(EdgeBody::stream(stream))
+                .expect("should build request");
+
+            let result = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &ec_context,
+                &services,
+                req,
+            )
+            .await;
+
+            let err = match result {
+                Ok(_) => panic!("streaming body should be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err.current_context(), TrustedServerError::BadRequest { .. }),
+                "streaming request body should fail as bad request"
             );
         });
     }

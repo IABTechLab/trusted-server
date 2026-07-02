@@ -78,14 +78,14 @@
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
 //! finalization (geo and TS headers) when settings can be reloaded via
-//! [`trusted_server_core::settings_data::get_settings`]; if settings loading itself
-//! fails, they are returned without geo or TS headers.
+//! [`load_settings_from_config_store`]; if settings loading itself fails, they
+//! are returned without geo or TS headers.
 
 use std::sync::Arc;
 
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
-use edgezero_adapter_fastly::FastlyRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_core::app::{App, Hooks};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{
@@ -123,7 +123,9 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::{ProxyAssetRoute, Settings};
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 use trusted_server_core::tester_cookie::{handle_clear_tester, handle_set_tester};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
@@ -154,12 +156,20 @@ pub(crate) struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 pub(crate) fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    build_state_from_settings(get_settings()?)
+    build_state_from_settings(load_settings_from_config_store()?)
+}
+
+pub(crate) fn load_settings_from_config_store() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    get_settings_from_config_store(&FastlyPlatformConfigStore, &store_name, &config_key)
 }
 
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    warn_if_certificate_check_disabled(&settings);
+
     let orchestrator = build_orchestrator(&settings)?;
     let registry = IntegrationRegistry::new(&settings)?;
 
@@ -171,6 +181,14 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
     }))
+}
+
+fn warn_if_certificate_check_disabled(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "INSECURE: proxy.certificate_check is disabled; HTTPS origin certificate verification is disabled"
+        );
+    }
 }
 
 /// Resolves per-request consent KV store services for routes that read consent data.
@@ -1113,6 +1131,25 @@ fn fallback_route_handler(
 pub struct TrustedServerApp;
 
 impl TrustedServerApp {
+    pub(crate) fn build_app_with_state() -> (App, Option<Arc<AppState>>) {
+        let (router, state) = Self::router_with_state();
+        let mut app = App::with_name(router, Self::name());
+        Self::configure(&mut app);
+        (app, state)
+    }
+
+    fn router_with_state() -> (RouterService, Option<Arc<AppState>>) {
+        let state = match build_state() {
+            Ok(state) => state,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), None);
+            }
+        };
+
+        (Self::routes_for_state(&state), Some(state))
+    }
+
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
             .middleware(FinalizeResponseMiddleware::new(
@@ -1160,15 +1197,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        Self::routes_for_state(&state)
+        Self::router_with_state().0
     }
 }
 
@@ -1186,7 +1215,7 @@ mod tests {
     };
 
     use edgezero_core::body::Body;
-    use edgezero_core::http::{header, request_builder, Method, StatusCode};
+    use edgezero_core::http::{header, request_builder, Method, Response, StatusCode};
     use edgezero_core::router::RouterService;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
@@ -1258,6 +1287,10 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("should build request")
+    }
+
+    fn route(router: &RouterService, request: edgezero_core::http::Request) -> Response {
+        block_on(router.oneshot(request)).expect("should route request")
     }
 
     fn test_settings() -> Settings {
@@ -1403,8 +1436,8 @@ mod tests {
         });
         let router = startup_error_router(&report);
 
-        let head_response = block_on(router.oneshot(empty_request(Method::HEAD, "/")));
-        let options_response = block_on(router.oneshot(empty_request(Method::OPTIONS, "/any")));
+        let head_response = route(&router, empty_request(Method::HEAD, "/"));
+        let options_response = route(&router, empty_request(Method::OPTIONS, "/any"));
 
         assert_eq!(
             head_response.status(),
@@ -1494,7 +1527,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::POST, "/_ts/admin/keys/rotate");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1614,7 +1647,7 @@ mod tests {
                     .body(Body::from("{\"key_id\":\"leak-me\"}"))
                     .expect("should build authorized legacy-alias request");
 
-                let response = block_on(router.oneshot(req));
+                let response = route(&router, req);
 
                 assert_eq!(
                     response.status(),
@@ -1632,8 +1665,10 @@ mod tests {
         // header), not the publisher fallback, which would fail with a
         // gateway error without a live backend.
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::OPTIONS, "/_ts/api/v1/identify")));
+        let response = route(
+            &router,
+            empty_request(Method::OPTIONS, "/_ts/api/v1/identify"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1649,7 +1684,7 @@ mod tests {
         // require_identity_graph fails with a KvStore error (503) — proving
         // the request was NOT proxied to the publisher origin.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/api/v1/identify")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/api/v1/identify"));
 
         assert_eq!(
             response.status(),
@@ -1666,8 +1701,10 @@ mod tests {
         // ec.ec_store configured, require_identity_graph fails with a KvStore
         // error (503).
         let router = test_router();
-        let response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/api/v1/batch-sync")));
+        let response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/api/v1/batch-sync"),
+        );
 
         assert_eq!(
             response.status(),
@@ -1679,7 +1716,7 @@ mod tests {
     #[test]
     fn dispatch_set_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1698,7 +1735,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/set-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/set-tester"));
 
         assert_eq!(
             response.status(),
@@ -1720,7 +1757,7 @@ mod tests {
     #[test]
     fn dispatch_clear_tester_is_disabled_by_default() {
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1739,7 +1776,7 @@ mod tests {
         settings.tester_cookie.enabled = true;
         let state = app_state_for_settings(settings);
         let router = TrustedServerApp::routes_for_state(&state);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/_ts/clear-tester")));
+        let response = route(&router, empty_request(Method::GET, "/_ts/clear-tester"));
 
         assert_eq!(
             response.status(),
@@ -1765,7 +1802,7 @@ mod tests {
         // point via response extensions — even on error responses — so that
         // edgezero_main can run ec_finalize_response and pull sync.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert!(
             response.extensions().get::<super::EcFinalizeState>().is_some(),
@@ -1790,7 +1827,7 @@ mod tests {
             Some("1:65536;2:0;4:6291456;6:262144"),
         ));
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         let finalize = response
             .extensions()
@@ -1809,7 +1846,7 @@ mod tests {
         // documents the regression the extension threading fixes: the same
         // request that looks like a browser above is treated as a bot here.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let finalize = response
             .extensions()
@@ -1845,7 +1882,7 @@ mod tests {
             server_region: Some("US-East".to_string()),
         });
 
-        let _ = block_on(router.oneshot(req));
+        let _ = route(&router, req);
 
         let observed = captured
             .lock()
@@ -1889,10 +1926,10 @@ mod tests {
         // Named routes must also thread EC finalize state, mirroring how the
         // legacy path finalizes every response with the pre-routing EcContext.
         let router = test_router();
-        let response = block_on(router.oneshot(empty_request(
-            Method::GET,
-            "/.well-known/trusted-server.json",
-        )));
+        let response = route(
+            &router,
+            empty_request(Method::GET, "/.well-known/trusted-server.json"),
+        );
 
         assert!(
             response
@@ -1915,7 +1952,7 @@ mod tests {
         let router = test_router();
         let req = empty_request(Method::HEAD, "/first-party/proxy");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_ne!(
             response.status(),
@@ -1936,7 +1973,7 @@ mod tests {
             .body(Body::from(body))
             .expect("should build auction request");
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1960,7 +1997,7 @@ mod tests {
             "/",
         );
 
-        let response = block_on(router.oneshot(req));
+        let response = route(&router, req);
 
         assert_eq!(
             response.status(),
@@ -1981,8 +2018,10 @@ mod tests {
         let state = app_state_for_settings(settings_with_missing_consent_store());
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let admin_response =
-            block_on(router.oneshot(empty_request(Method::POST, "/_ts/admin/keys/rotate")));
+        let admin_response = route(
+            &router,
+            empty_request(Method::POST, "/_ts/admin/keys/rotate"),
+        );
         assert_eq!(
             admin_response.status(),
             StatusCode::UNAUTHORIZED,
@@ -1994,15 +2033,14 @@ mod tests {
             .uri("/auction")
             .body(Body::from(r#"{"adUnits":[]}"#))
             .expect("should build auction request");
-        let auction_response = block_on(router.oneshot(auction_request));
+        let auction_response = route(&router, auction_request);
         assert_eq!(
             auction_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "auction should fail closed when configured consent KV cannot be opened"
         );
 
-        let publisher_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/articles/example")));
+        let publisher_response = route(&router, empty_request(Method::GET, "/articles/example"));
         assert_eq!(
             publisher_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2012,8 +2050,10 @@ mod tests {
         // Integration routes must NOT require the consent KV — runtime_services_for_consent_route
         // is wired only into the publisher and auction branches of dispatch_fallback, not into
         // the integration proxy branch. A missing consent store must not 503 integration routes.
-        let integration_response =
-            block_on(router.oneshot(empty_request(Method::GET, "/integrations/datadome/tags.js")));
+        let integration_response = route(
+            &router,
+            empty_request(Method::GET, "/integrations/datadome/tags.js"),
+        );
         assert_ne!(
             integration_response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2061,7 +2101,7 @@ mod tests {
         let state = build_state_from_settings(settings).expect("should build state");
         let router = TrustedServerApp::routes_for_state(&state);
 
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/.image/banner.png")));
+        let response = route(&router, empty_request(Method::GET, "/.image/banner.png"));
 
         assert!(
             response
@@ -2162,7 +2202,7 @@ mod tests {
         // still carry the RequestFilterEffects the filter emitted — proving the
         // filter ran on the dispatch path.
         let router = router_with_request_filters(vec![Arc::new(RecordingRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         let effects = response
             .extensions()
@@ -2184,7 +2224,7 @@ mod tests {
         // fallback, return its own response, still carry EcFinalizeState (legacy
         // parity: Respond keeps EC finalization), and thread its response effects.
         let router = router_with_request_filters(vec![Arc::new(ChallengeRequestFilter)]);
-        let response = block_on(router.oneshot(empty_request(Method::GET, "/some-page")));
+        let response = route(&router, empty_request(Method::GET, "/some-page"));
 
         assert_eq!(
             response.status(),

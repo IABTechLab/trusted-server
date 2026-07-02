@@ -10,6 +10,8 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
 use trusted_server_core::auction::{AuctionOrchestrator, build_orchestrator};
+#[cfg(target_arch = "wasm32")]
+use trusted_server_core::config_payload::settings_from_config_blob;
 use trusted_server_core::ec::EcContext;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
@@ -27,7 +29,6 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
 use crate::platform::build_runtime_services;
@@ -35,6 +36,14 @@ use crate::platform::build_runtime_services;
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "wasm32")]
+static CLOUDFLARE_CONFIG_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "wasm32")]
+pub fn set_cloudflare_config_json(value: String) {
+    let _ = CLOUDFLARE_CONFIG_JSON.set(value);
+}
 
 /// Application state built once at startup and shared across all requests.
 pub struct AppState {
@@ -50,8 +59,43 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let settings = load_startup_settings()?;
     build_state_with_settings(settings)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    settings_from_cloudflare_config_json()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn settings_from_cloudflare_config_json() -> Result<Settings, Report<TrustedServerError>> {
+    let raw_config = CLOUDFLARE_CONFIG_JSON.get().ok_or_else(|| {
+        Report::new(TrustedServerError::Configuration {
+            message: "Cloudflare TRUSTED_SERVER_CONFIG is required".to_string(),
+        })
+        .attach("set TRUSTED_SERVER_CONFIG to JSON containing the app_config blob envelope")
+    })?;
+    let value: serde_json::Value = serde_json::from_str(raw_config).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: "invalid Cloudflare TRUSTED_SERVER_CONFIG JSON".to_string(),
+        })
+        .attach(format!("failed to parse TRUSTED_SERVER_CONFIG: {error}"))
+    })?;
+    let envelope = value
+        .get("app_config")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: "Cloudflare TRUSTED_SERVER_CONFIG missing app_config".to_string(),
+            })
+        })?;
+    settings_from_config_blob(envelope)
 }
 
 /// Build the application state from explicit settings.

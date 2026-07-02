@@ -39,7 +39,20 @@ const SIGN_MAX_BODY_BYTES: usize = 65536;
 const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
-    Cursor::new(body.into_bytes())
+    Cursor::new(body.into_bytes().unwrap_or_default())
+}
+
+fn request_body_bytes(
+    body: EdgeBody,
+    endpoint: &str,
+) -> Result<bytes::Bytes, Report<TrustedServerError>> {
+    if body.is_stream() {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: format!("{endpoint} request body must be buffered, not streamed"),
+        }));
+    }
+
+    Ok(body.into_bytes().unwrap_or_default())
 }
 
 /// Headers copied from the original client request to the upstream proxy request
@@ -1545,7 +1558,7 @@ pub async fn handle_first_party_proxy_sign(
     let req_url = req.uri().to_string();
 
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes();
+        let body_bytes = request_body_bytes(req.into_body(), "first-party sign")?;
         enforce_max_body_size(&body_bytes, SIGN_MAX_BODY_BYTES, "first-party sign")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
@@ -1660,7 +1673,7 @@ pub async fn handle_first_party_proxy_rebuild(
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     let payload = if method == Method::POST {
-        let body_bytes = req.into_body().into_bytes();
+        let body_bytes = request_body_bytes(req.into_body(), "first-party rebuild")?;
         enforce_max_body_size(&body_bytes, REBUILD_MAX_BODY_BYTES, "first-party rebuild")?;
         let body =
             std::str::from_utf8(&body_bytes).change_context(TrustedServerError::InvalidUtf8 {
@@ -2061,9 +2074,25 @@ mod tests {
             .expect("should build http post request")
     }
 
+    fn build_http_post_streaming_request(uri: impl AsRef<str>) -> HttpRequest<EdgeBody> {
+        let stream = futures::stream::iter(vec![Bytes::from_static(b"{}")]);
+        HttpRequest::builder()
+            .method(Method::POST)
+            .uri(uri.as_ref())
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(EdgeBody::stream(stream))
+            .expect("should build streaming http post request")
+    }
+
     fn response_body_string(response: http::Response<EdgeBody>) -> String {
-        String::from_utf8(response.into_body().into_bytes().to_vec())
-            .expect("response body should be valid UTF-8")
+        String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("response body should be valid UTF-8")
     }
 
     struct QueuedHttpResponse {
@@ -2948,7 +2977,7 @@ mod tests {
         assert_eq!(ct, "text/html; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes();
+        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
         let mut decoder = GzDecoder::new(&compressed_output[..]);
         let mut decompressed = String::new();
         decoder
@@ -3004,7 +3033,7 @@ mod tests {
         assert_eq!(ct, "text/css; charset=utf-8");
 
         // Decompress output to verify content was rewritten
-        let compressed_output = out.into_body().into_bytes();
+        let compressed_output = out.into_body().into_bytes().unwrap_or_default();
         let mut decoder = Decompressor::new(&compressed_output[..], 4096);
         let mut decompressed = String::new();
         decoder
@@ -4674,6 +4703,30 @@ mod tests {
                 err.current_context().status_code(),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "should return 413 for oversized sign body"
+            );
+        });
+    }
+
+    #[test]
+    fn sign_rejects_streaming_body() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let req = build_http_post_streaming_request("https://edge.example/first-party/sign");
+            let err = handle_first_party_proxy_sign(&settings, &noop_services(), req)
+                .await
+                .expect_err("should reject streaming sign body");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_REQUEST,
+                "should return 400 for streaming sign body"
+            );
+            assert!(
+                matches!(
+                    err.current_context(),
+                    TrustedServerError::BadRequest { message }
+                        if message == "first-party sign request body must be buffered, not streamed"
+                ),
+                "should explain that sign bodies must be buffered"
             );
         });
     }

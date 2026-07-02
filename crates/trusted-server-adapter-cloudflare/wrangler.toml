@@ -17,8 +17,7 @@ binding = "TRUSTED_SERVER_KV"
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
 [vars]
-# TRUSTED_SERVER_CONFIG is consumed by the edgezero layer as a JSON-encoded env
-# var binding. At runtime it is bridged to PlatformConfigStore via
-# ConfigStoreHandleAdapter — replace the placeholder values with your publisher
-# settings before deploying.
-TRUSTED_SERVER_CONFIG = '{"publisher.domain":"your-publisher.com"}'
+# TRUSTED_SERVER_CONFIG is required at startup. Replace this intentionally
+# invalid placeholder with JSON containing an `app_config` blob envelope before
+# deploying or running `wrangler dev` against real traffic.
+TRUSTED_SERVER_CONFIG = '{"app_config":""}'

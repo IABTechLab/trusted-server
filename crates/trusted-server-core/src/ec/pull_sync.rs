@@ -384,7 +384,11 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
         return None;
     }
 
-    let body = response.response.into_body().into_bytes();
+    let body = response
+        .response
+        .into_body()
+        .into_bytes()
+        .unwrap_or_default();
     if body.len() > MAX_PULL_RESPONSE_BYTES {
         log::warn!(
             "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",

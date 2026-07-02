@@ -35,16 +35,14 @@ pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
 pub mod auth;
+pub mod config;
+pub mod config_payload;
 pub mod consent;
 pub mod consent_config;
 pub mod constants;
 pub mod cookies;
 pub mod creative;
 pub mod creative_opportunities;
-// Build-time slot validation, shared with `build.rs` via `#[path]`. Compiled
-// here only under test so its rules stay exercised by `cargo test`.
-#[cfg(test)]
-mod creative_slot_build_check;
 pub mod ec;
 pub(crate) mod edge_cookie;
 pub mod error;

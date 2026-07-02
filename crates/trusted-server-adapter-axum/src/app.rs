@@ -26,12 +26,14 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 
 use trusted_server_core::platform::RuntimeServices;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware};
-use crate::platform::build_runtime_services;
+use crate::platform::{AxumPlatformConfigStore, build_runtime_services};
 
 // ---------------------------------------------------------------------------
 // AppState
@@ -51,7 +53,10 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    let settings =
+        get_settings_from_config_store(&AxumPlatformConfigStore, &store_name, &config_key)?;
     build_state_with_settings(settings)
 }
 

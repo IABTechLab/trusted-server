@@ -1,0 +1,145 @@
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "replace-with-admin-password-32-bytes"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+# Optional: override outbound Host header while connecting to origin_url.
+# origin_host_header_override = "www.example.com"
+proxy_secret = "change-me-proxy-secret"
+
+[ec]
+passphrase = "trusted-server-placeholder-secret"
+ec_store = "ec_identity_store"
+pull_sync_concurrency = 3
+# cluster_trust_threshold = 10
+# cluster_recheck_secs = 3600
+
+# Example partner configuration. Replace the token before validating/pushing.
+# [[ec.partners]]
+# name = "Example Partner"
+# source_domain = "partner.example.com"
+# openrtb_atype = 3
+# bidstream_enabled = true
+# api_token = "replace-with-partner-api-token-32-bytes-minimum"
+# batch_rate_limit = 60
+# pull_sync_enabled = false
+
+# Custom headers to include in every response.
+# [response_headers]
+# X-Robots-Tag = "noindex"
+
+[request_signing]
+enabled = false
+config_store_id = "app_config"
+secret_store_id = "secrets"
+
+[integrations.prebid]
+enabled = false
+server_url = "https://prebid.example.com/openrtb2/auction"
+timeout_ms = 1000
+bidders = []
+debug = false
+client_side_bidders = []
+
+[integrations.nextjs]
+enabled = false
+rewrite_attributes = ["href", "link", "siteBaseUrl", "siteProductionDomain", "url"]
+max_combined_payload_bytes = 10485760
+
+[integrations.testlight]
+enabled = false
+endpoint = "https://testlight.example.com/openrtb2/auction"
+timeout_ms = 1200
+rewrite_scripts = true
+
+[integrations.didomi]
+enabled = false
+sdk_origin = "https://sdk.example.com"
+api_origin = "https://api.example.com"
+
+[integrations.sourcepoint]
+enabled = false
+rewrite_sdk = true
+cdn_origin = "https://cdn.example.com"
+cache_ttl_seconds = 3600
+
+[integrations.permutive]
+enabled = false
+organization_id = ""
+workspace_id = ""
+project_id = ""
+api_endpoint = "https://api.example.com"
+secure_signals_endpoint = "https://secure-signals.example.com"
+
+[integrations.lockr]
+enabled = false
+app_id = ""
+api_endpoint = "https://identity.example.com"
+sdk_url = "https://identity.example.com/trusted-server.js"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.datadome]
+enabled = false
+sdk_origin = "https://sdk.example.com"
+api_origin = "https://api.example.com"
+cache_ttl_seconds = 3600
+rewrite_sdk = true
+
+[integrations.gpt]
+enabled = false
+script_url = "https://ads.example.com/gpt.js"
+cache_ttl_seconds = 3600
+rewrite_script = true
+
+[proxy]
+# certificate_check = true
+# allowed_domains = ["ads.example.com", "*.cdn.example.com"]
+
+[auction]
+enabled = false
+providers = []
+timeout_ms = 2000
+allowed_context_keys = []
+
+[integrations.aps]
+enabled = false
+pub_id = "your-aps-publisher-id"
+endpoint = "https://aps.example.com/e/dtb/bid"
+timeout_ms = 1000
+
+[integrations.google_tag_manager]
+enabled = false
+container_id = "GTM-EXAMPLE"
+upstream_url = "https://tags.example.com"
+
+[integrations.adserver_mock]
+enabled = false
+endpoint = "https://adserver.example.com/mediate"
+timeout_ms = 1000
+
+[integrations.adserver_mock.context_query_params]
+example_segments = "segments"
+
+[debug]
+ja4_endpoint_enabled = false
+
+[creative_opportunities]
+gam_network_id = "123456789"
+# FCP is not affected by this value — body content above </body> has already
+# streamed and painted before the hold begins. What this caps is the slip on
+# DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
+# drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
+# default; raise only if your SSPs need more headroom and your analytics confirm
+# the DCL slip is acceptable.
+auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
+price_granularity = "dense"
+
+# No slot templates are enabled in the checked-in default config. Add
+# `[[creative_opportunities.slot]]` entries via private config or override the
+# entire array via:
+# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'

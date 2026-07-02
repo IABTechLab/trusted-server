@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use edgezero_adapter_spin::SpinRequestContext;
+use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -28,7 +28,6 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
-use trusted_server_core::settings_data::get_settings;
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -51,7 +50,7 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = get_settings()?;
+    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
     build_state_with_settings(settings)
 }
 
@@ -1064,7 +1063,12 @@ mod tests {
                     .uri(path)
                     .body(edgezero_core::body::Body::empty())
                     .expect("should build request");
-                let status = router.oneshot(req).await.status().as_u16();
+                let status = router
+                    .oneshot(req)
+                    .await
+                    .expect("should route startup-error request")
+                    .status()
+                    .as_u16();
                 assert_eq!(
                     status, 503,
                     "{method} {path} must return 503 from the startup fallback, got {status}"
@@ -1087,14 +1091,17 @@ mod tests {
             .uri("/health")
             .body(edgezero_core::body::Body::empty())
             .expect("should build request");
-        let resp = router.oneshot(req).await;
+        let resp = router
+            .oneshot(req)
+            .await
+            .expect("should route startup-error health request");
 
         assert_eq!(
             resp.status().as_u16(),
             200,
             "GET /health must return 200 from the startup fallback"
         );
-        let body = resp.into_body().into_bytes();
+        let body = resp.into_body().into_bytes().unwrap_or_default();
         assert_eq!(
             &body[..],
             b"ok",
