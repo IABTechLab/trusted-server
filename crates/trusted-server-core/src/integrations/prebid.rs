@@ -433,10 +433,17 @@ fn validate_external_bundle_config(
         })
     })?;
 
-    if !allowed_domains.is_empty()
-        && !allowed_domains
-            .iter()
-            .any(|pattern| is_host_allowed(host, pattern))
+    if allowed_domains.is_empty() {
+        return Err(Report::new(TrustedServerError::Configuration {
+            message:
+                "proxy.allowed_domains must include the external Prebid bundle host when integrations.prebid.external_bundle_url is configured"
+                    .to_string(),
+        }));
+    }
+
+    if !allowed_domains
+        .iter()
+        .any(|pattern| is_host_allowed(host, pattern))
     {
         return Err(Report::new(TrustedServerError::Configuration {
             message: format!(
@@ -2083,7 +2090,7 @@ mod tests {
     };
     use crate::settings::Settings;
     use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
-    use crate::test_support::tests::crate_test_settings_str;
+    use crate::test_support::tests::create_test_settings;
     use base64::engine::general_purpose::STANDARD as TEST_BASE64_STANDARD;
     use http::Method;
     use serde_json::json;
@@ -2091,7 +2098,7 @@ mod tests {
     use std::io::Cursor;
 
     fn make_settings() -> Settings {
-        Settings::from_toml(&crate_test_settings_str()).expect("should parse settings")
+        create_test_settings()
     }
 
     fn base_config() -> PrebidIntegrationConfig {
@@ -3012,6 +3019,115 @@ external_bundle_sri = "sha384-AAAA"
             !response_header_is_present(&sanitized, "x-upstream"),
             "should strip arbitrary upstream headers on error responses"
         );
+    }
+
+    #[test]
+    fn external_bundle_startup_validation_requires_proxy_allowed_domains() {
+        let mut settings = make_settings();
+        settings.proxy.allowed_domains.clear();
+
+        let err = validate_config_for_startup(&settings)
+            .expect_err("should reject external bundle without proxy allowlist");
+
+        assert!(
+            err.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {err:?}"
+        );
+    }
+
+    #[test]
+    fn external_bundle_handler_fetches_and_sanitizes_with_platform_client() {
+        futures::executor::block_on(async {
+            let sha256 = "a".repeat(64);
+            let mut config = base_config();
+            config.external_bundle_sha256 = Some(sha256.clone());
+            let integration = PrebidIntegration::new(config);
+            let mut settings = make_settings();
+            settings.proxy.allowed_domains = vec!["assets.example".to_string()];
+
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response_with_headers(
+                200,
+                b"console.log('bundle');".to_vec(),
+                vec![
+                    (header::CONTENT_TYPE.as_str(), "text/html"),
+                    (header::CACHE_CONTROL.as_str(), "private, max-age=0"),
+                    (header::SET_COOKIE.as_str(), "bad=1; Path=/"),
+                    ("x-upstream", "leak"),
+                ],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = http::Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://pub.example{PREBID_BUNDLE_ROUTE}?v={sha256}"
+                ))
+                .header(header::COOKIE, "ts-ec=should-not-forward")
+                .header(header::ACCEPT, "*/*")
+                .body(EdgeBody::empty())
+                .expect("should build external bundle request");
+
+            let response = integration
+                .handle_external_bundle(&settings, &services, req)
+                .await
+                .expect("should proxy external bundle");
+
+            assert_eq!(response.status(), StatusCode::OK, "should preserve status");
+            assert_eq!(
+                header_value_str(&response, header::CONTENT_TYPE.as_str()),
+                Some(PREBID_BUNDLE_CONTENT_TYPE.to_string()),
+                "should normalize JS content type"
+            );
+            assert_eq!(
+                header_value_str(&response, header::CACHE_CONTROL.as_str()),
+                Some(PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL.to_string()),
+                "versioned bundle response should be immutable"
+            );
+            assert_eq!(
+                header_value_str(&response, header::ETAG.as_str()),
+                Some(format!("\"sha256:{sha256}\"")),
+                "should emit configured hash ETag"
+            );
+            assert!(
+                !response_header_is_present(&response, header::SET_COOKIE.as_str()),
+                "should strip upstream Set-Cookie"
+            );
+            assert!(
+                !response_header_is_present(&response, "x-upstream"),
+                "should strip arbitrary upstream headers"
+            );
+            assert_eq!(
+                response_body_string(response),
+                "console.log('bundle');",
+                "should preserve bundle bytes"
+            );
+
+            assert_eq!(
+                stub.recorded_request_uris(),
+                vec!["https://assets.example/prebid/trusted-prebid.js".to_string()],
+                "should fetch the configured external bundle URL without adding EC query params"
+            );
+            let recorded_headers = stub.recorded_request_headers();
+            assert_eq!(
+                recorded_headers.len(),
+                1,
+                "should make one upstream request"
+            );
+            assert!(
+                !recorded_headers[0]
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(header::COOKIE.as_str())),
+                "external bundle fetch should not forward client cookies"
+            );
+            assert!(
+                !recorded_headers[0]
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(header::ACCEPT.as_str())),
+                "external bundle fetch should not forward client headers"
+            );
+        });
     }
 
     #[test]

@@ -47,7 +47,9 @@ pub mod tests {
     /// Panics if the embedded TOML configuration is invalid.
     pub fn create_test_settings() -> Settings {
         let toml_str = crate_test_settings_str();
-        Settings::from_toml(&toml_str).expect("Invalid config")
+        let mut settings = Settings::from_toml(&toml_str).expect("Invalid config");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
     }
 
     /// A valid EC ID in `{64-hex}.{6-alnum}` format for use in tests.

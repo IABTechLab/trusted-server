@@ -111,6 +111,10 @@ enabled = true
 server_url = "https://prebid-server.example.com/openrtb2/auction"
 external_bundle_url = "https://assets.example.com/prebid/trusted-prebid.js"
 
+[proxy]
+# Required for external_bundle_url. Include the bundle host and any HTTPS redirect targets.
+allowed_domains = ["assets.example.com"]
+
 [integrations.prebid.bundle]
 adapters = ["rubicon", "kargo"]
 user_id_modules = ["sharedIdSystem", "uid2IdSystem"]
@@ -148,7 +152,8 @@ external_bundle_sri = "sha384-..."
 
 `external_bundle_url` remains manually authored by the operator. The CLI does not
 infer it from `--out` and does not know where the operator will upload the local
-bundle.
+bundle. Runtime validation requires `proxy.allowed_domains` to include the hosted
+bundle URL's host and any HTTPS redirect targets.
 
 ---
 
@@ -390,7 +395,8 @@ rg 'external_bundle_sha256|external_bundle_sri' trusted-server.toml
 ```
 
 Then upload the generated JS file manually, set or verify
-`integrations.prebid.external_bundle_url`, and run:
+`integrations.prebid.external_bundle_url`, ensure `proxy.allowed_domains`
+contains the bundle host and any HTTPS redirect targets, and run:
 
 ```bash
 ts config validate

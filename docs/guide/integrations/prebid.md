@@ -35,6 +35,11 @@ client_side_bidders = ["rubicon"]
 # Script interception patterns (optional - defaults shown below)
 script_patterns = ["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]
 
+# Required when external_bundle_url is configured. Include the bundle host and
+# any HTTPS redirect targets used by that host.
+[proxy]
+allowed_domains = ["assets.example"]
+
 # External bundle generation inputs used by `ts prebid bundle`.
 [integrations.prebid.bundle]
 adapters = ["rubicon"]
@@ -59,25 +64,25 @@ set = { placementId = "_s2sHeaderPlacement" }
 
 ### Configuration Options
 
-| Field                      | Type          | Default                                                                | Description                                                                                                                                      |
-| -------------------------- | ------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                        |
-| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                       |
-| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                  |
-| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                          |
-| `external_bundle_url`      | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`                                     |
-| `external_bundle_sha256`   | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                              |
-| `external_bundle_sri`      | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                               |
-| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                      |
-| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                   |
-| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts    |
-| `debug`                    | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)             |
-| `test_mode`                | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand |
-| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                        |
-| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)               |
-| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                      |
-| `bundle.adapters`          | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                             |
-| `bundle.user_id_modules`   | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                       |
+| Field                      | Type          | Default                                                                | Description                                                                                                                                                      |
+| -------------------------- | ------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                  | Boolean       | `true`                                                                 | Enable Prebid integration                                                                                                                                        |
+| `server_url`               | String        | Required                                                               | Prebid Server endpoint URL                                                                                                                                       |
+| `timeout_ms`               | Integer       | `1000`                                                                 | Request timeout in milliseconds                                                                                                                                  |
+| `bidders`                  | Array[String] | `["mocktioneer"]`                                                      | List of enabled bidders                                                                                                                                          |
+| `external_bundle_url`      | String        | Required when enabled                                                  | Absolute HTTPS URL of the generated external Prebid bundle, proxied through `/integrations/prebid/bundle.js`; its host must be listed in `proxy.allowed_domains` |
+| `external_bundle_sha256`   | String        | `None`                                                                 | Optional 64-character hex SHA-256 used for versioned first-party URLs, immutable cache headers, and `sha256:` ETags                                              |
+| `external_bundle_sri`      | String        | `None`                                                                 | Optional Subresource Integrity metadata added to the same-origin bundle script tag when configured                                                               |
+| `bid_param_overrides`      | Table         | `{}`                                                                   | Static per-bidder param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                      |
+| `bid_param_zone_overrides` | Table         | `{}`                                                                   | Per-bidder, per-zone param overrides; normalized into the canonical override-rule engine and shallow-merged into bidder params                                   |
+| `bid_param_override_rules` | Array[Table]  | `[]`                                                                   | Canonical ordered override rules with `when` matchers and `set` objects; evaluated after compatibility fields so later rules win on conflicts                    |
+| `debug`                    | Boolean       | `false`                                                                | Enable Prebid debug mode (sets `ext.prebid.debug` and `ext.prebid.returnallbidstatus`; surfaces debug metadata in auction responses)                             |
+| `test_mode`                | Boolean       | `false`                                                                | Set the OpenRTB `test: 1` flag so bidders treat the auction as non-billable test traffic. Separate from `debug` to avoid suppressing real demand                 |
+| `debug_query_params`       | String        | `None`                                                                 | Extra query params appended for debugging                                                                                                                        |
+| `client_side_bidders`      | Array[String] | `[]`                                                                   | Bidders that run client-side via native Prebid.js adapters instead of server-side. See [Client-Side Bidders](#client-side-bidders)                               |
+| `script_patterns`          | Array[String] | `["/prebid.js", "/prebid.min.js", "/prebidjs.js", "/prebidjs.min.js"]` | URL patterns for Prebid script interception                                                                                                                      |
+| `bundle.adapters`          | Array[String] | Required for `ts prebid bundle`                                        | Prebid.js bidder adapter modules imported into the generated external browser bundle                                                                             |
+| `bundle.user_id_modules`   | Array[String] | Generator default preset when omitted                                  | Prebid User ID modules imported into the generated external browser bundle                                                                                       |
 
 ## External Bundle Generation
 
@@ -90,8 +95,9 @@ ts prebid bundle
 
 The command writes generated artifacts to `dist/prebid/` by default and updates
 `external_bundle_sha256` and `external_bundle_sri` in `trusted-server.toml` from
-the generated manifest. Upload the generated JavaScript file manually and set
-`external_bundle_url` to the hosted HTTPS asset URL before running
+the generated manifest. Upload the generated JavaScript file manually, set
+`external_bundle_url` to the hosted HTTPS asset URL, and include that host (plus
+any redirect targets) in `proxy.allowed_domains` before running
 `ts config validate` or `ts config push`.
 
 ## Debug Mode

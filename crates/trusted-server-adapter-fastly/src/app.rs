@@ -1175,6 +1175,9 @@ mod tests {
                 origin_url = "https://origin.test-publisher.com"
                 proxy_secret = "unit-test-proxy-secret"
 
+                [proxy]
+                allowed_domains = ["*.example", "*.example.com"]
+
                 [ec]
                 passphrase = "test-passphrase-at-least-32-bytes!!"
 
@@ -1240,6 +1243,9 @@ mod tests {
             cookie_domain = ".test-publisher.com"
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
+
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"

@@ -393,6 +393,9 @@ fn base_route_settings_toml() -> &'static str {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [proxy]
+            allowed_domains = ["*.example", "*.example.com"]
+
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
 

@@ -101,13 +101,17 @@ external_bundle_sha256 = "abc123..."
 
 # Optional but recommended when sha256 is configured.
 external_bundle_sri = "sha384-..."
+
+[proxy]
+# Required for external_bundle_url. Include the bundle host and any HTTPS redirect targets.
+allowed_domains = ["assets.example.com"]
 ```
 
 ### Field Semantics
 
 | Field                    | Required                               | Description                                                                                                                         |
 | ------------------------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `external_bundle_url`    | Yes when Prebid integration is enabled | Absolute `https://` URL of the generated Prebid bundle.                                                                             |
+| `external_bundle_url`    | Yes when Prebid integration is enabled | Absolute `https://` URL of the generated Prebid bundle. Host must be permitted by `proxy.allowed_domains`.                          |
 | `external_bundle_sha256` | No                                     | Hex SHA-256 of the exact JS bytes. When present, enables content-addressed URLs and immutable caching for versioned route requests. |
 | `external_bundle_sri`    | Recommended when SHA-256 is configured | Optional browser Subresource Integrity value for the proxied first-party script response.                                           |
 
@@ -115,8 +119,8 @@ Prebid config should fail validation when:
 
 - `external_bundle_url` is missing while Prebid is enabled
 - `external_bundle_url` is not `https://`
-- `external_bundle_url` host is not permitted by `proxy.allowed_domains` when
-  `proxy.allowed_domains` is non-empty
+- `proxy.allowed_domains` is empty while `external_bundle_url` is configured
+- `external_bundle_url` host is not permitted by `proxy.allowed_domains`
 - `external_bundle_sha256` is present but malformed
 - `external_bundle_sri` is present but malformed
 

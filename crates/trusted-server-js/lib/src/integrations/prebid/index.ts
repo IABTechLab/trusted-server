@@ -19,11 +19,11 @@ import 'prebid.js/modules/consentManagementUsp.js';
 import 'prebid.js/modules/userId.js';
 
 // Client-side bid adapters — self-register with prebid.js on import.
-// The external bundle generator writes _adapters.generated.ts and
-// _user_ids.generated.ts from its --adapters and --user-id-modules options.
-// When a bidder is listed in `client_side_bidders` in trusted-server.toml,
-// the requestBids shim leaves its bids untouched and the corresponding
-// adapter handles them natively in the browser.
+// The external bundle generator aliases these placeholder modules to temporary
+// modules built from its --adapters and --user-id-modules options. When a bidder
+// is listed in `client_side_bidders` in trusted-server.toml, the requestBids
+// shim leaves its bids untouched and the corresponding adapter handles them
+// natively in the browser.
 import './_adapters.generated';
 import './_user_ids.generated';
 

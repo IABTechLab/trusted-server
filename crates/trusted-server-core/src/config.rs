@@ -199,7 +199,10 @@ mod tests {
     use crate::test_support::tests::crate_test_settings_str;
 
     fn valid_settings() -> Settings {
-        Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
+        let mut settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
+        settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
+        settings
     }
 
     #[test]
@@ -258,6 +261,20 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("Insecure default"),
             "error should mention insecure default"
+        );
+    }
+
+    #[test]
+    fn deploy_validation_rejects_external_prebid_bundle_without_proxy_allowed_domains() {
+        let mut settings = valid_settings();
+        settings.proxy.allowed_domains.clear();
+
+        let err = validate_settings_for_deploy(&settings)
+            .expect_err("should reject external Prebid bundle without proxy allowlist");
+
+        assert!(
+            err.to_string().contains("proxy.allowed_domains"),
+            "error should mention proxy.allowed_domains: {err:?}"
         );
     }
 

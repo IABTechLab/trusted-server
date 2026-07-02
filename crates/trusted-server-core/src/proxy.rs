@@ -313,15 +313,15 @@ pub struct ProxyRequestConfig<'a> {
     pub stream_passthrough: bool,
     /// Domains allowed for the initial request and any redirects.
     ///
-    /// **Open mode** (`&[]`): every host is permitted. Integration proxies pass `&[]`
-    /// because their target URLs originate from operator-controlled configuration
+    /// **Open mode** (`&[]`): every host is permitted. Most integration proxies pass
+    /// `&[]` because their target URLs originate from operator-controlled configuration
     /// (e.g. `trusted-server.toml` integration settings) and are therefore trusted at
     /// operator setup time rather than at request time.
     ///
     /// **Restricted mode** (non-empty slice): only hosts matching a listed pattern are
-    /// permitted. Currently only [`handle_first_party_proxy`] passes
-    /// `&settings.proxy.allowed_domains` because it follows redirect chains that may
-    /// originate from untrusted creative-supplied URLs.
+    /// permitted. First-party creative proxying and managed static-asset proxies pass
+    /// `&settings.proxy.allowed_domains` because they follow redirect chains that must
+    /// stay constrained to operator-approved hosts.
     pub allowed_domains: &'a [String],
     /// Require the initial target and every followed redirect hop to use HTTPS.
     pub require_https: bool,
@@ -1402,13 +1402,13 @@ async fn proxy_with_redirects(
             })?;
 
         let next_scheme = next_url.scheme().to_ascii_lowercase();
+        if redirect_policy.require_https && next_scheme != "https" {
+            log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
+            return Err(Report::new(TrustedServerError::Forbidden {
+                message: "non-HTTPS redirect blocked".to_string(),
+            }));
+        }
         if next_scheme != "http" && next_scheme != "https" {
-            if redirect_policy.require_https {
-                log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
-                return Err(Report::new(TrustedServerError::Forbidden {
-                    message: "non-HTTPS redirect blocked".to_string(),
-                }));
-            }
             return finalize_response(
                 settings,
                 req,
@@ -1416,12 +1416,6 @@ async fn proxy_with_redirects(
                 beresp,
                 redirect_policy.stream_passthrough,
             );
-        }
-        if redirect_policy.require_https && next_scheme != "https" {
-            log::warn!("redirect to `{}` blocked: HTTPS is required", next_url);
-            return Err(Report::new(TrustedServerError::Forbidden {
-                message: "non-HTTPS redirect blocked".to_string(),
-            }));
         }
 
         let next_host = match next_url.host_str() {
@@ -4579,14 +4573,9 @@ mod tests {
 
     #[test]
     fn redirect_empty_allowlist_permits_any() {
-        // The guard at proxy_with_redirects checks `!allowed_domains.is_empty()`
-        // before calling is_host_allowed, so no host is ever blocked when the
-        // list is empty. Verify the combined condition is false for any host.
         let allowed: [String; 0] = [];
-        let would_block =
-            !allowed.is_empty() && !allowed.iter().any(|p| is_host_allowed("evil.com", p));
         assert!(
-            !would_block,
+            redirect_is_permitted(&allowed, "evil.com"),
             "empty allowlist should not block any redirect host"
         );
     }

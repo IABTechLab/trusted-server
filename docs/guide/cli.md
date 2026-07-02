@@ -142,8 +142,9 @@ ts prebid bundle
 By default, generated artifacts are written to `dist/prebid/`, and the command
 updates `integrations.prebid.external_bundle_sha256` and
 `integrations.prebid.external_bundle_sri` in `trusted-server.toml`. Upload the
-generated JavaScript file yourself and set `external_bundle_url` to its HTTPS
-asset URL before running `ts config validate` or `ts config push`.
+generated JavaScript file yourself, set `external_bundle_url` to its HTTPS
+asset URL, and include that host (plus any redirect targets) in
+`proxy.allowed_domains` before running `ts config validate` or `ts config push`.
 
 Use custom paths when needed:
 

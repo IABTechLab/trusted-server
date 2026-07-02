@@ -315,7 +315,13 @@ external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
 # external_bundle_sha256 = "..."
 # external_bundle_sri = "sha384-..."
 # script_patterns = ["/static/prebid/*"]
+
+[proxy]
+allowed_domains = ["assets.example"]
 ```
+
+The `proxy.allowed_domains` entry is required for `external_bundle_url` and must
+cover the bundle host plus any HTTPS redirect targets used by that host.
 
 Tests or scaffolding can inject configs by calling `settings.integrations.insert_config("prebid", &serde_json::json!({...}))`, the same helper that other integrations use.
 
