@@ -4,7 +4,7 @@
 - **Date:** 2026-07-02
 - **Scope:** Move trusted-server **completely** onto EdgeZero primitives: config push, KV, secret store, config injection without an embedded `trusted-server.toml`, extractor-based handlers, and deletion of every pre-EdgeZero workaround.
 - **Shape:** Umbrella roadmap. Defines the end-state, the current-state gap, and an ordered set of phases with dependencies. **Each phase gets its own implementation plan** (`writing-plans`) before code is written.
-- **Companion spec:** Phase 0 (`State<T>` extractor + nested `#[secret]`) is an **edgezero-repo** change, specified separately (`…-state-and-nested-secrets-design.md`) and tracked via its own edgezero PR. This umbrella depends on it but does not re-specify it.
+- **Companion spec:** Phase 0 (`State<T>` extractor + nested `#[secret]`) is an **edgezero-repo** change, specified separately (`…-state-and-nested-secrets-design.md`) and tracked via edgezero PR [stackpop/edgezero#305](https://github.com/stackpop/edgezero/pull/305). This umbrella depends on it but does not re-specify it.
 
 ---
 
@@ -86,7 +86,7 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 ### Phase 0 — EdgeZero prerequisites (external, edgezero repo)
 
-**Owner:** edgezero. **Tracked by:** its own spec + PR (link to be added).
+**Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#305](https://github.com/stackpop/edgezero/pull/305) — "add State<T> + nested #[secret] design spec".
 **Delivers:** (A) `State<T>` extractor + `RouterBuilder::with_state`; (B) nested/array `#[secret]` in `#[derive(AppConfig)]` + path-aware `secret_walk`.
 **Blocks:** Phase 3 (B), Phase 4 (A). **This umbrella consumes it as a versioned dependency** — bump the pinned `edgezero` rev once merged.
 
