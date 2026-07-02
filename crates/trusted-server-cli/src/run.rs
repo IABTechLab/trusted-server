@@ -9,7 +9,7 @@ use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::audit::browser_collector::BrowserAuditCollector;
 use crate::config_init::{run_config_init, ConfigInitArgs};
-use crate::prebid_bundle::{run_bundle, NpmPrebidBundleGenerator, PrebidBundleArgs};
+use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", about = "Trusted Server CLI")]

@@ -788,7 +788,11 @@ impl IntegrationRegistry {
         let mut inner = IntegrationRegistryInner::default();
 
         for builder in crate::integrations::builders() {
-            if let Some(registration) = builder(settings)? {
+            if let Some(registration) = (builder.build)(settings)? {
+                debug_assert_eq!(
+                    registration.integration_id, builder.id,
+                    "integration builder ID should match registration ID"
+                );
                 inner
                     .enabled_integration_ids
                     .push(registration.integration_id);

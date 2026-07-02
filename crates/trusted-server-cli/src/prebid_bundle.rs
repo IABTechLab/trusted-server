@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
-use toml_edit::{table, value, DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, table, value};
 
 pub(crate) type CliResult<T> = Result<T, String>;
 
-const NODE_MODULES_MISSING_HELP: &str =
-    "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
+const NODE_MODULES_MISSING_HELP: &str = "Prebid bundling dependencies are missing. Run `cd crates/trusted-server-js/lib && npm ci`, then retry `ts prebid bundle`.";
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct PrebidBundleArgs {
