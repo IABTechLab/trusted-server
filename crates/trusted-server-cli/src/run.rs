@@ -7,7 +7,8 @@ use edgezero_cli::args::{
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::audit::browser_collector::BrowserAuditCollector;
+use crate::audit::{run_audit, AuditArgs};
+use crate::config_ad_templates::{run_ad_templates, AdTemplatesCommand};
 use crate::config_init::{run_config_init, ConfigInitArgs};
 
 #[derive(Debug, Parser)]
@@ -19,10 +20,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Audit a public page and write draft Trusted Server artifacts.
-    Audit(AuditArgs),
     /// Sign in / out / status against an `EdgeZero` adapter.
     Auth(AuthArgs),
+    /// Browser-backed page and ad-template audits.
+    Audit(AuditArgs),
     /// Build the project for a target adapter.
     Build(BuildArgs),
     /// Trusted Server app-config commands.
@@ -36,29 +37,11 @@ enum Command {
     Serve(ServeArgs),
 }
 
-#[derive(Debug, clap::Args)]
-pub(crate) struct AuditArgs {
-    /// Public HTTP(S) URL to audit.
-    pub(crate) url: String,
-    /// JavaScript asset audit output path.
-    #[arg(long)]
-    pub(crate) js_assets: Option<std::path::PathBuf>,
-    /// Draft Trusted Server config output path.
-    #[arg(long)]
-    pub(crate) config: Option<std::path::PathBuf>,
-    /// Do not write the JavaScript asset audit file.
-    #[arg(long)]
-    pub(crate) no_js_assets: bool,
-    /// Do not write the draft Trusted Server config file.
-    #[arg(long)]
-    pub(crate) no_config: bool,
-    /// Overwrite existing output files.
-    #[arg(long)]
-    pub(crate) force: bool,
-}
-
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Diagnose server-side ad-template configuration and path matching.
+    #[command(name = "ad-templates", subcommand)]
+    AdTemplates(AdTemplatesCommand),
     /// Initialize a Trusted Server config file from the example template.
     Init(ConfigInitArgs),
     /// Diff `trusted-server.toml` against the live `EdgeZero` config.
@@ -74,21 +57,17 @@ enum ConfigCommand {
 /// # Errors
 ///
 /// Returns an error when command parsing, config validation, `EdgeZero`
-/// delegation, audit collection, or config initialization fails.
+/// delegation, or config initialization fails.
 pub fn run_from_env() -> Result<(), String> {
     dispatch(Args::parse())
 }
 
 fn dispatch(args: Args) -> Result<(), String> {
     match args.command {
-        Command::Audit(args) => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let collector = BrowserAuditCollector;
-            crate::audit::run_audit(&args, &collector, &mut out)
-        }
         Command::Auth(args) => edgezero_cli::run_auth(&args),
+        Command::Audit(args) => run_audit(&args),
         Command::Build(args) => edgezero_cli::run_build(&args),
+        Command::Config(ConfigCommand::AdTemplates(args)) => run_ad_templates(&args),
         Command::Config(ConfigCommand::Init(args)) => run_config_init(&args),
         Command::Config(ConfigCommand::Diff(args)) => {
             match edgezero_cli::run_config_diff_typed::<TrustedServerAppConfig>(&args) {
@@ -120,64 +99,6 @@ mod tests {
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
-    }
-
-    #[test]
-    fn parses_audit_with_default_outputs() {
-        let args = parse(&["ts", "audit", "https://publisher.example"]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
-        };
-        assert_eq!(audit.url, "https://publisher.example");
-        assert_eq!(audit.js_assets, None);
-        assert_eq!(audit.config, None);
-        assert!(!audit.no_js_assets);
-        assert!(!audit.no_config);
-        assert!(!audit.force);
-    }
-
-    #[test]
-    fn parses_audit_with_custom_outputs() {
-        let args = parse(&[
-            "ts",
-            "audit",
-            "https://publisher.example",
-            "--js-assets",
-            "audit/js-assets.toml",
-            "--config",
-            "audit/trusted-server.toml",
-            "--no-js-assets",
-            "--no-config",
-            "--force",
-        ]);
-        let Command::Audit(audit) = args.command else {
-            panic!("expected audit command");
-        };
-        assert_eq!(audit.js_assets, Some(PathBuf::from("audit/js-assets.toml")));
-        assert_eq!(
-            audit.config,
-            Some(PathBuf::from("audit/trusted-server.toml"))
-        );
-        assert!(audit.no_js_assets);
-        assert!(audit.no_config);
-        assert!(audit.force);
-    }
-
-    #[test]
-    fn audit_does_not_accept_adapter_option() {
-        let error = Args::try_parse_from([
-            "ts",
-            "audit",
-            "https://publisher.example",
-            "--adapter",
-            "fastly",
-        ])
-        .expect_err("should reject audit adapter option");
-        assert!(
-            error.to_string().contains("unexpected argument")
-                || error.to_string().contains("Found argument"),
-            "error should explain unsupported option"
-        );
     }
 
     #[test]
@@ -281,5 +202,91 @@ mod tests {
 
         let default_validate = ConfigValidateArgs::default();
         assert_eq!(validate.manifest, default_validate.manifest);
+    }
+
+    #[test]
+    fn config_ad_templates_match_parses_app_config_flags() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "match",
+            "--app-config",
+            "publisher-a.toml",
+            "--no-env",
+            "--details",
+            "/news/story",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Match(match_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates match command");
+        };
+        assert_eq!(
+            match_args.config.app_config,
+            Some(PathBuf::from("publisher-a.toml"))
+        );
+        assert!(match_args.config.no_env);
+        assert!(match_args.details);
+        assert_eq!(match_args.path_or_url, "/news/story");
+    }
+
+    #[test]
+    fn config_ad_templates_check_parses_expected_slots() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "ad-templates",
+            "check",
+            "/sports/game",
+            "--expected-slot",
+            "atf",
+            "--expected-slot",
+            "sports-sidebar",
+            "--allow-extra-slots",
+        ]);
+        let Command::Config(ConfigCommand::AdTemplates(AdTemplatesCommand::Check(check_args))) =
+            args.command
+        else {
+            panic!("expected ad-templates check command");
+        };
+        assert_eq!(check_args.path_or_url, "/sports/game");
+        assert_eq!(check_args.expected_slots, ["atf", "sports-sidebar"]);
+        assert!(check_args.allow_extra_slots);
+        assert!(!check_args.expect_no_slots);
+    }
+
+    #[test]
+    fn audit_legacy_url_parses_as_page_alias() {
+        let args = parse(&["ts", "audit", "https://www.example.com/"]);
+        assert!(matches!(args.command, Command::Audit(_)));
+    }
+
+    #[test]
+    fn audit_page_subcommand_parses() {
+        let args = parse(&["ts", "audit", "page", "https://www.example.com/"]);
+        assert!(matches!(args.command, Command::Audit(_)));
+    }
+
+    #[test]
+    fn audit_ad_templates_verify_parses() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "verify",
+            "https://www.example.com/",
+        ]);
+        assert!(matches!(args.command, Command::Audit(_)));
+    }
+
+    #[test]
+    fn audit_ad_templates_without_verify_is_error() {
+        assert!(Args::try_parse_from(["ts", "audit", "ad-templates"]).is_err());
+    }
+
+    #[test]
+    fn audit_rejects_non_http_url() {
+        assert!(Args::try_parse_from(["ts", "audit", "ftp://www.example.com/"]).is_err());
     }
 }

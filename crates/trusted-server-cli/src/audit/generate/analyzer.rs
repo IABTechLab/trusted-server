@@ -5,8 +5,8 @@ use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::audit::collector::CollectedPage;
-use crate::audit::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
+use crate::audit::generate::collector::CollectedPage;
+use crate::audit::generate::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
 use crate::error::{report_error, CliResult};
 
 static GTM_REGEX: LazyLock<Regex> =
@@ -256,7 +256,7 @@ pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::collector::{CollectedRequest, CollectedScriptTag};
+    use crate::audit::generate::collector::{CollectedRequest, CollectedScriptTag};
 
     fn page_url() -> Url {
         Url::parse("https://publisher.example/page").expect("should parse URL")

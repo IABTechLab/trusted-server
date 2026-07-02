@@ -787,13 +787,19 @@ pub(crate) fn should_run_server_side_ad_stack(
     consent_allows_auction: bool,
     auction_enabled: bool,
 ) -> bool {
-    is_get
-        && is_navigation
-        && !is_prefetch
-        && !is_bot
-        && has_matched_slots
-        && consent_allows_auction
-        && auction_enabled
+    crate::creative_opportunities::evaluate_ad_stack_gate(
+        crate::creative_opportunities::AdStackGateInput {
+            method_get: is_get,
+            navigation: is_navigation,
+            prefetch: is_prefetch,
+            bot: is_bot,
+            matched_slots: has_matched_slots,
+            consent_allows_auction: Some(consent_allows_auction),
+            auction_enabled,
+        },
+    )
+    .expected
+        == crate::creative_opportunities::RuntimeAdStackExpected::Yes
 }
 
 /// Write winning bids from an auction result into the shared `ad_bids_state` lock.
