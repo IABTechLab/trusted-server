@@ -143,6 +143,18 @@ impl CreativeOpportunitySlot {
             format.validate_runtime(&self.id)?;
         }
 
+        // A negative floor silently disables minimum-price enforcement, and a
+        // non-finite floor (NaN/infinity) produces surprising all-pass/all-drop
+        // comparisons and an invalid OpenRTB `bidfloor`.
+        if let Some(floor_price) = self.floor_price {
+            if !floor_price.is_finite() || floor_price < 0.0 {
+                return Err(format!(
+                    "slot `{}` floor_price must be a finite value >= 0.0, got {floor_price}",
+                    self.id
+                ));
+            }
+        }
+
         // An explicit empty/whitespace `div_id` override is rejected: the
         // injected JS resolves slots with `candidate.id.startsWith(slot.div_id)`,
         // and every element id starts with the empty string, so an empty override
@@ -565,6 +577,42 @@ mod tests {
         assert!(
             slot.validate_runtime("1234").is_ok(),
             "a concrete div_id override should pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_rejects_invalid_floor_prices() {
+        let mut slot = make_slot("atf", vec!["/"]);
+        slot.compile_patterns();
+
+        slot.floor_price = Some(-0.01);
+        assert!(
+            slot.validate_runtime("1234").is_err(),
+            "negative floor_price should fail validation"
+        );
+
+        slot.floor_price = Some(f64::NAN);
+        assert!(
+            slot.validate_runtime("1234").is_err(),
+            "NaN floor_price should fail validation"
+        );
+
+        slot.floor_price = Some(f64::INFINITY);
+        assert!(
+            slot.validate_runtime("1234").is_err(),
+            "infinite floor_price should fail validation"
+        );
+
+        slot.floor_price = Some(0.0);
+        assert!(
+            slot.validate_runtime("1234").is_ok(),
+            "zero floor_price should pass validation"
+        );
+
+        slot.floor_price = None;
+        assert!(
+            slot.validate_runtime("1234").is_ok(),
+            "absent floor_price should pass validation"
         );
     }
 

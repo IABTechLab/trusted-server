@@ -245,6 +245,38 @@ export function installGptShim(): boolean {
 // ------------------------------------------------------------------
 
 /**
+ * Sandbox token list for debug ADM fallback iframes.
+ *
+ * Deliberately excludes `allow-same-origin`: combined with `allow-scripts` on
+ * srcdoc (or first-party src) content, that pair effectively removes the
+ * sandbox's origin isolation and would let SSP-provided markup run with the
+ * publisher origin's privileges.
+ */
+export const ADM_IFRAME_SANDBOX = 'allow-scripts allow-popups allow-forms';
+
+/**
+ * Resolve an ADM-extracted iframe src to a safe, loadable URL.
+ *
+ * Protocol-relative URLs are upgraded to https. Only http(s) URLs (including
+ * page-relative paths, which resolve against the page origin) are accepted —
+ * anything else (javascript:, data:, blob:, …) is rejected so SSP-provided
+ * markup cannot smuggle a script-executing URL into the unsandboxed GAM
+ * iframe.
+ */
+export function safeAdmIframeSrc(src: string): string | undefined {
+  const resolved = src.startsWith('//') ? `https:${src}` : src;
+  try {
+    const parsed = new URL(resolved, window.location.href);
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return resolved;
+    }
+  } catch {
+    // Unparseable URL — treat as unsafe.
+  }
+  return undefined;
+}
+
+/**
  * Replace the GAM-rendered creative with the server-side auction adm.
  *
  * Adapted from PR #241 (github.com/IABTechLab/trusted-server/pull/241).
@@ -252,9 +284,10 @@ export function installGptShim(): boolean {
  * Only active when inject_adm_for_testing injects adm server-side.
  *
  * Strategy:
- * 1. If adm contains an <iframe src="...">, set that src on the GAM iframe
- *    directly — avoids cross-origin document access.
- * 2. Otherwise replace the slot element's content with a srcdoc iframe.
+ * 1. If adm contains an <iframe src="..."> with a safe http(s) src, set that
+ *    src on the GAM iframe directly — avoids cross-origin document access.
+ * 2. Otherwise replace the slot element's content with a sandboxed srcdoc
+ *    iframe (no `allow-same-origin` — see [ADM_IFRAME_SANDBOX]).
  */
 function injectAdmIntoSlot(divId: string, adm: string): void {
   try {
@@ -265,14 +298,14 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
     if (!slotEl) return;
 
     // Extract the first iframe src from the adm (e.g. mocktioneer creative
-    // wraps a first-party proxy iframe in a div).
+    // wraps a first-party proxy iframe in a div). Reject non-http(s) schemes.
     const srcMatch = adm.match(/<iframe[^>]+\bsrc=["']([^"']+)["']/i);
-    const innerSrc = srcMatch?.[1];
+    const innerSrc = srcMatch?.[1] ? safeAdmIframeSrc(srcMatch[1]) : undefined;
     const gamIframe = slotEl.querySelector('iframe') as HTMLIFrameElement | null;
 
     if (innerSrc && gamIframe) {
       // Set the GAM iframe src — works even cross-origin (no document access needed).
-      gamIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+      gamIframe.src = innerSrc;
       log.debug(`[tsjs-gpt] gam-intercept: set iframe src for '${divId}'`);
     } else if (innerSrc) {
       // GAM iframe not yet in DOM (APS renders async after slotRenderEnded).
@@ -281,7 +314,7 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
       requestAnimationFrame(() => {
         const retryIframe = slotEl!.querySelector('iframe') as HTMLIFrameElement | null;
         if (retryIframe) {
-          retryIframe.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          retryIframe.src = innerSrc;
           log.debug(`[tsjs-gpt] gam-intercept: set iframe src (retry) for '${divId}'`);
         } else {
           slotEl!.innerHTML = '';
@@ -289,20 +322,20 @@ function injectAdmIntoSlot(divId: string, adm: string): void {
           f.style.cssText = 'border:none';
           f.width = String(slotEl!.offsetWidth || 728);
           f.height = String(slotEl!.offsetHeight || 90);
-          f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
-          f.src = innerSrc.startsWith('//') ? `https:${innerSrc}` : innerSrc;
+          f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
+          f.src = innerSrc;
           slotEl!.appendChild(f);
           log.debug(`[tsjs-gpt] gam-intercept: inserted src iframe for '${divId}'`);
         }
       });
     } else {
-      // No extractable src — replace slot content with a sandboxed srcdoc iframe.
+      // No extractable safe src — replace slot content with a sandboxed srcdoc iframe.
       slotEl.innerHTML = '';
       const f = document.createElement('iframe');
       f.style.border = 'none';
       f.width = String(slotEl.offsetWidth || 728);
       f.height = String(slotEl.offsetHeight || 90);
-      f.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-same-origin');
+      f.setAttribute('sandbox', ADM_IFRAME_SANDBOX);
       f.srcdoc = adm;
       slotEl.appendChild(f);
       log.debug(`[tsjs-gpt] gam-intercept: replaced slot content for '${divId}'`);

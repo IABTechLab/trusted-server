@@ -62,7 +62,10 @@ pub fn enforce_set_cookie_cache_privacy(response: &mut Response) {
 /// [`enforce_set_cookie_cache_privacy`], then applies operator headers — but on
 /// an uncacheable (`private`/`no-store`) response the cache-controlling headers
 /// (`Cache-Control` and the surrogate cache headers) are skipped so operators
-/// cannot re-enable shared caching for per-user payloads.
+/// cannot re-enable shared caching for per-user payloads. After the operator
+/// headers are applied the cookie-privacy downgrade runs once more, so a
+/// configured `Set-Cookie` combined with public/surrogate cache headers cannot
+/// produce a shared-cacheable cookie-bearing response.
 ///
 /// Invalid header names/values are logged and skipped rather than panicking, so
 /// a misconfigured operator header can never take down a request.
@@ -100,6 +103,12 @@ pub fn apply_response_headers_with_cache_privacy(settings: &Settings, response: 
         };
         response.headers_mut().insert(header_name, header_value);
     }
+
+    // Operator headers can themselves introduce Set-Cookie (alongside public
+    // or surrogate cache headers) onto a previously cookieless response, which
+    // the pre-apply pass could not see. Re-run the downgrade so the final
+    // response can never pair Set-Cookie with shared cacheability.
+    enforce_set_cookie_cache_privacy(response);
 }
 
 #[cfg(test)]
@@ -156,6 +165,39 @@ mod tests {
         assert!(
             !response.headers().contains_key("surrogate-control"),
             "surrogate cache headers must be stripped on cookie responses"
+        );
+    }
+
+    #[test]
+    fn downgrades_operator_configured_set_cookie_with_public_cache_headers() {
+        // Operator headers that add Set-Cookie plus shared-cache directives to
+        // a cookieless response must be re-downgraded after they are applied.
+        let settings = settings_with_response_headers(&[
+            ("set-cookie", "operator=abc"),
+            ("cache-control", "public, max-age=600"),
+            ("surrogate-control", "max-age=600"),
+        ]);
+        let mut response = response_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build response");
+
+        apply_response_headers_with_cache_privacy(&settings, &mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=0"),
+            "operator Set-Cookie plus public Cache-Control must be re-downgraded to private"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "surrogate cache headers must be stripped when operator headers add Set-Cookie"
+        );
+        assert!(
+            response.headers().contains_key(header::SET_COOKIE),
+            "the operator Set-Cookie itself should still be applied"
         );
     }
 

@@ -383,3 +383,35 @@ describe('GPT shim – runtime gating', () => {
     expect(win.googletag).toBeUndefined();
   });
 });
+
+describe('GPT debug ADM iframe hardening', () => {
+  it('sandbox token list omits allow-same-origin', async () => {
+    const mod = await import('../../../src/integrations/gpt/index');
+
+    expect(mod.ADM_IFRAME_SANDBOX).toContain('allow-scripts');
+    // allow-scripts + allow-same-origin on srcdoc content removes the
+    // sandbox's origin isolation — the pair must never be reintroduced.
+    expect(mod.ADM_IFRAME_SANDBOX).not.toContain('allow-same-origin');
+  });
+
+  it('safeAdmIframeSrc accepts http(s), relative, and protocol-relative URLs', async () => {
+    const { safeAdmIframeSrc } = await import('../../../src/integrations/gpt/index');
+
+    expect(safeAdmIframeSrc('https://ads.example.com/creative')).toBe(
+      'https://ads.example.com/creative'
+    );
+    expect(safeAdmIframeSrc('http://ads.example.com/creative')).toBe(
+      'http://ads.example.com/creative'
+    );
+    expect(safeAdmIframeSrc('//ads.example.com/creative')).toBe('https://ads.example.com/creative');
+    expect(safeAdmIframeSrc('/first-party/creative?sig=abc')).toBe('/first-party/creative?sig=abc');
+  });
+
+  it('safeAdmIframeSrc rejects script-executing and opaque schemes', async () => {
+    const { safeAdmIframeSrc } = await import('../../../src/integrations/gpt/index');
+
+    expect(safeAdmIframeSrc('javascript:alert(1)')).toBeUndefined();
+    expect(safeAdmIframeSrc('data:text/html,<script>alert(1)</script>')).toBeUndefined();
+    expect(safeAdmIframeSrc('blob:https://example.com/uuid')).toBeUndefined();
+  });
+});
