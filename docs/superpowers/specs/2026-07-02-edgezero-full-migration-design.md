@@ -10,11 +10,13 @@
 
 ## 1. End-state
 
-trusted-server is a fully EdgeZero-native app: adapter binaries call `run_app::<App>`; core is platform-neutral; config, KV, and secrets flow exclusively through EdgeZero's `StoreRegistry`; app config is a signed blob published by `ts config push` and read back typed at request time with secrets resolved from the secret store; handlers are `#[action]` functions taking `FromRequest` extractors; and no Fastly-specific or pre-EdgeZero shim remains in core or the adapters.
+trusted-server is a fully EdgeZero-native app: adapter binaries are thin entry points (`run_app::<App>` where the platform allows it, or a **documented adapter-level dispatch shim** where it does not — see Fastly below); core is platform-neutral; config, KV, and secrets flow exclusively through EdgeZero's `StoreRegistry`; app config is a signed blob published by `ts config push` and read back typed with secrets resolved from the secret store; handlers are `#[action]` functions taking `FromRequest` extractors; and no *pre-EdgeZero* shim remains in core or the adapters.
+
+**Fastly is not `run_app::<App>` today and may not be at the end** (Blocker, verified `adapter-fastly/src/main.rs`): Fastly deliberately calls `app.router().oneshot()` directly instead of the standard dispatch helpers, because (a) the helpers convert through `fastly::Response` via `set_header`, which **drops duplicate `Set-Cookie` values** from publisher/origin responses, and (b) `run_app_*` triggers a **logger reinit** Fastly must avoid. Fastly also injects `client_info` + `device_signals` (TLS JA4 / H2 fingerprint) into request extensions from the *original* `FastlyRequest` before conversion — signals a reconstructed EdgeZero request cannot expose. This is an **EdgeZero-adapter capability gap**, not trusted-server cruft. Resolution is a **prerequisite (P0-C)**, see §4a.
 
 Concretely, at the end of this migration:
 
-- **No `include_str!` of any `*.toml` config** in any adapter. All four adapters load app config from the EdgeZero config store.
+- **No adapter/runtime app-config baking** — no `include_str!` of `*.toml` **app config** in any adapter runtime path; all four adapters load app config from the EdgeZero config store. (The `ts config init` CLI command still embeds `trusted-server.example.toml` as a scaffolding template — that is not runtime config baking and is out of scope.)
 - **No app-level secrets embedded in the pushed config blob.** Secrets live in the EdgeZero secret store; the blob carries only key names, resolved at request time.
 - **No bespoke `PlatformConfigStore` / `PlatformSecretStore` / `RuntimeServices`.** Core and adapters use EdgeZero `ConfigStore` / `SecretStore` / `KvStore` via `StoreRegistry`.
 - **No `FastlyManagementApiClient`, no `settings_data.rs` chunk resolver, no `config`-crate env overlay, no `Redacted<T>`.**
@@ -32,7 +34,7 @@ Verified across `trusted-server-core`, the four adapters, `trusted-server-cli`, 
 | **KV** | ✅ 100% on EdgeZero (`KvStore`/`KvHandle`, re-exported as `PlatformKvStore`) | None (baseline for the pattern) |
 | **Routing** | ✅ All 4 adapters route through EdgeZero `RouterService` + `Hooks` | None structurally; handler authoring changes in Phase 4 |
 | **Core off `fastly::` types** | ✅ Enforced by `migration_guards.rs` | Keep the guard; extend coverage as adapters shrink |
-| **Config load** | ⚠️ Fastly + Axum load the blob from the config store; **Cloudflare + Spin `include_str!` `trusted-server.example.toml`** | Phase 2 |
+| **Config load** | ⚠️ Fastly + Axum load the blob from the config store; **Cloudflare** reads a `TRUSTED_SERVER_CONFIG` env side-channel (native fallback `include_str!`); **Spin `include_str!` `trusted-server.example.toml`** — none of these is a boot-time config-store read | Phase 2 (P-BOOT) |
 | **Config injection** | ⚠️ `TrustedServerAppConfig` wraps `Settings`, `SECRET_FIELDS = &[]` → secrets inline in blob; `#[derive(AppConfig)]`/`#[secret]` unused | Phases 2–3 |
 | **Config / Secret stores** | ❌ Core uses bespoke `PlatformConfigStore`/`PlatformSecretStore` + `RuntimeServices`; 4× per-adapter `platform.rs` impls; `FastlyManagementApiClient` for writes | Phase 1 |
 | **Fastly config chunking** | ❌ `settings_data.rs` re-implements EdgeZero's `chunked_config.rs` verbatim in core | Phase 1 |
@@ -46,6 +48,9 @@ Verified across `trusted-server-core`, the four adapters, `trusted-server-cli`, 
 2. **`AppConfig<C>` re-parses + verifies + secret-walks the whole blob every request** — too costly for `Settings`. Decision: keep loading `Settings` once at startup into `Arc<Settings>`, exposed via `State<Settings>`, rather than the per-request `AppConfig` extractor (see §4, Decision D1).
 3. **Full secret externalization needs nested/array `#[secret]`** because `Settings` is deeply nested → **Phase 0** (edgezero derive change).
 4. **Integration proxies are a second, nested `matchit` router** with their own `IntegrationProxy::handle(&Settings, &RuntimeServices, req)` convention — orthogonal to the core route handlers (see §4, Decision D2).
+5. **Fastly cannot use `run_app::<App>` today** — it bypasses standard dispatch for multi-value `Set-Cookie` preservation, to skip a logger reinit, and to capture TLS JA4 / H2 fingerprints from the raw `FastlyRequest`. Needs an EdgeZero-adapter capability (**P0-C**, §4a) or a permanent documented exception → **Phase 0 / §4a**.
+6. **Config is loaded at boot, before any request context exists** (`build_state()` → `load_startup_settings()`), but EdgeZero's config-store handle is only wired *per request* (`ConfigRegistry` in request extensions). On Cloudflare, config arrives via a `TRUSTED_SERVER_CONFIG` env side-channel injected at the worker entry; on Spin it's baked example TOML. So "load config from the store at startup" needs a **boot-time store-access mechanism**, not the per-request registry → **§4a + Phase 2**.
+7. **The logical app-config store id is inconsistent** — `settings_data.rs` defaults to `app_config`, `edgezero.toml` declares `trusted_server_config`, and Fastly splits rollout flags (`trusted_server_config`) from the app-config blob (`app_config`). Must be unified → **Decision D5**, before Phase 1/2 planning.
 
 ---
 
@@ -76,9 +81,27 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 **D2 — Integration proxy router stays put (for now).** Phase 4 migrates the **named/core routes** to extractors. The integration registry's nested `matchit` dispatch and `IntegrationProxy::handle` signature are internal, working, and orthogonal; migrating them is a **follow-up** (Phase 4b, optional), not silently dropped. Called out so the extractor migration isn't mistaken for "all handlers."
 
-**D3 — Secret resolution happens at startup, not per request.** With D1, the startup config load resolves `#[secret]` fields against the secret store once (Phase 3). Adapters must therefore have a secret-store handle available at boot, not only per request. Fastly/Axum already open stores eagerly; Cloudflare/Spin resolve from bindings — confirm boot-time access in Phase 3 scoping.
+**D3 — Secret resolution happens at startup, not per request.** With D1, the startup config load resolves `#[secret]` fields against the secret store once (Phase 3). Adapters must therefore have a secret-store handle available **at boot**, not only per request — the same boot-time-store-access problem as config (constraint 6). Resolution is shared with §4a. On Cloudflare `env` and on Spin the host component are both available at the `run_app` entry, so a boot-time handle is constructible; the gap is that EdgeZero currently only exposes stores via the per-request registry.
 
 **D4 — One typed `Settings` as the AppConfig root.** Replace `TrustedServerAppConfig` (wrapper with empty `SECRET_FIELDS`) by deriving `AppConfig` directly on `Settings`, with `#[secret]` on the real secret fields (Phase 3). Removes a transitional indirection.
+
+**D5 — Single logical app-config store id.** Unify on **one** logical config store id and blob key before Phase 1/2 planning. Recommendation: the app-config blob lives in the `edgezero.toml`-declared config store id **`trusted_server_config`** under key **`app_config`** (the current `CONFIG_BLOB_KEY`); reconcile `settings_data.rs`'s `DEFAULT_CONFIG_STORE_ID = "app_config"` to that store id. The competing `app_config` **store** id exists only because rollout flags were parked in `trusted_server_config`; those flags are deleted in Phase 5, removing the reason for two stores. *Open sub-question: keep flags and app-config in the same store until Phase 5, or move flags out first — decide in the Phase 1 plan.*
+
+---
+
+## 4a. Prerequisites (must resolve before or during Phase 1/2)
+
+These are not trusted-server refactors; they are EdgeZero-adapter capability gaps or up-front decisions that gate the phases.
+
+**P0-C — EdgeZero adapter dispatch that preserves multi-value headers and skips logger reinit (Fastly).** For Fastly to reach a thin entry point, EdgeZero's Fastly adapter dispatch must: (1) preserve duplicate response headers (esp. `Set-Cookie`) instead of collapsing via `set_header`; (2) allow the app to opt out of the per-call logger reinit; and (3) provide a hook to inject request-scoped extensions (`client_info`, `device_signals`) derived from the raw `FastlyRequest` before conversion. **Two resolutions:**
+- **(Recommended) Upstream to EdgeZero** as a header-preserving `run_app`/dispatch variant + a pre-dispatch extension hook. Add to the edgezero prerequisite set alongside Phase 0 (A/B). Then Fastly's `main.rs` collapses to that variant.
+- **(Fallback) Permanent documented exception** — Fastly keeps a small adapter-level dispatch shim calling `app.router().oneshot()`. The end-state (§1) already allows this. This is *not* pre-EdgeZero cruft and would survive Phase 5.
+Decision needed with the edgezero maintainer; feeds the same PR track as #305.
+
+**P-BOOT — Boot-time store access for startup config + secret load.** Define, per adapter, how `build_state()` obtains a config-store (and secret-store) handle at boot, before request context. Options:
+- **(a) Boot-time handle from the adapter environment** — Cloudflare builds a config-store handle from the `env` binding passed to `run_app`; Spin from the host component config; Fastly/Axum open the store eagerly (already do). Requires EdgeZero to expose a boot-time store constructor (or trusted-server constructs it from the adapter's env directly, mirroring today's `TRUSTED_SERVER_CONFIG` side-channel but reading the store instead).
+- **(b) Lazy first-request load + cache** — defer the config load to the first request (where the registry exists), cache `Arc<Settings>` in a `OnceCell`. Keeps D1's load-once semantics but moves the load off the boot path. Trade-off: first request pays the cost and must handle a config-load error as a request error.
+Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/Spin both pass it to `run_app`), falling back to **(b)** only if an adapter genuinely cannot construct a boot-time handle. Settle in the Phase 2 plan; this is the load-bearing detail that makes "no baked TOML on Cloudflare/Spin" actually implementable.
 
 ---
 
@@ -87,8 +110,9 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 ### Phase 0 — EdgeZero prerequisites (external, edgezero repo)
 
 **Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#305](https://github.com/stackpop/edgezero/pull/305) — "add State<T> + nested #[secret] design spec".
-**Delivers:** (A) `State<T>` extractor + `RouterBuilder::with_state`; (B) nested/array `#[secret]` in `#[derive(AppConfig)]` + path-aware `secret_walk`.
-**Blocks:** Phase 3 (B), Phase 4 (A). **This umbrella consumes it as a versioned dependency** — bump the pinned `edgezero` rev once merged.
+**Delivers:** (A) `State<T>` extractor + `RouterBuilder::with_state`; (B) nested/array `#[secret]` in `#[derive(AppConfig)]` + path-aware `secret_walk`; **(C, if resolved upstream) P0-C** header-preserving Fastly dispatch + pre-dispatch extension hook (§4a).
+**Blocks:** Phase 3 (B), Phase 4 (A), Phase 5/Fastly end-state (C). **This umbrella consumes it as a versioned dependency** — bump the pinned `edgezero` rev once merged.
+**Note for #305:** the trusted-server secret audit (Phase 3 / §5) confirms **array secrets exist** (`ec.partners[].api_token`, `handlers[].password`) and **optional-string secrets exist** (`ts_pull_token`). So edgezero #305's `ArrayEach` and `Option<String>` support are **required**, not deferrable — this settles that PR's open question B-1.
 
 ---
 
@@ -115,7 +139,7 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 **Changes:**
 - Derive `AppConfig` on the config root (interim: still `TrustedServerAppConfig` until Phase 3 collapses it onto `Settings`) so all adapters use the same store-load path.
-- **Cloudflare** (`adapter-cloudflare/src/app.rs`) and **Spin** (`adapter-spin/src/app.rs`): replace `Settings::from_toml(include_str!(".../trusted-server.example.toml"))` with `get_settings_from_config_store(...)` (now the EdgeZero `ConfigStore` path from Phase 1). Seed each platform's config store (`wrangler.toml` / `runtime-config.toml` / `fastly.toml` local blocks) with the pushed blob.
+- **Cloudflare** (`adapter-cloudflare/src/app.rs`) and **Spin** (`adapter-spin/src/app.rs`): replace startup config sourcing (Cloudflare's `TRUSTED_SERVER_CONFIG` env side-channel + the native `include_str!` fallback; Spin's baked example TOML) with a **boot-time config-store read** per **P-BOOT (§4a)**. `build_state()` obtains a config-store handle from the adapter env passed to `run_app` (option a) or defers to a lazy first-request cached load (option b). This is the load-bearing detail — settle the mechanism in the Phase 2 plan. Seed each platform's config store (`wrangler.toml` / `runtime-config.toml` / `fastly.toml` local blocks) with the pushed blob under the D5 store id/key.
 - Delete `Settings::from_toml_and_env`, `ENVIRONMENT_VARIABLE_PREFIX/SEPARATOR`, and the `config` **dev-dependency**. Any remaining env overlay uses EdgeZero's `EDGEZERO__*` / AppConfig `<APP>__…` layers.
 
 **Deletions:** both `include_str!` config paths, `from_toml_and_env`, `config` crate dep.
@@ -131,13 +155,27 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 **Changes:**
 - Collapse `TrustedServerAppConfig` onto `Settings` (D4): `#[derive(AppConfig)]` on `Settings`, `#[secret]` / `#[secret(store_ref)]` on the real secret fields (S3 keys, request-signing key refs, DataDome server-side key, integration API keys, etc.), including the **nested** ones enabled by Phase 0.
-- Audit `Settings` for the secret inventory **before implementation** — this settles Phase 0's open question B-1 (are any secrets inside arrays?). Feed the answer back to the edgezero PR.
 - Delete `Redacted<T>` and its manual redaction handling; `#[secret]` + the secret store replace it.
 - Operator migration: `ts` provisions secrets into the secret store (via EdgeZero provision), and a migration guide moves existing inline secrets out of `trusted-server.toml`. `reject_placeholder_secrets` becomes a check on the resolved values at boot.
 - Startup load resolves `#[secret]` fields against the secret store (D1/D3), then validates.
 
+**Secret inventory (spec artifact — verify + extend during the Phase 3 plan).** Preliminary audit of `Settings`; shapes drive the edgezero #305 requirements:
+
+| Secret | Path | Shape | Notes |
+|---|---|---|---|
+| Partner API tokens | `ec.partners[].api_token` | **array element** | needs `ArrayEach` (edgezero #305) |
+| Handler passwords | `handlers[].password` | **array element** | needs `ArrayEach` |
+| EC passphrase | `ec.passphrase` | scalar `String` | nested |
+| Pull token | `ts_pull_token` | **`Option<String>`** | needs optional-secret support (edgezero #305) |
+| Publisher proxy secret | `publisher.proxy_secret` | scalar `String` | nested |
+| DataDome server-side key | `integrations.datadome.*` (store-ref name+key) | store-ref | already resolves via secret-store name+key |
+| S3 / proxy secret access key | `proxy.secret_access_key` (+ `proxy.secret_store`) | store-ref | already store-backed |
+| Request-signing keys | `request_signing.*` (`secret_store_id`) | store-ref | already store-backed |
+
+Two consequences: (1) edgezero #305 **must** ship `ArrayEach` + `Option<String>` (see Phase 0 note); (2) the already-store-backed secrets (DataDome, S3, request-signing) need only re-expression as `#[secret(store_ref)]`, not relocation.
+
 **Deletions:** inline secrets in the blob, `Redacted<T>`, `SECRET_FIELDS = &[]` wrapper.
-**Acceptance:** pushed blob contains only secret **key names**; boot resolves them; a config with a nested secret validates and serves; operator migration guide published; tests green.
+**Acceptance:** pushed blob contains only secret **key names**; boot resolves them; a config with nested **and array** secrets validates and serves; operator migration guide published; tests green.
 
 ---
 
@@ -148,14 +186,14 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 **Depends on:** Phase 0 (A) `State<T>`; cleaner after Phase 1.
 
 **Changes:**
-- Introduce `State<Arc<AppState>>` (or narrower `State<Arc<Settings>>` / `State<Arc<AuctionOrchestrator>>` / `State<Arc<IntegrationRegistry>>`) wired via `RouterBuilder::with_state` in each adapter's `Hooks::routes()`.
+- Introduce `State<Arc<AppState>>` (or narrower `State<Arc<Settings>>` / `State<Arc<AuctionOrchestrator>>` / `State<Arc<IntegrationRegistry>>`) wired via `RouterBuilder::with_state` in each adapter's `Hooks::routes()`. *Granularity (one `Arc<AppState>` vs per-component states) is a Phase 4 plan decision.*
 - Rewrite core `handle_*` (`proxy.rs`, `publisher.rs`, `auction/endpoints.rs`, `request_signing/endpoints.rs`, `ec/*.rs`) from `(&Settings, &RuntimeServices, Request<EdgeBody>)` to `#[action]` signatures using `State<…>`, `Json`/`Query`/`Path`/`Headers`/`Host`, and the store extractors (`Kv`, `Secrets`, `Config`).
 - Delete the per-adapter shims (`execute_handler`/`execute_named`/`named_route_handler` + `NamedRouteHandler` enums) and shrink/retire `RuntimeServices` (its store fields already gone in Phase 1; remaining bundle folds into `State` + extractors).
 - **EC lifecycle & pre-route filters** (`build_ec_request_state`, `run_pre_route_filters`, `attach_dispatch_extensions`, `FinalizeResponseMiddleware`) are cross-cutting — keep them as **middleware**, not per-arg extractors.
 - **Phase 4b (optional follow-up, D2):** migrate the integration proxy nested router / `IntegrationProxy::handle` onto `RouterService` + extractors. Deferred by default.
 
 **Deletions:** per-adapter handler shims, `NamedRouteHandler` enums, `RuntimeServices` (final form).
-**Acceptance:** all named routes served via `#[action]` handlers on all adapters; middleware carries EC lifecycle; parity test green.
+**Acceptance:** every named route **that a given adapter supports** is served via an `#[action]` handler on that adapter (route sets are *not* uniform — Fastly exposes EC identity routes `/_ts/api/v1/{identify,batch-sync}`; Spin and Axum deliberately omit them to match non-Fastly adapters); middleware carries EC lifecycle, and **Fastly-only EC after-send / finalize ordering** is preserved; parity test green.
 
 ---
 
@@ -167,11 +205,12 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 **Changes:**
 - Delete `legacy_main` / `route_request` (`adapter-fastly/src/main.rs`), `compat.rs` (fastly↔http shim), and the flag machinery (`edgezero_enabled`, `edgezero_rollout_pct`, `select_edgezero_entrypoint`, `should_route_to_edgezero`, IP-bucket hashing).
-- `main()` calls the EdgeZero path unconditionally (`run_app::<TrustedServerApp>` shape).
-- Retire the `trusted_server_config` rollout-flag reads.
+- `main()` calls the EdgeZero path unconditionally — the P0-C dispatch variant, or the documented Fastly dispatch shim (§4a), depending on how P0-C resolves.
+- Retire the `trusted_server_config` rollout-flag reads (the flags, not the config store — after D5 the store may still hold app config).
+- **Ancillary cleanup (easy to miss):** Fastly route tests importing legacy stores + `route_request` (`adapter-fastly/src/route_tests.rs`); generated Viceroy config rollout flags (`integration-tests/src/bin/generate-viceroy-config.rs`); `fastly.toml` local `edgezero_enabled`/`edgezero_rollout_pct` config; and the rollout runbook `docs/internal/EDGEZERO_MIGRATION.md`.
 
-**Deletions:** `legacy_main`, `route_request`, `compat.rs`, rollout flags.
-**Acceptance:** Fastly adapter has a single EdgeZero entry path; no rollout flags; full CI gate green; production traffic unaffected (already 100% on EdgeZero by gate definition).
+**Deletions:** `legacy_main`, `route_request`, `compat.rs`, rollout flags, `route_tests.rs` legacy imports, viceroy-config flags, `fastly.toml` flag config, `EDGEZERO_MIGRATION.md` runbook.
+**Acceptance:** Fastly adapter has a single EdgeZero entry path; no rollout flags anywhere (adapter, tests, generated config, `fastly.toml`, docs); full CI gate green; production traffic unaffected (already 100% on EdgeZero by gate definition).
 
 ---
 
@@ -183,12 +222,13 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 | Bespoke config/secret store traits | `core/src/platform/traits.rs` (config+secret trait defs); `mod.rs`/`types.rs` edited, not deleted (KV re-export + shrinking `RuntimeServices` stay) | 1 | EdgeZero `ConfigStore`/`SecretStore`/`StoreRegistry` |
 | 4× per-adapter store impls | `adapter-*/src/platform.rs` | 1 | per-adapter EdgeZero store impls |
 | Fastly management REST client | `adapter-fastly/src/management_api.rs` | 1 | EdgeZero CLI provision |
-| `include_str!` config baking | `adapter-{cloudflare,spin}/src/app.rs` | 2 | store-loaded config |
+| Adapter/runtime app-config baking | `adapter-{cloudflare,spin}/src/app.rs` (`include_str!` + Cloudflare `TRUSTED_SERVER_CONFIG` side-channel) | 2 | boot-time store-loaded config (P-BOOT). *`ts config init` template embed is out of scope.* |
 | Legacy env overlay + `config` dep | `core/src/settings.rs` (`from_toml_and_env`, `ENVIRONMENT_VARIABLE_*`) | 2 | `EDGEZERO__*` / AppConfig env layers |
 | AppConfig wrapper w/ empty `SECRET_FIELDS` | `core/src/config.rs` | 3 | `#[derive(AppConfig)]` on `Settings` |
 | `Redacted<T>` | `core/src/redacted.rs` | 3 | `#[secret]` + secret store |
 | Per-adapter handler shims | `adapter-*/src/app.rs` | 4 | `#[action]` + extractors |
 | Legacy Fastly path + flags + compat | `adapter-fastly/src/{main.rs,compat.rs}` | 5 | single EdgeZero entry path |
+| Rollout-flag ancillaries | `adapter-fastly/src/route_tests.rs` (legacy imports), `integration-tests/src/bin/generate-viceroy-config.rs` (flags), `fastly.toml` (local flag config), `docs/internal/EDGEZERO_MIGRATION.md` (runbook) | 5 | — (deleted with the rollout mechanism) |
 
 **Explicitly NOT cruft (do not remove):** `migration_guards.rs` (intentional `fastly::` ban test), `s3_sigv4.rs` (AWS-domain canonical/hashing), `platform/image_optimizer.rs` (no EdgeZero equivalent yet), EC KV CAS wrapper (`ec/kv*.rs` — needs EdgeZero generation-CAS parity first; revisit, don't delete).
 
@@ -198,7 +238,10 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 | ID | Question | Owner / resolution |
 |----|----------|--------------------|
-| R1 | Do any `Settings` secrets live inside **arrays**? | Phase 3 audit; feeds edgezero Phase 0 B-1. |
+| R1 | Do any `Settings` secrets live inside **arrays**? | **Resolved: yes** (`ec.partners[].api_token`, `handlers[].password`) + optional (`ts_pull_token`). edgezero #305 must ship `ArrayEach` + `Option<String>` (see §5 Phase 3 inventory + Phase 0 note). |
+| R7 | P0-C: upstream a header-preserving Fastly dispatch, or keep a permanent Fastly dispatch shim? | Decide with edgezero maintainer (§4a); gates the Fastly end-state and Phase 5. |
+| R8 | P-BOOT: boot-time store handle (a) vs lazy cached first-request load (b), per adapter? | Phase 2 plan (§4a). |
+| R9 | D5: single config-store id `trusted_server_config` (key `app_config`) — confirm and reconcile `settings_data.rs`. | Phase 1 plan. |
 | R2 | `StoreName` vs `StoreId` split — still needed after `management_api.rs` deletion? | Phase 1; drop if only the CLI provision path used it. |
 | R3 | EC identity API + Fastly rate limiter are Fastly-only today | Out of scope here; note as a portability follow-up (not blocking). |
 | R4 | Cloudflare/Spin boot-time secret-store access for D3 | Confirm in Phase 3 scoping. |
