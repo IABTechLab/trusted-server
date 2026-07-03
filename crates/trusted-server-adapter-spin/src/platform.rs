@@ -61,6 +61,57 @@ impl PlatformConfigStore for NoopConfigStore {
     }
 }
 
+/// Spin key-value-backed [`PlatformConfigStore`] used to load the app-config
+/// blob at startup.
+///
+/// `ts config push --adapter spin` writes the app-config blob into a Spin
+/// key-value store (label = the config store id, key = the blob key), so
+/// startup opens that store by name and reads the blob. This is deliberately
+/// distinct from [`ConfigStoreHandleAdapter`], which reads per-request
+/// request-signing config from Spin component *variables*: a multi-kilobyte
+/// blob does not fit Spin's flat variable namespace.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub(crate) struct SpinKvConfigStore;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+impl PlatformConfigStore for SpinKvConfigStore {
+    fn get(&self, store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
+        let label = store_name.as_ref();
+        let store =
+            futures::executor::block_on(spin_sdk::key_value::Store::open(label)).map_err(|e| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "failed to open Spin key-value store `{label}`: {e}"
+                ))
+            })?;
+        let bytes = futures::executor::block_on(store.get(key))
+            .map_err(|e| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "Spin key-value lookup for `{key}` in `{label}` failed: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                Report::new(PlatformError::ConfigStore).attach(format!(
+                    "key `{key}` not found in Spin key-value store `{label}`"
+                ))
+            })?;
+        String::from_utf8(bytes).map_err(|e| {
+            Report::new(PlatformError::ConfigStore).attach(format!(
+                "Spin key-value value for `{key}` is not valid UTF-8: {e}"
+            ))
+        })
+    }
+
+    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported on Spin"))
+    }
+
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("config store writes are not supported on Spin"))
+    }
+}
+
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 struct NoopSecretStore;
 

@@ -1,0 +1,15 @@
+# Spin runtime configuration for the Trusted Server adapter.
+#
+# Declares the `app_config` key-value store that holds the Trusted Server
+# app-config blob loaded at startup and seeded by `ts config push --adapter
+# spin`. Spin auto-provides only the `default` label; any other label (here
+# `app_config`) must be declared here or `spin up` fails with
+# `unknown key_value_stores label app_config`.
+#
+# `type = "spin"` uses Spin's built-in SQLite key-value backend (a local
+# `.spin/sqlite_key_value.db` file), matching what `ts config push --adapter
+# spin --local` writes to. Point it at redis/azure/etc. for a shared backend.
+#
+# Load it explicitly: `spin up --runtime-config-file runtime-config.toml`.
+[key_value_store.app_config]
+type = "spin"

@@ -16,6 +16,9 @@
 /spin
 /spin.sig
 
+# Spin runtime state (local KV/SQLite created by `spin up`)
+.spin/
+
 # EdgeZero local KV store (created by edgezero-adapter-axum framework)
 .edgezero/
 

@@ -26,6 +26,10 @@ use trusted_server_core::request_signing::{
     handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use trusted_server_core::settings_data::{
+    default_config_key, default_config_store_name, get_settings_from_config_store,
+};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, NormalizeMiddleware};
 use crate::platform::build_runtime_services;
@@ -48,8 +52,34 @@ pub struct AppState {
 /// Returns an error when settings, the auction orchestrator, or the integration
 /// registry fail to initialise.
 fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    let settings = Settings::from_toml(include_str!("../../../trusted-server.example.toml"))?;
-    build_state_with_settings(settings)
+    build_state_with_settings(load_startup_settings()?)
+}
+
+/// Loads startup [`Settings`] on the Spin runtime from the app-config blob in
+/// the Spin key-value store seeded by `ts config push --adapter spin` (store id
+/// and blob key both resolve to `app_config`).
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::ConfigStoreUnavailable`] (HTTP 503) when the
+/// store is unseeded or unreadable, and [`TrustedServerError::Configuration`]
+/// (HTTP 500) when the blob fails envelope/settings verification.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    let store_name = default_config_store_name();
+    let config_key = default_config_key();
+    get_settings_from_config_store(
+        &crate::platform::SpinKvConfigStore,
+        &store_name,
+        &config_key,
+    )
+}
+
+/// Loads startup [`Settings`] from the embedded example config on non-Spin
+/// (native test) builds, where Spin host key-value functions are unavailable.
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+fn load_startup_settings() -> Result<Settings, Report<TrustedServerError>> {
+    Settings::from_toml(include_str!("../../../trusted-server.example.toml"))
 }
 
 /// Build the application state from explicit settings.

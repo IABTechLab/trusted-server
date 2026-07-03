@@ -38,7 +38,11 @@ source = "../../target/wasm32-wasip1/release/trusted_server_adapter_spin.wasm"
 # origins are still served over plaintext http. Follow-up: scope this to the
 # configured origins once they can be enumerated from settings.
 allowed_outbound_hosts = ["https://*:*", "http://*:*"]
-key_value_stores = ["default"]
+# `app_config` holds the Trusted Server app-config blob loaded at startup and
+# seeded by `ts config push --adapter spin`. Spin auto-provides only `default`;
+# `app_config` must be granted here and backed by a `[key_value_store.app_config]`
+# stanza in runtime-config.toml (passed via `spin up --runtime-config-file`).
+key_value_stores = ["default", "app_config"]
 
 [component.trusted-server.variables]
 v_current_x2dkid = "{{ v_current_x2dkid }}"

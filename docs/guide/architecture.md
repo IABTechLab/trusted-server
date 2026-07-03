@@ -66,7 +66,7 @@ Native Axum dev/test adapter (native binary):
 Fermyon Spin adapter (`wasm32-wasip1` component):
 
 - Production-capable deployment target for the Spin runtime
-- Platform services (config store, secret store, KV) backed by Spin component variables and the EdgeZero KV handle
+- Startup app-config blob loaded from a Spin key-value store (`app_config`, seeded by `ts config push --adapter spin`); per-request request-signing config and secrets read from Spin component variables; KV via the EdgeZero KV handle
 - Outbound HTTP via `spin_sdk::http::send` — no configurable per-request timeout (see rustdoc)
 - Single auction provider only; multi-provider fan-out requires the Fastly adapter
 

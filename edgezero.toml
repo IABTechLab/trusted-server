@@ -101,5 +101,5 @@ features = ["spin"]
 
 [adapters.spin.commands]
 build = "cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release"
-serve = "spin up --from crates/trusted-server-adapter-spin"
+serve = "spin up --from crates/trusted-server-adapter-spin --runtime-config-file crates/trusted-server-adapter-spin/runtime-config.toml"
 deploy = "spin deploy --from crates/trusted-server-adapter-spin"
