@@ -73,7 +73,7 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
             .as_ref()
             .expect("should declare a KV store")
             .default_id(),
-        "trusted_server_kv",
+        "ec_identity_store",
         "Spin KV declaration must expose its default logical store id"
     );
     assert!(

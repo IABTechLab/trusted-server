@@ -5,7 +5,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config_payload::settings_from_config_blob;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, RuntimeServices, StoreName};
+use crate::platform::{PlatformConfigStore, StoreName};
 use crate::settings::Settings;
 
 const DEFAULT_CONFIG_STORE_ID: &str = "app_config";
@@ -26,29 +26,6 @@ struct FastlyChunkRef {
     key: String,
     len: usize,
     sha256: String,
-}
-
-/// Loads [`Settings`] from the default `EdgeZero` `app_config` config store.
-///
-/// The store name is resolved from `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`
-/// and falls back to the logical id `app_config`. The blob key is resolved from
-/// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` and also falls back to
-/// `app_config`.
-///
-/// # Errors
-///
-/// Returns [`TrustedServerError::ConfigStoreUnavailable`] (HTTP 503) when the
-/// config blob (or a referenced chunk) cannot be read — store unseeded,
-/// transient backend, or a chunk key missing. Returns
-/// [`TrustedServerError::Configuration`] (HTTP 500) when the read succeeds but
-/// the blob fails envelope/chunk verification or Trusted Server settings
-/// validation.
-pub fn get_settings_from_services(
-    services: &RuntimeServices,
-) -> Result<Settings, Report<TrustedServerError>> {
-    let store_name = default_config_store_name();
-    let config_key = default_config_key();
-    get_settings_from_config_store(services.config_store(), &store_name, &config_key)
 }
 
 /// Returns the default `EdgeZero` app-config store name.

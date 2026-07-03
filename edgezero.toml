@@ -21,16 +21,23 @@ version = "0.1.0"
 # any one platform's names. `default` is the primary logical id.
 
 [stores.kv]
-ids = ["trusted_server_kv"]
-default = "trusted_server_kv"
+ids = ["ec_identity_store"]
+default = "ec_identity_store"
 
+# The config store holds the pushed app-config blob. Its id must match the
+# runtime bootstrap store the HTTP layer opens before Settings are loaded
+# (`DEFAULT_CONFIG_STORE_ID`/`CONFIG_BLOB_KEY` = `app_config` in
+# `trusted-server-core::settings_data`). `ts config push` defaults its target
+# to `[stores.config].default`, and Fastly opens config stores by this id
+# directly (no logical->physical binding), so a mismatch would push the blob to
+# a store the runtime never reads -> every request 503s. Keep this `app_config`.
 [stores.config]
-ids = ["trusted_server_config"]
-default = "trusted_server_config"
+ids = ["app_config"]
+default = "app_config"
 
 [stores.secrets]
-ids = ["trusted_server_secrets"]
-default = "trusted_server_secrets"
+ids = ["secrets"]
+default = "secrets"
 
 # -- Fastly Compute (production) --------------------------------------------
 
