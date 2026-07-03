@@ -25,9 +25,6 @@ if [ -z "$NODE_VERSION" ]; then
     exit 1
 fi
 
-echo "==> Validating shared integration-test dependency versions..."
-./scripts/check-integration-dependency-versions.sh
-
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \

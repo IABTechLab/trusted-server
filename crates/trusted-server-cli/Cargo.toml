@@ -2,7 +2,7 @@
 name = "trusted-server-cli"
 version = "0.1.0"
 authors = []
-edition = "2021"
+edition = "2024"
 publish = false
 license = "Apache-2.0"
 
@@ -28,6 +28,34 @@ toml = { workspace = true }
 trusted-server-core = { workspace = true }
 url = { workspace = true }
 which = { workspace = true }
+
+# `ts dev proxy` is macOS-only — CA trust via the login keychain, Safari
+# automation via `networksetup`, and a native TLS / networking stack. Scoping
+# these dependencies to macOS keeps unsupported targets (notably the
+# repo-default `wasm32-wasip1` from `.cargo/config.toml`) from trying to build
+# `tokio`, `ring`, or `aws-lc-sys` for a target they do not support; on those
+# targets the `dev` subcommand is simply absent.
+[target.'cfg(target_os = "macos")'.dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+derive_more = { workspace = true }
+directories = { workspace = true }
+error-stack = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server", "client"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+# Secure (O_EXCL, random-named, 0700) temp dirs for throwaway browser profiles.
+tempfile = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+x509-parser = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = { workspace = true }

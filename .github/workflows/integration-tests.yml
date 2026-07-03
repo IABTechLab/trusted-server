@@ -68,7 +68,6 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          check-dependency-versions: "false"
           install-viceroy: "true"
           build-wasm: "false"
           build-axum: "false"
@@ -128,7 +127,6 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          check-dependency-versions: "false"
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"
@@ -176,7 +174,6 @@ jobs:
         uses: ./.github/actions/setup-integration-test-env
         with:
           origin-port: ${{ env.ORIGIN_PORT }}
-          check-dependency-versions: "false"
           install-viceroy: "true"
           build-wasm: "false"
           build-test-images: "false"
