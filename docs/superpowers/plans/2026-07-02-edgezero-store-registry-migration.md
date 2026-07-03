@@ -82,9 +82,13 @@ git commit -m "Record Phase 1 kind-aware store-id map and confirm D6-a"
 
 ## Task 2: Declare all store ids (kv/config/secrets) in `edgezero.toml` + reconcile fields/fixtures
 
-**Files:**
-- Modify: `edgezero.toml` (`[stores.kv]`, `[stores.config]`, `[stores.secrets]` `ids`)
+**Files (exact):**
+- Modify: `edgezero.toml` (`[stores.kv]`/`[stores.config]`/`[stores.secrets]` `ids`)
+- Modify: `crates/trusted-server-core/src/settings_data.rs` (`DEFAULT_CONFIG_STORE_ID`)
 - Modify: `trusted-server.example.toml`, `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
+- Create: `crates/trusted-server-core/src/testdata/all-store-refs.toml`
+- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-spin/spin.toml` (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state)
+- Create: `crates/trusted-server-core/src/stores.rs` (shared `stores_metadata()`); Modify: each `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` (`impl Hooks` → add `fn stores()`)
 - Test: `crates/trusted-server-core/src/settings.rs` (`#[cfg(test)]`)
 
 **Interfaces:**
@@ -148,8 +152,20 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add edgezero.toml fastly.toml trusted-server.example.toml crates/trusted-server-adapter-*/{wrangler.toml,spin.toml} crates/trusted-server-integration-tests/fixtures crates/trusted-server-core/src
-git commit -m "Declare kv/config/secret store ids in edgezero.toml and reconcile config fields"
+git add edgezero.toml fastly.toml trusted-server.example.toml \
+  crates/trusted-server-adapter-cloudflare/wrangler.toml \
+  crates/trusted-server-adapter-spin/spin.toml \
+  crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml \
+  crates/trusted-server-core/src/settings.rs \
+  crates/trusted-server-core/src/settings_data.rs \
+  crates/trusted-server-core/src/stores.rs \
+  crates/trusted-server-core/src/lib.rs \
+  crates/trusted-server-core/src/testdata/all-store-refs.toml \
+  crates/trusted-server-adapter-fastly/src/app.rs \
+  crates/trusted-server-adapter-axum/src/app.rs \
+  crates/trusted-server-adapter-cloudflare/src/app.rs \
+  crates/trusted-server-adapter-spin/src/app.rs
+git commit -m "Declare kv/config/secret store ids in edgezero.toml, platform manifests, and Hooks::stores()"
 ```
 
 ---
@@ -193,14 +209,14 @@ fn composite_config_reads_named_store_and_writes_delegate() {
     // Unknown store id is a strict error, not a fallback to default.
     let err = composite.get(&StoreName::from("nope"), "kid-1").expect_err("unknown store must error");
     assert!(matches!(err.current_context(), PlatformError::ConfigStore), "unknown id -> ConfigStore error");
-    // Write delegates to the management-path writer.
+    // Write delegates to the management-path writer, PRESERVING the target StoreId (core D6-a risk).
     composite
         .put(&StoreId::from("jwks_store"), "current-kid", "kid-2")
         .expect("should delegate write");
     assert_eq!(
-        writer.puts.lock().expect("lock").as_slice(),
-        &[("current-kid".to_owned(), "kid-2".to_owned())],
-        "write should delegate to the management-path writer",
+        writer.puts.lock().expect("should acquire writer lock").as_slice(),
+        &[("jwks_store".to_owned(), "current-kid".to_owned(), "kid-2".to_owned())],
+        "write must delegate to the writer with the SAME StoreId, key, and value",
     );
 }
 ```
@@ -212,7 +228,7 @@ Expected: FAIL (module does not exist).
 
 - [ ] **Step 3: Implement `composite.rs`**
 
-`get` resolves `reader.named(store_name)` → `ConfigStoreBinding`, then `block_on(binding.handle.get(key))`; `get_bytes` resolves `reader.named(store_name)` → `BoundSecretStore`, then `block_on(bound.get_bytes(key))` (mirror `storage/kv_store.rs`). Strict: `named` returning `None` → `PlatformError`; EdgeZero `Ok(None)`/`Err` → `PlatformError`. `put`/`create`/`delete` forward to `writer`. Add `config_registry(entries, default)` / `secret_registry(...)` / `RecordingConfigWriter` test helpers that build a real `StoreRegistry` from in-memory EdgeZero stores (config entries wrapped as `ConfigStoreBinding { handle, default_key }`).
+`get` resolves `reader.named(store_name)` → `ConfigStoreBinding`, then `block_on(binding.handle.get(key))`; `get_bytes` resolves `reader.named(store_name)` → `BoundSecretStore`, then `block_on(bound.get_bytes(key))` (mirror `storage/kv_store.rs`). Strict: `named` returning `None` → `PlatformError`; EdgeZero `Ok(None)`/`Err` → `PlatformError`. `put`/`create`/`delete` forward to `writer`. Add `config_registry(entries, default)` / `secret_registry(...)` test helpers that build a real `StoreRegistry` from in-memory EdgeZero stores (config entries wrapped as `ConfigStoreBinding { handle, default_key }`), and a `RecordingConfigWriter` (impl `PlatformConfigWriter`) that records **`(StoreId, key, value)`** tuples so tests assert the target StoreId is preserved on delegation.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -291,7 +307,18 @@ git commit -m "Load boot config via EdgeZero config store on Fastly and Axum"
 - Modify: `crates/trusted-server-adapter-{axum,cloudflare,spin}/src/platform.rs` (`build_runtime_services` → composite)
 - Test: `crates/trusted-server-adapter-axum/src/app.rs` route tests (+ cloudflare/spin equivalents)
 
-- [ ] **Step 0: Switch Axum `main.rs` to `run_app::<TrustedServerApp>()`.** Replace the `TrustedServerApp::routes()` + `AxumDevServer::with_config(router, config).run()` path with `edgezero_adapter_axum::run_app::<TrustedServerApp>()` (preserving bind-address/port behavior via the config surface `run_app` exposes, or `DevServer::run` with `.with_*` registry wiring). Confirm the dev server still binds the configured address. Run `cargo run -p trusted-server-adapter-axum` locally to sanity-check it boots.
+- [ ] **Step 0: Wire registries into Axum while keeping the custom PORT behavior.** Do **not** call `dev_server::run_app` — it reads bind config only from `EDGEZERO__ADAPTER__HOST/PORT` and would drop trusted-server's `PORT`/`axum.toml` handling (`main.rs:11`, `port_from_env`). Instead keep the current `AxumDevServer::with_config(router, config)` and chain the builder's registry setters (verified present: `AxumDevServer::{with_config_registry, with_kv_registry, with_secret_registry}`):
+```rust
+// adapter-axum/src/main.rs
+let router = TrustedServerApp::routes();
+let stores = trusted_server_core::stores_metadata(); // Task 2 Step 5
+let mut server = AxumDevServer::with_config(router, config);
+if let Some(reg) = build_config_registry_axum(&stores) { server = server.with_config_registry(reg); }
+if let Some(reg) = build_kv_registry_axum(&stores)     { server = server.with_kv_registry(reg); }
+if let Some(reg) = build_secret_registry_axum(&stores) { server = server.with_secret_registry(reg); }
+server.run()?;
+```
+Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs` mirroring Task 6's Fastly by-id builders but opening the EdgeZero **Axum** store primitives (`.edgezero/*` local backends). This preserves PORT/axum.toml exactly and wires registries. Run `cargo run -p trusted-server-adapter-axum` to confirm it boots on the configured port.
 
 **Interfaces:**
 - Consumes: Task 3 composite; `ConfigRegistry`/`SecretRegistry` from request extensions.
@@ -310,7 +337,7 @@ cargo test-axum first_party_proxy_reads_s3_secret
 ```
 Expected: FAIL (all three).
 
-- [ ] **Step 2: Build `RuntimeServices` via the composite** in each adapter's `build_runtime_services`, passing the whole request `ConfigRegistry`/`SecretRegistry` as the composite reader (Task 3) and the per-adapter **write-only** impl (`PlatformConfigWriter`/`PlatformSecretWriter`, Task 3 Step 0 / Task 8) as the writer.
+- [ ] **Step 2: Build `RuntimeServices` via the composite** in each adapter's `build_runtime_services(ctx: &RequestContext)`. **Extract the whole registry from request extensions** — `ctx.request().extensions().get::<ConfigRegistry>().cloned()` / `get::<SecretRegistry>()` — the same way EdgeZero's `Config`/`Secrets` extractors do. Do **not** use `ctx.config_store_default()`/`config_store(id)` (those return a single bound handle and would wire only the default store). Pass the cloned registry as the composite reader (Task 3) and the per-adapter **write-only** impl (`PlatformConfigWriter`/`PlatformSecretWriter`) as the writer. If a registry is absent from extensions, that is a wiring bug (Step 0 / EdgeZero dispatch) — surface it, don't silently fall back.
 
 - [ ] **Step 3: Run to verify pass** (all three)
 
@@ -378,7 +405,7 @@ With reads via EdgeZero (`FastlyConfigStore` reassembles chunks transparently), 
 
 - [ ] **Step 2: Delete `FastlyChunkPointer`, `FastlyChunkRef`, `resolve_fastly_chunk_pointer`, `sha256_hex`, and the chunk constants;** collapse `get_settings_from_config_store` to `ConfigStore::get` + `settings_from_config_blob`.
 
-- [ ] **Step 3: Run tests** — `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin` → PASS.
+- [ ] **Step 3: Run tests + wasm checks** — `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo check-cloudflare && cargo check-spin` → PASS.
 
 - [ ] **Step 4: Commit**
 
