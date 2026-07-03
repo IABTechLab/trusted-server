@@ -85,7 +85,13 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 **D4 — One typed `Settings` as the AppConfig root.** Replace `TrustedServerAppConfig` (wrapper with empty `SECRET_FIELDS`) by deriving `AppConfig` directly on `Settings`, with `#[secret]` on the real secret fields (Phase 3). Removes a transitional indirection.
 
-**D5 — Single logical app-config store id.** Unify on **one** logical config store id and blob key before Phase 1/2 planning. Recommendation: the app-config blob lives in the `edgezero.toml`-declared config store id **`trusted_server_config`** under key **`app_config`** (the current `CONFIG_BLOB_KEY`); reconcile `settings_data.rs`'s `DEFAULT_CONFIG_STORE_ID = "app_config"` to that store id. The competing `app_config` **store** id exists only because rollout flags were parked in `trusted_server_config`; those flags are deleted in Phase 5, removing the reason for two stores. *Open sub-question: keep flags and app-config in the same store until Phase 5, or move flags out first — decide in the Phase 1 plan.*
+**D5 — Reconcile ALL runtime store ids with `edgezero.toml`.** Not just the app-config blob: EdgeZero's registry lookup is **strict** (unknown id → `None`), so every logical store id any config field or call site names at runtime must appear in `edgezero.toml` `[stores.config]`/`[stores.secrets]` `ids`. Today `edgezero.toml` declares only `trusted_server_config` / `trusted_server_secrets`, while config references `app_config`, `secrets`, JWKS/config-list stores, DataDome `ts_secrets`, S3 secret store, etc. Phase 1 must either (a) declare all these ids in `edgezero.toml` and map each to a platform store via `EDGEZERO__STORES__*__NAME`, or (b) collapse them onto the declared defaults and update every config field + fixture. Recommendation: the app-config blob lives in `trusted_server_config` under key `app_config` (`CONFIG_BLOB_KEY`); collapse incidental ids onto the declared defaults where semantically identical, and declare the genuinely-separate ones (e.g. JWKS store). The full id inventory is the Phase 1 plan's task 1.
+
+**D6 — Runtime write path for request-signing key rotation.** EdgeZero `ConfigStore`/`SecretStore` are **read-only** at runtime; writes go through provisioning (author/ops time). But `KeyRotationManager` writes+deletes config (JWKS) and secrets (private keys) **at request time** via `/_ts/admin/keys/{rotate,deactivate,delete}`, backed by `management_api.rs`. Three resolutions:
+- **(a) Keep a write-capable admin abstraction** — retain the trusted-server `put`/`create`/`delete` traits + `management_api.rs` for the admin write path only; EdgeZero read-only stores serve the read path. Least disruptive; leaves a non-EdgeZero write path (so "completely on EdgeZero" is not literally met for admin writes).
+- **(b) Move key rotation out of runtime** — make rotate/deactivate/delete an **ops/CLI** operation (`ts keys …`) that writes via EdgeZero provisioning; the runtime only reads current keys. Most EdgeZero-native; changes the admin surface from an HTTP endpoint to an operator command — a **product/ops decision**.
+- **(c) Add an EdgeZero runtime store-write/provision API** — upstream change; broadens the platform.
+**Decision needed before Phase 1 deletions.** Until then `management_api.rs` stays. This is R10; recommend (a) as the interim (unblocks Phase 1 read migration) with (b) as the target end-state if ops agrees.
 
 ---
 
@@ -118,18 +124,21 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 
 ### Phase 1 — Stores onto EdgeZero `StoreRegistry`
 
-**Goal:** delete trusted-server's bespoke config/secret store layer; route all store access through EdgeZero `ConfigStore` / `SecretStore` / `StoreRegistry` (KV is already there).
+**Goal:** route all **read** store access through EdgeZero `ConfigStore` / `SecretStore` / `StoreRegistry` (KV is already there), and delete the bespoke read layer + duplicated chunk resolver. **Runtime writes and store-id reconciliation must be resolved first** (see D5, D6 below and the plan's task 1).
+
+> **Plan ordering (per review):** the Phase 1 plan does NOT start with deletions. Task 1 is a **store-capability inventory** — enumerate every runtime store id and every read vs write call site — and a **decision on D6** (runtime writes). Deletions come only after the write path is settled.
 
 **Changes:**
-- Replace `PlatformConfigStore` / `PlatformSecretStore` (`platform/traits.rs`, `types.rs`) and the `RuntimeServices` config/secret fields with EdgeZero `ConfigStoreHandle` / `BoundSecretStore` resolved from the per-request registries (`ConfigRegistry` / `SecretRegistry`), matching how KV already works.
-- Migrate core secret consumers to `secrets.named(id)?.require_str(key)` / config consumers to the config binding: `proxy.rs` (S3), `request_signing/{signing,rotation}.rs`, `integrations/datadome/{protection,protection_scope}.rs`.
-- Delete the 4× per-adapter `platform.rs` config/secret store impls (`FastlyPlatformConfigStore`, `AxumPlatformConfigStore`, `NoopConfigStore`, `Cloudflare…`, and secret equivalents); adapters instead build `ConfigRegistry`/`SecretRegistry` via `dispatch_with_registries` from `[stores.*]` metadata.
-- Delete `FastlyManagementApiClient` (`management_api.rs`) — store writes/provisioning move to the EdgeZero CLI provision path.
+- **Reads:** replace the `PlatformConfigStore`/`PlatformSecretStore` **read** methods and the `RuntimeServices` config/secret fields with EdgeZero `ConfigStoreHandle` / `BoundSecretStore` resolved from the per-request registries (`ConfigRegistry`/`SecretRegistry`), matching KV. Migrate read consumers: `proxy.rs` (S3), `request_signing/{signing,rotation}.rs` (reads), `integrations/datadome/{protection,protection_scope}.rs`.
+- **Writes (D6):** `KeyRotationManager` writes+deletes **config and secrets at request time** (`store_private_key`/`store_public_jwk`/`delete_key` for `/_ts/admin/keys/rotate` + deactivate/delete). EdgeZero `ConfigStore`/`SecretStore` are **read-only by design**. So `management_api.rs` **cannot be deleted in Phase 1 as originally written**. Resolve per D6 before touching it.
+- **Store-id reconciliation (D5, expanded):** every runtime store id referenced by config must be declared in `edgezero.toml` `[stores.config]`/`[stores.secrets]` `ids` or strict registry lookup returns `None`. Reconcile at least: the app-config blob store, `request_signing.config_store_id` (`app_config` today) + `secret_store_id` (`secrets` today), the JWKS/config-list store, DataDome config-list + secret stores (`ts_secrets`), the S3 secret store, and all `trusted-server.example.toml` + integration/test fixtures.
+- **Fastly registry injection (ties to P0-C):** Fastly's custom `oneshot` path (§1) currently inserts only a `ConfigStoreHandle`, not registries via `dispatch_with_registries`. Phase 1 must add explicit `Kv`/`Config`/`Secret` registry construction + insertion into extensions compatible with that custom path (not just the standard dispatch helper the other adapters use).
+- Delete the 4× per-adapter `platform.rs` config/secret **read** impls; adapters build registries from `[stores.*]` metadata (via `dispatch_with_registries` on Axum/Cloudflare/Spin, via the Fastly-specific injection above).
 - Delete `settings_data.rs`'s `FastlyChunkPointer` resolver — EdgeZero's `FastlyConfigStore` resolves chunks transparently. `get_settings_from_config_store` collapses to `ConfigStore::get` + `settings_from_config_blob`.
 
-**Deletions:** `management_api.rs`, `settings_data.rs` chunk resolver, `platform/traits.rs` config/secret traits, 4× `platform.rs` config/secret impls.
-**Keeps:** `RuntimeServices` as a shrinking bundle for the still-explicit-arg handlers (removed in Phase 4); `StoreName`/`StoreId` only where the CLI provisioning still needs the management-id split (revisit).
-**Acceptance:** all adapters build; `cargo test-fastly/-axum/-cloudflare/-spin` green; secret/config reads exercised in tests go through EdgeZero registries; parity test passes.
+**Deletions (after D6/D5 resolved):** `settings_data.rs` chunk resolver, `platform/traits.rs` config/secret **read** traits, 4× `platform.rs` config/secret read impls. **`management_api.rs` deletion is conditional on D6** (may move to CLI/ops instead, or stay as a runtime write path).
+**Keeps:** `RuntimeServices` as a shrinking bundle (removed in Phase 4); the runtime write path until D6 resolves it; `StoreName`/`StoreId` where writes/provisioning need the management-id split.
+**Acceptance:** all adapters build; `cargo test-fastly/-axum/-cloudflare/-spin` + parity green; secret/config **reads** go through EdgeZero registries; **key rotation/delete still works** (per the D6 resolution); every declared store id resolves (no strict-lookup `None`).
 
 ---
 
@@ -221,7 +230,7 @@ Two consequences: (1) edgezero #305 **must** ship `ArrayEach` + `Option<String>`
 | Fastly chunk-pointer resolver | `core/src/settings_data.rs` | 1 | EdgeZero `FastlyConfigStore` + `chunked_config.rs` |
 | Bespoke config/secret store traits | `core/src/platform/traits.rs` (config+secret trait defs); `mod.rs`/`types.rs` edited, not deleted (KV re-export + shrinking `RuntimeServices` stay) | 1 | EdgeZero `ConfigStore`/`SecretStore`/`StoreRegistry` |
 | 4× per-adapter store impls | `adapter-*/src/platform.rs` | 1 | per-adapter EdgeZero store impls |
-| Fastly management REST client | `adapter-fastly/src/management_api.rs` | 1 | EdgeZero CLI provision |
+| Fastly management REST client (**runtime writes**) | `adapter-fastly/src/management_api.rs` | **conditional (D6)** — 1 only if key rotation moves to ops/CLI; otherwise retained as the admin write path | EdgeZero provisioning (if writes leave runtime) — else no replacement |
 | Adapter/runtime app-config baking | `adapter-{cloudflare,spin}/src/app.rs` (`include_str!` + Cloudflare `TRUSTED_SERVER_CONFIG` side-channel) | 2 | boot-time store-loaded config (P-BOOT). *`ts config init` template embed is out of scope.* |
 | Legacy env overlay + `config` dep | `core/src/settings.rs` (`from_toml_and_env`, `ENVIRONMENT_VARIABLE_*`) | 2 | `EDGEZERO__*` / AppConfig env layers |
 | AppConfig wrapper w/ empty `SECRET_FIELDS` | `core/src/config.rs` | 3 | `#[derive(AppConfig)]` on `Settings` |
@@ -241,7 +250,8 @@ Two consequences: (1) edgezero #305 **must** ship `ArrayEach` + `Option<String>`
 | R1 | Do any `Settings` secrets live inside **arrays**? | **Resolved: yes** (`ec.partners[].api_token`, `handlers[].password`) + optional (`ts_pull_token`). edgezero #305 must ship `ArrayEach` + `Option<String>` (see §5 Phase 3 inventory + Phase 0 note). |
 | R7 | P0-C: upstream a header-preserving Fastly dispatch, or keep a permanent Fastly dispatch shim? | Decide with edgezero maintainer (§4a); gates the Fastly end-state and Phase 5. |
 | R8 | P-BOOT: boot-time store handle (a) vs lazy cached first-request load (b), per adapter? | Phase 2 plan (§4a). |
-| R9 | D5: single config-store id `trusted_server_config` (key `app_config`) — confirm and reconcile `settings_data.rs`. | Phase 1 plan. |
+| R9 | D5: reconcile **all** runtime store ids (`app_config`, `secrets`, JWKS, DataDome `ts_secrets`, S3, fixtures) with `edgezero.toml` — strict lookup fails otherwise. | Phase 1 plan task 1. |
+| R10 | D6: runtime write path for key rotation — keep write-capable admin abstraction (a), move to ops/CLI (b), or upstream an EdgeZero write API (c)? | **Blocks Phase 1 deletions.** Decide before deleting `management_api.rs`. |
 | R2 | `StoreName` vs `StoreId` split — still needed after `management_api.rs` deletion? | Phase 1; drop if only the CLI provision path used it. |
 | R3 | EC identity API + Fastly rate limiter are Fastly-only today | Out of scope here; note as a portability follow-up (not blocking). |
 | R4 | Cloudflare/Spin boot-time secret-store access for D3 | Confirm in Phase 3 scoping. |
