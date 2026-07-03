@@ -378,27 +378,34 @@ fn legacy_admin_alias_denied() -> Response {
 // Startup error fallback
 // ---------------------------------------------------------------------------
 
-/// Returns a [`RouterService`] that responds to every route with a generic
-/// 503 Service Unavailable. The startup error is logged but not echoed in the
-/// response body so that deployment state is not leaked to anonymous callers.
+/// Returns a [`RouterService`] that answers every route with the startup
+/// error's mapped HTTP status: an unseeded/unreadable config store yields 503,
+/// while a blob that reads but fails envelope/settings verification yields 500.
+/// The body is the generic user-facing message so deployment state is not
+/// leaked to anonymous callers.
 fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
-    log::error!("startup failed, serving error fallback: {:?}", e);
+    log::error!("startup failed, serving error fallback: {e:?}");
 
-    let handler = |_ctx: RequestContext| {
-        let body = edgezero_core::body::Body::from("Service Unavailable\n");
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        async move { Ok::<Response, EdgeError>(resp) }
+    let status = e.current_context().status_code();
+    let message = Arc::new(format!("{}\n", e.current_context().user_message()));
+
+    let make = move |msg: Arc<String>| {
+        move |_ctx: RequestContext| {
+            let body = edgezero_core::body::Body::from((*msg).clone());
+            let mut resp = Response::new(body);
+            *resp.status_mut() = status;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            async move { Ok::<Response, EdgeError>(resp) }
+        }
     };
 
     // Cover the full publisher fallback method set (GET, POST, HEAD, OPTIONS,
     // PUT, PATCH, DELETE) so degraded behaviour stays consistent with the
-    // healthy router: every method on `/` and `/{*rest}` returns the generic
-    // 503 instead of a router-level 405 for HEAD/OPTIONS/PATCH.
+    // healthy router: every method on `/` and `/{*rest}` returns the mapped
+    // error status instead of a router-level 405 for HEAD/OPTIONS/PATCH.
     let mut builder = RouterService::builder().middleware(FinalizeResponseMiddleware::new(
         Arc::new(Settings::default()),
     ));
@@ -408,8 +415,8 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
         Ok::<Response, EdgeError>(health_response())
     });
     for method in publisher_fallback_methods() {
-        builder = builder.route("/", method.clone(), handler);
-        builder = builder.route("/{*rest}", method, handler);
+        builder = builder.route("/", method.clone(), make(Arc::clone(&message)));
+        builder = builder.route("/{*rest}", method, make(Arc::clone(&message)));
     }
     builder.build()
 }
@@ -983,8 +990,9 @@ mod tests {
         // (including HEAD/OPTIONS/PATCH) on both "/" and nested paths with the
         // generic 503, never a router-level 405, so startup-failure behaviour
         // stays consistent with the healthy router.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
+        let report = Report::new(TrustedServerError::ConfigStoreUnavailable {
+            store_name: "app_config".to_string(),
+            message: "unseeded".to_string(),
         });
         let router = startup_error_router(&report);
 
@@ -1010,11 +1018,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_error_router_maps_verify_failure_to_500() {
+        // A blob that reads but fails envelope/settings verification is a
+        // Configuration error (500), not a config-store read failure (503). The
+        // startup router must surface that distinction, not flatten to 503.
+        let report = Report::new(TrustedServerError::Configuration {
+            message: "blob failed integrity verification".to_string(),
+        });
+        let router = startup_error_router(&report);
+
+        let req = edgezero_core::http::request_builder()
+            .method("GET")
+            .uri("/")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let status = router
+            .oneshot(req)
+            .await
+            .expect("should route startup-error request")
+            .status()
+            .as_u16();
+        assert_eq!(
+            status, 500,
+            "a verify-failure startup error must map to 500, not a flattened 503"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_error_router_answers_health_with_200() {
         // The liveness probe must keep returning 200 even while application state
         // construction is failing, matching the Fastly/Axum health behaviour.
-        let report = Report::new(TrustedServerError::BadRequest {
-            message: "startup failure".to_string(),
+        let report = Report::new(TrustedServerError::ConfigStoreUnavailable {
+            store_name: "app_config".to_string(),
+            message: "unseeded".to_string(),
         });
         let router = startup_error_router(&report);
 
