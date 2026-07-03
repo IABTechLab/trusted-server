@@ -65,10 +65,10 @@
 //!   run on these responses. Legacy ran EC finalization on its own auth
 //!   challenges. Like the 401 geo-skip, this is privacy-conservative: no EC
 //!   cookies are issued to unauthenticated callers.
-//! - **Publisher responses** are buffered (bounded by
-//!   `publisher.max_buffered_body_bytes`) instead of streamed to the client.
-//!   Asset responses are streamed straight to the client (see
-//!   [`dispatch_asset_fallback`]), matching legacy.
+//! - **Publisher HTML responses with full-document post-processors** remain
+//!   buffered (bounded by `publisher.max_buffered_body_bytes`). Other
+//!   processable publisher responses and asset responses stream through to the
+//!   client.
 //! - **Router-level 405s** (unregistered verbs) skip EC finalization along
 //!   with the middleware chain; the entry point still adds TS headers.
 //!
@@ -115,7 +115,8 @@ use trusted_server_core::proxy::{
     handle_first_party_proxy_rebuild, handle_first_party_proxy_sign, AssetProxyCachePolicy,
 };
 use trusted_server_core::publisher::{
-    buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
+    handle_streaming_publisher_request, handle_tsjs_dynamic, OwnedProcessResponseParams,
+    PublisherResponse,
 };
 use trusted_server_core::request_signing::{
     handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
@@ -146,6 +147,14 @@ pub(crate) struct AppState {
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
+}
+
+/// Processing state consumed by the Fastly entry point when it writes a
+/// publisher response directly into the client stream.
+pub(crate) struct PublisherStreamState {
+    pub(crate) params: OwnedProcessResponseParams,
+    pub(crate) settings: Arc<Settings>,
+    pub(crate) registry: Arc<IntegrationRegistry>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -731,24 +740,59 @@ async fn dispatch_fallback(
         // available — fail closed with 503 when it is configured but cannot
         // be opened, matching legacy behavior.
         match runtime_services_for_consent_route(&state.settings, services) {
-            Ok(publisher_services) => {
-                handle_publisher_request(&state.settings, &state.registry, &publisher_services, req)
-                    .await
-                    .and_then(|pub_response| {
-                        buffer_publisher_response(
-                            pub_response,
-                            &method,
-                            &state.settings,
-                            &state.registry,
-                        )
-                    })
-            }
+            Ok(publisher_services) => handle_streaming_publisher_request(
+                &state.settings,
+                &state.registry,
+                &publisher_services,
+                req,
+            )
+            .await
+            .map(|publisher_response| {
+                resolve_publisher_response(publisher_response, &method, state)
+            }),
             Err(e) => Err(e),
         }
     };
 
     let response = result.unwrap_or_else(|e| http_error(&e));
     attach_dispatch_extensions(response, ec, effects)
+}
+
+fn resolve_publisher_response(
+    publisher_response: PublisherResponse,
+    method: &Method,
+    state: &AppState,
+) -> Response {
+    match publisher_response {
+        PublisherResponse::Buffered(response) => response,
+        PublisherResponse::Stream {
+            mut response,
+            body,
+            params,
+        } => {
+            if response_carries_body(method, response.status()) {
+                *response.body_mut() = body;
+                response
+                    .extensions_mut()
+                    .insert(Arc::new(PublisherStreamState {
+                        params,
+                        settings: Arc::clone(&state.settings),
+                        registry: Arc::clone(&state.registry),
+                    }));
+            }
+            response
+        }
+        PublisherResponse::PassThrough { mut response, body } => {
+            *response.body_mut() = body;
+            response
+        }
+    }
+}
+
+fn response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
 }
 
 /// Returns `true` when an asset response should carry a (streamed) body.
@@ -1238,10 +1282,15 @@ mod tests {
     impl PlatformHttpClient for StreamingHttpClient {
         async fn send(
             &self,
-            _request: PlatformHttpRequest,
+            request: PlatformHttpRequest,
         ) -> Result<PlatformResponse, Report<PlatformError>> {
+            assert!(
+                request.stream_response,
+                "streaming Fastly routes should request an origin response stream"
+            );
             let response = edgezero_core::http::response_builder()
                 .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html")
                 .body(Body::stream(futures::stream::iter(vec![
                     Bytes::from_static(b"streamed-asset"),
                 ])))
@@ -2164,6 +2213,47 @@ mod tests {
         assert!(
             matches!(response.body(), Body::Stream(_)),
             "EdgeZero asset dispatch must stream the origin body, not buffer it"
+        );
+    }
+
+    #[test]
+    fn dispatch_publisher_fallback_preserves_origin_stream() {
+        let state =
+            build_state_from_settings(test_settings()).expect("should build publisher test state");
+        let services = streaming_runtime_services();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/")
+            .header(header::HOST, "test-publisher.com")
+            .body(Body::empty())
+            .expect("should build publisher request");
+
+        let response = block_on(super::dispatch_fallback(&state, &services, req));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should preserve the streaming origin status"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html"),
+            "should preserve the processable origin content type"
+        );
+        assert!(
+            matches!(response.body(), Body::Stream(_)),
+            "Fastly publisher dispatch must preserve the origin stream: {:?}",
+            response.body()
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<Arc<super::PublisherStreamState>>()
+                .is_some(),
+            "publisher streams should carry processing state for the entry point"
         );
     }
 

@@ -23,6 +23,7 @@ use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::platform::PlatformGeo as _;
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{stream_asset_body, AssetProxyCachePolicy};
+use trusted_server_core::publisher::stream_publisher_body;
 use trusted_server_core::settings::Settings;
 
 mod app;
@@ -35,7 +36,9 @@ mod middleware;
 mod platform;
 mod rate_limiter;
 
-use crate::app::{load_settings_from_config_store, EcFinalizeState, TrustedServerApp};
+use crate::app::{
+    load_settings_from_config_store, EcFinalizeState, PublisherStreamState, TrustedServerApp,
+};
 use crate::ec_kv::FastlyEcKvStore;
 use crate::middleware::{apply_finalize_headers, resolve_geo_for_response, HEADER_X_TS_FINALIZED};
 use crate::platform::{client_info_from_request, FastlyPlatformGeo};
@@ -320,9 +323,9 @@ fn run_edgezero_pull_sync_after_send(
 
 /// Sends a finalized `EdgeZero` response to the client.
 ///
-/// Asset responses carry an [`EdgeBody::Stream`] body: headers are committed
-/// first, then the origin body is piped chunk by chunk so large assets never
-/// materialize in the Wasm heap. Other responses are sent in one shot.
+/// Publisher and asset streams commit headers first, then pipe the origin body
+/// chunk by chunk so large responses do not materialize in the Wasm heap.
+/// Other responses are sent in one shot.
 fn send_edgezero_response(
     mut response: HttpResponse,
     request_filter_effects: Option<&RequestFilterEffects>,
@@ -331,7 +334,35 @@ fn send_edgezero_response(
         effects.apply_to_response(&mut response);
     }
 
+    let publisher_stream = response
+        .extensions_mut()
+        .remove::<Arc<PublisherStreamState>>();
     let (parts, body) = response.into_parts();
+
+    if let Some(stream_state) = publisher_stream {
+        let skeleton =
+            compat::to_fastly_response_skeleton(HttpResponse::from_parts(parts, EdgeBody::empty()));
+        let mut streaming_body = skeleton.stream_to_client();
+        match stream_publisher_body(
+            body,
+            &mut streaming_body,
+            &stream_state.params,
+            &stream_state.settings,
+            &stream_state.registry,
+        ) {
+            Ok(()) => {
+                if let Err(e) = streaming_body.finish() {
+                    log::error!("failed to finish EdgeZero publisher streaming body: {e}");
+                }
+            }
+            Err(e) => {
+                log::error!("EdgeZero publisher streaming failed: {e:?}");
+                drop(streaming_body);
+            }
+        }
+        return;
+    }
+
     match body {
         EdgeBody::Stream(_) => {
             let skeleton = compat::to_fastly_response_skeleton(HttpResponse::from_parts(
