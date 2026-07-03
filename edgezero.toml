@@ -1,0 +1,98 @@
+# Unified EdgeZero manifest for Trusted Server.
+#
+# One portable app definition plus one `[adapters.<name>]` block per runtime
+# target (fastly, axum, cloudflare, spin). Store declarations are portable:
+# they list the logical store ids the app uses. Platform store names / bindings
+# are supplied out of band (fastly.toml service resources, the Spin runtime,
+# Cloudflare bindings, axum local files), so the ids here are the union across
+# adapters with `default` set to the primary (production Fastly) id.
+
+[app]
+name = "trusted-server"
+entry = "crates/trusted-server-core"
+kind = "http"
+version = "0.1.0"
+
+# -- Stores ------------------------------------------------------------------
+# Logical store ids only. These are the portable Trusted Server names; the
+# physical store each adapter binds is overridable out of band (Fastly binds
+# `ec_identity_store`/`app_config`/secret stores in `fastly.toml`, Spin via its
+# runtime config, Cloudflare via bindings), so the ids here do not have to match
+# any one platform's names. `default` is the primary logical id.
+
+[stores.kv]
+ids = ["trusted_server_kv"]
+default = "trusted_server_kv"
+
+[stores.config]
+ids = ["trusted_server_config"]
+default = "trusted_server_config"
+
+[stores.secrets]
+ids = ["trusted_server_secrets"]
+default = "trusted_server_secrets"
+
+# -- Fastly Compute (production) --------------------------------------------
+
+[adapters.fastly.adapter]
+crate = "crates/trusted-server-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.build]
+target = "wasm32-wasip1"
+profile = "release"
+
+[adapters.fastly.commands]
+auth-login = "fastly profile create"
+auth-logout = "fastly profile delete"
+auth-status = "fastly profile list"
+build = "cargo build --bin trusted-server-adapter-fastly --release --target wasm32-wasip1 --color always"
+serve = "fastly compute serve"
+deploy = "fastly compute publish"
+
+# -- Axum (native dev server) -----------------------------------------------
+
+[adapters.axum.adapter]
+crate = "crates/trusted-server-adapter-axum"
+manifest = "crates/trusted-server-adapter-axum/axum.toml"
+
+[adapters.axum.build]
+target = "native"
+profile = "dev"
+
+[adapters.axum.commands]
+build = "cargo build -p trusted-server-adapter-axum"
+serve = "cargo run -p trusted-server-adapter-axum"
+
+# -- Cloudflare Workers ------------------------------------------------------
+
+[adapters.cloudflare.adapter]
+crate = "crates/trusted-server-adapter-cloudflare"
+manifest = "crates/trusted-server-adapter-cloudflare/wrangler.toml"
+
+[adapters.cloudflare.build]
+target = "wasm32-unknown-unknown"
+profile = "release"
+features = ["cloudflare"]
+
+[adapters.cloudflare.commands]
+build = "cargo build -p trusted-server-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare"
+serve = "wrangler dev --cwd crates/trusted-server-adapter-cloudflare"
+deploy = "wrangler deploy --cwd crates/trusted-server-adapter-cloudflare"
+
+# -- Fermyon Spin ------------------------------------------------------------
+
+[adapters.spin.adapter]
+crate = "crates/trusted-server-adapter-spin"
+manifest = "crates/trusted-server-adapter-spin/spin.toml"
+component = "trusted-server"
+
+[adapters.spin.build]
+target = "wasm32-wasip1"
+profile = "release"
+features = ["spin"]
+
+[adapters.spin.commands]
+build = "cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release"
+serve = "spin up --from crates/trusted-server-adapter-spin"
+deploy = "spin deploy --from crates/trusted-server-adapter-spin"

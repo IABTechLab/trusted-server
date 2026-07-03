@@ -557,18 +557,14 @@ impl PlatformGeo for FastlyPlatformGeo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// KV store
-// ---------------------------------------------------------------------------
-
 /// Extract [`ClientInfo`] from the original Fastly request.
 ///
 /// Fastly's TLS, JA4, and HTTP/2 fingerprint accessors only return real values
 /// on the client request before it is converted to platform HTTP types. This
-/// must therefore be called at the adapter entry point while the original
-/// [`fastly::Request`] is still available. `edgezero_main` stores the result in
-/// request extensions so `build_per_request_services` can read back the same
-/// bot-protection metadata the reconstructed request cannot expose.
+/// must therefore be called by the `EdgeZero` entry point while the original
+/// [`fastly::Request`] is still available. The result is stored in request
+/// extensions so `build_per_request_services` can read back metadata the
+/// reconstructed request cannot expose.
 #[must_use]
 pub fn client_info_from_request(req: &Request) -> ClientInfo {
     ClientInfo {
@@ -605,10 +601,9 @@ mod tests {
     use std::io;
     use std::time::Duration;
 
+    use super::*;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
-
-    use super::*;
 
     #[test]
     fn edge_request_to_fastly_replaces_url_derived_host_header() {

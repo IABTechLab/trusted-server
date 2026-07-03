@@ -9,6 +9,6 @@ binding = "TRUSTED_SERVER_KV"
 id = "ci-local-kv"
 
 [vars]
-# Settings are baked into the WASM binary at build time; this JSON only needs
-# to satisfy any runtime config-store lookups (e.g. request-signing keys).
+# Placeholder replaced by the integration test harness with a JSON object that
+# contains the runtime Trusted Server app-config blob envelope.
 TRUSTED_SERVER_CONFIG = "{}"

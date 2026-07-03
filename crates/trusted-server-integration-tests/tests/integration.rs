@@ -19,16 +19,14 @@ fn init_logger() {
 }
 
 #[test]
-fn default_fastly_viceroy_template_defines_trusted_server_config_store() {
+fn default_fastly_viceroy_template_has_generated_config_store_marker() {
     let template = include_str!("../fixtures/configs/viceroy-template.toml");
+    const MARKER: &str = "# GENERATED_TRUSTED_SERVER_CONFIG_STORES";
 
-    assert!(
-        template.contains("[local_server.config_stores.trusted_server_config]"),
-        "default Fastly Viceroy template should define trusted_server_config"
-    );
-    assert!(
-        template.contains("[local_server.config_stores.trusted_server_config.contents]"),
-        "default Fastly Viceroy template should define trusted_server_config contents"
+    assert_eq!(
+        template.matches(MARKER).count(),
+        1,
+        "default Fastly Viceroy template should contain exactly one generated config-store marker"
     );
 }
 
@@ -215,13 +213,9 @@ fn test_ec_lifecycle_fastly() {
         process.base_url
     );
 
-    // EdgeZero entry-point canary. The focused CI job opts into this assertion
-    // via EXPECT_EDGEZERO_ENTRY_POINT so the EC lifecycle run verifies it reached
-    // the post-cutover router before executing route-level scenarios.
-    if std::env::var("EXPECT_EDGEZERO_ENTRY_POINT").as_deref() == Ok("true") {
-        common::ec::assert_edgezero_entry_point(&process.base_url)
-            .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
-    }
+    // Verify the post-cutover router is active before route-level scenarios.
+    common::ec::assert_edgezero_entry_point(&process.base_url)
+        .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
 
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");

@@ -17,8 +17,8 @@ const BASIC_AUTH_REALM: &str = r#"Basic realm="Trusted Server""#;
 /// when the supplied credentials are valid. Returns `Ok(Some(Response))` with
 /// the auth challenge when credentials are missing or invalid.
 ///
-/// Admin endpoints are protected by requiring a handler at build time; see
-/// [`Settings::from_toml_and_env`]. Credential checks use constant-time
+/// Admin endpoints are protected by requiring a handler during settings
+/// finalization; see [`Settings::from_toml`]. Credential checks use constant-time
 /// comparison for both username and password, and evaluate both regardless of
 /// individual match results to avoid timing oracles.
 ///

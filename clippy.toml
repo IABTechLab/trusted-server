@@ -1,11 +1,14 @@
 # Clippy configuration. See https://doc.rust-lang.org/clippy/lint_configuration.html
 #
-# Test code uses `.unwrap()`, `.expect()`, `panic!`, `assert!`, indexing, and
-# other "if this fails, the test fails" idioms by convention. We keep the
-# corresponding restriction lints active in production code but exempt tests.
+# Test code uses `.unwrap()`, `.expect()`, `panic!`, `assert!`, indexing,
+# `println!`/`dbg!`, and other "if this fails, the test fails" idioms by
+# convention. We keep the corresponding restriction lints active in production
+# code but exempt tests.
+allow-dbg-in-tests = true
 allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
+allow-print-in-tests = true
 allow-unwrap-in-tests = true
 
 # Keep current Trusted Server thresholds while strict lint cleanup is underway.

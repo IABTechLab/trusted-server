@@ -18,7 +18,10 @@ const WASM_PATH =
 
 const VICEROY_CONFIG =
   process.env.VICEROY_CONFIG_PATH ||
-  resolve(__dirname, "../fixtures/configs/viceroy-template.toml");
+  resolve(
+    __dirname,
+    "../../../target/integration-test-artifacts/configs/viceroy.toml",
+  );
 
 /** Persist current state so global-teardown can always clean up. */
 function writeState(state: {

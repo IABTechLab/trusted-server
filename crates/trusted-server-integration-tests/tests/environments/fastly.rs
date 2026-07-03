@@ -1,7 +1,7 @@
 use crate::common::runtime::{
     RuntimeEnvironment, RuntimeProcess, RuntimeProcessHandle, TestError, TestResult,
 };
-use error_stack::ResultExt as _;
+use error_stack::{Report, ResultExt as _};
 use std::io::{BufRead as _, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -9,9 +9,8 @@ use std::process::{Child, Command, Stdio};
 /// Fastly Compute runtime using Viceroy local simulator.
 ///
 /// Spawns a `viceroy` child process with the WASM binary and the
-/// Viceroy-specific `fastly.toml` config (KV stores, secrets).
-/// The application config (origin URL, integrations) is baked into
-/// the WASM binary at build time.
+/// generated Viceroy config (runtime resources plus Trusted Server app-config
+/// blob).
 pub struct FastlyViceroy;
 
 impl RuntimeEnvironment for FastlyViceroy {
@@ -23,6 +22,12 @@ impl RuntimeEnvironment for FastlyViceroy {
         let port = super::find_available_port()?;
 
         let viceroy_config = self.viceroy_config_path();
+        if !viceroy_config.exists() {
+            return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+                "Viceroy config `{}` does not exist; run `scripts/generate-integration-viceroy-configs.sh` or `scripts/integration-tests.sh`, or set VICEROY_CONFIG_PATH to a generated config",
+                viceroy_config.display()
+            )));
+        }
 
         let mut child = Command::new("viceroy")
             .arg(wasm_path)
@@ -63,15 +68,15 @@ impl RuntimeEnvironment for FastlyViceroy {
 }
 
 impl FastlyViceroy {
-    /// Path to the Viceroy-specific `fastly.toml` template.
+    /// Path to the generated Viceroy configuration.
     ///
     /// This contains `[local_server]` configuration (backends, KV stores,
-    /// secret stores) that Viceroy needs, separate from the application config.
+    /// secret stores) plus generated test application config stores.
     ///
     /// Honors the `VICEROY_CONFIG_PATH` environment variable so CI jobs can
-    /// point the same WASM binary at specialized Viceroy fixtures. Falls back
-    /// to the post-cutover default template, which includes the
-    /// `trusted_server_config` store required by the Fastly entry point.
+    /// select a generated config. This mirrors the browser harness's
+    /// `global-setup.ts`, which reads the same variable. Falls back to the local
+    /// generated config path when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {
         if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH")
             && !path.is_empty()
@@ -79,7 +84,7 @@ impl FastlyViceroy {
             return std::path::PathBuf::from(path);
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/configs/viceroy-template.toml")
+            .join("../../target/integration-test-artifacts/configs/viceroy.toml")
     }
 }
 

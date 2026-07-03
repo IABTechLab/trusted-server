@@ -27,6 +27,18 @@ cargo build-fastly       # Fastly adapter + core (wasm32-wasip1)
 cargo build-axum         # Axum dev server (native)
 cargo build-cloudflare   # Cloudflare Workers (wasm32-unknown-unknown)
 
+# Build the host-target CLI
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --package trusted-server-cli --target "$HOST_TARGET"
+
+# Create local config, then edit placeholders before validation
+ts config init
+# Edit trusted-server.toml
+ts config validate
+
+# Audit a public page with Chrome/Chromium to bootstrap a draft config
+ts audit https://publisher.example
+
 # Run tests (Fastly/WASM crates — requires Viceroy)
 cargo test-fastly
 

@@ -271,7 +271,6 @@ fn mappings_to_json(mappings: &[BatchMapping]) -> Vec<Value> {
 // Assertion helpers
 // ---------------------------------------------------------------------------
 
-/// Asserts the response has a specific HTTP status code.
 /// Asserts the running Viceroy instance is serving the post-cutover `EdgeZero`
 /// entry point.
 ///

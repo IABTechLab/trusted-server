@@ -1,5 +1,6 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
 
+use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
 
@@ -12,16 +13,40 @@ pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
     }
 
     match body {
-        edgezero_core::body::Body::Once(bytes) => {
+        EdgeBody::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_resp.set_body(bytes.to_vec());
             }
         }
-        edgezero_core::body::Body::Stream(_) => {
+        EdgeBody::Stream(_) => {
+            // Streaming bodies cannot cross the compat boundary. Both audited call sites
+            // (legacy_main buffered arm and edgezero_main after EdgeZero collapses bodies
+            // to Once) only pass Once bodies — a Stream here is a caller error.
+            // The assert is suppressed in test builds where the behavior-documentation
+            // test deliberately exercises this path.
+            #[cfg(not(test))]
+            debug_assert!(
+                false,
+                "to_fastly_response: streaming body will be silently dropped; \
+                 use to_fastly_response_skeleton + stream_to_client for streaming responses"
+            );
             log::warn!("streaming body in compat::to_fastly_response; body will be empty");
         }
     }
 
+    fastly_resp
+}
+
+/// Convert an [`HttpResponse`] into a `fastly::Response` without a body.
+///
+/// Use this when the caller will stream the body separately through
+/// [`fastly::Response::stream_to_client`].
+pub(crate) fn to_fastly_response_skeleton(resp: HttpResponse) -> fastly::Response {
+    let (parts, _body) = resp.into_parts();
+    let mut fastly_resp = fastly::Response::from_status(parts.status.as_u16());
+    for (name, value) in &parts.headers {
+        fastly_resp.append_header(name.as_str(), value.as_bytes());
+    }
     fastly_resp
 }
 
@@ -77,7 +102,7 @@ mod tests {
         use edgezero_core::http::StatusCode;
 
         let stream = futures::stream::empty::<bytes::Bytes>();
-        let stream_body = edgezero_core::body::Body::stream(stream);
+        let stream_body = EdgeBody::stream(stream);
 
         let http_resp = edgezero_core::http::response_builder()
             .status(StatusCode::OK)
