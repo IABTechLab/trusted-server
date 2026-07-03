@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-02-edgezero-full-migration-design.md` §5 Phase 1, D5, D6, §4a.
 
+## Pinned dependency (verified)
+
+This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktree-state-nested-secrets-spec-review` @ `6ebc29a5`** (PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306)). That commit **has** every API this plan uses — verified by inspecting the pinned checkout: `store_registry.rs` (`StoreRegistry`/`ConfigRegistry`/`SecretRegistry`/`from_parts`), `StoresMetadata` + `Hooks::stores()` (`app.rs`), `dispatch_with_registries` + `build_*_registry` (adapter-fastly), `AxumDevServer::{with_config,with_kv,with_secret}_registry`, the `[stores.*]` `ids`/`default` manifest schema (`manifest.rs`, `StoreDeclaration`, `deny_unknown_fields`), CloudflareConfigStore backed by **KV namespaces**, and AxumConfigStore backed by **`.edgezero/local-config-<id>.json`**. Older cargo-cache checkouts (e.g. `ce6bcf7`, "Add store support for Spin adapter #253") **predate** the registry refactor and lack these — do not review against them; confirm any API check against `6ebc29a5`.
+
 ## Global Constraints
 
 - Rust **2024 edition**, toolchain **1.95.0**; WASM target `wasm32-wasip1`.
@@ -90,6 +94,7 @@ git commit -m "Record Phase 1 kind-aware store-id map and confirm D6-a"
 - Create: `crates/trusted-server-core/src/testdata/all-store-refs.toml`
 - **Modify (integration test surfaces that hard-code `app_config` — break under the rename):** `crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs` (`[local_server.config_stores.app_config]` + `app_config = '''…'''` + the generator test asserting them → `trusted_server_config`), `crates/trusted-server-integration-tests/tests/common/config.rs` (`{"app_config": envelope}` → `{"trusted_server_config": …}`), `crates/trusted-server-integration-tests/tests/environments/axum.rs` (env `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` → the trusted_server_config-keyed name)
 - Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-spin/spin.toml` (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state)
+- Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json` side-channel key `app_config` → `CONFIG_BLOB_KEY`)
 - Create: `crates/trusted-server-core/src/stores.rs` (shared `stores_metadata()`); Modify: each `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` (`impl Hooks` → add `fn stores()`)
 - Test: `crates/trusted-server-core/src/settings.rs` (`#[cfg(test)]`)
 
@@ -148,7 +153,11 @@ Apply the **D5 renames**: set `settings_data.rs::DEFAULT_CONFIG_STORE_ID = "trus
   - **Cloudflare** (`wrangler.toml`): EdgeZero backs **config stores by a KV namespace binding** (`config_store.rs`) — so each **config** id (`trusted_server_config`, `jwks_store`, `datadome-ip-bypass`) gets a `[[kv_namespaces]]` binding (as does each KV id). **Secrets use a FLAT namespace — `CloudflareSecretStore::get_bytes` ignores `store_name` and reads `env.secret(key)`.** So do **not** `wrangler secret put signing_keys` (that provisions the wrong name). Provision the concrete secret **keys the code reads**: the signing KIDs written by `KeyRotationManager`, the DataDome `server_side_key_secret_name`, and the S3 `access_key_id` / `secret_access_key` / optional session-token keys. Document the exact `wrangler secret put <key>` commands in the operator runbook; `store_name`/store-id is irrelevant on Cloudflare.
   - **Spin** (`spin.toml`): config **and** KV ids open **KV-store labels** (`request.rs:282`) — declare each under the component's `key_value_stores = [...]`. Secrets are likewise a **flat** namespace (`SpinSecretStore` ignores `store_name`) mapped to Spin variables — provision the concrete secret **keys** (as for Cloudflare), lowercased per Spin's variable rules, not the store id.
 
-- [ ] **Step 6b: Update integration-test surfaces that hard-code the old `app_config` store/key** (they run in the adapter suites, so the rename breaks them): in `generate-viceroy-config.rs` rename the generated `[local_server.config_stores.app_config]` block + `app_config = '''…'''` entry to `trusted_server_config` (store and key) and update the generator's own assertion test; in `tests/common/config.rs` change `{"app_config": envelope}` to `{"trusted_server_config": envelope}`; in `tests/environments/axum.rs` rename the `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` env var to the `trusted_server_config`-keyed equivalent the Axum config store expects.
+- [ ] **Step 6b: Update every surface that hard-codes the old `app_config` store/key** (they run in the adapter suites / boot paths, so the rename breaks them):
+  - **`generate-viceroy-config.rs` — MERGE, don't duplicate.** The generator already emits `[local_server.config_stores.trusted_server_config]` holding the **rollout flags** (`edgezero_enabled`, `edgezero_rollout_pct`), separate from the `app_config` store holding the envelope blob. After the rename both live in ONE store `trusted_server_config`, so **merge the envelope entry into the existing `trusted_server_config.contents` table under key `trusted_server_config`** (alongside the flag keys) — do **not** emit a second `[local_server.config_stores.trusted_server_config]` block (duplicate table). Update the generator's assertion test accordingly.
+  - **`tests/common/config.rs`:** `{"app_config": envelope}` → `{"trusted_server_config": envelope}`.
+  - **`tests/environments/axum.rs`:** rename the `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` env var to the `trusted_server_config`-keyed name the Axum config store expects.
+  - **`crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json`):** it reads the literal `value.get("app_config")` from the `TRUSTED_SERVER_CONFIG` side-channel (Cloudflare stays on the side-channel until Phase 2). Change this literal to `CONFIG_BLOB_KEY` (now `"trusted_server_config"`) so Cloudflare boot doesn't break under the rename. (This is a key-string update only; the Phase 2 store migration is separate.)
   - **Axum**: dev-only local files `.edgezero/local-config-<id>.json` (config) and the redb KV default; document how to seed them, do not commit machine-local state.
   Cross-check each existing manifest — some ids (`jwks_store`, `signing_keys`) are already partially declared (`request_signing/mod.rs` doc references `fastly.toml`); add only the missing ones.
 
@@ -168,6 +177,7 @@ git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs \
   crates/trusted-server-integration-tests/tests/common/config.rs \
   crates/trusted-server-integration-tests/tests/environments/axum.rs \
+  crates/trusted-server-adapter-cloudflare/src/app.rs \
   crates/trusted-server-core/src/settings.rs \
   crates/trusted-server-core/src/settings_data.rs \
   crates/trusted-server-core/src/config_payload.rs \
