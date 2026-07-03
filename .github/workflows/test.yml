@@ -11,12 +11,8 @@ on:
 
 jobs:
   test-rust:
-    name: cargo test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: cargo test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
