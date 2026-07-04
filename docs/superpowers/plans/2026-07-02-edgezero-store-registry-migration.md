@@ -146,10 +146,13 @@ Apply the **D5 renames**: set `settings_data.rs::DEFAULT_CONFIG_STORE_ID = "trus
 
 - [ ] **Step 4: Declare every id in `edgezero.toml`** — `[stores.kv]` = `trusted_server_kv`, `ec_identity_store`, `consent_store`, `creative_store`; `[stores.config]` = `trusted_server_config`, `jwks_store`, `datadome-ip-bypass`; `[stores.secrets]` = `trusted_server_secrets`, `signing_keys`, `ts_secrets`, `s3-auth`. (Names double as the platform store names under D7.) Also set `config_payload.rs::CONFIG_BLOB_KEY = "trusted_server_config"` (blob key == store id, per the D5 rule) so `ts config push`'s default key and the boot read agree with no env/`--key`.
 
-- [ ] **Step 5: Wire `Hooks::stores()` on all four adapters (Blocker — metadata is not wired today).** Each `impl Hooks for TrustedServerApp` currently overrides only `routes()`; the default `stores()` returns **empty** `StoresMetadata`, so no registries can be built from it. Add `fn stores() -> StoresMetadata` returning the `[stores.*]` metadata, generated once from `edgezero.toml`. Prefer a single shared `const`/fn in `trusted-server-core` (e.g. `pub fn stores_metadata() -> StoresMetadata`) that all four adapters return, so the ids live in one place. Verify against `edgezero_core::app::StoresMetadata`/`StoreMetadata` shape.
+- [ ] **Step 5: Wire `Hooks::stores()` on all four adapters (Blocker — metadata is not wired today).** Each `impl Hooks for TrustedServerApp` currently overrides only `routes()`; the default `stores()` returns **empty** `StoresMetadata`, so no registries can be built from it. Add `fn stores() -> StoresMetadata` returning the `[stores.*]` metadata, generated once from `edgezero.toml`. Prefer a single shared fn in `trusted-server-core` (`pub fn stores_metadata() -> StoresMetadata`) that all four adapters return, so the ids live in one place. Verify against `edgezero_core::app::StoresMetadata`/`StoreMetadata` shape.
+
+- [ ] **Step 5b: Anti-drift test — `stores_metadata()` and every adapter's `Hooks::stores()` must equal `edgezero.toml`.** Registries are built from `TrustedServerApp::stores()`, **not** from the `edgezero.toml` that Step 1's test validates — so a stale/incomplete `stores_metadata()` would pass Step 1 while runtime registries silently miss ids. Add a test that parses `edgezero.toml`'s `[stores.*]` ids/default and asserts they equal `trusted_server_core::stores_metadata()` **and** each `<adapter>::TrustedServerApp::stores()` (per kind, ids as sets + default). Put the core half in `trusted-server-core` and one assertion in each adapter's test module (so a future adapter that forgets to return `stores_metadata()` fails).
 
 - [ ] **Step 6: Declare the stores in every PLATFORM manifest (Blocker — local resources missing), per each adapter's real mapping.** D7 requires each logical id to be openable as a real platform store. The adapters map kinds to concrete resources differently — declare exactly:
   - **Fastly** (`fastly.toml`): KV ids → `[[local_server.kv_stores.<id>]]`; config ids → `[local_server.config_stores.<id>]`; secret ids → `[local_server.secret_stores.<id>]`. Also add the production-service store bindings for each id.
+  - **Cloudflare manifest `cloudflare.toml` — reconcile the STALE schema (Medium blocker).** `crates/trusted-server-adapter-cloudflare/cloudflare.toml` still uses the pre-rewrite manifest schema (`[stores.kv].name = …`, `[stores.kv.adapters.cloudflare].name = …`), which the pinned EdgeZero manifest parser (`manifest.rs`, `deny_unknown_fields`) **rejects** in favor of `[stores.*]` `ids`/`default`. Either migrate it to the `ids`/`default` schema (matching `edgezero.toml`) or **delete it if `edgezero.toml` is the single source** and nothing loads `cloudflare.toml`. Do not leave a stale-schema manifest that a tool/test could load.
   - **Cloudflare** (`wrangler.toml`): EdgeZero backs **config stores by a KV namespace binding** (`config_store.rs`) — so each **config** id (`trusted_server_config`, `jwks_store`, `datadome-ip-bypass`) gets a `[[kv_namespaces]]` binding (as does each KV id). **Secrets use a FLAT namespace — `CloudflareSecretStore::get_bytes` ignores `store_name` and reads `env.secret(key)`.** So do **not** `wrangler secret put signing_keys` (that provisions the wrong name). Provision the concrete secret **keys the code reads**: the signing KIDs written by `KeyRotationManager`, the DataDome `server_side_key_secret_name`, and the S3 `access_key_id` / `secret_access_key` / optional session-token keys. Document the exact `wrangler secret put <key>` commands in the operator runbook; `store_name`/store-id is irrelevant on Cloudflare.
   - **Spin** (`spin.toml`): config **and** KV ids open **KV-store labels** (`request.rs:282`) — declare each under the component's `key_value_stores = [...]`. Secrets are likewise a **flat** namespace (`SpinSecretStore` ignores `store_name`) mapped to Spin variables — provision the concrete secret **keys** (as for Cloudflare), lowercased per Spin's variable rules, not the store id.
 
@@ -172,6 +175,7 @@ Expected: PASS.
 ```bash
 git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-adapter-cloudflare/wrangler.toml \
+  crates/trusted-server-adapter-cloudflare/cloudflare.toml \
   crates/trusted-server-adapter-spin/spin.toml \
   crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml \
   crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs \
@@ -363,10 +367,16 @@ Expected: FAIL (all three).
 
 - [ ] **Step 2: Build `RuntimeServices` via the composite** in each adapter's `build_runtime_services(ctx: &RequestContext)`. **Extract the whole registry from request extensions** — `ctx.request().extensions().get::<ConfigRegistry>().cloned()` / `get::<SecretRegistry>()` — the same way EdgeZero's `Config`/`Secrets` extractors do. Do **not** use `ctx.config_store_default()`/`config_store(id)` (those return a single bound handle and would wire only the default store). Pass the cloned registry as the composite reader (Task 3) and the per-adapter **write-only** impl (`PlatformConfigWriter`/`PlatformSecretWriter`) as the writer. If a registry is absent from extensions, that is a wiring bug (Step 0 / EdgeZero dispatch) — surface it, don't silently fall back.
 
-- [ ] **Step 3: Run to verify pass** (all three)
+- [ ] **Step 2b: Non-default coverage on Cloudflare AND Spin (not just Axum).** Cloudflare/Spin platform mappings differ (config = KV-namespace/label backed; secrets = flat namespace), so default-only assertions are insufficient. Add, in each of the Cloudflare and Spin test modules, tests proving **non-default** resolution: a `jwks_store` **config** read and a `ts_secrets` / S3 **secret**-key read resolve through the composite (route tests if cheap, else small `build_runtime_services` + composite-read tests seeding a 2-id registry).
+
+- [ ] **Step 2c: Decide KV multi-id handling (Cloudflare/Spin gap).** Cloudflare (`platform.rs:568`) and Spin (`platform.rs:725`) build `RuntimeServices` from `ctx.kv_store_default()` **only** — a non-default KV id (`consent.consent_store`, `ec.ec_store`, `creative_store`) will **not** resolve there, though Fastly handles it via special store reopening (`app.rs:205`). Config/secret tests would pass while KV stays default-only. Choose one and record it:
+  - **(Recommended) Resolve named KV via the registry:** have `build_runtime_services` on Cloudflare/Spin (and Fastly's per-request services) obtain the `KvRegistry` from extensions and expose `kv_store(id)` through it (a KV analogue of the config/secret composite), so `consent_store`/`ec_store` resolve everywhere. Add a non-default-KV test per adapter.
+  - **(Defer)** Explicitly scope Phase 1 to config/secret multi-id + KV-**default** only; document that non-default KV on Cloudflare/Spin is unresolved (Fastly-only today) and **narrow Phase 1 acceptance accordingly**, tracking KV multi-id as a Phase 1 follow-up. Do not leave it as a silent gap.
+
+- [ ] **Step 3: Run to verify pass** (all three, incl. the non-default tests from 2b)
 
 Run: `cargo test-axum && cargo test-cloudflare && cargo test-spin`
-Expected: PASS. (Cloudflare/Spin reuse the same composite; their route tests assert the default-id read at minimum.)
+Expected: PASS.
 
 - [ ] **Step 4: Commit**
 
@@ -443,15 +453,20 @@ git commit -m "Delete duplicated Fastly config-chunk resolver; rely on EdgeZero 
 
 ---
 
-## Task 8: Retire per-adapter config/secret READ impls; keep the write path (D6-a)
+## Task 8: Retire per-adapter config/secret READ impls — EXCEPT Fastly's, which the live legacy path still needs (D6-a)
 
-Now that all reads (boot + request, all adapters) flow through EdgeZero, delete the config/secret **read** implementations. The per-adapter management impls become **write-only** (`PlatformConfigWriter`/`PlatformSecretWriter` from Task 3 Step 0) + `management_api.rs` (D6-a). Update the legacy `route_tests.rs` stubs that construct `RuntimeServices` from bespoke read stores.
+Now that all reads (boot + request) flow through EdgeZero **on the edgezero path**, convert the per-adapter management impls to **write-only** (`PlatformConfigWriter`/`PlatformSecretWriter` from Task 3 Step 0) + `management_api.rs` (D6-a).
+
+**⚠️ Phase 1 / Phase 5 boundary (Blocker fix):** Fastly's `legacy_main` (`adapter-fastly/src/main.rs:726`) is **still live** until Phase 5 (gated on 100% rollout, issue #495). It builds `RuntimeServices` via `build_runtime_services` (`adapter-fastly/src/platform.rs:578`), which wires `FastlyPlatformConfigStore` / `FastlyPlatformSecretStore` **for reads**. So **Fastly's read impls must NOT become write-only in Phase 1** — doing so breaks (or fails to compile) the legacy path before it is deleted. Therefore:
+- **Axum / Cloudflare / Spin** read impls → **write-only** now (they have no legacy path).
+- **Fastly** `FastlyPlatformConfigStore`/`FastlyPlatformSecretStore` stay **read+write** (full `PlatformConfigStore`/`PlatformSecretStore`) until Phase 5. The edgezero path on Fastly reads via the composite (Task 3–6); `legacy_main` reads via the direct impl. Both coexist. Fastly's read impls are deleted / narrowed to write-only in **Phase 5**, together with `legacy_main`.
 
 **Files:**
-- Modify: `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/platform.rs`
+- Modify: `crates/trusted-server-adapter-{axum,cloudflare,spin}/src/platform.rs` (→ write-only)
+- Leave: `crates/trusted-server-adapter-fastly/src/platform.rs` config/secret **read** impls in place (write-only conversion deferred to Phase 5)
 - Modify: `crates/trusted-server-adapter-fastly/src/route_tests.rs` (update stubs to the composite/registry shape)
 
-- [ ] **Step 1: Convert per-adapter config/secret impls to write-only.** The old impls implemented the read+write `PlatformConfigStore`/`PlatformSecretStore` (`FastlyPlatformConfigStore` with `get`+`put`+`delete`, `AxumPlatformConfigStore`, `NoopConfigStore`, Cloudflare/Spin equivalents, secret impls). Now that the composite serves reads, **re-implement them as `PlatformConfigWriter`/`PlatformSecretWriter`** (drop `get`/`get_bytes`; keep `put`/`create`/`delete`). This compiles only because Task 3 Step 0 split the traits — otherwise deleting `get` from a `PlatformConfigStore` impl is a trait-incompleteness error. Keep `management_api.rs`.
+- [ ] **Step 1: Convert the NON-Fastly config/secret impls to write-only.** For **Axum / Cloudflare / Spin**, re-implement the old read+write impls (`AxumPlatformConfigStore`, `NoopConfigStore`, Cloudflare/Spin equivalents, secret impls) as `PlatformConfigWriter`/`PlatformSecretWriter` (drop `get`/`get_bytes`; keep `put`/`create`/`delete`). This compiles only because Task 3 Step 0 split the traits. **Leave `FastlyPlatformConfigStore`/`FastlyPlatformSecretStore` as full read+write** — `legacy_main` still reads through them until Phase 5 (see the boundary note above). Keep `management_api.rs`.
 
 - [ ] **Step 2: Update `route_tests.rs`** — the stub stores (`StubJwksConfigStore`, etc.) and `RuntimeServices` construction move to the composite/registry shape: build the composite reader from a real `ConfigRegistry`/`SecretRegistry` with **at least two ids** (default + a non-default such as `jwks_store`/`ts_secrets`), and assert an **unknown store id resolves strictly to an error** (not a silent fallback to default). Writer = a recording stub; keep coverage of the write path (`put`/`create`/`delete`) so key-rotation delegation stays tested.
 

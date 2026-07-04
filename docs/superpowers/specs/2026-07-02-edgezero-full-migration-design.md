@@ -164,7 +164,7 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 - Delete the 4× per-adapter `platform.rs` config/secret **read** impls; adapters build registries from `[stores.*]` metadata (via `dispatch_with_registries` on Axum/Cloudflare/Spin, via the Fastly-specific injection above).
 - Delete `settings_data.rs`'s `FastlyChunkPointer` resolver — EdgeZero's `FastlyConfigStore` resolves chunks transparently. `get_settings_from_config_store` collapses to `ConfigStore::get` + `settings_from_config_blob`.
 
-**Deletions (after D6/D5 resolved):** `settings_data.rs` chunk resolver, `platform/traits.rs` config/secret **read** traits, 4× `platform.rs` config/secret read impls. **`management_api.rs` deletion is conditional on D6** (may move to CLI/ops instead, or stay as a runtime write path).
+**Deletions (after D6/D5 resolved):** `settings_data.rs` chunk resolver, `platform/traits.rs` config/secret **read** traits, and the **Axum/Cloudflare/Spin** `platform.rs` config/secret read impls (→ write-only). **Fastly's read impls stay** until Phase 5 — `legacy_main` reads through `FastlyPlatformConfigStore`/`FastlyPlatformSecretStore` via `build_runtime_services` and is live until the 100%-rollout cutover, so converting them to write-only in Phase 1 would break the legacy path (Phase 1/Phase 5 boundary). **`management_api.rs` deletion is conditional on D6.**
 **Keeps:** `RuntimeServices` as a shrinking bundle (removed in Phase 4); the runtime write path until D6 resolves it; `StoreName`/`StoreId` where writes/provisioning need the management-id split.
 **Acceptance:** all adapters build; `cargo test-fastly/-axum/-cloudflare/-spin` + parity green; secret/config **reads** go through EdgeZero registries; **key rotation/delete still works** (per the D6 resolution); every declared store id resolves (no strict-lookup `None`).
 
@@ -245,6 +245,7 @@ Two consequences: (1) edgezero #306 **must** ship `ArrayEach` + `Option<String>`
 - Delete `legacy_main` / `route_request` (`adapter-fastly/src/main.rs`), `compat.rs` (fastly↔http shim), and the flag machinery (`edgezero_enabled`, `edgezero_rollout_pct`, `select_edgezero_entrypoint`, `should_route_to_edgezero`, IP-bucket hashing).
 - `main()` calls the EdgeZero path unconditionally — the P0-C dispatch variant, or the documented Fastly dispatch shim (§4a), depending on how P0-C resolves.
 - Retire the `trusted_server_config` rollout-flag reads (the flags, not the config store — after D5 the store may still hold app config).
+- **Now convert Fastly's `FastlyPlatformConfigStore`/`FastlyPlatformSecretStore` read impls to write-only** (the conversion deferred from Phase 1 Task 8) — safe here because `legacy_main`/`build_runtime_services`'s direct reads are deleted with the legacy path.
 - **Ancillary cleanup (easy to miss):** Fastly route tests importing legacy stores + `route_request` (`adapter-fastly/src/route_tests.rs`); generated Viceroy config rollout flags (`integration-tests/src/bin/generate-viceroy-config.rs`); `fastly.toml` local `edgezero_enabled`/`edgezero_rollout_pct` config; and the rollout runbook `docs/internal/EDGEZERO_MIGRATION.md`.
 
 **Deletions:** `legacy_main`, `route_request`, `compat.rs`, rollout flags, `route_tests.rs` legacy imports, viceroy-config flags, `fastly.toml` flag config, `EDGEZERO_MIGRATION.md` runbook.
@@ -258,7 +259,7 @@ Two consequences: (1) edgezero #306 **must** ship `ArrayEach` + `Option<String>`
 |---|---|---|---|
 | Fastly chunk-pointer resolver | `core/src/settings_data.rs` | 1 | EdgeZero `FastlyConfigStore` + `chunked_config.rs` |
 | Bespoke config/secret store traits | `core/src/platform/traits.rs` (config+secret trait defs); `mod.rs`/`types.rs` edited, not deleted (KV re-export + shrinking `RuntimeServices` stay) | 1 | EdgeZero `ConfigStore`/`SecretStore`/`StoreRegistry` |
-| 4× per-adapter store impls | `adapter-*/src/platform.rs` | 1 | per-adapter EdgeZero store impls |
+| Per-adapter config/secret read impls → write-only | `adapter-{axum,cloudflare,spin}/src/platform.rs` **Phase 1**; `adapter-fastly/src/platform.rs` **Phase 5** (Fastly reads kept for `legacy_main` until cutover) | 1 / 5 | EdgeZero registries + composite for reads |
 | Fastly management REST client (**runtime writes**) | `adapter-fastly/src/management_api.rs` | **conditional (D6)** — 1 only if key rotation moves to ops/CLI; otherwise retained as the admin write path | EdgeZero provisioning (if writes leave runtime) — else no replacement |
 | Adapter/runtime app-config baking | `adapter-{cloudflare,spin}/src/app.rs` (`include_str!` + Cloudflare `TRUSTED_SERVER_CONFIG` side-channel) | 2 | boot-time store-loaded config (P-BOOT). *`ts config init` template embed is out of scope.* |
 | Legacy env overlay + `config` dep | `core/src/settings.rs` (`from_toml_and_env`, `ENVIRONMENT_VARIABLE_*`) | 2 | `EDGEZERO__*` / AppConfig env layers |
