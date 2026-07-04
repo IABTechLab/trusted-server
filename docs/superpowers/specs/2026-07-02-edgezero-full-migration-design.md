@@ -4,7 +4,7 @@
 - **Date:** 2026-07-02
 - **Scope:** Move trusted-server **completely** onto EdgeZero primitives: config push, KV, secret store, config injection without an embedded `trusted-server.toml`, extractor-based handlers, and deletion of every pre-EdgeZero workaround.
 - **Shape:** Umbrella roadmap. Defines the end-state, the current-state gap, and an ordered set of phases with dependencies. **Each phase gets its own implementation plan** (`writing-plans`) before code is written.
-- **Companion spec:** Phase 0 (`State<T>` extractor + nested `#[secret]`) is an **edgezero-repo** change, specified separately (`…-state-and-nested-secrets-design.md`) and tracked via edgezero PR [stackpop/edgezero#305](https://github.com/stackpop/edgezero/pull/305). This umbrella depends on it but does not re-specify it.
+- **Companion spec:** Phase 0 (`State<T>` extractor + nested `#[secret]`) is an **edgezero-repo** change, specified separately (`…-state-and-nested-secrets-design.md`) and tracked via edgezero PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306). This umbrella depends on it but does not re-specify it.
 
 ---
 
@@ -113,7 +113,7 @@ Phase 1 (stores) ──> Phase 2 (config) ──> Phase 3 (secrets)   Phase 4 (e
 
 These are not trusted-server refactors; they are EdgeZero-adapter capability gaps or up-front decisions that gate the phases.
 
-**P0-C — Header-preserving Fastly `run_app` dispatch + pre-dispatch extension hook (REQUIRED under full convergence).** For Fastly to be the one-line `run_app::<App>`, EdgeZero's Fastly `run_app`/dispatch must: (1) preserve duplicate response headers (esp. `Set-Cookie`) instead of collapsing via `set_header`; (2) allow opting out of the per-call logger reinit; and (3) expose a **pre-dispatch hook** to inject request-scoped extensions (`client_info`, `device_signals` from JA4/H2) derived from the raw `FastlyRequest` before conversion. **This must be upstreamed** — the "permanent Fastly exception" fallback is off the table now that the decision is full convergence. New edgezero PR (same track as #305/#306). Until it lands, Fastly keeps its interim custom `oneshot` + local registry builders (Phase 1 Task 6) as **throwaway scaffolding**, replaced by `run_app` once P0-C merges.
+**P0-C — Header-preserving Fastly `run_app` dispatch + pre-dispatch extension hook (REQUIRED under full convergence).** For Fastly to be the one-line `run_app::<App>`, EdgeZero's Fastly `run_app`/dispatch must: (1) preserve duplicate response headers (esp. `Set-Cookie`) instead of collapsing via `set_header`; (2) allow opting out of the per-call logger reinit; and (3) expose a **pre-dispatch hook** to inject request-scoped extensions (`client_info`, `device_signals` from JA4/H2) derived from the raw `FastlyRequest` before conversion. **This must be upstreamed** — the "permanent Fastly exception" fallback is off the table now that the decision is full convergence. New edgezero PR (same track as #306). Until it lands, Fastly keeps its interim custom `oneshot` + local registry builders (Phase 1 Task 6) as **throwaway scaffolding**, replaced by `run_app` once P0-C merges.
 
 **P0-D — App-state injection for macro/`run_app` apps (REQUIRED, new).** `State<T>` (from #306) is read from request extensions, and `RouterBuilder::with_state` inserts it — but the `app!` macro generates the router and `run_app` dispatches it, so a macro app has **no builder to call `with_state` on**. EdgeZero must add a way for a `Hooks` app to register app-level state that `run_app` inserts into every request — e.g. a `Hooks::app_state() -> Extensions` (or `configure`-time state layer / `app!` `[app] state` support) that the per-adapter `run_app` copies into each request's extensions alongside the store registries. Without this, `State<Arc<AppState>>` cannot reach `#[action]` handlers in a macro app. New edgezero PR.
 
@@ -135,10 +135,10 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 
 ### Phase 0 — EdgeZero prerequisites (external, edgezero repo)
 
-**Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#305](https://github.com/stackpop/edgezero/pull/305) — "add State<T> + nested #[secret] design spec".
+**Owner:** edgezero. **Tracked by:** its own spec + PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306) — "State<T> extractor + nested/array #[secret] support".
 **Delivers:** (A) `State<T>` extractor + `RouterBuilder::with_state`; (B) nested/array `#[secret]` in `#[derive(AppConfig)]` + path-aware `secret_walk`; **(C, if resolved upstream) P0-C** header-preserving Fastly dispatch + pre-dispatch extension hook (§4a).
 **Blocks:** Phase 3 (B), Phase 4 (A), Phase 5/Fastly end-state (C). **This umbrella consumes it as a versioned dependency** — bump the pinned `edgezero` rev once merged.
-**Note for #305:** the trusted-server secret audit (Phase 3 / §5) confirms **array secrets exist** (`ec.partners[].api_token`, `handlers[].password`) and **optional-string secrets exist** (`ts_pull_token`). So edgezero #305's `ArrayEach` and `Option<String>` support are **required**, not deferrable — this settles that PR's open question B-1.
+**Note for #306:** the trusted-server secret audit (Phase 3 / §5) confirms **array secrets exist** (`ec.partners[].api_token`, `handlers[].password`) and **optional-string secrets exist** (`ts_pull_token`). So edgezero #306's `ArrayEach` and `Option<String>` support are **required**, not deferrable — this settles that PR's open question B-1.
 
 ---
 
@@ -196,20 +196,20 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 - Operator migration: `ts` provisions secrets into the secret store (via EdgeZero provision), and a migration guide moves existing inline secrets out of `trusted-server.toml`. `reject_placeholder_secrets` becomes a check on the resolved values at boot.
 - Startup load resolves `#[secret]` fields against the secret store (D1/D3), then validates.
 
-**Secret inventory (spec artifact — verify + extend during the Phase 3 plan).** Preliminary audit of `Settings`; shapes drive the edgezero #305 requirements:
+**Secret inventory (spec artifact — verify + extend during the Phase 3 plan).** Preliminary audit of `Settings`; shapes drive the edgezero #306 requirements:
 
 | Secret | Path | Shape | Notes |
 |---|---|---|---|
-| Partner API tokens | `ec.partners[].api_token` | **array element** | needs `ArrayEach` (edgezero #305) |
+| Partner API tokens | `ec.partners[].api_token` | **array element** | needs `ArrayEach` (edgezero #306) |
 | Handler passwords | `handlers[].password` | **array element** | needs `ArrayEach` |
 | EC passphrase | `ec.passphrase` | scalar `String` | nested |
-| Pull token | `ts_pull_token` | **`Option<String>`** | needs optional-secret support (edgezero #305) |
+| Pull token | `ts_pull_token` | **`Option<String>`** | needs optional-secret support (edgezero #306) |
 | Publisher proxy secret | `publisher.proxy_secret` | scalar `String` | nested |
 | DataDome server-side key | `integrations.datadome.*` (store-ref name+key) | store-ref | already resolves via secret-store name+key |
 | S3 / proxy secret access key | `proxy.secret_access_key` (+ `proxy.secret_store`) | store-ref | already store-backed |
 | Request-signing keys | `request_signing.*` (`secret_store_id`) | store-ref | already store-backed |
 
-Two consequences: (1) edgezero #305 **must** ship `ArrayEach` + `Option<String>` (see Phase 0 note); (2) the already-store-backed secrets (DataDome, S3, request-signing) need only re-expression as `#[secret(store_ref)]`, not relocation.
+Two consequences: (1) edgezero #306 **must** ship `ArrayEach` + `Option<String>` (see Phase 0 note); (2) the already-store-backed secrets (DataDome, S3, request-signing) need only re-expression as `#[secret(store_ref)]`, not relocation.
 
 **Deletions:** inline secrets in the blob, `Redacted<T>`, `SECRET_FIELDS = &[]` wrapper.
 **Acceptance:** pushed blob contains only secret **key names**; boot resolves them; a config with nested **and array** secrets validates and serves; operator migration guide published; tests green.
@@ -276,7 +276,7 @@ Two consequences: (1) edgezero #305 **must** ship `ArrayEach` + `Option<String>`
 
 | ID | Question | Owner / resolution |
 |----|----------|--------------------|
-| R1 | Do any `Settings` secrets live inside **arrays**? | **Resolved: yes** (`ec.partners[].api_token`, `handlers[].password`) + optional (`ts_pull_token`). edgezero #305 must ship `ArrayEach` + `Option<String>` (see §5 Phase 3 inventory + Phase 0 note). |
+| R1 | Do any `Settings` secrets live inside **arrays**? | **Resolved: yes** (`ec.partners[].api_token`, `handlers[].password`) + optional (`ts_pull_token`). edgezero #306 must ship `ArrayEach` + `Option<String>` (see §5 Phase 3 inventory + Phase 0 note). |
 | R7 | P0-C: header-preserving Fastly `run_app` dispatch + pre-dispatch hook — **REQUIRED** under full convergence (no permanent-exception fallback). | New edgezero PR; gates Phase 4 Fastly convergence. |
 | R13 | P0-D: macro/`run_app` app-state injection (`with_state` is builder-only). | New edgezero PR; gates `State<AppState>` in `#[action]` handlers. |
 | R14 | Sequencing: land P0-C/P0-D early (skip Phase 1 throwaway adapter builders) vs proceed with interim builders? | Decide now (§3 sequencing note) — affects Phase 1 Tasks 5–6 scope. |
