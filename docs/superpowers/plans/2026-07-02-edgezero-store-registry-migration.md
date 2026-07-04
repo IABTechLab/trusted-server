@@ -376,24 +376,33 @@ Expected: FAIL (all three).
 - [ ] **Step 2b: Non-default coverage on Cloudflare AND Spin (not just Axum).** Cloudflare/Spin platform mappings differ (config = KV-namespace/label backed; secrets = flat namespace), so default-only assertions are insufficient. Add, in each of the Cloudflare and Spin test modules, tests proving **non-default** resolution: a `jwks_store` **config** read and a `ts_secrets` / S3 **secret**-key read resolve through the composite (route tests if cheap, else small `build_runtime_services` + composite-read tests seeding a 2-id registry).
 
 - [ ] **Step 2c: Named-KV resolution — a CORE surface change, not adapter-only (DECIDED — registry-backed KV now).** The core `RuntimeServices` exposes only `kv_store(&self) -> &dyn PlatformKvStore` — a **single** handle — and consumers that have a store id today **drop it**: `publisher.rs:626` does `settings.consent.consent_store.as_deref().map(|_| services.kv_store())`. So adapter-only changes cannot make `consent_store` resolve. This step is cross-cutting:
-  - **Core (`platform/types.rs`):** add a registry-backed named accessor, e.g. `RuntimeServices::kv_store_named(&self, id: &str) -> Option<KvHandle>` resolving from a `KvRegistry` carried on `RuntimeServices` (add a `kv_registry` field + builder setter, populated by adapters from `ctx.request().extensions().get::<KvRegistry>()`). Keep `kv_store()`/`kv_handle()` as the default for existing consumers.
-  - **Consent call sites (`publisher.rs`):** replace `.map(|_| services.kv_store())` with `settings.consent.consent_store.as_deref().and_then(|id| services.kv_store_named(id))` — so the configured id actually selects the store. Audit other KV consumers (`storage/kv_store.rs`, `ec/*`) for the same "id dropped" pattern.
+  - **Type decision — resolve named KV as `KvHandle`, and migrate consent onto `KvHandle`.** `KvRegistry::named(id)` yields a `KvHandle` (a wrapper `{ store: Arc<dyn KvStore> }`), **not** a `&dyn PlatformKvStore` — and `ConsentPipelineInput.kv_store` is currently `Option<&dyn PlatformKvStore>` (`consent/mod.rs:89`), so a `KvHandle` does not fit directly. Do **not** wrap; **migrate the consent KV surface to `KvHandle`** (the idiomatic edgezero handle — `RuntimeServices` already exposes `kv_handle()` for the default). Specifically:
+    - **Core (`platform/types.rs`):** add `RuntimeServices::kv_handle_named(&self, id: &str) -> Option<KvHandle>` (mirroring the existing `kv_handle()`), resolving from a `KvRegistry` carried on `RuntimeServices` (add a `kv_registry` field + builder setter, populated by adapters from `ctx.request().extensions().get::<KvRegistry>()`).
+    - **Consent (`consent/mod.rs`, `storage/kv_store.rs`, `publisher.rs`):** change `ConsentPipelineInput.kv_store` from `Option<&dyn PlatformKvStore>` to `Option<KvHandle>`; update the consent persistence fns (`load_consent_from_kv`/`save_consent_to_kv`/`delete_consent_from_kv`) to take a `&KvHandle` and use its async methods (they already `block_on`). At the call site (`publisher.rs:626`) pass `settings.consent.consent_store.as_deref().and_then(|id| services.kv_handle_named(id))`.
+    - Audit other KV consumers (`ec/*`) for the same "id dropped" pattern; they already use `kv_handle()` so are lower-risk.
   - **Adapters (all four `platform.rs`):** populate `RuntimeServices.kv_registry` from extensions in `build_runtime_services`. Remove Fastly's special consent-store reopening (`app.rs:205`, `runtime_services_for_consent_route`) — now redundant.
-  - **Files:** `crates/trusted-server-core/src/platform/types.rs`, `crates/trusted-server-core/src/publisher.rs` (+ any other id-dropping call sites), `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/platform.rs`, `crates/trusted-server-adapter-fastly/src/app.rs` (remove consent special-case), adapter test helpers (Step 2d).
-  - **Test:** per adapter, a non-default KV id (`consent_store`) resolves via `kv_store_named` and is **distinct** from the default handle; an unknown id → `None`.
+  - **Files:** `crates/trusted-server-core/src/platform/types.rs`, `crates/trusted-server-core/src/consent/mod.rs` (`ConsentPipelineInput.kv_store` type), `crates/trusted-server-core/src/storage/kv_store.rs` (consent persistence fns → `&KvHandle`), `crates/trusted-server-core/src/publisher.rs` (call site), `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/platform.rs`, `crates/trusted-server-adapter-fastly/src/app.rs` (remove consent special-case), adapter test helpers (Step 2d).
+  - **Test:** per adapter, a non-default KV id (`consent_store`) resolves via `kv_handle_named` and is **distinct** from the default handle; an unknown id → `None`.
 
 - [ ] **Step 2d: Test-support — registry-populated `RequestContext` helper + migrate existing direct-context tests.** Strict registries make a missing registry a wiring bug, but existing adapter tests call `build_runtime_services(&ctx)` / `build_per_request_services(&ctx)` on **hand-built** `RequestContext`s with no registries inserted (e.g. `adapter-axum/src/app.rs:130`, `adapter-cloudflare/src/app.rs:151,314`, `adapter-spin/src/app.rs:440`, `adapter-cloudflare/src/platform.rs:729`). Those will now fail (composite → `registry.named()` → `None`). Add a shared test helper (e.g. `test_context_with_registries(config: &[…], kv: &[…], secrets: &[…]) -> RequestContext`) that inserts `ConfigRegistry`/`KvRegistry`/`SecretRegistry` into the context, and **migrate every existing direct-context test** to use it. Enumerate them during the run (`rg 'build_(runtime|per_request)_services'` in adapter test modules).
 
-- [ ] **Step 3: Run to verify pass** (all three, incl. the non-default tests from 2b)
+- [ ] **Step 3: Run to verify pass** — this task touches **core** (`platform/types.rs`, consent, `publisher.rs`) and **Fastly** (`platform.rs`/`app.rs`) as well as Axum/CF/Spin, so run **all four** adapters + wasm checks (per the global "all four green" rule), incl. the non-default config/secret/KV tests from 2b/2c.
 
-Run: `cargo test-axum && cargo test-cloudflare && cargo test-spin`
+Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo check-cloudflare && cargo check-spin`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Commit** (include the core + Fastly changes, not just the three adapters)
 
 ```bash
-git add crates/trusted-server-adapter-axum crates/trusted-server-adapter-cloudflare crates/trusted-server-adapter-spin
-git commit -m "Build RuntimeServices via composite store in Axum, Cloudflare, and Spin"
+git add crates/trusted-server-core/src/platform/types.rs \
+  crates/trusted-server-core/src/consent/mod.rs \
+  crates/trusted-server-core/src/storage/kv_store.rs \
+  crates/trusted-server-core/src/publisher.rs \
+  crates/trusted-server-adapter-fastly \
+  crates/trusted-server-adapter-axum \
+  crates/trusted-server-adapter-cloudflare \
+  crates/trusted-server-adapter-spin
+git commit -m "Wire RuntimeServices via composite + registry-backed named KV across all adapters"
 ```
 
 ---
