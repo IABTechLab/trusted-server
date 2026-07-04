@@ -335,7 +335,7 @@ git commit -m "Load boot config via EdgeZero config store on Fastly and Axum"
 **Files:**
 - Modify: `crates/trusted-server-adapter-axum/src/main.rs` (keep `AxumDevServer::with_config`, chain registry setters)
 - Create: `crates/trusted-server-adapter-axum/src/registries.rs` (`build_{config,kv,secret}_registry_axum(&StoresMetadata)`)
-- **Modify (core KV surface, Step 2c):** `crates/trusted-server-core/src/platform/types.rs` (`RuntimeServices::kv_store_named` + `kv_registry` field/builder), `crates/trusted-server-core/src/publisher.rs` (consent call site passes `consent_store`), + any other id-dropping KV consumers
+- **Modify (core KV surface, Step 2c):** `crates/trusted-server-core/src/platform/types.rs` (`RuntimeServices::kv_handle_named` + `kv_registry` field/builder), `crates/trusted-server-core/src/consent/mod.rs` + `storage/kv_store.rs` (consent KV surface → `KvHandle`), `crates/trusted-server-core/src/publisher.rs` (call site passes `consent_store`)
 - Modify: `crates/trusted-server-adapter-{axum,cloudflare,spin}/src/platform.rs` (`build_runtime_services` → composite + `kv_registry` from extensions)
 - Modify: `crates/trusted-server-adapter-fastly/src/{platform.rs,app.rs}` (populate `kv_registry`; remove consent-store special-casing)
 - Test-support (Step 2d): a shared `test_context_with_registries(...)` helper; migrate existing direct-context tests (`adapter-{axum,cloudflare,spin,fastly}` test modules)
