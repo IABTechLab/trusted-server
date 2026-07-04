@@ -124,11 +124,6 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 
 *(P-BOOT's `build_state()` gets subsumed under full convergence: once `run_app` owns startup, boot config load is `run_app` reading the config store via the registry it builds; the boot reader collapses into option (a)/(b) inside `run_app`, and D1's load-once `Settings` is populated from the P0-D state hook at first use.)*
 
-**P-BOOT — Boot-time store access for startup config + secret load.** Define, per adapter, how `build_state()` obtains a config-store (and secret-store) handle at boot, before request context. Options:
-- **(a) Boot-time handle from the adapter environment** — Cloudflare builds a config-store handle from the `env` binding passed to `run_app`; Spin from the host component config; Fastly/Axum open the store eagerly (already do). Requires EdgeZero to expose a boot-time store constructor (or trusted-server constructs it from the adapter's env directly, mirroring today's `TRUSTED_SERVER_CONFIG` side-channel but reading the store instead).
-- **(b) Lazy first-request load + cache** — defer the config load to the first request (where the registry exists), cache `Arc<Settings>` in a `OnceCell`. Keeps D1's load-once semantics but moves the load off the boot path. Trade-off: first request pays the cost and must handle a config-load error as a request error.
-Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/Spin both pass it to `run_app`), falling back to **(b)** only if an adapter genuinely cannot construct a boot-time handle. Settle in the Phase 2 plan; this is the load-bearing detail that makes "no baked TOML on Cloudflare/Spin" actually implementable.
-
 ---
 
 ## 5. Phases
@@ -161,12 +156,12 @@ Recommendation: **(a)** where the adapter env is available at boot (Cloudflare/S
 
   **`StoreName` semantics (D7):** `platform/types.rs::StoreName` is documented as an "edge-visible platform name". Under D7 runtime reads resolve through the registry by **logical id** (`registry.named(id)`), so for reads `StoreName` now carries the **logical store id** (== platform name by default). Phase 1 updates the `StoreName` doc and audits read call sites to pass logical ids, not physical platform names.
 - **Fastly registry injection (ties to P0-C):** Fastly's custom `oneshot` path (§1) currently inserts only a `ConfigStoreHandle`, not registries via `dispatch_with_registries`. EdgeZero's `dispatch_with_registries` and its registry builders are **`pub(crate)`** (verified in the pinned checkout), so trusted-server must build the registries **locally** (from `StoresMetadata` + `EnvConfig` + the EdgeZero Fastly store open primitives) and insert them into extensions before `oneshot` — or an EdgeZero public builder must be added upstream (**R11**).
-- Delete the 4× per-adapter `platform.rs` config/secret **read** impls; adapters build registries from `[stores.*]` metadata (via `dispatch_with_registries` on Axum/Cloudflare/Spin, via the Fastly-specific injection above).
+- Convert the **Axum/Cloudflare/Spin** `platform.rs` config/secret **read** impls to write-only (Fastly's stay read+write until Phase 5 — see the deletions note below); adapters build registries from `[stores.*]` metadata (via `dispatch_with_registries` on Axum/Cloudflare/Spin, via the Fastly-specific injection above).
 - Delete `settings_data.rs`'s `FastlyChunkPointer` resolver — EdgeZero's `FastlyConfigStore` resolves chunks transparently. `get_settings_from_config_store` collapses to `ConfigStore::get` + `settings_from_config_blob`.
 
 **Deletions (after D6/D5 resolved):** `settings_data.rs` chunk resolver, `platform/traits.rs` config/secret **read** traits, and the **Axum/Cloudflare/Spin** `platform.rs` config/secret read impls (→ write-only). **Fastly's read impls stay** until Phase 5 — `legacy_main` reads through `FastlyPlatformConfigStore`/`FastlyPlatformSecretStore` via `build_runtime_services` and is live until the 100%-rollout cutover, so converting them to write-only in Phase 1 would break the legacy path (Phase 1/Phase 5 boundary). **`management_api.rs` deletion is conditional on D6.**
 **Keeps:** `RuntimeServices` as a shrinking bundle (removed in Phase 4); the runtime write path until D6 resolves it; `StoreName`/`StoreId` where writes/provisioning need the management-id split.
-**Acceptance:** all adapters build; `cargo test-fastly/-axum/-cloudflare/-spin` + parity green; secret/config **reads** go through EdgeZero registries; **key rotation/delete still works** (per the D6 resolution); every declared store id resolves (no strict-lookup `None`).
+**Acceptance:** all adapters build; `cargo test-fastly/-axum/-cloudflare/-spin` + parity green; secret/config **reads** go through EdgeZero registries; **named KV ids resolve on all four adapters** via the `KvRegistry` (not default-only — `consent_store`/`ec_store` resolve on Cloudflare/Spin, and Fastly's consent-store special-casing is removed); **key rotation/delete still works** (per the D6 resolution); every declared store id (kv/config/secret) resolves (no strict-lookup `None`); Fastly `legacy_main` still reads (its read impls untouched until Phase 5).
 
 ---
 
