@@ -214,8 +214,8 @@ Concrete D6-a mechanism. The bespoke traits read **by `StoreName`** and callers 
 - Consumes: `edgezero_core::store_registry::{ConfigRegistry, SecretRegistry, ConfigStoreBinding, BoundSecretStore}`, write-only `Arc<dyn PlatformConfigWriter>`/`Arc<dyn PlatformSecretWriter>`.
 - Produces:
   - New **write-only** traits `PlatformConfigWriter { put; delete }` and `PlatformSecretWriter { create; delete }` (extracted from the read+write `PlatformConfigStore`/`PlatformSecretStore`). This is what lets Task 8 delete the per-adapter **read** impls while keeping the writer object — the writer no longer needs `get`/`get_bytes`.
-  - `CompositeConfigStore::new(reader: ConfigRegistry, writer: Arc<dyn PlatformConfigWriter>) -> Self` implementing the full read+write `PlatformConfigStore`. **`ConfigRegistry::named(id)` returns `Option<ConfigStoreBinding>`, not a handle** — so `get(store_name, key)` = resolve `binding = reader.named(store_name.as_str()).ok_or(PlatformError::ConfigStore)?`, then `block_on(binding.handle.get(key))`. EdgeZero `ConfigStore::get` returns `Result<Option<String>, ConfigStoreError>`; the bespoke `get` returns `Result<String, PlatformError>`, so map `Ok(None)`/`Err(ConfigStoreError::*)` → `PlatformError::ConfigStore`. `put`/`delete` → `writer`.
-  - `CompositeSecretStore::new(reader: SecretRegistry, writer: Arc<dyn PlatformSecretWriter>) -> Self` implementing `PlatformSecretStore`: `get_bytes(store_name, key)` = `reader.named(store_name.as_str()).ok_or(PlatformError::SecretStore)?` → `block_on(bound.get_bytes(key))`; map `Ok(None)`/`Err` → `PlatformError::SecretStore`. `create`/`delete` → `writer`. A store_name not in the registry is a hard error (strict), not a silent fallback.
+  - `CompositeConfigStore::new(reader: Option<ConfigRegistry>, writer: Arc<dyn PlatformConfigWriter>) -> Self` implementing the full read+write `PlatformConfigStore`. The reader is `Option` because **an empty `StoreRegistry` cannot be constructed** (fields are private; `from_parts` returns `None` on empty `by_id`) — so the "absent registry" case is `None`, not an empty registry. `get(store_name, key)` = `let reg = self.reader.as_ref().ok_or(PlatformError::ConfigStore)?;` then (since **`ConfigRegistry::named(id)` returns `Option<ConfigStoreBinding>`, not a handle**) `let binding = reg.named(store_name.as_str()).ok_or(PlatformError::ConfigStore)?;` then `block_on(binding.handle.get(key))`. EdgeZero `ConfigStore::get` returns `Result<Option<String>, ConfigStoreError>`; the bespoke `get` returns `Result<String, PlatformError>`, so map `Ok(None)`/`Err(ConfigStoreError::*)` → `PlatformError::ConfigStore`. `put`/`delete` → `writer`.
+  - `CompositeSecretStore::new(reader: Option<SecretRegistry>, writer: Arc<dyn PlatformSecretWriter>) -> Self` implementing `PlatformSecretStore`: `get_bytes(store_name, key)` = `self.reader.as_ref().ok_or(PlatformError::SecretStore)?.named(store_name.as_str()).ok_or(PlatformError::SecretStore)?` → `block_on(bound.get_bytes(key))`; map `Ok(None)`/`Err` → `PlatformError::SecretStore`. `create`/`delete` → `writer`. Both an **absent registry** (`None`) and a store_name not in the registry are hard errors (strict), never a silent fallback.
 
 - [ ] **Step 0: Split write-only traits.** In `traits.rs`, define `pub trait PlatformConfigWriter: Send + Sync { put; delete }` and `pub trait PlatformSecretWriter: Send + Sync { create; delete }` (matching the parent traits' `Send + Sync` bounds, since they're held as `Arc<dyn …>`). Keep `PlatformConfigStore`/`PlatformSecretStore` as the read+write surface `RuntimeServices` exposes. This split is the prerequisite that makes Task 8's "delete reads, keep writes" compile. Run `cargo check-axum` to confirm the split compiles before proceeding.
 
@@ -282,7 +282,7 @@ fn composite_secret_reads_named_store_and_writes_delegate() {
 
 - [ ] **Step 2: Run to verify both fail**
 
-Run: `cargo test-fastly composite_config_reads_named_store_and_writes_delegate composite_secret_reads_named_store_and_writes_delegate`
+Run: `cargo test-fastly composite_` (one shared-prefix filter runs both `composite_config_…` and `composite_secret_…`; `cargo test` takes a single filter).
 Expected: FAIL (module does not exist).
 
 - [ ] **Step 3: Implement `composite.rs`**
@@ -400,7 +400,7 @@ cargo test-axum first_party_proxy_reads_s3_secret
 ```
 Expected: FAIL (all three).
 
-- [ ] **Step 2: Build `RuntimeServices` via the composite** in each adapter's `build_runtime_services(ctx: &RequestContext)`. **Extract the whole registry from request extensions** — `ctx.request().extensions().get::<ConfigRegistry>().cloned()` / `get::<SecretRegistry>()` — the same way EdgeZero's `Config`/`Secrets` extractors do. Do **not** use `ctx.config_store_default()`/`config_store(id)` (those return a single bound handle and would wire only the default store). Pass the cloned registry as the composite reader (Task 3) and the per-adapter **write-only** impl (`PlatformConfigWriter`/`PlatformSecretWriter`) as the writer. **Absent-registry policy (concrete):** `build_runtime_services` returns `RuntimeServices` (not `Result`) on all adapters, so don't add a fallible signature. Instead, when a registry is absent from extensions, build a composite over an **empty** registry (`StoreRegistry` with no ids) — its strict `named()`/`default()` return `None`, so the composite's `get`/`get_bytes` **error** (`PlatformError`) on first read rather than silently reading a default store. A missing registry thus surfaces as a read error at the call site, not a silent fallback, with no builder signature change.
+- [ ] **Step 2: Build `RuntimeServices` via the composite** in each adapter's `build_runtime_services(ctx: &RequestContext)`. **Extract the whole registry from request extensions** — `ctx.request().extensions().get::<ConfigRegistry>().cloned()` / `get::<SecretRegistry>()` — the same way EdgeZero's `Config`/`Secrets` extractors do. Do **not** use `ctx.config_store_default()`/`config_store(id)` (those return a single bound handle and would wire only the default store). Pass the cloned registry **`Option`** as the composite reader (Task 3) and the per-adapter **write-only** impl (`PlatformConfigWriter`/`PlatformSecretWriter`) as the writer. **Absent-registry policy (concrete):** `build_runtime_services` returns `RuntimeServices` (not `Result`) on all adapters, so don't add a fallible signature. The composite reader is `Option<ConfigRegistry>` / `Option<SecretRegistry>` (an empty `StoreRegistry` is unconstructable — private fields; `from_parts` → `None` on empty). So pass `ctx.request().extensions().get::<ConfigRegistry>().cloned()` (already an `Option`) straight into `CompositeConfigStore::new(...)`; when it's `None`, the composite's `get`/`get_bytes` **error** (`PlatformError`) on first read rather than silently reading a default store. A missing registry surfaces as a read error at the call site — no builder signature change, no empty-registry construction.
 
 - [ ] **Step 2b: Non-default coverage on Cloudflare AND Spin (not just Axum).** Cloudflare/Spin platform mappings differ (config = KV-namespace/label backed; secrets = flat namespace), so default-only assertions are insufficient. Add, in each of the Cloudflare and Spin test modules, tests proving **non-default** resolution: a `jwks_store` **config** read and a `ts_secrets` / S3 **secret**-key read resolve through the composite (route tests if cheap, else small `build_runtime_services` + composite-read tests seeding a 2-id registry).
 
@@ -460,7 +460,11 @@ EdgeZero's Fastly `dispatch_with_registries` and its registry builders are `pub(
 
 Run: `cargo test-fastly build_config_registry_resolves_declared_ids` → Expected: FAIL.
 
-- [ ] **Step 3: Implement the three builders** in `registries.rs` with the signatures above: iterate `StoreMetadata.ids`, open the EdgeZero Fastly store **by the logical id** (`FastlyConfigStore`/`FastlyKvStore`/`FastlySecretStore` open primitive), collect into a `BTreeMap<String, H>`, and `StoreRegistry::from_parts(by_id, default_id.to_owned())` (propagating the KV `open` error in `build_kv_registry`). No `EnvConfig`, no runtime dictionary.
+- [ ] **Step 3: Implement the three builders** in `registries.rs` with the signatures above — the three kinds construct **differently** (mirror EdgeZero's own private Fastly builders, `request.rs`):
+  - **KV** (`build_kv_registry -> Result<Option<KvRegistry>, FastlyError>`): for each id, `FastlyKvStore::open(id)` (this **can fail** → propagate `FastlyError`) → `KvHandle`; collect into `BTreeMap<String, KvHandle>`; `StoreRegistry::from_parts(by_id, default_id)`.
+  - **Config** (`-> Option<ConfigRegistry>`): for each id, build a `ConfigStoreHandle` over `FastlyConfigStore` for that id (+ `ConfigStoreBinding { handle, default_key }`); `from_parts`.
+  - **Secret** (`-> Option<SecretRegistry>`): **do NOT open per id.** Create **one** `SecretHandle::new(Arc::new(FastlySecretStore))` (the provider is stateless — `FastlySecretStore::get_bytes(store_name, key)` opens the named store per call), then bind each id via `BoundSecretStore::new(handle.clone(), store_name)` where `store_name` = the logical id (D7); `from_parts`.
+  - All open **by logical id** (D7 — no `EnvConfig`/runtime dictionary). `from_parts` yields `None` if a kind is undeclared or the default id is absent.
 
 - [ ] **Step 4: Insert registries in the oneshot block** — replace the lone `core_req.extensions_mut().insert(config_store)` at `main.rs:477`: build the three registries via Step 3 (propagate `build_kv_registry`'s `FastlyError` into the dispatch's `Result`), and `if let Some(reg) = ...` insert each into `core_req.extensions_mut()`, preserving the existing `client_info`/`device_signals` inserts.
 
@@ -482,7 +486,9 @@ Run: `cargo test-fastly oneshot_discovery_reads_jwks_via_registry` → Expected:
 
 Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 ```bash
-git add crates/trusted-server-adapter-fastly crates/trusted-server-core/src/publisher.rs
+git add crates/trusted-server-adapter-fastly \
+  crates/trusted-server-core/src/publisher.rs \
+  crates/trusted-server-core/src/consent/mod.rs
 git commit -m "Inject Fastly registries; flip consent to named KV; remove consent special-casing"
 ```
 
