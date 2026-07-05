@@ -230,7 +230,7 @@ fn composite_config_reads_named_store_and_writes_delegate() {
         ("jwks_store", "kid-1", "{\"kty\":\"OKP\"}"),
     ], "trusted_server_config");
     let writer = Arc::new(RecordingConfigWriter::default());
-    let composite = CompositeConfigStore::new(reader, writer.clone());
+    let composite = CompositeConfigStore::new(Some(reader), writer.clone());
     // Act + Assert: non-default store resolves.
     let jwk = composite
         .get(&StoreName::from("jwks_store"), "kid-1")
@@ -261,7 +261,7 @@ fn composite_secret_reads_named_store_and_writes_delegate() {
         ("ts_secrets", "server-side-key", b"dd-secret"),
     ], "trusted_server_secrets");
     let writer = Arc::new(RecordingSecretWriter::default());
-    let composite = CompositeSecretStore::new(reader, writer.clone());
+    let composite = CompositeSecretStore::new(Some(reader), writer.clone());
     // Non-default store resolves.
     let v = composite.get_bytes(&StoreName::from("ts_secrets"), "server-side-key").expect("read");
     assert_eq!(v, b"dd-secret");
@@ -291,7 +291,7 @@ Expected: FAIL (module does not exist).
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test-fastly composite_config_reads_named_store_and_writes_delegate`
+Run: `cargo test-fastly composite_` (runs both config + secret composite tests)
 Expected: PASS.
 
 - [ ] **Step 5: Reconcile `StoreName` semantics (D7).** `platform/types.rs::StoreName` is documented as an "edge-visible **platform** name". The composite now resolves `registry.named(store_name.as_str())` by **logical id**, so `StoreName` for reads must carry the **logical store id**. Update the `StoreName` doc comment to say "logical runtime store id" for reads, and audit read call sites (`request_signing/{signing,rotation}.rs`, `proxy.rs`, `integrations/datadome/{protection,protection_scope}.rs`) to confirm they pass **logical ids** (`trusted_server_config`, `jwks_store`, `ts_secrets`, `datadome-ip-bypass`, …), not physical platform names. No functional change if ids already equal names (D7 convention), but the doc + audit prevent implementers from passing physical names into logical registries.
@@ -364,7 +364,7 @@ git commit -m "Load boot config via EdgeZero config store on Fastly and Axum"
 **Files:**
 - Modify: `crates/trusted-server-adapter-axum/src/main.rs` (keep `AxumDevServer::with_config`, chain registry setters)
 - Create: `crates/trusted-server-adapter-axum/src/registries.rs` (`build_{config,kv,secret}_registry_axum(&StoresMetadata)`)
-- **Modify (core KV surface, Step 2c):** `crates/trusted-server-core/src/platform/types.rs` (`RuntimeServices::kv_handle_named` + `kv_registry` field/builder), `crates/trusted-server-core/src/consent/mod.rs` + `storage/kv_store.rs` (consent KV surface → `KvHandle`), `crates/trusted-server-core/src/publisher.rs` (call site passes `consent_store`)
+- **Modify (core KV surface, Step 2c):** `crates/trusted-server-core/src/platform/types.rs` (`RuntimeServices::kv_handle_named` + `kv_registry` field/builder), `crates/trusted-server-core/src/consent/mod.rs` + `storage/kv_store.rs` (consent KV surface → `KvHandle`), `crates/trusted-server-core/src/publisher.rs` (interim call site keeps `kv_handle()`; the named `consent_store` flip is **Task 6**)
 - Modify: `crates/trusted-server-adapter-{axum,cloudflare,spin}/src/platform.rs` (`build_runtime_services` → composite + `kv_registry` from extensions)
 - **Fastly named-KV + composite + `runtime_services_for_consent_route` removal → Task 6** (Fastly injects registries only in Task 6). Task 5 leaves Fastly compiling: the core `kv_handle_named` is additive and returns `None` on Fastly until Task 6 wires `kv_registry` (consent falls back safely).
 - Test-support (Step 2d): a shared `test_context_with_registries(...)` helper; migrate existing direct-context tests (`adapter-{axum,cloudflare,spin,fastly}` test modules)
@@ -410,7 +410,7 @@ Expected: FAIL (all three).
     - **Consent type migration (Task 5) vs behavioral flip (Task 6) — avoid an interim Fastly regression.** Change `ConsentPipelineInput.kv_store` from `Option<&dyn PlatformKvStore>` to `Option<KvHandle>` and update the persistence fns (`load_consent_from_kv`/`save_consent_to_kv`/`delete_consent_from_kv`) to take `&KvHandle` (they already `block_on`) — **in Task 5**. But **do NOT flip the `publisher.rs:626` call site to `kv_handle_named` in Task 5**: Fastly has no `KvRegistry` until Task 6, so `kv_handle_named("consent_store")` would return `None` there and consent persistence would **silently skip on Fastly** between Task 5 and Task 6. Today Fastly consent works because `runtime_services_for_consent_route` (`app.rs:205`) reopens the consent store and **swaps the default** kv via `with_kv_store`. So in **Task 5**, the call site keeps today's behavior: pass `services.kv_handle()` (the default handle — which on Fastly is the swapped consent store; on the others matches current behavior). The **named-lookup flip** — `settings.consent.consent_store.as_deref().and_then(|id| services.kv_handle_named(id))` — and removal of the Fastly swap happen **atomically in Task 6**, once all four adapters (Fastly included) inject a `KvRegistry`. The behavioral test (below) therefore lands in **Task 6**.
     - Audit other KV consumers (`ec/*`) for the same "id dropped" pattern; they already use `kv_handle()` so are lower-risk.
   - **Adapters — Axum/Cloudflare/Spin here; Fastly in Task 6 (sequencing).** Populate `RuntimeServices.kv_registry` from extensions in `build_runtime_services` for **Axum/Cloudflare/Spin** (they inject registries via EdgeZero `run_app`/`dispatch_with_registries`). **Fastly's** named-KV wiring belongs in **Task 6**, because Fastly only injects registries into extensions in Task 6 (its custom `oneshot`); its active per-request services are built in `app.rs:238` (`build_per_request_services`), not `platform.rs`, and its consent special-casing (`app.rs:205`, `runtime_services_for_consent_route`, used at `app.rs:588/735`) is removed **there** once the `kv_registry` is present. Doing Fastly named-KV in Task 5 would populate from a registry not yet in extensions.
-  - **Files:** `crates/trusted-server-core/src/platform/types.rs`, `crates/trusted-server-core/src/consent/mod.rs` (`ConsentPipelineInput.kv_store` type), `crates/trusted-server-core/src/storage/kv_store.rs` (consent persistence fns → `&KvHandle`), `crates/trusted-server-core/src/publisher.rs` (call site), `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/platform.rs`, `crates/trusted-server-adapter-fastly/src/app.rs` (remove consent special-case), adapter test helpers (Step 2d).
+  - **Files (Task 5):** `crates/trusted-server-core/src/platform/types.rs`, `crates/trusted-server-core/src/consent/mod.rs` (`ConsentPipelineInput.kv_store` type), `crates/trusted-server-core/src/storage/kv_store.rs` (consent persistence fns → `&KvHandle`), `crates/trusted-server-core/src/publisher.rs` (interim call site, kept on `kv_handle()`), `crates/trusted-server-adapter-{axum,cloudflare,spin}/src/platform.rs`, adapter test helpers (Step 2d). **Fastly `platform.rs`/`app.rs` (populate `kv_registry`, remove consent special-case) + the `publisher.rs` named-lookup flip are Task 6**, not here.
   - **Test (Task 5):** the `kv_handle_named` surface resolves — per adapter, `kv_handle_named("consent_store")` returns a handle distinct from the default; unknown id → `None`. (The **behavioral** consent test — that `consent_store` is actually selected and the default is left untouched — lands in **Task 6** with the call-site flip; see Task 6.)
 
 - [ ] **Step 2d: Test-support — registry-populated `RequestContext` helper + migrate existing direct-context tests.** Strict registries make a missing registry a wiring bug, but existing adapter tests call `build_runtime_services(&ctx)` / `build_per_request_services(&ctx)` on **hand-built** `RequestContext`s with no registries inserted (e.g. `adapter-axum/src/app.rs:130`, `adapter-cloudflare/src/app.rs:151,314`, `adapter-spin/src/app.rs:440`, `adapter-cloudflare/src/platform.rs:729`). Those will now fail (composite → `registry.named()` → `None`). Add a shared test helper (e.g. `test_context_with_registries(config: &[…], kv: &[…], secrets: &[…]) -> RequestContext`) that inserts `ConfigRegistry`/`KvRegistry`/`SecretRegistry` into the context, and **migrate every existing direct-context test** to use it. Enumerate them during the run (`rg 'build_(runtime|per_request)_services'` in adapter test modules).
@@ -461,7 +461,7 @@ EdgeZero's Fastly `dispatch_with_registries` and its registry builders are `pub(
 Run: `cargo test-fastly build_config_registry_resolves_declared_ids` → Expected: FAIL.
 
 - [ ] **Step 3: Implement the three builders** in `registries.rs` with the signatures above — the three kinds construct **differently** (mirror EdgeZero's own private Fastly builders, `request.rs`):
-  - **KV** (`build_kv_registry -> Result<Option<KvRegistry>, FastlyError>`): for each id, `FastlyKvStore::open(id)` (this **can fail** → propagate `FastlyError`) → `KvHandle`; collect into `BTreeMap<String, KvHandle>`; `StoreRegistry::from_parts(by_id, default_id)`.
+  - **KV** (`build_kv_registry -> Result<Option<KvRegistry>, FastlyError>`): `FastlyKvStore::open(id)` returns `Result<FastlyKvStore, KvError>` (not a `KvHandle`), so for each id `let store = FastlyKvStore::open(id)?;` then wrap `KvHandle::new(Arc::new(store))` (map `KvError` → `FastlyError`); collect into `BTreeMap<String, KvHandle>`; `StoreRegistry::from_parts(by_id, default_id)`.
   - **Config** (`-> Option<ConfigRegistry>`): for each id, build a `ConfigStoreHandle` over `FastlyConfigStore` for that id (+ `ConfigStoreBinding { handle, default_key }`); `from_parts`.
   - **Secret** (`-> Option<SecretRegistry>`): **do NOT open per id.** Create **one** `SecretHandle::new(Arc::new(FastlySecretStore))` (the provider is stateless — `FastlySecretStore::get_bytes(store_name, key)` opens the named store per call), then bind each id via `BoundSecretStore::new(handle.clone(), store_name)` where `store_name` = the logical id (D7); `from_parts`.
   - All open **by logical id** (D7 — no `EnvConfig`/runtime dictionary). `from_parts` yields `None` if a kind is undeclared or the default id is absent.
