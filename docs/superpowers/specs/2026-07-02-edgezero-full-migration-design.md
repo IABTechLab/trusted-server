@@ -34,7 +34,7 @@ Verified across `trusted-server-core`, the four adapters, `trusted-server-cli`, 
 
 | Concern | Today | Gap to close |
 |---|---|---|
-| **KV** | ✅ 100% on EdgeZero (`KvStore`/`KvHandle`, re-exported as `PlatformKvStore`) | None (baseline for the pattern) |
+| **KV** | ⚠️ **Default** KV is on EdgeZero (`KvStore`/`KvHandle`, re-exported as `PlatformKvStore`), but **named/non-default KV is not selected**: `RuntimeServices` exposes only a single default handle and consent drops the configured `consent_store` id (`publisher.rs:626`) | Phase 1 (named-KV surface + consent migration — see D5/Step 2c) |
 | **Routing** | ✅ All 4 adapters route through EdgeZero `RouterService` + `Hooks` | None structurally; handler authoring changes in Phase 4 |
 | **Core off `fastly::` types** | ✅ Enforced by `migration_guards.rs` | Keep the guard; extend coverage as adapters shrink |
 | **Config load** | ⚠️ Fastly + Axum load the blob from the config store; **Cloudflare** reads a `TRUSTED_SERVER_CONFIG` env side-channel (native fallback `include_str!`); **Spin `include_str!` `trusted-server.example.toml`** — none of these is a boot-time config-store read | Phase 2 (P-BOOT) |
