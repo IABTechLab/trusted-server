@@ -283,6 +283,7 @@ mod tests {
                 url: "https://cdn.example.com/dynamic.js".to_string(),
                 resource_type: Some("Script".to_string()),
             }],
+            gpt_slots: Vec::new(),
             warnings: vec!["partial settle".to_string()],
         };
 
@@ -319,6 +320,7 @@ mod tests {
             html: "<html><head><title>HTML Title</title></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -336,6 +338,7 @@ mod tests {
             html: "<html><head><title>HTML Title</title></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -360,6 +363,7 @@ mod tests {
                 url: "https://cdn.example.com/prebid.js".to_string(),
                 resource_type: Some("script".to_string()),
             }],
+            gpt_slots: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -394,6 +398,7 @@ mod tests {
                 },
             ],
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -424,6 +429,7 @@ mod tests {
             html: "<html><head></head></html>".to_string(),
             script_tags: Vec::new(),
             network_requests: Vec::new(),
+            gpt_slots: Vec::new(),
             warnings: Vec::new(),
         };
 

@@ -53,6 +53,7 @@ fn run_with_collector(
         init_scripts: Vec::new(),
         scroll,
         collect_ad_evidence: false,
+        cookies: Vec::new(),
     })?;
 
     let stdout = io::stdout();

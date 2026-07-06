@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::network::CookieParam;
 use chromiumoxide::ArcHttpRequest;
 use futures::StreamExt as _;
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use url::Url;
 use which::which;
 
 use crate::audit::generate::collector::{
-    AuditCollector, CollectedPage, CollectedRequest, CollectedScriptTag,
+    AuditCollector, CollectedGptSlot, CollectedPage, CollectedRequest, CollectedScriptTag,
 };
 use crate::error::{report_error, CliResult};
 
@@ -29,7 +30,11 @@ const RESOURCE_TIMING_BUFFER_WARNING: &str =
 pub(crate) struct BrowserAuditCollector;
 
 impl AuditCollector for BrowserAuditCollector {
-    fn collect_page(&self, target_url: &Url) -> CliResult<CollectedPage> {
+    fn collect_page(
+        &self,
+        target_url: &Url,
+        cookies: &[(String, String)],
+    ) -> CliResult<CollectedPage> {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -39,11 +44,14 @@ impl AuditCollector for BrowserAuditCollector {
                 ))
             })?;
 
-        runtime.block_on(collect_page_via_browser_async(target_url))
+        runtime.block_on(collect_page_via_browser_async(target_url, cookies))
     }
 }
 
-async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<CollectedPage> {
+async fn collect_page_via_browser_async(
+    target_url: &Url,
+    cookies: &[(String, String)],
+) -> CliResult<CollectedPage> {
     let chrome_executable = find_browser_executable()?;
     let user_data_dir = TempDir::new().map_err(|error| {
         report_error(format!(
@@ -75,7 +83,7 @@ async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<Collected
         }
     });
 
-    let result = collect_page_from_browser(&mut browser, target_url).await;
+    let result = collect_page_from_browser(&mut browser, target_url, cookies).await;
 
     let close_result = timeout(BROWSER_CLOSE_TIMEOUT, browser.close())
         .await
@@ -99,10 +107,22 @@ async fn collect_page_via_browser_async(target_url: &Url) -> CliResult<Collected
 async fn collect_page_from_browser(
     browser: &mut Browser,
     target_url: &Url,
+    cookies: &[(String, String)],
 ) -> CliResult<CollectedPage> {
     let page = browser.new_page("about:blank").await.map_err(|error| {
         report_error(format!("failed to create browser page for audit: {error}"))
     })?;
+
+    // Set operator-supplied cookies before navigating so the origin sees an
+    // authenticated session on the first request. Scoping each to the target URL
+    // lets Chrome infer domain/path.
+    for (name, value) in cookies {
+        let mut cookie = CookieParam::new(name.clone(), value.clone());
+        cookie.url = Some(target_url.to_string());
+        page.set_cookie(cookie)
+            .await
+            .map_err(|error| report_error(format!("failed to set cookie `{name}`: {error}")))?;
+    }
 
     timeout(NAVIGATION_TIMEOUT, page.goto(target_url.as_str()))
         .await
@@ -187,6 +207,14 @@ async fn collect_page_from_browser(
         warnings.push(warning.to_string());
     }
 
+    // Best-effort read of the live GPT slot registry. This is the authoritative
+    // source for slot path/div/size, so a failure here downgrades to empty
+    // rather than failing the whole audit.
+    let gpt_slots: Vec<CollectedGptSlot> = match page.evaluate(GPT_SLOTS_SCRIPT).await {
+        Ok(result) => result.into_value().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
     Ok(CollectedPage {
         requested_url: target_url.to_string(),
         final_url,
@@ -206,9 +234,36 @@ async fn collect_page_from_browser(
                 resource_type: entry.initiator_type,
             })
             .collect(),
+        gpt_slots,
         warnings,
     })
 }
+
+/// Reads the live GPT slot registry into `{gam_unit_path, div_id, sizes}` rows.
+///
+/// Mirrors the ad-template verifier's `getSlots()` scrape: it defends against a
+/// missing or partially-initialized `googletag`, keeps only numeric sizes, and
+/// drops slots without a path or div id.
+const GPT_SLOTS_SCRIPT: &str = r#"() => {
+    try {
+        if (!window.googletag || typeof googletag.pubads !== 'function') return [];
+        const pubads = googletag.pubads();
+        if (typeof pubads.getSlots !== 'function') return [];
+        return pubads.getSlots().map((slot) => {
+            const path = typeof slot.getAdUnitPath === 'function' ? slot.getAdUnitPath() : '';
+            const div = typeof slot.getSlotElementId === 'function' ? slot.getSlotElementId() : '';
+            const rawSizes = typeof slot.getSizes === 'function' ? (slot.getSizes() || []) : [];
+            const sizes = rawSizes.map((size) =>
+                (size && typeof size.getWidth === 'function' && typeof size.getHeight === 'function')
+                    ? [size.getWidth(), size.getHeight()]
+                    : null
+            ).filter(Boolean);
+            return { gam_unit_path: path, div_id: div, sizes };
+        }).filter((slot) => slot.gam_unit_path && slot.div_id);
+    } catch (error) {
+        return [];
+    }
+}"#;
 
 async fn wait_for_page_settle(page: &chromiumoxide::Page) -> CliResult<bool> {
     let mut elapsed = Duration::ZERO;

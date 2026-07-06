@@ -42,6 +42,12 @@ pub struct BrowserCollectRequest {
     pub scroll: bool,
     /// Whether to extract `window.__tsAdTemplateEvidence` after settle/scroll.
     pub collect_ad_evidence: bool,
+    /// Operator-supplied `(name, value)` cookies set on the browser context
+    /// before navigation, scoped to the request URL. Used to carry an existing
+    /// authenticated session (e.g. a valid bot-protection clearance cookie) so
+    /// the origin serves the real page instead of a challenge. The collector
+    /// only sends these; it never reads cookies back.
+    pub cookies: Vec<(String, String)>,
 }
 
 /// The result of collecting a single page.

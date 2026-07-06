@@ -43,6 +43,7 @@ pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String
         &args.urls,
         args.strict,
         args.scroll,
+        &args.cookies,
     );
 
     let stdout = io::stdout();
@@ -71,6 +72,7 @@ fn build_report(
     urls: &[url::Url],
     strict: bool,
     scroll: bool,
+    cookies: &[(String, String)],
 ) -> VerificationReport {
     let init_script = build_init_script(creative);
 
@@ -84,6 +86,7 @@ fn build_report(
             init_scripts: init_script.clone().into_iter().collect(),
             scroll,
             collect_ad_evidence: true,
+            cookies: cookies.to_vec(),
         };
 
         match collector.collect_page(request) {
@@ -459,6 +462,7 @@ mod tests {
             &parsed,
             strict,
             false,
+            &[],
         )
     }
 

@@ -1,13 +1,16 @@
 //! Chrome/Chromium-backed implementation of [`AuditCollector`] using
 //! `chromiumoxide` (CDP).
 //!
-//! The collector is read-only: it installs optional pre-navigation init scripts,
-//! navigates, waits for the page to settle, optionally scrolls, and reads back a
-//! bounded set of evidence. It never captures page HTML, cookies, or storage.
+//! The collector installs optional pre-navigation init scripts, sets any
+//! operator-supplied cookies, navigates, waits for the page to settle, optionally
+//! scrolls, and reads back a bounded set of evidence. It never *captures* page
+//! HTML, cookies, or storage; supplied cookies are only *sent* to carry an
+//! existing session past origin gates.
 
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::network::CookieParam;
 use chromiumoxide::page::Page;
 use futures::StreamExt as _;
 
@@ -251,6 +254,17 @@ async fn collect_with_browser(
             .map_err(|error| format!("failed to install init script: {error}"))?;
     }
 
+    // Set operator-supplied cookies on the context before navigating so the
+    // origin sees an authenticated session on the first request. Scoping each to
+    // the request URL lets Chrome infer domain/path.
+    for (name, value) in &request.cookies {
+        let mut cookie = CookieParam::new(name.clone(), value.clone());
+        cookie.url = Some(request.url.to_string());
+        page.set_cookie(cookie)
+            .await
+            .map_err(|error| format!("failed to set cookie `{name}`: {error}"))?;
+    }
+
     page.goto(request.url.as_str())
         .await
         .map_err(|error| format!("failed to navigate to {}: {error}", request.url))?;
@@ -470,6 +484,7 @@ mod tests {
                 init_scripts: vec![script],
                 scroll: false,
                 collect_ad_evidence: true,
+                cookies: Vec::new(),
             })
             .expect("should collect fixture page");
 
