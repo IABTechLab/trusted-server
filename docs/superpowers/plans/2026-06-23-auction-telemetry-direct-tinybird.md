@@ -265,7 +265,7 @@ max_body_bytes = 1048576
 Notes:
 
 - The revised spec lists token secret keys but not a Secret Store name. The implementation needs a store name because `PlatformSecretStore` reads by `StoreName`; use `tinybird.secret_store` with a safe default such as `ts_secrets` unless the user prefers separate per-token store settings.
-- Validate only when `enabled` or `access_enabled` is true:
+- Validate only when `enabled` is true; `access_enabled = true` is rejected until Phase 9 wires an access-log emitter, so operators cannot enable a no-op path by mistake:
   - `api_host` must be non-empty, host-only, no scheme, no path, no control characters.
   - dataset names must be non-empty and bounded.
   - secret key names must be non-empty.
@@ -494,7 +494,7 @@ Tinybird fixture tests must prove:
 
 ### Phase 9: Optional ops access telemetry
 
-Do this only if requested for the implementation PR; auction telemetry alone satisfies phase 1.
+Do this only if requested for a future implementation PR; auction telemetry alone satisfies phase 1. Until this phase is implemented, `tinybird.access_enabled = true` fails validation rather than silently emitting nothing.
 
 - [ ] Add `AccessTelemetrySink` or extend the Tinybird sink with `emit_access_log`.
 - [ ] Emit one sampled row at top-level response finalization where status and elapsed time are known.

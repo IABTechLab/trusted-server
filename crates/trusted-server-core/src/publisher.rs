@@ -34,7 +34,7 @@ use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction,
 };
 use crate::auction::telemetry::{
-    build_auction_events, emit_auction_events_best_effort, AuctionObservationContext,
+    build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
     AuctionSource, AuctionTerminalOutcome,
 };
 use crate::auction::types::{
@@ -676,14 +676,16 @@ pub async fn stream_publisher_body_async<W: Write>(
         if let (Some(observation), Some(auction_request)) =
             (telemetry.observation, telemetry.auction_request.as_ref())
         {
-            let telemetry_batch = build_auction_events(
-                observation,
-                AuctionTerminalOutcome::Completed {
-                    request: auction_request,
-                    result: &result,
-                },
-            );
-            emit_auction_events_best_effort(services, telemetry_batch).await;
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::Completed {
+                        request: auction_request,
+                        result: &result,
+                    },
+                )
+            })
+            .await;
         }
 
         write_bids_to_state(
@@ -1184,17 +1186,19 @@ async fn emit_abandoned_auction(
         return;
     };
     let (request, provider_responses, abandoned_providers, elapsed_ms) = dispatched.abandon();
-    let telemetry_batch = build_auction_events(
-        observation,
-        AuctionTerminalOutcome::Abandoned {
-            request: &request,
-            provider_responses: &provider_responses,
-            abandoned_providers: &abandoned_providers,
-            reason,
-            elapsed_ms,
-        },
-    );
-    emit_auction_events_best_effort(services, telemetry_batch).await;
+    emit_auction_events_best_effort_lazy(services, || {
+        build_auction_events(
+            observation,
+            AuctionTerminalOutcome::Abandoned {
+                request: &request,
+                provider_responses: &provider_responses,
+                abandoned_providers: &abandoned_providers,
+                reason,
+                elapsed_ms,
+            },
+        )
+    })
+    .await;
 }
 
 async fn collect_stream_auction(
@@ -1215,14 +1219,16 @@ async fn collect_stream_auction(
     if let (Some(observation), Some(auction_request)) =
         (telemetry.observation, telemetry.auction_request.as_ref())
     {
-        let telemetry_batch = build_auction_events(
-            observation,
-            AuctionTerminalOutcome::Completed {
-                request: auction_request,
-                result: &result,
-            },
-        );
-        emit_auction_events_best_effort(services, telemetry_batch).await;
+        emit_auction_events_best_effort_lazy(services, || {
+            build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Completed {
+                    request: auction_request,
+                    result: &result,
+                },
+            )
+        })
+        .await;
     }
     log::info!(
         "body_close_hold_loop: collect complete - {} winning bid(s)",
@@ -1510,30 +1516,34 @@ pub async fn handle_publisher_request(
                     provider_responses,
                     elapsed_ms,
                 } => {
-                    let telemetry_batch = build_auction_events(
-                        observation,
-                        AuctionTerminalOutcome::DispatchFailed {
-                            request: &request,
-                            provider_responses: &provider_responses,
-                            reason: "dispatch_failed",
-                            elapsed_ms,
-                        },
-                    );
-                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &request,
+                                provider_responses: &provider_responses,
+                                reason: "dispatch_failed",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
                     None
                 }
                 DispatchAuctionOutcome::NotStarted => {
                     let elapsed_ms = observation.elapsed_ms();
-                    let telemetry_batch = build_auction_events(
-                        observation,
-                        AuctionTerminalOutcome::DispatchFailed {
-                            request: &auction_request,
-                            provider_responses: &[],
-                            reason: "no_provider_dispatched",
-                            elapsed_ms,
-                        },
-                    );
-                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::DispatchFailed {
+                                request: &auction_request,
+                                provider_responses: &[],
+                                reason: "no_provider_dispatched",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
                     None
                 }
             }
@@ -1550,14 +1560,16 @@ pub async fn handle_publisher_request(
                 "not_ad_stack_eligible"
             };
             let elapsed_ms = observation.elapsed_ms();
-            let telemetry_batch = build_auction_events(
-                observation,
-                AuctionTerminalOutcome::Skipped {
-                    reason: skip_reason,
-                    elapsed_ms,
-                },
-            );
-            emit_auction_events_best_effort(services, telemetry_batch).await;
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::Skipped {
+                        reason: skip_reason,
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
             None
         }
     };
@@ -2318,29 +2330,33 @@ pub async fn handle_page_bids(
             {
                 Ok(result) => {
                     let winning_bids = result.winning_bids.clone();
-                    let telemetry_batch = build_auction_events(
-                        observation,
-                        AuctionTerminalOutcome::Completed {
-                            request: &auction_request,
-                            result: &result,
-                        },
-                    );
-                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::Completed {
+                                request: &auction_request,
+                                result: &result,
+                            },
+                        )
+                    })
+                    .await;
                     winning_bids
                 }
                 Err(e) => {
                     log::warn!("page-bids auction failed: {e:?}");
                     let elapsed_ms = observation.elapsed_ms();
-                    let telemetry_batch = build_auction_events(
-                        observation,
-                        AuctionTerminalOutcome::ExecutionFailed {
-                            request: Some(&auction_request),
-                            provider_responses: &[],
-                            reason: "execution_failed",
-                            elapsed_ms,
-                        },
-                    );
-                    emit_auction_events_best_effort(services, telemetry_batch).await;
+                    emit_auction_events_best_effort_lazy(services, || {
+                        build_auction_events(
+                            observation,
+                            AuctionTerminalOutcome::ExecutionFailed {
+                                request: Some(&auction_request),
+                                provider_responses: &[],
+                                reason: "execution_failed",
+                                elapsed_ms,
+                            },
+                        )
+                    })
+                    .await;
                     std::collections::HashMap::new()
                 }
             }
@@ -2357,14 +2373,16 @@ pub async fn handle_page_bids(
                 "not_ad_stack_eligible"
             };
             let elapsed_ms = observation.elapsed_ms();
-            let telemetry_batch = build_auction_events(
-                observation,
-                AuctionTerminalOutcome::Skipped {
-                    reason: skip_reason,
-                    elapsed_ms,
-                },
-            );
-            emit_auction_events_best_effort(services, telemetry_batch).await;
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::Skipped {
+                        reason: skip_reason,
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
             std::collections::HashMap::new()
         }
     };

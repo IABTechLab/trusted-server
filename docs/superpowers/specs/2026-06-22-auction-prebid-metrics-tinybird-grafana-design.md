@@ -89,11 +89,10 @@ unless the application deliberately waits, which it must not do on the hot path.
 2. **Raw retention is 30 days** via TTL on `auction_events_raw` and
    `access_logs_raw`. Per-minute rollups in materialized views are retained 13
    months (adjustable), since they are small.
-3. **Phase 1 ships yield telemetry and optionally ops access telemetry.** Auction
-   telemetry is the primary requirement. Ops access telemetry uses the same
-   direct-ingest transport but must be volume-gated with configuration and may be
-   sampled or disabled if one async POST per request is too expensive for the
-   Tinybird plan.
+3. **Phase 1 ships auction yield telemetry.** Auction telemetry is the primary
+   requirement. Ops access telemetry is a future phase: its config/schema can be
+   reserved, but enabling it must fail closed until an emitter exists so an
+   operator cannot turn on a no-op telemetry path by mistake.
 4. **Phase 1 uses hosted Tinybird Cloud.** Tinybird manages the data plane,
    scaling, and service availability. See Deployment.
 5. **All auction initiation paths are in scope.** Initial-navigation SSAT, SPA
@@ -475,17 +474,17 @@ reconciled revenue.
 
 The Fastly adapter needs runtime configuration for direct Tinybird ingestion:
 
-| setting                         | purpose                                                    |
-| ------------------------------- | ---------------------------------------------------------- |
-| `tinybird.enabled`              | master enable/disable switch                               |
-| `tinybird.api_host`             | regional Tinybird API host, without path                   |
-| `tinybird.auction_dataset`      | usually `auction_events_raw`                               |
-| `tinybird.auction_token_secret` | Fastly Secret Store key containing the `ts_ingest` token   |
-| `tinybird.access_enabled`       | enable/disable direct access-log telemetry                 |
-| `tinybird.access_dataset`       | usually `access_logs_raw`                                  |
-| `tinybird.access_token_secret`  | Fastly Secret Store key containing the access append token |
-| `tinybird.access_sample_rate`   | fraction of requests to emit for ops telemetry             |
-| `tinybird.max_body_bytes`       | defensive maximum body size for one direct ingest POST     |
+| setting                         | purpose                                                                             |
+| ------------------------------- | ----------------------------------------------------------------------------------- |
+| `tinybird.enabled`              | master enable/disable switch                                                        |
+| `tinybird.api_host`             | regional Tinybird API host, without path                                            |
+| `tinybird.auction_dataset`      | usually `auction_events_raw`                                                        |
+| `tinybird.auction_token_secret` | Fastly Secret Store key containing the `ts_ingest` token                            |
+| `tinybird.access_enabled`       | reserved for future direct access-log telemetry; rejected while no emitter is wired |
+| `tinybird.access_dataset`       | future access-log datasource, usually `access_logs_raw`                             |
+| `tinybird.access_token_secret`  | future Fastly Secret Store key for the access append token                          |
+| `tinybird.access_sample_rate`   | future fraction of requests to emit for ops telemetry                               |
+| `tinybird.max_body_bytes`       | defensive maximum body size for one direct ingest POST                              |
 
 The adapter must not log token values or request `Authorization` headers. Local
 and test environments may use disabled/no-op sinks or fixture secrets.

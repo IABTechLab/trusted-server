@@ -18,6 +18,7 @@ use trusted_server_core::settings::{Settings, TinybirdSettings};
 const TINYBIRD_EVENTS_PATH: &str = "/v0/events";
 const TINYBIRD_NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const TINYBIRD_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
+const TINYBIRD_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(2);
 const TINYBIRD_MAX_ROWS_PER_AUCTION_BATCH: usize = 512;
 
 /// Build the configured auction telemetry sink.
@@ -168,6 +169,10 @@ impl FastlyTinybirdAuctionTelemetrySink {
 
 #[async_trait::async_trait(?Send)]
 impl AuctionTelemetrySink for FastlyTinybirdAuctionTelemetrySink {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     async fn emit_auction_events(
         &self,
         services: &RuntimeServices,
@@ -206,7 +211,7 @@ fn tinybird_backend_spec(api_host: &str) -> PlatformBackendSpec {
         host_header_override: None,
         certificate_check: true,
         first_byte_timeout: TINYBIRD_FIRST_BYTE_TIMEOUT,
-        between_bytes_timeout: TINYBIRD_FIRST_BYTE_TIMEOUT,
+        between_bytes_timeout: TINYBIRD_BETWEEN_BYTES_TIMEOUT,
     }
 }
 

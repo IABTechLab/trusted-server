@@ -25,7 +25,7 @@ use crate::settings::Settings;
 
 use super::formats::{convert_to_openrtb_response, convert_tsjs_to_auction_request};
 use super::telemetry::{
-    build_auction_events, emit_auction_events_best_effort, AuctionObservationContext,
+    build_auction_events, emit_auction_events_best_effort_lazy, AuctionObservationContext,
     AuctionSource, AuctionTerminalOutcome,
 };
 use super::types::AuctionContext;
@@ -197,14 +197,16 @@ pub async fn handle_auction(
             &auction_request,
             ec_context,
         );
-        let telemetry_batch = build_auction_events(
-            observation,
-            AuctionTerminalOutcome::Skipped {
-                reason: "consent_denied",
-                elapsed_ms: 0,
-            },
-        );
-        emit_auction_events_best_effort(services, telemetry_batch).await;
+        emit_auction_events_best_effort_lazy(services, || {
+            build_auction_events(
+                observation,
+                AuctionTerminalOutcome::Skipped {
+                    reason: "consent_denied",
+                    elapsed_ms: 0,
+                },
+            )
+        })
+        .await;
 
         let empty_result = OrchestrationResult {
             provider_responses: Vec::new(),
@@ -297,30 +299,34 @@ pub async fn handle_auction(
         Ok(result) => result,
         Err(err) => {
             let elapsed_ms = observation.elapsed_ms();
-            let telemetry_batch = build_auction_events(
-                observation,
-                AuctionTerminalOutcome::ExecutionFailed {
-                    request: Some(&auction_request),
-                    provider_responses: &[],
-                    reason: "execution_failed",
-                    elapsed_ms,
-                },
-            );
-            emit_auction_events_best_effort(services, telemetry_batch).await;
+            emit_auction_events_best_effort_lazy(services, || {
+                build_auction_events(
+                    observation,
+                    AuctionTerminalOutcome::ExecutionFailed {
+                        request: Some(&auction_request),
+                        provider_responses: &[],
+                        reason: "execution_failed",
+                        elapsed_ms,
+                    },
+                )
+            })
+            .await;
             return Err(err.change_context(TrustedServerError::Auction {
                 message: "Auction orchestration failed".to_string(),
             }));
         }
     };
 
-    let telemetry_batch = build_auction_events(
-        observation,
-        AuctionTerminalOutcome::Completed {
-            request: &auction_request,
-            result: &result,
-        },
-    );
-    emit_auction_events_best_effort(services, telemetry_batch).await;
+    emit_auction_events_best_effort_lazy(services, || {
+        build_auction_events(
+            observation,
+            AuctionTerminalOutcome::Completed {
+                request: &auction_request,
+                result: &result,
+            },
+        )
+    })
+    .await;
 
     log::info!(
         "Auction completed: {} providers, {} winning bids, {}ms total",

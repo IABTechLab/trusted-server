@@ -426,12 +426,20 @@ impl AuctionEventBatch {
 /// Sink for auction telemetry batches.
 #[async_trait::async_trait(?Send)]
 pub trait AuctionTelemetrySink: Send + Sync {
+    /// Return whether this sink emits telemetry.
+    ///
+    /// Callers use this as a cheap hot-path gate before allocating telemetry
+    /// rows. Enabled sinks may still drop individual empty or invalid batches.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     /// Emit an auction telemetry batch.
     ///
     /// # Errors
     ///
     /// Returns an error when the sink cannot start emission. Callers should use
-    /// [`emit_auction_events_best_effort`] on the hot path.
+    /// [`emit_auction_events_best_effort_lazy`] on the hot path.
     async fn emit_auction_events(
         &self,
         services: &RuntimeServices,
@@ -444,6 +452,10 @@ pub struct NoopAuctionTelemetrySink;
 
 #[async_trait::async_trait(?Send)]
 impl AuctionTelemetrySink for NoopAuctionTelemetrySink {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
     async fn emit_auction_events(
         &self,
         _services: &RuntimeServices,
@@ -455,14 +467,27 @@ impl AuctionTelemetrySink for NoopAuctionTelemetrySink {
 
 /// Emit a telemetry batch without letting errors affect customer traffic.
 pub async fn emit_auction_events_best_effort(services: &RuntimeServices, batch: AuctionEventBatch) {
+    emit_auction_events_best_effort_lazy(services, || batch).await;
+}
+
+/// Lazily build and emit a telemetry batch without affecting customer traffic.
+///
+/// The batch builder is skipped when the configured sink is disabled, avoiding
+/// per-auction row allocations on the default no-op telemetry path.
+pub async fn emit_auction_events_best_effort_lazy(
+    services: &RuntimeServices,
+    build_batch: impl FnOnce() -> AuctionEventBatch,
+) {
+    let sink = services.auction_telemetry_sink();
+    if !sink.is_enabled() {
+        return;
+    }
+
+    let batch = build_batch();
     if batch.is_empty() {
         return;
     }
-    if let Err(err) = services
-        .auction_telemetry_sink()
-        .emit_auction_events(services, batch)
-        .await
-    {
+    if let Err(err) = sink.emit_auction_events(services, batch).await {
         log::warn!("auction telemetry emission skipped: {err:?}");
     }
 }
@@ -884,6 +909,7 @@ fn looks_like_uuid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use serde_json::json;
@@ -939,6 +965,22 @@ mod tests {
             cache_path: None,
             metadata: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn emit_lazy_skips_builder_when_sink_is_disabled() {
+        let services = crate::platform::test_support::noop_services();
+        let builder_called = Cell::new(false);
+
+        futures::executor::block_on(emit_auction_events_best_effort_lazy(&services, || {
+            builder_called.set(true);
+            AuctionEventBatch::default()
+        }));
+
+        assert!(
+            !builder_called.get(),
+            "disabled telemetry sink should not build auction rows"
+        );
     }
 
     #[test]

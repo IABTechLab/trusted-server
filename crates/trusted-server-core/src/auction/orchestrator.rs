@@ -1319,6 +1319,7 @@ mod tests {
     use web_time::Instant;
 
     use crate::auction::config::AuctionConfig;
+    use crate::auction::orchestrator::DispatchAuctionOutcome;
     use crate::auction::provider::AuctionProvider;
     use crate::auction::test_support::create_test_auction_context;
     use crate::auction::types::{
@@ -2126,7 +2127,7 @@ mod tests {
 
             // Assert: no dispatch and no provider request launched.
             assert!(
-                dispatched.is_none(),
+                matches!(dispatched, DispatchAuctionOutcome::NotStarted),
                 "should skip initial-page dispatch on sequential platforms"
             );
             assert!(

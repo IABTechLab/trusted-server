@@ -1739,16 +1739,19 @@ pub struct TinybirdSettings {
     /// Secret key containing the auction datasource APPEND token.
     #[serde(default = "default_tinybird_auction_token_secret")]
     pub auction_token_secret: String,
-    /// Enable optional access-log telemetry.
+    /// Reserved for future access-log telemetry.
+    ///
+    /// `true` is rejected until an access-log emitter is wired, so operators
+    /// cannot enable a setting that silently emits nothing.
     #[serde(default)]
     pub access_enabled: bool,
-    /// Access-log Events API datasource name.
+    /// Future access-log Events API datasource name.
     #[serde(default = "default_tinybird_access_dataset")]
     pub access_dataset: String,
-    /// Secret key containing the access-log datasource APPEND token.
+    /// Future Secret Store key containing the access-log datasource APPEND token.
     #[serde(default = "default_tinybird_access_token_secret")]
     pub access_token_secret: String,
-    /// Fraction of requests to emit for optional access telemetry.
+    /// Future fraction of requests to emit for optional access telemetry.
     #[serde(default)]
     pub access_sample_rate: f64,
     /// Defensive maximum NDJSON body size for one Events API request.
@@ -1819,7 +1822,12 @@ impl TinybirdSettings {
                 message: "tinybird.max_body_bytes must be at least 1024".to_owned(),
             }));
         }
-        if !self.enabled && !self.access_enabled {
+        if self.access_enabled {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "tinybird.access_enabled is reserved for future access-log telemetry; no emitter is currently wired".to_owned(),
+            }));
+        }
+        if !self.enabled {
             return Ok(());
         }
         validate_tinybird_api_host(&self.api_host)?;
@@ -1833,10 +1841,6 @@ impl TinybirdSettings {
         if self.enabled {
             validate_tinybird_dataset(&self.auction_dataset, "tinybird.auction_dataset")?;
             validate_tinybird_secret(&self.auction_token_secret, "tinybird.auction_token_secret")?;
-        }
-        if self.access_enabled {
-            validate_tinybird_dataset(&self.access_dataset, "tinybird.access_dataset")?;
-            validate_tinybird_secret(&self.access_token_secret, "tinybird.access_token_secret")?;
         }
         Ok(())
     }
@@ -2638,6 +2642,21 @@ mod tests {
         let settings = Settings::from_toml(&toml).expect("should accept Tinybird region host");
         assert!(settings.tinybird.enabled);
         assert_eq!(settings.tinybird.api_host, "api.us-east.aws.tinybird.co");
+    }
+
+    #[test]
+    fn tinybird_access_enabled_is_rejected_until_emitter_is_wired() {
+        let toml = format!(
+            "{}\n[tinybird]\naccess_enabled = true\n",
+            crate_test_settings_str()
+        );
+
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject access telemetry before emitter exists");
+        assert!(
+            format!("{err:?}").contains("tinybird.access_enabled"),
+            "should report unsupported tinybird.access_enabled setting: {err:?}"
+        );
     }
 
     #[test]
