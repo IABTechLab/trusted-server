@@ -5,9 +5,9 @@ use regex::Regex;
 use scraper::{Html, Selector};
 use url::Url;
 
-use crate::audit::collector::CollectedPage;
-use crate::audit::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
-use crate::error::{report_error, CliResult};
+use crate::commands::audit::collector::CollectedPage;
+use crate::commands::audit::{AssetParty, AuditArtifact, AuditedAsset, DetectedIntegration};
+use crate::error::{CliResult, report_error};
 
 static GTM_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bGTM-[A-Z0-9]+\b").expect("should compile GTM regex"));
@@ -243,10 +243,10 @@ pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<Strin
     }
 
     for asset in &artifact.assets {
-        if asset.integration.as_deref() == Some("google_tag_manager") {
-            if let Some(matched) = GTM_REGEX.find(asset.url.as_str()) {
-                return Some(matched.as_str().to_string());
-            }
+        if asset.integration.as_deref() == Some("google_tag_manager")
+            && let Some(matched) = GTM_REGEX.find(asset.url.as_str())
+        {
+            return Some(matched.as_str().to_string());
         }
     }
 
@@ -256,7 +256,7 @@ pub(crate) fn extract_gtm_container_id(artifact: &AuditArtifact) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::collector::{CollectedRequest, CollectedScriptTag};
+    use crate::commands::audit::collector::{CollectedRequest, CollectedScriptTag};
 
     fn page_url() -> Url {
         Url::parse("https://publisher.example/page").expect("should parse URL")
@@ -475,12 +475,16 @@ mod tests {
     fn detect_integrations_from_inline_script_reads_case_insensitive_markers() {
         let matches = detect_integrations_from_inline_script("window.PREBID = window.Didomi;");
 
-        assert!(matches
-            .iter()
-            .any(|(integration, _)| integration == "prebid"));
-        assert!(matches
-            .iter()
-            .any(|(integration, _)| integration == "didomi"));
+        assert!(
+            matches
+                .iter()
+                .any(|(integration, _)| integration == "prebid")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|(integration, _)| integration == "didomi")
+        );
     }
 
     #[test]

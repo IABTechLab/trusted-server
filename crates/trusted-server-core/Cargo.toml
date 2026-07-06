@@ -12,14 +12,16 @@ license = "Apache-2.0"
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 base64 = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
-async-trait = { workspace = true }
 cookie = { workspace = true }
 derive_more = { workspace = true }
+ed25519-dalek = { workspace = true }
+edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
@@ -30,31 +32,29 @@ http = { workspace = true }
 iab_gpp = { workspace = true }
 jose-jwk = { workspace = true }
 log = { workspace = true }
-mime = { workspace = true }
-rand = { workspace = true }
 lol_html = { workspace = true }
 matchit = { workspace = true }
+mime = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 toml = { workspace = true }
-trusted-server-js = { path = "../trusted-server-js" }
-trusted-server-openrtb = { path = "../trusted-server-openrtb" }
+trusted-server-js = { workspace = true }
+trusted-server-openrtb = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true }
 validator = { workspace = true }
-ed25519-dalek = { workspace = true }
-edgezero-core = { workspace = true }
 web-time = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # Enable JS-backed RNG for `wasm32-unknown-unknown` targets (e.g. Cloudflare Workers).
 # The Fastly adapter uses `wasm32-wasip1`, which has native POSIX RNG and does not
 # need these — this block is intentionally scoped to `target_os = "unknown"` only.
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { workspace = true, features = ["js"] }
 uuid = { workspace = true, features = ["js"] }
 
 [features]

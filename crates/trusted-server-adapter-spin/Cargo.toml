@@ -26,10 +26,10 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
-http-body-util = "0.1"
+http-body-util = { workspace = true }
 log = { workspace = true }
-trusted-server-core = { path = "../trusted-server-core" }
-trusted-server-js = { path = "../trusted-server-js" }
+trusted-server-core = { workspace = true }
+trusted-server-js = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 spin-sdk = { workspace = true }

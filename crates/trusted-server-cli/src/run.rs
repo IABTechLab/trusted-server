@@ -7,8 +7,9 @@ use edgezero_cli::args::{
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::audit::browser_collector::BrowserAuditCollector;
-use crate::config_init::{run_config_init, ConfigInitArgs};
+use crate::commands::audit::AuditArgs;
+use crate::commands::audit::browser_collector::BrowserAuditCollector;
+use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", about = "Trusted Server CLI")]
@@ -34,27 +35,9 @@ enum Command {
     Provision(ProvisionArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
-}
-
-#[derive(Debug, clap::Args)]
-pub(crate) struct AuditArgs {
-    /// Public HTTP(S) URL to audit.
-    pub(crate) url: String,
-    /// JavaScript asset audit output path.
-    #[arg(long)]
-    pub(crate) js_assets: Option<std::path::PathBuf>,
-    /// Draft Trusted Server config output path.
-    #[arg(long)]
-    pub(crate) config: Option<std::path::PathBuf>,
-    /// Do not write the JavaScript asset audit file.
-    #[arg(long)]
-    pub(crate) no_js_assets: bool,
-    /// Do not write the draft Trusted Server config file.
-    #[arg(long)]
-    pub(crate) no_config: bool,
-    /// Overwrite existing output files.
-    #[arg(long)]
-    pub(crate) force: bool,
+    /// Local developer tools (e.g. the macOS-only production-hostname proxy).
+    #[command(subcommand)]
+    Dev(crate::commands::dev::DevCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,7 +68,7 @@ fn dispatch(args: Args) -> Result<(), String> {
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             let collector = BrowserAuditCollector;
-            crate::audit::run_audit(&args, &collector, &mut out)
+            crate::commands::audit::run_audit(&args, &collector, &mut out)
         }
         Command::Auth(args) => edgezero_cli::run_auth(&args),
         Command::Build(args) => edgezero_cli::run_build(&args),
@@ -106,6 +89,7 @@ fn dispatch(args: Args) -> Result<(), String> {
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
         Command::Provision(args) => edgezero_cli::run_provision(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
+        Command::Dev(command) => crate::commands::dev::run(command),
     }
 }
 
