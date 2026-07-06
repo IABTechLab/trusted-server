@@ -14,6 +14,8 @@
 
 This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktree-state-nested-secrets-spec-review` @ `d8f71a4a`** (PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306), now including the merged P0 State<T> + nested/array `#[secret]` work). That commit **has** every API this plan uses — re-verified against the pinned checkout: `store_registry.rs` (`StoreRegistry`/`ConfigRegistry`/`SecretRegistry`/`from_parts`), `StoresMetadata` + `Hooks::stores()` (`app.rs`), `dispatch_with_registries` + `build_*_registry` (adapter-fastly), `AxumDevServer::{with_config,with_kv,with_secret}_registry`, the `[stores.*]` `ids`/`default` manifest schema (`manifest.rs`, `deny_unknown_fields`), CloudflareConfigStore backed by **KV namespaces**, AxumConfigStore backed by **`.edgezero/local-config-<id>.json`**. **P0 caveat:** the nested-secret work reshaped `AppConfigMeta` from a `const SECRET_FIELDS` to `fn secret_fields() -> Vec<SecretField>`; `TrustedServerAppConfig`'s impl was updated to match (empty until Phase 3) and `cargo check` is green on core + all four adapters + CLI at this pin. Older cargo-cache checkouts (`6ebc29a5`, `ce6bcf7`, `7ec2ad1`, …) predate this pin — **confirm any API check against `d8f71a4a`**, not an older checkout dir.
 
+> **Lockfile guard (execution):** `Cargo.toml` uses a **mutable branch** dependency (`branch = "worktree-state-nested-secrets-spec-review"`) and the upstream branch has **already advanced past `d8f71a4a`**. Execute every task with the committed `Cargo.lock` — build/test **`--locked`** and **do not `cargo update` the edgezero crates** unless the EdgeZero API is re-reviewed and this pin note re-verified. A silent bump could pull an unreviewed commit mid-migration.
+
 ## Global Constraints
 
 - Rust **2024 edition**, toolchain **1.95.0**; WASM target `wasm32-wasip1`.
@@ -448,8 +450,10 @@ EdgeZero's Fastly `dispatch_with_registries` and its registry builders are `pub(
 **Files:**
 - Create: `crates/trusted-server-adapter-fastly/src/registries.rs` (`build_config_registry`, `build_secret_registry`, `build_kv_registry`)
 - Modify: `crates/trusted-server-adapter-fastly/src/main.rs:477` (the `oneshot` dispatch block)
-- Modify: `crates/trusted-server-adapter-fastly/src/app.rs:238` (`build_per_request_services` → build from composite, Step 4b)
-- Test: `crates/trusted-server-adapter-fastly/src/registries.rs` (`#[cfg(test)]`) + a route test in `route_tests.rs`
+- Modify: `crates/trusted-server-adapter-fastly/src/app.rs:238` (`build_per_request_services` → build from composite; remove `runtime_services_for_consent_route` + its call sites at `app.rs:584/735`, Step 4b)
+- Modify: `crates/trusted-server-adapter-fastly/src/platform.rs` (`impl PlatformConfigWriter`/`PlatformSecretWriter` for the Fastly stores, Step 4b)
+- Modify (Step 5b, core consent flip): `crates/trusted-server-core/src/consent/mod.rs` (`resolve_consent_kv`), `crates/trusted-server-core/src/publisher.rs` (both call sites), `crates/trusted-server-core/src/auction/endpoints.rs` (auction fail-closed)
+- Test: `crates/trusted-server-adapter-fastly/src/registries.rs` (`#[cfg(test)]`) + route tests in `route_tests.rs` (incl. the Fastly consent/503 gates); + core consent/auction tests; + migrate Fastly direct-context tests (deferred from Task 5 Step 2d)
 
 **Interfaces:**
 - Consumes: `StoresMetadata` (from `Hooks::stores()`), EdgeZero `FastlyConfigStore`/`FastlyKvStore`/`FastlySecretStore` open primitives, `StoreRegistry::from_parts` (which returns **`Option<Self>`** — `None` when the default id is absent from `by_id`).
@@ -491,8 +495,10 @@ let consent_kv = match settings.consent.consent_store.as_deref() {
     None => None, // consent persistence intentionally disabled
 };
 ```
-So **configured-but-unresolved → error (→ 503 on consent-dependent routes)**; **unconfigured → `None` (persistence off)**. Integration routes stay unaffected (they don't require consent KV). **Also fix the revocation delete path (`publisher.rs:885`)**, which currently does `if consent_store.is_some() { delete_consent_from_kv(services.kv_store(), …) }` using the **default** KV — change it to the **named** handle with the same fail-closed resolution, so revocation deletes from `consent_store`, not the default.
-Add the **behavioral** core test (failing first): with `consent_store = "consent_store"` + a registry holding a **default** KV + a distinct `consent_store` KV, a consent round-trip (load/save/delete) reads/writes the **`consent_store`** handle and leaves the **default** store **untouched**; add a second test that a **configured-but-unresolved** consent store **errors** (not silently skips). Confirm the existing Fastly 503 tests still pass. Files: `crates/trusted-server-core/src/publisher.rs` (both call sites + core consent tests).
+So **configured-but-unresolved → error (→ 503 on consent-dependent routes)**; **unconfigured → `None` (persistence off)**. Integration routes stay unaffected (they don't require consent KV). Extract this into a **shared core helper** `resolve_consent_kv(settings, services) -> Result<Option<KvHandle>, Report<TrustedServerError>>` so the fail-closed logic lives in one place. **Also fix the revocation delete path (`publisher.rs:885`)**, which currently does `if consent_store.is_some() { delete_consent_from_kv(services.kv_store(), …) }` using the **default** KV — route it through `resolve_consent_kv` so revocation deletes from `consent_store`, not the default.
+
+  **Cover the auction route too (not just publisher) — this is where the removed Fastly wrapper's guard must land.** The Fastly auction route (`adapter-fastly/src/app.rs:584`) got its fail-closed from `runtime_services_for_consent_route` (removed in Step 4b, "auction reads consent data … fail closed with 503"). `handle_auction` (`auction/endpoints.rs`) builds a `KvIdentityGraph` over the consent KV. So `handle_auction` must call `resolve_consent_kv(settings, services)?` (propagating the 503 on a configured-but-unresolved store) before constructing the `KvIdentityGraph`, replacing the adapter-level wrapper with core-level fail-closed that works on **all four** adapters. **The existing Fastly tests `dispatch_auction_with_missing_consent_store_returns_503` and `edgezero_missing_consent_store_breaks_only_consent_routes` are mandatory gates — they must still pass** after the wrapper is removed.
+Add the **behavioral** core test (failing first): with `consent_store = "consent_store"` + a registry holding a **default** KV + a distinct `consent_store` KV, a consent round-trip (load/save/delete) reads/writes the **`consent_store`** handle and leaves the **default** store **untouched**; add a second test that a **configured-but-unresolved** consent store **errors** (not silently skips). Confirm the existing Fastly 503 tests still pass. Files: `crates/trusted-server-core/src/consent/mod.rs` (`resolve_consent_kv` helper), `crates/trusted-server-core/src/publisher.rs` (both call sites), `crates/trusted-server-core/src/auction/endpoints.rs` (auction fail-closed), + core consent/auction tests.
 
 - [ ] **Step 5c: Fastly named-KV / consent route test.** With `runtime_services_for_consent_route` removed (4b), add a Fastly test proving `consent_store` resolves via the **injected `KvRegistry`** — a consent-persisting route (or a `build_per_request_services`-level test) writes/reads through the `consent_store` handle, not the default. This guards the special-case removal.
 
@@ -557,7 +563,7 @@ Expected: PASS. **Key rotation/delete still works** (composite writer path).
 
 ```bash
 git add crates/trusted-server-adapter-*
-git commit -m "Retire per-adapter config/secret read impls; reads via EdgeZero, writes via composite"
+git commit -m "Retire non-Fastly per-adapter config/secret read impls; reads via EdgeZero, writes via composite (Fastly reads kept until Phase 5)"
 ```
 
 ---
