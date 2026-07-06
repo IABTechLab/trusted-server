@@ -12,7 +12,7 @@
 
 ## Pinned dependency (verified)
 
-This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktree-state-nested-secrets-spec-review` @ `6ebc29a5`** (PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306)). That commit **has** every API this plan uses — verified by inspecting the pinned checkout: `store_registry.rs` (`StoreRegistry`/`ConfigRegistry`/`SecretRegistry`/`from_parts`), `StoresMetadata` + `Hooks::stores()` (`app.rs`), `dispatch_with_registries` + `build_*_registry` (adapter-fastly), `AxumDevServer::{with_config,with_kv,with_secret}_registry`, the `[stores.*]` `ids`/`default` manifest schema (`manifest.rs`, `StoreDeclaration`, `deny_unknown_fields`), CloudflareConfigStore backed by **KV namespaces**, and AxumConfigStore backed by **`.edgezero/local-config-<id>.json`**. Older cargo-cache checkouts (e.g. `ce6bcf7`, "Add store support for Spin adapter #253") **predate** the registry refactor and lack these — do not review against them; confirm any API check against `6ebc29a5`.
+This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktree-state-nested-secrets-spec-review` @ `d8f71a4a`** (PR [stackpop/edgezero#306](https://github.com/stackpop/edgezero/pull/306), now including the merged P0 State<T> + nested/array `#[secret]` work). That commit **has** every API this plan uses — re-verified against the pinned checkout: `store_registry.rs` (`StoreRegistry`/`ConfigRegistry`/`SecretRegistry`/`from_parts`), `StoresMetadata` + `Hooks::stores()` (`app.rs`), `dispatch_with_registries` + `build_*_registry` (adapter-fastly), `AxumDevServer::{with_config,with_kv,with_secret}_registry`, the `[stores.*]` `ids`/`default` manifest schema (`manifest.rs`, `deny_unknown_fields`), CloudflareConfigStore backed by **KV namespaces**, AxumConfigStore backed by **`.edgezero/local-config-<id>.json`**. **P0 caveat:** the nested-secret work reshaped `AppConfigMeta` from a `const SECRET_FIELDS` to `fn secret_fields() -> Vec<SecretField>`; `TrustedServerAppConfig`'s impl was updated to match (empty until Phase 3) and `cargo check` is green on core + all four adapters + CLI at this pin. Older cargo-cache checkouts (`6ebc29a5`, `ce6bcf7`, `7ec2ad1`, …) predate this pin — **confirm any API check against `d8f71a4a`**, not an older checkout dir.
 
 ## Global Constraints
 
@@ -93,7 +93,7 @@ git commit -m "Record Phase 1 kind-aware store-id map and confirm D6-a"
 - Modify: `trusted-server.example.toml`, `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
 - Create: `crates/trusted-server-core/src/testdata/all-store-refs.toml`
 - **Modify (integration test surfaces that hard-code `app_config` — break under the rename):** `crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs` (`[local_server.config_stores.app_config]` + `app_config = '''…'''` + the generator test asserting them → `trusted_server_config`), `crates/trusted-server-integration-tests/tests/common/config.rs` (`{"app_config": envelope}` → `{"trusted_server_config": …}`), `crates/trusted-server-integration-tests/tests/environments/axum.rs` (env `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` → the trusted_server_config-keyed name)
-- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-spin/spin.toml`; **Create** `crates/trusted-server-adapter-spin/runtime-config.toml` (KV-store backends for the declared Spin labels) and **Modify** `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml` (declare the new local Fastly stores for parity). (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state.)
+- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-cloudflare/cloudflare.toml` (reconcile/delete stale schema, Step 6), `crates/trusted-server-adapter-spin/spin.toml`; **Create** `crates/trusted-server-adapter-spin/runtime-config.toml` (KV-store backends for the declared Spin labels) and **Modify** `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml` (declare the new local Fastly stores for parity). (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state.)
 - Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json` side-channel key `app_config` → `CONFIG_BLOB_KEY`)
 - Create: `crates/trusted-server-core/src/stores.rs` (shared `stores_metadata()`); Modify: each `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` (`impl Hooks` → add `fn stores()`)
 - Test: `crates/trusted-server-core/src/settings.rs` (`#[cfg(test)]`)
@@ -211,6 +211,7 @@ Concrete D6-a mechanism. The bespoke traits read **by `StoreName`** and callers 
 - Modify: `crates/trusted-server-core/src/platform/traits.rs` (split write-only traits)
 - Create: `crates/trusted-server-core/src/platform/composite.rs` (`CompositeConfigStore`, `CompositeSecretStore`)
 - Modify: `crates/trusted-server-core/src/platform/mod.rs` (export composite + writer traits)
+- Modify: `crates/trusted-server-core/src/platform/types.rs` (`StoreName` doc → logical read id, Step 5)
 - Test: `crates/trusted-server-core/src/platform/composite.rs` (`#[cfg(test)]`)
 
 **Interfaces:**
@@ -347,8 +348,8 @@ Run: `cargo test-fastly get_settings_reads_blob_via_edgezero_handle` → Expecte
 
 Run: `cargo test-fastly get_settings_reads_blob_via_edgezero_handle`
 Expected: PASS.
-Then confirm the adapter boot paths still build/pass via their existing `build_state` coverage:
-Run: `cargo test-fastly && cargo test-axum`
+Then, since `get_settings_from_config_store`'s re-typing is a **core** change, confirm **all four** adapters + wasm surfaces still build/pass (the "all four green" rule):
+Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo check-cloudflare && cargo check-spin`
 Expected: PASS.
 
 - [ ] **Step 4: Commit**
@@ -384,7 +385,7 @@ if let Some(reg) = build_kv_registry_axum(&stores)     { server = server.with_kv
 if let Some(reg) = build_secret_registry_axum(&stores) { server = server.with_secret_registry(reg); }
 server.run()?;
 ```
-Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs` mirroring Task 6's Fastly by-id builders but opening the EdgeZero **Axum** store primitives (`.edgezero/*` local backends). This preserves PORT/axum.toml exactly and wires registries. Run `cargo run -p trusted-server-adapter-axum` to confirm it boots on the configured port.
+Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs` mirroring Task 6's Fastly by-id builders but opening the EdgeZero **Axum** store primitives (`.edgezero/*` local backends). This preserves PORT/axum.toml exactly and wires registries. **Bounded smoke (do not block the executor):** the dev server is long-lived, so don't run it bare — either `timeout 8 cargo run -p trusted-server-adapter-axum 2>&1 | grep -q 'Listening on'` (assert the bind log, non-zero timeout exit is expected/ignored), or run it in the background, `curl -fsS localhost:$PORT/health`, then kill it. Prefer an Axum route test over booting the server where possible.
 
 **Interfaces:**
 - Consumes: Task 3 composite; `ConfigRegistry`/`SecretRegistry` from request extensions.
@@ -482,13 +483,22 @@ Run: `cargo test-fastly build_config_registry_resolves_declared_ids` → Expecte
 
 Run: `cargo test-fastly oneshot_discovery_reads_jwks_via_registry` → Expected: FAIL, then PASS only after Steps 3, 4, **and 4b** (the test reads through `RuntimeServices`, which is composite-backed only after 4b — without 4b the injected registries are unused and the read still hits the old direct store).
 
-- [ ] **Step 5b: Flip the consent call site to named KV + behavioral test (the atomic cutover — all four adapters now inject a `KvRegistry`).** Now that Fastly (Step 4b) and Axum/CF/Spin (Task 5) all inject a `KvRegistry`, change `publisher.rs:626` from `services.kv_handle()` to `settings.consent.consent_store.as_deref().and_then(|id| services.kv_handle_named(id))`. This is the point where the configured id actually selects the store on **every** adapter (and `runtime_services_for_consent_route`'s swap, removed in 4b, is no longer needed). Add the **behavioral** core test (write it failing first): with `consent_store = "consent_store"` and a registry holding a **default** KV + a distinct `consent_store` KV, a consent round-trip (load/save/delete) reads/writes the **`consent_store`** handle and leaves the **default** store **untouched** (assert against both). Files: `crates/trusted-server-core/src/publisher.rs` (+ core consent test).
+- [ ] **Step 5b: Flip the consent call site to named KV — FAIL CLOSED — + behavioral test (the atomic cutover; all four adapters now inject a `KvRegistry`).** Now that Fastly (Step 4b) and Axum/CF/Spin (Task 5) all inject a `KvRegistry`, resolve the consent store by id. **Do NOT use `.and_then(|id| kv_handle_named(id))`** — that silently yields `None` (= "no persistence") when a store **is** configured but unresolved, regressing today's **fail-closed** behavior (Fastly returns **503** on consent-dependent routes for a missing consent store — see the existing tests `dispatch_auction_with_missing_consent_store_returns_503` and `edgezero_missing_consent_store_breaks_only_consent_routes` in `adapter-fastly/src/app.rs`). Instead, at `publisher.rs:626`:
+```rust
+let consent_kv = match settings.consent.consent_store.as_deref() {
+    Some(id) => Some(services.kv_handle_named(id).ok_or_else(|| Report::new(
+        TrustedServerError::KvStore { store_name: id.to_owned(), message: "consent store not resolved".into() }))?),
+    None => None, // consent persistence intentionally disabled
+};
+```
+So **configured-but-unresolved → error (→ 503 on consent-dependent routes)**; **unconfigured → `None` (persistence off)**. Integration routes stay unaffected (they don't require consent KV). **Also fix the revocation delete path (`publisher.rs:885`)**, which currently does `if consent_store.is_some() { delete_consent_from_kv(services.kv_store(), …) }` using the **default** KV — change it to the **named** handle with the same fail-closed resolution, so revocation deletes from `consent_store`, not the default.
+Add the **behavioral** core test (failing first): with `consent_store = "consent_store"` + a registry holding a **default** KV + a distinct `consent_store` KV, a consent round-trip (load/save/delete) reads/writes the **`consent_store`** handle and leaves the **default** store **untouched**; add a second test that a **configured-but-unresolved** consent store **errors** (not silently skips). Confirm the existing Fastly 503 tests still pass. Files: `crates/trusted-server-core/src/publisher.rs` (both call sites + core consent tests).
 
 - [ ] **Step 5c: Fastly named-KV / consent route test.** With `runtime_services_for_consent_route` removed (4b), add a Fastly test proving `consent_store` resolves via the **injected `KvRegistry`** — a consent-persisting route (or a `build_per_request_services`-level test) writes/reads through the `consent_store` handle, not the default. This guards the special-case removal.
 
 - [ ] **Step 6: Fastly suite + parity + commit** (core consent flip is committed here with the Fastly work, since the flip is only safe once Fastly injects registries)
 
-Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
+Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin && cargo check-cloudflare && cargo check-spin && cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 ```bash
 git add crates/trusted-server-adapter-fastly \
   crates/trusted-server-core/src/publisher.rs \
