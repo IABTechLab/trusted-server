@@ -57,9 +57,9 @@ rg -n 'config_store_id|jwks|JWKS_CONFIG_STORE_NAME|"app_config"|config_store\s*=
 rg -n 'secret_store_id|secret_store\s*=|"secrets"|ts_secrets|signing_keys|SIGNING_SECRET_STORE_NAME' crates/trusted-server-core trusted-server.example.toml
 rg -n '\[stores\.' edgezero.toml
 ```
-Expected (verified): **KV** ids = `ec.ec_store` (`ec_identity_store`, `settings.rs:452`), `consent.consent_store` (`consent_config.rs:80`), and `auction.creative_store` (`auction_config_types.rs:28`, default `"creative_store"`, **deprecated** — creatives are delivered inline); **config** ids = the app-config blob store (**store id `trusted_server_config`**, see D5 rule below), `request_signing.config_store_id`, the JWKS store (`JWKS_CONFIG_STORE_NAME`), and **DataDome's IP-CIDR config store** (`ProtectionIpCidrSourceConfig.config_store`, default `datadome-ip-bypass`, `protection_scope.rs:165`); **secret** ids = `secrets` (`request_signing.secret_store_id`), DataDome `ts_secrets`, the S3 secret store, `signing_keys` (`SIGNING_SECRET_STORE_NAME`) — versus `edgezero.toml` declaring only one id per kind. NOTE: `counter_store` (`RATE_COUNTER_NAME` in the Fastly `rate_limiter.rs`) and `opid_store` are **Fastly-only** platform stores, not `Settings` logical ids — out of scope for D5. `creative_store` **is** a `Settings` id: declare it in `[stores.kv]` (deprecated) so strict lookup can't fail, and flag it for removal in a later phase.
+Expected (verified): **KV** ids = `ec.ec_store` (`ec_identity_store`, `settings.rs:452`), `consent.consent_store` (`consent_config.rs:80`), and `auction.creative_store` (`auction_config_types.rs:28`, default `"creative_store"`, **deprecated** — creatives are delivered inline); **config** ids = the app-config blob store (**store id `app_config`**, see D5 rule below), `request_signing.config_store_id`, the JWKS store (`JWKS_CONFIG_STORE_NAME`), and **DataDome's IP-CIDR config store** (`ProtectionIpCidrSourceConfig.config_store`, default `datadome-ip-bypass`, `protection_scope.rs:165`); **secret** ids = `secrets` (`request_signing.secret_store_id`), DataDome `ts_secrets`, the S3 secret store, `signing_keys` (`SIGNING_SECRET_STORE_NAME`) — versus `edgezero.toml` declaring only one id per kind. NOTE: `counter_store` (`RATE_COUNTER_NAME` in the Fastly `rate_limiter.rs`) and `opid_store` are **Fastly-only** platform stores, not `Settings` logical ids — out of scope for D5. `creative_store` **is** a `Settings` id: declare it in `[stores.kv]` (deprecated) so strict lookup can't fail, and flag it for removal in a later phase.
 
-  **D5 app-config store-id/key decision (record in Task 1 Output):** the app-config blob → config **store id `trusted_server_config`**, blob **key `trusted_server_config`** (key == store id, D7-consistent — see below). This changes `settings_data.rs::DEFAULT_CONFIG_STORE_ID` from `"app_config"` to `"trusted_server_config"` (`settings_data.rs:11`) **and** `config_payload.rs::CONFIG_BLOB_KEY` from `"app_config"` to `"trusted_server_config"`. Rationale: `default_config_key()` falls back to the id when no `…__KEY` env is set, and D7 forbids that runtime env — so the key must equal the id, or `ts config push` would need `--key`. The `app_config` name is fully retired.
+  **D5 app-config store-id/key decision (operator-confirmed — KEEP `app_config`):** the app-config blob stays in config **store id `app_config`**, blob **key `app_config`** (`CONFIG_BLOB_KEY` and `DEFAULT_CONFIG_STORE_ID` **unchanged**). We resolve the `settings_data.rs` (`app_config`) vs `edgezero.toml` (was `trusted_server_config`) inconsistency by **declaring `app_config` in `edgezero.toml`** (config `default = "app_config"`), **not** by renaming the code/config/tests. This avoids the entire rename cascade (config_payload, settings_data, example, integration fixtures, Viceroy generator, test envs, Cloudflare side-channel). Key == id == `app_config`, so `ts config push`'s default key and the boot read already agree with no env/`--key`. *(The earlier "rename to `trusted_server_config`" plan was reversed by operator decision on 2026-07-07.)*
 
   **Request-signing store ids (do NOT point at app-config):** request signing reads use hard-coded `JWKS_CONFIG_STORE_NAME = "jwks_store"` (config) + `SIGNING_SECRET_STORE_NAME = "signing_keys"` (secret); writes use `request_signing.config_store_id`/`secret_store_id`. Today the example sets these to `"app_config"`/`"secrets"` — which sends **writes to a different store than reads**. Fix: set `request_signing.config_store_id = "jwks_store"` and `secret_store_id = "signing_keys"` in `trusted-server.example.toml` + fixtures, and declare `jwks_store` (config) + `signing_keys` (secret) as logical ids in `edgezero.toml`. (Under the composite, reads resolve `registry.named("jwks_store")`; writes go to the same store via the writer/management id.)
 
@@ -73,7 +73,7 @@ Expected: only `KeyRotationManager` in `crates/trusted-server-core/src/request_s
 
 - [ ] **Step 3: Record the kind-partitioned D5 map**
 
-Append a table to "Task 1 Output": for each `{kv|config|secrets}` id → resolution (declare in `edgezero.toml`, or collapse onto the kind's default) → the concrete platform resource per adapter. **Under D7 there is no `EDGEZERO__STORES__*__NAME` mapping** — the logical id opens the same-named platform store, so the table records the *platform resource per adapter* (Fastly local/prod store, CF KV namespace / flat secret keys, Spin KV label / variable), **not** an env var. Spec default: app-config blob → config id `trusted_server_config` key `trusted_server_config` (key == id); JWKS → its own config id; `ec_identity_store` → kv id; collapse `secrets`→`trusted_server_secrets` where identical; declare DataDome/S3/signing as distinct secret ids.
+Append a table to "Task 1 Output": for each `{kv|config|secrets}` id → resolution (declare in `edgezero.toml`, or collapse onto the kind's default) → the concrete platform resource per adapter. **Under D7 there is no `EDGEZERO__STORES__*__NAME` mapping** — the logical id opens the same-named platform store, so the table records the *platform resource per adapter* (Fastly local/prod store, CF KV namespace / flat secret keys, Spin KV label / variable), **not** an env var. Spec default: app-config blob → config id **`app_config`** key `app_config` (kept, not renamed); JWKS → its own config id `jwks_store`; `ec_identity_store` → kv id; declare `signing_keys`/DataDome `ts_secrets`/S3 `s3-auth` as distinct secret ids.
 
 - [ ] **Step 4: Confirm D6-a (or STOP)**
 
@@ -90,18 +90,15 @@ git commit -m "Record Phase 1 kind-aware store-id map and confirm D6-a"
 
 ## Task 2: Declare all store ids (kv/config/secrets) in `edgezero.toml` + reconcile fields/fixtures
 
-**Files (exact):**
-- Modify: `edgezero.toml` (`[stores.kv]`/`[stores.config]`/`[stores.secrets]` `ids`)
-- Modify: `crates/trusted-server-core/src/settings_data.rs` (`DEFAULT_CONFIG_STORE_ID`)
-- Modify: `crates/trusted-server-core/src/config_payload.rs` (`CONFIG_BLOB_KEY` → `"trusted_server_config"`)
-- Modify: `trusted-server.example.toml`, `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
+**Files (exact) — app-config store KEPT as `app_config` (no rename cascade):**
+- Modify: `edgezero.toml` (`[stores.kv]`/`[stores.config]`/`[stores.secrets]` `ids` + set config `default = "app_config"`)
+- Modify: `trusted-server.example.toml` + `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml` — **only** the request-signing 2-line fix (`config_store_id = "jwks_store"`, `secret_store_id = "signing_keys"`)
 - Create: `crates/trusted-server-core/src/testdata/all-store-refs.toml`
-- **Modify (integration test surfaces that hard-code `app_config` — break under the rename):** `crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs` (`[local_server.config_stores.app_config]` + `app_config = '''…'''` + the generator test asserting them → `trusted_server_config`), `crates/trusted-server-integration-tests/tests/common/config.rs` (`{"app_config": envelope}` → `{"trusted_server_config": …}`), `crates/trusted-server-integration-tests/tests/environments/axum.rs` (env `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` → the trusted_server_config-keyed name)
-- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-cloudflare/cloudflare.toml` (reconcile/delete stale schema, Step 6), `crates/trusted-server-adapter-spin/spin.toml` (labels + drop stale `v_…` comment); **Create** `crates/trusted-server-adapter-spin/runtime-config.toml`. The **serve command** (`spin up … --runtime-config-file …`) lives in `edgezero.toml` (Spin serve command, ~L95) and `CLAUDE.md` (Spin smoke line, ~L87) — update both, not `spin.toml`.
-- **Create** `docs/internal/store-provisioning.md` (operator runbook: Fastly mgmt-id==logical-id + store create/link, Cloudflare `wrangler secret put`, Spin runtime-config) (KV-store backends for the declared Spin labels) and **Modify** `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml` (declare the new local Fastly stores for parity). (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state.)
-- Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json` side-channel key `app_config` → `CONFIG_BLOB_KEY`)
+- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-cloudflare/cloudflare.toml` (reconcile/delete stale schema, Step 6), `crates/trusted-server-adapter-spin/spin.toml` (labels + drop stale `v_…` comment); **Create** `crates/trusted-server-adapter-spin/runtime-config.toml`. The Spin **serve command** (`spin up … --runtime-config-file …`) lives in `edgezero.toml` (~L95) and `CLAUDE.md` (~L87) — update both, not `spin.toml`.
+- **Create** `docs/internal/store-provisioning.md` (operator runbook: Fastly mgmt-id==logical-id + store create/link, Cloudflare `wrangler secret put`, Spin runtime-config backends). **Modify** `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml` (declare the new local Fastly stores for parity).
 - Create: `crates/trusted-server-core/src/stores.rs` (shared `stores_metadata()`); Modify: each `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` (`impl Hooks` → add `fn stores()`)
 - Test: `crates/trusted-server-core/src/settings.rs` (`#[cfg(test)]`)
+- **NOT touched (would only change under the abandoned rename):** `config_payload.rs` (`CONFIG_BLOB_KEY` stays `app_config`), `settings_data.rs` (`DEFAULT_CONFIG_STORE_ID` stays `app_config`), `generate-viceroy-config.rs`, `tests/common/config.rs`, `tests/environments/{axum,cloudflare}.rs`, Cloudflare `app.rs` side-channel key.
 
 **Interfaces:**
 - Consumes: Task 1 map.
@@ -141,15 +138,15 @@ fn every_referenced_store_id_is_declared_by_kind() {
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `cargo test-fastly every_referenced_store_id_is_declared_by_kind`
-Expected: FAIL — `ec_identity_store`/`consent_store`/`creative_store` (kv), `jwks_store`/`datadome-ip-bypass`/`trusted_server_config` (config), `signing_keys`/`ts_secrets` (secrets) referenced but not declared.
+Expected: FAIL — `ec_identity_store`/`consent_store`/`creative_store` (kv), `jwks_store`/`datadome-ip-bypass`/`app_config` (config), `signing_keys`/`ts_secrets` (secrets) referenced but not declared.
 
 - [ ] **Step 3: Implement `referenced_store_ids_by_kind()` + manifest helper**
 
 Add the `ReferencedStoreIds` struct + method returning **KV** ids (`ec.ec_store`, `consent.consent_store`, `auction.creative_store`), **config** ids (`request_signing.config_store_id`, the app-config store id, and **every `ProtectionIpCidrSourceConfig.config_store`** from DataDome scopes — default `datadome-ip-bypass`), **secret** ids (`request_signing.secret_store_id`, DataDome `ts_secrets`, S3). Do **not** include `counter_store`/`opid_store`. Add test-only `declared_store_ids_by_kind_from_manifest()` parsing `edgezero.toml`.
 
-Apply the **D5 renames**: set `settings_data.rs::DEFAULT_CONFIG_STORE_ID = "trusted_server_config"`; set `request_signing.config_store_id = "jwks_store"` and `secret_store_id = "signing_keys"` in `trusted-server.example.toml` + fixtures (they must match the read constants — **not** `app_config`/`secrets`).
+**D5 (operator decision — keep `app_config`):** do **NOT** rename the app-config store. `config_payload.rs::CONFIG_BLOB_KEY` and `settings_data.rs::DEFAULT_CONFIG_STORE_ID` **stay `"app_config"`** — we declare `app_config` in `edgezero.toml` instead (Step 4), avoiding the rename cascade. The **only** example/fixture edit in Task 2 is the request-signing fix: set `request_signing.config_store_id = "jwks_store"` and `secret_store_id = "signing_keys"` in `trusted-server.example.toml` + the integration fixture (they must match the read constants `JWKS_CONFIG_STORE_NAME`/`SIGNING_SECRET_STORE_NAME`, not the dormant `app_config`/`secrets`). Do **not** touch the Viceroy generator, `tests/common/config.rs`, `tests/environments/{axum,cloudflare}.rs`, or the Cloudflare side-channel key — those only needed changing under the abandoned rename.
 
-- [ ] **Step 4: Declare every id in `edgezero.toml`** — `[stores.kv]` = `trusted_server_kv`, `ec_identity_store`, `consent_store`, `creative_store`; `[stores.config]` = `trusted_server_config`, `jwks_store`, `datadome-ip-bypass`; `[stores.secrets]` = `trusted_server_secrets`, `signing_keys`, `ts_secrets`, `s3-auth`. (Names double as the platform store names under D7.) Also set `config_payload.rs::CONFIG_BLOB_KEY = "trusted_server_config"` (blob key == store id, per the D5 rule) so `ts config push`'s default key and the boot read agree with no env/`--key`.
+- [ ] **Step 4: Declare every id in `edgezero.toml`** — `[stores.kv]` ids = `trusted_server_kv`, `ec_identity_store`, `consent_store`, `creative_store` (default stays `trusted_server_kv`); `[stores.config]` ids = **`app_config`**, `jwks_store`, `datadome-ip-bypass` with **`default = "app_config"`** (declare the existing app-config store name — no rename); `[stores.secrets]` ids = `trusted_server_secrets`, `signing_keys`, `ts_secrets`, `s3-auth` (default stays `trusted_server_secrets`). (Names double as the platform store names under D7.) `CONFIG_BLOB_KEY` stays `app_config`; blob key == store id == `app_config`, so `ts config push`'s default key and the boot read already agree with no env/`--key`. *(Confirm during the run whether `trusted_server_kv`/`trusted_server_secrets` are real code-referenced defaults or just edgezero.toml placeholders; if nothing references them, set the kv/secret defaults to a real referenced id instead.)*
 
 - [ ] **Step 5: Wire `Hooks::stores()` on all four adapters (Blocker — metadata is not wired today).** Each `impl Hooks for TrustedServerApp` currently overrides only `routes()`; the default `stores()` returns **empty** `StoresMetadata`, so no registries can be built from it. Add `fn stores() -> StoresMetadata` returning the `[stores.*]` metadata, generated once from `edgezero.toml`. Prefer a single shared fn in `trusted-server-core` (`pub fn stores_metadata() -> StoresMetadata`) that all four adapters return, so the ids live in one place. Verify against `edgezero_core::app::StoresMetadata`/`StoreMetadata` shape.
 
@@ -158,20 +155,12 @@ Apply the **D5 renames**: set `settings_data.rs::DEFAULT_CONFIG_STORE_ID = "trus
 - [ ] **Step 6: Declare the stores in every PLATFORM manifest (Blocker — local resources missing), per each adapter's real mapping.** D7 requires each logical id to be openable as a real platform store. The adapters map kinds to concrete resources differently — declare exactly:
   - **Fastly** — `fastly.toml` holds **only local Viceroy resources** under `[local_server]`: add each id as `[[local_server.kv_stores.<id>]]` / `[local_server.config_stores.<id>]` / `[local_server.secret_stores.<id>]`. The **production** Fastly KV/config/secret stores + their service links are **not** in `fastly.toml` — they are an **operator/provisioning step** (create via `fastly kv-store`/`config-store`/`secret-store` + link to the service, or the EdgeZero provision path). Document those commands in the operator runbook; do not try to express them in `fastly.toml`.
   - **Cloudflare manifest `cloudflare.toml` — reconcile the STALE schema (Medium blocker).** `crates/trusted-server-adapter-cloudflare/cloudflare.toml` still uses the pre-rewrite manifest schema (`[stores.kv].name = …`, `[stores.kv.adapters.cloudflare].name = …`), which the pinned EdgeZero manifest parser (`manifest.rs`, `deny_unknown_fields`) **rejects** in favor of `[stores.*]` `ids`/`default`. Either migrate it to the `ids`/`default` schema (matching `edgezero.toml`) or **delete it if `edgezero.toml` is the single source** and nothing loads `cloudflare.toml`. Do not leave a stale-schema manifest that a tool/test could load.
-  - **Cloudflare** (`wrangler.toml`): EdgeZero backs **config stores by a KV namespace binding** (`config_store.rs`) — so each **config** id (`trusted_server_config`, `jwks_store`, `datadome-ip-bypass`) gets a `[[kv_namespaces]]` binding (as does each KV id). **Secrets use a FLAT namespace — `CloudflareSecretStore::get_bytes` ignores `store_name` and reads `env.secret(key)`.** So do **not** `wrangler secret put signing_keys` (that provisions the wrong name). Provision the concrete secret **keys the code reads**: the signing KIDs written by `KeyRotationManager`, the DataDome `server_side_key_secret_name`, and the S3 `access_key_id` / `secret_access_key` / optional session-token keys. Document the exact `wrangler secret put <key>` commands in the operator runbook; `store_name`/store-id is irrelevant on Cloudflare.
-  - **Spin** (`spin.toml` **and** `runtime-config.toml`): config **and** KV ids open **KV-store labels** (`request.rs:282`). `spin.toml:41` currently declares only `key_value_stores = ["default"]` — extend it to list **every** kv+config logical id label (`trusted_server_kv`, `consent_store`, `creative_store`, `trusted_server_config`, `jwks_store`, `datadome-ip-bypass`). Each declared label **also needs a backend** in `runtime-config.toml` (`[key_value_store.<label>]`) — **create `crates/trusted-server-adapter-spin/runtime-config.toml`** (none exists today) mapping each label to a store backend (e.g. `spin` default, or a file backend for tests). **Also remove the stale doc comment** at `spin.toml:7` describing the old `v_…` component-variable encoding for config/secret stores (superseded by KV-label config + flat secrets). And **document the launch command** — EdgeZero loads the backends only when Spin is run with the runtime config, so the local-run instruction becomes `spin up --from crates/trusted-server-adapter-spin --runtime-config-file crates/trusted-server-adapter-spin/runtime-config.toml` (update `edgezero.toml`'s Spin serve command / CLAUDE.md's Spin smoke line accordingly). Secrets are a **flat** namespace (`SpinSecretStore` ignores `store_name`) mapped to Spin variables — provision the concrete secret **keys** (as for Cloudflare), lowercased per Spin's variable rules, not the store id.
+  - **Cloudflare** (`wrangler.toml`): EdgeZero backs **config stores by a KV namespace binding** (`config_store.rs`) — so each **config** id (`app_config`, `jwks_store`, `datadome-ip-bypass`) gets a `[[kv_namespaces]]` binding (as does each KV id). **Secrets use a FLAT namespace — `CloudflareSecretStore::get_bytes` ignores `store_name` and reads `env.secret(key)`.** So do **not** `wrangler secret put signing_keys` (that provisions the wrong name). Provision the concrete secret **keys the code reads**: the signing KIDs written by `KeyRotationManager`, the DataDome `server_side_key_secret_name`, and the S3 `access_key_id` / `secret_access_key` / optional session-token keys. Document the exact `wrangler secret put <key>` commands in the operator runbook; `store_name`/store-id is irrelevant on Cloudflare.
+  - **Spin** (`spin.toml` **and** `runtime-config.toml`): config **and** KV ids open **KV-store labels** (`request.rs:282`). `spin.toml:41` currently declares only `key_value_stores = ["default"]` — extend it to list **every** kv+config logical id label (`trusted_server_kv`, `consent_store`, `creative_store`, `app_config`, `jwks_store`, `datadome-ip-bypass`). Each declared label **also needs a backend** in `runtime-config.toml` (`[key_value_store.<label>]`) — **create `crates/trusted-server-adapter-spin/runtime-config.toml`** (none exists today) mapping each label to a store backend (e.g. `spin` default, or a file backend for tests). **Also remove the stale doc comment** at `spin.toml:7` describing the old `v_…` component-variable encoding for config/secret stores (superseded by KV-label config + flat secrets). And **document the launch command** — EdgeZero loads the backends only when Spin is run with the runtime config, so the local-run instruction becomes `spin up --from crates/trusted-server-adapter-spin --runtime-config-file crates/trusted-server-adapter-spin/runtime-config.toml` (update `edgezero.toml`'s Spin serve command / CLAUDE.md's Spin smoke line accordingly). Secrets are a **flat** namespace (`SpinSecretStore` ignores `store_name`) mapped to Spin variables — provision the concrete secret **keys** (as for Cloudflare), lowercased per Spin's variable rules, not the store id.
   - **Viceroy integration template** (`crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml`): it declares `[local_server.kv_stores]` with only placeholder stores (`counter_store`). Once Fastly opens **every** declared KV id at runtime, missing local stores (`trusted_server_kv`, `consent_store`, `creative_store`) fail the parity suite. Add each declared kv/config/secret id to the template's `[local_server.*_stores]` blocks.
   - **Operator provisioning runbook** (**create `docs/internal/store-provisioning.md`**): the production store creation/link steps that don't live in any manifest — Fastly `kv-store`/`config-store`/`secret-store` create + service link (and the **requirement that the Fastly management resource id equals the runtime logical id** for `jwks_store`/`signing_keys`, per spec D5); Cloudflare `wrangler secret put <key>` for the concrete secret keys; Spin runtime-config backend setup. The spec mandates documenting this; give it a real file so it's committed, not just prose in the plan.
 
-- [ ] **Step 6b: Update every surface that hard-codes the old `app_config` store/key** (they run in the adapter suites / boot paths, so the rename breaks them):
-  - **`generate-viceroy-config.rs` — MERGE, don't duplicate.** The generator already emits `[local_server.config_stores.trusted_server_config]` holding the **rollout flags** (`edgezero_enabled`, `edgezero_rollout_pct`), separate from the `app_config` store holding the envelope blob. After the rename both live in ONE store `trusted_server_config`, so **merge the envelope entry into the existing `trusted_server_config.contents` table under key `trusted_server_config`** (alongside the flag keys) — do **not** emit a second `[local_server.config_stores.trusted_server_config]` block (duplicate table). Update the generator's assertion test accordingly.
-  - **`tests/common/config.rs`:** `{"app_config": envelope}` → `{"trusted_server_config": envelope}`.
-  - **`tests/environments/axum.rs`:** rename the `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` env var to the `trusted_server_config`-keyed name the Axum config store expects.
-  - **`crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json`):** it reads the literal `value.get("app_config")` from the `TRUSTED_SERVER_CONFIG` side-channel (Cloudflare stays on the side-channel until Phase 2). Change this literal to `CONFIG_BLOB_KEY` (now `"trusted_server_config"`) so Cloudflare boot doesn't break under the rename. (Key-string update only; the Phase 2 store migration is separate.)
-  - **`crates/trusted-server-integration-tests/tests/environments/cloudflare.rs`:** the `inject_cloudflare_config` tests assert against `{"app_config":"blob"}` / `TRUSTED_SERVER_CONFIG = '''{"app_config":…}'''` literals (lines ~206/210/221/232) — update to the `trusted_server_config` key.
-  - **`crates/trusted-server-adapter-cloudflare/wrangler.toml`:** the placeholder `TRUSTED_SERVER_CONFIG = '{"app_config":""}'` (line ~23) + its `app_config` comment (line ~21) — update to `trusted_server_config`.
-  - **Axum**: dev-only local files `.edgezero/local-config-<id>.json` (config) and the redb KV default; document how to seed them, do not commit machine-local state.
-  Cross-check each existing manifest — some ids (`jwks_store`, `signing_keys`) are already partially declared (`request_signing/mod.rs` doc references `fastly.toml`); add only the missing ones.
+- [ ] **Step 6b: (REMOVED — no app-config rename).** The operator decision keeps the app-config store named `app_config`, so **none** of the `app_config → trusted_server_config` surface edits are needed: the Viceroy generator, `tests/common/config.rs`, `tests/environments/{axum,cloudflare}.rs`, the Cloudflare `settings_from_cloudflare_config_json` side-channel key, and the `wrangler.toml` placeholder JSON **stay as-is** (they already use `app_config`, which is now the declared store id). Only the request-signing `config_store_id`/`secret_store_id` 2-line fix (Step 3) touches `example.toml` + the fixture. Cross-check each manifest — some ids (`jwks_store`, `signing_keys`) may already be partially declared (`request_signing/mod.rs` doc references `fastly.toml`); add only the missing ones. (Axum dev-only `.edgezero/local-config-<id>.json` seeding stays documented, not committed.)
 
 - [ ] **Step 7: Run to verify pass + full adapter suites + wasm checks**
 
@@ -182,6 +171,9 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
+# NOTE: no app-config rename (keep `app_config`). Only the request-signing 2-line
+# fix touches example.toml/fixture; the Viceroy generator, tests/common/config.rs,
+# tests/environments/*, config_payload.rs, settings_data.rs are NOT changed in Task 2.
 git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-adapter-cloudflare/wrangler.toml \
   crates/trusted-server-adapter-cloudflare/cloudflare.toml \
@@ -191,14 +183,7 @@ git add edgezero.toml fastly.toml trusted-server.example.toml \
   CLAUDE.md \
   docs/internal/store-provisioning.md \
   crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml \
-  crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs \
-  crates/trusted-server-integration-tests/tests/common/config.rs \
-  crates/trusted-server-integration-tests/tests/environments/axum.rs \
-  crates/trusted-server-integration-tests/tests/environments/cloudflare.rs \
-  crates/trusted-server-adapter-cloudflare/src/app.rs \
   crates/trusted-server-core/src/settings.rs \
-  crates/trusted-server-core/src/settings_data.rs \
-  crates/trusted-server-core/src/config_payload.rs \
   crates/trusted-server-core/src/stores.rs \
   crates/trusted-server-core/src/lib.rs \
   crates/trusted-server-core/src/testdata/all-store-refs.toml \
@@ -206,14 +191,14 @@ git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-adapter-axum/src/app.rs \
   crates/trusted-server-adapter-cloudflare/src/app.rs \
   crates/trusted-server-adapter-spin/src/app.rs
-git commit -m "Declare store ids in edgezero.toml, manifests, Hooks::stores(); rename app-config store/key to trusted_server_config"
+git commit -m "Declare store ids in edgezero.toml, platform manifests, Hooks::stores(); fix request-signing store ids (keep app_config)"
 ```
 
 ---
 
 ## Task 3: Registry-backed composite store (reads → EdgeZero registry by store_name, writes → management path)
 
-Concrete D6-a mechanism. The bespoke traits read **by `StoreName`** and callers use **multiple** store ids (`trusted_server_config`, `jwks_store`, `datadome-ip-bypass`, `s3-auth`, `ts_secrets`, `ec_identity_store` for KV). So the composite must hold the **whole `ConfigRegistry`/`SecretRegistry`** (not a single handle) and resolve `named(store_name)` on each read; writes (`put`/`create`/`delete`) delegate to the existing management-API-backed writer. Preserves `KeyRotationManager` writes with zero call-site changes.
+Concrete D6-a mechanism. The bespoke traits read **by `StoreName`** and callers use **multiple** store ids (`app_config`, `jwks_store`, `datadome-ip-bypass`, `s3-auth`, `ts_secrets`, `ec_identity_store` for KV). So the composite must hold the **whole `ConfigRegistry`/`SecretRegistry`** (not a single handle) and resolve `named(store_name)` on each read; writes (`put`/`create`/`delete`) delegate to the existing management-API-backed writer. Preserves `KeyRotationManager` writes with zero call-site changes.
 
 **Files:**
 - Modify: `crates/trusted-server-core/src/platform/traits.rs` (split write-only traits)
@@ -236,11 +221,11 @@ Concrete D6-a mechanism. The bespoke traits read **by `StoreName`** and callers 
 ```rust
 #[test]
 fn composite_config_reads_named_store_and_writes_delegate() {
-    // Arrange: a ConfigRegistry with TWO ids (default `trusted_server_config`, non-default `jwks_store`).
+    // Arrange: a ConfigRegistry with TWO ids (default `app_config`, non-default `jwks_store`).
     let reader = config_registry(&[
-        ("trusted_server_config", "current-kid", "kid-1"),
+        ("app_config", "current-kid", "kid-1"),
         ("jwks_store", "kid-1", "{\"kty\":\"OKP\"}"),
-    ], "trusted_server_config");
+    ], "app_config");
     let writer = Arc::new(RecordingConfigWriter::default());
     let composite = CompositeConfigStore::new(Some(reader), writer.clone());
     // Act + Assert: non-default store resolves.
@@ -306,7 +291,7 @@ Expected: FAIL (module does not exist).
 Run: `cargo test-fastly composite_` (runs both config + secret composite tests), then confirm the core trait split compiles on every target incl. the **wasm** surfaces (repo rule): `cargo check -p trusted-server-adapter-axum && cargo check-cloudflare && cargo check-spin`
 Expected: PASS.
 
-- [ ] **Step 5: Reconcile `StoreName` semantics (D7).** `platform/types.rs::StoreName` is documented as an "edge-visible **platform** name". The composite now resolves `registry.named(store_name.as_str())` by **logical id**, so `StoreName` for reads must carry the **logical store id**. Update the `StoreName` doc comment to say "logical runtime store id" for reads, and audit read call sites (`request_signing/{signing,rotation}.rs`, `proxy.rs`, `integrations/datadome/{protection,protection_scope}.rs`) to confirm they pass **logical ids** (`trusted_server_config`, `jwks_store`, `ts_secrets`, `datadome-ip-bypass`, …), not physical platform names. No functional change if ids already equal names (D7 convention), but the doc + audit prevent implementers from passing physical names into logical registries.
+- [ ] **Step 5: Reconcile `StoreName` semantics (D7).** `platform/types.rs::StoreName` is documented as an "edge-visible **platform** name". The composite now resolves `registry.named(store_name.as_str())` by **logical id**, so `StoreName` for reads must carry the **logical store id**. Update the `StoreName` doc comment to say "logical runtime store id" for reads, and audit read call sites (`request_signing/{signing,rotation}.rs`, `proxy.rs`, `integrations/datadome/{protection,protection_scope}.rs`) to confirm they pass **logical ids** (`app_config`, `jwks_store`, `ts_secrets`, `datadome-ip-bypass`, …), not physical platform names. No functional change if ids already equal names (D7 convention), but the doc + audit prevent implementers from passing physical names into logical registries.
 
 - [ ] **Step 6: Commit**
 
@@ -338,9 +323,9 @@ git commit -m "Add registry-backed composite store; document StoreName as logica
 fn get_settings_reads_blob_via_edgezero_handle() {
     // Arrange: an EdgeZero ConfigStoreHandle over an in-memory store holding the blob envelope.
     let blob = blob_envelope_json(include_str!("../../../trusted-server.example.toml"));
-    let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore::with(&[("trusted_server_config", &blob)])));
+    let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore::with(&[("app_config", &blob)])));
     // Act
-    let settings = get_settings_from_config_store(&handle, "trusted_server_config")
+    let settings = get_settings_from_config_store(&handle, "app_config")
         .expect("should parse settings from the EdgeZero-read blob");
     // Assert
     assert!(settings.ec.ec_store.is_some(), "should deserialize the example config");
@@ -350,7 +335,7 @@ fn get_settings_reads_blob_via_edgezero_handle() {
 
 Run: `cargo test-fastly get_settings_reads_blob_via_edgezero_handle` → Expected: FAIL.
 
-- [ ] **Step 2: Re-type `get_settings_from_config_store`** to `(&ConfigStoreHandle, key: &str)`, called with **store id `trusted_server_config`, key `trusted_server_config`** (D5 — key == store id; `CONFIG_BLOB_KEY` is set to `trusted_server_config` in Task 2). In Fastly `load_settings_from_config_store()` open the EdgeZero `FastlyConfigStore` for `trusted_server_config` at boot and wrap in a `ConfigStoreHandle`. In Axum `build_state()` open the EdgeZero Axum config store, which reads **`.edgezero/local-config-trusted_server_config.json`** (`edgezero-adapter-axum/src/config_store.rs` — id-scoped local file); do **not** apply any env-key override (D7). The adapter-level boot wiring is exercised by each adapter's existing `build_state` test path (no new Viceroy test needed — the core test above covers the parse logic).
+- [ ] **Step 2: Re-type `get_settings_from_config_store`** to `(&ConfigStoreHandle, key: &str)`, called with **store id `app_config`, key `app_config`** (`CONFIG_BLOB_KEY`, unchanged). In Fastly `load_settings_from_config_store()` open the EdgeZero `FastlyConfigStore` for `app_config` at boot and wrap in a `ConfigStoreHandle`. In Axum `build_state()` open the EdgeZero Axum config store, which reads **`.edgezero/local-config-app_config.json`** (`edgezero-adapter-axum/src/config_store.rs` — id-scoped local file); do **not** apply any env-key override (D7). The adapter-level boot wiring is exercised by each adapter's existing `build_state` test path (no new Viceroy test needed — the core test above covers the parse logic).
 
 - [ ] **Step 3: Run to verify pass** (core test + adapter boot suites)
 
@@ -402,7 +387,7 @@ Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs`
 - Produces: `RuntimeServices` whose reads flow through EdgeZero, writes through the composite writer.
 
 - [ ] **Step 1: Write failing Axum tests covering the default AND a non-default config id AND a non-default secret id** (in the Axum app test module):
-  - `discovery_reads_jwks_from_nondefault_config_store` — `GET /.well-known/trusted-server.json`: seed the Axum `ConfigRegistry` with two ids (`trusted_server_config` default + the JWKS store id); assert `200` + the JWKS `kid` in the body (proves non-default **config** id resolution).
+  - `discovery_reads_jwks_from_nondefault_config_store` — `GET /.well-known/trusted-server.json`: seed the Axum `ConfigRegistry` with two ids (`app_config` default + the JWKS store id); assert `200` + the JWKS `kid` in the body (proves non-default **config** id resolution).
   - `datadome_reads_secret_from_nondefault_secret_store` — a request to a **protected non-integration** route (the DataDome server-side key is read during protected-request *filtering* in `protection.rs`, which **skips** the `/integrations/datadome/*` routes — see `protection.rs:110`), so drive a publisher/first-party route in DataDome's protection scope. Seed the `SecretRegistry` with two ids (default + `ts_secrets`) and the server-side key under `ts_secrets`; assert the filter reads it (proves non-default **secret** id resolution).
   - `first_party_proxy_reads_s3_secret` — `GET /first-party/proxy` for an S3-auth asset route: seed the S3 secret id; assert the SigV4 path obtains the secret (proves the S3 secret read).
 
@@ -590,7 +575,7 @@ git commit -m "Retire non-Fastly per-adapter config/secret read impls; reads via
 | KV | `ec_identity_store` | `ec.ec_store` (`settings.rs:452`, example L16) | declare |
 | KV | `consent_store` | `consent.consent_store` (`consent_config.rs:80`) | declare |
 | KV | `creative_store` | `auction.creative_store` (`auction_config_types.rs:30`, **deprecated**) | declare (keep strict lookup safe) |
-| config | `trusted_server_config` | app-config blob; **key == id** (`CONFIG_BLOB_KEY`→`trusted_server_config`, `DEFAULT_CONFIG_STORE_ID`→`trusted_server_config`) | rename from `app_config` |
+| config | **`app_config`** (KEEP — operator decision) | app-config blob; `CONFIG_BLOB_KEY`/`DEFAULT_CONFIG_STORE_ID` **stay `app_config`** | **declare `app_config` in `edgezero.toml`** (set `[stores.config]` default to `app_config`) — NO rename cascade; do **not** touch `config_payload.rs`/`settings_data.rs`/the Viceroy generator/test envs/Cloudflare side-channel for the app-config store |
 | config | `jwks_store` | `JWKS_CONFIG_STORE_NAME` (`request_signing/mod.rs:40`); `request_signing.config_store_id` | set example/fixtures `config_store_id = "jwks_store"` (today wrongly `app_config`) |
 | config | `datadome-ip-bypass` | `default_ip_cidr_source_store` (`protection_scope.rs:164`) | declare |
 | secret | `signing_keys` | `SIGNING_SECRET_STORE_NAME` (`mod.rs:46`); `request_signing.secret_store_id` | set example/fixtures `secret_store_id = "signing_keys"` (today wrongly `secrets`) |
