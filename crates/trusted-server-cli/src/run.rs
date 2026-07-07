@@ -8,7 +8,7 @@ use edgezero_cli::args::{
 use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::audit::browser_collector::BrowserAuditCollector;
-use crate::config_init::{run_config_init, ConfigInitArgs};
+use crate::config_init::{ConfigInitArgs, run_config_init};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
 #[derive(Debug, Parser)]

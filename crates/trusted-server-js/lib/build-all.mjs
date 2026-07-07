@@ -39,6 +39,7 @@ const integrationModules = fs.existsSync(integrationsDir)
           fs.existsSync(path.join(fullPath, 'index.ts'))
         );
       })
+      .sort()
       : [];
 
 console.log('[build-all] Discovered integrations:', integrationModules);

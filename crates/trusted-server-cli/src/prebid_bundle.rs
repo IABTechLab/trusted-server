@@ -162,15 +162,16 @@ pub(crate) fn run_bundle(
     writeln!(out, "Updated config: {}", args.config.display())
         .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
 
+    let bundle_filename = manifest.filename.as_str();
     if config.external_bundle_url.is_none() {
         writeln!(
             out,
-            "Next: upload the bundle and set integrations.prebid.external_bundle_url to its HTTPS URL."
+            "Next: upload {bundle_filename} and set integrations.prebid.external_bundle_url to its HTTPS URL."
         )
     } else {
         writeln!(
             out,
-            "Next: upload the bundle and update integrations.prebid.external_bundle_url if the hosted filename changed."
+            "Next: upload {bundle_filename} and update integrations.prebid.external_bundle_url if the hosted filename changed."
         )
     }
     .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
@@ -860,6 +861,13 @@ adapters = ["rubicon", 123]
 
         let output = String::from_utf8(out).expect("stdout should be valid utf8");
         assert!(output.contains("generator stdout"));
+        assert!(
+            output.contains(&format!(
+                "Next: upload trusted-prebid-{}.js and update integrations.prebid.external_bundle_url",
+                "b".repeat(64)
+            )),
+            "should tell operators which content-addressed filename to host: {output}"
+        );
         let stderr = String::from_utf8(err).expect("stderr should be valid utf8");
         assert!(stderr.contains("generator stderr"));
 

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::ArcHttpRequest;
+use chromiumoxide::browser::{Browser, BrowserConfig};
 use futures::StreamExt as _;
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -14,7 +14,7 @@ use which::which;
 use crate::audit::collector::{
     AuditCollector, CollectedPage, CollectedRequest, CollectedScriptTag,
 };
-use crate::error::{report_error, CliResult};
+use crate::error::{CliResult, report_error};
 
 const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(250);

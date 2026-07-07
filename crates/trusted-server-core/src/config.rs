@@ -24,6 +24,7 @@ use crate::integrations::{
 use crate::settings::{IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
+#[cfg(test)]
 const DEPLOY_VALIDATED_INTEGRATION_IDS: &[&str] = &[
     "prebid",
     "aps",
@@ -133,8 +134,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 fn validate_enabled_integrations(
     settings: &Settings,
 ) -> Result<HashSet<&'static str>, Report<TrustedServerError>> {
-    let mut enabled_auction_providers =
-        HashSet::with_capacity(DEPLOY_VALIDATED_INTEGRATION_IDS.len());
+    let mut enabled_auction_providers = HashSet::new();
 
     if validate_prebid(settings)? {
         enabled_auction_providers.insert("prebid");

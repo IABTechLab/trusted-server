@@ -51,6 +51,9 @@ const PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, i
 const PREBID_BUNDLE_REVALIDATION_CACHE_CONTROL: &str =
     "public, max-age=300, s-maxage=300, stale-while-revalidate=60, stale-if-error=86400";
 const PREBID_BUNDLE_ERROR_CACHE_CONTROL: &str = "no-store";
+const PREBID_BUNDLE_ERROR_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const PREBID_BUNDLE_NOSNIFF_HEADER: &str = "x-content-type-options";
+const PREBID_BUNDLE_NOSNIFF_VALUE: &str = "nosniff";
 const TRUSTED_SERVER_BIDDER: &str = "trustedServer";
 const BIDDER_PARAMS_KEY: &str = "bidderParams";
 const ZONE_KEY: &str = "zone";
@@ -622,6 +625,10 @@ impl PrebidIntegration {
             header::CONTENT_TYPE,
             HeaderValue::from_static(PREBID_BUNDLE_CONTENT_TYPE),
         );
+        response.headers_mut().insert(
+            header::HeaderName::from_static(PREBID_BUNDLE_NOSNIFF_HEADER),
+            HeaderValue::from_static(PREBID_BUNDLE_NOSNIFF_VALUE),
+        );
 
         match mode {
             ExternalBundleCacheMode::Immutable => {
@@ -677,8 +684,16 @@ impl PrebidIntegration {
             self.apply_external_bundle_headers(&mut sanitized, mode);
         } else {
             sanitized.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(PREBID_BUNDLE_ERROR_CONTENT_TYPE),
+            );
+            sanitized.headers_mut().insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(PREBID_BUNDLE_ERROR_CACHE_CONTROL),
+            );
+            sanitized.headers_mut().insert(
+                header::HeaderName::from_static(PREBID_BUNDLE_NOSNIFF_HEADER),
+                HeaderValue::from_static(PREBID_BUNDLE_NOSNIFF_VALUE),
             );
         }
 
@@ -2866,6 +2881,11 @@ external_bundle_sri = "sha384-AAAA"
             "should normalize JS content type"
         );
         assert_eq!(
+            header_value_str(&immutable, PREBID_BUNDLE_NOSNIFF_HEADER),
+            Some(PREBID_BUNDLE_NOSNIFF_VALUE.to_string()),
+            "should disable content sniffing"
+        );
+        assert_eq!(
             header_value_str(&immutable, "cache-control"),
             Some(PREBID_BUNDLE_IMMUTABLE_CACHE_CONTROL.to_string()),
             "versioned responses should be immutable"
@@ -2932,6 +2952,11 @@ external_bundle_sri = "sha384-AAAA"
             header_value_str(&sanitized, "content-type"),
             Some(PREBID_BUNDLE_CONTENT_TYPE.to_string()),
             "should normalize JS content type"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, PREBID_BUNDLE_NOSNIFF_HEADER),
+            Some(PREBID_BUNDLE_NOSNIFF_VALUE.to_string()),
+            "should disable content sniffing"
         );
         assert_eq!(
             header_value_str(&sanitized, "cache-control"),
@@ -3007,9 +3032,15 @@ external_bundle_sri = "sha384-AAAA"
             Some(PREBID_BUNDLE_ERROR_CACHE_CONTROL.to_string()),
             "should prevent caching upstream error responses"
         );
-        assert!(
-            !response_header_is_present(&sanitized, "content-type"),
-            "should strip upstream content type on error responses"
+        assert_eq!(
+            header_value_str(&sanitized, "content-type"),
+            Some(PREBID_BUNDLE_ERROR_CONTENT_TYPE.to_string()),
+            "should replace upstream content type on error responses"
+        );
+        assert_eq!(
+            header_value_str(&sanitized, PREBID_BUNDLE_NOSNIFF_HEADER),
+            Some(PREBID_BUNDLE_NOSNIFF_VALUE.to_string()),
+            "should disable content sniffing on error responses"
         );
         assert!(
             !response_header_is_present(&sanitized, "set-cookie"),

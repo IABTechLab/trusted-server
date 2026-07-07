@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::audit::collector::AuditCollector;
 use crate::config_init::EXAMPLE_CONFIG;
-use crate::error::{cli_error, report_error, CliResult};
+use crate::error::{CliResult, cli_error, report_error};
 use crate::run::AuditArgs;
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
