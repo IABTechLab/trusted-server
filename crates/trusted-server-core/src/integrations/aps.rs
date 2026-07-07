@@ -294,71 +294,69 @@ impl IntegrationConfig for ApsConfig {
 /// Amazon APS auction provider.
 pub struct ApsAuctionProvider {
     config: ApsConfig,
-    // Maps APS slot ID → creative opportunity slot ID for the in-flight request.
-    // Written by request_bids before the async send; read by parse_response when the
-    // response arrives. Safe because Fastly Compute runs each request in an isolated
-    // single-threaded Wasm instance — the Mutex never contends in practice.
-    //
-    // Unlike adserver_mock's bid index (rebuilt in parse_response_with_context
-    // from context.provider_responses), this map derives from the AuctionRequest,
-    // which AuctionContext does not carry — migrating it off provider-instance
-    // state needs the request threaded through the context first.
-    slot_id_map: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl ApsAuctionProvider {
     /// Create a new APS auction provider.
     #[must_use]
     pub fn new(config: ApsConfig) -> Self {
-        Self {
-            config,
-            slot_id_map: std::sync::Mutex::new(HashMap::new()),
+        Self { config }
+    }
+
+    /// Resolve the APS-specific slot ID for a slot.
+    ///
+    /// Uses the APS slot ID from `[slot.providers.aps]` if configured; falls
+    /// back to the creative-opportunity slot ID otherwise.
+    fn aps_slot_id(slot: &crate::auction::types::AdSlot) -> String {
+        slot.bidders
+            .get("aps")
+            .and_then(|p| p.get("slotID"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&slot.id)
+            .to_string()
+    }
+
+    /// Build the APS slot ID → creative-opportunity slot ID map for `request`.
+    ///
+    /// Derived from the [`AuctionRequest`] on every call so the mapping stays
+    /// request-scoped: the provider instance is shared across concurrent
+    /// auctions on non-Fastly adapters, and instance state would let
+    /// overlapping auctions overwrite or consume each other's maps.
+    fn build_slot_id_map(request: &AuctionRequest) -> HashMap<String, String> {
+        let mut slot_id_map: HashMap<String, String> = HashMap::new();
+        for slot in &request.slots {
+            let aps_slot_id = Self::aps_slot_id(slot);
+            // Last-write-wins: two slots configuring the same
+            // `[bidders.aps].slotID` would remap one slot's bids to the
+            // wrong creative slot. Log the collision so a misconfiguration
+            // is diagnosable, mirroring the build_bid_index collision log.
+            if let Some(previous_slot_id) = slot_id_map.insert(aps_slot_id.clone(), slot.id.clone())
+            {
+                log::debug!(
+                    "APS slot ID '{aps_slot_id}' maps to multiple creative slots \
+                     ('{previous_slot_id}' overwritten by '{}'); bids for this APS \
+                     slot will resolve to the last one",
+                    slot.id,
+                );
+            }
         }
+        slot_id_map
     }
 
     /// Convert unified `AuctionRequest` to APS TAM bid request format.
     ///
-    /// Returns the serialisable `ApsBidRequest` and a map of APS slot ID →
-    /// creative-opportunity slot ID so the caller can remap bids in the response.
     /// Populates consent fields (GDPR, US Privacy, GPP) from the
     /// [`ConsentContext`](crate::consent::ConsentContext) attached to the request.
     ///
     /// `timeout_ms` is the effective auction budget for this provider (already
     /// capped by the orchestrator) — advertised to APS so it never expects more
     /// time than the edge will actually wait.
-    fn to_aps_request(
-        &self,
-        request: &AuctionRequest,
-        timeout_ms: u32,
-    ) -> (ApsBidRequest, HashMap<String, String>) {
-        let mut slot_id_map: HashMap<String, String> = HashMap::new();
+    fn to_aps_request(&self, request: &AuctionRequest, timeout_ms: u32) -> ApsBidRequest {
         let slots: Vec<ApsSlot> = request
             .slots
             .iter()
             .map(|slot| {
-                // Use the APS-specific slot ID from [slot.providers.aps] if configured;
-                // fall back to the creative-opportunity slot ID otherwise.
-                let aps_slot_id = slot
-                    .bidders
-                    .get("aps")
-                    .and_then(|p| p.get("slotID"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&slot.id)
-                    .to_string();
-                // Last-write-wins: two slots configuring the same
-                // `[bidders.aps].slotID` would remap one slot's bids to the
-                // wrong creative slot. Log the collision so a misconfiguration
-                // is diagnosable, mirroring the build_bid_index collision log.
-                if let Some(previous_slot_id) =
-                    slot_id_map.insert(aps_slot_id.clone(), slot.id.clone())
-                {
-                    log::debug!(
-                        "APS slot ID '{aps_slot_id}' maps to multiple creative slots \
-                         ('{previous_slot_id}' overwritten by '{}'); bids for this APS \
-                         slot will resolve to the last one",
-                        slot.id,
-                    );
-                }
+                let aps_slot_id = Self::aps_slot_id(slot);
 
                 // Extract sizes from banner formats
                 let sizes: Vec<[u32; 2]> = slot
@@ -393,7 +391,7 @@ impl ApsAuctionProvider {
             })
         });
 
-        let bid_request = ApsBidRequest {
+        ApsBidRequest {
             pub_id: self.config.pub_id.clone(),
             slots,
             page_url: request.publisher.page_url.clone(),
@@ -403,8 +401,7 @@ impl ApsAuctionProvider {
             us_privacy,
             gpp,
             gpp_sid,
-        };
-        (bid_request, slot_id_map)
+        }
     }
 
     /// Parse size string (e.g., "300x250") into width and height.
@@ -493,7 +490,15 @@ impl ApsAuctionProvider {
     }
 
     /// Parse APS TAM response into unified `AuctionResponse`.
-    fn parse_aps_response(&self, json: &Json, response_time_ms: u64) -> AuctionResponse {
+    ///
+    /// `slot_map` is the request-scoped APS slot ID → creative-opportunity
+    /// slot ID mapping built by [`Self::build_slot_id_map`].
+    fn parse_aps_response(
+        &self,
+        json: &Json,
+        response_time_ms: u64,
+        slot_map: &HashMap<String, String>,
+    ) -> AuctionResponse {
         let mut bids = Vec::new();
 
         // Try to parse as ApsBidResponse with contextual wrapper
@@ -503,16 +508,6 @@ impl ApsAuctionProvider {
                 aps_response.contextual.slots.len()
             );
 
-            // Take the map by value so it does not linger on the provider
-            // across requests if the Fastly Compute runtime ever reuses Wasm
-            // instances. Today each request gets its own instance so this is
-            // belt-and-suspenders; tomorrow it may not be.
-            let slot_map = std::mem::take(
-                &mut *self
-                    .slot_id_map
-                    .lock()
-                    .expect("should lock APS slot id map"),
-            );
             for slot in aps_response.contextual.slots {
                 match self.parse_aps_slot(&slot) {
                     Ok(mut bid) => {
@@ -553,6 +548,51 @@ impl ApsAuctionProvider {
             AuctionResponse::success("aps", bids, response_time_ms)
         }
     }
+
+    /// Shared parse path for both trait entry points.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response body cannot be read or is not valid JSON.
+    async fn parse_response_inner(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+        slot_map: &HashMap<String, String>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let response = response.response;
+
+        // Check status code
+        if !response.status().is_success() {
+            log::warn!("APS returned non-success status: {}", response.status());
+            return Ok(AuctionResponse::error("aps", response_time_ms));
+        }
+
+        // Parse response body — collect_response_bounded caps memory from misbehaving providers.
+        let body_bytes =
+            collect_response_bounded(response.into_body(), UPSTREAM_RTB_MAX_RESPONSE_BYTES, "aps")
+                .await
+                .change_context(TrustedServerError::Auction {
+                    message: "Failed to read APS response body".to_string(),
+                })?;
+        let response_json: Json =
+            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
+                message: "Failed to parse APS response JSON".to_string(),
+            })?;
+
+        log::trace!("APS: received response: {:?}", response_json);
+
+        // Transform to unified format
+        let auction_response = self.parse_aps_response(&response_json, response_time_ms, slot_map);
+
+        log::info!(
+            "APS returned {} bids in {}ms",
+            auction_response.bids.len(),
+            response_time_ms
+        );
+
+        Ok(auction_response)
+    }
 }
 
 #[async_trait(?Send)]
@@ -572,16 +612,12 @@ impl AuctionProvider for ApsAuctionProvider {
             self.config.pub_id
         );
 
-        // Transform to APS format; store the APS-slot-ID → creative-slot-ID map so
-        // parse_response can remap bids back to the creative opportunity slot ID.
-        // `context.timeout_ms` is the effective budget the orchestrator granted
-        // this provider — the payload must advertise the same deadline the edge
-        // backend enforces below.
-        let (aps_request, slot_id_map) = self.to_aps_request(request, context.timeout_ms);
-        *self
-            .slot_id_map
-            .lock()
-            .expect("should lock APS slot id map") = slot_id_map;
+        // Transform to APS format. `context.timeout_ms` is the effective budget
+        // the orchestrator granted this provider — the payload must advertise
+        // the same deadline the edge backend enforces below. The APS-slot-ID →
+        // creative-slot-ID remapping is rebuilt from the request in
+        // `parse_response_with_context`, keeping it request-scoped.
+        let aps_request = self.to_aps_request(request, context.timeout_ms);
 
         // Serialize to JSON
         let aps_json =
@@ -638,38 +674,27 @@ impl AuctionProvider for ApsAuctionProvider {
         response: PlatformResponse,
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let response = response.response;
+        // No auction request available — bids keep their raw APS slot IDs. The
+        // orchestrator always calls [`Self::parse_response_with_context`], so
+        // this path only serves callers outside the orchestration flow.
+        log::debug!("APS: parsing without request context — slot ID remapping unavailable");
+        self.parse_response_inner(response, response_time_ms, &HashMap::new())
+            .await
+    }
 
-        // Check status code
-        if !response.status().is_success() {
-            log::warn!("APS returned non-success status: {}", response.status());
-            return Ok(AuctionResponse::error("aps", response_time_ms));
-        }
-
-        // Parse response body — collect_response_bounded caps memory from misbehaving providers.
-        let body_bytes =
-            collect_response_bounded(response.into_body(), UPSTREAM_RTB_MAX_RESPONSE_BYTES, "aps")
-                .await
-                .change_context(TrustedServerError::Auction {
-                    message: "Failed to read APS response body".to_string(),
-                })?;
-        let response_json: Json =
-            serde_json::from_slice(&body_bytes).change_context(TrustedServerError::Auction {
-                message: "Failed to parse APS response JSON".to_string(),
-            })?;
-
-        log::trace!("APS: received response: {:?}", response_json);
-
-        // Transform to unified format
-        let auction_response = self.parse_aps_response(&response_json, response_time_ms);
-
-        log::info!(
-            "APS returned {} bids in {}ms",
-            auction_response.bids.len(),
-            response_time_ms
-        );
-
-        Ok(auction_response)
+    async fn parse_response_with_context(
+        &self,
+        response: PlatformResponse,
+        response_time_ms: u64,
+        request: &AuctionRequest,
+        _context: &AuctionContext<'_>,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        // Rebuild the APS-slot-ID → creative-slot-ID map from the auction
+        // request so overlapping auctions on shared provider instances cannot
+        // overwrite or consume each other's mappings.
+        let slot_map = Self::build_slot_id_map(request);
+        self.parse_response_inner(response, response_time_ms, &slot_map)
+            .await
     }
 
     fn supports_media_type(&self, media_type: &MediaType) -> bool {
@@ -816,7 +841,7 @@ mod tests {
 
         let provider = ApsAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&auction_request, 800);
+        let aps_request = provider.to_aps_request(&auction_request, 800);
 
         // Verify basic fields
         assert_eq!(aps_request.pub_id, "5128");
@@ -886,18 +911,17 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let (aps_request, slot_id_map) = provider.to_aps_request(&request, 800);
+        let aps_request = provider.to_aps_request(&request, 800);
         assert_eq!(
             aps_request.slots[0].slot_id, "aps-slot-atf-sidebar",
             "should send configured APS slot ID to APS"
         );
+        let slot_id_map = ApsAuctionProvider::build_slot_id_map(&request);
         assert_eq!(
             slot_id_map.get("aps-slot-atf-sidebar").map(String::as_str),
             Some("atf_sidebar_ad"),
             "should build reverse map from APS slot ID to creative slot ID"
         );
-
-        *provider.slot_id_map.lock().expect("should lock") = slot_id_map;
 
         let aps_response = json!({
             "contextual": {
@@ -911,7 +935,7 @@ mod tests {
             }
         });
 
-        let response = provider.parse_aps_response(&aps_response, 100);
+        let response = provider.parse_aps_response(&aps_response, 100, &slot_id_map);
         assert_eq!(response.bids.len(), 1, "should parse one bid");
         assert_eq!(
             response.bids[0].slot_id, "atf_sidebar_ad",
@@ -971,7 +995,7 @@ mod tests {
             }
         });
 
-        let auction_response = provider.parse_aps_response(&aps_response, 150);
+        let auction_response = provider.parse_aps_response(&aps_response, 150, &HashMap::new());
 
         // Verify response
         assert_eq!(auction_response.provider, "aps");
@@ -1019,7 +1043,7 @@ mod tests {
             }
         });
 
-        let auction_response = provider.parse_aps_response(&aps_response, 100);
+        let auction_response = provider.parse_aps_response(&aps_response, 100, &HashMap::new());
 
         assert_eq!(auction_response.provider, "aps");
         assert_eq!(auction_response.status, BidStatus::NoBid);
@@ -1061,7 +1085,7 @@ mod tests {
             }
         });
 
-        let auction_response = provider.parse_aps_response(&aps_response, 100);
+        let auction_response = provider.parse_aps_response(&aps_response, 100, &HashMap::new());
 
         // Should return no-bid since all slots are invalid
         assert_eq!(auction_response.status, BidStatus::NoBid);
@@ -1138,7 +1162,7 @@ mod tests {
         let provider = ApsAuctionProvider::new(config);
         let request = create_test_auction_request();
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 500);
+        let aps_request = provider.to_aps_request(&request, 500);
 
         assert_eq!(
             aps_request.timeout,
@@ -1169,7 +1193,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
+        let aps_request = provider.to_aps_request(&request, 800);
 
         // Verify GDPR consent
         let gdpr = aps_request.gdpr.expect("should have gdpr");
@@ -1198,7 +1222,7 @@ mod tests {
         let provider = ApsAuctionProvider::new(config);
         let request = create_test_auction_request(); // consent is None
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
+        let aps_request = provider.to_aps_request(&request, 800);
 
         assert!(aps_request.gdpr.is_none());
         assert!(aps_request.us_privacy.is_none());
@@ -1225,7 +1249,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (aps_request, _slot_id_map) = provider.to_aps_request(&request, 800);
+        let aps_request = provider.to_aps_request(&request, 800);
         let json = serde_json::to_value(&aps_request).expect("should serialize");
 
         // GDPR fields present
@@ -1286,5 +1310,121 @@ mod tests {
             bid.metadata.get("amznbid").and_then(|v| v.as_str()),
             Some("encoded-price")
         );
+    }
+
+    fn single_slot_request(
+        auction_id: &str,
+        aps_slot_id: &str,
+        creative_id: &str,
+    ) -> AuctionRequest {
+        let mut bidders = HashMap::new();
+        bidders.insert("aps".to_string(), json!({ "slotID": aps_slot_id }));
+        AuctionRequest {
+            id: auction_id.to_string(),
+            slots: vec![AdSlot {
+                id: creative_id.to_string(),
+                formats: vec![AdFormat {
+                    media_type: MediaType::Banner,
+                    width: 300,
+                    height: 250,
+                }],
+                floor_price: None,
+                targeting: HashMap::new(),
+                bidders,
+            }],
+            publisher: PublisherInfo {
+                domain: "example.com".to_string(),
+                page_url: None,
+            },
+            user: UserInfo {
+                id: None,
+                consent: None,
+                eids: None,
+            },
+            device: None,
+            site: None,
+            context: HashMap::new(),
+        }
+    }
+
+    fn aps_platform_response(aps_slot_id: &str) -> PlatformResponse {
+        let body = json!({
+            "contextual": {
+                "slots": [{
+                    "slotID": aps_slot_id,
+                    "size": "300x250",
+                    "fif": "1",
+                    "amznbid": "1gtm3q",
+                    "meta": ["slotID"]
+                }]
+            }
+        });
+        let response = http::Response::builder()
+            .status(200)
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize APS response body"),
+            ))
+            .expect("should build APS platform response");
+        PlatformResponse::new(response)
+    }
+
+    #[test]
+    fn concurrent_auctions_parse_out_of_order_with_correct_slot_remapping() {
+        // Regression: the reverse slot map used to live on the shared provider
+        // instance, so a second auction's request_bids overwrote the first
+        // auction's map and out-of-order parses remapped bids to the wrong
+        // creative slot. The map is now derived from each parse's own request.
+        let provider = ApsAuctionProvider::new(ApsConfig {
+            enabled: true,
+            pub_id: "5128".to_string(),
+            endpoint: default_endpoint(),
+            timeout_ms: 800,
+        });
+
+        let request_a = single_slot_request("auction-a", "aps-slot-a", "creative_a");
+        let request_b = single_slot_request("auction-b", "aps-slot-b", "creative_b");
+
+        let settings = crate::test_support::tests::create_test_settings();
+        let http_request = http::Request::builder()
+            .uri("https://example.com/")
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let context = crate::auction::test_support::create_test_auction_context(
+            &settings,
+            &http_request,
+            800,
+        );
+
+        futures::executor::block_on(async {
+            // Parse auction B's response first, then auction A's — the reverse
+            // of dispatch order — each against its own request.
+            let response_b = provider
+                .parse_response_with_context(
+                    aps_platform_response("aps-slot-b"),
+                    100,
+                    &request_b,
+                    &context,
+                )
+                .await
+                .expect("should parse auction B response");
+            let response_a = provider
+                .parse_response_with_context(
+                    aps_platform_response("aps-slot-a"),
+                    100,
+                    &request_a,
+                    &context,
+                )
+                .await
+                .expect("should parse auction A response");
+
+            assert_eq!(
+                response_b.bids[0].slot_id, "creative_b",
+                "auction B bid should remap to auction B's creative slot"
+            );
+            assert_eq!(
+                response_a.bids[0].slot_id, "creative_a",
+                "auction A bid should remap to auction A's creative slot despite parsing last"
+            );
+        });
     }
 }

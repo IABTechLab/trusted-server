@@ -236,18 +236,13 @@ crate requires a native target while the workspace default is `wasm32-wasip1`.
 
 ## Dependency maintenance
 
-`crates/trusted-server-integration-tests` is intentionally excluded from the workspace, so it
-keeps its own `Cargo.lock`.
-
-Shared direct dependency versions are checked in CI by
-`scripts/check-integration-dependency-versions.sh`. When updating a dependency
-that exists in both manifests:
-
-1. Update the version in both `Cargo.toml` files.
-2. Regenerate the nested lockfile with
-   `cargo generate-lockfile --manifest-path crates/trusted-server-integration-tests/Cargo.toml`.
-3. Ensure the workspace and integration-test lockfiles resolve the same version
-   for that shared dependency.
+`crates/trusted-server-integration-tests` is a workspace member, so it shares
+`[workspace.dependencies]` and the single root `Cargo.lock` with the adapters it
+exercises. There is no separate lockfile or version-drift check to maintain:
+update a shared dependency once in the root `[workspace.dependencies]` (or in this
+crate's own `Cargo.toml` for integration-only dependencies) and the shared
+lockfile resolves it. The crate is native + Docker-based (testcontainers), so it
+is excluded from the wasm workspace aliases and run via `./scripts/integration-tests.sh`.
 
 ## Known gaps
 

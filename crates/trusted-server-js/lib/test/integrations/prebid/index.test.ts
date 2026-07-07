@@ -1559,3 +1559,47 @@ describe('prebid/client-side bidders', () => {
     errorSpy.mockRestore();
   });
 });
+
+describe('prebid self-init user ID module timing', () => {
+  const userSyncCallCount = () =>
+    mockSetConfig.mock.calls.filter(([arg]) => arg && typeof arg === 'object' && 'userSync' in arg)
+      .length;
+
+  const setReadyState = (value: DocumentReadyState) => {
+    Object.defineProperty(document, 'readyState', { value, configurable: true });
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    mockSetConfig.mockClear();
+  });
+
+  afterEach(() => {
+    setReadyState('complete');
+  });
+
+  it('installs user ID modules immediately when the bundle loads after window load', async () => {
+    // The GPT slim loader appends this bundle from a window.load handler, so
+    // the document is already complete — a load listener would never fire.
+    setReadyState('complete');
+
+    await import('../../../src/integrations/prebid/index');
+
+    expect(userSyncCallCount()).toBeGreaterThan(0);
+  });
+
+  it('defers user ID modules to window load when the document is still loading', async () => {
+    setReadyState('loading');
+
+    await import('../../../src/integrations/prebid/index');
+
+    expect(userSyncCallCount()).toBe(0);
+
+    window.dispatchEvent(new Event('load'));
+    expect(userSyncCallCount()).toBe(1);
+
+    // { once: true } — a second load event must not reinstall.
+    window.dispatchEvent(new Event('load'));
+    expect(userSyncCallCount()).toBe(1);
+  });
+});

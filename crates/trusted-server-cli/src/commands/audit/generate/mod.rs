@@ -15,9 +15,9 @@ use trusted_server_core::creative_opportunities::{
 };
 use url::Url;
 
-use crate::audit::generate::collector::AuditCollector;
-use crate::config_init::EXAMPLE_CONFIG;
-use crate::error::{cli_error, report_error, CliResult};
+use crate::commands::audit::generate::collector::AuditCollector;
+use crate::commands::config::init::EXAMPLE_CONFIG;
+use crate::error::{CliResult, cli_error, report_error};
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
 
@@ -45,7 +45,7 @@ pub(crate) struct GenerateArgs {
     /// Cookie to send with the page request, as `name=value`. Repeatable.
     /// Use to carry an existing session (e.g. a valid bot-protection clearance
     /// cookie) so the origin serves the real page instead of a challenge.
-    #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = crate::audit::parse_cookie)]
+    #[arg(long = "cookie", value_name = "NAME=VALUE", value_parser = crate::commands::audit::parse_cookie)]
     pub(crate) cookies: Vec<(String, String)>,
 }
 
@@ -836,15 +836,15 @@ fn splice_creative_slots(
 
     // Section exists — update `gam_network_id` (best-effort) and replace slots.
     let mut document = existing.to_string();
-    if let Some(network_id) = network_id {
-        if let Ok(updated) = replace_key_in_section(
+    if let Some(network_id) = network_id
+        && let Ok(updated) = replace_key_in_section(
             &document,
             "creative_opportunities",
             "gam_network_id",
             &format!("gam_network_id = \"{network_id}\""),
-        ) {
-            document = updated;
-        }
+        )
+    {
+        document = updated;
     }
 
     let lines: Vec<&str> = document.lines().collect();
@@ -959,7 +959,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::audit::generate::collector::{CollectedPage, CollectedRequest, CollectedScriptTag};
+    use crate::commands::audit::generate::collector::{
+        CollectedPage, CollectedRequest, CollectedScriptTag,
+    };
 
     struct FakeCollector {
         collected: CollectedPage,

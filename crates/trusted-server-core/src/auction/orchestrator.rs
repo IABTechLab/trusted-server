@@ -276,7 +276,12 @@ impl AuctionOrchestrator {
             // /__ts/page-bids must match or mediated cache bids lose the metadata
             // needed for creative rendering and win/billing beacons.
             let mediator_resp = mediator
-                .parse_response_with_context(platform_resp, response_time_ms, &mediator_context)
+                .parse_response_with_context(
+                    platform_resp,
+                    response_time_ms,
+                    request,
+                    &mediator_context,
+                )
                 .await
                 .change_context(TrustedServerError::Auction {
                     message: format!("Mediator {} parse failed", mediator.provider_name()),
@@ -546,7 +551,12 @@ impl AuctionOrchestrator {
                         // parallel (`/auction`, page-bids) and collect (publisher)
                         // paths. The default impl delegates to `parse_response`.
                         match provider
-                            .parse_response_with_context(response, response_time_ms, context)
+                            .parse_response_with_context(
+                                response,
+                                response_time_ms,
+                                request,
+                                context,
+                            )
                             .await
                         {
                             Ok(auction_response) => {
@@ -764,6 +774,23 @@ impl AuctionOrchestrator {
             return None;
         }
 
+        // Mirror run_providers_parallel: reject multi-provider fan-out before
+        // any request launches when the platform executes `send_async` eagerly
+        // (e.g. Cloudflare Workers, Spin). Sequential execution would accrue
+        // the sum of provider latencies before the origin fetch and then fail
+        // collection with empty bids.
+        if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
+        {
+            log::warn!(
+                "{} auction providers configured, but this platform's HTTP client \
+                 executes requests sequentially — skipping initial-page auction \
+                 dispatch; configure a single provider, or use an adapter with \
+                 concurrent fan-out support",
+                provider_names.len(),
+            );
+            return None;
+        }
+
         let auction_start = Instant::now();
         let mut backend_to_provider: HashMap<String, (String, Instant, Arc<dyn AuctionProvider>)> =
             HashMap::new();
@@ -939,6 +966,7 @@ impl AuctionOrchestrator {
                             .parse_response_with_context(
                                 platform_response,
                                 response_time_ms,
+                                &request,
                                 context,
                             )
                             .await
@@ -1082,6 +1110,7 @@ impl AuctionOrchestrator {
                                         .parse_response_with_context(
                                             platform_resp,
                                             response_time_ms,
+                                            &request,
                                             &mediator_context,
                                         )
                                         .await
@@ -1355,6 +1384,7 @@ mod tests {
             &self,
             _response: PlatformResponse,
             response_time_ms: u64,
+            _request: &AuctionRequest,
             _context: &AuctionContext<'_>,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
             // Context-aware path: restores nurl/ad_id from the collected SSP bids.
@@ -1955,6 +1985,70 @@ mod tests {
             assert!(
                 stub_for_assertion.recorded_backend_names().is_empty(),
                 "should not launch any provider request before rejecting"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatch_auction_skips_multi_provider_fanout_on_sequential_platform() {
+        futures::executor::block_on(async {
+            // Arrange: two configured providers on a platform whose HTTP
+            // client executes send_async eagerly (no concurrent fan-out).
+            // The initial-page dispatch path must apply the same guard as
+            // run_providers_parallel or the summed provider latency lands
+            // before the origin fetch.
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_concurrent_fanout(false);
+            let stub_for_assertion = Arc::clone(&stub);
+
+            let services = build_services_with_http_client(stub);
+            // SAFETY: `Box::leak` creates a `'static` reference for test use only.
+            // The leaked allocation is bounded to the test process lifetime.
+            let services: &'static RuntimeServices = Box::leak(Box::new(services));
+
+            let config = AuctionConfig {
+                enabled: true,
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            };
+            let mut orchestrator = AuctionOrchestrator::new(config);
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-a",
+                backend: "backend-a",
+            }));
+            orchestrator.register_provider(Arc::new(StubAuctionProvider {
+                name: "provider-b",
+                backend: "backend-b",
+            }));
+
+            let request = create_test_auction_request();
+            let settings = create_test_settings();
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri("https://example.com/test")
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build request");
+            let context = AuctionContext {
+                settings: &settings,
+                request: &req,
+                timeout_ms: 2000,
+                provider_responses: None,
+                services,
+            };
+
+            // Act
+            let dispatched = orchestrator.dispatch_auction(&request, &context).await;
+
+            // Assert: no dispatch and no provider request launched.
+            assert!(
+                dispatched.is_none(),
+                "should skip initial-page dispatch on sequential platforms"
+            );
+            assert!(
+                stub_for_assertion.recorded_backend_names().is_empty(),
+                "should not launch any provider request on a sequential platform"
             );
         });
     }

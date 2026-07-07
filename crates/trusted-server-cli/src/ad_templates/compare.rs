@@ -499,10 +499,12 @@ mod tests {
         );
 
         assert_eq!(result.slots[0].status, SlotStatus::Partial);
-        assert!(result.slots[0]
-            .warnings
-            .iter()
-            .any(|w| w.code == "dom_without_gpt"));
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "dom_without_gpt")
+        );
     }
 
     #[test]
@@ -614,10 +616,12 @@ mod tests {
         );
 
         assert_eq!(result.slots[0].status, SlotStatus::Partial);
-        assert!(result.slots[0]
-            .warnings
-            .iter()
-            .any(|w| w.code == "incompatible_sizes"));
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "incompatible_sizes")
+        );
     }
 
     #[test]
@@ -636,10 +640,12 @@ mod tests {
         );
 
         assert_eq!(result.slots[0].status, SlotStatus::Partial);
-        assert!(result.slots[0]
-            .warnings
-            .iter()
-            .any(|w| w.code == "unsupported_format"));
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "unsupported_format")
+        );
     }
 
     #[test]
@@ -690,10 +696,12 @@ mod tests {
         );
 
         assert_ne!(result.slots[0].status, SlotStatus::Confirmed);
-        assert!(result.slots[0]
-            .warnings
-            .iter()
-            .any(|w| w.code == "out_of_page_slot"));
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "out_of_page_slot")
+        );
     }
 
     #[test]
@@ -741,10 +749,12 @@ mod tests {
             SlotStatus::Confirmed,
             "missing APS does not flip status"
         );
-        assert!(result.slots[0]
-            .warnings
-            .iter()
-            .any(|w| w.code == "aps_evidence_missing"));
+        assert!(
+            result.slots[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "aps_evidence_missing")
+        );
         assert!(
             !result.strict_failed(),
             "provider warning alone must not fail strict"

@@ -4,14 +4,16 @@ use std::io::{self, Write};
 
 use clap::Args;
 
-use crate::audit::browser::BrowserCollector;
-use crate::audit::collector::{AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage};
+use crate::commands::audit::browser::BrowserCollector;
+use crate::commands::audit::collector::{
+    AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage,
+};
 
 /// Arguments for `ts audit page <url>`.
 #[derive(Debug, Args)]
 pub(crate) struct PageAuditArgs {
     /// The page URL to audit (http or https).
-    #[arg(value_parser = crate::audit::parse_http_url)]
+    #[arg(value_parser = crate::commands::audit::parse_http_url)]
     pub url: url::Url,
     /// Perform a deterministic scroll pass after the initial settle.
     #[arg(long)]

@@ -16,7 +16,9 @@ use futures::StreamExt as _;
 
 use crate::ad_templates::compare::BrowserAdEvidence;
 use crate::ad_templates::output::Warning;
-use crate::audit::collector::{AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage};
+use crate::commands::audit::collector::{
+    AuditCollector, BrowserCollectRequest, BrowserOpts, CollectedPage,
+};
 
 /// Candidate Chrome/Chromium executable names searched on `PATH`.
 const CHROME_NAMES: &[&str] = &[
@@ -401,7 +403,9 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
-    use crate::audit::collector::{build_ad_template_init_script, AdTemplateCollectorConfig};
+    use crate::commands::audit::collector::{
+        AdTemplateCollectorConfig, build_ad_template_init_script,
+    };
 
     /// Whether a local Chrome/Chromium is available to run browser fixture tests.
     fn chrome_available() -> bool {

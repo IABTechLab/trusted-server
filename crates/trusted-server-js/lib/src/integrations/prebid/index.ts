@@ -925,9 +925,20 @@ function syncPrebidEidsCookie(): void {
 if (typeof window !== 'undefined') {
   installPrebidNpm();
   installRefreshHandler();
-  window.addEventListener('load', () => {
+  // The slim-Prebid lazy loader appends this bundle from a window.load
+  // handler, so `load` may already have fired by the time this code runs —
+  // waiting for it again would skip user ID setup entirely on that path.
+  if (document.readyState === 'complete') {
     installUserIdModules();
-  });
+  } else {
+    window.addEventListener(
+      'load',
+      () => {
+        installUserIdModules();
+      },
+      { once: true }
+    );
+  }
 }
 
 export { pbjs };

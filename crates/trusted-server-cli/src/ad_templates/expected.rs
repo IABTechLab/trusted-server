@@ -5,7 +5,7 @@
 //! browser-evidence comparison. It must not duplicate glob-matching semantics.
 
 use trusted_server_core::auction::types::MediaType;
-use trusted_server_core::creative_opportunities::{match_slots, CreativeOpportunitiesConfig};
+use trusted_server_core::creative_opportunities::{CreativeOpportunitiesConfig, match_slots};
 use url::Url;
 
 /// The expected slots for a single page path, in configured slot order.

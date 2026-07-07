@@ -7,9 +7,9 @@ use edgezero_cli::args::{
 };
 use trusted_server_core::config::TrustedServerAppConfig;
 
-use crate::audit::{run_audit, AuditArgs};
-use crate::config_ad_templates::{run_ad_templates, AdTemplatesCommand};
-use crate::config_init::{run_config_init, ConfigInitArgs};
+use crate::commands::audit::{AuditArgs, run_audit};
+use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
+use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 
 #[derive(Debug, Parser)]
 #[command(name = "ts", about = "Trusted Server CLI")]
@@ -35,6 +35,9 @@ enum Command {
     Provision(ProvisionArgs),
     /// Serve the project locally through a target adapter.
     Serve(ServeArgs),
+    /// Local developer tools (e.g. the macOS-only production-hostname proxy).
+    #[command(subcommand)]
+    Dev(crate::commands::dev::DevCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,6 +88,7 @@ fn dispatch(args: Args) -> Result<(), String> {
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
         Command::Provision(args) => edgezero_cli::run_provision(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
+        Command::Dev(command) => crate::commands::dev::run(command),
     }
 }
 

@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use url::Url;
 
-use crate::audit::generate::collector::{CollectedGptSlot, CollectedRequest};
+use crate::commands::audit::generate::collector::{CollectedGptSlot, CollectedRequest};
 
 /// A hyphen-delimited hex hash *segment* (16+ hex chars bounded by `-` or end),
 /// e.g. the UUID GPT embeds in `ad-in_content-<uuid>-in_content-0`. Marks the

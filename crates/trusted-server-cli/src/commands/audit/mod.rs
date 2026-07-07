@@ -14,8 +14,8 @@ pub mod page;
 use clap::{Args, Subcommand};
 
 use crate::app_config::AppConfigArgs;
-use crate::audit::collector::BrowserOpts;
-use crate::audit::page::PageAuditArgs;
+use crate::commands::audit::collector::BrowserOpts;
+use crate::commands::audit::page::PageAuditArgs;
 
 /// Parses and validates an `http`/`https` URL, rejecting all other schemes.
 ///

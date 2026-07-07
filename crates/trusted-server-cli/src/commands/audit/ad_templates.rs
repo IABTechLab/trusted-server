@@ -9,23 +9,23 @@
 use std::io::{self, Write};
 
 use trusted_server_core::creative_opportunities::{
-    evaluate_ad_stack_gate, AdStackGateInput, CreativeOpportunitiesConfig,
+    AdStackGateInput, CreativeOpportunitiesConfig, evaluate_ad_stack_gate,
 };
 
 use crate::ad_templates::compare::{
-    compare_page_evidence, BrowserAdEvidence, EvidencePhase, ExtraEvidence, RuntimeGateSummary,
-    SlotEvidence, SlotResult, SlotStatus as CompareStatus,
+    BrowserAdEvidence, EvidencePhase, ExtraEvidence, RuntimeGateSummary, SlotEvidence, SlotResult,
+    SlotStatus as CompareStatus, compare_page_evidence,
 };
-use crate::ad_templates::expected::{expected_slots_for_path, normalize_path_or_url, ExpectedSlot};
+use crate::ad_templates::expected::{ExpectedSlot, expected_slots_for_path, normalize_path_or_url};
 use crate::ad_templates::output::{
     ConfiguredJson, EvidencePhaseJson, ExtraEvidenceJson, FormatJson, GateState, Gates,
     GptEvidenceJson, PageJson, RuntimeAdStackExpectedJson, SlotEvidenceJson, SlotJson, SlotStatus,
     VerificationReport, Warning,
 };
-use crate::audit::collector::{
-    build_ad_template_init_script, AdTemplateCollectorConfig, AuditCollector, BrowserCollectRequest,
+use crate::commands::audit::AuditAdTemplatesVerifyArgs;
+use crate::commands::audit::collector::{
+    AdTemplateCollectorConfig, AuditCollector, BrowserCollectRequest, build_ad_template_init_script,
 };
-use crate::audit::AuditAdTemplatesVerifyArgs;
 
 /// Verifies configured ad-template slots against live page evidence.
 ///
@@ -35,7 +35,7 @@ use crate::audit::AuditAdTemplatesVerifyArgs;
 /// surfaces a page-level error or a `--strict` failure (after writing output).
 pub(crate) fn run_verify(args: &AuditAdTemplatesVerifyArgs) -> Result<(), String> {
     let loaded = crate::app_config::load_settings(&args.config)?;
-    let collector = crate::audit::browser::BrowserCollector::from_opts(&args.browser);
+    let collector = crate::commands::audit::browser::BrowserCollector::from_opts(&args.browser);
     let report = build_report(
         &collector,
         loaded.settings.creative_opportunities.as_ref(),
@@ -142,7 +142,7 @@ fn build_init_script(creative: Option<&CreativeOpportunitiesConfig>) -> Option<S
 /// the page would fail `--strict`.
 fn build_page(
     requested: &url::Url,
-    collected: &crate::audit::collector::CollectedPage,
+    collected: &crate::commands::audit::collector::CollectedPage,
     creative: Option<&CreativeOpportunitiesConfig>,
     auction_enabled: bool,
 ) -> (PageJson, bool) {
@@ -372,7 +372,7 @@ mod tests {
 
     use super::*;
     use crate::ad_templates::compare::{DomEvidence, GptSlotEvidence};
-    use crate::audit::collector::CollectedPage;
+    use crate::commands::audit::collector::CollectedPage;
 
     struct FakeCollector {
         pages: HashMap<String, Result<CollectedPage, String>>,

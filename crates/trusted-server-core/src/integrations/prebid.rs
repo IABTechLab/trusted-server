@@ -871,6 +871,12 @@ fn non_empty_override_object(
 
 /// Copies browser headers to the outgoing Prebid Server request.
 ///
+/// The inbound `X-Forwarded-For` header is never copied: on the server-side
+/// publisher auction path `from` is the browser navigation request, so its
+/// XFF value is client-supplied and spoofable. Instead the header is
+/// synthesized from `client_ip` — the platform-attested client address —
+/// matching the trusted IP already sent in `OpenRTB` `device.ip`.
+///
 /// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
 /// stripped from the `Cookie` header since consent travels exclusively
 /// through the `OpenRTB` body.
@@ -878,17 +884,20 @@ fn copy_request_headers(
     from: &http::Request<EdgeBody>,
     to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
+    client_ip: Option<std::net::IpAddr>,
 ) {
-    let headers_to_copy = [
-        header::USER_AGENT,
-        header::HeaderName::from_static("x-forwarded-for"),
-        header::REFERER,
-        header::ACCEPT_LANGUAGE,
-    ];
+    let headers_to_copy = [header::USER_AGENT, header::REFERER, header::ACCEPT_LANGUAGE];
 
     for header_name in &headers_to_copy {
         if let Some(value) = from.headers().get(header_name) {
             to.headers_mut().insert(header_name, value.clone());
+        }
+    }
+
+    if let Some(ip) = client_ip {
+        if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+            to.headers_mut()
+                .insert(header::HeaderName::from_static("x-forwarded-for"), value);
         }
     }
 
@@ -1670,6 +1679,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             context.request,
             &mut pbs_req,
             self.config.consent_forwarding,
+            context.services.client_info().client_ip,
         );
 
         let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
@@ -5119,6 +5129,62 @@ set = { networkId = 42 }
             bid.cache_id.as_deref(),
             Some("cache-uuid-xyz"),
             "should extract cache UUID separately"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_replaces_client_supplied_xff_with_attested_ip() {
+        let from = http::Request::builder()
+            .uri("https://publisher.example.com/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let mut to = http::Request::builder()
+            .uri("https://pbs.example.com/openrtb2/auction")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        copy_request_headers(
+            &from,
+            &mut to,
+            ConsentForwardingMode::Both,
+            Some(std::net::IpAddr::from([203, 0, 113, 7])),
+        );
+
+        assert_eq!(
+            to.headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok()),
+            Some("203.0.113.7"),
+            "should synthesize XFF from the platform-attested client IP, not the spoofable inbound header"
+        );
+        assert_eq!(
+            to.headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("test-agent"),
+            "should still copy the browser User-Agent"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_omits_xff_without_attested_client_ip() {
+        let from = http::Request::builder()
+            .uri("https://publisher.example.com/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let mut to = http::Request::builder()
+            .uri("https://pbs.example.com/openrtb2/auction")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None);
+
+        assert!(
+            !to.headers().contains_key("x-forwarded-for"),
+            "should not forward the client-supplied XFF when no attested IP exists"
         );
     }
 }

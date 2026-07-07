@@ -14,49 +14,32 @@ name = "parity"
 path = "tests/parity.rs"
 harness = true
 
+[lints]
+workspace = true
+
 [dependencies]
-edgezero-core = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", default-features = false }
-serde_json = "1.0.149"
-trusted-server-core = { path = "../trusted-server-core" }
+edgezero-core = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
 
 [dev-dependencies]
-testcontainers = { version = "0.25", features = ["blocking"] }
-reqwest = { version = "0.12", features = ["blocking", "cookies", "json"] }
-scraper = "0.24.0"
-log = "0.4.33"
-error-stack = "0.6"
-derive_more = { version = "2.0", features = ["display"] }
-env_logger = "0.11"
-libc = "0.2"
-toml = "1.1"
-urlencoding = "2.1"
+axum = { workspace = true }
+bytes = { workspace = true }
+derive_more = { workspace = true }
+edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+env_logger = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "cookies"] }
+scraper = { workspace = true }
+testcontainers = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+toml = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
 trusted-server-adapter-spin = { path = "../trusted-server-adapter-spin" }
-# This crate is excluded from the workspace, so the edgezero git rev below
-# cannot come from [workspace.dependencies] and duplicates the pin in the
-# root Cargo.toml. Any edgezero rev bump must be applied in BOTH places, or
-# this crate compiles edgezero-core at a different rev than the adapters
-# under test and fails with a type mismatch.
-edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero", rev = "e4837232670aa2e704311018fd1a2dfbbd990c7d", features = ["axum"] }
-axum = "0.8.9"
-tower = { version = "0.4", features = ["util"] }
-tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros"] } # exact pin — keep in sync with workspace-resolved tokio version
-http = "1"
-http-body-util = "0.1"
-bytes = "1"
-
-[lints.clippy]
-unwrap_used = "deny"
-expect_used = "allow"
-panic = "deny"
-module_name_repetitions = "allow"
-must_use_candidate = "warn"
-doc_markdown = "warn"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-needless_pass_by_value = "warn"
-redundant_closure_for_method_calls = "warn"
-print_stdout = "warn"
-print_stderr = "warn"
-dbg_macro = "warn"
+urlencoding = { workspace = true }

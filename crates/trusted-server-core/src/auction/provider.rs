@@ -49,11 +49,13 @@ pub trait AuctionProvider: Send + Sync {
         response_time_ms: u64,
     ) -> Result<AuctionResponse, Report<TrustedServerError>>;
 
-    /// Parse the response with access to the original auction context.
+    /// Parse the response with access to the original auction request and context.
     ///
     /// Providers that need request-local metadata while transforming responses
-    /// can override this method. The default preserves the existing
-    /// response-only provider contract.
+    /// can override this method. `request` is the [`AuctionRequest`] the
+    /// orchestrator dispatched, so request-scoped data (e.g. slot ID mappings)
+    /// can be derived here instead of stored on the shared provider instance.
+    /// The default preserves the existing response-only provider contract.
     ///
     /// # Errors
     ///
@@ -62,9 +64,10 @@ pub trait AuctionProvider: Send + Sync {
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
+        request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-        let _ = context;
+        let _ = (request, context);
         self.parse_response(response, response_time_ms).await
     }
 

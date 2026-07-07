@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use crate::ad_templates::expected::normalize_path_or_url;
-use crate::app_config::{load_settings, AppConfigArgs};
+use crate::app_config::{AppConfigArgs, load_settings};
 use clap::{Args, Subcommand};
 use trusted_server_core::auction::types::MediaType;
 use trusted_server_core::creative_opportunities::{
-    evaluate_ad_stack_gate, match_slots, AdStackGateInput, CreativeOpportunityFormat,
-    CreativeOpportunitySlot, RuntimeAdStackExpected,
+    AdStackGateInput, CreativeOpportunityFormat, CreativeOpportunitySlot, RuntimeAdStackExpected,
+    evaluate_ad_stack_gate, match_slots,
 };
 
 #[derive(Debug, Subcommand)]
@@ -391,11 +391,7 @@ fn join_set(set: &BTreeSet<&str>) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }
 
 #[allow(

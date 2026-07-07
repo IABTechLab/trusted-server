@@ -5,10 +5,6 @@ inputs:
   origin-port:
     description: Fixed origin port baked into the WASM binary for integration tests.
     required: true
-  check-dependency-versions:
-    description: Run the integration dependency version consistency check.
-    required: false
-    default: "true"
   install-viceroy:
     description: Install the Viceroy binary used by integration tests.
     required: false
@@ -38,11 +34,6 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Check shared dependency versions
-      if: ${{ inputs.check-dependency-versions == 'true' }}
-      shell: bash
-      run: ./scripts/check-integration-dependency-versions.sh
-
     - name: Retrieve Rust version
       id: rust-version
       shell: bash

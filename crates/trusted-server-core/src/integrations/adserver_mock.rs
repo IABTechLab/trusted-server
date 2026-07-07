@@ -497,6 +497,7 @@ impl AuctionProvider for AdServerMockProvider {
         &self,
         response: PlatformResponse,
         response_time_ms: u64,
+        _request: &AuctionRequest,
         context: &AuctionContext<'_>,
     ) -> Result<AuctionResponse, Report<TrustedServerError>> {
         // Rebuild the SSP-bid lookup from the orchestrator-provided bidder
