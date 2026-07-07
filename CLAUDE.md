@@ -113,6 +113,7 @@ cargo fmt --all -- --check
 cargo clippy-fastly
 cargo clippy-axum
 cargo clippy-cloudflare
+cargo clippy-cloudflare-wasm
 cargo clippy-spin-native
 cargo clippy-spin-wasm
 
@@ -332,7 +333,7 @@ IntegrationRegistration::builder(ID)
 Every PR must pass:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-spin-native && cargo clippy-spin-wasm`
+2. `cargo clippy-fastly && cargo clippy-axum && cargo clippy-cloudflare && cargo clippy-cloudflare-wasm && cargo clippy-spin-native && cargo clippy-spin-wasm`
 3. `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo test-spin`
 4. `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity`
 5. JS build and test (`cd crates/trusted-server-js/lib && npx vitest run`)

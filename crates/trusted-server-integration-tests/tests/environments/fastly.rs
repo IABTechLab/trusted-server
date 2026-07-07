@@ -10,8 +10,7 @@ use std::process::{Child, Command, Stdio};
 ///
 /// Spawns a `viceroy` child process with the WASM binary and the
 /// generated Viceroy config (runtime resources plus Trusted Server app-config
-/// blob). Legacy-path settings are still baked into the WASM binary at build
-/// time; the EdgeZero-path settings come from the generated `app_config` blob.
+/// blob).
 pub struct FastlyViceroy;
 
 impl RuntimeEnvironment for FastlyViceroy {
@@ -75,9 +74,9 @@ impl FastlyViceroy {
     /// secret stores) plus generated test application config stores.
     ///
     /// Honors the `VICEROY_CONFIG_PATH` environment variable so CI jobs can
-    /// point the same WASM binary at generated legacy or `EdgeZero` configs. This
-    /// mirrors the browser harness's `global-setup.ts`, which reads the same
-    /// variable. Falls back to the local generated legacy config path when unset.
+    /// select a generated config. This mirrors the browser harness's
+    /// `global-setup.ts`, which reads the same variable. Falls back to the local
+    /// generated config path when unset.
     fn viceroy_config_path(&self) -> std::path::PathBuf {
         if let Ok(path) = std::env::var("VICEROY_CONFIG_PATH")
             && !path.is_empty()
@@ -85,7 +84,7 @@ impl FastlyViceroy {
             return std::path::PathBuf::from(path);
         }
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/integration-test-artifacts/configs/viceroy-legacy.toml")
+            .join("../../target/integration-test-artifacts/configs/viceroy.toml")
     }
 }
 

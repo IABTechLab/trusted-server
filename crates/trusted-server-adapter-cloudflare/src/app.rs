@@ -5,7 +5,7 @@ use std::sync::Arc;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::auction::endpoints::handle_auction;
@@ -25,8 +25,7 @@ use trusted_server_core::publisher::{
     handle_publisher_request, handle_tsjs_dynamic, page_bids_preflight_denied,
 };
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 
@@ -222,6 +221,20 @@ pub(crate) fn http_error(report: &Report<TrustedServerError>) -> Response {
     let body = edgezero_core::body::Body::from(format!("{}\n", root_error.user_message()));
     let mut response = Response::new(body);
     *response.status_mut() = root_error.status_code();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn admin_key_management_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin key management is not supported on Cloudflare Workers.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
@@ -442,18 +455,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // letting them fall through would forward the caller's
             // `Authorization` header and key-management payload to the origin,
             // leaking admin credentials.
-            .post(
-                "/_ts/admin/keys/rotate",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_rotate_key(&s.settings, &services, req)
-                }),
-            )
-            .post(
-                "/_ts/admin/keys/deactivate",
-                make_handler(Arc::clone(&state), |s, services, req| async move {
-                    handle_deactivate_key(&s.settings, &services, req)
-                }),
-            )
+            .post("/_ts/admin/keys/rotate", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_key_management_not_supported())
+            })
+            .post("/_ts/admin/keys/deactivate", |_ctx: RequestContext| async {
+                Ok::<Response, EdgeError>(admin_key_management_not_supported())
+            })
             .post(
                 "/auction",
                 make_handler(Arc::clone(&state), |s, services, req| async move {

@@ -49,9 +49,9 @@ This script:
 
 # Browser — single framework after building WASM/images and generating configs
 cd crates/trusted-server-integration-tests/browser
-VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy.toml \
 TEST_FRAMEWORK=nextjs npx playwright test
-VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy.toml \
 TEST_FRAMEWORK=wordpress npx playwright test
 ```
 
@@ -93,7 +93,7 @@ config is kept as readable TOML in
 `fixtures/configs/trusted-server.integration.toml` and converted into an
 EdgeZero `BlobEnvelope` at test setup time.
 
-Generate both legacy and EdgeZero Viceroy configs manually with:
+Generate the post-cutover Viceroy config manually with:
 
 ```bash
 ARTIFACTS_DIR=target/integration-test-artifacts \
@@ -101,15 +101,14 @@ INTEGRATION_ORIGIN_PORT=8888 \
 ./scripts/generate-integration-viceroy-configs.sh
 ```
 
-Generated outputs:
+Generated output:
 
 | File | Purpose |
 |---|---|
-| `target/integration-test-artifacts/configs/viceroy-legacy.toml` | Standard legacy-entry integration and browser tests (`edgezero_enabled = "false"`) |
-| `target/integration-test-artifacts/configs/viceroy-edgezero.toml` | EdgeZero EC lifecycle job (`edgezero_enabled = "true"`) |
+| `target/integration-test-artifacts/configs/viceroy.toml` | Fastly integration, EC lifecycle, and browser tests |
 
-Set `VICEROY_CONFIG_PATH` to one of those generated files when invoking
-`cargo test` or Playwright directly.
+Set `VICEROY_CONFIG_PATH` to the generated file when invoking `cargo test` or
+Playwright directly.
 
 ## Test scenarios
 
