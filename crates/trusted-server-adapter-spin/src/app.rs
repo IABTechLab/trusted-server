@@ -22,8 +22,7 @@ use trusted_server_core::publisher::{
     PublisherResponse, buffer_publisher_response, handle_publisher_request, handle_tsjs_dynamic,
 };
 use trusted_server_core::request_signing::{
-    handle_deactivate_key, handle_rotate_key, handle_trusted_server_discovery,
-    handle_verify_signature,
+    handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
 
@@ -308,6 +307,20 @@ fn health_response() -> Response {
     resp
 }
 
+fn admin_key_management_not_supported() -> Response {
+    let body = edgezero_core::body::Body::from(
+        "Admin key management is not supported on Fermyon Spin.\n\
+         Use the Fastly adapter (via Viceroy or deployed) to rotate or deactivate keys.\n",
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -456,28 +469,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
-        // /_ts/admin/keys/rotate
-        let s = Arc::clone(&state);
-        let rotate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_rotate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
-        };
-
-        // /_ts/admin/keys/deactivate
-        let s = Arc::clone(&state);
-        let deactivate_handler = move |ctx: RequestContext| {
-            let s = Arc::clone(&s);
-            async move {
-                let services = build_runtime_services(&ctx);
-                let req = ctx.into_request();
-                Ok(handle_deactivate_key(&s.settings, &services, req)
-                    .unwrap_or_else(|e| http_error(&e)))
-            }
+        let admin_not_supported_handler = |_ctx: RequestContext| async {
+            Ok::<Response, EdgeError>(admin_key_management_not_supported())
         };
 
         // /auction
@@ -643,8 +636,8 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             // handler regex `^/_ts/admin` does not match them, and letting them
             // fall through to the publisher fallback would forward admin
             // credentials and key-management payloads to the origin.
-            .post("/_ts/admin/keys/rotate", rotate_handler)
-            .post("/_ts/admin/keys/deactivate", deactivate_handler)
+            .post("/_ts/admin/keys/rotate", admin_not_supported_handler)
+            .post("/_ts/admin/keys/deactivate", admin_not_supported_handler)
             .post("/auction", auction_handler)
             .get("/first-party/proxy", fp_proxy_handler)
             .get("/first-party/click", fp_click_handler)

@@ -5040,33 +5040,33 @@ origin_host_header_overide = "www.example.com""#,
     }
 
     /// Verifies that [`Settings::ADMIN_ENDPOINTS`] stays in sync with the
-    /// admin route table in `crates/trusted-server-adapter-fastly/src/main.rs`.
+    /// admin route table in `crates/trusted-server-adapter-fastly/src/app.rs`.
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
     #[test]
     fn admin_endpoints_match_fastly_router() {
-        let router_source = include_str!("../../trusted-server-adapter-fastly/src/main.rs");
+        let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");
 
         for endpoint in Settings::ADMIN_ENDPOINTS {
             assert!(
                 router_source.contains(endpoint),
                 "ADMIN_ENDPOINTS lists \"{endpoint}\" but it was not found in \
-                 crates/trusted-server-adapter-fastly/src/main.rs — remove it from ADMIN_ENDPOINTS or \
+                 crates/trusted-server-adapter-fastly/src/app.rs — remove it from ADMIN_ENDPOINTS or \
                  add the route back to the router"
             );
         }
 
         // Also verify we haven't missed any admin routes in the router.
-        // Best-effort: only detects string-literal routes in standard match-arm
-        // format. If you define admin routes differently (e.g. via constants or
-        // non-standard formatting), add them to ADMIN_ENDPOINTS manually.
+        // Best-effort: only detects string-literal routes in the NamedRoute
+        // table. If you define admin routes differently (e.g. via constants),
+        // add them to ADMIN_ENDPOINTS manually.
         let admin_routes_in_router: Vec<&str> = router_source
             .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
-                // Match arms look like: (Method::POST, "/_ts/admin/...") => ...
-                if trimmed.starts_with('(') && trimmed.contains("\"/_ts/admin/") {
+                // Route entries look like: path: "/_ts/admin/...",
+                if trimmed.starts_with("path: ") && trimmed.contains("\"/_ts/admin/") {
                     let start = trimmed.find("\"/_ts/admin/")?;
                     let rest = &trimmed[start + 1..];
                     let end = rest.find('"')?;

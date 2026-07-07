@@ -10,11 +10,12 @@
 //! Unsupported `Content-Encoding` values must bypass rewriting entirely. The
 //! streaming processor treats unknown encodings as identity, so publisher code
 //! must gate them out before the body enters the rewrite pipeline.
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::time::Duration;
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
+use futures::{Stream, StreamExt};
 use http::{header, HeaderValue, Method, Request, Response, StatusCode, Uri};
 
 use crate::consent::{allows_ec_creation, build_consent_context, ConsentPipelineInput};
@@ -32,8 +33,54 @@ use crate::streaming_replacer::create_url_replacer;
 const SUPPORTED_ENCODING_VALUES: [&str; 3] = ["gzip", "deflate", "br"];
 const DEFAULT_PUBLISHER_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn body_as_reader(body: EdgeBody) -> std::io::Cursor<bytes::Bytes> {
-    std::io::Cursor::new(body.into_bytes().unwrap_or_default())
+struct StreamingBodyReader<S> {
+    stream: S,
+    current: Cursor<bytes::Bytes>,
+}
+
+impl<S> StreamingBodyReader<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            current: Cursor::new(bytes::Bytes::new()),
+        }
+    }
+}
+
+impl<S, E> Read for StreamingBodyReader<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let bytes_read = self.current.read(output)?;
+            if bytes_read > 0 {
+                return Ok(bytes_read);
+            }
+
+            match futures::executor::block_on(self.stream.next()) {
+                Some(Ok(chunk)) => self.current = Cursor::new(chunk),
+                Some(Err(error)) => return Err(std::io::Error::other(error.to_string())),
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
+fn body_as_reader(body: EdgeBody) -> Box<dyn Read> {
+    if body.is_stream() {
+        let stream = body
+            .into_stream()
+            .expect("should contain a stream after checking the body variant");
+        Box::new(StreamingBodyReader::new(stream))
+    } else {
+        Box::new(Cursor::new(body.into_bytes().unwrap_or_default()))
+    }
 }
 
 fn not_found_response() -> Response<EdgeBody> {
@@ -568,7 +615,39 @@ pub async fn handle_publisher_request(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     services: &RuntimeServices,
+    req: Request<EdgeBody>,
+) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    handle_publisher_request_with_mode(settings, integration_registry, services, req, false).await
+}
+
+/// Proxies a publisher request while asking the platform adapter to preserve
+/// the origin response body as a stream when full-document HTML
+/// post-processing is not required.
+///
+/// Fastly uses this path so processable responses can be rewritten directly
+/// into the client stream without first materializing the origin body in the
+/// Wasm heap. Adapters without streaming response support should call
+/// [`handle_publisher_request`] instead.
+///
+/// # Errors
+///
+/// Returns a [`TrustedServerError`] if the proxy request fails or the origin
+/// backend is unreachable.
+pub async fn handle_streaming_publisher_request(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
+    req: Request<EdgeBody>,
+) -> Result<PublisherResponse, Report<TrustedServerError>> {
+    handle_publisher_request_with_mode(settings, integration_registry, services, req, true).await
+}
+
+async fn handle_publisher_request_with_mode(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
     mut req: Request<EdgeBody>,
+    stream_origin_response: bool,
 ) -> Result<PublisherResponse, Report<TrustedServerError>> {
     log::debug!("Proxying request to publisher_origin");
 
@@ -687,9 +766,15 @@ pub async fn handle_publisher_request(
         })?,
     );
 
+    let has_post_processors = integration_registry.has_html_post_processors();
+    let mut platform_request = PlatformHttpRequest::new(req, backend_name);
+    if stream_origin_response {
+        platform_request = platform_request.with_stream_response();
+    }
+
     let mut response = services
         .http_client()
-        .send(PlatformHttpRequest::new(req, backend_name))
+        .send(platform_request)
         .await
         .change_context(TrustedServerError::Proxy {
             message: "Failed to proxy request to origin".to_string(),
@@ -728,8 +813,6 @@ pub async fn handle_publisher_request(
         .map(|h| h.to_str().unwrap_or_default())
         .unwrap_or_default()
         .to_lowercase();
-    let has_post_processors = integration_registry.has_html_post_processors();
-
     let route = classify_response_route(
         status,
         &content_type,
@@ -799,6 +882,22 @@ pub async fn handle_publisher_request(
             );
 
             let body = std::mem::replace(response.body_mut(), EdgeBody::empty());
+            let body = if body.is_stream() {
+                let bytes = body
+                    .into_bytes_bounded(settings.publisher.max_buffered_body_bytes)
+                    .await
+                    .map_err(|error| {
+                        Report::new(TrustedServerError::Proxy {
+                            message:
+                                "Failed to buffer publisher response for full-document processing"
+                                    .to_string(),
+                        })
+                        .attach(format!("stream collection failed: {error:?}"))
+                    })?;
+                EdgeBody::from_bytes(bytes)
+            } else {
+                body
+            };
             let params = ProcessResponseParams {
                 content_encoding: &content_encoding,
                 origin_host: &origin_host,
@@ -901,6 +1000,10 @@ mod tests {
     use crate::platform::test_support::{
         build_services_with_http_client, noop_services, StubHttpClient,
     };
+    use crate::platform::{
+        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult,
+    };
     use crate::test_support::tests::create_test_settings;
     use edgezero_core::body::Body as EdgeBody;
     use http::{header, Method, Request as HttpRequest, StatusCode};
@@ -912,6 +1015,44 @@ mod tests {
             .uri(uri)
             .body(EdgeBody::empty())
             .expect("should build test request")
+    }
+
+    struct StreamingPublisherHttpClient;
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for StreamingPublisherHttpClient {
+        async fn send(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            assert!(
+                request.stream_response,
+                "streaming publisher requests should preserve the origin stream"
+            );
+            let response = edgezero_core::http::response_builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html")
+                .body(EdgeBody::stream(futures::stream::iter([
+                    bytes::Bytes::from_static(b"<html><body><a href=\"https://origin."),
+                    bytes::Bytes::from_static(b"test-publisher.com/page\">link</a></body></html>"),
+                ])))
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            Ok(PlatformResponse::new(response))
+        }
+
+        async fn send_async(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn select(
+            &self,
+            _pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
     }
 
     #[test]
@@ -1832,6 +1973,82 @@ mod tests {
             !decompressed.contains("origin.example.com"),
             "should not contain original host. Got: {decompressed}"
         );
+    }
+
+    #[test]
+    fn stream_publisher_body_processes_chunked_input() {
+        let settings = create_test_settings();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let body = EdgeBody::stream(futures::stream::iter([
+            bytes::Bytes::from_static(b"https://origin."),
+            bytes::Bytes::from_static(b"example.com/page"),
+        ]));
+        let params = OwnedProcessResponseParams {
+            content_encoding: String::new(),
+            origin_host: "origin.example.com".to_string(),
+            origin_url: "https://origin.example.com".to_string(),
+            request_host: "proxy.example.com".to_string(),
+            request_scheme: "https".to_string(),
+            content_type: "text/plain".to_string(),
+        };
+
+        let mut output = Vec::new();
+        stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect("should process a chunked publisher body");
+
+        assert_eq!(
+            std::str::from_utf8(&output).expect("output should be UTF-8"),
+            "https://proxy.example.com/page"
+        );
+    }
+
+    #[test]
+    fn streaming_publisher_request_buffers_only_full_document_processing() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "nextjs",
+                    &serde_json::json!({
+                        "enabled": true,
+                        "rewrite_attributes": ["href", "link", "url"],
+                    }),
+                )
+                .expect("should update nextjs config");
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            assert!(
+                registry.has_html_post_processors(),
+                "nextjs should require full-document HTML processing"
+            );
+            let services = build_services_with_http_client(Arc::new(StreamingPublisherHttpClient)
+                as Arc<dyn crate::platform::PlatformHttpClient>);
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let publisher_response =
+                handle_streaming_publisher_request(&settings, &registry, &services, request)
+                    .await
+                    .expect("should process streamed HTML requiring a full document");
+            let response = match publisher_response {
+                PublisherResponse::Buffered(response) => response,
+                _ => panic!("HTML with post-processors should return a buffered response"),
+            };
+            let output = response.body().as_bytes().unwrap_or_default();
+
+            assert!(
+                std::str::from_utf8(output)
+                    .expect("output should be UTF-8")
+                    .contains("publisher.example"),
+                "buffered post-processing should rewrite the streamed origin URL"
+            );
+        });
     }
 
     /// Empty origin body on the streaming route must produce no output
