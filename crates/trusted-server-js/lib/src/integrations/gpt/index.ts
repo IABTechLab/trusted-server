@@ -713,10 +713,15 @@ export function installSpaAuctionHook(): void {
   // can be called with the current URL, so guard every entry point against
   // re-requesting impressions for a path we already loaded.
   let currentPath = location.pathname;
+  // Last path whose slots/bids were actually applied — the initial SSR page
+  // counts. A failed navigation rolls `currentPath` back to this rather than to
+  // the immediately-previous committed value: on rapid A→B where A was aborted
+  // mid-flight and B then fails, rolling back to A (never loaded) would strand
+  // it behind the no-op guard, so we roll back to the last applied route instead.
+  let lastAppliedPath = location.pathname;
 
   async function onNavigate(path: string): Promise<void> {
     if (path === currentPath) return;
-    const previousPath = currentPath;
     currentPath = path;
     inflight?.abort();
     const controller = new AbortController();
@@ -737,7 +742,7 @@ export function installSpaAuctionHook(): void {
         // committed path back so a later navigation here retries instead of
         // being skipped by the no-op guard at the top. Only roll back when no
         // newer navigation has already advanced currentPath.
-        if (inflight === controller) currentPath = previousPath;
+        if (inflight === controller) currentPath = lastAppliedPath;
         return;
       }
       const data = (await res.json()) as PageBidsResponse;
@@ -748,6 +753,9 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      // This route is now the committed, loaded state — a later failed
+      // navigation rolls back here, and a return trip no-ops correctly.
+      lastAppliedPath = path;
       // An empty page-bids response (auction kill switch or consent gate) carries
       // no TS slots. Only run adInit() when there are slots to apply or prior TS
       // state to sweep — otherwise a consent-denied or kill-switched navigation
@@ -761,7 +769,7 @@ export function installSpaAuctionHook(): void {
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (inflight === controller) currentPath = previousPath;
+      if (inflight === controller) currentPath = lastAppliedPath;
       log.warn('SPA auction hook: fetch failed', err);
     }
   }

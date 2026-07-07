@@ -110,7 +110,7 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    // Reject oversized bodies before any allocation. The Content-Length
+    // Reject oversized bodies before core buffers/parses them. The Content-Length
     // pre-check stops well-behaved clients early; the post-read check defends
     // against clients that lie about (or omit) the header.
     let content_length_exceeded = req

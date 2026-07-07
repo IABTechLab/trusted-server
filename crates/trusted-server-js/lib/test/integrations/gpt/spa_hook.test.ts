@@ -353,6 +353,59 @@ describe('installSpaAuctionHook', () => {
     expect(adInit).toHaveBeenCalledTimes(1);
   });
 
+  it('does not strand a path that was aborted mid-flight then failed on the next nav', async () => {
+    // Rapid A→B where A is aborted mid-flight and B then fails must roll
+    // `currentPath` back to the last *applied* path (here the initial route),
+    // not to A. Rolling back to A — which never loaded — would leave it behind
+    // the no-op guard so a later real navigation to A never re-fetches.
+    document.body.innerHTML = '<div id="div-a"></div>';
+    let resolveA: ((value: unknown) => void) | undefined;
+    fetchStub
+      // A: still in flight when B starts (aborted, never settles on its own).
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveA = resolve;
+          })
+      )
+      // B: fails.
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      // A retried: succeeds.
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          slots: [{ id: 'a', div_id: 'div-a' }],
+          bids: { a: { hb_pb: '1.00' } },
+        }),
+      });
+    const { installSpaAuctionHook } = await importGptModule();
+    installSpaAuctionHook();
+    const ts = (window as TestWindow).tsjs!;
+    const adInit = vi.fn();
+    ts.adInit = adInit;
+
+    // A starts (left in flight), then B aborts A and fails.
+    history.pushState({}, '', '/a');
+    history.pushState({}, '', '/b');
+    await flushAsync();
+    expect(ts.adSlots).toBeUndefined();
+
+    // Navigate back to /a. With the rollback keyed to the last applied path
+    // (the initial route) instead of B's previous path (/a), this is NOT
+    // swallowed by the no-op guard and re-fetches.
+    history.pushState({}, '', '/a');
+    await flushAsync();
+
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    expect(ts.adSlots).toEqual([{ id: 'a', div_id: 'div-a' }]);
+    expect(adInit).toHaveBeenCalledTimes(1);
+
+    // The original aborted A fetch resolving late must not clobber the retry.
+    resolveA?.({ ok: true, json: async () => ({ slots: [{ id: 'stale' }], bids: {} }) });
+    await flushAsync();
+    expect(ts.adSlots).toEqual([{ id: 'a', div_id: 'div-a' }]);
+  });
+
   it('is idempotent — repeated install calls do not double-fetch a navigation', async () => {
     fetchStub.mockResolvedValue({
       ok: true,

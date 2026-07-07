@@ -243,8 +243,7 @@ fn is_hop_by_hop_response_header(name: &str, connection_tokens: &[String]) -> bo
         "upgrade",
     ];
     let lower = name.to_ascii_lowercase();
-    HOP_BY_HOP.iter().any(|header| *header == lower)
-        || connection_tokens.iter().any(|token| *token == lower)
+    HOP_BY_HOP.iter().any(|header| *header == lower) || connection_tokens.contains(&lower)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -339,13 +338,12 @@ impl CloudflareHttpClient {
             .ok()
             .flatten()
             .and_then(|v| v.trim().parse::<usize>().ok())
+            && claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES
         {
-            if claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES {
-                return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                    "origin Content-Length {claimed_len} exceeds \
-                     {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
-                )));
-            }
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "origin Content-Length {claimed_len} exceeds \
+                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+            )));
         }
 
         let connection_tokens = response_connection_tokens(&resp);

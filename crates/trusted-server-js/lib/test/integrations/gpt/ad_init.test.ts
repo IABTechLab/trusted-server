@@ -986,6 +986,59 @@ describe('installTsRenderBridge', () => {
     beaconSpy.mockRestore();
   });
 
+  it('fetches PBS Cache once when two same-adId messages race before the fetch resolves', async () => {
+    // Concurrent render double-fire guard: two 'Prebid Request' messages for the
+    // same adId can arrive before the first cache fetch settles. The in-flight
+    // `renderingAdIds` gate must collapse them to a single fetch — the persistent
+    // firedBeacons dedup only engages after a fetch resolves, so it cannot stop
+    // the second fetch on its own. Deferring the fetch keeps both messages in the
+    // window where only the in-flight gate can prevent the duplicate.
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    const mockAd = '<div>Test Creative</div>';
+    let resolveFetch: (value: Response) => void = () => {};
+    fetchStub.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      })
+    );
+
+    const bridgeListener = await captureBridgeListener();
+
+    const stopSpy = vi.fn();
+    const portMessages: string[] = [];
+    const fakePort = { postMessage: (s: string) => portMessages.push(s) };
+    const source = createTrustedSlotIframe();
+
+    const dispatch = (): unknown =>
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'test-cache-uuid' }),
+          ports: [fakePort],
+          source,
+          stopImmediatePropagation: stopSpy,
+        }) as unknown as MessageEvent
+      );
+
+    // Both messages dispatched before the deferred fetch resolves.
+    dispatch();
+    dispatch();
+
+    // The second message hit the in-flight gate — only one fetch launched.
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+
+    // Resolve the single fetch and flush its .then chain.
+    resolveFetch({ ok: true, text: () => Promise.resolve(mockAd) } as Response);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(portMessages).toHaveLength(1);
+    // A single render still fires both win and billing beacons exactly once.
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/win');
+    expect(beaconSpy).toHaveBeenCalledWith('https://ssp.example/bill');
+    expect(beaconSpy).toHaveBeenCalledTimes(2);
+    beaconSpy.mockRestore();
+  });
+
   it('responds with adm without fetching PBS Cache when debug adm is available', async () => {
     const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
     const debugAdm = '<div>Debug Creative</div>';

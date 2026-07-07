@@ -3473,6 +3473,38 @@ server_url = "https://prebid.example"
     }
 
     #[test]
+    fn to_openrtb_drops_imp_when_all_banner_formats_exceed_i32_max() {
+        // The build-time bound: every banner format's u32 dimensions pass through
+        // `to_openrtb_i32`, which omits any value above i32::MAX. When a slot's
+        // only format is out of range (here u32::MAX), no valid formats remain, so
+        // the whole imp must be dropped rather than emitted with an empty format
+        // list — a sizeless imp is unbiddable and would only waste an SSP call.
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.slots[0].formats = vec![AdFormat {
+            media_type: MediaType::Banner,
+            width: u32::MAX,
+            height: u32::MAX,
+        }];
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert!(
+            openrtb.imp.is_empty(),
+            "should drop the imp entirely when every banner format exceeds i32::MAX"
+        );
+    }
+
+    #[test]
     fn to_openrtb_sets_site_ref_from_referer_header() {
         let provider = PrebidAuctionProvider::new(base_config());
         let auction_request = create_test_auction_request();
