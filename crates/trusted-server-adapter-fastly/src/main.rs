@@ -34,6 +34,7 @@ mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
+mod tinybird;
 
 use crate::app::{load_settings_from_config_store, EcFinalizeState, TrustedServerApp};
 use crate::ec_kv::FastlyEcKvStore;

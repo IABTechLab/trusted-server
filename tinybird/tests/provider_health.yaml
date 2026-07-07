@@ -1,0 +1,13 @@
+- name: aps_nobid_rate
+  description: No-bid provider rows compute request and no-bid rates without multiplying by summary rows.
+  expected_http_status: 200
+  parameters: start=2026-06-23%2012:00:00&end=2026-06-23%2012:01:00&publisher=test-publisher.example&source=auction_api&provider_filter=aps
+  expected_result: |
+    {"minute":"2026-06-23 12:00:00","publisher_domain":"test-publisher.example","auction_source":"auction_api","provider":"aps","provider_role":"bidder","requests":1,"successes":0,"nobids":1,"errors":0,"timeouts":0,"abandonments":0,"parsed_bids":0,"nobid_rate":1,"error_rate":0,"abandonment_rate":0}
+
+- name: abandoned_initial_navigation
+  description: Abandoned provider calls are visible for wasted dispatch observability.
+  expected_http_status: 200
+  parameters: start=2026-06-23%2012:01:00&end=2026-06-23%2012:02:00&publisher=test-publisher.example&source=initial_navigation&provider_filter=prebid
+  expected_result: |
+    {"minute":"2026-06-23 12:01:00","publisher_domain":"test-publisher.example","auction_source":"initial_navigation","provider":"prebid","provider_role":"bidder","requests":1,"successes":0,"nobids":0,"errors":0,"timeouts":0,"abandonments":1,"parsed_bids":0,"nobid_rate":0,"error_rate":0,"abandonment_rate":1}

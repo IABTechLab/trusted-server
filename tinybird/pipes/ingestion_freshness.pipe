@@ -1,0 +1,18 @@
+DESCRIPTION >
+  Published ingestion freshness endpoint for dashboard health panels.
+
+NODE endpoint
+SQL >
+  SELECT
+    publisher_domain,
+    auction_source,
+    max(event_ts) AS latest_event_ts,
+    dateDiff('second', max(event_ts), now()) AS freshness_lag_seconds,
+    count() AS raw_rows
+  FROM auction_events_raw
+  WHERE event_ts >= now() - INTERVAL 1 DAY
+    AND ({{String(publisher, '')}} = '' OR publisher_domain = {{String(publisher, '')}})
+  GROUP BY publisher_domain, auction_source
+  ORDER BY latest_event_ts DESC
+
+TYPE endpoint
