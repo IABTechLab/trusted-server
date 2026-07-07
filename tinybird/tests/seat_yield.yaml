@@ -1,0 +1,6 @@
+- name: prebid_kargo_winning_cpm
+  description: Seat yield exposes priced bid samples, canonical wins, and decoded winning CPM quantiles.
+  expected_http_status: 200
+  parameters: start=2026-06-23%2012:00:00&end=2026-06-23%2012:01:00&publisher=test-publisher.example&source=auction_api&provider_filter=prebid
+  expected_result: |
+    {"minute":"2026-06-23 12:00:00","publisher_domain":"test-publisher.example","auction_source":"auction_api","provider":"prebid","seat":"kargo","priced_bid_samples":1,"wins":1,"win_rate":1,"winning_cpm_quantiles":[1.25,1.25,1.25]}

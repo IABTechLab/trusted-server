@@ -1,0 +1,37 @@
+DESCRIPTION >
+  Published auction summary endpoint for Grafana. Data is directional and best effort.
+
+NODE endpoint
+SQL >
+  SELECT
+    minute,
+    publisher_domain,
+    auction_source,
+    terminal_status,
+    terminal_reason,
+    auctions,
+    requested_slots,
+    winning_bids,
+    if(requested_slots = 0, 0, toFloat64(winning_bids) / requested_slots) AS fill_rate,
+    total_time_ms_quantiles
+  FROM (
+    SELECT
+      minute,
+      publisher_domain,
+      auction_source,
+      terminal_status,
+      terminal_reason,
+      countMerge(auctions) AS auctions,
+      sumMerge(requested_slots) AS requested_slots,
+      sumMerge(winning_bids) AS winning_bids,
+      quantilesMerge(0.5, 0.95, 0.99)(total_time_quantiles) AS total_time_ms_quantiles
+    FROM auction_overview_rollup
+    WHERE minute >= parseDateTimeBestEffort({{DateTime(start, '2026-01-01 00:00:00')}})
+      AND minute < parseDateTimeBestEffort({{DateTime(end, '2027-01-01 00:00:00')}})
+      AND ({{String(publisher, '')}} = '' OR publisher_domain = {{String(publisher, '')}})
+      AND ({{String(source, '')}} = '' OR auction_source = {{String(source, '')}})
+    GROUP BY minute, publisher_domain, auction_source, terminal_status, terminal_reason
+  )
+  ORDER BY minute ASC
+
+TYPE endpoint

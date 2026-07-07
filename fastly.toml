@@ -53,6 +53,14 @@ build = """
             key = "api_key"
             env = "FASTLY_KEY"
 
+        [[local_server.secret_stores.ts_secrets]]
+            key = "tinybird_auction_append_token"
+            data = "test-tinybird-auction-append-token"
+
+        [[local_server.secret_stores.ts_secrets]]
+            key = "tinybird_access_append_token"
+            data = "test-tinybird-access-append-token"
+
     [local_server.config_stores]
         [local_server.config_stores.trusted_server_config]
             format = "inline-toml"

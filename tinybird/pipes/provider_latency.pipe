@@ -1,0 +1,23 @@
+DESCRIPTION >
+  Published provider latency quantile endpoint for Grafana.
+
+NODE endpoint
+SQL >
+  SELECT
+    minute,
+    publisher_domain,
+    auction_source,
+    provider,
+    provider_role,
+    countMerge(requests) AS sample_count,
+    quantilesMerge(0.5, 0.95, 0.99)(latency_quantiles) AS provider_response_time_ms_quantiles
+  FROM auction_provider_stats_rollup
+  WHERE minute >= parseDateTimeBestEffort({{DateTime(start, '2026-01-01 00:00:00')}})
+    AND minute < parseDateTimeBestEffort({{DateTime(end, '2027-01-01 00:00:00')}})
+    AND ({{String(publisher, '')}} = '' OR publisher_domain = {{String(publisher, '')}})
+    AND ({{String(source, '')}} = '' OR auction_source = {{String(source, '')}})
+    AND ({{String(provider_filter, '')}} = '' OR provider = {{String(provider_filter, '')}})
+  GROUP BY minute, publisher_domain, auction_source, provider, provider_role
+  ORDER BY minute ASC
+
+TYPE endpoint

@@ -1,0 +1,36 @@
+DESCRIPTION >
+  Published seat yield endpoint for Grafana. CPM is directional and excludes null-price bids.
+
+NODE endpoint
+SQL >
+  SELECT
+    minute,
+    publisher_domain,
+    auction_source,
+    provider,
+    seat,
+    priced_bid_samples,
+    wins,
+    if(priced_bid_samples = 0, 0, toFloat64(wins) / priced_bid_samples) AS win_rate,
+    winning_cpm_quantiles
+  FROM (
+    SELECT
+      minute,
+      publisher_domain,
+      auction_source,
+      provider,
+      seat,
+      countMerge(bids) AS priced_bid_samples,
+      sumMerge(wins) AS wins,
+      quantilesMerge(0.5, 0.95, 0.99)(winning_cpm_quantiles) AS winning_cpm_quantiles
+    FROM auction_bid_stats_rollup
+    WHERE minute >= parseDateTimeBestEffort({{DateTime(start, '2026-01-01 00:00:00')}})
+      AND minute < parseDateTimeBestEffort({{DateTime(end, '2027-01-01 00:00:00')}})
+      AND ({{String(publisher, '')}} = '' OR publisher_domain = {{String(publisher, '')}})
+      AND ({{String(source, '')}} = '' OR auction_source = {{String(source, '')}})
+      AND ({{String(provider_filter, '')}} = '' OR provider = {{String(provider_filter, '')}})
+    GROUP BY minute, publisher_domain, auction_source, provider, seat
+  )
+  ORDER BY minute ASC
+
+TYPE endpoint

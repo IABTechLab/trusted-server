@@ -1,0 +1,19 @@
+DESCRIPTION >
+  Optional sampled Trusted Server access telemetry rows. Disabled by default in Fastly config.
+
+SCHEMA >
+  `event_ts` DateTime64(3),
+  `method` LowCardinality(String),
+  `path` String,
+  `status` UInt16,
+  `time_elapsed_ms` UInt32,
+  `cache_state` LowCardinality(Nullable(String)),
+  `country` LowCardinality(String),
+  `sample_rate` Float64,
+  `event_date` Date DEFAULT toDate(event_ts)
+
+ENGINE "MergeTree"
+ENGINE_SORTING_KEY "event_date, path, status, method"
+TTL "event_date + INTERVAL 30 DAY"
+
+TOKEN ts_access_ingest APPEND
