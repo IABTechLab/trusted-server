@@ -49,9 +49,9 @@ This script:
 
 # Browser — single framework after building WASM/images and generating configs
 cd crates/trusted-server-integration-tests/browser
-VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy.toml \
 TEST_FRAMEWORK=nextjs npx playwright test
-VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy-legacy.toml \
+VICEROY_CONFIG_PATH=../../../target/integration-test-artifacts/configs/viceroy.toml \
 TEST_FRAMEWORK=wordpress npx playwright test
 ```
 
@@ -93,7 +93,7 @@ config is kept as readable TOML in
 `fixtures/configs/trusted-server.integration.toml` and converted into an
 EdgeZero `BlobEnvelope` at test setup time.
 
-Generate both legacy and EdgeZero Viceroy configs manually with:
+Generate the post-cutover Viceroy config manually with:
 
 ```bash
 ARTIFACTS_DIR=target/integration-test-artifacts \
@@ -101,15 +101,14 @@ INTEGRATION_ORIGIN_PORT=8888 \
 ./scripts/generate-integration-viceroy-configs.sh
 ```
 
-Generated outputs:
+Generated output:
 
 | File | Purpose |
 |---|---|
-| `target/integration-test-artifacts/configs/viceroy-legacy.toml` | Standard legacy-entry integration and browser tests (`edgezero_enabled = "false"`) |
-| `target/integration-test-artifacts/configs/viceroy-edgezero.toml` | EdgeZero EC lifecycle job (`edgezero_enabled = "true"`) |
+| `target/integration-test-artifacts/configs/viceroy.toml` | Fastly integration, EC lifecycle, and browser tests |
 
-Set `VICEROY_CONFIG_PATH` to one of those generated files when invoking
-`cargo test` or Playwright directly.
+Set `VICEROY_CONFIG_PATH` to the generated file when invoking `cargo test` or
+Playwright directly.
 
 ## Test scenarios
 
@@ -236,18 +235,13 @@ crate requires a native target while the workspace default is `wasm32-wasip1`.
 
 ## Dependency maintenance
 
-`crates/trusted-server-integration-tests` is intentionally excluded from the workspace, so it
-keeps its own `Cargo.lock`.
-
-Shared direct dependency versions are checked in CI by
-`scripts/check-integration-dependency-versions.sh`. When updating a dependency
-that exists in both manifests:
-
-1. Update the version in both `Cargo.toml` files.
-2. Regenerate the nested lockfile with
-   `cargo generate-lockfile --manifest-path crates/trusted-server-integration-tests/Cargo.toml`.
-3. Ensure the workspace and integration-test lockfiles resolve the same version
-   for that shared dependency.
+`crates/trusted-server-integration-tests` is a workspace member, so it shares
+`[workspace.dependencies]` and the single root `Cargo.lock` with the adapters it
+exercises. There is no separate lockfile or version-drift check to maintain:
+update a shared dependency once in the root `[workspace.dependencies]` (or in this
+crate's own `Cargo.toml` for integration-only dependencies) and the shared
+lockfile resolves it. The crate is native + Docker-based (testcontainers), so it
+is excluded from the wasm workspace aliases and run via `./scripts/integration-tests.sh`.
 
 ## Known gaps
 

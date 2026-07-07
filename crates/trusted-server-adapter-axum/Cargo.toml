@@ -25,7 +25,7 @@ log = { workspace = true }
 reqwest = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-trusted-server-core = { path = "../trusted-server-core" }
+trusted-server-core = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

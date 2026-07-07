@@ -18,6 +18,18 @@ fn init_logger() {
     let _ = env_logger::try_init();
 }
 
+#[test]
+fn default_fastly_viceroy_template_has_generated_config_store_marker() {
+    let template = include_str!("../fixtures/configs/viceroy-template.toml");
+    const MARKER: &str = "# GENERATED_TRUSTED_SERVER_CONFIG_STORES";
+
+    assert_eq!(
+        template.matches(MARKER).count(),
+        1,
+        "default Fastly Viceroy template should contain exactly one generated config-store marker"
+    );
+}
+
 /// Test all combinations: frameworks x runtimes (matrix testing).
 ///
 /// Iterates every registered runtime and framework, running all standard
@@ -200,6 +212,10 @@ fn test_ec_lifecycle_fastly() {
         "EC lifecycle tests: Viceroy running at {}",
         process.base_url
     );
+
+    // Verify the post-cutover router is active before route-level scenarios.
+    common::ec::assert_edgezero_entry_point(&process.base_url)
+        .expect("EdgeZero entry-point canary failed: TRACE did not return a router-level 405");
 
     for scenario in EcScenario::all() {
         log::info!("  Running EC scenario: {scenario:?}");

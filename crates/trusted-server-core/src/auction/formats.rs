@@ -29,7 +29,11 @@ use super::types::{
     PublisherInfo, SiteInfo, UserInfo,
 };
 
-/// Request body format for auction endpoints (tsjs/Prebid.js format).
+/// Request body for `POST /auction` (tsjs / Prebid.js wire format).
+///
+/// `adUnits` lists the placements to bid on. `config` carries optional
+/// context values (e.g. audience segments) filtered through
+/// [`auction.allowed_context_keys`][`crate::settings::AuctionConfig::allowed_context_keys`].
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdRequest {
@@ -38,6 +42,15 @@ pub struct AdRequest {
     pub eids: Option<JsonValue>,
 }
 
+/// A single ad placement in an [`AdRequest`].
+///
+/// `code` identifies the slot (e.g. `"atf_sidebar_ad"`) and becomes the
+/// impression ID in the outgoing `OpenRTB` request.
+///
+/// `bids` is optional. When absent or empty the PBS provider falls back to
+/// a stored-request keyed by `code` (`imp.ext.prebid.storedrequest.id`).
+/// When present, each entry's params are forwarded inline to PBS as
+/// `imp.ext.prebid.bidder.<bidder>`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdUnit {
@@ -46,7 +59,11 @@ pub struct AdUnit {
     pub bids: Option<Vec<BidConfig>>,
 }
 
-/// Bidder configuration from the request.
+/// Inline bidder params for one SSP within an [`AdUnit`].
+///
+/// `params` is passed verbatim to the corresponding PBS bidder adapter.
+/// When the `bids` array is absent, the slot falls back to PBS stored
+/// requests — see [`AdUnit`] for details.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BidConfig {
@@ -420,6 +437,10 @@ mod tests {
             height: 250,
             nurl: None,
             burl: None,
+            ad_id: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
             metadata: HashMap::new(),
         }
     }
@@ -1127,5 +1148,186 @@ mod tests {
 
         assert!(bid.get("w").is_none(), "should omit out-of-range width");
         assert!(bid.get("h").is_none(), "should omit out-of-range height");
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+    use crate::consent::ConsentContext;
+    use crate::platform::test_support::noop_services;
+    use crate::test_support::tests::crate_test_settings_str;
+    use http::Method;
+
+    fn make_settings() -> Settings {
+        Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings")
+    }
+
+    fn make_req() -> Request<EdgeBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::empty())
+            .expect("should build test request")
+    }
+
+    fn call_convert(body: &AdRequest) -> AuctionRequest {
+        let settings = make_settings();
+        let services = noop_services();
+        let req = make_req();
+        convert_tsjs_to_auction_request(
+            body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            Some("test-ec-id"),
+            None,
+        )
+        .expect("should convert without error")
+    }
+
+    #[test]
+    fn no_bids_produces_empty_bidders_map() {
+        // An ad unit with no `bids` array must produce an empty bidders map.
+        // An empty bidders map triggers the PBS stored-request fallback:
+        // the PBS provider sets imp.ext.prebid.storedrequest = { id: "<code>" }.
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "atf_sidebar_ad".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250]],
+                    }),
+                }),
+                bids: None,
+            }],
+            config: None,
+            eids: None,
+        };
+
+        let auction_request = call_convert(&body);
+
+        assert_eq!(auction_request.slots.len(), 1, "should have one slot");
+        let slot = &auction_request.slots[0];
+        assert_eq!(slot.id, "atf_sidebar_ad", "slot id should match unit code");
+        assert!(
+            slot.bidders.is_empty(),
+            "absent bids array should yield empty bidders map (PBS stored-request path)"
+        );
+    }
+
+    #[test]
+    fn inline_bids_populate_bidders_map() {
+        // When bids are supplied, each bidder+params pair should appear in the
+        // slot's bidders map so PBS receives inline params.
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "homepage_header_ad".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![970, 90]],
+                    }),
+                }),
+                bids: Some(vec![BidConfig {
+                    bidder: "kargo".to_string(),
+                    params: serde_json::json!({ "placementId": "client_123" }),
+                }]),
+            }],
+            config: None,
+            eids: None,
+        };
+
+        let auction_request = call_convert(&body);
+
+        let slot = &auction_request.slots[0];
+        assert!(
+            slot.bidders.contains_key("kargo"),
+            "kargo bidder should be present in slot bidders map"
+        );
+        assert_eq!(
+            slot.bidders["kargo"]["placementId"], "client_123",
+            "bidder params should be forwarded verbatim"
+        );
+    }
+
+    #[test]
+    fn config_allowed_key_passes_through() {
+        // Keys in auction.allowed_context_keys must reach the auction context.
+        // The test settings do not set allowed_context_keys so the default
+        // (empty) applies — verify a key is NOT present rather than IS.
+        // To test the allow-list, inject a key via a custom settings string.
+        let settings_str = format!(
+            "{}\n[auction]\nallowed_context_keys = [\"permutive_segments\"]\n",
+            crate_test_settings_str()
+        );
+        let settings = Settings::from_toml(&settings_str).expect("should parse");
+        let services = noop_services();
+        let req = make_req();
+
+        let body = AdRequest {
+            ad_units: vec![],
+            config: Some(serde_json::json!({
+                "permutive_segments": ["seg1", "seg2"],
+                "disallowed_key": "should be dropped",
+            })),
+            eids: None,
+        };
+
+        let auction_request = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            Some("test-ec-id"),
+            None,
+        )
+        .expect("should convert");
+
+        assert!(
+            auction_request.context.contains_key("permutive_segments"),
+            "allowed key should be in auction context"
+        );
+        assert!(
+            !auction_request.context.contains_key("disallowed_key"),
+            "unlisted key should be dropped"
+        );
+    }
+
+    #[test]
+    fn invalid_banner_size_returns_error() {
+        // Banner sizes must be [width, height] pairs; a 3-element size is invalid.
+        let body = AdRequest {
+            ad_units: vec![AdUnit {
+                code: "bad_slot".to_string(),
+                media_types: Some(MediaTypes {
+                    banner: Some(BannerUnit {
+                        sizes: vec![vec![300, 250, 99]], // invalid — 3 elements
+                    }),
+                }),
+                bids: None,
+            }],
+            config: None,
+            eids: None,
+        };
+
+        let settings = make_settings();
+        let services = noop_services();
+        let req = make_req();
+        let result = convert_tsjs_to_auction_request(
+            &body,
+            &settings,
+            &services,
+            &req,
+            ConsentContext::default(),
+            Some("test-ec-id"),
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "3-element banner size should return an error"
+        );
     }
 }

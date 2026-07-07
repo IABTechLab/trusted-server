@@ -152,6 +152,7 @@ fn integration_backend_spec(
         host_header_override: None,
         certificate_check,
         first_byte_timeout,
+        between_bytes_timeout: first_byte_timeout,
     })
 }
 

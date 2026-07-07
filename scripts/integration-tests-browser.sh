@@ -25,9 +25,6 @@ if [ -z "$NODE_VERSION" ]; then
     exit 1
 fi
 
-echo "==> Validating shared integration-test dependency versions..."
-./scripts/check-integration-dependency-versions.sh
-
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
 TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
@@ -39,7 +36,7 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
+GENERATED_VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
 
 # --- Build Docker images ---
 echo "==> Building WordPress test container..."

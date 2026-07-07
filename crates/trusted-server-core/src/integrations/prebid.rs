@@ -2,6 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use base64::{
+    engine::general_purpose::{
+        STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD,
+    },
+    Engine as _,
+};
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::{Report, ResultExt};
+use http::header::HeaderValue;
+use http::{header, Method, StatusCode};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+use url::{Url, Url as ParsedUrl};
+use validator::{Validate, ValidationError};
+
 use crate::auction::provider::AuctionProvider;
 use crate::auction::types::{
     AuctionContext, AuctionRequest, AuctionResponse, Bid as AuctionBid, MediaType,
@@ -19,8 +35,8 @@ use crate::integrations::{
 };
 use crate::openrtb::{
     to_openrtb_i32, Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt,
+    ImpStoredRequest, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt,
+    RequestExt, Site, ToExt, TrustedServerExt, User, UserExt,
 };
 use crate::platform::{
     PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, RuntimeServices,
@@ -28,21 +44,6 @@ use crate::platform::{
 use crate::proxy::{is_host_allowed, proxy_request, ProxyRequestConfig};
 use crate::request_signing::{RequestSigner, SigningParams, SIGNING_VERSION};
 use crate::settings::{IntegrationConfig, Settings};
-use async_trait::async_trait;
-use base64::{
-    engine::general_purpose::{
-        STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_STANDARD_NO_PAD,
-    },
-    Engine as _,
-};
-use edgezero_core::body::Body as EdgeBody;
-use error_stack::{Report, ResultExt};
-use http::header::HeaderValue;
-use http::{header, Method, StatusCode};
-use serde::{Deserialize, Serialize};
-use serde_json::Value as Json;
-use url::Url;
-use validator::{Validate, ValidationError};
 
 const PREBID_INTEGRATION_ID: &str = "prebid";
 const PREBID_BUNDLE_ROUTE: &str = "/integrations/prebid/bundle.js";
@@ -211,6 +212,21 @@ pub struct PrebidIntegrationConfig {
     /// - `both` — consent in both cookies and body (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
+    /// Strip `nurl` and `burl` from PBS bids before they reach `window.tsjs.bids`.
+    ///
+    /// Set to `true` when the PBS deployment is configured to fire win/billing
+    /// notifications server-side (e.g. `ext.prebid.events.enabled`), so the
+    /// client does not double-fire them via `sendBeacon`. Default: `false`.
+    #[serde(default)]
+    pub suppress_nurl: bool,
+    /// Bidder seats whose `nurl` and `burl` should be stripped before they reach
+    /// `window.tsjs.bids`.
+    ///
+    /// Use this when only specific PBS seats fire win/billing notifications
+    /// internally. The global [`suppress_nurl`](Self::suppress_nurl) switch still
+    /// suppresses every bidder when set.
+    #[serde(default, deserialize_with = "crate::settings::vec_from_seq_or_map")]
+    pub suppress_nurl_bidders: Vec<String>,
 }
 
 impl IntegrationConfig for PrebidIntegrationConfig {
@@ -500,9 +516,9 @@ impl PrebidIntegration {
         }
 
         let parsed = if without_query.starts_with("//") {
-            Url::parse(&format!("https:{without_query}"))
+            ParsedUrl::parse(&format!("https:{without_query}"))
         } else {
-            Url::parse(without_query)
+            ParsedUrl::parse(without_query)
         };
 
         parsed
@@ -1240,6 +1256,12 @@ fn non_empty_override_object(
 
 /// Copies browser headers to the outgoing Prebid Server request.
 ///
+/// The inbound `X-Forwarded-For` header is never copied: on the server-side
+/// publisher auction path `from` is the browser navigation request, so its
+/// XFF value is client-supplied and spoofable. Instead the header is
+/// synthesized from `client_ip` — the platform-attested client address —
+/// matching the trusted IP already sent in `OpenRTB` `device.ip`.
+///
 /// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
 /// stripped from the `Cookie` header since consent travels exclusively
 /// through the `OpenRTB` body.
@@ -1247,17 +1269,20 @@ fn copy_request_headers(
     from: &http::Request<EdgeBody>,
     to: &mut http::Request<EdgeBody>,
     consent_forwarding: ConsentForwardingMode,
+    client_ip: Option<std::net::IpAddr>,
 ) {
-    let headers_to_copy = [
-        header::USER_AGENT,
-        header::HeaderName::from_static("x-forwarded-for"),
-        header::REFERER,
-        header::ACCEPT_LANGUAGE,
-    ];
+    let headers_to_copy = [header::USER_AGENT, header::REFERER, header::ACCEPT_LANGUAGE];
 
     for header_name in &headers_to_copy {
         if let Some(value) = from.headers().get(header_name) {
             to.headers_mut().insert(header_name, value.clone());
+        }
+    }
+
+    if let Some(ip) = client_ip {
+        if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
+            to.headers_mut()
+                .insert(header::HeaderName::from_static("x-forwarded-for"), value);
         }
     }
 
@@ -1330,6 +1355,21 @@ impl PrebidAuctionProvider {
         })
     }
 
+    /// Returns the full Prebid Server `OpenRTB2` auction endpoint URL.
+    ///
+    /// Backward-compatible normalization: `server_url` may be configured as
+    /// either the PBS origin (path is appended here) or the full endpoint
+    /// already ending in `/openrtb2/auction` (used as-is, ignoring a trailing
+    /// slash) — both shapes produce the same request URL.
+    fn auction_endpoint_url(&self) -> String {
+        let base = self.config.server_url.trim_end_matches('/');
+        if base.ends_with("/openrtb2/auction") {
+            base.to_string()
+        } else {
+            format!("{base}/openrtb2/auction")
+        }
+    }
+
     /// Convert auction request to `OpenRTB` format with all enrichments.
     fn to_openrtb(
         &self,
@@ -1381,22 +1421,45 @@ impl PrebidAuctionProvider {
                 // Build the bidder map for PBS.
                 // The JS adapter sends "trustedServer" as the bidder (our orchestrator
                 // adapter name). Replace it with the real PBS bidders from config.
-                // Pass through any other bidders with their params as-is.
+                // Only pass through keys that are known PBS bidders — skip provider-specific
+                // keys like "aps" which belong to their own separate auction provider.
                 let mut bidder: HashMap<String, Json> = HashMap::new();
                 for (name, params) in &slot.bidders {
                     if name == TRUSTED_SERVER_BIDDER {
                         bidder.extend(expand_trusted_server_bidders(&self.config.bidders, params));
-                    } else {
+                    } else if self.config.bidders.iter().any(|b| b == name) {
                         bidder.insert(name.clone(), params.clone());
+                    } else if name != "aps" {
+                        // `aps` is intentionally handled by its own provider. Any
+                        // other unrecognized key is likely a misconfiguration (a
+                        // slot bidder absent from `config.bidders`) that silently
+                        // yields an empty bidder map and a stored-request no-bid —
+                        // log it so the drop is diagnosable.
+                        log::debug!(
+                            "prebid: dropping slot '{}' bidder '{}' — not in config.bidders and not a known provider key",
+                            slot.id,
+                            name
+                        );
                     }
                 }
 
-                // Fallback to config bidders if none provided
-                if bidder.is_empty() {
-                    for b in &self.config.bidders {
-                        bidder.insert(b.clone(), Json::Object(serde_json::Map::new()));
-                    }
-                }
+                // When no inline PBS bidder params exist (e.g. creative-opportunity slots
+                // whose PBS params live in stored requests), tell PBS to resolve bidder
+                // config from the stored request keyed by this slot ID.
+                //
+                // This cannot fire for the client /auction path: the JS adapter
+                // injects a `trustedServer` entry into every ad unit, so `bidder`
+                // is only empty for server-side creative-opportunity slots with
+                // no inline provider params (or when `config.bidders` is empty,
+                // where PBS previously received an empty bidder map and returned
+                // no bids — a stored-request miss is the same no-bid outcome).
+                let storedrequest = if bidder.is_empty() {
+                    Some(ImpStoredRequest {
+                        id: slot.id.clone(),
+                    })
+                } else {
+                    None
+                };
 
                 // Apply canonical and compatibility-derived rules in normalized order.
                 for (name, params) in &mut bidder {
@@ -1418,7 +1481,10 @@ impl PrebidAuctionProvider {
                     secure: Some(true), // require HTTPS creatives
                     tagid: Some(slot.id.clone()),
                     ext: ImpExt {
-                        prebid: PrebidImpExt { bidder },
+                        prebid: PrebidImpExt {
+                            bidder,
+                            storedrequest,
+                        },
                     }
                     .to_ext(),
                     ..Default::default()
@@ -1437,13 +1503,13 @@ impl PrebidAuctionProvider {
 
         // Build user object — populate consent at both OpenRTB 2.6 top-level
         // and Prebid ext-based locations (dual placement).
-        // In cookies_only mode, body consent fields are omitted — consent
-        // travels exclusively through the forwarded Cookie header.
-        let consent_ctx = if self.config.consent_forwarding.includes_body_consent() {
-            request.user.consent.as_ref()
-        } else {
-            None
-        };
+        // In cookies_only mode, cookie-sourced consent travels through the
+        // forwarded Cookie header. KV/policy-sourced consent has no inbound
+        // cookie to forward, so carry it in the OpenRTB body instead.
+        let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
+            self.config.consent_forwarding.includes_body_consent()
+                || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
+        });
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: request.user.id.clone(),
@@ -1593,7 +1659,12 @@ impl PrebidAuctionProvider {
             .and_then(|value| value.to_str().ok())
             .map(std::string::ToString::to_string);
 
-        let tmax = to_openrtb_i32(self.config.timeout_ms, "tmax", "request");
+        // Advertise the effective auction budget, not the raw provider config:
+        // the orchestrator caps `context.timeout_ms` to the remaining auction
+        // budget, and the edge backend stops waiting after that long. Telling
+        // PBS it has more time than the edge will wait turns partial bids into
+        // edge timeouts.
+        let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request");
 
         OpenRtbRequest {
             id: Some(request.id.clone()),
@@ -1774,6 +1845,15 @@ impl PrebidAuctionProvider {
         }
     }
 
+    fn should_suppress_bid_notifications(&self, bidder: &str) -> bool {
+        self.config.suppress_nurl
+            || self
+                .config
+                .suppress_nurl_bidders
+                .iter()
+                .any(|suppressed_bidder| suppressed_bidder == bidder)
+    }
+
     /// Parse a single bid from `OpenRTB` response.
     fn parse_bid(&self, bid_obj: &Json, seat: &str) -> Result<AuctionBid, ()> {
         let slot_id = bid_obj
@@ -1803,15 +1883,33 @@ impl PrebidAuctionProvider {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0);
 
-        let nurl = bid_obj
-            .get("nurl")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string);
+        let suppress_bid_notifications = self.should_suppress_bid_notifications(seat);
+        let nurl = if suppress_bid_notifications {
+            None
+        } else {
+            bid_obj
+                .get("nurl")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        };
 
-        let burl = bid_obj
-            .get("burl")
+        let burl = if suppress_bid_notifications {
+            None
+        } else {
+            bid_obj
+                .get("burl")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        };
+
+        // `adid` is the creative/ad identifier. The OpenRTB `id` is the bid ID,
+        // not an ad ID, so it is not used as a fallback: surfacing it as `ad_id`
+        // (which is exposed raw in the debug bid) would mislead any consumer that
+        // treats `ad_id` as a creative identifier. Absent `adid`, `ad_id` is None.
+        let ad_id = bid_obj
+            .get("adid")
             .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string);
+            .map(String::from);
 
         let adomain = bid_obj
             .get("adomain")
@@ -1821,6 +1919,49 @@ impl PrebidAuctionProvider {
                     .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
                     .collect()
             });
+
+        // Extract PBS Cache coordinates from ext.prebid.cache.bids
+        let cache_entry = bid_obj
+            .get("ext")
+            .and_then(|e| e.get("prebid"))
+            .and_then(|p| p.get("cache"))
+            .and_then(|c| c.get("bids"));
+
+        let cache_id = cache_entry
+            .and_then(|c| c.get("cacheId"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let (cache_host, cache_path) = cache_entry
+            .and_then(|c| c.get("url"))
+            .and_then(|v| v.as_str())
+            .and_then(|url_str| {
+                ParsedUrl::parse(url_str)
+                    .map_err(|e| log::debug!("PBS cache URL parse failed: {}", e))
+                    .ok()
+            })
+            .map(|u| {
+                let host = u.host_str().map(String::from);
+                // path() returns "/" for root — only use if non-trivial
+                let path = u.path().to_string();
+                let path = if path.is_empty() || path == "/" {
+                    None
+                } else {
+                    Some(path)
+                };
+                (host, path)
+            })
+            .unwrap_or((None, None));
+
+        // Guard: if we extracted a cache UUID but couldn't extract the host,
+        // the bid will have hb_adid set but no endpoint to fetch from — creative will fail.
+        if cache_id.is_some() && cache_host.is_none() {
+            log::warn!(
+                "PBS bid has cache UUID but cache URL could not be parsed — \
+                 creative will fail to render for slot '{}'",
+                slot_id
+            );
+        }
 
         Ok(AuctionBid {
             slot_id,
@@ -1833,6 +1974,10 @@ impl PrebidAuctionProvider {
             height,
             nurl,
             burl,
+            ad_id,
+            cache_id,
+            cache_host,
+            cache_path,
             metadata: std::collections::HashMap::new(),
         })
     }
@@ -1897,8 +2042,8 @@ impl AuctionProvider for PrebidAuctionProvider {
         if log::log_enabled!(log::Level::Debug) {
             match serde_json::to_string_pretty(&openrtb) {
                 Ok(json) => log::debug!(
-                    "Prebid OpenRTB request to {}/openrtb2/auction:\n{}",
-                    self.config.server_url,
+                    "Prebid OpenRTB request to {}:\n{}",
+                    self.auction_endpoint_url(),
                     json
                 ),
                 Err(e) => {
@@ -1910,7 +2055,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         // Create HTTP request
         let mut pbs_req = http::Request::builder()
             .method(http::Method::POST)
-            .uri(format!("{}/openrtb2/auction", self.config.server_url))
+            .uri(self.auction_endpoint_url())
             .body(EdgeBody::empty())
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to build Prebid request".to_string(),
@@ -1919,6 +2064,7 @@ impl AuctionProvider for PrebidAuctionProvider {
             context.request,
             &mut pbs_req,
             self.config.consent_forwarding,
+            context.services.client_info().client_ip,
         );
 
         let pbs_body = serde_json::to_vec(&openrtb).change_context(TrustedServerError::Prebid {
@@ -2090,7 +2236,7 @@ mod tests {
         AdFormat, AdSlot, AuctionContext, AuctionRequest, DeviceInfo, PublisherInfo, UserInfo,
     };
 
-    use crate::consent::ConsentContext;
+    use crate::consent::{ConsentContext, ConsentSource};
     use crate::geo::GeoInfo;
     use crate::html_processor::{create_html_processor, HtmlProcessorConfig};
     use crate::integrations::{
@@ -2137,6 +2283,8 @@ mod tests {
             bid_param_overrides: HashMap::default(),
             bid_param_override_rules: Vec::new(),
             consent_forwarding: ConsentForwardingMode::Both,
+            suppress_nurl: false,
+            suppress_nurl_bidders: Vec::new(),
         }
     }
 
@@ -2148,10 +2296,11 @@ mod tests {
             spec: &PlatformBackendSpec,
         ) -> Result<String, Report<PlatformError>> {
             Ok(format!(
-                "predicted_{}_{}_{}",
+                "predicted_{}_{}_{}_{}",
                 spec.scheme,
                 spec.host,
-                spec.first_byte_timeout.as_millis()
+                spec.first_byte_timeout.as_millis(),
+                spec.between_bytes_timeout.as_millis()
             ))
         }
 
@@ -2187,8 +2336,8 @@ mod tests {
             .expect("should predict backend name through platform backend");
 
         assert_eq!(
-            backend_name, "predicted_https_prebid.example_123",
-            "should use PlatformBackend::predict_name instead of duplicating the naming scheme"
+            backend_name, "predicted_https_prebid.example_123_123",
+            "should cap both first-byte and between-bytes timeouts to the auction budget"
         );
     }
 
@@ -3681,6 +3830,49 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
+    fn to_openrtb_includes_kv_consent_when_cookies_only_has_no_cookie_to_forward() {
+        let mut config = base_config();
+        config.consent_forwarding = ConsentForwardingMode::CookiesOnly;
+        let provider = PrebidAuctionProvider::new(config);
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.consent = Some(ConsentContext {
+            raw_tc_string: Some("BOkv-backed-consent-string".to_string()),
+            raw_us_privacy: Some("1YNN".to_string()),
+            gdpr_applies: true,
+            source: ConsentSource::KvStore,
+            ..Default::default()
+        });
+
+        let settings = make_settings();
+        let request = build_test_request();
+        assert!(
+            !request.headers().contains_key(header::COOKIE),
+            "test request should not carry a consent cookie to forward"
+        );
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert_eq!(
+            openrtb.user.as_ref().and_then(|u| u.consent.as_deref()),
+            Some("BOkv-backed-consent-string"),
+            "cookies_only should fall back to body consent when consent came from KV"
+        );
+        let regs = openrtb.regs.as_ref().expect("should include consent regs");
+        assert_eq!(regs.gdpr, Some(true), "should carry GDPR applicability");
+        assert_eq!(
+            regs.us_privacy.as_deref(),
+            Some("1YNN"),
+            "should carry non-cookie consent strings from KV"
+        );
+    }
+
+    #[test]
     fn to_openrtb_sets_gdpr_true_for_non_eu_country_with_consent() {
         // When geo says non-GDPR but a consent string is present, the consent
         // string is the stronger signal (VPN / carrier IP / geo-DB drift can
@@ -4228,7 +4420,7 @@ external_bundle_sri = "sha384-AAAA"
         assert_eq!(
             openrtb.tmax,
             Some(1000),
-            "should set tmax from config timeout_ms"
+            "should set tmax from the effective auction context timeout"
         );
         assert_eq!(
             openrtb.cur,
@@ -4238,15 +4430,72 @@ external_bundle_sri = "sha384-AAAA"
     }
 
     #[test]
-    fn to_openrtb_omits_tmax_when_timeout_exceeds_i32_max() {
+    fn auction_endpoint_url_appends_path_to_base_origin() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should append /openrtb2/auction to a base origin"
+        );
+    }
+
+    #[test]
+    fn auction_endpoint_url_does_not_double_append_full_endpoint() {
         let mut config = base_config();
-        config.timeout_ms = i32::MAX as u32 + 1;
+        config.server_url = "https://prebid.example/openrtb2/auction".to_string();
+        let provider = PrebidAuctionProvider::new(config);
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should use a full endpoint URL as-is"
+        );
+
+        let mut config = base_config();
+        config.server_url = "https://prebid.example/openrtb2/auction/".to_string();
+        let provider = PrebidAuctionProvider::new(config);
+        assert_eq!(
+            provider.auction_endpoint_url(),
+            "https://prebid.example/openrtb2/auction",
+            "should normalize a trailing slash on a full endpoint URL"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_tmax_uses_effective_context_timeout_not_provider_config() {
+        // Provider config says 1000ms but the auction budget is only 500ms —
+        // PBS must be told the tighter effective deadline, otherwise the edge
+        // gives up before PBS responds.
+        let config = base_config();
+        assert_eq!(config.timeout_ms, 1000, "should start from 1000ms config");
         let provider = PrebidAuctionProvider::new(config);
         let auction_request = create_test_auction_request();
 
         let settings = make_settings();
         let request = build_test_request();
-        let context = create_test_auction_context(&settings, &request);
+        let context = shared_test_auction_context(&settings, &request, 500);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert_eq!(
+            openrtb.tmax,
+            Some(500),
+            "should set tmax from the effective auction context timeout, not provider config"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_omits_tmax_when_timeout_exceeds_i32_max() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let auction_request = create_test_auction_request();
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = shared_test_auction_context(&settings, &request, i32::MAX as u32 + 1);
 
         let openrtb = provider.to_openrtb(
             &auction_request,
@@ -4294,6 +4543,38 @@ external_bundle_sri = "sha384-AAAA"
         );
         assert_eq!(formats[0].w, Some(300), "should preserve valid width");
         assert_eq!(formats[0].h, Some(250), "should preserve valid height");
+    }
+
+    #[test]
+    fn to_openrtb_drops_imp_when_all_banner_formats_exceed_i32_max() {
+        // The build-time bound: every banner format's u32 dimensions pass through
+        // `to_openrtb_i32`, which omits any value above i32::MAX. When a slot's
+        // only format is out of range (here u32::MAX), no valid formats remain, so
+        // the whole imp must be dropped rather than emitted with an empty format
+        // list — a sizeless imp is unbiddable and would only waste an SSP call.
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.slots[0].formats = vec![AdFormat {
+            media_type: MediaType::Banner,
+            width: u32::MAX,
+            height: u32::MAX,
+        }];
+
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        assert!(
+            openrtb.imp.is_empty(),
+            "should drop the imp entirely when every banner format exceeds i32::MAX"
+        );
     }
 
     #[test]
@@ -5601,6 +5882,92 @@ set = { placementId = "explicit_header" }
         assert_eq!(statuses[1]["status"], "timeout");
     }
 
+    // ========================================================================
+    // PBS stored request tests
+    // ========================================================================
+
+    #[test]
+    fn to_openrtb_uses_stored_request_when_slot_has_no_pbs_bidder_params() {
+        // Slot only has "aps" provider — not a PBS bidder
+        let slot = make_slot(
+            "atf_sidebar_ad",
+            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should not send inline bidder params when using stored request"
+        );
+        assert_eq!(
+            prebid["storedrequest"]["id"], "atf_sidebar_ad",
+            "should use slot id as stored request id"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_uses_stored_request_when_slot_has_empty_bidders() {
+        let slot = make_slot("homepage_header_ad", HashMap::new());
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert_eq!(
+            prebid["storedrequest"]["id"], "homepage_header_ad",
+            "should use slot id as stored request id for slot with no bidder map"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_uses_inline_bidder_params_not_stored_request_for_trusted_server_slots() {
+        let mut config = base_config();
+        config.bidders = vec!["kargo".to_string()];
+
+        let slot = make_ts_slot(
+            "in_content_ad",
+            &json!({ "kargo": { "placementId": "client_123" } }),
+            None,
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(config, &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("storedrequest").is_none(),
+            "should not use stored request when inline bidder params are present"
+        );
+        assert_eq!(
+            prebid["bidder"]["kargo"]["placementId"], "client_123",
+            "should use inline bidder params from trustedServer expansion"
+        );
+    }
+
+    #[test]
+    fn to_openrtb_skips_aps_key_from_slot_bidders_in_pbs_request() {
+        let slot = make_slot(
+            "atf_sidebar_ad",
+            HashMap::from([("aps".to_string(), json!({"slotID": "aps-slot-atf-sidebar"}))]),
+        );
+        let request = make_auction_request(vec![slot]);
+
+        let ortb = call_to_openrtb(base_config(), &request);
+        let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
+        let prebid = ext.get("prebid").expect("should have prebid in ext");
+
+        assert!(
+            prebid.get("bidder").is_none(),
+            "should not forward aps key into PBS imp.ext.prebid.bidder"
+        );
+    }
+
     #[test]
     fn register_rejects_invalid_bid_param_override_rule() {
         let toml = format!(
@@ -5646,6 +6013,292 @@ set = { networkId = 42 }
         assert!(
             result.is_err(),
             "should fail fast when a canonical rule has no matcher fields"
+        );
+    }
+
+    #[test]
+    fn parse_bid_extracts_cache_id_from_ext_prebid_cache_bids() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-123",
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "adm": "<div>ad</div>",
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "https://openads.adsrvr.org/cache?uuid=f47447a0-b759-4f2f-9887-af458b79b570",
+                            "cacheId": "f47447a0-b759-4f2f-9887-af458b79b570"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "thetradedesk")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("f47447a0-b759-4f2f-9887-af458b79b570"),
+            "should extract cacheId as cache_id"
+        );
+        assert_eq!(
+            bid.cache_host.as_deref(),
+            Some("openads.adsrvr.org"),
+            "should extract host from cache URL"
+        );
+        assert_eq!(
+            bid.cache_path.as_deref(),
+            Some("/cache"),
+            "should extract path from cache URL"
+        );
+    }
+
+    #[test]
+    fn parse_bid_sets_cache_fields_to_none_when_no_cache_entry() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-456",
+            "impid": "atf_sidebar_ad",
+            "price": 0.50,
+            "w": 300,
+            "h": 250
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert!(bid.cache_id.is_none(), "should be None when cache absent");
+        assert!(bid.cache_host.is_none(), "should be None when cache absent");
+        assert!(bid.cache_path.is_none(), "should be None when cache absent");
+    }
+
+    #[test]
+    fn parse_bid_handles_malformed_cache_url_gracefully() {
+        let bid_json = serde_json::json!({
+            "id": "bid-id-789",
+            "impid": "atf_sidebar_ad",
+            "price": 0.50,
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "not-a-valid-url",
+                            "cacheId": "some-uuid"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid without panicking");
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("some-uuid"),
+            "should still extract cacheId even if URL is malformed"
+        );
+        assert!(
+            bid.cache_host.is_none(),
+            "should be None when URL parse fails"
+        );
+        assert!(
+            bid.cache_path.is_none(),
+            "should be None when URL parse fails"
+        );
+    }
+
+    #[test]
+    fn parse_bid_includes_nurl_and_burl_by_default() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.nurl.as_deref(),
+            Some("https://ssp.example/win?id=abc123"),
+            "should include nurl when suppress_nurl is false"
+        );
+        assert_eq!(
+            bid.burl.as_deref(),
+            Some("https://ssp.example/bill?id=abc123"),
+            "should include burl when suppress_nurl is false"
+        );
+    }
+
+    #[test]
+    fn parse_bid_strips_nurl_and_burl_when_suppress_nurl_enabled() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let config = PrebidIntegrationConfig {
+            suppress_nurl: true,
+            ..base_config()
+        };
+        let provider = PrebidAuctionProvider::new(config);
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.nurl, None,
+            "should strip nurl when suppress_nurl is true"
+        );
+        assert_eq!(
+            bid.burl, None,
+            "should strip burl when suppress_nurl is true"
+        );
+    }
+
+    #[test]
+    fn parse_bid_strips_nurl_and_burl_for_configured_suppressed_bidder_only() {
+        let bid_json = serde_json::json!({
+            "impid": "atf_sidebar_ad",
+            "price": 1.50,
+            "w": 300,
+            "h": 250,
+            "nurl": "https://ssp.example/win?id=abc123",
+            "burl": "https://ssp.example/bill?id=abc123"
+        });
+        let config = PrebidIntegrationConfig {
+            suppress_nurl_bidders: vec!["appnexus".to_string()],
+            ..base_config()
+        };
+        let provider = PrebidAuctionProvider::new(config);
+
+        let suppressed_bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse suppressed bidder bid");
+        let preserved_bid = provider
+            .parse_bid(&bid_json, "openx")
+            .expect("should parse unsuppressed bidder bid");
+
+        assert_eq!(
+            suppressed_bid.nurl, None,
+            "should strip nurl only for the configured bidder"
+        );
+        assert_eq!(
+            suppressed_bid.burl, None,
+            "should strip burl only for the configured bidder"
+        );
+        assert_eq!(
+            preserved_bid.nurl.as_deref(),
+            Some("https://ssp.example/win?id=abc123"),
+            "should preserve nurl for bidders not configured for suppression"
+        );
+        assert_eq!(
+            preserved_bid.burl.as_deref(),
+            Some("https://ssp.example/bill?id=abc123"),
+            "should preserve burl for bidders not configured for suppression"
+        );
+    }
+
+    #[test]
+    fn parse_bid_preserves_ad_id_alongside_cache_id() {
+        let bid_json = serde_json::json!({
+            "id": "bid-impression-id",
+            "impid": "atf_sidebar_ad",
+            "adid": "bidder-ad-id-abc",
+            "price": 1.0,
+            "w": 300,
+            "h": 250,
+            "ext": {
+                "prebid": {
+                    "cache": {
+                        "bids": {
+                            "url": "https://cache.example.com/cache",
+                            "cacheId": "cache-uuid-xyz"
+                        }
+                    }
+                }
+            }
+        });
+        let provider = PrebidAuctionProvider::new(base_config());
+        let bid = provider
+            .parse_bid(&bid_json, "appnexus")
+            .expect("should parse bid");
+        assert_eq!(
+            bid.ad_id.as_deref(),
+            Some("bidder-ad-id-abc"),
+            "should keep ad_id from adid field"
+        );
+        assert_eq!(
+            bid.cache_id.as_deref(),
+            Some("cache-uuid-xyz"),
+            "should extract cache UUID separately"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_replaces_client_supplied_xff_with_attested_ip() {
+        let from = http::Request::builder()
+            .uri("https://publisher.example.com/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .header(header::USER_AGENT, "test-agent")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let mut to = http::Request::builder()
+            .uri("https://pbs.example.com/openrtb2/auction")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        copy_request_headers(
+            &from,
+            &mut to,
+            ConsentForwardingMode::Both,
+            Some(std::net::IpAddr::from([203, 0, 113, 7])),
+        );
+
+        assert_eq!(
+            to.headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok()),
+            Some("203.0.113.7"),
+            "should synthesize XFF from the platform-attested client IP, not the spoofable inbound header"
+        );
+        assert_eq!(
+            to.headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some("test-agent"),
+            "should still copy the browser User-Agent"
+        );
+    }
+
+    #[test]
+    fn copy_request_headers_omits_xff_without_attested_client_ip() {
+        let from = http::Request::builder()
+            .uri("https://publisher.example.com/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .body(EdgeBody::empty())
+            .expect("should build inbound request");
+        let mut to = http::Request::builder()
+            .uri("https://pbs.example.com/openrtb2/auction")
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+
+        copy_request_headers(&from, &mut to, ConsentForwardingMode::Both, None);
+
+        assert!(
+            !to.headers().contains_key("x-forwarded-for"),
+            "should not forward the client-supplied XFF when no attested IP exists"
         );
     }
 }

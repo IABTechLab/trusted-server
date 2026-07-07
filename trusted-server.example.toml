@@ -136,3 +136,19 @@ example_segments = "segments"
 
 [debug]
 ja4_endpoint_enabled = false
+
+[creative_opportunities]
+gam_network_id = "123456789"
+# FCP is not affected by this value — body content above </body> has already
+# streamed and painted before the hold begins. What this caps is the slip on
+# DOMContentLoaded and window.load. Worst case: a cache-hit page where origin
+# drains in <50 ms but the auction runs to the limit. 500 ms is the recommended
+# default; raise only if your SSPs need more headroom and your analytics confirm
+# the DCL slip is acceptable.
+auction_timeout_ms = 500  # override via TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__AUCTION_TIMEOUT_MS
+price_granularity = "dense"
+
+# No slot templates are enabled in the checked-in default config. Add
+# `[[creative_opportunities.slot]]` entries via private config or override the
+# entire array via:
+# TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT='[{"id":"...","gam_unit_path":"...",...}]'

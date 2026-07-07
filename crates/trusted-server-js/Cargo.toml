@@ -15,10 +15,6 @@ name = "trusted_server_js"
 path = "src/lib.rs"
 test = false
 
-[package.metadata]
-repository = "https://example.invalid/trusted-server"
-readme = "README.md"
-
 [build-dependencies]
 build-print = { workspace = true }
 which = { workspace = true }

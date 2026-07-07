@@ -1,45 +1,8 @@
 //! Compatibility bridge between `fastly` SDK types and `http` crate types.
-//!
-//! Contains only the functions used by the legacy `main()` entry point.
-//! Relocated from `trusted-server-core` as part of removing all `fastly` crate
-//! imports from the core library.
 
 use edgezero_core::body::Body as EdgeBody;
-use edgezero_core::http::{Request as HttpRequest, RequestBuilder, Response as HttpResponse, Uri};
+use edgezero_core::http::Response as HttpResponse;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
-
-fn build_http_request(req: &fastly::Request, body: EdgeBody) -> HttpRequest {
-    // Does not panic in practice: a URL that Fastly accepts but `http::Uri`
-    // rejects degrades to "/" instead of aborting the Wasm instance.
-    let uri: Uri = req.get_url_str().parse().unwrap_or_else(|_| {
-        log::warn!(
-            "failed to parse fastly request URL '{}'; falling back to '/'",
-            req.get_url_str()
-        );
-        Uri::from_static("/")
-    });
-
-    let mut builder: RequestBuilder = edgezero_core::http::request_builder()
-        .method(req.get_method().clone())
-        .uri(uri);
-
-    for (name, value) in req.get_headers() {
-        builder = builder.header(name.as_str(), value.as_bytes());
-    }
-
-    builder
-        .body(body)
-        .expect("should build http request from fastly request")
-}
-
-/// Convert an owned `fastly::Request` into an [`HttpRequest`].
-///
-/// URLs that Fastly accepts but `http::Uri` rejects fall back to `/` with a
-/// warning instead of panicking, preserving availability on the legacy path.
-pub(crate) fn from_fastly_request(mut req: fastly::Request) -> HttpRequest {
-    let body = EdgeBody::from(req.take_body_bytes());
-    build_http_request(&req, body)
-}
 
 /// Convert an [`HttpResponse`] into a `fastly::Response`.
 pub(crate) fn to_fastly_response(resp: HttpResponse) -> fastly::Response {
@@ -132,23 +95,6 @@ mod tests {
             "should strip fastly-ssl"
         );
         assert!(req.get_header("host").is_some(), "should preserve host");
-    }
-
-    #[test]
-    fn from_fastly_request_falls_back_to_root_on_unparseable_url() {
-        // `url::Url` (used by fastly) has no length limit, but `http::Uri`
-        // rejects URIs longer than 65534 bytes — an accepted-by-Fastly,
-        // rejected-by-Uri divergence the fallback guards against.
-        let long_url = format!("https://example.com/{}", "a".repeat(70_000));
-        let req = fastly::Request::get(long_url);
-
-        let http_req = from_fastly_request(req);
-
-        assert_eq!(
-            http_req.uri(),
-            &Uri::from_static("/"),
-            "should fall back to '/' when the fastly URL cannot be parsed as an http::Uri"
-        );
     }
 
     #[test]

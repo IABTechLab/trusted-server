@@ -28,9 +28,6 @@ if [ -z "$NODE_VERSION" ]; then
     exit 1
 fi
 
-echo "==> Validating shared integration-test dependency versions..."
-./scripts/check-integration-dependency-versions.sh
-
 for arg in "$@"; do
     case "$arg" in
         test_wordpress_fastly|test_nextjs_fastly)
@@ -62,7 +59,7 @@ TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK=false \
 
 echo "==> Generating Viceroy configs..."
 INTEGRATION_ORIGIN_PORT="$ORIGIN_PORT" ./scripts/generate-integration-viceroy-configs.sh
-VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy-legacy.toml"
+VICEROY_CONFIG_PATH="$REPO_ROOT/target/integration-test-artifacts/configs/viceroy.toml"
 
 echo "==> Building WordPress test container..."
 docker build -t test-wordpress:latest \
