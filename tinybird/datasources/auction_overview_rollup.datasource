@@ -1,0 +1,18 @@
+DESCRIPTION >
+  Per-minute auction summary rollup target.
+
+SCHEMA >
+  `minute` DateTime,
+  `publisher_domain` String,
+  `auction_source` LowCardinality(String),
+  `terminal_status` LowCardinality(String),
+  `terminal_reason` LowCardinality(Nullable(String)),
+  `auctions` AggregateFunction(count),
+  `requested_slots` AggregateFunction(sum, UInt64),
+  `winning_bids` AggregateFunction(sum, UInt64),
+  `total_time_quantiles` AggregateFunction(quantiles(0.5, 0.95, 0.99), UInt32),
+  `event_date` Date DEFAULT toDate(minute)
+
+ENGINE "AggregatingMergeTree"
+ENGINE_SORTING_KEY "event_date, minute, publisher_domain, auction_source, terminal_status, terminal_reason"
+TTL "event_date + INTERVAL 13 MONTH"
