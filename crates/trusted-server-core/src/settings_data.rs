@@ -1,5 +1,5 @@
 use edgezero_core::env_config::EnvConfig;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
