@@ -2029,6 +2029,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5283,6 +5289,7 @@ dependencies = [
  "flate2",
  "futures",
  "getrandom 0.2.17",
+ "glob",
  "hex",
  "hmac",
  "http",
@@ -5299,6 +5306,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "temp-env",
+ "tokio",
  "toml",
  "trusted-server-js",
  "trusted-server-openrtb",

@@ -13,6 +13,7 @@ use validator::{Validate, ValidationError};
 
 use crate::auction_config_types::AuctionConfig;
 use crate::consent_config::ConsentConfig;
+use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::error::TrustedServerError;
 use crate::host_header::validate_host_header_override_value;
 use crate::platform::PlatformImageOptimizerRegion;
@@ -1731,6 +1732,21 @@ pub struct DebugConfig {
     /// Fastly-observed TLS details that browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
+
+    /// Inject a `<!-- ts-debug: ... -->` HTML comment before `</body>` showing
+    /// auction pipeline stats (SSP count, mediator status, winning bid count).
+    /// Never enable in production — visible in page source.
+    #[serde(default)]
+    pub auction_html_comment: bool,
+
+    /// Include raw `adm` creative markup in `window.tsjs.bids` for GPT/GAM
+    /// debug rendering through the Prebid Universal Creative bridge.
+    ///
+    /// Use this to validate the server-side auction→GAM targeting→creative
+    /// rendering pipeline while PBS Cache is unavailable. Never enable in
+    /// production — injects raw HTML from SSPs.
+    #[serde(default)]
+    pub inject_adm_for_testing: bool,
 }
 
 /// Tester-cookie endpoint configuration.
@@ -1768,6 +1784,8 @@ pub struct Settings {
     pub consent: ConsentConfig,
     #[serde(default)]
     pub proxy: Proxy,
+    #[serde(default)]
+    pub creative_opportunities: Option<CreativeOpportunitiesConfig>,
     #[serde(default)]
     pub image_optimizer: ImageOptimizerSettings,
     #[serde(default)]
@@ -1868,14 +1886,28 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error if any handler path regex does not compile.
-    pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
+    /// Returns a configuration error if any cached runtime artifact cannot be
+    /// prepared, if any handler path regex does not compile, or if a creative
+    /// opportunity slot is invalid.
+    pub fn prepare_runtime(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.image_optimizer.prepare_runtime()?;
         self.proxy.prepare_runtime()?;
         self.validate_asset_image_optimizer_profile_sets()?;
 
         for handler in &self.handlers {
             handler.prepare_runtime()?;
+        }
+
+        if let Some(co) = &mut self.creative_opportunities {
+            co.compile_slots();
+            // Slots flow into injected HTML/JS, provider payloads, and GPT
+            // calls. Env/private config can bypass static review, so validate
+            // the full runtime shape on every load path.
+            co.validate_runtime().map_err(|err| {
+                Report::new(TrustedServerError::Configuration {
+                    message: format!("Invalid creative opportunity slot config: {err}"),
+                })
+            })?;
         }
 
         for (name, value) in &self.response_headers {
@@ -1892,6 +1924,17 @@ impl Settings {
         }
 
         Ok(())
+    }
+
+    /// Returns compiled creative opportunity slots, or empty slice if feature is disabled.
+    #[must_use]
+    pub fn creative_opportunity_slots(
+        &self,
+    ) -> &[crate::creative_opportunities::CreativeOpportunitySlot] {
+        self.creative_opportunities
+            .as_ref()
+            .map(|co| co.slot.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Rejects known placeholder secret values.
@@ -5044,6 +5087,210 @@ origin_host_header_overide = "www.example.com""#,
     ///
     /// If this test fails, a route was added or removed in the Fastly
     /// router without updating `ADMIN_ENDPOINTS` (or vice versa).
+    #[test]
+    fn settings_parses_creative_opportunities_section() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+auction_timeout_ms = 500
+"#;
+        let settings = Settings::from_toml(toml).expect("should parse");
+        let co = settings
+            .creative_opportunities
+            .expect("should have creative_opportunities");
+        assert_eq!(co.gam_network_id, "21765378893");
+        assert_eq!(co.auction_timeout_ms, Some(500));
+    }
+
+    #[test]
+    fn settings_rejects_invalid_creative_opportunity_slot_id() {
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+id = "xss<script>"
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#;
+        let err = Settings::from_toml(toml).expect_err("should reject invalid slot id");
+        assert!(
+            format!("{err:?}").contains("Invalid creative opportunity slot config"),
+            "error should mention the invalid slot id, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_env_injected_invalid_creative_opportunity_slot_id() {
+        // A TRUSTED_SERVER__CREATIVE_OPPORTUNITIES__SLOT override must go through
+        // the same runtime slot validation as a TOML-defined slot, so an invalid
+        // id injected via env is rejected by from_toml_and_env (the build-time
+        // path uses the same validation against the merged config).
+        let toml = r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+"#;
+        let slot_key = format!(
+            "{}{}CREATIVE_OPPORTUNITIES{}SLOT",
+            ENVIRONMENT_VARIABLE_PREFIX,
+            ENVIRONMENT_VARIABLE_SEPARATOR,
+            ENVIRONMENT_VARIABLE_SEPARATOR
+        );
+        temp_env::with_var(
+            slot_key,
+            Some(
+                r#"[{"id":"bad id","page_patterns":["/"],"formats":[{"width":300,"height":250}]}]"#,
+            ),
+            || {
+                let err = Settings::from_toml_and_env(toml)
+                    .expect_err("should reject env-injected invalid slot id");
+                assert!(
+                    format!("{err:?}").contains("Invalid creative opportunity slot config"),
+                    "error should mention the invalid slot id, got: {err:?}"
+                );
+            },
+        );
+    }
+
+    fn creative_opportunity_settings_toml(slot_body: &str) -> String {
+        format!(
+            r#"
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "unit-test-admin-secret"
+
+[publisher]
+domain = "example.com"
+cookie_domain = ".example.com"
+origin_url = "https://origin.example.com"
+proxy_secret = "secret"
+
+[ec]
+passphrase = "test-secret-key-32-bytes-minimum"
+
+[creative_opportunities]
+gam_network_id = "21765378893"
+
+[[creative_opportunities.slot]]
+{slot_body}
+"#
+        )
+    }
+
+    fn assert_creative_opportunity_slot_config_rejected(slot_body: &str, expected: &str) {
+        let toml = creative_opportunity_settings_toml(slot_body);
+        let err = Settings::from_toml(&toml)
+            .expect_err("should reject malformed creative opportunity slot");
+        assert!(
+            format!("{err:?}").contains(expected),
+            "error should contain {expected:?}, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = []
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_valid_page_patterns() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["["]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "must include at least one valid page pattern",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_without_formats() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = []
+"#,
+            "must include at least one format",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_zero_dimensions() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+page_patterns = ["/"]
+formats = [{ width = 0, height = 250 }]
+"#,
+            "must have positive width and height",
+        );
+    }
+
+    #[test]
+    fn settings_rejects_creative_opportunity_slot_with_empty_gam_unit_path() {
+        assert_creative_opportunity_slot_config_rejected(
+            r#"
+id = "atf"
+gam_unit_path = ""
+page_patterns = ["/"]
+formats = [{ width = 300, height = 250 }]
+"#,
+            "resolved GAM unit path must not be empty",
+        );
+    }
+
     #[test]
     fn admin_endpoints_match_fastly_router() {
         let router_source = include_str!("../../trusted-server-adapter-fastly/src/app.rs");

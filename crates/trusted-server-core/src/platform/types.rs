@@ -139,6 +139,8 @@ pub struct PlatformBackendSpec {
     pub certificate_check: bool,
     /// Maximum time to wait for the first response byte.
     pub first_byte_timeout: Duration,
+    /// Maximum time to wait between response body bytes.
+    pub between_bytes_timeout: Duration,
 }
 
 /// Cloneable container of platform services for a single request.

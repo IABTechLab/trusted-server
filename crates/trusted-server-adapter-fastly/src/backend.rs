@@ -49,6 +49,8 @@ fn sanitize_backend_name_component(value: &str) -> String {
 
 /// Default first-byte timeout for backends (15 seconds).
 pub(crate) const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default timeout between response body bytes for backends (10 seconds).
+pub(crate) const DEFAULT_BETWEEN_BYTES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for creating a dynamic Fastly backend.
 ///
@@ -60,6 +62,7 @@ pub struct BackendConfig<'a> {
     port: Option<u16>,
     certificate_check: bool,
     first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
     host_header_override: Option<&'a str>,
 }
 
@@ -76,6 +79,7 @@ impl<'a> BackendConfig<'a> {
             port: None,
             certificate_check: true,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
+            between_bytes_timeout: DEFAULT_BETWEEN_BYTES_TIMEOUT,
             host_header_override: None,
         }
     }
@@ -103,6 +107,17 @@ impl<'a> BackendConfig<'a> {
     #[must_use]
     pub fn first_byte_timeout(mut self, timeout: Duration) -> Self {
         self.first_byte_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum time to wait between response body bytes.
+    ///
+    /// Defaults to 10 seconds. Auction backends should set this to the same
+    /// remaining budget as the first-byte timeout so slow-drip bodies cannot
+    /// hold the auction past its deadline.
+    #[must_use]
+    pub fn between_bytes_timeout(mut self, timeout: Duration) -> Self {
+        self.between_bytes_timeout = timeout;
         self
     }
 
@@ -159,13 +174,15 @@ impl<'a> BackendConfig<'a> {
         } else {
             "_nocert"
         };
-        let timeout_ms = self.first_byte_timeout.as_millis();
+        let first_byte_timeout_ms = self.first_byte_timeout.as_millis();
+        let between_bytes_timeout_ms = self.between_bytes_timeout.as_millis();
         let backend_name = format!(
-            "backend_{}{}{}_t{}",
+            "backend_{}{}{}_fb{}_bb{}",
             sanitize_backend_name_component(&name_base),
             host_override_suffix,
             cert_suffix,
-            timeout_ms
+            first_byte_timeout_ms,
+            between_bytes_timeout_ms
         );
 
         Ok((backend_name, target_port))
@@ -187,9 +204,10 @@ impl<'a> BackendConfig<'a> {
     /// Ensure a dynamic backend exists for this configuration and return its name.
     ///
     /// The backend name is derived from the scheme, host, port, certificate
-    /// setting, and `first_byte_timeout` to avoid collisions.  Different
-    /// timeout values produce different backend registrations so that a
-    /// tight deadline cannot be silently widened by an earlier registration.
+    /// setting, `first_byte_timeout`, and `between_bytes_timeout` to avoid
+    /// collisions. Different timeout values produce different backend
+    /// registrations so that a tight deadline cannot be silently widened by an
+    /// earlier registration.
     ///
     /// # Errors
     ///
@@ -210,7 +228,7 @@ impl<'a> BackendConfig<'a> {
             .override_host(&host_header)
             .connect_timeout(Duration::from_secs(1))
             .first_byte_timeout(self.first_byte_timeout)
-            .between_bytes_timeout(Duration::from_secs(10));
+            .between_bytes_timeout(self.between_bytes_timeout);
         if self.scheme.eq_ignore_ascii_case("https") {
             builder = builder.enable_ssl().sni_hostname(self.host);
             if self.certificate_check {
@@ -381,7 +399,7 @@ mod tests {
         let name = BackendConfig::new("https", "origin.example.com")
             .ensure()
             .expect("should create backend for valid HTTPS origin");
-        assert_eq!(name, "backend_https_origin_example_com_443_t15000");
+        assert_eq!(name, "backend_https_origin_example_com_443_fb15000_bb10000");
     }
 
     #[test]
@@ -390,7 +408,10 @@ mod tests {
             .certificate_check(false)
             .ensure()
             .expect("should create backend with cert check disabled");
-        assert_eq!(name, "backend_https_origin_example_com_443_nocert_t15000");
+        assert_eq!(
+            name,
+            "backend_https_origin_example_com_443_nocert_fb15000_bb10000"
+        );
     }
 
     #[test]
@@ -399,7 +420,7 @@ mod tests {
             .port(Some(8080))
             .ensure()
             .expect("should create backend for HTTP origin with explicit port");
-        assert_eq!(name, "backend_http_api_test-site_org_8080_t15000");
+        assert_eq!(name, "backend_http_api_test-site_org_8080_fb15000_bb10000");
     }
 
     #[test]
@@ -407,7 +428,7 @@ mod tests {
         let name = BackendConfig::new("http", "example.org")
             .ensure()
             .expect("should create backend defaulting to port 80 for HTTP");
-        assert_eq!(name, "backend_http_example_org_80_t15000");
+        assert_eq!(name, "backend_http_example_org_80_fb15000_bb10000");
     }
 
     #[test]
@@ -464,11 +485,11 @@ mod tests {
         );
         assert_eq!(
             name_a,
-            "backend_https_origin_example_com_443_oh_www_example_com_t15000"
+            "backend_https_origin_example_com_443_oh_www_example_com_fb15000_bb10000"
         );
         assert_eq!(
             name_b,
-            "backend_https_origin_example_com_443_oh_m_example_com_t15000"
+            "backend_https_origin_example_com_443_oh_m_example_com_fb15000_bb10000"
         );
     }
 
@@ -523,12 +544,39 @@ mod tests {
             "backends with different timeouts should have different names"
         );
         assert!(
-            name_a.ends_with("_t2000"),
-            "name should include timeout suffix"
+            name_a.ends_with("_fb2000_bb10000"),
+            "name should include first-byte and between-bytes timeout suffix"
         );
         assert!(
-            name_b.ends_with("_t500"),
-            "name should include timeout suffix"
+            name_b.ends_with("_fb500_bb10000"),
+            "name should include first-byte and between-bytes timeout suffix"
+        );
+    }
+
+    #[test]
+    fn different_between_bytes_timeouts_produce_different_names() {
+        use std::time::Duration;
+
+        let (name_a, _) = BackendConfig::new("https", "origin.example.com")
+            .between_bytes_timeout(Duration::from_secs(2))
+            .compute_name()
+            .expect("should compute name with 2000ms between-bytes timeout");
+        let (name_b, _) = BackendConfig::new("https", "origin.example.com")
+            .between_bytes_timeout(Duration::from_millis(500))
+            .compute_name()
+            .expect("should compute name with 500ms between-bytes timeout");
+
+        assert_ne!(
+            name_a, name_b,
+            "backends with different between-bytes timeouts should have different names"
+        );
+        assert!(
+            name_a.ends_with("_fb15000_bb2000"),
+            "name should include first-byte and between-bytes timeout suffix"
+        );
+        assert!(
+            name_b.ends_with("_fb15000_bb500"),
+            "name should include first-byte and between-bytes timeout suffix"
         );
     }
 }
