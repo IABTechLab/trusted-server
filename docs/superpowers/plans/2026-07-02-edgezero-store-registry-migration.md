@@ -19,8 +19,8 @@ This plan targets the EdgeZero commit pinned in `Cargo.lock`: **`branch = worktr
 ## Global Constraints
 
 - **Mixed Rust edition — follow each crate's `Cargo.toml`** (not global 2024): `trusted-server-core` and `trusted-server-adapter-fastly` are **2021**; `trusted-server-adapter-axum` is **2024**. Toolchain **1.95.0**; WASM target `wasm32-wasip1`.
-- **Run every cargo command `--locked`** (aliases too — e.g. `cargo test-fastly --locked`, or set `CARGO_NET_OFFLINE`/commit the lock). The edgezero dep is a **mutable branch** whose upstream head has advanced past the pinned `d8f71a4a`; `--locked` prevents a silent bump to an unreviewed commit (see the pin note).
-- **Preflight before Task 1:** materialize + verify the pinned edgezero object locally so nobody re-checks APIs against a stale cache checkout — `cargo fetch --locked` then `cargo check -p trusted-server-core --locked`, and confirm the resolved rev is `d8f71a4a` (`grep 'edgezero-core' Cargo.lock`). The checkout dir is `…/git/checkouts/edgezero-efe7ff47d5367787/d8f71a4/` (present locally as of this writing).
+- **Run every cargo command `--locked`.** The `Run:` snippets in the tasks below **omit `--locked` for brevity** — the executor MUST append it to **every** cargo invocation (each command in an `&&` chain too): `cargo test-fastly --locked`, `cargo check-cloudflare --locked`, etc. The edgezero dep is a **mutable branch** whose upstream head has advanced past the pinned `d8f71a4a`; `--locked` prevents a silent bump to an unreviewed commit (see the pin note). *(Safest: `export CARGO_NET_OFFLINE=true` for the session after the preflight fetch, so no command can update the lock.)*
+- **Preflight before Task 1:** materialize + verify the pinned edgezero object locally so nobody re-checks APIs against a stale cache checkout — `cargo fetch --locked` then `cargo check -p trusted-server-core --locked`, and confirm the resolved rev is `d8f71a4a` (`grep 'edgezero-core' Cargo.lock`). The checkout dir is `…/git/checkouts/edgezero-efe7ff47d5367787/<short-rev>/` — but **do not assume it is materialized**: on a given machine the cache may only hold an *older* checkout (e.g. `7ec2ad1`), so `cargo fetch --locked` first, then verify the resolved rev is `d8f71a4a` before checking APIs against any checkout dir.
 - Errors: `error-stack` `Report<E>` only (no `anyhow` outside the Spin entry point); `derive_more::Display`; import `Error` from `core::error::`.
 - No `unwrap()` in production (`expect("should …")`); no `println!`/`eprintln!` (use `log`).
 - No wildcard imports (except `use super::*` in `#[cfg(test)]`); no imports inside functions.
@@ -97,7 +97,7 @@ git commit -m "Record Phase 1 kind-aware store-id map and confirm D6-a"
 - Modify: `trusted-server.example.toml`, `crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml`
 - Create: `crates/trusted-server-core/src/testdata/all-store-refs.toml`
 - **Modify (integration test surfaces that hard-code `app_config` — break under the rename):** `crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs` (`[local_server.config_stores.app_config]` + `app_config = '''…'''` + the generator test asserting them → `trusted_server_config`), `crates/trusted-server-integration-tests/tests/common/config.rs` (`{"app_config": envelope}` → `{"trusted_server_config": …}`), `crates/trusted-server-integration-tests/tests/environments/axum.rs` (env `TRUSTED_SERVER_CONFIG_APP_CONFIG_APP_CONFIG` → the trusted_server_config-keyed name)
-- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-cloudflare/cloudflare.toml` (reconcile/delete stale schema, Step 6), `crates/trusted-server-adapter-spin/spin.toml` (labels + drop stale `v_…` comment + serve command); **Create** `crates/trusted-server-adapter-spin/runtime-config.toml`
+- Modify (platform manifests): `fastly.toml`, `crates/trusted-server-adapter-cloudflare/wrangler.toml`, `crates/trusted-server-adapter-cloudflare/cloudflare.toml` (reconcile/delete stale schema, Step 6), `crates/trusted-server-adapter-spin/spin.toml` (labels + drop stale `v_…` comment); **Create** `crates/trusted-server-adapter-spin/runtime-config.toml`. The **serve command** (`spin up … --runtime-config-file …`) lives in `edgezero.toml` (Spin serve command, ~L95) and `CLAUDE.md` (Spin smoke line, ~L87) — update both, not `spin.toml`.
 - **Create** `docs/internal/store-provisioning.md` (operator runbook: Fastly mgmt-id==logical-id + store create/link, Cloudflare `wrangler secret put`, Spin runtime-config) (KV-store backends for the declared Spin labels) and **Modify** `crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml` (declare the new local Fastly stores for parity). (Axum uses `.edgezero/local-config-*.json` local dev files — document but do not commit machine-local state.)
 - Modify: `crates/trusted-server-adapter-cloudflare/src/app.rs` (`settings_from_cloudflare_config_json` side-channel key `app_config` → `CONFIG_BLOB_KEY`)
 - Create: `crates/trusted-server-core/src/stores.rs` (shared `stores_metadata()`); Modify: each `crates/trusted-server-adapter-{fastly,axum,cloudflare,spin}/src/app.rs` (`impl Hooks` → add `fn stores()`)
@@ -188,6 +188,8 @@ git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-adapter-spin/spin.toml \
   crates/trusted-server-adapter-spin/runtime-config.toml \
   crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml \
+  edgezero.toml \
+  CLAUDE.md \
   docs/internal/store-provisioning.md \
   crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml \
   crates/trusted-server-integration-tests/src/bin/generate-viceroy-config.rs \
@@ -392,7 +394,9 @@ if let Some(reg) = build_kv_registry_axum(&stores)     { server = server.with_kv
 if let Some(reg) = build_secret_registry_axum(&stores) { server = server.with_secret_registry(reg); }
 server.run()?;
 ```
-Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs` mirroring Task 6's Fastly by-id builders but opening the EdgeZero **Axum** store primitives (`.edgezero/*` local backends). **KV-file path decision (make it explicit):** EdgeZero's Axum KV backend uses a **private** on-disk path scheme (`.edgezero/kv-<slug>-<hash>.redb`). If trusted-server reimplements the open by hand it risks pointing at a **different file** than EdgeZero's dev server, silently diverging local KV. So **prefer reusing EdgeZero's public Axum KV constructor** if one exists at the pin; if it's private, **upstream a public helper** (small R11-style ask) rather than copying the slug/hash algorithm. Record the choice in Task 1's decision output; do NOT hand-reimplement the path without confirming byte-for-byte parity with EdgeZero's algorithm. This preserves PORT/axum.toml exactly and wires registries. **Bounded smoke (do not block the executor):** the dev server is long-lived, so don't run it bare — either `timeout 8 cargo run -p trusted-server-adapter-axum 2>&1 | grep -q 'Listening on'` (assert the bind log, non-zero timeout exit is expected/ignored), or run it in the background, `curl -fsS localhost:$PORT/health`, then kill it. Prefer an Axum route test over booting the server where possible.
+Add `build_*_registry_axum(&StoresMetadata)` in `adapter-axum/src/registries.rs` mirroring Task 6's Fastly by-id builders but opening the EdgeZero **Axum** store primitives (`.edgezero/*` local backends). **KV-file path decision (make it explicit):** EdgeZero's Axum KV backend uses a **private** on-disk path scheme (`.edgezero/kv-<slug>-<hash>.redb`). If trusted-server reimplements the open by hand it risks pointing at a **different file** than EdgeZero's dev server, silently diverging local KV. Executable rule (pick during Task 1, record the choice):
+  - **If EdgeZero exposes a public by-logical-id Axum KV constructor** at the pin (`grep -rn 'pub fn' …/edgezero-adapter-axum/src/key_value_store.rs`) → **use it**.
+  - **Else** → copy the exact `.edgezero/kv-<slug>-<hash>.redb` path algorithm verbatim **plus a parity test** asserting the generated path byte-for-byte matches EdgeZero's for a known id, **and** file a separate "expose public Axum KV constructor" upstream ask (R11) so the copy is removed later. Do **not** ship a hand-written path without that parity test. This preserves PORT/axum.toml exactly and wires registries. **Bounded smoke (do not block the executor):** the dev server is long-lived, so don't run it bare — either `timeout 8 cargo run -p trusted-server-adapter-axum 2>&1 | grep -q 'Listening on'` (assert the bind log, non-zero timeout exit is expected/ignored), or run it in the background, `curl -fsS localhost:$PORT/health`, then kill it. Prefer an Axum route test over booting the server where possible.
 
 **Interfaces:**
 - Consumes: Task 3 composite; `ConfigRegistry`/`SecretRegistry` from request extensions.
@@ -513,8 +517,9 @@ Run: `cargo test-fastly && cargo test-axum && cargo test-cloudflare && cargo tes
 ```bash
 git add crates/trusted-server-adapter-fastly \
   crates/trusted-server-core/src/publisher.rs \
-  crates/trusted-server-core/src/consent/mod.rs
-git commit -m "Inject Fastly registries; flip consent to named KV; remove consent special-casing"
+  crates/trusted-server-core/src/consent/mod.rs \
+  crates/trusted-server-core/src/auction/endpoints.rs
+git commit -m "Inject Fastly registries; flip consent to named KV (fail-closed, incl. auction); remove consent special-casing"
 ```
 
 ---
