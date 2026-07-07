@@ -1915,8 +1915,10 @@ fn page_bids_request_allowed(req: &Request<EdgeBody>) -> bool {
     }
 }
 
-/// Builds the `403 Forbidden` returned for a CORS preflight (`OPTIONS`) to the
-/// side-effecting `/__ts/page-bids` endpoint.
+/// Builds the `403 Forbidden` returned when the side-effecting
+/// `/__ts/page-bids` endpoint refuses a request — both the CORS preflight
+/// (`OPTIONS`) and the GET cross-site gate ([`page_bids_request_allowed`])
+/// return this single denial shape.
 ///
 /// The GET handler's [`page_bids_request_allowed`] gate trusts the
 /// `X-TSJS-Page-Bids` header precisely because this endpoint never grants a
@@ -1985,13 +1987,7 @@ pub async fn handle_page_bids(
                 .and_then(|v| v.to_str().ok()),
             req.headers().contains_key("x-tsjs-page-bids")
         );
-        let mut response = Response::new(EdgeBody::from("Forbidden"));
-        *response.status_mut() = StatusCode::FORBIDDEN;
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
-        );
-        return Ok(response);
+        return Ok(page_bids_preflight_denied());
     }
 
     let path_param = req

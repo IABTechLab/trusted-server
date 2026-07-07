@@ -99,7 +99,7 @@ export interface TsjsApi {
   /** Maps actualDivId → slotId for slotRenderEnded billing lookup. */
   divToSlotId?: Record<string, string>;
   /**
-   * Win/billing beacons already fired, keyed by `slotId|bidIdentity`.
+   * Win/billing beacons already fired, keyed by `slotId|bidIdentity|kind|url`.
    * Used by the GPT render bridge so a bid's nurl/burl fire at most once even
    * across repeated Prebid Universal Creative requests for the same adId.
    */

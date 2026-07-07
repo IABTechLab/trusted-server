@@ -718,7 +718,7 @@ async fn dispatch_fallback(
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by publisher.max_buffered_body_bytes.
         // Only the handle_publisher_request branch below routes through
-        // buffer_publisher_response. Integration responses are small in practice
+        // buffer_publisher_response_async. Integration responses are small in practice
         // and the EdgeZero flag is off by default; extend the cap here if that changes.
         state
             .registry
