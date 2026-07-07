@@ -188,7 +188,6 @@ git add edgezero.toml fastly.toml trusted-server.example.toml \
   crates/trusted-server-adapter-spin/spin.toml \
   crates/trusted-server-adapter-spin/runtime-config.toml \
   crates/trusted-server-integration-tests/fixtures/configs/viceroy-template.toml \
-  edgezero.toml \
   CLAUDE.md \
   docs/internal/store-provisioning.md \
   crates/trusted-server-integration-tests/fixtures/configs/trusted-server.integration.toml \
