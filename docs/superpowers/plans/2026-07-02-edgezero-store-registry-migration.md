@@ -577,9 +577,31 @@ git commit -m "Retire non-Fastly per-adapter config/secret read impls; reads via
 
 ---
 
-## Task 1 Output (filled in during execution)
+## Task 1 Output (recorded 2026-07-06; pin `d8f71a4a`, `--locked` preflight green)
 
-_Kind-partitioned D5 map and the confirmed D6-a decision are recorded here by Task 1 before Tasks 2+ run._
+**Preflight:** `cargo fetch --locked` OK; `d8f71a4a` checkout materialized; `cargo check -p trusted-server-core --locked` green. All registry APIs present at the pin (per the "Pinned dependency" note).
+
+**D6 decision: D6-a (confirmed by operator).** Runtime key-rotation writes stay via the composite writer + `management_api.rs`; reads move to EdgeZero. Verified the **only** runtime write sites are `KeyRotationManager` (`request_signing/rotation.rs`): `.put(&config_store_id, …)` (JWKS `current-kid`/`active-kids`/per-kid) at L196/209/224, `.create(&secret_store_id, …)` at L176, `.delete(&{config,secret}_store_id, …)` at L96/116/124/285/292. No other runtime writer exists. `management_api.rs` is **retained**.
+
+**D5 store-id map (kind-partitioned; declare all in `edgezero.toml`):**
+
+| Kind | Logical id | Source | Reconcile |
+|---|---|---|---|
+| KV | `ec_identity_store` | `ec.ec_store` (`settings.rs:452`, example L16) | declare |
+| KV | `consent_store` | `consent.consent_store` (`consent_config.rs:80`) | declare |
+| KV | `creative_store` | `auction.creative_store` (`auction_config_types.rs:30`, **deprecated**) | declare (keep strict lookup safe) |
+| config | `trusted_server_config` | app-config blob; **key == id** (`CONFIG_BLOB_KEY`→`trusted_server_config`, `DEFAULT_CONFIG_STORE_ID`→`trusted_server_config`) | rename from `app_config` |
+| config | `jwks_store` | `JWKS_CONFIG_STORE_NAME` (`request_signing/mod.rs:40`); `request_signing.config_store_id` | set example/fixtures `config_store_id = "jwks_store"` (today wrongly `app_config`) |
+| config | `datadome-ip-bypass` | `default_ip_cidr_source_store` (`protection_scope.rs:164`) | declare |
+| secret | `signing_keys` | `SIGNING_SECRET_STORE_NAME` (`mod.rs:46`); `request_signing.secret_store_id` | set example/fixtures `secret_store_id = "signing_keys"` (today wrongly `secrets`) |
+| secret | `ts_secrets` | `default_server_side_key_secret_store` (`datadome.rs:242`) | declare |
+| secret | `s3-auth` | `default_s3_secret_store` (`settings.rs:654`) | declare |
+
+`counter_store`/`opid_store` are Fastly-adapter constants (rate limiter / opid), **not** `Settings` ids — out of scope. Requirement (spec D5): Fastly management resource id **==** runtime logical id for `jwks_store`/`signing_keys` (operator runbook).
+
+**Axum local-KV path (deferred to Task 5 impl):** first `grep 'pub fn' …/edgezero-adapter-axum/src/key_value_store.rs` at the pin — use a public by-logical-id constructor if present; else copy the `.edgezero/kv-<slug>-<hash>.redb` algorithm **with a parity test** + file the upstream ask.
+
+**No plan/spec conflicts surfaced in pre-flight.** Proceed to Task 2.
 
 ---
 
