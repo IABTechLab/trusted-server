@@ -5,7 +5,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config_payload::settings_from_config_blob;
 use crate::error::TrustedServerError;
-use crate::platform::{PlatformConfigStore, StoreName};
+use crate::platform::{PlatformConfigStore, PlatformError, StoreName};
 use crate::settings::Settings;
 
 const DEFAULT_CONFIG_STORE_ID: &str = "app_config";
@@ -54,6 +54,7 @@ pub fn default_config_key() -> String {
 /// Returns [`TrustedServerError::ConfigStoreUnavailable`] (HTTP 503) when the
 /// config blob (or a referenced chunk) cannot be read, and
 /// [`TrustedServerError::Configuration`] (HTTP 500) when the read succeeds but
+/// the value cannot be decoded ([`PlatformError::ConfigValueInvalid`]) or
 /// envelope/chunk verification or settings validation fails.
 pub fn get_settings_from_config_store(
     config_store: &dyn PlatformConfigStore,
@@ -70,14 +71,25 @@ fn read_config_entry(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<TrustedServerError>> {
-    config_store
-        .get(store_name, key)
-        .change_context(TrustedServerError::ConfigStoreUnavailable {
-            store_name: store_name.to_string(),
-            message: format!(
-                "read failed for `{key}` (unseeded, missing, or transient) — run `ts config push` to (re)seed"
-            ),
-        })
+    config_store.get(store_name, key).map_err(|report| {
+        // A value that was read but cannot be decoded is terminal (500-class),
+        // not a retryable store outage: the store and key are reachable, so
+        // clients retrying a 503 would never recover until the value is reseeded.
+        if matches!(report.current_context(), PlatformError::ConfigValueInvalid) {
+            report.change_context(TrustedServerError::Configuration {
+                message: format!(
+                    "config value for `{key}` was read but cannot be decoded — run `ts config push` to reseed"
+                ),
+            })
+        } else {
+            report.change_context(TrustedServerError::ConfigStoreUnavailable {
+                store_name: store_name.to_string(),
+                message: format!(
+                    "read failed for `{key}` (unseeded, missing, or transient) — run `ts config push` to (re)seed"
+                ),
+            })
+        }
+    })
 }
 
 // Mirrors `edgezero-adapter-fastly`'s crate-private `chunked_config` resolver
@@ -395,6 +407,59 @@ mod tests {
             err.current_context().status_code(),
             http::StatusCode::SERVICE_UNAVAILABLE,
             "a referenced chunk missing is a read failure → 503"
+        );
+    }
+
+    #[test]
+    fn undecodable_config_value_is_configuration_500() {
+        // The store is reachable and the key exists, but the adapter reports the
+        // value as undecodable (e.g. non-UTF-8 bytes seeded into Spin KV) —
+        // terminal 500, not retryable 503.
+        struct CorruptValueConfigStore;
+
+        impl PlatformConfigStore for CorruptValueConfigStore {
+            fn get(
+                &self,
+                _store_name: &StoreName,
+                key: &str,
+            ) -> Result<String, Report<PlatformError>> {
+                Err(Report::new(PlatformError::ConfigValueInvalid)
+                    .attach(format!("value for `{key}` is not valid UTF-8")))
+            }
+
+            fn put(
+                &self,
+                _store_id: &crate::platform::StoreId,
+                _key: &str,
+                _value: &str,
+            ) -> Result<(), Report<PlatformError>> {
+                Ok(())
+            }
+
+            fn delete(
+                &self,
+                _store_id: &crate::platform::StoreId,
+                _key: &str,
+            ) -> Result<(), Report<PlatformError>> {
+                Ok(())
+            }
+        }
+
+        let err = get_settings_from_config_store(
+            &CorruptValueConfigStore,
+            &StoreName::from("app_config"),
+            CONFIG_BLOB_KEY,
+        )
+        .expect_err("undecodable value must error");
+
+        assert_eq!(
+            err.current_context().status_code(),
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a value that reads but cannot be decoded should map to 500"
+        );
+        assert!(
+            format!("{err:?}").contains("ts config push"),
+            "error chain should carry the actionable `ts config push` hint for logs"
         );
     }
 

@@ -11,6 +11,13 @@ pub enum PlatformError {
     /// Config store access failed.
     #[display("config store error")]
     ConfigStore,
+    /// Config store value was read but cannot be decoded (present but corrupt).
+    ///
+    /// Unlike [`PlatformError::ConfigStore`], this is terminal: the store and
+    /// key are reachable, so retrying cannot succeed until the value is
+    /// reseeded.
+    #[display("config value invalid")]
+    ConfigValueInvalid,
     /// Secret store access failed.
     #[display("secret store error")]
     SecretStore,

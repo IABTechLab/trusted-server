@@ -94,11 +94,7 @@ impl PlatformConfigStore for SpinKvConfigStore {
                     "key `{key}` not found in Spin key-value store `{label}`"
                 ))
             })?;
-        String::from_utf8(bytes).map_err(|e| {
-            Report::new(PlatformError::ConfigStore).attach(format!(
-                "Spin key-value value for `{key}` is not valid UTF-8: {e}"
-            ))
-        })
+        decode_config_store_value(key, bytes)
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
@@ -110,6 +106,24 @@ impl PlatformConfigStore for SpinKvConfigStore {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("config store writes are not supported on Spin"))
     }
+}
+
+/// Decodes a value read from the Spin key-value app-config store.
+///
+/// A present-but-not-UTF-8 value is [`PlatformError::ConfigValueInvalid`], not
+/// [`PlatformError::ConfigStore`]: the read itself succeeded, so core maps it
+/// to the terminal 500-class configuration path instead of the retryable 503
+/// store-unavailable path.
+// Compiled for tests on native targets so unit tests can exercise the decode
+// classification; the only production call site is `SpinKvConfigStore::get`
+// inside the `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` block.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn decode_config_store_value(key: &str, bytes: Vec<u8>) -> Result<String, Report<PlatformError>> {
+    String::from_utf8(bytes).map_err(|e| {
+        Report::new(PlatformError::ConfigValueInvalid).attach(format!(
+            "Spin key-value value for `{key}` is not valid UTF-8: {e}"
+        ))
+    })
 }
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -1362,6 +1376,31 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject uppercase-leading key at the encoder boundary"
+        );
+    }
+
+    #[test]
+    fn decode_config_store_value_accepts_utf8() {
+        let decoded = decode_config_store_value("blob", b"{\"kind\":\"config\"}".to_vec())
+            .expect("should decode UTF-8 config value");
+
+        assert_eq!(
+            decoded, "{\"kind\":\"config\"}",
+            "should return the decoded string unchanged"
+        );
+    }
+
+    #[test]
+    fn decode_config_store_value_classifies_non_utf8_as_invalid_value() {
+        // A present-but-corrupt value must be the terminal ConfigValueInvalid
+        // (core maps it to a 500), not ConfigStore (retryable 503) — otherwise
+        // clients retry a bad config seed forever.
+        let err = decode_config_store_value("blob", vec![0xff, 0xfe, 0x00])
+            .expect_err("should reject non-UTF-8 config value");
+
+        assert!(
+            matches!(err.current_context(), PlatformError::ConfigValueInvalid),
+            "non-UTF-8 config value should classify as ConfigValueInvalid, got: {err:?}"
         );
     }
 
